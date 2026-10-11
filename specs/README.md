@@ -170,6 +170,12 @@ there is no such guarantee in this repository's printed argv or admission code.
 Fresh reads at Prepare and atomic Record favor safety; real stale snapshots or
 non-atomic field writes cannot invalidate the exhibited before-recording race.
 
+Writing a claim into Run before launching and reading it back is not a fix on
+Projects v2: `updateProjectV2ItemFieldValue` has no expected-value precondition,
+so two dispatchers can each read Run empty, each write their own claim, and each
+read back their own value before the other's write lands. Without a server-side
+compare-and-set, a claim needs one serialized writer, which is the authority below.
+
 The design document proposes one serialized admission authority, durable
 reservations, request-key deduplication and conservative ambiguous-dispatch
 recovery. Those are future work, not actions in this model. A future model can

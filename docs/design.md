@@ -185,7 +185,7 @@ missing_status
 accepted_result_issue_open
 ```
 
-The trusted create-issue route fixes the repository from policy; omitted targets must not silently select an unrelated checkout. Project provisioning/deletion reuses existing gh project commands rather than duplicating the whole CLI. References: [gh command reference](https://cli.github.com/manual/gh_help_reference), [extensions](https://cli.github.com/manual/gh_extension), [exit codes](https://cli.github.com/manual/gh_help_exit-codes).
+The trusted create-issue route fixes the repository from policy; omitted targets must not silently select an unrelated checkout. `project init` creates only the dispatch join's missing fields; other project provisioning/deletion reuses existing gh project commands rather than duplicating the whole CLI. References: [gh command reference](https://cli.github.com/manual/gh_help_reference), [extensions](https://cli.github.com/manual/gh_extension), [exit codes](https://cli.github.com/manual/gh_help_exit-codes).
 
 ## 6. Day-one live CI and credential-free tests
 
@@ -301,8 +301,8 @@ receive organization Projects write permission; GITHUB_TOKEN does not grant it.
 
 No scheduled admission, automatic recording, run listing, refusal-to-Blocked
 conversion or stuck-run recovery is implemented yet. Do not retry an ambiguous
-dispatch automatically. Field provisioning remains manual with `gh project
-field-create` (Run/Result are text fields). No workflow permissions, token
+dispatch automatically. `project init` creates missing Turn/Run/Result
+fields with the operator's own token and never edits existing fields or options. No workflow permissions, token
 placement or action pins are changed in this patch.
 
 **A — Extension distribution.** Recommend keeping source in agent-board and creating a release-only gh-agent-board distribution repository. Alternative: rename source to gh-agent-board to avoid a second release destination.

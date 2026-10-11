@@ -6,7 +6,8 @@
 agent-board is an early command-line tool that reads a project board on
 GitHub, finds where the board has drifted from what actually happened,
 and proposes the repairs. It proposes; it does not apply them yet, and it
-does not run agents yet.
+does not run agents yet. Its only write to your board is `project init`,
+which adds the fields dispatch needs.
 
 It is the first piece of a coordinator for coding agents that keeps its
 whole record on the forge: the board, its issues and their pull requests
@@ -57,7 +58,8 @@ issues. For an organization project, a classic token needs `read:project`
 (and access to the repositories being read); a fine-grained token needs the
 organization's Projects **Read** and the repositories' Issues **Read** permissions,
 plus GitHub's required Metadata read. Organization approval or SSO authorization
-may also be required. Read commands do not need `project` write scope.
+may also be required. Read commands do not need `project` write scope;
+`project init` does (classic `project`, or fine-grained Projects **Read and write**).
 If you already use `gh`, you can explicitly reuse its authentication with
 `export GH_TOKEN="$(gh auth token)"`; there is no automatic fallback today.
 
@@ -124,21 +126,31 @@ issue. These grammar checks do not authenticate a result or correlate a run.
 Only open Todo/In Progress items are accepted; a different Run is not overwritten.
 No proposal marks work Done or closes an issue.
 
-Before dispatch, provision these fields (replace OWNER and NUMBER):
+Before the first dispatch, create the fields the join uses, once per board:
 
 ```sh
-gh project field-create NUMBER --owner OWNER --name Turn --data-type SINGLE_SELECT --single-select-options Coordinator,Worker,Operator,External,None
-gh project field-create NUMBER --owner OWNER --name Run --data-type TEXT
-gh project field-create NUMBER --owner OWNER --name Result --data-type TEXT
+agent-board project init --owner my-org --project 7
 ```
 
-Set the item's Turn to Coordinator using the project UI. Dispatch and recording
-check the schema before proposing writes and report missing fields/options.
-Todo and In Progress are required Status options; In Review and the design's
-other statuses are optional for this join. Provisioning is not automatic.
+It reads the field schema and creates whichever of Turn (single-select:
+Coordinator, Worker, Operator, External, None), Run and Result (text) are
+missing, prints one row per field saying `present` or `created`, and reads the
+schema back. Running it again creates nothing. It never changes an existing
+field or its options: a Turn field of the wrong type, or a Status that is missing
+or lacks Todo or In Progress, is reported for you to fix in project settings.
+If a creation fails partway, the rows printed before it were done; rerun after fixing. With
+`--snapshot FILE` it only prints what is missing. It needs a token with project
+write: yours, at your terminal; no workflow here runs it.
+
+Then set the item's Turn to Coordinator in the project UI. Dispatch and recording
+check the schema before proposing writes; a missing field is reported with the
+`project init` command for that board. In Review and the design's other statuses
+are optional for this join.
 
 This is an offline join, not automatic dispatch/write-back. No new credential,
-workflow or data store is introduced. See the
+workflow or data store is introduced. Printing argv does not claim the item: two
+operators who run `request dispatch` for the same item before either records the
+run will start two runs (see [the model](specs/README.md)). See the
 [remaining integration seam](docs/design.md#dispatch-preview-integration-seam).
 
 ## What it checks
@@ -163,8 +175,8 @@ are not representative of a new board with built-in automation enabled.
 Every proposed Status must exist in the snapshot's single-select schema; missing,
 duplicate or unavailable options produce diagnostics instead of impossible writes.
 `project view` reports missing design statuses and fields, not a requirement to
-replace a default board's Todo/In Progress/Done schema. Provision fields manually;
-`project init` is not implemented. Built-in workflow settings are not read by the
+replace a default board's Todo/In Progress/Done schema. `project init` creates
+only the dispatch join's fields, not the design's other statuses. Built-in workflow settings are not read by the
 API adapter: check them in project settings. Closed issues with unknown closure
 reason are left for review. Done/open items are also left for review regardless of
 event order: no reopen timeline or accepted-completion authority is inferred.
@@ -230,7 +242,8 @@ board.
 ## What is real today
 
 The model, the three rules, the reader for GitHub Projects, and the
-commands above. CI runs them against fixtures on every change.
+commands above. `project init` is tested against a fake GitHub transport only;
+it has not yet been run against a live project. CI runs them against fixtures on every change.
 
 A live test runs from
 [cgwalters-forge-stage/board-test](https://github.com/cgwalters-forge-stage/board-test)
@@ -271,10 +284,10 @@ Before eventual live apply, cgwalters must set the staging **apply**
 token's organization Projects permission to **Read and write**. No write token
 is needed or used for this preview.
 
-The integration seam uses agentic-job's public
+agentic-job's public
 [workflow docs](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/workflow.md)
 and [safe-output docs](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/safe-outputs.md)
-now describe a proposals-only reusable entry point and support `update_project`
+describe a proposals-only reusable entry point and support `update_project`
 and `close_issue`. This repository's scheduled preview has not yet been wired
 to that entry point; upstream support is not evidence of configured apply here.
 

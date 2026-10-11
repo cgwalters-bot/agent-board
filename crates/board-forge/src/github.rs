@@ -53,6 +53,17 @@ pub fn parse_github_item(input: &str, repository: Option<&str>, host: &str) -> R
     Ok(item)
 }
 
+/// GitHub login syntax: 1-39 ASCII alphanumerics or hyphens, not starting with a hyphen,
+/// plus the `_shortcode` suffix of enterprise managed users. Shell-inert, so a validated
+/// login can be printed into a command to copy.
+pub fn is_github_login(login: &str) -> bool {
+    (1..=39).contains(&login.len())
+        && !login.starts_with('-')
+        && login
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
 pub fn validate_github_project(project: &Url) -> Result<()> {
     ensure!(
         project.scheme() == "https"
@@ -68,7 +79,7 @@ pub fn validate_github_project(project: &Url) -> Result<()> {
     ensure!(
         parts.len() == 4
             && ["orgs", "users"].contains(&parts[0])
-            && !parts[1].is_empty()
+            && is_github_login(parts[1])
             && parts[2] == "projects"
             && parts[3].parse::<u64>().is_ok_and(|n| n > 0),
         "invalid GitHub project URL"
@@ -159,8 +170,8 @@ fn operation(query: &str) -> (&str, &str, bool) {
         ),
         (
             "createProjectV2Field(",
-            "creating Fixture nonce field in project",
-            "organization Projects write",
+            "creating field in project",
+            "organization Projects write (for a user-owned project, a classic token's project scope)",
             false,
         ),
         (
@@ -222,7 +233,10 @@ mod diagnostic_tests {
             ("deleteProjectV2(", "organization Projects write"),
             ("addProjectV2ItemById(", "organization Projects write"),
             ("deleteProjectV2Item(", "organization Projects write"),
-            ("createProjectV2Field(", "organization Projects write"),
+            (
+                "createProjectV2Field(",
+                "organization Projects write (for a user-owned project, a classic token's project scope)",
+            ),
             (
                 "updateProjectV2ItemFieldValue(",
                 "organization Projects write",
@@ -515,6 +529,19 @@ fn typed_field(
     }
 }
 
+// The project (id, url) and its complete field schema; shared by snapshots and `project init`.
+fn read_schema(t: &impl Transport, owner: &str, number: u64) -> Result<(Value, Vec<Value>, bool)> {
+    let data = t.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":owner,"number":number}))?;
+    let project = data["repositoryOwner"]["projectV2"].clone();
+    let (fields, complete) = connection(
+        t,
+        "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{fields(first:100,after:$cursor){nodes{... on ProjectV2Field{id name dataType} ... on ProjectV2SingleSelectField{id name dataType options{id name}} ... on ProjectV2IterationField{id name dataType configuration{iterations{id title startDate duration} completedIterations{id title startDate duration}}}} pageInfo{hasNextPage endCursor}}}}}",
+        json!({"id":text(&project, "id")?}),
+        "/node/fields",
+    )?;
+    Ok((project, fields, complete))
+}
+
 impl<T: Transport> Forge for GitHub<T> {
     fn capabilities(&self) -> Result<Vec<Capability>> {
         // Read access never establishes mutation authority.
@@ -529,28 +556,72 @@ impl<T: Transport> Forge for GitHub<T> {
 }
 
 impl<T: Transport> GitHub<T> {
-    pub fn snapshot_with_policy(&self, policy: &board_core::AgentPolicy) -> Result<Snapshot> {
-        ensure!(self.number > 0, "project number must be positive");
-        let diagnostic = DiagnosticTransport {
+    fn diagnostic(&self) -> DiagnosticTransport<'_, T> {
+        DiagnosticTransport {
             transport: &self.transport,
             project: format!("{}/{}", self.owner, self.number),
             repository: String::new(),
-        };
+        }
+    }
+
+    /// The project's node ID and complete field schema, without reading items.
+    /// The returned URL must name the requested project before anything writes to its ID.
+    pub fn schema(&self) -> Result<(String, Vec<Value>)> {
+        ensure!(self.number > 0, "project number must be positive");
+        let diagnostic = self.diagnostic();
         let transport = ReadBudget {
             transport: &diagnostic,
             remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
         };
-        let data = transport.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":self.owner,"number":self.number}))?;
-        let project = &data["repositoryOwner"]["projectV2"];
-        let id = text(project, "id")?;
+        let (project, fields, complete) = read_schema(&transport, &self.owner, self.number)?;
+        let url: Url = text(&project, "url")?
+            .parse()
+            .context("parse project URL")?;
+        validate_github_project(&url)?;
+        let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+        ensure!(
+            parts[1].eq_ignore_ascii_case(&self.owner) && parts[3] == self.number.to_string(),
+            "GitHub returned project {url}, not {}/{}",
+            self.owner,
+            self.number
+        );
+        ensure!(complete, "incomplete project field schema");
+        Ok((text(&project, "id")?.to_owned(), fields))
+    }
+
+    /// Create one project field; single-select options are created in the given order.
+    pub fn create_field(
+        &self,
+        project: &str,
+        name: &str,
+        data_type: &str,
+        options: &[&str],
+    ) -> Result<String> {
+        let options: Option<Vec<_>> = (data_type == "SINGLE_SELECT").then(|| {
+            options
+                .iter()
+                .map(|name| json!({"name":name,"color":"GRAY","description":""}))
+                .collect()
+        });
+        let data = self.diagnostic().graphql(
+            "mutation($id:ID!,$name:String!,$dataType:ProjectV2CustomFieldType!,$options:[ProjectV2SingleSelectFieldOptionInput!]){createProjectV2Field(input:{projectId:$id,dataType:$dataType,name:$name,singleSelectOptions:$options}){projectV2Field{... on ProjectV2Field{id} ... on ProjectV2SingleSelectField{id}}}}",
+            // Named `id` so a failure names the project node it was writing to.
+            json!({"id":project,"name":name,"dataType":data_type,"options":options}),
+        )?;
+        Ok(text(&data["createProjectV2Field"]["projectV2Field"], "id")?.to_owned())
+    }
+
+    pub fn snapshot_with_policy(&self, policy: &board_core::AgentPolicy) -> Result<Snapshot> {
+        ensure!(self.number > 0, "project number must be positive");
+        let diagnostic = self.diagnostic();
+        let transport = ReadBudget {
+            transport: &diagnostic,
+            remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
+        };
+        let (project, fields, mut complete) = read_schema(&transport, &self.owner, self.number)?;
+        let id = text(&project, "id")?;
         let clock = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)?;
-        let (fields, mut complete) = connection(
-            &transport,
-            "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{fields(first:100,after:$cursor){nodes{... on ProjectV2Field{id name dataType} ... on ProjectV2SingleSelectField{id name dataType options{id name}} ... on ProjectV2IterationField{id name dataType configuration{iterations{id title startDate duration} completedIterations{id title startDate duration}}}} pageInfo{hasNextPage endCursor}}}}}",
-            json!({"id":id}),
-            "/node/fields",
-        )?;
         let (members, members_complete) = connection(
             &transport,
             "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{id content{__typename ... on Issue{id number title state stateReason createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{id number title state createdAt updatedAt closedAt mergedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
@@ -752,7 +823,7 @@ impl<T: Transport> GitHub<T> {
         }
         let mut snapshot = Snapshot {
             schema: board_core::SNAPSHOT_SCHEMA.into(),
-            project: text(project, "url")?.parse()?,
+            project: text(&project, "url")?.parse()?,
             clock: clock.clone(),
             coverage: Coverage {
                 complete,

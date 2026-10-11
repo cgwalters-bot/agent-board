@@ -107,7 +107,7 @@ enum Command {
 enum Project {
     /// Show item counts and available fields (use --json for snapshot data).
     View,
-    #[command(hide = true)]
+    /// Create the Turn, Run and Result fields dispatch needs, if missing (writes).
     Init,
 }
 
@@ -242,21 +242,22 @@ fn agent_policy(cli: &Cli) -> Result<board_core::AgentPolicy> {
     board_core::AgentPolicy::parse(&input)
 }
 
+fn github(cli: &Cli) -> Result<board_forge::github::GitHub<board_forge::github::Client>> {
+    ensure!(
+        cli.hostname == board_forge::github::DEFAULT_HOST,
+        "unsupported GitHub host"
+    );
+    Ok(board_forge::github::GitHub {
+        owner: cli.owner.clone().context("live commands require --owner")?,
+        number: cli.project.context("live commands require --project")?,
+        transport: board_forge::github::Client::from_env()?,
+    })
+}
+
 fn load(cli: &Cli) -> Result<Snapshot> {
     let policy = agent_policy(cli)?;
     if cli.snapshot.is_none() {
-        ensure!(
-            cli.hostname == board_forge::github::DEFAULT_HOST,
-            "unsupported GitHub host"
-        );
-        let owner = cli.owner.clone().context("live reads require --owner")?;
-        let number = cli.project.context("live reads require --project")?;
-        let snapshot = board_forge::github::GitHub {
-            transport: board_forge::github::Client::from_env()?,
-            owner,
-            number,
-        }
-        .snapshot_with_policy(&policy)?;
+        let snapshot = github(cli)?.snapshot_with_policy(&policy)?;
         if !snapshot.coverage.complete {
             eprintln!("Warning: snapshot coverage is incomplete; reconciliation is blocked.");
         }
@@ -345,6 +346,16 @@ fn execute(cli: Cli) -> Result<()> {
                 render(serde_json::to_value(snapshot)?, &cli)
             } else {
                 project_summary(&snapshot)
+            }
+        }
+        Command::Project {
+            command: Project::Init,
+        } => {
+            ensure!(cli.json.is_none(), "project init prints a field table");
+            if cli.snapshot.is_some() {
+                dispatch::init_plan(&load(&cli)?, &mut io::stdout().lock())
+            } else {
+                dispatch::init(&github(&cli)?, &mut io::stdout().lock())
             }
         }
         Command::Item {

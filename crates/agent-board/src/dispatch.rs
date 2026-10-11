@@ -1,7 +1,9 @@
-//! Offline join to agentic-job's dispatch caller. Nothing here grants write authority.
+//! Offline join to agentic-job's dispatch caller, and `project init`, which creates the
+//! join's missing fields with the operator's own token. Nothing here grants a run write authority.
 use anyhow::{Context, Result, ensure};
 use board_core::{Item, Snapshot, Status, Turn};
-use board_forge::{parse_github_item, validate_github_project};
+use board_forge::github::{GitHub, Transport};
+use board_forge::{is_github_login, parse_github_item, validate_github_project};
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -84,29 +86,43 @@ fn positive_id(value: &str) -> bool {
         && value.parse::<u64>().is_ok()
 }
 
-fn require_field(snapshot: &Snapshot, name: &str, kind: &str) -> Result<()> {
-    let fields: Vec<_> = snapshot
-        .fields
-        .iter()
-        .filter(|f| f["name"] == name)
-        .collect();
-    ensure!(
-        fields.len() == 1 && fields[0]["dataType"] == kind,
-        "board needs exactly one {name} field of type {kind}; provision it with gh project field-create NUMBER --owner OWNER --name '{name}' --data-type {kind}{}",
-        if name == "Turn" {
-            " --single-select-options Coordinator,Worker,Operator,External,None"
-        } else if name == "Status" {
-            " --single-select-options Todo,'In Progress',Done"
-        } else {
-            ""
-        }
-    );
-    Ok(())
+/// A field the join reads or proposes: name, type, options it needs, options `project init` creates.
+struct JoinField {
+    name: &'static str,
+    data_type: &'static str,
+    required: &'static [&'static str],
+    created: &'static [&'static str],
 }
 
-fn has_option(snapshot: &Snapshot, name: &str, option: &str) -> bool {
-    let fields: Vec<_> = snapshot
-        .fields
+const JOIN_FIELDS: [JoinField; 4] = [
+    JoinField {
+        name: "Status",
+        data_type: "SINGLE_SELECT",
+        required: &["Todo", "In Progress"],
+        created: &[],
+    },
+    JoinField {
+        name: "Turn",
+        data_type: "SINGLE_SELECT",
+        required: &["Coordinator", "Worker", "Operator"],
+        created: &["Coordinator", "Worker", "Operator", "External", "None"],
+    },
+    JoinField {
+        name: "Run",
+        data_type: "TEXT",
+        required: &[],
+        created: &[],
+    },
+    JoinField {
+        name: "Result",
+        data_type: "TEXT",
+        required: &[],
+        created: &[],
+    },
+];
+
+fn has_option(fields: &[Value], name: &str, option: &str) -> bool {
+    let fields: Vec<_> = fields
         .iter()
         .filter(|f| f["name"] == name && f["dataType"] == "SINGLE_SELECT")
         .collect();
@@ -116,26 +132,136 @@ fn has_option(snapshot: &Snapshot, name: &str, option: &str) -> bool {
             .is_some_and(|options| options.iter().filter(|o| o["name"] == option).count() == 1)
 }
 
-fn require_option(snapshot: &Snapshot, name: &str, option: &str) -> Result<()> {
+/// Join fields absent from the schema. A present but unusable field is an error:
+/// creating a second one, or rewriting its options, could lose existing values.
+fn missing_fields(fields: &[Value]) -> Result<Vec<&'static JoinField>> {
+    let mut missing = Vec::new();
+    for field in &JOIN_FIELDS {
+        let named: Vec<_> = fields.iter().filter(|f| f["name"] == field.name).collect();
+        if named.is_empty() {
+            // GitHub's built-in automations act on the built-in Status, not a lookalike.
+            ensure!(
+                field.name != "Status",
+                "board has no Status field; restore the built-in Status in project settings"
+            );
+            missing.push(field);
+            continue;
+        }
+        ensure!(
+            named.len() == 1 && named[0]["dataType"] == field.data_type,
+            "board needs exactly one {} field of type {}; fix it in project settings",
+            field.name,
+            field.data_type
+        );
+        for option in field.required {
+            ensure!(
+                has_option(fields, field.name, option),
+                "board needs an unambiguous {} option '{option}'; add it in project settings",
+                field.name
+            );
+        }
+    }
+    Ok(missing)
+}
+
+fn require_join_schema(snapshot: &Snapshot) -> Result<()> {
+    let missing = missing_fields(&snapshot.fields)?;
     ensure!(
-        has_option(snapshot, name, option),
-        "board needs an unambiguous {name} option '{option}'; add it in project settings"
+        missing.is_empty(),
+        "board lacks the {} field(s); create them with: agent-board project init {}",
+        missing
+            .iter()
+            .map(|f| f.name)
+            .collect::<Vec<_>>()
+            .join(", "),
+        init_args(snapshot)
     );
     Ok(())
 }
 
-fn require_join_schema(snapshot: &Snapshot) -> Result<()> {
-    require_field(snapshot, "Status", "SINGLE_SELECT")?;
-    require_field(snapshot, "Turn", "SINGLE_SELECT")?;
-    for option in ["Coordinator", "Worker", "Operator"] {
-        require_option(snapshot, "Turn", option)?;
+// The error is a command to copy, and a snapshot file may come from elsewhere: print
+// only a login-syntax owner and a numeric project, else placeholders.
+fn init_args(snapshot: &Snapshot) -> String {
+    let segments: Vec<_> = snapshot
+        .project
+        .path_segments()
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    match segments.as_slice() {
+        [_, owner, "projects", number] if is_github_login(owner) && positive_id(number) => {
+            format!("--owner {owner} --project {number}")
+        }
+        _ => "--owner OWNER --project NUMBER".into(),
     }
-    for name in ["Run", "Result"] {
-        require_field(snapshot, name, "TEXT")?;
+}
+
+// Options are listed only for fields init creates; existing ones are left as they are.
+fn init_row(out: &mut impl Write, field: &JoinField, present: bool, action: &str) -> Result<()> {
+    let (action, options) = if present {
+        ("present", String::new())
+    } else {
+        (action, field.created.join(", "))
+    };
+    writeln!(
+        out,
+        "{}\t{}\t{action}\t{options}",
+        field.name, field.data_type
+    )?;
+    Ok(())
+}
+
+/// Print which join fields `project init` would create in a saved snapshot's schema.
+pub fn init_plan(snapshot: &Snapshot, out: &mut impl Write) -> Result<()> {
+    ensure!(
+        snapshot.coverage.complete,
+        "incomplete snapshot cannot show which fields are missing"
+    );
+    let missing = missing_fields(&snapshot.fields)?;
+    for field in &JOIN_FIELDS {
+        let absent = missing.iter().any(|f| f.name == field.name);
+        init_row(out, field, !absent, "missing")?;
     }
-    for option in ["Todo", "In Progress"] {
-        require_option(snapshot, "Status", option)?;
+    if !missing.is_empty() {
+        eprintln!(
+            "Plan only: a snapshot is not changed; run project init against the live project to create the missing fields."
+        );
     }
+    Ok(())
+}
+
+/// Create the join's missing fields on the live project, then read the schema back.
+/// Existing fields and options are never changed, so a rerun creates nothing.
+pub fn init<T: Transport>(github: &GitHub<T>, out: &mut impl Write) -> Result<()> {
+    let (project, fields) = github.schema()?;
+    let missing = missing_fields(&fields)?;
+    for field in &JOIN_FIELDS {
+        let absent = missing.iter().any(|f| f.name == field.name);
+        if absent {
+            github
+                .create_field(&project, field.name, field.data_type, field.created)
+                .with_context(|| {
+                    format!(
+                        "create {} field; rows above were done, rerun project init after fixing this",
+                        field.name
+                    )
+                })?;
+        }
+        init_row(out, field, !absent, "created")?;
+    }
+    let (_, fields) = github.schema()?;
+    let missing = missing_fields(&fields)?;
+    ensure!(
+        missing.is_empty(),
+        "created fields not visible on readback: {}",
+        missing
+            .iter()
+            .map(|f| f.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    eprintln!(
+        "Board has the fields request dispatch and run record need; set an item's Turn to Coordinator to make it dispatchable."
+    );
     Ok(())
 }
 
@@ -228,7 +354,7 @@ fn proposal(snapshot: &Snapshot, args: &Record, repo: Option<&str>, host: &str) 
             valid_pr || valid_comment,
             "expected a pull request or comment on the target issue"
         );
-        let status = if has_option(snapshot, "Status", "In Review") {
+        let status = if has_option(&snapshot.fields, "Status", "In Review") {
             "In Review"
         } else {
             "In Progress"
@@ -438,6 +564,249 @@ mod tests {
     }
 
     #[test]
+    fn init_creates_only_missing_fields_and_reruns_as_noop() {
+        use std::cell::RefCell;
+        /// A project whose field list grows with each createProjectV2Field call.
+        struct Board {
+            fields: RefCell<Vec<Value>>,
+            /// Variables of every createProjectV2Field call, in order.
+            created: RefCell<Vec<Value>>,
+            /// Drop created fields, as if readback did not see them.
+            lost: bool,
+            /// Refuse creating this field, as GitHub would on a mid-run failure.
+            refuse: Option<&'static str>,
+        }
+        impl Transport for Board {
+            fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+                if query.contains("createProjectV2Field(") {
+                    assert_eq!(variables["id"], "P");
+                    // TEXT fields get no options; each option carries GitHub's required inputs.
+                    let options = &variables["options"];
+                    match variables["dataType"].as_str() {
+                        Some("TEXT") => assert!(options.is_null()),
+                        Some("SINGLE_SELECT") => {
+                            for option in options.as_array().unwrap() {
+                                let keys: Vec<_> = option.as_object().unwrap().keys().collect();
+                                assert_eq!(keys, ["color", "description", "name"]);
+                                assert_eq!(option["color"], "GRAY");
+                            }
+                        }
+                        other => panic!("unexpected dataType {other:?}"),
+                    }
+                    self.created.borrow_mut().push(variables.clone());
+                    anyhow::ensure!(
+                        self.refuse != variables["name"].as_str(),
+                        "GitHub HTTP status 403"
+                    );
+                    let mut field = json!({"id": "F", "name": variables["name"], "dataType": variables["dataType"]});
+                    if let Some(options) = variables["options"].as_array() {
+                        field["options"] = options.clone().into();
+                    }
+                    if !self.lost {
+                        self.fields.borrow_mut().push(field);
+                    }
+                    return Ok(json!({"createProjectV2Field":{"projectV2Field":{"id":"F"}}}));
+                }
+                if query.contains("fields(first") {
+                    return Ok(
+                        json!({"node":{"fields":{"nodes": *self.fields.borrow(), "pageInfo":{"hasNextPage":false}}}}),
+                    );
+                }
+                if query.contains("repositoryOwner(login:") {
+                    return Ok(
+                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
+                    );
+                }
+                anyhow::bail!("unexpected query {query}")
+            }
+        }
+        let status = json!({"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Todo"},{"name":"In Progress"},{"name":"Done"}]});
+        // Columns: initial fields, owner asked for, lost readback, refused field,
+        // fields attempted, rows printed (in JOIN_FIELDS order), error.
+        let all = ["Status", "Turn", "Run", "Result"];
+        for (fields, owner, lost, refuse, created, rows, error) in [
+            (
+                vec![status.clone()],
+                "example",
+                false,
+                None,
+                vec!["Turn", "Run", "Result"],
+                &all[..],
+                None,
+            ),
+            // GitHub returns the login's canonical case.
+            (
+                vec![status.clone()],
+                "EXAMPLE",
+                false,
+                None,
+                vec!["Turn", "Run", "Result"],
+                &all[..],
+                None,
+            ),
+            (
+                snapshot().fields,
+                "example",
+                false,
+                None,
+                vec![],
+                &all[..],
+                None,
+            ),
+            (
+                vec![],
+                "example",
+                false,
+                None,
+                vec![],
+                &[][..],
+                Some("restore the built-in Status"),
+            ),
+            (
+                vec![status.clone()],
+                "example",
+                true,
+                None,
+                vec!["Turn", "Run", "Result"],
+                &all[..],
+                Some("not visible on readback: Turn, Run, Result"),
+            ),
+            (
+                vec![status.clone(), json!({"name":"Run","dataType":"NUMBER"})],
+                "example",
+                false,
+                None,
+                vec![],
+                &[][..],
+                Some("exactly one Run field"),
+            ),
+            (
+                vec![
+                    status.clone(),
+                    json!({"name":"Turn","dataType":"SINGLE_SELECT","options":[{"name":"Coordinator"}]}),
+                ],
+                "example",
+                false,
+                None,
+                vec![],
+                &[][..],
+                Some("Turn option 'Worker'"),
+            ),
+            // A lookup that resolves to another project is never written to.
+            (
+                vec![status.clone()],
+                "other",
+                false,
+                None,
+                vec![],
+                &[][..],
+                Some(
+                    "GitHub returned project https://github.com/orgs/example/projects/1, not other/1",
+                ),
+            ),
+            // A failure partway stops further creations; the rows before it were done.
+            (
+                vec![status.clone()],
+                "example",
+                false,
+                Some("Run"),
+                vec!["Turn", "Run"],
+                &all[..2],
+                Some(
+                    "create Run field; rows above were done, rerun project init after fixing this: creating field in project example/1 (node P)",
+                ),
+            ),
+        ] {
+            let github = GitHub {
+                transport: Board {
+                    fields: RefCell::new(fields),
+                    created: RefCell::new(vec![]),
+                    lost,
+                    refuse,
+                },
+                owner: owner.into(),
+                number: 1,
+            };
+            let mut out = Vec::new();
+            let result = init(&github, &mut out);
+            // An unusable field is refused before any write or output; a lost write
+            // still prints its row, since the mutation itself succeeded.
+            let actions: Vec<_> = String::from_utf8(out)
+                .unwrap()
+                .lines()
+                .map(|row| row.split('\t').take(3).collect::<Vec<_>>().join(" "))
+                .collect();
+            let expected: Vec<_> = JOIN_FIELDS
+                .iter()
+                .filter(|f| rows.contains(&f.name))
+                .map(|f| {
+                    let action = if created.contains(&f.name) {
+                        "created"
+                    } else {
+                        "present"
+                    };
+                    format!("{} {} {action}", f.name, f.data_type)
+                })
+                .collect();
+            assert_eq!(actions, expected);
+            let names: Vec<_> = github
+                .transport
+                .created
+                .borrow()
+                .iter()
+                .map(|v| v["name"].clone())
+                .collect();
+            assert_eq!(names, created);
+            match error {
+                Some(error) => assert!(format!("{:#}", result.unwrap_err()).contains(error)),
+                None => {
+                    result.unwrap();
+                    // Idempotent: a rerun on the resulting board creates nothing.
+                    github.transport.created.borrow_mut().clear();
+                    let mut out = Vec::new();
+                    init(&github, &mut out).unwrap();
+                    assert!(!String::from_utf8(out).unwrap().contains("created"));
+                    assert!(github.transport.created.borrow().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn init_hint_prints_only_login_syntax() {
+        let mut s = snapshot();
+        for (project, args) in [
+            (
+                "https://github.com/orgs/example/projects/1",
+                "--owner example --project 1",
+            ),
+            (
+                "https://github.com/users/jdoe_corp/projects/12",
+                "--owner jdoe_corp --project 12",
+            ),
+            (
+                "https://github.com/orgs/$(id)/projects/1",
+                "--owner OWNER --project NUMBER",
+            ),
+            (
+                "https://github.com/orgs/a;id/projects/1",
+                "--owner OWNER --project NUMBER",
+            ),
+            (
+                "https://github.com/orgs/x&&id/projects/1",
+                "--owner OWNER --project NUMBER",
+            ),
+            (
+                "https://github.com/orgs/example/projects/1;id",
+                "--owner OWNER --project NUMBER",
+            ),
+        ] {
+            s.project = project.parse().unwrap();
+            assert_eq!(init_args(&s), args, "{project}");
+        }
+    }
+
+    #[test]
     fn schema_and_recorded_run() {
         let mut s = snapshot();
         s.items[0].status = Some(Status::InProgress);
@@ -459,7 +828,18 @@ mod tests {
         for name in ["Turn", "Run", "Result", "Status"] {
             let mut bad = s.clone();
             bad.fields.retain(|field| field["name"] != name);
-            assert!(proposal(&bad, &args, None, "github.com").is_err(), "{name}");
+            let error = proposal(&bad, &args, None, "github.com").unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if name == "Status" {
+                    "board has no Status field; restore the built-in Status in project settings"
+                        .to_owned()
+                } else {
+                    format!(
+                        "board lacks the {name} field(s); create them with: agent-board project init --owner example --project 1"
+                    )
+                }
+            );
         }
         for name in ["Turn", "Status"] {
             let mut bad = s.clone();

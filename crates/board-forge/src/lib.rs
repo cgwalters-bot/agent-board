@@ -5,7 +5,7 @@ use board_core::{Capability, Intent, Plan, Snapshot};
 use serde_json::{Value, json};
 
 pub mod github;
-pub use github::{github_item_url, parse_github_item, validate_github_project};
+pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 
 pub trait Forge {
     fn snapshot(&self) -> Result<Snapshot>;
@@ -85,6 +85,23 @@ mod tests {
             ("https://github.com/not-a-project", false),
             ("https://forge.example/orgs/example/projects/1", false),
             ("https://github.com/orgs/example/projects/0", false),
+            ("https://github.com/orgs/my-org-2/projects/1", true),
+            (
+                format!("https://github.com/orgs/{}/projects/1", "a".repeat(39)).as_str(),
+                true,
+            ),
+            (
+                format!("https://github.com/orgs/{}/projects/1", "a".repeat(40)).as_str(),
+                false,
+            ),
+            // Owners are printed into a copyable command: only login syntax passes.
+            ("https://github.com/orgs/$(id)/projects/1", false),
+            ("https://github.com/orgs/a;id/projects/1", false),
+            ("https://github.com/orgs/x&&id/projects/1", false),
+            ("https://github.com/orgs/-lead/projects/1", false),
+            ("https://github.com/orgs/a%20b/projects/1", false),
+            // Enterprise managed user logins carry an underscore suffix.
+            ("https://github.com/users/jdoe_corp/projects/1", true),
         ] {
             assert_eq!(
                 validate_github_project(&Url::parse(url).unwrap()).is_ok(),

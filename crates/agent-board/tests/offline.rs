@@ -290,6 +290,159 @@ fn emitted_proposal() {
 }
 
 #[test]
+fn project_init_plan_and_dispatch_hint_table() {
+    // Honor TMPDIR, allowing sandbox runners to keep scratch files under home.
+    let directory = std::env::temp_dir().join(format!("agent-board-init-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let snapshot = directory.join("board.json");
+    let write = |fields: &Value, complete: bool| {
+        let mut board: Value =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        board["fields"] = fields.clone();
+        board["items"][0]["status"] = "Todo".into();
+        board["coverage"]["complete"] = complete.into();
+        std::fs::write(&snapshot, board.to_string()).unwrap();
+    };
+    let default_board = serde_json::json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Todo"},{"name":"In Progress"},{"name":"Done"}]}]);
+    let mut text_turn = default_board.clone();
+    text_turn
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"name":"Turn","dataType":"TEXT"}));
+    for (fields, complete, code, stdout, stderr) in [
+        (
+            &default_board,
+            true,
+            0,
+            "Status\tSINGLE_SELECT\tpresent\t\nTurn\tSINGLE_SELECT\tmissing\tCoordinator, Worker, Operator, External, None\nRun\tTEXT\tmissing\t\nResult\tTEXT\tmissing\t\n",
+            "Plan only",
+        ),
+        (&default_board, false, 1, "", "incomplete snapshot"),
+        (
+            &text_turn,
+            true,
+            1,
+            "",
+            "exactly one Turn field of type SINGLE_SELECT",
+        ),
+        (
+            &serde_json::json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"name":"Triage"}]}]),
+            true,
+            1,
+            "",
+            "Status option 'Todo'",
+        ),
+        (
+            &serde_json::json!([]),
+            true,
+            1,
+            "",
+            "restore the built-in Status",
+        ),
+    ] {
+        write(fields, complete);
+        let output = command()
+            .args(["project", "init", "--snapshot"])
+            .arg(&snapshot)
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), stdout);
+        assert!(String::from_utf8(output.stderr).unwrap().contains(stderr));
+    }
+    // A default board lacks only fields init can create; dispatch names the command.
+    write(&default_board, true);
+    let output = command()
+        .args([
+            "request",
+            "dispatch",
+            "--item",
+            "example/intake#1",
+            "--caller",
+            "example/runners",
+            "--snapshot",
+        ])
+        .arg(&snapshot)
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8(output.stderr).unwrap().contains(
+        "board lacks the Turn, Run, Result field(s); create them with: agent-board project init --owner example --project 1"
+    ));
+    // A snapshot can come from elsewhere: a hostile owner never reaches the printed command.
+    for owner in ["$(id)", "a;id", "x&&id"] {
+        let mut board: Value = serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
+        board["project"] = format!("https://github.com/orgs/{owner}/projects/1").into();
+        let hostile = directory.join("hostile.json");
+        std::fs::write(&hostile, board.to_string()).unwrap();
+        let output = command()
+            .args([
+                "request",
+                "dispatch",
+                "--item",
+                "example/intake#1",
+                "--caller",
+                "example/runners",
+                "--snapshot",
+            ])
+            .arg(&hostile)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("invalid GitHub project URL"), "{stderr}");
+        assert!(!stderr.contains("project init"), "{stderr}");
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn project_init_live_refusals_precede_token() {
+    // Each is refused before a token is read: no token is set, yet none is asked for.
+    for (args, stderr) in [
+        (
+            vec!["--owner", "example", "--project", "1", "--json", "fields"],
+            "project init prints a field table",
+        ),
+        (
+            vec![
+                "--owner",
+                "example",
+                "--project",
+                "1",
+                "--hostname",
+                "github.example",
+            ],
+            "unsupported GitHub host",
+        ),
+        (vec!["--project", "1"], "live commands require --owner"),
+        (
+            vec!["--owner", "example"],
+            "live commands require --project",
+        ),
+    ] {
+        let output = command()
+            .args(["project", "init"])
+            .args(&args)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(stderr), "{args:?}: {error}");
+        assert!(
+            !error.contains("authentication required"),
+            "{args:?}: {error}"
+        );
+    }
+}
+
+#[test]
 fn snapshot_and_project_views() {
     for args in [["snapshot", "create"], ["project", "view"]] {
         let output = command()
