@@ -1,0 +1,21 @@
+name: review
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+permissions: {}
+jobs:
+  review:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/review'))
+    # Base-owned policy; the head is fetched only as data inside the sandbox.
+    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@1a96301e22f4a496bdd7a25d952204eaa4e729eb
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+      actions: read
+      id-token: write
+      statuses: write
