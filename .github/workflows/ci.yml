@@ -1,6 +1,8 @@
 name: ci
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
 permissions:
@@ -18,6 +20,7 @@ jobs:
           persist-credentials: false
       # Hosted Ubuntu supplies Java, Node and curl. The harness pins TLC's hash.
       - run: bash specs/check.sh
+      - run: python3 .github/agentic-job/test_review.py
   rust:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -32,3 +35,15 @@ jobs:
       - run: cargo run --locked -q -p agent-board -- item list --snapshot fixtures/board.json
       - run: cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board.json --emit
       - run: cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage
+
+  # Require only ci in the ruleset, on both PR and merge-group commits.
+  ci:
+    if: ${{ always() }}
+    needs: [specs, rust]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"

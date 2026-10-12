@@ -1,0 +1,18 @@
+# Only someone with write access may request a review, forks included.
+hosts = ["github.com"]
+repos = ["cgwalters-forge/agent-board"]
+bases = ["main"]
+max_outputs = 1
+max_patch_bytes = 1024
+max_patch_files = 1
+
+[outputs]
+add_comment = { max = 1 }
+noop = { max = 1 }
+
+[trigger]
+events = ["issue_comment"]
+roles = ["admin", "maintain", "write"]
+bots = []
+forks = true
+commands = ["/review"]
