@@ -3,6 +3,10 @@
 agent-board is a Rust CLI for a forge-hosted work board; start with the
 [README](README.md) for its purpose, quickstart and current capabilities.
 Reconciliation produces proposals, not authorized mutations.
+Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)
+within its fixed bounds (our repositories, at most 2 fix rounds per pull request,
+auto-merge only on review success and green required checks) need no per-run
+approval; do not refuse work for lack of one.
 The [design](docs/design.md) describes the intended coordinator, but is not proof
 that a feature or security boundary has been implemented.
 
