@@ -157,13 +157,19 @@ fn operation(query: &str) -> (&str, &str, bool) {
         ),
         (
             "createIssue(",
-            "opening the scratch issue",
+            "opening issue in",
             "repository Issues write",
             true,
         ),
         (
             "closeIssue(",
-            "closing the scratch issue",
+            "closing issue in",
+            "repository Issues write",
+            true,
+        ),
+        (
+            "addComment(",
+            "commenting on issue in",
             "repository Issues write",
             true,
         ),
@@ -273,6 +279,7 @@ mod diagnostic_tests {
             ("issue(number:", "repository Issues read"),
             ("createIssue(", "repository Issues write"),
             ("closeIssue(", "repository Issues write"),
+            ("addComment(", "repository Issues write"),
             ("repository(owner:", "repository Metadata read"),
             ("labels(first", "repository Issues read"),
             ("assignees(first", "repository Issues read"),
@@ -476,6 +483,16 @@ fn http_response_data(status: u16, body: Value) -> Result<Value> {
         anyhow::bail!("{diagnostic}");
     }
     response_data(body)
+}
+
+/// Node IDs for opening an issue, resolved by `GitHub::issue_target`.
+pub struct IssueTarget {
+    repository: String,
+    repository_id: String,
+    label: String,
+    label_id: String,
+    assignee: String,
+    assignee_id: String,
 }
 
 pub struct GitHub<T> {
@@ -934,6 +951,166 @@ impl<T: Transport> GitHub<T> {
             json!({"id":project,"name":name,"dataType":data_type,"options":options}),
         )?;
         Ok(text(&data["createProjectV2Field"]["projectV2Field"], "id")?.to_owned())
+    }
+
+    fn repository_diagnostic(&self, repository: &str) -> DiagnosticTransport<'_, T> {
+        DiagnosticTransport {
+            transport: &self.transport,
+            project: format!("{}/{}", self.owner, self.number),
+            repository: repository.into(),
+        }
+    }
+
+    /// Resolve where an issue with one label and one assignee can be opened, before
+    /// anything is written. A missing label is refused rather than created, as
+    /// `field_writes` refuses new fields, and the assignee must be assignable there:
+    /// GitHub silently drops anyone else, which would leave an unassigned issue behind.
+    pub fn issue_target(
+        &self,
+        repository: &str,
+        label: &str,
+        assignee: &str,
+    ) -> Result<IssueTarget> {
+        let (owner, name) = repository
+            .split_once('/')
+            .context("GitHub repositories require OWNER/REPO")?;
+        ensure!(
+            is_github_login(assignee),
+            "invalid GitHub login {assignee:?}"
+        );
+        let data = self.repository_diagnostic(repository).graphql(
+            "query($owner:String!,$repo:String!,$label:String!,$login:String!){repository(owner:$owner,name:$repo){id nameWithOwner label(name:$label){id name} assignableUsers(query:$login,first:100){nodes{id login}}}}",
+            json!({"owner":owner,"repo":name,"label":label,"login":assignee}),
+        )?;
+        let repo = &data["repository"];
+        ensure!(
+            repo["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repository)),
+            "GitHub returned a different repository than {repository}"
+        );
+        // GitHub's label lookup is case-insensitive; the label applied must be this one.
+        ensure!(
+            repo["label"]["name"] == label,
+            "{repository} has no {label:?} label; create it first"
+        );
+        // The query matches logins and names by prefix; only the exact login counts.
+        let user = repo["assignableUsers"]["nodes"]
+            .as_array()
+            .context("missing assignable users")?
+            .iter()
+            .find(|u| {
+                u["login"]
+                    .as_str()
+                    .is_some_and(|l| l.eq_ignore_ascii_case(assignee))
+            })
+            .with_context(|| format!("{assignee} cannot be assigned issues in {repository}"))?;
+        Ok(IssueTarget {
+            repository: repository.into(),
+            repository_id: text(repo, "id")?.to_owned(),
+            label: label.into(),
+            label_id: text(&repo["label"], "id")?.to_owned(),
+            assignee: assignee.into(),
+            assignee_id: text(user, "id")?.to_owned(),
+        })
+    }
+
+    /// Open an issue at a resolved target, returning its node ID and number. The receipt
+    /// is checked; on a mismatch the issue exists and the error names it.
+    pub fn create_issue(
+        &self,
+        target: &IssueTarget,
+        title: &str,
+        body: &str,
+    ) -> Result<(String, u64)> {
+        let created = self.repository_diagnostic(&target.repository).graphql(
+            "mutation($repo:ID!,$title:String!,$body:String!,$label:ID!,$user:ID!){createIssue(input:{repositoryId:$repo,title:$title,body:$body,labelIds:[$label],assigneeIds:[$user]}){issue{id number labels(first:2){nodes{name}} assignees(first:2){nodes{login}}}}}",
+            json!({"repo":target.repository_id,"title":title,"body":body,"label":target.label_id,"user":target.assignee_id}),
+        )?;
+        let issue = &created["createIssue"]["issue"];
+        let number = issue["number"]
+            .as_u64()
+            .context("missing created issue number")?;
+        let names = |key: &str, field: &str| -> Vec<String> {
+            issue[key]["nodes"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|n| n[field].as_str().map(str::to_lowercase))
+                .collect()
+        };
+        ensure!(
+            names("labels", "name") == [target.label.to_lowercase()]
+                && names("assignees", "login") == [target.assignee.to_lowercase()],
+            "opened {}#{number}, but GitHub did not apply label {} and assignee {}",
+            target.repository,
+            target.label,
+            target.assignee
+        );
+        Ok((text(issue, "id")?.to_owned(), number))
+    }
+
+    /// The issue's node ID, whether it is open, and its label names. A truncated label
+    /// list is refused: an unseen page could hold the label a caller requires.
+    pub fn issue_labels(&self, issue: &ItemRef) -> Result<(String, bool, Vec<String>)> {
+        ensure!(issue.host == DEFAULT_HOST, "unsupported item host");
+        let (owner, name) = issue
+            .repository
+            .split_once('/')
+            .context("GitHub repositories require OWNER/REPO")?;
+        let data = self.repository_diagnostic(&issue.repository).graphql(
+            "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){id number state repository{nameWithOwner} labels(first:100){nodes{name} pageInfo{hasNextPage}}}}}",
+            json!({"owner":owner,"repo":name,"number":issue.number}),
+        )?;
+        let found = &data["repository"]["issue"];
+        ensure!(
+            found["number"].as_u64() == Some(issue.number)
+                && found["repository"]["nameWithOwner"]
+                    .as_str()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(&issue.repository)),
+            "GitHub returned a different issue than {}",
+            issue.display()
+        );
+        let labels = &found["labels"];
+        ensure!(
+            labels["pageInfo"]["hasNextPage"] == false,
+            "issue has more than 100 labels"
+        );
+        let names = labels["nodes"]
+            .as_array()
+            .context("missing issue labels")?
+            .iter()
+            .map(|n| text(n, "name").map(str::to_owned))
+            .collect::<Result<_>>()?;
+        Ok((
+            text(found, "id")?.to_owned(),
+            text(found, "state")? == "OPEN",
+            names,
+        ))
+    }
+
+    /// Comment on an issue, returning the comment URL.
+    pub fn comment(&self, repository: &str, issue: &str, body: &str) -> Result<String> {
+        let data = self.repository_diagnostic(repository).graphql(
+            "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{url}}}}",
+            json!({"id":issue,"body":body}),
+        )?;
+        Ok(text(&data["addComment"]["commentEdge"]["node"], "url")?.to_owned())
+    }
+
+    /// Close an issue as completed and check that GitHub reports it closed.
+    pub fn close_completed(&self, repository: &str, issue: &str) -> Result<()> {
+        let data = self.repository_diagnostic(repository).graphql(
+            "mutation($id:ID!){closeIssue(input:{issueId:$id,stateReason:COMPLETED}){issue{id state}}}",
+            json!({"id":issue}),
+        )?;
+        let receipt = &data["closeIssue"]["issue"];
+        ensure!(
+            receipt["id"].as_str() == Some(issue) && receipt["state"] == "CLOSED",
+            "close receipt mismatch"
+        );
+        Ok(())
     }
 
     pub fn snapshot_with_policy(&self, policy: &board_core::AgentPolicy) -> Result<Snapshot> {

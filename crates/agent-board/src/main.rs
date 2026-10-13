@@ -1,3 +1,4 @@
+mod ask;
 mod dispatch;
 mod item;
 mod live;
@@ -67,7 +68,7 @@ enum Command {
         #[command(subcommand)]
         command: Item,
     },
-    #[command(hide = true)]
+    /// Ask the operator a question as an issue, list or resolve asks.
     Ask {
         #[command(subcommand)]
         command: Ask,
@@ -161,11 +162,16 @@ struct List {
 
 #[derive(Subcommand)]
 enum Ask {
-    Create {
-        #[arg(long)]
-        item: String,
+    /// Open a question issue and set it and the blocked item Needs human (writes with --apply).
+    Create(ask::Create),
+    /// List open board issues labelled question.
+    List {
+        /// Maximum number of asks to display.
+        #[arg(short = 'L', long, default_value_t = 30)]
+        limit: usize,
     },
-    List,
+    /// Comment the answer, close the ask and set it Done (writes with --apply).
+    Resolve(ask::Resolve),
 }
 
 #[derive(Subcommand)]
@@ -404,7 +410,7 @@ fn execute(cli: Cli) -> Result<()> {
                 "--state must be open, closed or all"
             );
             let snapshot = load(&cli)?;
-            let mut items: Vec<_> = snapshot
+            let items: Vec<_> = snapshot
                 .items
                 .iter()
                 .filter(|item| {
@@ -418,30 +424,79 @@ fn execute(cli: Cli) -> Result<()> {
                             .is_none_or(|repo| *repo == item.identity.repository)
                 })
                 .collect();
-            items.sort_by(|a, b| a.identity.cmp(&b.identity));
-            items.truncate(args.limit);
-            let values = items
+            print_items(&cli, items, args.limit)
+        }
+        Command::Ask {
+            command: Ask::List { limit },
+        } => {
+            let snapshot = load(&cli)?;
+            let items = snapshot
+                .items
                 .iter()
-                .map(|item| item_json(item))
-                .collect::<Result<Vec<_>>>()?;
-            if cli.json.is_some() {
-                render(Value::Array(values), &cli)
-            } else {
-                let mut out = io::stdout().lock();
-                writeln!(out, "ITEM\tSTATUS\tPRIORITY\tTURN\tTITLE")?;
-                for item in items {
-                    writeln!(
-                        out,
-                        "{}\t{}\t{}\t{}\t{}",
-                        item.identity.display(),
-                        label(&item.status),
-                        label(&item.priority),
-                        label(&item.turn),
-                        item.title
-                    )?;
-                }
-                Ok(())
+                .filter(|item| {
+                    item.state == "open"
+                        && item.labels.iter().any(|l| l == ask::ASK_LABEL)
+                        && cli
+                            .repo
+                            .as_ref()
+                            .is_none_or(|repo| *repo == item.identity.repository)
+                })
+                .collect();
+            print_items(&cli, items, *limit)
+        }
+        Command::Ask {
+            command: Ask::Create(args),
+        } => {
+            ensure!(cli.json.is_none(), "--json is unsupported for ask create");
+            let blocked = item::issue_identity(&args.item, cli.repo.as_deref(), &cli.hostname)?;
+            // The ask goes where -R says, else beside the item it blocks.
+            let repository = cli.repo.as_deref().unwrap_or(&blocked.repository);
+            let composed = ask::compose(args, &blocked, repository)?;
+            let mut out = io::stdout().lock();
+            if cli.snapshot.is_some() {
+                ensure!(
+                    !args.apply,
+                    "--apply writes to the live board; it cannot use --snapshot"
+                );
+                return ask::create_preview(
+                    &load(&cli)?,
+                    &blocked,
+                    repository,
+                    args,
+                    &composed,
+                    &mut out,
+                );
             }
+            ask::create(
+                &github(&cli)?,
+                &blocked,
+                repository,
+                args,
+                &composed,
+                &mut out,
+            )
+        }
+        Command::Ask {
+            command: Ask::Resolve(args),
+        } => {
+            ensure!(cli.json.is_none(), "--json is unsupported for ask resolve");
+            let identity = item::issue_identity(&args.item, cli.repo.as_deref(), &cli.hostname)?;
+            ask::check_answer(&args.answer)?;
+            let mut out = io::stdout().lock();
+            if cli.snapshot.is_some() {
+                ensure!(
+                    !args.apply,
+                    "--apply writes to the live board; it cannot use --snapshot"
+                );
+                return ask::resolve_preview(&load(&cli)?, &identity, &args.answer, &mut out);
+            }
+            ask::resolve(
+                &github(&cli)?,
+                &identity,
+                &args.answer,
+                args.apply,
+                &mut out,
+            )
         }
         Command::Item {
             command: Item::View { item },
@@ -555,6 +610,32 @@ fn item_write(
         &mut None,
         &mut out,
     )
+}
+
+fn print_items(cli: &Cli, mut items: Vec<&board_core::Item>, limit: usize) -> Result<()> {
+    items.sort_by(|a, b| a.identity.cmp(&b.identity));
+    items.truncate(limit);
+    let values = items
+        .iter()
+        .map(|item| item_json(item))
+        .collect::<Result<Vec<_>>>()?;
+    if cli.json.is_some() {
+        return render(Value::Array(values), cli);
+    }
+    let mut out = io::stdout().lock();
+    writeln!(out, "ITEM\tSTATUS\tPRIORITY\tTURN\tTITLE")?;
+    for item in items {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}",
+            item.identity.display(),
+            label(&item.status),
+            label(&item.priority),
+            label(&item.turn),
+            item.title
+        )?;
+    }
+    Ok(())
 }
 
 fn project_summary(snapshot: &Snapshot) -> Result<()> {
@@ -676,39 +757,40 @@ fn select(value: &Value, fields: &[&str]) -> Result<Value> {
 
 fn render(mut value: Value, cli: &Cli) -> Result<()> {
     if let Some(fields) = &cli.json {
-        let available: &[&str] = if matches!(cli.command, Command::Item { .. }) {
-            &[
-                "identity",
-                "title",
-                "state",
-                "state_reason",
-                "status",
-                "priority",
-                "turn",
-                "fields_complete",
-                "evidence",
-                "number",
-                "repository",
-                "url",
-                "content_kind",
-                "assignment",
-                "labels",
-                "assignees",
-                "timestamps",
-                "fields",
-            ]
-        } else {
-            &[
-                "schema",
-                "project",
-                "actions",
-                "diagnostics",
-                "clock",
-                "coverage",
-                "items",
-                "fields",
-            ]
-        };
+        let available: &[&str] =
+            if matches!(cli.command, Command::Item { .. } | Command::Ask { .. }) {
+                &[
+                    "identity",
+                    "title",
+                    "state",
+                    "state_reason",
+                    "status",
+                    "priority",
+                    "turn",
+                    "fields_complete",
+                    "evidence",
+                    "number",
+                    "repository",
+                    "url",
+                    "content_kind",
+                    "assignment",
+                    "labels",
+                    "assignees",
+                    "timestamps",
+                    "fields",
+                ]
+            } else {
+                &[
+                    "schema",
+                    "project",
+                    "actions",
+                    "diagnostics",
+                    "clock",
+                    "coverage",
+                    "items",
+                    "fields",
+                ]
+            };
         for field in fields.split(',') {
             ensure!(
                 available.contains(&field),

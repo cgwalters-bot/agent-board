@@ -102,6 +102,9 @@ pub enum Status {
     #[serde(rename = "In Review")]
     InReview,
     Blocked,
+    /// An open ask for the operator, and the items it blocks; nonterminal like Blocked.
+    #[serde(rename = "Needs human")]
+    NeedsHuman,
     Done,
     Cancelled,
 }
@@ -604,6 +607,7 @@ mod tests {
             Some(Status::Draft),
             Some(Status::InReview),
             Some(Status::Blocked),
+            Some(Status::NeedsHuman),
             Some(Status::Done),
             Some(Status::Cancelled),
         ];
