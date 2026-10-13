@@ -11,7 +11,7 @@ jobs:
       github.event_name == 'pull_request_target' ||
       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/review'))
     # Base-owned policy; the head is fetched only as data inside the sandbox.
-    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@1a96301e22f4a496bdd7a25d952204eaa4e729eb
+    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@fbb0a2708f231ecc7acd7116fc957b8b3712a41c
     permissions:
       contents: read
       issues: read
