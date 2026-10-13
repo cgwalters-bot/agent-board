@@ -10,7 +10,25 @@ pub const DEFAULT_HOST: &str = "github.com";
 
 /// Interpret GitHub syntax only for the explicitly selected GitHub host.
 pub fn parse_github_item(input: &str, repository: Option<&str>, host: &str) -> Result<ItemRef> {
-    let (repository, number) = if input.contains("://") {
+    Ok(parse_github_identity(input, repository, host)?.0)
+}
+
+/// Parse an issue identity without losing an explicit pull request URL's kind.
+pub fn parse_github_issue(input: &str, repository: Option<&str>, host: &str) -> Result<ItemRef> {
+    let (item, pull_request) = parse_github_identity(input, repository, host)?;
+    ensure!(
+        !pull_request,
+        "only issues can be added or edited, not pull requests"
+    );
+    Ok(item)
+}
+
+fn parse_github_identity(
+    input: &str,
+    repository: Option<&str>,
+    host: &str,
+) -> Result<(ItemRef, bool)> {
+    let (repository, number, pull_request) = if input.contains("://") {
         let url = Url::parse(input).context("parse GitHub issue URL")?;
         ensure!(
             url.scheme() == "https" && url.host_str() == Some(host),
@@ -32,13 +50,18 @@ pub fn parse_github_item(input: &str, repository: Option<&str>, host: &str) -> R
         (
             format!("{}/{}", parts[0], parts[1]),
             parts[3].parse().context("parse issue number")?,
+            parts[2] == "pull",
         )
     } else {
         let (repo, number) = match input.rsplit_once('#') {
             Some(parts) => parts,
             None => (repository.context("bare numbers require --repo")?, input),
         };
-        (repo.into(), number.parse().context("parse issue number")?)
+        (
+            repo.into(),
+            number.parse().context("parse issue number")?,
+            false,
+        )
     };
     let item = ItemRef {
         host: host.into(),
@@ -50,7 +73,7 @@ pub fn parse_github_item(input: &str, repository: Option<&str>, host: &str) -> R
         item.repository.split('/').count() == 2,
         "GitHub repositories require OWNER/REPO"
     );
-    Ok(item)
+    Ok((item, pull_request))
 }
 
 /// GitHub login syntax: 1-39 ASCII alphanumerics or hyphens, not starting with a hyphen,
@@ -126,6 +149,12 @@ pub struct DiagnosticTransport<'a, T> {
 
 fn operation(query: &str) -> (&str, &str, bool) {
     for (marker, step, permission, repository) in [
+        (
+            "issue(number:",
+            "reading issue",
+            "repository Issues read",
+            true,
+        ),
         (
             "createIssue(",
             "opening the scratch issue",
@@ -241,6 +270,7 @@ mod diagnostic_tests {
                 "updateProjectV2ItemFieldValue(",
                 "organization Projects write",
             ),
+            ("issue(number:", "repository Issues read"),
             ("createIssue(", "repository Issues write"),
             ("closeIssue(", "repository Issues write"),
             ("repository(owner:", "repository Metadata read"),
@@ -290,7 +320,9 @@ impl<T: Transport> Transport for DiagnosticTransport<'_, T> {
             &self.project
         };
         let detail = if query.contains("updateProjectV2ItemFieldValue(") {
-            if variables["value"].get("singleSelectOptionId").is_some() {
+            if let Some(name) = variables["name"].as_str() {
+                &format!("setting {name} in project")
+            } else if variables["value"].get("singleSelectOptionId").is_some() {
                 "setting Status in project"
             } else {
                 "setting Fixture nonce in project"
@@ -529,6 +561,76 @@ fn typed_field(
     }
 }
 
+/// One `NAME=VALUE` edit resolved against a project field schema. Offline snapshot
+/// schemas may omit node IDs; only a live write needs them.
+#[derive(Debug)]
+pub struct FieldWrite {
+    pub name: String,
+    pub value: String,
+    select: bool,
+    field_id: Option<String>,
+    option_id: Option<String>,
+}
+
+/// Resolve every edit before anything is written. A writer that created fields or
+/// options, or coerced values, would let a typo change the board's schema or put a
+/// value where readers and automations expect an option; so each field must exist
+/// exactly once, be single-select (with exactly one matching option) or text, and be
+/// named only once. Edits are therefore bounded by the schema's own field count.
+pub fn field_writes(fields: &[Value], edits: &[String]) -> Result<Vec<FieldWrite>> {
+    let mut writes: Vec<FieldWrite> = Vec::new();
+    for edit in edits {
+        let (name, value) = edit
+            .split_once('=')
+            .with_context(|| format!("expected NAME=VALUE, got {edit:?}"))?;
+        ensure!(!name.is_empty(), "expected NAME=VALUE, got {edit:?}");
+        ensure!(
+            !value.is_empty(),
+            "{name}: clearing a field is not supported"
+        );
+        ensure!(
+            writes.iter().all(|w| w.name != name),
+            "{name} is set more than once"
+        );
+        let named: Vec<_> = fields.iter().filter(|f| f["name"] == name).collect();
+        ensure!(!named.is_empty(), "board has no {name} field");
+        ensure!(named.len() == 1, "board has more than one {name} field");
+        let field = named[0];
+        let (select, option_id) = match field["dataType"].as_str() {
+            Some("SINGLE_SELECT") => {
+                let options = field["options"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let matching: Vec<_> = options.iter().filter(|o| o["name"] == value).collect();
+                ensure!(
+                    matching.len() == 1,
+                    "{name} has no unambiguous option {value:?}; options: {}",
+                    options
+                        .iter()
+                        .filter_map(|o| o["name"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                (true, matching[0]["id"].as_str().map(str::to_owned))
+            }
+            Some("TEXT") => (false, None),
+            other => anyhow::bail!(
+                "{name} is a {} field; only single-select and text fields can be set",
+                other.unwrap_or("untyped")
+            ),
+        };
+        writes.push(FieldWrite {
+            name: name.into(),
+            value: value.into(),
+            select,
+            field_id: field["id"].as_str().map(str::to_owned),
+            option_id,
+        });
+    }
+    Ok(writes)
+}
+
 // The project (id, url) and its complete field schema; shared by snapshots and `project init`.
 fn read_schema(t: &impl Transport, owner: &str, number: u64) -> Result<(Value, Vec<Value>, bool)> {
     let data = t.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":owner,"number":number}))?;
@@ -564,9 +666,9 @@ impl<T: Transport> GitHub<T> {
         }
     }
 
-    /// The project's node ID and complete field schema, without reading items.
+    /// The project's node ID, URL and complete field schema, without reading items.
     /// The returned URL must name the requested project before anything writes to its ID.
-    pub fn schema(&self) -> Result<(String, Vec<Value>)> {
+    pub fn schema(&self) -> Result<(String, Url, Vec<Value>)> {
         ensure!(self.number > 0, "project number must be positive");
         let diagnostic = self.diagnostic();
         let transport = ReadBudget {
@@ -586,7 +688,91 @@ impl<T: Transport> GitHub<T> {
             self.number
         );
         ensure!(complete, "incomplete project field schema");
-        Ok((text(&project, "id")?.to_owned(), fields))
+        Ok((text(&project, "id")?.to_owned(), url, fields))
+    }
+
+    /// The issue's node ID and its item ID on `project`, if it is a member. A pull request
+    /// number is refused by GitHub's `issue` lookup, so it can never be enrolled as an issue.
+    pub fn issue_item(&self, project: &str, issue: &ItemRef) -> Result<(String, Option<String>)> {
+        ensure!(issue.host == DEFAULT_HOST, "unsupported item host");
+        let (owner, name) = issue
+            .repository
+            .split_once('/')
+            .context("GitHub repositories require OWNER/REPO")?;
+        let transport = DiagnosticTransport {
+            transport: &self.transport,
+            project: format!("{}/{}", self.owner, self.number),
+            repository: issue.repository.clone(),
+        };
+        let data = transport.graphql(
+            "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){id number repository{nameWithOwner} projectItems(first:100){nodes{id project{id}} pageInfo{hasNextPage}}}}}",
+            json!({"owner":owner,"repo":name,"number":issue.number}),
+        )?;
+        let found = &data["repository"]["issue"];
+        ensure!(
+            found["number"].as_u64() == Some(issue.number)
+                && found["repository"]["nameWithOwner"]
+                    .as_str()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(&issue.repository)),
+            "GitHub returned a different issue than {}",
+            issue.display()
+        );
+        let items = &found["projectItems"];
+        let mut members = Vec::new();
+        for node in items["nodes"].as_array().context("missing project items")? {
+            if text(&node["project"], "id")? == project {
+                members.push(text(node, "id")?.to_owned());
+            }
+        }
+        ensure!(
+            members.len() <= 1,
+            "issue has more than one item on the board"
+        );
+        // Absence on a truncated page is not evidence of absence: an edit could miss
+        // the item, and an add could create a second one.
+        ensure!(
+            !members.is_empty() || items["pageInfo"]["hasNextPage"] == false,
+            "issue is on more than 100 projects; board membership unknown"
+        );
+        Ok((text(found, "id")?.to_owned(), members.pop()))
+    }
+
+    /// Add an issue to the project, returning its item ID.
+    pub fn add_item(&self, project: &str, issue: &str) -> Result<String> {
+        let data = self.diagnostic().graphql(
+            "mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}",
+            json!({"project":project,"issue":issue}),
+        )?;
+        Ok(text(&data["addProjectV2ItemById"]["item"], "id")?.to_owned())
+    }
+
+    /// Set one validated field and check the value GitHub reports back for it.
+    pub fn set_field(&self, project: &str, item: &str, write: &FieldWrite) -> Result<()> {
+        let field = write
+            .field_id
+            .as_deref()
+            .context("field schema lacks node IDs")?;
+        let value = match &write.option_id {
+            Some(option) => json!({"singleSelectOptionId": option}),
+            None if write.select => anyhow::bail!("option schema lacks node IDs"),
+            None => json!({"text": write.value}),
+        };
+        let data = self.diagnostic().graphql(
+            "mutation($project:ID!,$item:ID!,$field:ID!,$value:ProjectV2FieldValue!,$name:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:$value}){projectV2Item{id fieldValueByName(name:$name){... on ProjectV2ItemFieldSingleSelectValue{optionId} ... on ProjectV2ItemFieldTextValue{text}}}}}",
+            json!({"project":project,"item":item,"field":field,"value":value,"name":write.name}),
+        )?;
+        let receipt = &data["updateProjectV2ItemFieldValue"]["projectV2Item"];
+        let observed = &receipt["fieldValueByName"];
+        ensure!(
+            receipt["id"].as_str() == Some(item)
+                && match &write.option_id {
+                    Some(option) => observed["optionId"].as_str() == Some(option),
+                    None => observed["text"].as_str() == Some(&write.value),
+                },
+            "{} update receipt mismatch",
+            write.name
+        );
+        Ok(())
     }
 
     /// Create one project field; single-select options are created in the given order.

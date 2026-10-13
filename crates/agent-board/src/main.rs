@@ -1,4 +1,5 @@
 mod dispatch;
+mod item;
 mod live;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -120,12 +121,12 @@ enum Item {
         /// Item URL, OWNER/REPO#N, or N with --repo.
         item: String,
     },
-    #[command(hide = true)]
-    Add { url: String },
+    /// Add an issue to the board, optionally setting Priority (writes with --apply).
+    Add(item::Add),
     #[command(hide = true)]
     Create,
-    #[command(hide = true)]
-    Edit { item: String },
+    /// Set single-select or text fields on a board issue (writes with --apply).
+    Edit(item::Edit),
     #[command(hide = true)]
     Close { item: String },
 }
@@ -433,6 +434,17 @@ fn execute(cli: Cli) -> Result<()> {
                 Ok(())
             }
         }
+        Command::Item {
+            command: Item::Add(add),
+        } => item_write(&cli, &add.item, &add.edits(), item::Mode::Add, add.apply),
+        Command::Item {
+            command:
+                Item::Edit(item::Edit {
+                    item,
+                    fields,
+                    apply,
+                }),
+        } => item_write(&cli, item, fields, item::Mode::Edit, *apply),
         Command::Reconcile {
             command: Reconcile::Plan { emit },
         } => {
@@ -479,9 +491,37 @@ fn execute(cli: Cli) -> Result<()> {
             )
         }
         _ => bail!(
-            "unsupported_capability: command is not implemented; use gh project item-add, gh project item-edit, gh issue create or gh issue close for manual changes; agent-board only reads and proposes repairs"
+            "unsupported_capability: command is not implemented; use gh issue create or gh issue close for manual changes"
         ),
     }
+}
+
+fn item_write(
+    cli: &Cli,
+    input: &str,
+    edits: &[String],
+    mode: item::Mode,
+    apply: bool,
+) -> Result<()> {
+    ensure!(cli.json.is_none(), "--json is unsupported for item writes");
+    let identity = item::issue_identity(input, cli.repo.as_deref(), &cli.hostname)?;
+    let mut out = io::stdout().lock();
+    if cli.snapshot.is_some() {
+        ensure!(
+            !apply,
+            "--apply writes to the live board; it cannot use --snapshot"
+        );
+        return item::preview(&load(cli)?, &identity, edits, mode, &mut out);
+    }
+    item::write(
+        &github(cli)?,
+        &identity,
+        edits,
+        mode,
+        apply,
+        &mut None,
+        &mut out,
+    )
 }
 
 fn project_summary(snapshot: &Snapshot) -> Result<()> {

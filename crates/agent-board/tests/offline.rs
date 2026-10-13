@@ -531,7 +531,7 @@ fn first_run_help_and_summary() {
     }
     assert!(!text.contains("board-snapshot/v1"));
     let output = command()
-        .args(["item", "add", "https://github.com/example/intake/issues/1"])
+        .args(["item", "create"])
         .assert()
         .code(1)
         .get_output()
@@ -540,8 +540,215 @@ fn first_run_help_and_summary() {
     assert!(
         String::from_utf8(output)
             .unwrap()
-            .contains("gh project item-add, gh project item-edit")
+            .contains("gh issue create")
     );
+}
+
+#[test]
+fn item_add_and_edit_preview_table() {
+    let proposal = |number: u64, fields: &str| {
+        format!(
+            "{{\"content_number\":{number},\"content_type\":\"issue\",\"fields\":{fields},\"project\":\"https://github.com/orgs/example/projects/1\",\"target_repo\":\"example/intake\",\"type\":\"update_project\"}}\n"
+        )
+    };
+    let mut board: Value =
+        serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+    board["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"name":"Priority","dataType":"SINGLE_SELECT","options":[{"name":"P0"},{"name":"P1"}]}));
+    board["items"][1]["content_kind"] = "pull_request".into();
+    // A snapshot only previews: nothing here has a token, and none is asked for.
+    for (args, code, stdout, stderr) in [
+        (
+            vec![
+                "item",
+                "add",
+                "https://github.com/example/intake/issues/9",
+                "--priority",
+                "P1",
+            ],
+            0,
+            proposal(9, r#"{"Priority":"P1"}"#),
+            "not applied",
+        ),
+        (
+            vec!["item", "add", "example/intake#9"],
+            0,
+            proposal(9, "{}"),
+            "not applied",
+        ),
+        (
+            vec![
+                "item",
+                "edit",
+                "1",
+                "-R",
+                "example/intake",
+                "--field",
+                "Status=Done",
+                "--field",
+                "Priority=P0",
+            ],
+            0,
+            proposal(1, r#"{"Priority":"P0","Status":"Done"}"#),
+            "not applied",
+        ),
+        (
+            vec!["item", "add", "example/intake#9", "--priority", "P9"],
+            1,
+            String::new(),
+            "Priority has no unambiguous option \"P9\"; options: P0, P1",
+        ),
+        (
+            vec!["item", "edit", "example/intake#9", "--field", "Status=Done"],
+            1,
+            String::new(),
+            "not on the board",
+        ),
+        (
+            vec!["item", "edit", "example/intake#2", "--field", "Status=Done"],
+            1,
+            String::new(),
+            "only issues can be added or edited, not pull_request",
+        ),
+        (
+            vec!["item", "add", "example/intake#2"],
+            1,
+            String::new(),
+            "only issues can be added or edited, not pull_request",
+        ),
+        (
+            vec!["item", "add", "https://github.com/example/intake/pull/9"],
+            1,
+            String::new(),
+            "only issues can be added or edited, not pull requests",
+        ),
+        (
+            vec!["item", "add", "https://github.com//example/intake/pull/9"],
+            1,
+            String::new(),
+            "only issues can be added or edited, not pull requests",
+        ),
+        (
+            vec![
+                "item",
+                "add",
+                "https://github.com/example/intake/issues/../pull/9",
+            ],
+            1,
+            String::new(),
+            "only issues can be added or edited, not pull requests",
+        ),
+        (
+            vec![
+                "item",
+                "edit",
+                "https://github.com//example/intake/./pull/1",
+                "--field",
+                "Status=Done",
+            ],
+            1,
+            String::new(),
+            "only issues can be added or edited, not pull requests",
+        ),
+        (
+            vec![
+                "item",
+                "add",
+                "9",
+                "--repo",
+                "example/intake",
+                "--hostname",
+                "github.example",
+            ],
+            1,
+            String::new(),
+            "unsupported item host github.example",
+        ),
+        (
+            vec!["item", "edit", "example/intake#1", "--field", "Turn=Worker"],
+            1,
+            String::new(),
+            "board has no Turn field",
+        ),
+        (
+            vec!["item", "edit", "example/intake#1"],
+            1,
+            String::new(),
+            "--field <NAME=VALUE>",
+        ),
+        (
+            vec![
+                "item",
+                "edit",
+                "example/intake#1",
+                "--field",
+                "Status=Done",
+                "--apply",
+            ],
+            1,
+            String::new(),
+            "cannot use --snapshot",
+        ),
+        (
+            vec!["item", "add", "example/intake#9", "--json", "fields"],
+            1,
+            String::new(),
+            "--json is unsupported",
+        ),
+    ] {
+        let output = command()
+            .args(&args)
+            .args(["--snapshot", "/dev/stdin"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .write_stdin(board.to_string())
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            stdout,
+            "{args:?}"
+        );
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(stderr), "{args:?}: {error}");
+    }
+    // Live writes are refused before a token is read, and a token is then required.
+    for (args, code, stderr) in [
+        (
+            vec![
+                "--owner",
+                "example",
+                "--project",
+                "1",
+                "--hostname",
+                "github.example",
+            ],
+            1,
+            "unsupported item host",
+        ),
+        (vec!["--project", "1"], 1, "live commands require --owner"),
+        (
+            vec!["--owner", "example", "--project", "1"],
+            4,
+            "authentication required",
+        ),
+    ] {
+        let output = command()
+            .args(["item", "add", "example/intake#9", "--apply"])
+            .args(&args)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(stderr), "{args:?}: {error}");
+    }
 }
 
 #[test]

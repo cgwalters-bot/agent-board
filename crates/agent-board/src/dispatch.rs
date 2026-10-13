@@ -252,7 +252,7 @@ pub fn init_plan(snapshot: &Snapshot, out: &mut impl Write) -> Result<()> {
 /// Create the join's missing fields on the live project, then read the schema back.
 /// Existing fields and options are never changed, so a rerun creates nothing.
 pub fn init<T: Transport>(github: &GitHub<T>, out: &mut impl Write) -> Result<()> {
-    let (project, fields) = github.schema()?;
+    let (project, _, fields) = github.schema()?;
     let missing = missing_fields(&fields)?;
     for field in &JOIN_FIELDS {
         let absent = missing.iter().any(|f| f.name == field.name);
@@ -268,7 +268,7 @@ pub fn init<T: Transport>(github: &GitHub<T>, out: &mut impl Write) -> Result<()
         }
         init_row(out, field, !absent, "created")?;
     }
-    let (_, fields) = github.schema()?;
+    let (_, _, fields) = github.schema()?;
     let missing = missing_fields(&fields)?;
     ensure!(
         missing.is_empty(),
