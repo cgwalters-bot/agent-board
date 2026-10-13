@@ -106,7 +106,7 @@ impl std::fmt::Display for AuthenticationRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "authentication required: provide a valid GH_TOKEN or GITHUB_TOKEN"
+            "authentication required: provide a valid GH_TOKEN or GITHUB_TOKEN (classic token: read:project, or project for writes such as project init; fine-grained: the owner's Projects permission)"
         )
     }
 }

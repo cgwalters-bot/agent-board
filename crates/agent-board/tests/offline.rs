@@ -599,13 +599,17 @@ fn live_reads_require_authentication() {
         vec!["item", "view", "example/intake#1"],
         vec!["reconcile", "plan"],
     ] {
-        command()
+        let output = command()
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
             .args(args)
             .args(["--owner", "example", "--project", "1"])
             .assert()
-            .code(4);
+            .code(4)
+            .get_output()
+            .stderr
+            .clone();
+        assert!(String::from_utf8(output).unwrap().contains("read:project"));
     }
 }
 

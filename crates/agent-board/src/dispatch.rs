@@ -10,6 +10,7 @@ use std::io::{self, Write};
 
 #[derive(Args)]
 pub struct Dispatch {
+    /// Issue to dispatch: URL, OWNER/REPO#N, or N with --repo.
     #[arg(long)]
     item: String,
     /// Repository containing the reviewed dispatch.yml caller, not the target code.
@@ -18,12 +19,14 @@ pub struct Dispatch {
     /// Caller default branch; the caller independently checks this.
     #[arg(long, default_value = "main")]
     branch: String,
+    /// Profile the caller workflow runs with.
     #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research"])]
     kind: String,
 }
 
 #[derive(Args)]
 pub struct Record {
+    /// Dispatched issue: URL, OWNER/REPO#N, or N with --repo.
     #[arg(long)]
     item: String,
     /// Actions URL selected and verified by the operator, not agent prose.
