@@ -1,0 +1,14 @@
+# Who and where `agent-board promote` trusts. Load this file from trusted main,
+# never from a run's inputs or proposed changes: whoever dispatches the workflow
+# must not be able to name another approver or author, or another policy repository.
+
+# The author of every fork pull request; it also owns older forks.
+bot = "cgwalters-bot"
+# The only login whose approving review or `/promote` comment promotes.
+approver = "cgwalters"
+# The organisation that owns the forks the bot's pull requests are opened in.
+forge = "cgwalters-forge"
+# Contribution policy records, `upstream-policy/OWNER/REPO.md`, count only as
+# pushed to this branch of this repository.
+policy_repo = "cgwalters-bot/homegit"
+policy_branch = "main"

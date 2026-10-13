@@ -46,6 +46,106 @@ fn status_update_cli_refusals() {
     }
 }
 
+/// promote refuses before reading a token or GitHub; with a valid dry run and no token
+/// it stops at authentication (exit 4), having made no request. Its config is required
+/// and a missing key is named.
+#[test]
+fn promote_cli_refusals() {
+    let directory =
+        std::env::temp_dir().join(format!("agent-board-promote-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let shipped = format!("{}/../../policy/promote.toml", env!("CARGO_MANIFEST_DIR"));
+    let partial = directory.join("promote.toml");
+    let text: String = std::fs::read_to_string(&shipped)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with("approver ="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&partial, text).unwrap();
+    let partial = partial.to_str().unwrap();
+    let missing = directory.join("missing.toml");
+    let missing = missing.to_str().unwrap();
+    let url = "https://github.com/cgwalters-forge/proj/pull/1";
+    for (args, code, reason) in [
+        (
+            vec!["promote", url, "--config", &shipped],
+            1,
+            "only runs with --dry-run",
+        ),
+        (
+            vec!["promote", url, "--dry-run"],
+            1,
+            "required arguments were not provided:\n  --config <FILE>",
+        ),
+        (
+            vec!["promote", url, "--dry-run", "--config", partial],
+            1,
+            "missing field `approver`",
+        ),
+        (
+            vec!["promote", url, "--dry-run", "--config", missing],
+            1,
+            "read promote config",
+        ),
+        (
+            vec![
+                "promote",
+                "https://github.com/acme/proj/pull/1",
+                "--dry-run",
+                "--config",
+                &shipped,
+            ],
+            1,
+            "expected a PR URL in one of the forks",
+        ),
+        (
+            vec![
+                "promote",
+                url,
+                "--dry-run",
+                "--config",
+                &shipped,
+                "--snapshot",
+                &fixture(),
+            ],
+            1,
+            "--snapshot and --json are unsupported",
+        ),
+        (
+            vec![
+                "promote",
+                url,
+                "--dry-run",
+                "--config",
+                &shipped,
+                "--hostname",
+                "github.example",
+            ],
+            1,
+            "unsupported GitHub host",
+        ),
+        (
+            vec!["promote", url, "--dry-run", "--config", &shipped],
+            4,
+            "authentication required",
+        ),
+    ] {
+        let output = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(args)
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(reason), "{reason}: {stderr}");
+        assert!(output.stdout.is_empty());
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn proposal_check_cli_table() {
     let snapshot = format!(

@@ -340,6 +340,19 @@ exist; neither is created, and the operator must be assignable in the ask's repo
 Resolving leaves the blocked item's Status to whoever acts on the answer. Asks on pull requests (homegit's review asks), sub-issue
 links and copying the blocked item's Priority are not implemented.
 
+`promote FORK_PR_URL --dry-run` ports the checks of homegit's `bot-pr promote`
+(approved current head, a current bot-ok contribution policy record in homegit, a
+stacked pull request's base merged upstream) and prints the plan, or the one refusal
+comment it would leave. It only reads, through a REST interface with no write method,
+and refuses to run without `--dry-run`; `.github/workflows/promote.yml` runs it on
+dispatch or when called with a URL. The bot, the approver, the forge organisation and the
+policy repository and branch are required keys of `--config`, `policy/promote.toml` as
+the workflow reads it from agent-board main, so a dispatch input cannot change them.
+Rebasing, DCO sign-off, opening the upstream pull
+request, refusal comments and their deduplication, `/promote --human-text` and the check
+of who loosened a policy verdict are not implemented; the real promote needs an
+operator-stored `PROMOTE_TOKEN`.
+
 For read-only setup, `project init --snapshot FILE` retains its field table on
 stdout and prints copyable `gh project field-create` commands for missing fields
 on stderr. It does not execute them; review the saved schema against the live

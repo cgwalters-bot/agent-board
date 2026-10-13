@@ -1,0 +1,49 @@
+name: promote
+# Checks one fork pull request with `agent-board promote --dry-run`. The poll (#40) is
+# meant to call this for every fork pull request whose current head the approver approved;
+# workflow_dispatch takes a URL by hand. Dry run only: it reads public repositories with
+# this run's read-only token and changes nothing.
+#
+# The bot, the approver, the forge organisation and the policy repository come from
+# policy/promote.toml in the agent-board main checkout below, never from inputs, so
+# whoever dispatches or calls this cannot name another approver or author.
+#
+# Promoting for real will need a token that can push to the forge's forks and
+# open upstream pull requests: the operator is to store it as PROMOTE_TOKEN in a `promote`
+# environment limited to main. No job here references it yet.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Fork pull request URL (https://github.com/FORGE/REPO/pull/N)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      url:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: promote-${{ inputs.url }}
+  cancel-in-progress: false
+jobs:
+  dry-run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # workflow_call otherwise checks out the caller (for example tracker).
+          # Build reviewed agent-board main, never the caller or dispatch ref.
+          repository: cgwalters-forge/agent-board
+          ref: refs/heads/main
+          persist-credentials: false
+      - run: cargo build --locked --release -p agent-board
+      # The URL arrives through the environment, never interpolated into the script;
+      # the CLI accepts only a pull request URL in a fork the config names.
+      - run: ./target/release/agent-board promote "$URL" --dry-run --config policy/promote.toml
+        env:
+          URL: ${{ inputs.url }}
+          GH_TOKEN: ${{ github.token }}

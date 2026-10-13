@@ -523,6 +523,92 @@ impl crate::poll::Rest for Client {
     }
 }
 
+/// Read-only REST: `get` returns the body of `GET https://api.github.com/PATH`, raw
+/// file content when `raw`, or `None` when GitHub answers 404. There is no write
+/// method, so a caller holding only this trait cannot mutate the forge.
+pub trait Rest {
+    fn get(&self, path: &str, raw: bool) -> Result<Option<String>>;
+}
+
+impl Rest for Client {
+    fn get(&self, path: &str, raw: bool) -> Result<Option<String>> {
+        // Paths are built from validated names; refuse anything that could leave the API.
+        ensure!(rest_path_ok(path), "invalid GitHub REST path");
+        let accept = if raw {
+            "application/vnd.github.raw+json"
+        } else {
+            "application/vnd.github+json"
+        };
+        let mut response = self
+            .agent
+            .get(&format!("https://api.github.com/{path}"))
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("Accept", accept)
+            .header("User-Agent", "agent-board")
+            .call()
+            .map_err(transport_error)?;
+        let status = response.status().as_u16();
+        if status == 404 {
+            return Ok(None);
+        }
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .context("read GitHub REST response")?;
+        if !(200..300).contains(&status) {
+            let message = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v["message"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "message unavailable".into());
+            if status == 401 {
+                return Err(anyhow::Error::from(AuthenticationRequired)
+                    .context(format!("GitHub HTTP status {status}: {message}")));
+            }
+            anyhow::bail!("GitHub HTTP status {status} for {path}: {message}");
+        }
+        Ok(Some(body))
+    }
+}
+
+/// A relative API path whose segments cannot climb out of it (`base...head` in a
+/// compare path is one segment, not `..`).
+fn rest_path_ok(path: &str) -> bool {
+    let route = path.split('?').next().unwrap_or_default();
+    !route.is_empty()
+        && path.is_ascii()
+        && !path
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || c == '#')
+        && route
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+#[cfg(test)]
+mod rest_tests {
+    #[test]
+    fn rest_paths() {
+        for (path, ok) in [
+            ("repos/acme/proj/pulls/1", true),
+            (
+                "repos/acme/proj/compare/main...cgwalters-forge:bot/fix",
+                true,
+            ),
+            ("repos/acme/.github", true),
+            ("repos/acme/proj/pulls?head=a%3Ab&state=open", true),
+            ("/repos/acme/proj", false),
+            ("repos/acme/../x", false),
+            ("repos/acme/./x", false),
+            ("repos//x", false),
+            ("repos/acme/proj pulls", false),
+            ("repos/acme/proj#x", false),
+            ("", false),
+        ] {
+            assert_eq!(super::rest_path_ok(path), ok, "{path}");
+        }
+    }
+}
+
 fn http_response_data(status: u16, body: Value) -> Result<Value> {
     if !(200..300).contains(&status) {
         let message = body["message"].as_str().unwrap_or("message unavailable");
