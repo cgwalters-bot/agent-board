@@ -6,6 +6,7 @@ use board_core::{Capability, Intent, Plan, Snapshot};
 use serde_json::{Value, json};
 
 pub mod github;
+pub mod plan;
 pub mod poll;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 

@@ -327,6 +327,9 @@ dispatch automatically. `project init` creates missing Turn/Run/Result
 fields with the operator's own token and never edits existing fields or options. No workflow permissions, token
 placement or action pins are changed in this patch.
 
+`dispatch ISSUE --dry-run` prints the workflow_dispatch request for the newest
+accepted [job plan](job-plans.md) on an issue; it sends nothing yet.
+
 `ask create` opens a question issue, labelled `question` and assigned to the
 operator, with lettered options and a recommendation, and sets it and the item it
 blocks to Needs human; `ask list` shows open asks on the board; `ask resolve` comments

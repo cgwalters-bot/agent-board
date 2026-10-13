@@ -84,6 +84,8 @@ enum Command {
         #[command(subcommand)]
         command: Request,
     },
+    /// Start the job an issue's newest accepted plan comment proposes (--dry-run prints the request).
+    Dispatch(dispatch::FromPlan),
     /// Save a normalized board snapshot for offline use.
     Snapshot {
         #[command(subcommand)]
@@ -348,6 +350,23 @@ fn execute(cli: Cli) -> Result<()> {
                 "dispatch prints its own JSON command schema"
             );
             dispatch::prepare(&load(&cli)?, args, cli.repo.as_deref(), &cli.hostname)
+        }
+        Command::Dispatch(args) => {
+            ensure!(
+                cli.json.is_none(),
+                "dispatch prints the request as JSON; --json is unsupported"
+            );
+            ensure!(
+                cli.snapshot.is_none(),
+                "plans are read from the issue's comments, not a snapshot"
+            );
+            dispatch::from_plan(
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
         }
         Command::Run {
             command: Run::Record(args),

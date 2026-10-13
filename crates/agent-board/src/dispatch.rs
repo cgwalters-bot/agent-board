@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use board_core::{Item, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
-use board_forge::{is_github_login, parse_github_item, validate_github_project};
+use board_forge::{is_github_login, parse_github_item, plan, validate_github_project};
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -22,6 +22,27 @@ pub struct Dispatch {
     /// Profile the caller workflow runs with.
     #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research"])]
     kind: String,
+}
+
+#[derive(Args)]
+pub struct FromPlan {
+    /// Issue whose newest accepted plan comment to dispatch: URL, OWNER/REPO#N, or N with --repo.
+    issue: String,
+    /// Print the workflow_dispatch request instead of sending it; required, as nothing is sent yet.
+    #[arg(long)]
+    dry_run: bool,
+    /// Repository whose dispatch.yml the request starts.
+    #[arg(long, value_name = "OWNER/REPO")]
+    caller: String,
+    /// Ref of the caller to run dispatch.yml from.
+    #[arg(long = "ref", default_value = "main")]
+    git_ref: String,
+    /// Login whose plans count: the operator.
+    #[arg(long, value_name = "LOGIN")]
+    operator: String,
+    /// Login the planning run comments as, whose plans also count.
+    #[arg(long, value_name = "LOGIN")]
+    planner: Option<String>,
 }
 
 #[derive(Args)]
@@ -319,6 +340,44 @@ pub fn prepare(snapshot: &Snapshot, args: &Dispatch, repo: Option<&str>, host: &
     writeln!(io::stdout().lock())?;
     eprintln!(
         "Preview only; execute argv only after operator approval. Dispatch is not recorded automatically."
+    );
+    Ok(())
+}
+
+/// The request that starts the job an issue's plan asks for. Every input is
+/// checked before the token is read, so a refusal never touches the network.
+pub fn from_plan<T: Transport>(
+    args: &FromPlan,
+    repo: Option<&str>,
+    host: &str,
+    transport: impl FnOnce() -> Result<T>,
+    out: &mut impl Write,
+) -> Result<()> {
+    ensure!(
+        args.dry_run,
+        "unsupported_capability: dispatch only prints its request; pass --dry-run"
+    );
+    ensure!(
+        host == board_forge::github::DEFAULT_HOST,
+        "plans are read only from github.com"
+    );
+    let issue = board_forge::github::parse_github_issue(&args.issue, repo, host)?;
+    let writers: Vec<&str> = std::iter::once(args.operator.as_str())
+        .chain(args.planner.as_deref())
+        .collect();
+    for writer in &writers {
+        ensure!(is_github_login(writer), "invalid login {writer:?}");
+    }
+    plan::validate_caller(&args.caller, &args.git_ref)?;
+    let comments = plan::issue_comments(&transport()?, &issue)?;
+    let (plan, from) = plan::newest_plan(&comments, &writers)?;
+    let request = plan.dispatch_request(&args.caller, &args.git_ref)?;
+    serde_json::to_writer(&mut *out, &request)?;
+    writeln!(out)?;
+    eprintln!(
+        "Dry run: request for the plan in {} by {}; nothing was sent.",
+        from.url,
+        from.author.as_deref().unwrap_or("-")
     );
     Ok(())
 }
@@ -823,6 +882,111 @@ mod tests {
         ] {
             s.project = project.parse().unwrap();
             assert_eq!(init_args(&s), args, "{project}");
+        }
+    }
+
+    #[test]
+    fn dispatch_from_plan_reads_only_after_checks() {
+        /// One page of comments; counts the reads.
+        struct Comments(Value, std::cell::Cell<usize>);
+        impl Transport for &Comments {
+            fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+                self.1.set(self.1.get() + 1);
+                Ok(json!({"repository": {"issue": {"comments": {
+                    "nodes": self.0, "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}))
+            }
+        }
+        let plan = json!({"schema": plan::JOB_PLAN_SCHEMA, "repo": "ostreedev/ostree", "item": 3665,
+            "kind": "research", "runner": "hosted", "brief": "Find why the test flakes."});
+        let node = |login: &str| {
+            json!({"url": "https://github.com/cgwalters-forge/tracker/issues/540#issuecomment-7",
+                "body": format!("```{}\n{plan}\n```", plan::PLAN_FENCE),
+                "createdAt": "2026-10-13T10:00:00Z", "lastEditedAt": null,
+                "author": {"login": login}, "editor": null})
+        };
+        let args = |issue: &str, dry_run: bool, caller: &str, planner: Option<&str>| FromPlan {
+            issue: issue.into(),
+            dry_run,
+            caller: caller.into(),
+            git_ref: "main".into(),
+            operator: "cgwalters".into(),
+            planner: planner.map(Into::into),
+        };
+        let issue = "https://github.com/cgwalters-forge/tracker/issues/540";
+        let tracker = "cgwalters-forge/tracker";
+        // Arguments, comment author, reads made, then output inputs or error.
+        for (args, author, reads, expected) in [
+            (
+                args(issue, true, tracker, Some("cgwalters-bot")),
+                "cgwalters-bot",
+                1,
+                Ok("research"),
+            ),
+            (
+                args("540", true, tracker, None),
+                "cgwalters",
+                1,
+                Ok("research"),
+            ),
+            (
+                args(issue, true, tracker, None),
+                "cgwalters-bot",
+                1,
+                Err("no plan on this issue"),
+            ),
+            (
+                args(issue, false, tracker, None),
+                "cgwalters",
+                0,
+                Err("pass --dry-run"),
+            ),
+            (
+                args(issue, true, "tracker", None),
+                "cgwalters",
+                0,
+                Err("invalid caller repository"),
+            ),
+            (
+                args(
+                    "https://github.com/cgwalters-forge/tracker/pull/540",
+                    true,
+                    tracker,
+                    None,
+                ),
+                "cgwalters",
+                0,
+                Err("not pull requests"),
+            ),
+            (
+                args(issue, true, tracker, Some("a b")),
+                "cgwalters",
+                0,
+                Err("invalid login"),
+            ),
+        ] {
+            let transport = Comments(json!([node(author)]), Default::default());
+            let mut out = Vec::new();
+            let result = from_plan(
+                &args,
+                Some("cgwalters-forge/tracker"),
+                "github.com",
+                || Ok(&transport),
+                &mut out,
+            );
+            assert_eq!(transport.1.get(), reads);
+            match (result, expected) {
+                (Ok(()), Ok(kind)) => {
+                    let request: Value = serde_json::from_slice(&out).unwrap();
+                    assert_eq!(request["body"]["inputs"]["kind"], kind);
+                    assert_eq!(request["body"]["inputs"]["pool"], "");
+                    assert_eq!(request["body"]["inputs"]["item"], "3665");
+                }
+                (Err(error), Err(expected)) => {
+                    assert!(format!("{error:#}").contains(expected), "{error:#}");
+                    assert!(out.is_empty());
+                }
+                (result, expected) => panic!("{result:?} != {expected:?}"),
+            }
         }
     }
 
