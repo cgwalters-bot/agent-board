@@ -387,14 +387,24 @@ impl Client {
             std::env::var("GH_TOKEN").ok(),
             std::env::var("GITHUB_TOKEN").ok(),
         )?;
-        Ok(Self {
+        Ok(Self::with_token(token))
+    }
+
+    /// The client for `name` when that variable holds a token.
+    pub fn from_var(name: &str) -> Option<Self> {
+        let token = std::env::var(name).ok().filter(|t| !t.is_empty())?;
+        Some(Self::with_token(token))
+    }
+
+    fn with_token(token: String) -> Self {
+        Self {
             token,
             agent: ureq::Agent::config_builder()
                 .http_status_as_error(false)
                 .timeout_global(Some(std::time::Duration::from_secs(30)))
                 .build()
                 .into(),
-        })
+        }
     }
 }
 
@@ -473,6 +483,44 @@ impl Transport for Client {
 }
 
 impl crate::poll::Rest for Client {
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        ensure!(
+            url.starts_with(API_ROOT),
+            "refusing to send the token outside {API_ROOT}"
+        );
+        let path = url.trim_start_matches(API_ROOT);
+        let request = |request: ureq::RequestBuilder<ureq::typestate::WithBody>| {
+            request
+                .header("Authorization", &format!("Bearer {}", self.token))
+                .header("User-Agent", "agent-board")
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .send_json(body)
+        };
+        let mut response = match method {
+            "POST" => request(self.agent.post(url)),
+            "PATCH" => request(self.agent.patch(url)),
+            _ => anyhow::bail!("unsupported method {method}"),
+        }
+        .map_err(transport_error)?;
+        let status = response.status().as_u16();
+        if status == 401 {
+            return Err(anyhow::Error::from(AuthenticationRequired)
+                .context(format!("{method} {path}: GitHub HTTP status 401")));
+        }
+        // 204 (a dispatch without run details) has no body.
+        let text = response
+            .body_mut()
+            .read_to_string()
+            .with_context(|| format!("read {method} {path}"))?;
+        let body = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(Value::String(text))
+        };
+        Ok((status, body))
+    }
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
         // A `Link` header or a cached URL must not carry the token elsewhere.
         ensure!(

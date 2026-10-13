@@ -1,6 +1,6 @@
 //! Read adapters and proposal lowering. Mutations are orchestrated only by the CLI's
-//! operator commands (`project init`, `item add`/`item edit`/`ask --apply`) and its opt-in
-//! staging fixture, through the shared GitHub transport. `poll` only previews its steps.
+//! operator commands (`project init`, `item add`/`item edit`/`ask --apply`), `poll --apply`
+//! and its opt-in staging fixture, through the shared GitHub transport.
 use anyhow::{Result, ensure};
 use board_core::{Capability, Intent, Plan, Snapshot};
 use serde_json::{Value, json};

@@ -101,7 +101,7 @@ enum Command {
         #[command(subcommand)]
         command: Output,
     },
-    /// Preview one pass of the pull request poll and say when the next is due.
+    /// One pass of the pull request poll, previewed or applied; says when the next is due.
     Poll(poll::Poll),
     /// Run the credential-bearing staging integration test.
     Test {

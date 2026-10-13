@@ -225,16 +225,34 @@ fetches their nested connections inline (at most 100 entries each); additional
 pages or redacted/missing connection data mark the item and snapshot incomplete,
 blocking reconciliation rather than treating a partial list as complete.
 
-`agent-board poll --dry-run` is the first slice of the tracker's pull request
-poll (#40): it prints the operator's and the bot's activity from each watched
-repository's events, a proposed step for each of the bot's open pull
-requests (keyed on the latest submitted review of the head by the operator, not
-a status and a VERDICT comment), and when the next pass is due (five minutes
-while anything changed or a pull request is in flight, doubling while idle, at
-most six hours apart). GETs are conditional against a disposable state file; the
-pull request query is GraphQL and is not. It takes no step: marking ready, fix
-dispatch, merging and `needs-human` stay in poll.cjs until the preview has been
-compared with it. Authenticated review-job verdicts are deferred: the shared
+`agent-board poll` is the tracker's pull request poll (#40), one pass a run:
+it prints the operator's and the bot's activity from the events of every
+repository on the board (given by `--owner`/`--project` or `--snapshot`) and of
+`--watch`/`--follow`, a step for each of the bot's open pull requests in the
+`--follow` repositories (keyed on the latest submitted review of the head by the
+operator, not a status and a VERDICT comment), and when the next pass is due
+(five minutes while anything changed or a pull request is in flight, doubling
+while idle, at most six hours apart). GETs are conditional against a disposable
+state file; the pull request query is GraphQL and is not. `--dry-run` takes no
+step. `--apply` takes poll.cjs's steps with the bot's `GH_TOKEN` (checked to be
+`--bot`'s, as only the bot's markers and claims are read back): mark ready,
+merge an operator-approved green head at once (pinned to the head that was
+read; never auto-merge or the merge queue, which stay pending where a later
+push could ride on the approval), label `needs-human` with the marker comment, and start a fix run
+through the caller's `--dispatch-workflow` with `DISPATCH_TOKEN`, at most three
+a pass as the dispatcher above is bounded. A pass claims each fix round with a
+comment naming the marker comment it decided from, and only the earliest claim on
+that comment, while that marker is still the newest, starts a run. Markers are only added: each round and each
+`needs-human` stop is a new comment, and the one later write is a round's run
+id, into its own comment. Readers use the newest marker by creation id, so a
+late result cannot roll back a newer round or stop, and each removal of the
+label is claimed from a stop of its own. A stop is added after its label, and
+`--apply` reads the comments before the label and without the response cache,
+so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
+repositories only; the board widens what is read, not what is changed. The
+workflow, its bounds and the tokens stay in the tracker, whose poll.yml still
+runs poll.cjs. Promoting operator-approved fork pull requests upstream is not
+implemented. Authenticated review-job verdicts are deferred: the shared
 Actions bot identity does not establish which workflow submitted a review.
 Job-only approvals and change requests therefore wait for an operator verdict,
 unlike poll.cjs; recorded job-only cases test this limitation separately from
