@@ -22,3 +22,7 @@ jobs:
       - run: ./target/release/agent-board test project --owner cgwalters-forge-stage --project 2 --repo cgwalters-forge-stage/board-test
         env:
           GH_TOKEN: ${{ secrets.PAT }}
+          # Main's PAT needs resource owner cgwalters-forge-stage, organization
+          # Projects Read and write, board-test Issues Read and write and Metadata
+          # read, with organization approval and project write access for its owner.
+          # GITHUB_TOKEN/workflow permissions cannot supply organization Projects writes.

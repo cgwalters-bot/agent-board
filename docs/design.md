@@ -313,6 +313,21 @@ placement or action pins are changed in this patch.
 
 **C — Test owner and credential.** Recommend a dedicated test organization and a dedicated App minting short-lived tokens. Alternative: a dedicated account's user projects plus classic PAT; simpler setup but broader standing credential. Configure through CI administration, never hand the secret to the agent.
 
+The current live template uses `cgwalters-forge-stage/board-test` environment
+`Main` secret `PAT`, passed only to the opt-in live invocation. Run 38253667620
+read project 2 and created/closed an issue, but `addProjectV2ItemById` returned
+`FORBIDDEN: Resource not accessible by personal access token`. This is missing
+effective project write access, not a missing token or repository Issues write.
+The operator must update that fine-grained PAT with resource owner
+`cgwalters-forge-stage`, organization Projects **Read and write**, and repository
+Issues **Read and write** plus Metadata read on `board-test`; ensure organization
+approval and the token owner's write access to project 2. Workflow `permissions`
+cannot grant this access. The kept-project preflight now reads `viewerCanUpdate`
+in its existing request and refuses before scratch creation unless it is true;
+later mutation failures still require cleanup. No credential or permission is
+changed by this diagnostic. Rerunning the staging workflow after provisioning
+is required to establish a green lane; offline tests cannot verify the secret.
+
 **D — Spending and autonomy.** Recommend one worker slot, finite run/period ceilings, missing usage blocks new work, and explicit approval for destructive downstream operations. Later enable policy-approved low-risk automatic admission and additional slots after replay/live tests demonstrate stable accounting. Neither option allows the model to raise its bounds.
 
 ### Evidence and verification limits

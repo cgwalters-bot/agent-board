@@ -92,9 +92,16 @@ fn lifecycle(
     };
     let t = &diagnostic;
     let project_read = kept.map(|number| {
-        let result = t.graphql("query($owner:String!,$number:Int!){organization(login:$owner){projectV2(number:$number){id number}}}", json!({"owner":owner,"number":number})).and_then(|data| {
+        let result = t.graphql("query($owner:String!,$number:Int!){organization(login:$owner){projectV2(number:$number){id number viewerCanUpdate}}}", json!({"owner":owner,"number":number})).and_then(|data| {
             string(&data, "/organization/projectV2/id")
                 .with_context(|| format!("reading project {owner}/{number}"))?;
+            // Read access alone caused the scheduled fixture to create and close
+            // scratch issues every day before its project-add mutation failed.
+            // This is an early diagnostic, not authorization for later writes.
+            ensure!(
+                data["organization"]["projectV2"]["viewerCanUpdate"] == true,
+                "project {owner}/{number} is not writable (viewerCanUpdate is false or missing); in {repo}, update environment Main secret PAT: fine-grained token resource owner {owner}, organization Projects Read and write, repository Issues Read and write (plus Metadata read); ensure organization approval and the token owner's project write access"
+            );
             Ok(data)
         });
         eprintln!("reading project {owner}/{number}: {}", match &result { Ok(_) => "ok".into(), Err(e) => format!("refused: {e:#}") });
@@ -422,7 +429,9 @@ mod tests {
             }
             if query.contains("projectV2(number") && query.contains("organization(login") {
                 assert_eq!(variables["number"], 2);
-                return Ok(json!({"organization":{"projectV2":{"id":"P_created","number":2}}}));
+                return Ok(
+                    json!({"organization":{"projectV2":{"id":"P_created","number":2,"viewerCanUpdate":true}}}),
+                );
             }
             if query.contains("organization(login") {
                 return Ok(
@@ -530,6 +539,57 @@ mod tests {
                     assert!(calls.iter().any(|q| q == REMOVE));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unwritable_kept_project_refuses_before_scratch_creation() {
+        struct Unwritable {
+            recorded: Recorded,
+            permission: Value,
+        }
+
+        impl Transport for Unwritable {
+            fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+                let mut response = self.recorded.graphql(query, variables)?;
+                if query.contains("projectV2(number") {
+                    assert!(query.contains("viewerCanUpdate"));
+                    response["organization"]["projectV2"]["viewerCanUpdate"] =
+                        self.permission.clone();
+                }
+                Ok(response)
+            }
+        }
+
+        for permission in [json!(false), Value::Null, json!("true")] {
+            let transport = Unwritable {
+                recorded: Recorded {
+                    calls: RefCell::new(vec![]),
+                    fail: 0,
+                },
+                permission,
+            };
+            let error = lifecycle(
+                &transport,
+                "cgwalters-forge-stage",
+                "cgwalters-forge-stage/board-test",
+                "nonce",
+                Some(2),
+            )
+            .unwrap_err();
+            let message = format!("{error:#}");
+            for expected in [
+                "no writes attempted",
+                "project cgwalters-forge-stage/2 is not writable",
+                "environment Main secret PAT",
+                "organization Projects Read and write",
+                "repository Issues Read and write",
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+            let calls = transport.recorded.calls.borrow();
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|query| query.starts_with("query")));
         }
     }
 
