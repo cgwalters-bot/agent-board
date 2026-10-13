@@ -657,7 +657,146 @@ impl<T: Transport> Forge for GitHub<T> {
     }
 }
 
+pub const STATUS_BODY_LIMIT: usize = 4_000;
+
+fn validate_status_body(body: &str) -> Result<()> {
+    ensure!(!body.trim().is_empty(), "status body must not be empty");
+    // Bound publication size, including generated summaries, before any mutation.
+    ensure!(
+        body.chars().count() <= STATUS_BODY_LIMIT,
+        "status body exceeds {STATUS_BODY_LIMIT} characters"
+    );
+    Ok(())
+}
+
+fn status_summary(items: &[Value], since: Option<&str>) -> Result<String> {
+    let parse = |s: &str| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .context("invalid status summary timestamp")
+    };
+    let cutoff = since.map(parse).transpose()?;
+    let mut changes = BTreeMap::new();
+    for item in items {
+        let content = &item["content"];
+        ensure!(
+            matches!(
+                content["__typename"].as_str(),
+                Some("Issue" | "PullRequest")
+            ),
+            "cannot summarize redacted or draft project items"
+        );
+        let created = parse(text(content, "createdAt")?)?;
+        let updated = parse(text(content, "updatedAt")?)?;
+        ensure!(
+            content
+                .get("closedAt")
+                .is_some_and(|value| value.is_null() || value.is_string()),
+            "missing or invalid closedAt"
+        );
+        let closed = content["closedAt"].as_str().map(parse).transpose()?;
+        if cutoff.is_some_and(|cutoff| updated <= cutoff) {
+            continue;
+        }
+        let change = if closed.is_some_and(|closed| cutoff.is_none_or(|cutoff| closed > cutoff)) {
+            "closed"
+        } else if cutoff.is_none_or(|cutoff| created > cutoff) {
+            "created"
+        } else {
+            "updated"
+        };
+        let repo = text(&content["repository"], "nameWithOwner")?;
+        let number = content["number"]
+            .as_u64()
+            .context("missing content number")?;
+        let kind = text(content, "__typename")?;
+        ensure!(
+            changes.insert((repo, number, kind), change).is_none(),
+            "duplicate project content"
+        );
+    }
+    let mut body = match since {
+        Some(since) => format!("Project activity since {since}:\n"),
+        None => "Project activity (first status update):\n".to_owned(),
+    };
+    if changes.is_empty() {
+        body.push_str("\nNo issue or pull request activity.\n");
+    }
+    for ((repo, number, kind), change) in changes {
+        use std::fmt::Write;
+        writeln!(body, "- {repo}#{number} ({kind}): {change}")?;
+    }
+    validate_status_body(&body)?;
+    Ok(body)
+}
+
 impl<T: Transport> GitHub<T> {
+    /// Explicit operator publication, not delegated output application.
+    pub fn status_update(&self, status: &str, body: Option<&str>) -> Result<String> {
+        let status = match status {
+            "on-track" => "ON_TRACK",
+            "at-risk" => "AT_RISK",
+            "off-track" => "OFF_TRACK",
+            _ => anyhow::bail!("invalid project status"),
+        };
+        if let Some(body) = body {
+            validate_status_body(body)?;
+        }
+        let (id, _, _) = self.schema()?;
+        let generated;
+        let body = match body {
+            Some(body) => body,
+            None => {
+                let diagnostic = self.diagnostic();
+                let transport = ReadBudget {
+                    transport: &diagnostic,
+                    remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
+                };
+                let (updates, complete) = connection(
+                    &transport,
+                    "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{statusUpdates(first:100,after:$cursor){nodes{createdAt} pageInfo{hasNextPage endCursor}}}}}",
+                    json!({"id":id}),
+                    "/node/statusUpdates",
+                )?;
+                ensure!(complete, "incomplete status update history");
+                let since = updates
+                    .iter()
+                    .map(|u| {
+                        let value = text(u, "createdAt")?;
+                        let timestamp = time::OffsetDateTime::parse(
+                            value,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .context("invalid status update timestamp")?;
+                        Ok((timestamp, value))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .max()
+                    .map(|(_, value)| value);
+                let (items, complete) = connection(
+                    &transport,
+                    "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{content{__typename ... on Issue{number createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{number createdAt updatedAt closedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
+                    json!({"id":id}),
+                    "/node/items",
+                )?;
+                ensure!(complete, "incomplete project items");
+                generated = status_summary(&items, since)?;
+                &generated
+            }
+        };
+        validate_status_body(body)?;
+        let data = self.diagnostic().graphql(
+            "mutation($project:ID!,$status:ProjectV2StatusUpdateStatus!,$body:String!){createProjectV2StatusUpdate(input:{projectId:$project,status:$status,body:$body}){statusUpdate{id body status}}}",
+            json!({"project":id,"status":status,"body":body}),
+        )?;
+        let receipt = &data["createProjectV2StatusUpdate"]["statusUpdate"];
+        ensure!(
+            receipt["body"] == body && receipt["status"] == status,
+            "status update receipt mismatch"
+        );
+        Ok(text(receipt, "id")?.to_owned())
+    }
+
     fn diagnostic(&self) -> DiagnosticTransport<'_, T> {
         DiagnosticTransport {
             transport: &self.transport,
@@ -1060,6 +1199,139 @@ mod tests {
 
     fn page(nodes: Value, next: bool, cursor: Value) -> Value {
         json!({"node":{"connection":{"nodes":nodes,"pageInfo":{"hasNextPage":next,"endCursor":cursor}}}})
+    }
+
+    #[test]
+    fn status_publication_validates_before_writing() {
+        for status in ["on-track", "at-risk", "off-track"] {
+            let native = status.replace('-', "_").to_uppercase();
+            let github = GitHub {
+                owner: "example".into(),
+                number: 1,
+                transport: Recorded {
+                    responses: RefCell::new(VecDeque::from([
+                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
+                        json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+                        json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":"Report","status":native}}}),
+                    ])),
+                    variables: RefCell::new(vec![]),
+                },
+            };
+            assert_eq!(github.status_update(status, Some("Report")).unwrap(), "U");
+            assert_eq!(
+                github.transport.variables.borrow()[2],
+                json!({"project":"P","body":"Report","status":native})
+            );
+            for body in [
+                "".to_owned(),
+                " ".to_owned(),
+                "x".repeat(STATUS_BODY_LIMIT + 1),
+            ] {
+                assert!(github.status_update(status, Some(&body)).is_err());
+            }
+            assert!(github.status_update("unknown", Some("Report")).is_err());
+            assert_eq!(github.transport.variables.borrow().len(), 3);
+        }
+    }
+
+    #[test]
+    fn summary_is_sorted_and_since_last_update() {
+        let make = |number, created, updated, closed| json!({"content":{"__typename":"Issue","repository":{"nameWithOwner":"example/repo"},"number":number,"createdAt":created,"updatedAt":updated,"closedAt":closed}});
+        let old = "2026-10-01T00:00:00Z";
+        let cutoff = "2026-10-02T00:00:00Z";
+        let new = "2026-10-03T00:00:00Z";
+        let items = vec![
+            make(3, old, new, Some(new)),
+            make(2, new, new, None),
+            make(1, old, new, None),
+            make(4, old, cutoff, None),
+        ];
+        let body = status_summary(&items, Some(cutoff)).unwrap();
+        assert_eq!(
+            body,
+            format!(
+                "Project activity since {cutoff}:\n- example/repo#1 (Issue): updated\n- example/repo#2 (Issue): created\n- example/repo#3 (Issue): closed\n"
+            )
+        );
+        let mut reversed = items.clone();
+        reversed.reverse();
+        assert_eq!(status_summary(&reversed, Some(cutoff)).unwrap(), body);
+        assert!(
+            status_summary(&[], None)
+                .unwrap()
+                .contains("first status update")
+        );
+        assert!(status_summary(&[json!({"content":null})], None).is_err());
+        assert!(status_summary(&items, Some("bad date")).is_err());
+        assert!(validate_status_body(&"é".repeat(STATUS_BODY_LIMIT)).is_ok());
+        let mut pr = make(5, new, new, None);
+        pr["content"]["__typename"] = json!("PullRequest");
+        assert!(
+            status_summary(&[pr], Some(cutoff))
+                .unwrap()
+                .contains("(PullRequest): created")
+        );
+        let many: Vec<_> = (1..200)
+            .map(|number| make(number, new, new, None))
+            .collect();
+        assert!(
+            status_summary(&many, None)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+        let mut missing = make(1, old, new, None);
+        missing["content"]
+            .as_object_mut()
+            .unwrap()
+            .remove("closedAt");
+        assert!(status_summary(&[missing], None).is_err());
+    }
+
+    #[test]
+    fn generated_status_publication_and_refusals() {
+        for case in [
+            "valid",
+            "wrong-project",
+            "incomplete",
+            "redacted",
+            "receipt",
+        ] {
+            let url = if case == "wrong-project" {
+                "https://github.com/orgs/other/projects/1"
+            } else {
+                "https://github.com/orgs/example/projects/1"
+            };
+            let body = "Project activity since 2026-10-02T00:00:00Z:\n\nNo issue or pull request activity.\n";
+            let github = GitHub {
+                owner: "example".into(),
+                number: 1,
+                transport: Recorded {
+                    responses: RefCell::new(VecDeque::from([
+                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":url}}}),
+                        json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}),
+                        json!({"node":{"statusUpdates":{"nodes":[{"createdAt":"2026-10-02T00:00:00Z"},{"createdAt":"2026-10-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}}),
+                        json!({"node":{"items":{"nodes":if case == "redacted" {json!([{"content":null}])} else {json!([])},"pageInfo":{"hasNextPage":case == "incomplete","endCursor":null}}}}),
+                        json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":if case == "receipt" {"wrong"} else {body},"status":"ON_TRACK"}}}),
+                    ])),
+                    variables: RefCell::new(vec![]),
+                },
+            };
+            let result = github.status_update("on-track", None);
+            assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
+            let count = github.transport.variables.borrow().len();
+            assert_eq!(
+                count,
+                match case {
+                    "wrong-project" => 2,
+                    "incomplete" | "redacted" => 4,
+                    _ => 5,
+                }
+            );
+            if case == "valid" {
+                assert_eq!(github.transport.variables.borrow()[4]["body"], body);
+            }
+        }
     }
 
     #[test]
