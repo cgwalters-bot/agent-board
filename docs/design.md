@@ -307,6 +307,11 @@ dispatch automatically. `project init` creates missing Turn/Run/Result
 fields with the operator's own token and never edits existing fields or options. No workflow permissions, token
 placement or action pins are changed in this patch.
 
+For read-only setup, `project init --snapshot FILE` retains its field table on
+stdout and prints copyable `gh project field-create` commands for missing fields
+on stderr. It does not execute them; review the saved schema against the live
+project first. Existing fields and optional Status options are not provisioned.
+
 **A — Extension distribution.** Recommend keeping source in agent-board and creating a release-only gh-agent-board distribution repository. Alternative: rename source to gh-agent-board to avoid a second release destination.
 
 **B — Initial authority and turn.** Recommend the strict four mutation types above, project Turn, operator approval before execution, and no coordinator-native assignment/comment/parent writes. Alternative: explicitly add narrowly bounded comments, two known assignees and same-owner sub-issue links after agentic-job validates them. This is an authority expansion, not an implementation detail.

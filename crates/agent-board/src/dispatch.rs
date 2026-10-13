@@ -185,6 +185,11 @@ fn require_join_schema(snapshot: &Snapshot) -> Result<()> {
 // The error is a command to copy, and a snapshot file may come from elsewhere: print
 // only a login-syntax owner and a numeric project, else placeholders.
 fn init_args(snapshot: &Snapshot) -> String {
+    let (owner, number) = init_target(snapshot);
+    format!("--owner {owner} --project {number}")
+}
+
+fn init_target(snapshot: &Snapshot) -> (&str, &str) {
     let segments: Vec<_> = snapshot
         .project
         .path_segments()
@@ -192,9 +197,9 @@ fn init_args(snapshot: &Snapshot) -> String {
         .unwrap_or_default();
     match segments.as_slice() {
         [_, owner, "projects", number] if is_github_login(owner) && positive_id(number) => {
-            format!("--owner {owner} --project {number}")
+            (owner, number)
         }
-        _ => "--owner OWNER --project NUMBER".into(),
+        _ => ("OWNER", "NUMBER"),
     }
 }
 
@@ -225,9 +230,21 @@ pub fn init_plan(snapshot: &Snapshot, out: &mut impl Write) -> Result<()> {
         init_row(out, field, !absent, "missing")?;
     }
     if !missing.is_empty() {
+        let (owner, number) = init_target(snapshot);
         eprintln!(
-            "Plan only: a snapshot is not changed; run project init against the live project to create the missing fields."
+            "Plan only: a snapshot is not changed; review these commands against the live project before running them:"
         );
+        for field in missing {
+            let options = if field.created.is_empty() {
+                String::new()
+            } else {
+                format!(" --single-select-options {}", field.created.join(","))
+            };
+            eprintln!(
+                "gh project field-create {number} --owner {owner} --name {} --data-type {}{options}",
+                field.name, field.data_type
+            );
+        }
     }
     Ok(())
 }

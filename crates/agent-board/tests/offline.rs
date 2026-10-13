@@ -309,15 +309,28 @@ fn project_init_plan_and_dispatch_hint_table() {
         .as_array_mut()
         .unwrap()
         .push(serde_json::json!({"name":"Turn","dataType":"TEXT"}));
+    let mut ready = default_board.clone();
+    ready.as_array_mut().unwrap().extend([
+        serde_json::json!({"name":"Turn","dataType":"SINGLE_SELECT","options":[{"name":"Coordinator"},{"name":"Worker"},{"name":"Operator"}]}),
+        serde_json::json!({"name":"Run","dataType":"TEXT"}),
+        serde_json::json!({"name":"Result","dataType":"TEXT"}),
+    ]);
     for (fields, complete, code, stdout, stderr) in [
         (
             &default_board,
             true,
             0,
             "Status\tSINGLE_SELECT\tpresent\t\nTurn\tSINGLE_SELECT\tmissing\tCoordinator, Worker, Operator, External, None\nRun\tTEXT\tmissing\t\nResult\tTEXT\tmissing\t\n",
-            "Plan only",
+            "gh project field-create 1 --owner example --name Turn --data-type SINGLE_SELECT --single-select-options Coordinator,Worker,Operator,External,None\ngh project field-create 1 --owner example --name Run --data-type TEXT\ngh project field-create 1 --owner example --name Result --data-type TEXT",
         ),
         (&default_board, false, 1, "", "incomplete snapshot"),
+        (
+            &ready,
+            true,
+            0,
+            "Status\tSINGLE_SELECT\tpresent\t\nTurn\tSINGLE_SELECT\tpresent\t\nRun\tTEXT\tpresent\t\nResult\tTEXT\tpresent\t\n",
+            "",
+        ),
         (
             &text_turn,
             true,
@@ -349,7 +362,11 @@ fn project_init_plan_and_dispatch_hint_table() {
             .get_output()
             .clone();
         assert_eq!(String::from_utf8(output.stdout).unwrap(), stdout);
-        assert!(String::from_utf8(output.stderr).unwrap().contains(stderr));
+        let diagnostic = String::from_utf8(output.stderr).unwrap();
+        assert!(diagnostic.contains(stderr));
+        if stderr.is_empty() || code != 0 {
+            assert!(!diagnostic.contains("gh project field-create"));
+        }
     }
     // A default board lacks only fields init can create; dispatch names the command.
     write(&default_board, true);
