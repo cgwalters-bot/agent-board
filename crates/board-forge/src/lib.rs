@@ -1,5 +1,6 @@
-//! Read adapters and proposal lowering. The CLI's opt-in staging fixture alone
-//! orchestrates mutations through the shared GitHub transport.
+//! Read adapters and proposal lowering. Mutations are orchestrated only by the CLI's
+//! operator commands (`project init`, `item add`/`item edit --apply`) and its opt-in
+//! staging fixture, through the shared GitHub transport.
 use anyhow::{Result, ensure};
 use board_core::{Capability, Intent, Plan, Snapshot};
 use serde_json::{Value, json};
