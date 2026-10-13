@@ -51,7 +51,7 @@ cargo build --locked --release -p agent-board
 Measured cold release build: 54.30 s. Do not run the live workflow's `test project`
 invocation in a sandbox: it needs GitHub network access and a staging write token,
 and creates/modifies forge objects. No current test requires root. See
-[README live-test status](README.md#what-is-real-today) and
+[README commands](README.md#commands) and
 [design implementation limits](docs/design.md#current-implementation-limits).
 
 ## Code conventions
