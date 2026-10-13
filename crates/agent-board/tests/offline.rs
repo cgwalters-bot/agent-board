@@ -1183,7 +1183,43 @@ fn poll_guard_table() {
     ];
     // Each fails before any request: no case here reaches the network.
     for (args, token, code, reason) in [
-        (vec!["--follow", "o/r"], true, 1, "pass --dry-run"),
+        (
+            vec!["--follow", "o/r"],
+            true,
+            1,
+            "pass --dry-run or --apply",
+        ),
+        (
+            vec!["--apply", "--follow", "o/r"],
+            true,
+            1,
+            "--dispatch-workflow <FILE>",
+        ),
+        (
+            vec![
+                "--apply",
+                "--dry-run",
+                "--dispatch-workflow",
+                "dispatch.yml",
+                "--follow",
+                "o/r",
+            ],
+            true,
+            1,
+            "cannot be used with",
+        ),
+        (
+            vec![
+                "--apply",
+                "--dispatch-workflow",
+                "../x.yml",
+                "--follow",
+                "o/r",
+            ],
+            true,
+            1,
+            "invalid workflow",
+        ),
         (
             vec!["--dry-run", "--follow", "o/r"],
             false,
