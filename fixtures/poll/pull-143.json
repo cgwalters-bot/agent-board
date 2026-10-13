@@ -1,0 +1,333 @@
+{
+  "id": "PR_kwDOUubGLM8AAAABHOnoIQ",
+  "number": 143,
+  "url": "https://github.com/cgwalters-forge/agentic-job/pull/143",
+  "title": "world-write: Load the BPF program with bpftool alone",
+  "isDraft": true,
+  "mergeable": "MERGEABLE",
+  "headRefOid": "bd5ba35f18427151d7e72dd01ddf3d70e6afdb83",
+  "headRefName": "bot/aj-136-bpftool",
+  "isCrossRepository": false,
+  "author": {
+    "login": "cgwalters-bot"
+  },
+  "headRepositoryOwner": {
+    "login": "cgwalters-forge"
+  },
+  "labels": {
+    "nodes": []
+  },
+  "autoMergeRequest": null,
+  "mergeQueueEntry": null,
+  "commits": {
+    "nodes": [
+      {
+        "commit": {
+          "oid": "bd5ba35f18427151d7e72dd01ddf3d70e6afdb83",
+          "statusCheckRollup": {
+            "contexts": {
+              "nodes": [
+                {
+                  "__typename": "CheckRun",
+                  "name": "docs",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215624",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "world-write (walk)",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495638/job/113098213940",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "world-write (lsm)",
+                  "status": "COMPLETED",
+                  "conclusion": "FAILURE",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495638/job/113098214163",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "rust",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215769",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "session-sandbox",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215634",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "corpus",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215615",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "egress",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215730",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "release-pin",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215684",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "static / build",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215856",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "safe-outputs",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215837",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "sandbox (0)",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215879",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "sandbox (1)",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215670",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "sandbox (2)",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215961",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "sandbox (3)",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215971",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "secure-host / build",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215613",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "secure-host-options",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215792",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "secure-host-published",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098216902",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-full / policy",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215655",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-full / agent",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099906394",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-full / notify",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099907770",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-full / check",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113100663406",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-full / apply",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113101061973",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-full / conclude",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113101267889",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-limit / policy",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215993",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-limit / agent",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113100163401",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-limit / notify",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113100165016",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-limit / check",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113101313413",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-limit / apply",
+                  "status": "COMPLETED",
+                  "conclusion": "SUCCESS",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113101924513",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-limit / conclude",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113102785091",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-event / policy",
+                  "status": "COMPLETED",
+                  "conclusion": "FAILURE",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113098215617",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-event / agent",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099545362",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-event / notify",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099545563",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-event / check",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099546510",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-event / apply",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099546661",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-event / conclude",
+                  "status": "COMPLETED",
+                  "conclusion": "SKIPPED",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113099547445",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "e2e-verify",
+                  "status": "COMPLETED",
+                  "conclusion": "FAILURE",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113102784286",
+                  "isRequired": false
+                },
+                {
+                  "__typename": "CheckRun",
+                  "name": "ci",
+                  "status": "COMPLETED",
+                  "conclusion": "FAILURE",
+                  "detailsUrl": "https://github.com/cgwalters-forge/agentic-job/actions/runs/37711495693/job/113103536425",
+                  "isRequired": false
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  }
+}

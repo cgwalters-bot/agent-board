@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
 pub const DEFAULT_HOST: &str = "github.com";
+/// The only origin a REST request carries the token to.
+pub const API_ROOT: &str = "https://api.github.com/";
 
 /// Interpret GitHub syntax only for the explicitly selected GitHub host.
 pub fn parse_github_item(input: &str, repository: Option<&str>, host: &str) -> Result<ItemRef> {
@@ -467,6 +469,57 @@ impl Transport for Client {
             Err(error) => return Err(error).context("decode GitHub GraphQL response"),
         };
         http_response_data(status, body)
+    }
+}
+
+impl crate::poll::Rest for Client {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+        // A `Link` header or a cached URL must not carry the token elsewhere.
+        ensure!(
+            url.starts_with(API_ROOT),
+            "refusing to send the token outside {API_ROOT}"
+        );
+        let mut request = self
+            .agent
+            .get(url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("User-Agent", "agent-board")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some((name, value)) = validator {
+            request = request.header(name, value);
+        }
+        let mut response = request.call().map_err(transport_error)?;
+        let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let (etag, last_modified) = (header("etag"), header("last-modified"));
+        let link = header("link");
+        let path = url.trim_start_matches(API_ROOT);
+        let body = match status {
+            304 => Value::Null,
+            200..300 => response
+                .body_mut()
+                .read_json()
+                .with_context(|| format!("decode GET {path}"))?,
+            401 => {
+                return Err(anyhow::Error::from(AuthenticationRequired)
+                    .context(format!("GET {path}: GitHub HTTP status 401")));
+            }
+            _ => anyhow::bail!("GET {path}: GitHub HTTP status {status}"),
+        };
+        Ok(crate::poll::RestResponse {
+            status,
+            etag,
+            last_modified,
+            link,
+            body,
+        })
     }
 }
 
