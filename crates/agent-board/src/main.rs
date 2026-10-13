@@ -2,6 +2,7 @@ mod ask;
 mod dispatch;
 mod item;
 mod live;
+mod poll;
 
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{Capability, Policy, Snapshot};
@@ -98,6 +99,8 @@ enum Command {
         #[command(subcommand)]
         command: Output,
     },
+    /// Preview one pass of the pull request poll and say when the next is due.
+    Poll(poll::Poll),
     /// Run the credential-bearing staging integration test.
     Test {
         #[command(subcommand)]
@@ -566,6 +569,28 @@ fn execute(cli: Cli) -> Result<()> {
                 eprintln!("Preview only; not applied.");
                 render(serde_json::to_value(plan)?, &cli)
             }
+        }
+        Command::Poll(args) => {
+            ensure!(
+                cli.json.is_none(),
+                "poll prints lines; --json is unsupported"
+            );
+            ensure!(
+                cli.repo.is_none(),
+                "poll takes --follow and --watch, not --repo"
+            );
+            poll::run(args, || {
+                // Every repository on the board, upstream included, is watched.
+                if cli.snapshot.is_none() && cli.owner.is_none() && cli.project.is_none() {
+                    return Ok(Vec::new());
+                }
+                Ok(load(&cli)?
+                    .items
+                    .iter()
+                    .filter(|item| item.identity.host == board_forge::github::DEFAULT_HOST)
+                    .map(|item| item.identity.repository.clone())
+                    .collect())
+            })
         }
         Command::Test {
             command: Test::Project(options),

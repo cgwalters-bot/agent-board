@@ -1,11 +1,12 @@
 //! Read adapters and proposal lowering. Mutations are orchestrated only by the CLI's
 //! operator commands (`project init`, `item add`/`item edit`/`ask --apply`) and its opt-in
-//! staging fixture, through the shared GitHub transport.
+//! staging fixture, through the shared GitHub transport. `poll` only previews its steps.
 use anyhow::{Result, ensure};
 use board_core::{Capability, Intent, Plan, Snapshot};
 use serde_json::{Value, json};
 
 pub mod github;
+pub mod poll;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 
 pub trait Forge {

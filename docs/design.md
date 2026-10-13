@@ -225,6 +225,26 @@ fetches their nested connections inline (at most 100 entries each); additional
 pages or redacted/missing connection data mark the item and snapshot incomplete,
 blocking reconciliation rather than treating a partial list as complete.
 
+`agent-board poll --dry-run` is the first slice of the tracker's pull request
+poll (#40): it prints the operator's and the bot's activity from each watched
+repository's events, a proposed step for each of the bot's open pull
+requests (keyed on the latest submitted review of the head by the operator, not
+a status and a VERDICT comment), and when the next pass is due (five minutes
+while anything changed or a pull request is in flight, doubling while idle, at
+most six hours apart). GETs are conditional against a disposable state file; the
+pull request query is GraphQL and is not. It takes no step: marking ready, fix
+dispatch, merging and `needs-human` stay in poll.cjs until the preview has been
+compared with it. Authenticated review-job verdicts are deferred: the shared
+Actions bot identity does not establish which workflow submitted a review.
+Job-only approvals and change requests therefore wait for an operator verdict,
+unlike poll.cjs; recorded job-only cases test this limitation separately from
+synthetic operator-verdict decisions. Activity is printed, not yet handed to a controller pass, and
+the events API serves one page of 100 a pass, so a busier gap is reported as
+such. A pull request with more labels, reviews, commits or checks than its one
+query reads waits rather than being decided on part of them. Required checks come from the base branch's rulesets and its classic
+protection; a required check that never reported is pending, and a protected
+branch whose requirements cannot be read is an error. It has been exercised against recorded responses only.
+
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done
 only for `COMPLETED`, Cancelled for `NOT_PLANNED`; an unknown reason blocks repair.

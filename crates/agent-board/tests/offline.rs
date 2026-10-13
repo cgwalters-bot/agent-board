@@ -1164,3 +1164,78 @@ fn ask_preview_and_list_table() {
         assert!(error.contains(stderr), "{args:?}: {error}");
     }
 }
+
+#[test]
+fn poll_guard_table() {
+    let dir = std::env::temp_dir().join(format!("agent-board-poll-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("state.json");
+    std::fs::write(&corrupt, r#"{"schema":"other"}"#).unwrap();
+    let corrupt = corrupt.to_str().unwrap();
+    let base = [
+        "poll",
+        "--operator",
+        "cgwalters",
+        "--bot",
+        "cgwalters-bot",
+        "--dispatch-repo",
+        "cgwalters-forge/tracker",
+    ];
+    // Each fails before any request: no case here reaches the network.
+    for (args, token, code, reason) in [
+        (vec!["--follow", "o/r"], true, 1, "pass --dry-run"),
+        (
+            vec!["--dry-run", "--follow", "o/r"],
+            false,
+            4,
+            "authentication",
+        ),
+        (vec!["--dry-run"], true, 1, "at least one repository"),
+        (
+            vec!["--dry-run", "--follow", "o/r/../x"],
+            true,
+            1,
+            "invalid repository",
+        ),
+        (
+            vec!["--dry-run", "--watch", "o/r?per_page=1"],
+            true,
+            1,
+            "invalid repository",
+        ),
+        (
+            vec!["--dry-run", "--follow", "o/r", "--json", "x"],
+            true,
+            1,
+            "--json is unsupported",
+        ),
+        (
+            vec!["--dry-run", "--follow", "o/r", "--state", corrupt],
+            true,
+            1,
+            "may be deleted",
+        ),
+    ] {
+        let mut command = command();
+        command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
+        if token {
+            command.env("GH_TOKEN", "unused");
+        }
+        let output = command
+            .args(base)
+            .args(&args)
+            .assert()
+            .code(code)
+            .stdout("")
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(reason), "{args:?}: {stderr}");
+    }
+    // A refused pass leaves the state as it was.
+    assert_eq!(
+        std::fs::read_to_string(corrupt).unwrap(),
+        r#"{"schema":"other"}"#
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
