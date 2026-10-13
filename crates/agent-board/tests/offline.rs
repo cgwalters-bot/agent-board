@@ -1239,3 +1239,66 @@ fn poll_guard_table() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn dispatch_plan_guard_table() {
+    let base = [
+        "dispatch",
+        "cgwalters-forge/tracker#540",
+        "--caller",
+        "cgwalters-forge/tracker",
+        "--operator",
+        "cgwalters",
+    ];
+    // Each fails before any request: no case here reaches the network.
+    for (args, token, code, reason) in [
+        (vec![], true, 1, "pass --dry-run"),
+        (vec!["--dry-run"], false, 4, "authentication"),
+        (
+            vec!["--dry-run", "--ref", "a..b"],
+            true,
+            1,
+            "invalid caller ref",
+        ),
+        (
+            vec!["--dry-run", "--planner", "bad/login"],
+            true,
+            1,
+            "invalid login",
+        ),
+        (
+            vec!["--dry-run", "--json", "x"],
+            true,
+            1,
+            "--json is unsupported",
+        ),
+        (
+            vec!["--dry-run", "--snapshot", "fixtures/board.json"],
+            true,
+            1,
+            "not a snapshot",
+        ),
+        (
+            vec!["--dry-run", "--hostname", "github.example"],
+            true,
+            1,
+            "plans are read only from github.com",
+        ),
+    ] {
+        let mut command = command();
+        command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");
+        if token {
+            command.env("GH_TOKEN", "unused");
+        }
+        let output = command
+            .args(base)
+            .args(&args)
+            .assert()
+            .code(code)
+            .stdout("")
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(reason), "{args:?}: {stderr}");
+    }
+}
