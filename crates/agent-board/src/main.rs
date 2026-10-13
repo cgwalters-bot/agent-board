@@ -110,6 +110,15 @@ enum Project {
     View,
     /// Create the Turn, Run and Result fields dispatch needs, if missing (writes).
     Init,
+    /// Publish a project status update (writes; requires project write permission).
+    StatusUpdate {
+        /// Overall project health: on-track, at-risk or off-track.
+        #[arg(long, value_parser = ["on-track", "at-risk", "off-track"])]
+        status: String,
+        /// Read the update body from a UTF-8 file; otherwise summarize since the last update.
+        #[arg(long)]
+        body: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -362,6 +371,30 @@ fn execute(cli: Cli) -> Result<()> {
             } else {
                 dispatch::init(&github(&cli)?, &mut io::stdout().lock())
             }
+        }
+        Command::Project {
+            command: Project::StatusUpdate { status, body },
+        } => {
+            ensure!(
+                cli.snapshot.is_none(),
+                "status-update requires a live project"
+            );
+            ensure!(cli.json.is_none(), "status-update does not support --json");
+            let body = body
+                .as_ref()
+                .map(|path| {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .with_context(|| format!("open {}", path.display()))?
+                        .take((board_forge::github::STATUS_BODY_LIMIT * 4 + 1) as u64)
+                        .read_to_end(&mut bytes)?;
+                    String::from_utf8(bytes).context("status body must be UTF-8")
+                })
+                .transpose()?;
+            let id = github(&cli)?.status_update(status, body.as_deref())?;
+            writeln!(io::stdout().lock(), "{id}")?;
+            Ok(())
         }
         Command::Item {
             command: Item::List(args),

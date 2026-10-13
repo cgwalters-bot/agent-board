@@ -10,6 +10,43 @@ fn fixture() -> String {
 }
 
 #[test]
+fn status_update_cli_refusals() {
+    for (args, reason) in [
+        (vec!["project", "status-update"], "--status"),
+        (
+            vec!["project", "status-update", "--status", "unknown"],
+            "invalid value",
+        ),
+        (
+            vec![
+                "project",
+                "status-update",
+                "--status",
+                "on-track",
+                "--snapshot",
+                &fixture(),
+            ],
+            "requires a live project",
+        ),
+        (
+            vec![
+                "project",
+                "status-update",
+                "--status",
+                "at-risk",
+                "--json",
+                "project",
+            ],
+            "does not support --json",
+        ),
+    ] {
+        let output = command().args(args).assert().code(1).get_output().clone();
+        assert!(String::from_utf8(output.stderr).unwrap().contains(reason));
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
 fn proposal_check_cli_table() {
     let snapshot = format!(
         "{}/../../fixtures/assigned-board.json",
