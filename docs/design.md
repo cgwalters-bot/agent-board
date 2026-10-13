@@ -17,7 +17,7 @@ Each item has one canonical issue and one project membership, keyed by native id
 |---|---|---|
 | Item | Issue title/body and native identity; project membership | Acceptance criteria live in the body. Membership defines managed work; enrollment repairs omissions. |
 | Epic and children | Issue with an existing epic label; native sub-issue relation | Decomposition is not a dependency or permission. Unclassified work need not have a parent. |
-| Status | Project single-select: Triage, Backlog, Todo, In Progress, Draft, In Review, Blocked, Done, Cancelled | Triage replaces null. Draft means a result awaits operator review, not a GitHub draft item. Terminal status requires evidence. |
+| Status | Project single-select: Triage, Backlog, Todo, In Progress, Draft, In Review, Blocked, Needs human, Done, Cancelled | Triage replaces null. Draft means a result awaits operator review, not a GitHub draft item. Needs human marks an open ask and the items it blocks. Terminal status requires evidence. |
 | Priority | Project single-select: P0, P1, P2 | P0 blocks current work; P1 active focus; P2 parked. No mirrored priority labels. |
 | Whose turn | Project single-select Turn: Coordinator, Worker, Operator, External, None | Canonical coordination signal. Native assignees remain human ownership, not a second turn field. |
 | Operator ask | One issue per decision, with question, lettered alternatives and blocked URLs; Ask text field links it | Operator answers on the issue. Existing PR review threads can be linked instead of creating duplicate asks. |
@@ -306,6 +306,16 @@ conversion or stuck-run recovery is implemented yet. Do not retry an ambiguous
 dispatch automatically. `project init` creates missing Turn/Run/Result
 fields with the operator's own token and never edits existing fields or options. No workflow permissions, token
 placement or action pins are changed in this patch.
+
+`ask create` opens a question issue, labelled `question` and assigned to the
+operator, with lettered options and a recommendation, and sets it and the item it
+blocks to Needs human; `ask list` shows open asks on the board; `ask resolve` comments
+the answer, closes the ask and sets it Done. They replace homegit's `bot-board
+question` and `resolve`, and like `item edit` print proposals unless the operator
+passes `--apply` with their own token. The label and the Status option must already
+exist; neither is created, and the operator must be assignable in the ask's repository.
+Resolving leaves the blocked item's Status to whoever acts on the answer. Asks on pull requests (homegit's review asks), sub-issue
+links and copying the blocked item's Priority are not implemented.
 
 For read-only setup, `project init --snapshot FILE` retains its field table on
 stdout and prints copyable `gh project field-create` commands for missing fields

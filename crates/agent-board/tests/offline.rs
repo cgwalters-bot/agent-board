@@ -520,8 +520,9 @@ fn first_run_help_and_summary() {
         (
             vec!["--help"],
             "Preview deterministic board repairs",
-            "  ask ",
+            "  output ",
         ),
+        (vec!["--help"], "Ask the operator a question", "  output "),
         (
             vec!["item", "--help"],
             "including closed issues",
@@ -1017,4 +1018,149 @@ fn machine_errors_table() {
         ])
         .assert()
         .code(1);
+}
+
+#[test]
+fn ask_preview_and_list_table() {
+    let mut board: Value =
+        serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+    board["fields"][0]["options"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"name":"Needs human"}));
+    board["items"][1]["labels"] = serde_json::json!(["question"]);
+    let mut closed = board["items"][1].clone();
+    closed["identity"]["number"] = 3.into();
+    closed["state"] = "closed".into();
+    closed["state_reason"] = "COMPLETED".into();
+    closed["status"] = "Done".into();
+    board["items"].as_array_mut().unwrap().push(closed);
+    let update = |number: u64, status: &str| {
+        format!(
+            "{{\"content_number\":{number},\"content_type\":\"issue\",\"fields\":{{\"Status\":\"{status}\"}},\"project\":\"https://github.com/orgs/example/projects/1\",\"target_repo\":\"example/intake\",\"type\":\"update_project\"}}\n"
+        )
+    };
+    // A snapshot only previews: nothing here has a token, and none is asked for.
+    for (args, code, stdout, stderr) in [
+        (
+            vec!["ask", "list"],
+            0,
+            "ITEM\tSTATUS\tPRIORITY\tTURN\tTITLE\nexample/intake#2\tTriage\tP1\tCoordinator\tAlready triaged\n".to_owned(),
+            "",
+        ),
+        (
+            vec!["ask", "list", "--json", "number,labels", "--jq", ".[].number"],
+            0,
+            "2\n".to_owned(),
+            "",
+        ),
+        (
+            vec!["ask", "create", "Ok?", "--item", "example/intake#1", "--assignee", "op", "-R", "example/tracker"],
+            0,
+            format!(
+                "{}\n{}",
+                r#"{"assignees":["op"],"body":"Blocks: `https://github.com/example/intake/issues/1`\n\nQ: Ok?\n\nReply with your answer in free text. Only comments by @op count.\n","labels":["question"],"target_repo":"example/tracker","title":"Ok?","type":"create_issue"}"#,
+                update(1, "Needs human")
+            ),
+            "not applied",
+        ),
+        (
+            vec!["ask", "create", "Ok?", "--item", "example/intake#9", "--assignee", "op"],
+            1,
+            String::new(),
+            "example/intake#9 is not on the board",
+        ),
+        (
+            vec!["ask", "create", "Ok?", "--item", "example/intake#1", "--assignee", "op", "--apply"],
+            1,
+            String::new(),
+            "cannot use --snapshot",
+        ),
+        (
+            vec!["ask", "resolve", "example/intake#2", "Use A."],
+            0,
+            format!(
+                "{}\n{}",
+                r#"{"body":"Use A.","issue_number":2,"target_repo":"example/intake","type":"close_issue"}"#,
+                update(2, "Done")
+            ),
+            "not applied",
+        ),
+        (
+            vec!["ask", "resolve", "example/intake#1", "Use A."],
+            1,
+            String::new(),
+            "not labelled question",
+        ),
+        (
+            vec!["ask", "resolve", "example/intake#3", "Use A."],
+            1,
+            String::new(),
+            "already closed",
+        ),
+        (
+            vec!["ask", "resolve", "https://github.com/example/intake/pull/2", "A"],
+            1,
+            String::new(),
+            "not pull requests",
+        ),
+        (
+            vec!["ask", "resolve", "example/intake#2", "A", "--json", "url"],
+            1,
+            String::new(),
+            "--json is unsupported",
+        ),
+    ] {
+        let output = command()
+            .args(&args)
+            .args(["--snapshot", "/dev/stdin"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .write_stdin(board.to_string())
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), stdout, "{args:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(stderr), "{args:?}: {error}");
+    }
+    // Live asks are refused before a token is read, and a token is then required.
+    for (args, code, stderr) in [
+        (
+            vec![
+                "ask",
+                "create",
+                "Q?",
+                "--item",
+                "example/intake#1",
+                "--assignee",
+                "a;b",
+            ],
+            1,
+            "invalid GitHub login",
+        ),
+        (
+            vec!["ask", "resolve", "example/intake#2", " "],
+            1,
+            "the answer is empty",
+        ),
+        (
+            vec!["ask", "resolve", "example/intake#2", "A"],
+            4,
+            "authentication required",
+        ),
+    ] {
+        let output = command()
+            .args(&args)
+            .args(["--owner", "example", "--project", "1", "--apply"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(stderr), "{args:?}: {error}");
+    }
 }
