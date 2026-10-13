@@ -116,7 +116,10 @@ enum Item {
     /// List board items, including closed issues by default.
     List(List),
     /// Inspect an item by URL, OWNER/REPO#N, or N with --repo.
-    View { item: String },
+    View {
+        /// Item URL, OWNER/REPO#N, or N with --repo.
+        item: String,
+    },
     #[command(hide = true)]
     Add { url: String },
     #[command(hide = true)]
@@ -204,6 +207,7 @@ enum Output {
 enum Check {
     /// Refuse outputs outside an identity's assignment and field policy.
     Proposals {
+        /// Identity from the policy whose bounds the proposals must stay within.
         #[arg(long = "as")]
         identity: String,
         /// JSONL proposals file; reads stdin when omitted.
@@ -668,4 +672,37 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
         writeln!(out)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// Every visible command and argument must say what it does in --help;
+    /// unimplemented commands stay hidden instead.
+    #[test]
+    fn help_describes_every_visible_command_and_argument() {
+        fn walk(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                if !arg.is_hide_set() && arg.get_help().is_none() {
+                    missing.push(format!("{path} {}", arg.get_id()));
+                }
+            }
+            for sub in command.get_subcommands() {
+                if sub.is_hide_set() {
+                    continue;
+                }
+                let path = format!("{path} {}", sub.get_name());
+                if sub.get_about().is_none() {
+                    missing.push(path.clone());
+                }
+                walk(sub, &path, missing);
+            }
+        }
+        let mut command = super::Cli::command();
+        command.build();
+        let mut missing = Vec::new();
+        walk(&command, "agent-board", &mut missing);
+        assert!(missing.is_empty(), "undocumented in --help: {missing:?}");
+    }
 }
