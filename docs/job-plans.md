@@ -65,11 +65,34 @@ can ask only for what they allow; a plan is a proposal, not write authority.
 ## Dispatch
 
 ```sh
-agent-board dispatch cgwalters-forge/tracker#540 --dry-run \
-  --caller cgwalters-forge/tracker --operator cgwalters --planner cgwalters-bot
+agent-board dispatch "$ISSUE" --dry-run \
+  --caller "$CALLER" --workflow "$WORKFLOW" --operator "$OPERATOR" --planner "$PLANNER"
 ```
 
 prints the `workflow_dispatch` REST request (method, URL and JSON body) that
-would start the caller's `dispatch.yml` at `--ref` (default `main`), and names
-the plan's comment on stderr. It needs a token that can read the issue.
-Without `--dry-run` it refuses: sending the request is not implemented yet.
+would start the caller's `--workflow` at `--ref` (default `main`), and names
+the plan's comment on stderr. It needs a token that can read the issue. The
+caller, workflow and logins come from the caller's own configuration (its
+repository variables), never from a plan or a dispatcher's inputs.
+
+`--apply` sends that request, once per plan. A plan is its comment and the
+time that comment last changed, so a writer's edit, or a reply with a plan, is
+a new plan. Before sending, dispatch posts one comment on the issue whose
+hidden first line names the plan (`<!-- agent-board-dispatch: COMMENT-ID@TIME -->`),
+reads the comments again, and goes on only if the plan is unchanged and no
+earlier comment names it, so
+two dispatches racing on the same plan start one run as long as GitHub's reads
+show the comments posted before them; a caller that runs dispatch in one
+concurrency group does not rely on that. The comment is then edited to link
+the run, or to say why it was not started, and `record=` and (where GitHub
+names it) `run=` lines go to stdout.
+
+Records count only from the writers, so a visitor's copied marker does not
+block a plan, and `GH_TOKEN` must be a writer's user token (dispatch asks
+GitHub whose it is): two accounts that each read only their own records would
+both dispatch. A plan with a record is refused, including one whose
+dispatch failed or whose dispatcher died between record and request: an
+ambiguous dispatch is not retried, and a writer edits or replaces the plan to
+try again. Anyone who can delete comments on the issue can remove a record and
+so have its plan dispatched again. The run is started with `DISPATCH_TOKEN` if
+it is set, else with `GH_TOKEN`.

@@ -18,7 +18,7 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `item add`, `item edit` | Add an issue / set fields; write only with `--apply`. |
 | `ask create\|list\|resolve` | Put a question to the operator as a `question` issue and mark the blocked item Needs human; write only with `--apply`. |
 | `request dispatch`, `run record` | Print `gh workflow run` argv for agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md); propose Run/Result field updates. |
-| `dispatch ISSUE --dry-run` | Print the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes. `--dry-run` is required: nothing is sent yet ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)). |
+| `dispatch ISSUE --dry-run\|--apply` | Print, or send once and record on the issue, the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)). |
 | `poll --dry-run` | Preview one pass of the pull request poll and when the next is due. `--dry-run` is required: no step is taken yet ([#40](https://github.com/cgwalters-forge/agent-board/issues/40)). |
 | `test project` | Staging integration test; holds a write token. Not for local use. |
 
@@ -60,7 +60,7 @@ is needed or used for this preview.
 
 - [#40](https://github.com/cgwalters-forge/agent-board/issues/40) poll: acting on its decisions (only `--dry-run` today).
 - [#44](https://github.com/cgwalters-forge/agent-board/issues/44) promote: open the upstream PR for an approved fork PR; no command yet.
-- [#46](https://github.com/cgwalters-forge/agent-board/issues/46) dispatch from plan comments: sending the request (only `--dry-run` today).
+- [#46](https://github.com/cgwalters-forge/agent-board/issues/46) dispatch from plan comments: the triage profile emitting plans, and several plans per issue.
 - Applying proposals goes through agentic-job's independent [safe-output](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/safe-outputs.md) check/apply; not wired here.
 
 Design: [docs/design.md](docs/design.md). License: Apache-2.0 or MIT.

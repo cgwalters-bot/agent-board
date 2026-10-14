@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, ensure};
 use board_core::{Item, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
+use board_forge::poll::Rest;
 use board_forge::{is_github_login, parse_github_item, plan, validate_github_project};
 use clap::Args;
 use serde_json::{Value, json};
@@ -28,13 +29,19 @@ pub struct Dispatch {
 pub struct FromPlan {
     /// Issue whose newest accepted plan comment to dispatch: URL, OWNER/REPO#N, or N with --repo.
     issue: String,
-    /// Print the workflow_dispatch request instead of sending it; required, as nothing is sent yet.
-    #[arg(long)]
+    /// Print the workflow_dispatch request instead of sending it.
+    #[arg(long, conflicts_with = "apply")]
     dry_run: bool,
-    /// Repository whose dispatch.yml the request starts.
+    /// Send it, unless this plan has been dispatched already, and record the run in one comment on the issue, with GH_TOKEN; the run is started with DISPATCH_TOKEN if set.
+    #[arg(long)]
+    apply: bool,
+    /// Repository whose --workflow the request starts; from the caller's configuration.
     #[arg(long, value_name = "OWNER/REPO")]
     caller: String,
-    /// Ref of the caller to run dispatch.yml from.
+    /// Workflow file in --caller that takes a plan's inputs, such as dispatch.yml.
+    #[arg(long, value_name = "FILE")]
+    workflow: String,
+    /// Ref of the caller to run --workflow from.
     #[arg(long = "ref", default_value = "main")]
     git_ref: String,
     /// Login whose plans count: the operator.
@@ -344,18 +351,20 @@ pub fn prepare(snapshot: &Snapshot, args: &Dispatch, repo: Option<&str>, host: &
     Ok(())
 }
 
-/// The request that starts the job an issue's plan asks for. Every input is
-/// checked before the token is read, so a refusal never touches the network.
-pub fn from_plan<T: Transport>(
+/// The request that starts the job an issue's plan asks for: printed with
+/// `--dry-run`, sent with `--apply`. Every input is checked before a token is
+/// read, so a refusal never touches the network.
+pub fn from_plan<T: Transport + Rest>(
     args: &FromPlan,
     repo: Option<&str>,
     host: &str,
     transport: impl FnOnce() -> Result<T>,
+    dispatcher: impl FnOnce() -> Option<T>,
     out: &mut impl Write,
 ) -> Result<()> {
     ensure!(
-        args.dry_run,
-        "unsupported_capability: dispatch only prints its request; pass --dry-run"
+        args.dry_run || args.apply,
+        "dispatch sends its request only when asked; pass --dry-run or --apply"
     );
     ensure!(
         host == board_forge::github::DEFAULT_HOST,
@@ -368,10 +377,32 @@ pub fn from_plan<T: Transport>(
     for writer in &writers {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
-    plan::validate_caller(&args.caller, &args.git_ref)?;
-    let comments = plan::issue_comments(&transport()?, &issue)?;
+    let target = plan::Target {
+        caller: args.caller.clone(),
+        workflow: args.workflow.clone(),
+        git_ref: args.git_ref.clone(),
+    };
+    target.validate()?;
+    let client = transport()?;
+    if args.apply {
+        let dispatcher = dispatcher();
+        let done = plan::dispatch(
+            &client,
+            dispatcher.as_ref().unwrap_or(&client),
+            &issue,
+            &writers,
+            &target,
+        )?;
+        // Ready for `$GITHUB_OUTPUT`; GitHub does not always name the run.
+        writeln!(out, "record={}", done.record)?;
+        if let Some(run) = &done.run {
+            writeln!(out, "run={run}")?;
+        }
+        return Ok(());
+    }
+    let comments = plan::issue_comments(&client, &issue)?;
     let (plan, from) = plan::newest_plan(&comments, &writers)?;
-    let request = plan.dispatch_request(&args.caller, &args.git_ref)?;
+    let request = plan.dispatch_request(&target)?;
     serde_json::to_writer(&mut *out, &request)?;
     writeln!(out)?;
     eprintln!(
@@ -896,6 +927,18 @@ mod tests {
                     "nodes": self.0, "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}))
             }
         }
+        impl Rest for &Comments {
+            fn get(
+                &self,
+                url: &str,
+                _: Option<(&str, &str)>,
+            ) -> Result<board_forge::poll::RestResponse> {
+                anyhow::bail!("unexpected GET {url}")
+            }
+            fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
+                anyhow::bail!("unexpected {method} {url}")
+            }
+        }
         let plan = json!({"schema": plan::JOB_PLAN_SCHEMA, "repo": "ostreedev/ostree", "item": 3665,
             "kind": "research", "runner": "hosted", "brief": "Find why the test flakes."});
         let node = |login: &str| {
@@ -907,7 +950,9 @@ mod tests {
         let args = |issue: &str, dry_run: bool, caller: &str, planner: Option<&str>| FromPlan {
             issue: issue.into(),
             dry_run,
+            apply: false,
             caller: caller.into(),
+            workflow: "dispatch.yml".into(),
             git_ref: "main".into(),
             operator: "cgwalters".into(),
             planner: planner.map(Into::into),
@@ -938,7 +983,7 @@ mod tests {
                 args(issue, false, tracker, None),
                 "cgwalters",
                 0,
-                Err("pass --dry-run"),
+                Err("pass --dry-run or --apply"),
             ),
             (
                 args(issue, true, "tracker", None),
@@ -971,6 +1016,7 @@ mod tests {
                 Some("cgwalters-forge/tracker"),
                 "github.com",
                 || Ok(&transport),
+                || None,
                 &mut out,
             );
             assert_eq!(transport.1.get(), reads);
