@@ -1,5 +1,8 @@
 # Job plans
 
+For proposals of human-executed issue and PR mutations, see
+[operator actions](operator-actions.md).
+
 A job plan is a proposed agent run, written as a comment on the issue it
 serves ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)).
 Dispatch starts exactly the job the newest accepted plan describes and adds

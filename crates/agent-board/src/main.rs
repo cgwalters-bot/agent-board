@@ -1,3 +1,4 @@
+mod action;
 mod ask;
 mod dispatch;
 mod epic;
@@ -55,6 +56,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Validate proposed operator mutations; never execute them.
+    Action {
+        #[command(subcommand)]
+        command: Action,
+    },
     /// Check proposals without applying them.
     Check {
         #[command(subcommand)]
@@ -122,6 +128,12 @@ enum Epic {
     Plan(epic::Plan),
     /// Apply the newest accepted epic plan once (dry run unless --apply).
     Apply(epic::Apply),
+}
+
+#[derive(Subcommand)]
+enum Action {
+    /// Print the newest accepted proposal's typed mutations without writing.
+    Check(action::Check),
 }
 
 #[derive(Subcommand)]
@@ -321,6 +333,21 @@ fn execute(cli: Cli) -> Result<()> {
         "unsupported_capability: --template is not implemented"
     );
     match &cli.command {
+        Command::Action {
+            command: Action::Check(args),
+        } => {
+            ensure!(
+                cli.json.is_none() && cli.snapshot.is_none(),
+                "action check does not support --json or --snapshot"
+            );
+            action::check(
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
         Command::Check {
             command:
                 Check::Proposals {
