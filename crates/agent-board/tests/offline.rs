@@ -1205,6 +1205,39 @@ fn ask_preview_and_list_table() {
 fn poll_guard_table() {
     let dir = std::env::temp_dir().join(format!("agent-board-poll-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("agent-board.json");
+    std::fs::write(&config, r#"{"operator":"operator","bot":"worker","dispatchRepo":"o/tracker","follow":["o/repo"],"reviewWorkflow":"review.yml","dispatchWorkflow":"dispatch.yml","fixPools":["large"],"mergeAuthors":["updater[bot]"],"toilFixPool":"small","kindPools":{"triage":"small"}}"#).unwrap();
+    // Config-only invocation reaches the authentication guard without a request.
+    for mode in ["--dry-run", "--apply"] {
+        let output = command()
+            .args([
+                "poll",
+                mode,
+                "--config",
+                config.to_str().unwrap(),
+                "--follow",
+                "untrusted/input",
+            ])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(4)
+            .get_output()
+            .clone();
+        assert!(String::from_utf8_lossy(&output.stderr).contains("authentication"));
+    }
+    std::fs::write(
+        &config,
+        r#"{"operator":"operator","bot":"worker","dispatchRepo":"o/tracker","follow":"wrong"}"#,
+    )
+    .unwrap();
+    let output = command()
+        .args(["poll", "--dry-run", "--config", config.to_str().unwrap()])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("config follow"));
     let corrupt = dir.join("state.json");
     std::fs::write(&corrupt, r#"{"schema":"other"}"#).unwrap();
     let corrupt = corrupt.to_str().unwrap();

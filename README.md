@@ -21,7 +21,7 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `dispatch ISSUE --dry-run\|--apply` | Print, or send once and record on the issue, the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)). |
 | `epic plan ISSUE --dry-run` | Check the newest accepted [epic plan](docs/epic-plans.md) and print its mutations. |
 | `epic apply ISSUE --config FILE` | Preview an epic plan, or apply once with the bot's token and `--apply`; a claim prevents replay after partial failure. |
-| `poll --dry-run\|--apply` | Preview one pull request poll pass, or explicitly apply its steps in `--follow` repositories. Apply requires `--dispatch-workflow`; `--review-workflow` selects eligible exact-head job reviews and repeated `--fix-pool` selects fix pools. See [poll behavior and limits](docs/design.md#current-implementation-limits). |
+| `poll --dry-run\|--apply` | Preview one pull request poll pass, or explicitly apply its steps in `--follow` repositories. `--config` reads trusted repository-owned settings; apply requires `--dispatch-workflow` or the file's `dispatchWorkflow`. `--review-workflow` selects eligible exact-head job reviews and repeated `--fix-pool` selects fix pools. See [poll behavior and limits](docs/design.md#current-implementation-limits). |
 | `test project` | Staging integration test; holds a write token. Not for local use. |
 
 `output check`/`output apply` are unsupported; sweeping is disabled.
