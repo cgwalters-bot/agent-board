@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReviewContracts(unittest.TestCase):
-    def test_caller_follows_main_and_never_checks_out_the_head(self):
+    def test_caller_uses_a_release_and_never_checks_out_the_head(self):
         caller = (ROOT / ".github/workflows/review.yml").read_text()
         self.assertRegex(
             caller,
-            r"uses: cgwalters-forge/agentic-job/\.github/workflows/review\.yml@main\n",
+            r"uses: cgwalters-forge/agentic-job/\.github/workflows/review\.yml@v0\.1\.0\n",
         )
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
@@ -29,7 +29,8 @@ class ReviewContracts(unittest.TestCase):
 
     def test_third_party_uses_are_hash_pinned(self):
         # Covers step-level and job-level (reusable workflow) uses:, which
-        # zizmor's unpinned-uses does not; only cgwalters-forge follows main
+        # zizmor's unpinned-uses does not. agentic-job is referenced by release
+        # tag; other cgwalters-forge references follow main
         # (cgwalters-forge/tracker#544).
         workflows = sorted((ROOT / ".github/workflows").glob("*.yml")) + sorted((ROOT / "live").glob("*.yml"))
         self.assertTrue(workflows)
@@ -39,10 +40,17 @@ class ReviewContracts(unittest.TestCase):
                     if ref.startswith("./"):
                         continue
                     target, _, pin = ref.partition("@")
-                    if target.startswith("cgwalters-forge/"):
+                    if re.match(r"cgwalters-forge/agentic-job(/|\Z)", target):
+                        self.assertRegex(pin, r"\Av\d+\.\d+\.\d+\Z")
+                    elif target.startswith("cgwalters-forge/"):
                         self.assertEqual(pin, "main")
                     else:
                         self.assertRegex(pin, r"\A[0-9a-f]{40}\Z")
+
+    def test_dependabot_proposes_agentic_job_releases_daily(self):
+        config = (ROOT / ".github/dependabot.yml").read_text()
+        self.assertIn("package-ecosystem: github-actions\n    directory: /\n    schedule:\n      interval: daily\n", config)
+        self.assertIn('groups:\n      agentic-job:\n        patterns:\n          - "cgwalters-forge/agentic-job"\n          - "cgwalters-forge/agentic-job/*"\n', config)
 
     def test_bounds_are_comment_only_and_commands_need_write(self):
         for name, events, roles in (
