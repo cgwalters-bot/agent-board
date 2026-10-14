@@ -106,12 +106,11 @@ const ACTIVITY_EVENTS: &[&str] = &[
 ];
 
 const READY: &str = "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { clientMutationId } }";
-// A merge now, of the head that was approved and found green, or none. Auto-merge
-// and the merge queue are left out: either stays pending after this pass, and
-// `expectedHeadOid` checks the head only when it is enabled, so a later push by
-// anyone with write access could be merged on this approval unless branch rules
-// this pass cannot see demand a fresh one.
+// Both writes admit only the head we approved. A queue is required by the base
+// branch's rules, not an auto-merge fallback; GitHub owns revalidation after
+// admission. Auto-merge remains excluded because it can admit a later push.
 const MERGE: &str = "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: REBASE, expectedHeadOid: $head}) { clientMutationId } }";
+const ENQUEUE: &str = "mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { clientMutationId } }";
 
 const PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -145,6 +144,32 @@ pub struct Config {
     /// The review job's workflow file in each followed repository, whose runs'
     /// reviews of a head count as its verdict; none counts only the operator's.
     pub review_workflow: Option<String>,
+    pub policy: PollPolicy,
+}
+
+/// Optional settings from the caller's repository-owned agent-board.json.
+/// Pool selection affects cost only, never fix authority or round limits.
+#[derive(Clone, Debug, Default)]
+pub struct PollPolicy {
+    pub merge_authors: Vec<String>,
+    pub toil_fix_pool: String,
+    pub kind_pools: BTreeMap<String, String>,
+}
+
+impl PollPolicy {
+    pub fn from_json(value: &Value) -> Result<Self> {
+        Ok(Self {
+            merge_authors: serde_json::from_value(
+                value.get("mergeAuthors").cloned().unwrap_or(json!([])),
+            )?,
+            toil_fix_pool: serde_json::from_value(
+                value.get("toilFixPool").cloned().unwrap_or(json!("")),
+            )?,
+            kind_pools: serde_json::from_value(
+                value.get("kindPools").cloned().unwrap_or(json!({})),
+            )?,
+        })
+    }
 }
 
 /// `OWNER/REPO` as it may be put into an API path: anything else could point
@@ -636,6 +661,7 @@ pub struct Marker {
     pub at: Option<String>,
     /// Written next to the label; with the label gone, someone took it off.
     pub stopped: bool,
+    pub pool: Option<String>,
 }
 
 impl Marker {
@@ -653,6 +679,9 @@ impl Marker {
         }
         if self.stopped {
             state["stopped"] = true.into();
+        }
+        if let Some(pool) = &self.pool {
+            state["pool"] = pool.clone().into();
         }
         state
     }
@@ -700,6 +729,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             run: state["run"].as_u64().filter(|r| *r > 0),
             at: state["at"].as_str().map(str::to_owned),
             stopped: state["stopped"].as_bool().unwrap_or(false),
+            pool: state["pool"].as_str().map(str::to_owned),
         };
         if latest.id.is_none() || marker.id > latest.id {
             latest = marker;
@@ -734,7 +764,8 @@ fn labelled(pull: &Value) -> bool {
 /// What a dispatch run opened: a fix can push nowhere else, and a draft on any
 /// other branch is its author's to mark ready.
 pub fn is_harness(pull: &Value, bot: &str) -> bool {
-    pull["isCrossRepository"].as_bool().unwrap_or(false)
+    text(pull, "/author/login") == bot
+        && pull["isCrossRepository"].as_bool().unwrap_or(false)
         && text(pull, "/headRepositoryOwner/login") == bot
         && text(pull, "/headRefName").starts_with(FIX_BRANCH_PREFIX)
 }
@@ -805,6 +836,237 @@ fn review_text(body: &str) -> String {
         Some((cut, _)) => format!("{}\n[cut]", &out[..cut]),
         None => out.to_owned(),
     }
+}
+
+// Port of poll.cjs's conservative toil classifier. This changes only which
+// configured pool gets the first bounded fix, never what it may write. Reject
+// ambiguous prose rather than letting a code defect disguised as a formatting
+// finding steer the run into the smaller pool.
+fn toil_finding(finding: &str) -> bool {
+    let lower = finding.to_ascii_lowercase();
+    if [
+        "[p0]",
+        "[p1]",
+        "blocker",
+        "important",
+        "secur",
+        "insecure",
+        "vulnerab",
+        "exploit",
+        "correctness",
+        "incorrect",
+        "wrong",
+        "bug",
+        "race",
+        "racy",
+        "credential",
+        "secret",
+        "token",
+        "password",
+        "auth",
+        "permission",
+        "privilege",
+        "bypass",
+        "inject",
+        "unsafe",
+        "unsigned",
+        "leak",
+        "gate",
+        "check",
+        "bound",
+        "parse",
+        "parser",
+        "parsing",
+        "validat",
+        "regress",
+        "crash",
+        "panic",
+        "test",
+        "without review",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        return false;
+    }
+    let mut heading = lower
+        .strip_prefix("**")
+        .and_then(|s| s.split_once("**").map(|(h, _)| h))
+        .unwrap_or(&lower)
+        .trim();
+    if heading.contains('`')
+        || heading
+            .split_whitespace()
+            .any(|w| w.contains('.') && w.contains(':'))
+    {
+        return false;
+    }
+    if heading.starts_with("[p")
+        && heading.as_bytes().get(3) == Some(&b']')
+        && heading
+            .as_bytes()
+            .get(2)
+            .is_some_and(|b| (b'2'..=b'9').contains(b))
+    {
+        heading = heading[4..].trim_start();
+    } else {
+        for tag in ["[nit]", "nit:", "nit.", "nit "] {
+            if let Some(rest) = heading.strip_prefix(tag) {
+                heading = rest.trim_start();
+                break;
+            }
+        }
+    }
+    for prefixes in [
+        &["fix ", "reword ", "rewrite ", "update "][..],
+        &["the ", "this ", "a ", "an ", "its ", "each ", "every "][..],
+    ] {
+        for prefix in prefixes {
+            if let Some(rest) = heading.strip_prefix(prefix) {
+                heading = rest;
+                break;
+            }
+        }
+    }
+    let labels = [
+        "subject line",
+        "description",
+        "rebase",
+        "rebased",
+        "rebasing",
+        "merge conflict",
+        "conflict",
+        "formatting",
+        "indentation",
+        "trailing whitespace",
+        "rustfmt",
+        "gofmt",
+        "cargo fmt",
+        "prettier",
+        "clang-format",
+        "ruff format",
+    ];
+    let opens = |label: &str| {
+        heading.strip_prefix(label).is_some_and(|rest| {
+            let rest = rest.strip_prefix('s').unwrap_or(rest);
+            rest.chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+        })
+    };
+    labels.iter().any(|label| opens(label))
+        || ["commit", "pull request", "pr"].iter().any(|prefix| {
+            [
+                "message",
+                "subject",
+                "body",
+                "bodies",
+                "title",
+                "description",
+            ]
+            .iter()
+            .any(|label| opens(&format!("{prefix} {label}")))
+        })
+}
+
+fn reviewed_head_line(line: &str, head: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("Reviewed admitted head")
+        .or_else(|| line.strip_prefix("Reviewed head"))
+    else {
+        return false;
+    };
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    let quoted = rest.starts_with('`');
+    let Some(rest) = rest.trim_start_matches('`').strip_prefix(head) else {
+        return false;
+    };
+    let rest = if quoted {
+        let Some(rest) = rest.strip_prefix('`') else {
+            return false;
+        };
+        rest
+    } else {
+        rest
+    };
+    let rest = rest.strip_suffix('.').unwrap_or(rest);
+    if rest.is_empty() {
+        return head.len() == 40;
+    }
+    let Some(rest) = rest.strip_prefix(" (").and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    let rest = rest.strip_prefix("diff against ").unwrap_or(rest);
+    let Some(rest) = rest.strip_prefix("merge-base ") else {
+        return false;
+    };
+    let (oid, branch) = rest
+        .split_once(" on ")
+        .or_else(|| rest.split_once(", "))
+        .unwrap_or(("", ""));
+    let oid = oid
+        .strip_prefix('`')
+        .and_then(|s| s.strip_suffix('`'))
+        .unwrap_or(oid);
+    head.len() == 40
+        && (7..=40).contains(&oid.len())
+        && oid.bytes().all(|b| b.is_ascii_hexdigit())
+        && !branch.is_empty()
+        && branch
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./-".contains(&b))
+}
+
+fn toil_only(pull: &Value, checks: &Checks, review: Option<(Review, &str)>) -> bool {
+    if !checks.failed.is_empty() {
+        return false;
+    }
+    let Some((Review::ChangesRequested, body)) = review else {
+        return true;
+    };
+    if pull["mergeable"] == CONFLICTING || body.chars().count() > REVIEW_TEXT_LIMIT {
+        return false;
+    }
+    let body = review_text(body);
+    if !body.contains(text(pull, "/headRefOid")) || body.ends_with("\n[cut]") {
+        return false;
+    }
+    let mut lines = body.lines();
+    let Some(reason) = lines
+        .next()
+        .and_then(|s| s.strip_prefix("VERDICT: CHANGES"))
+    else {
+        return false;
+    };
+    let reason = reason.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '[');
+    if !reason.is_empty() && !toil_finding(reason) {
+        return false;
+    }
+    let mut findings = 0;
+    for line in lines {
+        if line.trim().is_empty()
+            || line.starts_with("Verification: ")
+            || line.starts_with("> Generated by ")
+        {
+            continue;
+        }
+        let head = text(pull, "/headRefOid");
+        if reviewed_head_line(line, head) {
+            continue;
+        }
+        let finding = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .or_else(|| {
+                let (n, rest) = line.split_once(". ")?;
+                (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some(rest)
+            });
+        if !finding.is_some_and(toil_finding) {
+            return false;
+        }
+        findings += 1;
+    }
+    findings > 0
 }
 
 /// The task a fix run is started with, as poll.cjs's `fixTask`. `review` is
@@ -906,6 +1168,12 @@ pub fn decide(
     if labelled(pull) {
         return step("skip", format!("labelled {LABEL}"));
     }
+    if !pull["mergeQueueEntry"].is_null() {
+        return step("skip", "already queued");
+    }
+    if !pull["autoMergeRequest"].is_null() {
+        return step("skip", "auto-merge already on");
+    }
     let partial = truncated(pull);
     if !partial.is_empty() {
         return step(
@@ -923,7 +1191,12 @@ pub fn decide(
     let reset = marker.stopped;
     let fresh = Marker::default();
     let marker = if reset { &fresh } else { marker };
-    let harness = is_harness(pull, &config.bot);
+    let merge_only = config
+        .policy
+        .merge_authors
+        .iter()
+        .any(|a| a == text(pull, "/author/login"));
+    let harness = !merge_only && is_harness(pull, &config.bot);
     let not_ours =
         format!("not a {FIX_BRANCH_PREFIX} branch of the bot's fork, left to its author");
     let review = review_at_head(pull, config, review_run);
@@ -1040,9 +1313,6 @@ pub fn decide(
             "wait",
             format!("checks pending: {}", checks.pending.join(", ")),
         );
-    }
-    if !pull["autoMergeRequest"].is_null() || !pull["mergeQueueEntry"].is_null() {
-        return step("skip", "auto-merge already on or queued");
     }
     // GitHub works mergeability out again after every push to either side; an
     // answer that is not in yet is neither a conflict nor a go-ahead.
@@ -1342,10 +1612,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> Result<String> {
         let apply = self.apply.as_ref().context("not applying")?;
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
-        let pool = apply
-            .pools
-            .get(round.saturating_sub(1) as usize % apply.pools.len().max(1))
-            .cloned();
+        let review = head_review(pull, self.config, review_run);
+        let toil = toil_only(pull, checks, review);
+        let toil_pool = &self.config.policy.toil_fix_pool;
+        let pool = if !toil_pool.is_empty() && round == 1 && toil {
+            Some(toil_pool.clone())
+        } else {
+            let index = if !marker.stopped
+                && !toil_pool.is_empty()
+                && marker.pool.as_ref() == Some(toil_pool)
+            {
+                0
+            } else {
+                round.saturating_sub(1) as usize
+            };
+            apply
+                .pools
+                .get(index % apply.pools.len().max(1))
+                .cloned()
+                .or_else(|| self.config.policy.kind_pools.get("fix").cloned())
+        };
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
@@ -1375,6 +1661,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             run: None,
             at: Some(self.now.replace_nanosecond(0)?.format(&Rfc3339)?),
             stopped: false,
+            pool: pool.clone(),
         };
         let of = format!(
             "Fix round {round} of {MAX_FIX_ROUNDS} for `{}`",
@@ -1463,8 +1750,36 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 Ok(Some("marked ready".into()))
             }
             "merge" => {
-                self.mutate(MERGE, json!({"id": id, "head": head}))?;
-                Ok(Some("merged".into()))
+                let rules = self.get(&format!(
+                    "repos/{repo}/rules/branches/{}",
+                    url::form_urlencoded::byte_serialize(text(pull, "/baseRefName").as_bytes())
+                        .collect::<String>()
+                ))?;
+                let queued = rules
+                    .as_array()
+                    .context("rules are not an array")?
+                    .iter()
+                    .any(|r| r["type"] == "merge_queue");
+                if queued {
+                    self.mutate(ENQUEUE, json!({"id": id, "head": head}))?;
+                    Ok(Some("added to the merge queue".into()))
+                } else {
+                    let repo_settings = self.get(&format!("repos/{repo}"))?;
+                    let method = [
+                        ("allow_rebase_merge", "REBASE"),
+                        ("allow_squash_merge", "SQUASH"),
+                        ("allow_merge_commit", "MERGE"),
+                    ]
+                    .into_iter()
+                    .find(|(key, _)| repo_settings[*key] == true)
+                    .map(|(_, method)| method)
+                    .context("no allowed merge method")?;
+                    self.mutate(
+                        &MERGE.replace("mergeMethod: REBASE", &format!("mergeMethod: {method}")),
+                        json!({"id": id, "head": head}),
+                    )?;
+                    Ok(Some("merged".into()))
+                }
             }
             "needs-human" => {
                 self.needs_human(repo, number, marker, &decision.reason)?;
@@ -1610,6 +1925,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         &mut self,
         repo: &str,
         number: u64,
+        merge_only: bool,
         required: &mut BTreeMap<String, Vec<Value>>,
     ) -> Result<(String, bool)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
@@ -1619,11 +1935,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // stop, so a stop read here was labelled before the query below, and
         // no label there means a person took it off, not that another pass
         // is between its two writes.
-        let comments = self.paged(
-            &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
-            self.apply.is_some(),
-        )?;
-        let marker = find_marker(&comments, &self.config.bot);
+        let comments = if merge_only {
+            Vec::new()
+        } else {
+            self.paged(
+                &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+                self.apply.is_some(),
+            )?
+        };
+        let mut marker = find_marker(&comments, &self.config.bot);
         self.spend()?;
         let data = self.graphql.graphql(
             PULL_QUERY,
@@ -1634,6 +1954,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter(|p| p.is_object())
             .context("pull request not found")?
             .clone();
+        ensure!(
+            text(&pull, "/author/login") == self.config.bot
+                || self
+                    .config
+                    .policy
+                    .merge_authors
+                    .iter()
+                    .any(|a| a == text(&pull, "/author/login")),
+            "pull request author is not followed"
+        );
+        if text(&pull, "/author/login") != self.config.bot {
+            marker = Marker::default();
+        }
         let base = text(&pull, "/baseRefName").to_owned();
         if !required.contains_key(&base) {
             let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
@@ -1695,7 +2028,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             decision.reason,
             done.map(|d| format!(" -> {d}")).unwrap_or_default()
         );
-        Ok((line, in_flight(&pull, &self.config.bot, decision.action)))
+        Ok((
+            line,
+            text(&pull, "/author/login") == self.config.bot
+                && in_flight(&pull, &self.config.bot, decision.action),
+        ))
     }
 
     fn follow(&mut self, repo: &str, outcome: &mut Outcome) -> Result<()> {
@@ -1703,15 +2040,27 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             &format!("repos/{repo}/pulls?state=open&per_page=100"),
             false,
         )?;
-        let mut numbers: Vec<u64> = open
+        let mut numbers: Vec<(u64, bool)> = open
             .iter()
-            .filter(|p| text(p, "/user/login") == self.config.bot)
-            .filter_map(|p| p["number"].as_u64())
+            .filter(|p| {
+                text(p, "/user/login") == self.config.bot
+                    || self
+                        .config
+                        .policy
+                        .merge_authors
+                        .iter()
+                        .any(|a| a == text(p, "/user/login"))
+            })
+            .filter_map(|p| {
+                p["number"]
+                    .as_u64()
+                    .map(|n| (n, text(p, "/user/login") != self.config.bot))
+            })
             .collect();
         numbers.sort_unstable();
         let mut required = BTreeMap::new();
-        for number in numbers {
-            match self.pull(repo, number, &mut required) {
+        for (number, merge_only) in numbers {
+            match self.pull(repo, number, merge_only, &mut required) {
                 Ok((line, flying)) => {
                     outcome.lines.push(line);
                     outcome.in_flight += usize::from(flying);
@@ -1845,6 +2194,7 @@ mod tests {
             bot: BOT.into(),
             dispatch_repo: "cgwalters-forge/tracker".into(),
             review_workflow: Some("review.yml".into()),
+            policy: PollPolicy::default(),
         }
     }
 
@@ -3710,6 +4060,12 @@ mod tests {
     fn github() -> Fake {
         let mut fake = Fake::default();
         fake.page(
+            &format!("repos/{REPO}"),
+            None,
+            None,
+            json!({"allow_rebase_merge": true}),
+        );
+        fake.page(
             &format!("repos/{REPO}/events?per_page=100"),
             Some("\"e1\""),
             None,
@@ -4037,6 +4393,7 @@ mod tests {
                 bot: BOT.into(),
                 dispatch_repo: dispatch.into(),
                 review_workflow: Some(review.into()),
+                policy: PollPolicy::default(),
             };
             assert!(
                 run(
@@ -4092,6 +4449,363 @@ mod tests {
 
     fn applied(fake: &Fake, dispatcher: &Fake) -> Outcome {
         applied_after(fake, dispatcher, State::default())
+    }
+
+    #[test]
+    fn queued_merges_and_allowed_direct_methods_are_head_pinned() {
+        for (queue, settings, method, moved, refused, expected_errors) in [
+            (true, json!({}), "queue", false, false, 0),
+            (true, json!({}), "queue", true, false, 1),
+            (true, json!({}), "queue", false, true, 1),
+            (
+                false,
+                json!({"allow_rebase_merge": true}),
+                "REBASE",
+                false,
+                false,
+                0,
+            ),
+            (
+                false,
+                json!({"allow_squash_merge": true}),
+                "SQUASH",
+                false,
+                false,
+                0,
+            ),
+            (
+                false,
+                json!({"allow_merge_commit": true}),
+                "MERGE",
+                false,
+                false,
+                0,
+            ),
+            (false, json!({}), "none", false, false, 1),
+        ] {
+            let mut fake = github();
+            if queue {
+                let rules = &mut fake
+                    .rest
+                    .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                    .unwrap()
+                    .3;
+                rules
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "merge_queue"}));
+                fake.rest.remove(&format!("{API_ROOT}repos/{REPO}"));
+            } else {
+                fake.page(&format!("repos/{REPO}"), None, None, settings);
+            }
+            if moved {
+                fake.pushed = Some((470, "different".into()));
+            }
+            if refused {
+                fake.refused = vec![ENQUEUE];
+            }
+            let dispatcher = Fake::default();
+            let outcome = applied(&fake, &dispatcher);
+            assert_eq!(
+                outcome.errors, expected_errors,
+                "{method}: {:?}",
+                outcome.lines
+            );
+            assert!(dispatcher.writes.borrow().is_empty());
+            let writes = fake.writes.borrow();
+            if method == "none" {
+                assert!(writes.is_empty());
+                continue;
+            }
+            assert_eq!(writes.len(), 1);
+            assert_eq!(
+                writes[0].1,
+                json!({"id": fake.pulls[&470]["id"], "head": HEAD})
+            );
+            if queue {
+                assert_eq!(writes[0].0, ENQUEUE);
+            } else {
+                assert!(writes[0].0.contains(&format!("mergeMethod: {method}")));
+            }
+        }
+    }
+
+    #[test]
+    fn merge_only_authors_cannot_dispatch_or_stop_even_with_harness_branches() {
+        for (change, expected) in [
+            (json!({}), "merge"),
+            (json!({"isDraft": true}), "skip"),
+            (json!({"mergeable": "CONFLICTING"}), "skip"),
+            (json!({"title": "Agent run 123"}), "skip"),
+            (
+                json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                "skip",
+            ),
+            (
+                json!({"contexts": {"ci": {"status": "IN_PROGRESS"}}}),
+                "wait",
+            ),
+            (json!({"mergeQueueEntry": {"state": "QUEUED"}}), "skip"),
+            (json!({"autoMergeRequest": {"enabledAt": "now"}}), "skip"),
+        ] {
+            let mut fake = github();
+            let mut p = pull("pull-470", change);
+            p["author"]["login"] = "updater[bot]".into();
+            p["reviews"]["nodes"] = json!([review(
+                "APPROVED",
+                json!({"__typename": "User", "login": "cgwalters"}),
+                HEAD,
+                "approved"
+            )]);
+            fake.pulls.insert(470, p);
+            fake.page(
+                &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                None,
+                None,
+                json!([{"number": 470, "user": {"login": "updater[bot]"}}]),
+            );
+            fake.rest
+                .retain(|url, _| !url.contains("/comments") && !url.contains("/actions/runs/"));
+            let mut cfg = config();
+            cfg.policy.merge_authors = vec!["updater[bot]".into()];
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(
+                outcome
+                    .lines
+                    .last()
+                    .unwrap()
+                    .contains(&format!(" {expected}:")),
+                "{:?}",
+                outcome.lines
+            );
+            assert_eq!(outcome.in_flight, 0);
+            assert!(dispatcher.writes.borrow().is_empty());
+            assert!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .all(|(q, _)| q.starts_with("mutation") && q.contains("mergePullRequest"))
+            );
+            cfg.policy.merge_authors.clear();
+            assert!(
+                run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    applying(&dispatcher),
+                    now()
+                )
+                .unwrap()
+                .lines
+                .iter()
+                .all(|l| !l.contains("#470"))
+            );
+        }
+    }
+
+    #[test]
+    fn toil_pool_is_opt_in_and_the_next_round_uses_the_first_normal_pool() {
+        for (toil_pool, change, marker, expected) in [
+            (
+                "",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 0}),
+                "claude",
+            ),
+            (
+                "small",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 0}),
+                "small",
+            ),
+            (
+                "small",
+                json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                json!({"rounds": 0}),
+                "claude",
+            ),
+            (
+                "small",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 1, "pool": "small", "sha": "old"}),
+                "claude",
+            ),
+            (
+                "small",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 1, "pool": "claude", "sha": "old"}),
+                "openai",
+            ),
+        ] {
+            let mut fake = github();
+            fake.pulls.insert(470, pull("pull-470", change));
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&marker, "old")} ]),
+            );
+            let mut cfg = config();
+            cfg.policy.toil_fix_pool = toil_pool.into();
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(dispatcher.writes.borrow()[0].1["inputs"]["pool"], expected);
+            assert!(fake.writes.borrow().iter().any(|(_, body)| {
+                body["body"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(&format!("\"pool\":\"{expected}\"")))
+            }));
+        }
+    }
+
+    #[test]
+    fn fix_kind_pool_is_only_a_fallback_for_an_empty_round_list() {
+        for (pools, expected) in [(vec![], "fallback"), (vec!["normal".into()], "normal")] {
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"mergeable": "CONFLICTING"})));
+            let mut cfg = config();
+            cfg.policy
+                .kind_pools
+                .insert("fix".into(), "fallback".into());
+            let dispatcher = Fake::default();
+            let mut apply = applying(&dispatcher).unwrap();
+            apply.pools = pools;
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                Some(apply),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(dispatcher.writes.borrow()[0].1["inputs"]["pool"], expected);
+        }
+    }
+
+    #[test]
+    fn review_toil_selection_keeps_ambiguous_findings_on_normal_pools() {
+        for (line, accepted) in [
+            (
+                format!(
+                    "Reviewed admitted head `{HEAD}` (diff against merge-base `abcdef0` on main)."
+                ),
+                true,
+            ),
+            (
+                format!("Reviewed head: {HEAD} (merge-base abcdef0, refs/heads/main)"),
+                true,
+            ),
+            (format!("Reviewed head `{HEAD}`. Also fix a defect"), false),
+            (
+                format!("Reviewed head `{HEAD}` (merge-base not-a-sha on main)"),
+                false,
+            ),
+        ] {
+            assert_eq!(reviewed_head_line(&line, HEAD), accepted, "{line}");
+        }
+        for (finding, toil) in [
+            ("- **[nit] Commit message:** reword the subject", true),
+            ("- **Formatting:** run rustfmt", true),
+            ("- **[P2] Rebase:** refresh the branch", true),
+            ("- **Commit message parser:** drops trailers", false),
+            ("- **Formatting:** a security bug", false),
+            ("- **[P1] Formatting:** fix it", false),
+            ("- **Formatting:** important", false),
+            ("- **Formatting `src.rs:12`:** fix it", false),
+            ("- **Removing the PR title rule:** do this", false),
+            (
+                "- **Formatting:** fix it\nExtra prose about a defect",
+                false,
+            ),
+            ("- **Formatting:** fix it\n  - nested finding", false),
+            ("", false),
+        ] {
+            let mut fake = github();
+            let mut p = pull("pull-470", json!({}));
+            let body = format!(
+                "VERDICT: CHANGES\nReviewed head `{HEAD}`.\n\n{finding}\nVerification: not run"
+            );
+            p["reviews"]["nodes"] = json!([review(
+                "CHANGES_REQUESTED",
+                json!({"__typename": "User", "login": "cgwalters"}),
+                HEAD,
+                &body
+            )]);
+            fake.pulls.insert(470, p);
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(
+                &json!({"toilFixPool": "small", "kindPools": {"triage": "small"}}),
+            )
+            .unwrap();
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(
+                dispatcher.writes.borrow()[0].1["inputs"]["pool"],
+                if toil { "small" } else { "claude" },
+                "{finding}"
+            );
+        }
+        let p = pull("pull-470", json!({}));
+        for body in [
+            "VERDICT: CHANGES\nReviewed head `old`.\n- Formatting".to_owned(),
+            format!("VERDICT: CHANGES\nReviewed head `{HEAD}`.\n- Formatting\n[cut]"),
+            "x".repeat(REVIEW_TEXT_LIMIT + 1),
+        ] {
+            assert!(!toil_only(
+                &p,
+                &Checks::default(),
+                Some((Review::ChangesRequested, &body))
+            ));
+        }
+        for value in [
+            json!({"mergeAuthors": "not an array"}),
+            json!({"toilFixPool": false}),
+            json!({"kindPools": []}),
+        ] {
+            assert!(PollPolicy::from_json(&value).is_err());
+        }
     }
 
     /// An applying pass that has the state of an earlier one.

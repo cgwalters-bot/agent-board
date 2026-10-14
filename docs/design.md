@@ -238,9 +238,12 @@ while idle, at most six hours apart). GETs are conditional against a disposable
 state file; the pull request query is GraphQL and is not. `--dry-run` takes no
 step. `--apply` takes poll.cjs's steps with the bot's `GH_TOKEN` (checked to be
 `--bot`'s, as only the bot's markers and claims are read back): mark ready,
-merge an approved green head at once (pinned to the head that was
-read; never auto-merge or the merge queue, which stay pending where a later
-push could ride on the approval), label `needs-human` with the marker comment, and start a fix run
+merge an approved green head (pinned to the head that was read), enqueuing it
+when the base branch's rules require a merge queue, otherwise using an allowed
+repository merge method (rebase, squash, then merge in preference order).
+Queue admission also uses `expectedHeadOid`; GitHub owns revalidation after
+admission. Already queued and auto-merge-enabled requests are skipped, never
+enabled as a fallback. Label `needs-human` with the marker comment, and start a fix run
 through the caller's `--dispatch-workflow` with `DISPATCH_TOKEN`, at most three
 a pass as the dispatcher above is bounded. A pass claims each fix round with a
 comment naming the marker comment it decided from, and only the earliest claim on
@@ -276,6 +279,28 @@ such. A pull request with more labels, reviews, commits or checks than its one
 query reads waits rather than being decided on part of them. Required checks come from the base branch's rulesets and its classic
 protection; a required check that never reported is pending, and a protected
 branch whose requirements cannot be read is an error. It has been exercised against recorded responses only.
+
+`poll --config PATH` reads the caller's repository-owned `agent-board.json`:
+`operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
+optional `mergeAuthors`, `toilFixPool`, `kindPools`. File settings override the
+corresponding flags. The workflow must check this file out from its trusted
+default branch, never a dispatched head or dispatcher-controlled workflow input.
+The board and `watch` still only widen activity reads. No account or repository
+is built into these settings. `mergeAuthors` defaults to empty; these authors
+are merge-only, cannot mark drafts ready, start fix runs, read fix markers/runs,
+or receive `needs-human`, even on harness-shaped branches. Existing review
+provenance requirements are unchanged: outside the public bot-fork harness,
+only the operator's head approval counts.
+
+An absent/empty `toilFixPool` leaves normal fix-round pool selection unchanged.
+When set, only a first round with no failed check and either no rejected review
+or wholly toil findings uses it. Review classification conservatively accepts
+simple top-level formatting, rebase and message findings, rejecting ambiguous
+prose, severe findings, code references, stale or cut reviews and conflicts
+alongside rejected reviews. This is cost routing under the same fix bounds,
+not an authorization decision. The pool is recorded in the marker so the next
+round after toil uses `fixPools[0]`. `kindPools.fix` supplies a pool only when
+the fix-round list is empty; other kinds are not dispatched by poll.
 
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done
