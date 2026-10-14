@@ -31,6 +31,9 @@ pub struct Poll {
     /// Workflow file in --dispatch-repo that --apply starts fix runs with.
     #[arg(long, value_name = "FILE")]
     pub dispatch_workflow: Option<String>,
+    /// Workflow file of the review job in each --follow repository. Its reviews of a head count as the verdict only with this, and only from a run of it on pull_request_target for that head of a --bot dispatch pull request from its fork into a public repository; without it only --operator's count.
+    #[arg(long, value_name = "FILE")]
+    pub review_workflow: Option<String>,
     /// The workflow's `pool` input for each fix round in turn. Repeatable; none leaves its default.
     #[arg(long, value_name = "POOL")]
     pub fix_pool: Vec<String>,
@@ -56,6 +59,7 @@ pub fn run(args: &Poll, board: impl FnOnce() -> Result<Vec<String>>) -> Result<(
         operator: args.operator.clone(),
         bot: args.bot.clone(),
         dispatch_repo: args.dispatch_repo.clone(),
+        review_workflow: args.review_workflow.clone(),
     };
     let mut watch = args.watch.clone();
     watch.extend(board()?);

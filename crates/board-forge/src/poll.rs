@@ -54,6 +54,17 @@ const FIX_RUN_GRACE_SECONDS: i64 = 5 * 60;
 const FIX_RUN_TIMEOUT_SECONDS: i64 = 7 * 60 * 60;
 /// agentic-job's review status; the review it submits is what is read.
 const REVIEW_CONTEXT: &str = "review";
+/// The user id of `github-actions[bot]`, which submits agentic-job's reviews
+/// with the workflow token. Fixed by GitHub, unlike a login, which an app or
+/// user may share in part (`github-actions` is a free user name).
+const ACTIONS_BOT_ID: u64 = 41898282;
+/// Where the review job's marker comment opens in its review (gh-aw's safe
+/// outputs footer), naming the run that wrote it.
+const RUN_MARKER: &str = "<!-- gh-aw-agentic-workflow: ";
+/// The event the review job's verdict must come from; see [`review_run_matches`].
+const REVIEW_EVENT: &str = "pull_request_target";
+/// Where a repository's workflows are, as a run's `path` gives them.
+const WORKFLOWS_DIR: &str = ".github/workflows/";
 /// The connections of `PULL_QUERY` the decision reads as whole. One that is not
 /// known to be complete (more than the query asks for, or no `pageInfo`)
 /// leaves the pull request waiting: a label, a change request, a failed check
@@ -106,12 +117,13 @@ const PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id number url title body isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
+      baseRepository { nameWithOwner isPrivate }
       author { login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
-      reviews(last: 100) { nodes { state body submittedAt author { __typename login } commit { oid } } pageInfo { hasPreviousPage } }
+      reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
       commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes {
         __typename
@@ -130,6 +142,9 @@ pub struct Config {
     pub bot: String,
     /// Where the fix runs that markers name run.
     pub dispatch_repo: String,
+    /// The review job's workflow file in each followed repository, whose runs'
+    /// reviews of a head count as its verdict; none counts only the operator's.
+    pub review_workflow: Option<String>,
 }
 
 /// `OWNER/REPO` as it may be put into an API path: anything else could point
@@ -434,41 +449,181 @@ pub enum Review {
     Withheld,
 }
 
-/// The newest verdict on the head by the operator. A
-/// review of an older head says nothing of this one.
-pub fn review_at_head(pull: &Value, operator: &str) -> Option<Review> {
-    head_review(pull, operator).map(|(verdict, _)| verdict)
+/// The verdict on the head: the operator's newest if they gave one, else the
+/// review job's newest where `review_run` shows the job submitted it. A review
+/// of an older head says nothing of this one.
+pub fn review_at_head(pull: &Value, config: &Config, review_run: Option<&Value>) -> Option<Review> {
+    head_review(pull, config, review_run).map(|(verdict, _)| verdict)
 }
 
 /// [`review_at_head`] with the review's text.
-fn head_review<'a>(pull: &'a Value, operator: &str) -> Option<(Review, &'a str)> {
+///
+/// The review job's verdict is a review by `github-actions[bot]`, told apart
+/// by its fixed id ([`ACTIONS_BOT_ID`]), not its login. That identity is
+/// shared by every workflow of the repository, including those a branch of
+/// the repository adds or changes for its own pull request, which could
+/// approve itself, and any of them may edit what another wrote. So it counts
+/// only where the caller named the review workflow
+/// ([`Config::review_workflow`]), on a dispatch pull request from the bot's
+/// fork ([`is_harness`]) into a public repository, and where the run its marker
+/// names is that workflow's, run from the base repository's own branch on
+/// `pull_request_target` for this head while the review was submitted
+/// ([`review_run_matches`]). There the pull request's own workflows get a
+/// read-only `GITHUB_TOKEN` and cannot review, and the run check keeps out the
+/// repository's other workflows, short of those pushed by someone who can
+/// write to it. A private
+/// repository may send write tokens to fork workflows, which the query cannot
+/// see, so there (or where privacy is not known) only the operator counts.
+/// The operator outranks it: their change request stands over its approval,
+/// and their approval over its change request or withheld approval.
+fn head_review<'a>(
+    pull: &'a Value,
+    config: &Config,
+    review_run: Option<&Value>,
+) -> Option<(Review, &'a str)> {
+    let (operator, job) = verdicts(pull, config);
+    operator
+        .or_else(|| job.filter(|(_, r)| review_run_matches(pull, r, review_run, config)))
+        .map(|(verdict, r)| (verdict, text(r, "/body")))
+}
+
+/// The run of the review job a pass reads to decide `pull`: the one its marker
+/// on the job's newest verdict names, where that verdict could count.
+pub fn review_run_id(pull: &Value, config: &Config) -> Option<u64> {
+    let base = text(pull, "/baseRepository/nameWithOwner");
+    match verdicts(pull, config) {
+        (None, Some((_, review))) => {
+            cited_run(text(review, "/body")).and_then(|(repo, id)| (repo == base).then_some(id))
+        }
+        _ => None,
+    }
+}
+
+/// A verdict and the review that gave it.
+type Verdict<'a> = Option<(Review, &'a Value)>;
+
+/// The operator's newest verdict on the head, and the review job's where it
+/// may count, before its run is checked.
+fn verdicts<'a>(pull: &'a Value, config: &Config) -> (Verdict<'a>, Verdict<'a>) {
     let head = text(pull, "/headRefOid");
-    nodes(pull, "/reviews/nodes")
+    let at_head: Vec<&Value> = nodes(pull, "/reviews/nodes")
         .iter()
-        .filter(|r| {
-            let author = text(r, "/author/login");
-            // An app's slug may be a user's login too: the type tells them apart.
-            let kind = text(r, "/author/__typename");
-            // The shared Actions bot does not authenticate a particular workflow.
-            // Fail closed until independently validated job provenance is available.
-            (kind == "User" && author == operator)
-                && !head.is_empty()
-                && text(r, "/commit/oid") == head
-        })
+        .filter(|r| !head.is_empty() && text(r, "/commit/oid") == head)
+        .collect();
+    // An app's slug may be a user's login too: the type tells them apart.
+    let operator_review = |r: &Value| {
+        text(r, "/author/__typename") == "User" && text(r, "/author/login") == config.operator
+    };
+    let job_review = |r: &Value| {
+        text(r, "/author/__typename") == "Bot"
+            && r.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
+    };
+    let job_counts = config.review_workflow.is_some()
+        && is_harness(pull, &config.bot)
+        && pull["baseRepository"]["isPrivate"] == false;
+    (
+        newest_verdict(&at_head, operator_review, false),
+        job_counts
+            .then(|| newest_verdict(&at_head, job_review, true))
+            .flatten(),
+    )
+}
+
+/// The repository and id of the run named by the one gh-aw marker in a
+/// review's body, as agentic-job's apply writes it:
+/// `<!-- gh-aw-agentic-workflow: review, id: N, ..., run: https://github.com/OWNER/REPO/actions/runs/N -->`.
+/// More than one names no run: which is the job's own is not known.
+fn cited_run(body: &str) -> Option<(&str, u64)> {
+    let mut markers = body.match_indices(RUN_MARKER).map(|(at, _)| {
+        let rest = &body[at + RUN_MARKER.len()..];
+        rest.find("-->").map(|end| &rest[..end])
+    });
+    let (Some(Some(marker)), None) = (markers.next(), markers.next()) else {
+        return None;
+    };
+    let url = marker
+        .split(", ")
+        .find_map(|field| field.strip_prefix("run: "))?
+        .trim_end();
+    let (repo, id) = url
+        .strip_prefix("https://github.com/")?
+        .split_once("/actions/runs/")?;
+    validate_repository(repo).ok()?;
+    let digits = !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit());
+    Some((repo, id.parse().ok().filter(|_| digits)?))
+}
+
+/// Whether `run`, read from the base repository, is the configured review
+/// workflow's run that `review` names, started on `pull_request_target` for
+/// the head. That event runs the workflow (and what it calls) as the base
+/// branch has it, which the pull request cannot change, and gives the head as
+/// the run's `head_sha`; a `/review` comment's run gives the default branch's,
+/// so it says nothing of which head it read and does not count. The marker is
+/// the review's own text, which any workflow can copy, so the review must also
+/// have been submitted while that run's latest attempt ran: a copy of a
+/// finished run's marker does not count, and an unfinished run is waited for.
+/// What this does not rule out is anyone who can push a branch to the base
+/// repository: a push workflow can copy the marker while the run runs, and a
+/// branch with its own `review.yml` can be made the base of another pull
+/// request with this head. They are trusted with the verdict, as is whoever
+/// can change what the workflow calls.
+fn review_run_matches(pull: &Value, review: &Value, run: Option<&Value>, config: &Config) -> bool {
+    let (Some(run), Some(workflow)) = (run, &config.review_workflow) else {
+        return false;
+    };
+    let head = text(pull, "/headRefOid");
+    let base = text(pull, "/baseRepository/nameWithOwner");
+    cited_run(text(review, "/body")).is_some_and(|(repo, id)| {
+        !head.is_empty()
+            && repo == base
+            && run["id"].as_u64() == Some(id)
+            && text(run, "/repository/full_name") == base
+            && text(run, "/path") == format!("{WORKFLOWS_DIR}{workflow}")
+            && text(run, "/event") == REVIEW_EVENT
+            && text(run, "/head_sha") == head
+            && run["status"] == "completed"
+            && within(review, run)
+    })
+}
+
+/// Whether `review` was submitted between the start of `run`'s latest attempt
+/// and its last update. A rerun moves the start, so an earlier attempt's review
+/// stops counting.
+fn within(review: &Value, run: &Value) -> bool {
+    let submitted = timestamp(review["submittedAt"].as_str());
+    let (Some(from), Some(to)) = (
+        timestamp(run["run_started_at"].as_str()),
+        timestamp(run["updated_at"].as_str()),
+    ) else {
+        return false;
+    };
+    submitted.is_some_and(|at| from <= at && at <= to)
+}
+
+/// The newest verdict among `reviews` by whom `by` accepts. Only the review
+/// job withholds an approval, so only its comment reads as one (`withheld`).
+fn newest_verdict<'a>(
+    reviews: &[&'a Value],
+    by: impl Fn(&Value) -> bool,
+    withheld: bool,
+) -> Verdict<'a> {
+    reviews
+        .iter()
+        .filter(|r| by(r))
         .filter_map(|r| {
             let submitted = OffsetDateTime::parse(text(r, "/submittedAt"), &Rfc3339).ok()?;
             let verdict = match text(r, "/state") {
                 "APPROVED" => Some(Review::Approved),
                 "CHANGES_REQUESTED" => Some(Review::ChangesRequested),
-                "COMMENTED" if text(r, "/body").lines().next() == Some(WITHHELD) => {
+                "COMMENTED" if withheld && text(r, "/body").lines().next() == Some(WITHHELD) => {
                     Some(Review::Withheld)
                 }
                 _ => None,
             }?;
-            Some((submitted, verdict, text(r, "/body")))
+            Some((submitted, verdict, *r))
         })
         .max_by_key(|(submitted, _, _)| *submitted)
-        .map(|(_, verdict, body)| (verdict, body))
+        .map(|(_, verdict, review)| (verdict, review))
 }
 
 /// The poll's round count, from its marker comment on the pull request.
@@ -653,8 +808,8 @@ fn review_text(body: &str) -> String {
 }
 
 /// The task a fix run is started with, as poll.cjs's `fixTask`. `review` is
-/// the text of the operator's change request of the head, when that is what
-/// failed: their direction, unlike anything else on the pull request.
+/// the text of the change request of the head (the operator's, or else the
+/// review job's), when that is what failed.
 pub fn fix_task(
     repo: &str,
     pull: &Value,
@@ -736,13 +891,14 @@ fn step(action: &'static str, reason: impl Into<String>) -> Decision {
 
 /// The one step for a pull request, as poll.cjs's `decide`, except that the
 /// verdict is the review of the head rather than a status and a comment.
-/// `fix_run` is the marker's run when the marker names one for this head.
+/// `fix_run` is the marker's run when the marker names one for this head;
+/// `review_run` the run of [`review_run_id`].
 pub fn decide(
     config: &Config,
     pull: &Value,
     checks: &Checks,
     marker: &Marker,
-    fix_run: Option<&Value>,
+    (fix_run, review_run): (Option<&Value>, Option<&Value>),
     now: OffsetDateTime,
 ) -> Decision {
     let head = text(pull, "/headRefOid");
@@ -770,7 +926,7 @@ pub fn decide(
     let harness = is_harness(pull, &config.bot);
     let not_ours =
         format!("not a {FIX_BRANCH_PREFIX} branch of the bot's fork, left to its author");
-    let review = review_at_head(pull, &config.operator);
+    let review = review_at_head(pull, config, review_run);
     let mut failing = Vec::new();
     if review == Some(Review::ChangesRequested) {
         failing.push("review requested changes".to_owned());
@@ -910,6 +1066,20 @@ fn slim_event(event: &Value) -> Value {
             "review": payload["review"]["state"],
             "label": payload["label"]["name"],
         },
+    })
+}
+
+/// The fields of a review job's run that [`review_run_matches`] reads.
+fn slim_run(run: &Value) -> Value {
+    json!({
+        "id": run["id"],
+        "path": run["path"],
+        "event": run["event"],
+        "head_sha": run["head_sha"],
+        "status": run["status"],
+        "run_started_at": run["run_started_at"],
+        "updated_at": run["updated_at"],
+        "repository": {"full_name": run["repository"]["full_name"]},
     })
 }
 
@@ -1166,9 +1336,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         repo: &str,
         pull: &Value,
         checks: &Checks,
-        marker: &Marker,
-        read: &[Value],
+        (marker, read): (&Marker, &[Value]),
         round: u64,
+        review_run: Option<&Value>,
     ) -> Result<String> {
         let apply = self.apply.as_ref().context("not applying")?;
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
@@ -1211,7 +1381,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             short(head)
         );
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
-        let review = match head_review(pull, &self.config.operator) {
+        let review = match head_review(pull, self.config, review_run) {
             Some((Review::ChangesRequested, body)) => Some(body),
             _ => None,
         };
@@ -1277,6 +1447,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         checks: &Checks,
         (marker, read): (&Marker, &[Value]),
         decision: &Decision,
+        review_run: Option<&Value>,
     ) -> Result<Option<String>> {
         let number = pull["number"]
             .as_u64()
@@ -1306,7 +1477,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         "not started: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
                     )));
                 }
-                self.start_fix(repo, pull, checks, marker, read, round)
+                self.start_fix(repo, pull, checks, (marker, read), round, review_run)
                     .map(Some)
             }
             _ => Ok(None),
@@ -1485,16 +1656,36 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
             _ => None,
         };
+        // Kept to the fields the check reads: the cache is kept between passes.
+        // Not read for a labelled pull request, as the fix run is not.
+        let review_run = match review_run_id(&pull, self.config) {
+            Some(run) if !labelled(&pull) => Some(
+                self.get_url(
+                    &format!("{API_ROOT}repos/{repo}/actions/runs/{run}"),
+                    slim_run,
+                    false,
+                )?
+                .0,
+            ),
+            _ => None,
+        };
         let decision = decide(
             self.config,
             &pull,
             &checks,
             &marker,
-            fix_run.as_ref(),
+            (fix_run.as_ref(), review_run.as_ref()),
             self.now,
         );
         let done = match self.apply {
-            Some(_) => self.take(repo, &pull, &checks, (&marker, &comments), &decision)?,
+            Some(_) => self.take(
+                repo,
+                &pull,
+                &checks,
+                (&marker, &comments),
+                &decision,
+                review_run.as_ref(),
+            )?,
             None => None,
         };
         let line = format!(
@@ -1555,6 +1746,9 @@ pub fn run<R: Rest, G: Transport>(
         ensure!(is_github_login(login), "invalid login {login:?}");
     }
     validate_repository(&config.dispatch_repo)?;
+    if let Some(workflow) = &config.review_workflow {
+        validate_workflow(workflow)?;
+    }
     if let Some(apply) = &apply {
         validate_workflow(&apply.workflow)?;
     }
@@ -1650,6 +1844,7 @@ mod tests {
             operator: "cgwalters".into(),
             bot: BOT.into(),
             dispatch_repo: "cgwalters-forge/tracker".into(),
+            review_workflow: Some("review.yml".into()),
         }
     }
 
@@ -1683,20 +1878,59 @@ mod tests {
             "enforcement_level": "non_admins", "checks": checks}}})
     }
 
+    /// A review; the review job's carries the marker of its run, [`REVIEW_RUN`].
     fn review(state: &str, author: Value, oid: &str, body: &str) -> Value {
+        let body = if author == job() {
+            format!(
+                "{body}\n\n<!-- gh-aw-agentic-workflow: review, id: {REVIEW_RUN}, workflow_id: agentic-job, run: https://github.com/{REPO}/actions/runs/{REVIEW_RUN} -->"
+            )
+        } else {
+            body.to_owned()
+        };
         json!({"state": state, "body": body, "submittedAt": "2026-10-12T01:00:00Z", "author": author, "commit": {"oid": oid}})
     }
 
-    /// Trusted operator author for the decision table.
+    /// A review submitted half an hour after [`review`]'s.
+    fn later(mut review: Value) -> Value {
+        review["submittedAt"] = "2026-10-12T01:30:00Z".into();
+        review
+    }
+
+    /// The review job's author as GraphQL returns `github-actions[bot]`.
     fn job() -> Value {
-        user("cgwalters")
+        bot("github-actions", ACTIONS_BOT_ID)
+    }
+
+    fn bot(login: &str, id: u64) -> Value {
+        json!({"__typename": "Bot", "login": login, "databaseId": id})
     }
 
     fn user(login: &str) -> Value {
         json!({"__typename": "User", "login": login})
     }
 
-    /// Synthetic operator-verdict cases, not parity with the recorded job verdicts.
+    /// The run of the review job its reviews name.
+    const REVIEW_RUN: u64 = 38545967203;
+
+    /// The review job's run of `head` as a pass keeps it: finished after the
+    /// reviews [`review`] and [`later`] submit.
+    fn job_run(head: &Value) -> Value {
+        json!({"id": REVIEW_RUN, "path": ".github/workflows/review.yml", "event": "pull_request_target",
+            "head_sha": head, "status": "completed", "run_started_at": "2026-10-12T00:50:00Z",
+            "updated_at": "2026-10-12T01:45:00Z", "repository": {"full_name": REPO}})
+    }
+
+    /// The run a pass reads for `p`, as the review job's run of its head is.
+    fn review_run(p: &Value) -> Option<Value> {
+        review_run_id(p, &config()).map(|id| {
+            let mut run = job_run(&p["headRefOid"]);
+            run["id"] = id.into();
+            run
+        })
+    }
+
+    /// A recorded pull request; unless a case gives `reviews`, the review job's
+    /// review of the head stands for its recorded `review` status.
     fn pull(name: &str, change: Value) -> Value {
         pull_with_author(name, change, job())
     }
@@ -1710,6 +1944,8 @@ mod tests {
     fn pull_with_author(name: &str, change: Value, author: Value) -> Value {
         let mut p = fixture(name);
         p["mergeable"] = "MERGEABLE".into();
+        // The recordings predate `baseRepository`; the forge is public.
+        p["baseRepository"] = json!({"nameWithOwner": REPO, "isPrivate": false});
         p["baseRefName"] = "main".into();
         let mut change = change.as_object().cloned().unwrap_or_default();
         let contexts = change.remove("contexts");
@@ -2123,7 +2359,7 @@ mod tests {
             (
                 "another fork's dispatch/ branch gets no fix",
                 "pull-470",
-                json!({"headRepositoryOwner": someone, "contexts": changes}),
+                json!({"headRepositoryOwner": someone, "reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "")]}}),
                 json!({"rounds": 0}),
                 none.clone(),
                 "skip",
@@ -2346,14 +2582,114 @@ mod tests {
                 "wait",
                 None,
             ),
-            // Shared bot identity alone cannot identify the review workflow.
+            // The review job is the Actions bot by its id; a login proves nothing.
             (
-                "an unauthenticated Actions workflow approval waits",
+                "the review job's approval of the head merges",
                 "pull-470",
-                json!({"reviews": {"nodes": [review("APPROVED", json!({"__typename": "Bot", "login": "github-actions[bot]"}), HEAD, "")]}}),
+                json!({"reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "the review job's change request of the head gets a fix",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("CHANGES_REQUESTED", job(), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "fix",
+                Some(1),
+            ),
+            // A branch of the repository could add a workflow that approves it.
+            (
+                "an Actions approval of a green branch of the repository itself waits",
+                "pull-143",
+                json!({"isDraft": false, "headRefOid": HEAD, "contexts": {"ci": {"conclusion": "SUCCESS"}}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
                 json!({"rounds": 0}),
                 none.clone(),
                 "wait",
+                None,
+            ),
+            (
+                "the review job's approval in a private repository waits",
+                "pull-470",
+                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": true}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the review job's approval where privacy is unknown waits",
+                "pull-470",
+                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": null}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the operator's approval of a branch of the repository itself merges",
+                "pull-143",
+                json!({"isDraft": false, "headRefOid": HEAD, "contexts": {"ci": {"conclusion": "SUCCESS"}}, "reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "the operator's change request outranks the job's later approval",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, ""), later(review("APPROVED", job(), HEAD, ""))]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "fix",
+                Some(1),
+            ),
+            (
+                "the operator's approval outranks the job's later change request",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, ""), later(review("CHANGES_REQUESTED", job(), HEAD, ""))]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "an Actions login without the bot's id waits",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("APPROVED", json!({"__typename": "Bot", "login": "github-actions"}), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "another app named like the review job does not merge",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("APPROVED", bot("github-actions", 1), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "a user carrying the bot's id does not merge",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("APPROVED", json!({"__typename": "User", "login": "github-actions", "databaseId": ACTIONS_BOT_ID}), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the operator's withheld-approval text is no verdict over the job's",
+                "pull-470",
+                json!({"reviews": {"nodes": [review("APPROVED", job(), HEAD, ""), review("COMMENTED", user("cgwalters"), HEAD, WITHHELD)]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
                 None,
             ),
             (
@@ -2377,7 +2713,7 @@ mod tests {
             (
                 "another bot's change request spends no round",
                 "pull-470",
-                json!({"reviews": {"nodes": [review("APPROVED", job(), HEAD, ""), review("CHANGES_REQUESTED", json!({"__typename": "Bot", "login": "dependabot"}), HEAD, "")]}}),
+                json!({"reviews": {"nodes": [review("APPROVED", job(), HEAD, ""), review("CHANGES_REQUESTED", bot("dependabot", 49699333), HEAD, "")]}}),
                 json!({"rounds": 0}),
                 none.clone(),
                 "merge",
@@ -2455,7 +2791,10 @@ mod tests {
                 &p,
                 &classify_checks(&p, &required()),
                 &marker(state),
-                Some(&fix_run).filter(|r| !r.is_null()),
+                (
+                    Some(&fix_run).filter(|r| !r.is_null()),
+                    review_run(&p).as_ref(),
+                ),
                 now(),
             );
             assert_eq!(
@@ -2578,7 +2917,10 @@ mod tests {
                     "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}
                 }),
             );
-            assert_eq!(review_at_head(&p, "cgwalters"), Some(Review::Approved));
+            assert_eq!(
+                review_at_head(&p, &config(), review_run(&p).as_ref()),
+                Some(Review::Approved)
+            );
             for requirement in [
                 json!("review"),
                 json!({"context": "review", "integration_id": null}),
@@ -2586,7 +2928,14 @@ mod tests {
                 let checks = classify_checks(&p, &[requirement]);
                 assert_eq!(!checks.failed.is_empty(), failed, "{state}");
                 assert_eq!(!checks.pending.is_empty(), pending, "{state}");
-                let decision = decide(&config(), &p, &checks, &Marker::default(), None, now());
+                let decision = decide(
+                    &config(),
+                    &p,
+                    &checks,
+                    &Marker::default(),
+                    (None, review_run(&p).as_ref()),
+                    now(),
+                );
                 assert_eq!(decision.action == "merge", !failed && !pending, "{state}");
             }
             // A status without app provenance cannot satisfy a bound requirement,
@@ -2595,7 +2944,15 @@ mod tests {
                 classify_checks(&p, &[json!({"context": "review", "integration_id": 15368})]);
             assert_eq!(checks.pending, ["review"]);
             assert_ne!(
-                decide(&config(), &p, &checks, &Marker::default(), None, now()).action,
+                decide(
+                    &config(),
+                    &p,
+                    &checks,
+                    &Marker::default(),
+                    (None, review_run(&p).as_ref()),
+                    now()
+                )
+                .action,
                 "merge"
             );
         }
@@ -2676,7 +3033,14 @@ mod tests {
         ] {
             let checks = classify_checks(&p, &required_checks(&rules, &branch).unwrap());
             assert_eq!(checks.pending, ["build"], "{name}");
-            let got = decide(&config(), &p, &checks, &Marker::default(), None, now());
+            let got = decide(
+                &config(),
+                &p,
+                &checks,
+                &Marker::default(),
+                (None, review_run(&p).as_ref()),
+                now(),
+            );
             assert_eq!(got.action, "wait", "{name}: {}", got.reason);
         }
         // Even with a null rollup.
@@ -2715,37 +3079,67 @@ mod tests {
         for reviews in [json!([later, earlier]), json!([earlier, later])] {
             let p = pull("pull-470", json!({"reviews": {"nodes": reviews}}));
             assert_eq!(
-                review_at_head(&p, "cgwalters"),
+                review_at_head(&p, &config(), review_run(&p).as_ref()),
                 Some(Review::ChangesRequested)
             );
             let checks = classify_checks(&p, &required());
             assert_eq!(
-                decide(&config(), &p, &checks, &Marker::default(), None, now()).action,
+                decide(
+                    &config(),
+                    &p,
+                    &checks,
+                    &Marker::default(),
+                    (None, review_run(&p).as_ref()),
+                    now()
+                )
+                .action,
                 "fix"
             );
         }
     }
 
     #[test]
-    fn recorded_job_only_verdicts_wait() {
-        for status in ["SUCCESS", "FAILURE"] {
-            let p = pull_with_author(
+    fn recorded_job_verdicts_decide() {
+        for (status, verdict, action) in [
+            ("SUCCESS", Review::Approved, "merge"),
+            ("FAILURE", Review::ChangesRequested, "fix"),
+        ] {
+            let p = pull(
                 "pull-470",
                 json!({"contexts": {"review": {"state": status}}}),
-                json!({"__typename": "Bot", "login": "github-actions[bot]"}),
             );
-            assert_eq!(review_at_head(&p, "cgwalters"), None);
+            assert_eq!(
+                review_at_head(&p, &config(), review_run(&p).as_ref()),
+                Some(verdict)
+            );
             let checks = classify_checks(&p, &required());
             assert_eq!(
-                decide(&config(), &p, &checks, &Marker::default(), None, now()).action,
-                "wait"
+                decide(
+                    &config(),
+                    &p,
+                    &checks,
+                    &Marker::default(),
+                    (None, review_run(&p).as_ref()),
+                    now()
+                )
+                .action,
+                action
             );
         }
     }
 
     #[test]
-    fn another_workflows_review_is_not_a_job_verdict() {
-        for login in ["github-actions", "github-actions[bot]"] {
+    fn only_the_actions_bot_by_id_is_the_job() {
+        let impostors = [
+            json!({"__typename": "Bot", "login": "github-actions"}),
+            json!({"__typename": "Bot", "login": "github-actions", "databaseId": null}),
+            json!({"__typename": "Bot", "login": "github-actions", "databaseId": ACTIONS_BOT_ID.to_string()}),
+            bot("github-actions", ACTIONS_BOT_ID + 1),
+            bot("dependabot", 49699333),
+            user("github-actions"),
+            json!({"__typename": "User", "login": "github-actions", "databaseId": ACTIONS_BOT_ID}),
+        ];
+        for author in impostors {
             for (state, body) in [
                 ("APPROVED", "VERDICT: APPROVE"),
                 ("CHANGES_REQUESTED", "VERDICT: CHANGES"),
@@ -2753,13 +3147,264 @@ mod tests {
             ] {
                 let p = pull(
                     "pull-470",
-                    json!({"reviews": {"nodes": [review(
-                        state, json!({"__typename": "Bot", "login": login}), HEAD, body
-                    )]}}),
+                    json!({"reviews": {"nodes": [review(state, author.clone(), HEAD, body)]}}),
                 );
-                assert_eq!(review_at_head(&p, "cgwalters"), None);
+                assert_eq!(
+                    review_at_head(&p, &config(), review_run(&p).as_ref()),
+                    None,
+                    "{author} {state}"
+                );
             }
         }
+        let p = pull(
+            "pull-470",
+            json!({"reviews": {"nodes": [review("COMMENTED", job(), HEAD, WITHHELD)]}}),
+        );
+        assert_eq!(
+            review_at_head(&p, &config(), review_run(&p).as_ref()),
+            Some(Review::Withheld)
+        );
+        // Where both request changes, the fix carries the operator's text.
+        let p = pull(
+            "pull-470",
+            json!({"reviews": {"nodes": [
+                review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "operator"),
+                later(review("CHANGES_REQUESTED", job(), HEAD, "job")),
+            ]}}),
+        );
+        assert_eq!(
+            head_review(&p, &config(), review_run(&p).as_ref()),
+            Some((Review::ChangesRequested, "operator"))
+        );
+    }
+
+    /// The Actions bot's approval of a green head merges only as the review
+    /// workflow's own run, on `pull_request_target`, of a dispatch pull request
+    /// from the bot's fork into a public repository. Every other workflow of
+    /// the repository, a branch's own among them, reviews as the same bot.
+    #[test]
+    fn the_job_verdict_needs_its_runs_provenance() {
+        let approval = |body: &str| {
+            json!({"nodes": [{"state": "APPROVED", "body": body, "submittedAt": "2026-10-12T01:00:00Z",
+                "author": job(), "commit": {"oid": HEAD}}]})
+        };
+        let marker = |repo: &str, id: u64| {
+            format!(
+                "<!-- gh-aw-agentic-workflow: review, id: {id}, workflow_id: agentic-job, run: https://github.com/{repo}/actions/runs/{id} -->"
+            )
+        };
+        let ours = marker(REPO, REVIEW_RUN);
+        let two = format!("{ours}\n{}", marker(REPO, REVIEW_RUN + 1));
+        let elsewhere = marker("someone/agentic-job", REVIEW_RUN);
+        let unclosed = ours.trim_end_matches(" -->").to_owned();
+        let none = Value::Null;
+        // (case, pull request change, run fields changed (null: no run read),
+        // review workflow, action)
+        for (name, change, run, workflow, action) in [
+            (
+                "the review workflow's run of the head merges",
+                json!({}),
+                json!({}),
+                Some("review.yml"),
+                "merge",
+            ),
+            (
+                "without a review workflow only the operator counts",
+                json!({}),
+                json!({}),
+                None,
+                "wait",
+            ),
+            (
+                "a run not read",
+                json!({}),
+                none.clone(),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "another workflow's run",
+                json!({}),
+                json!({"path": ".github/workflows/triage.yml"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a workflow of that name elsewhere",
+                json!({}),
+                json!({"path": "review.yml"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run on pull_request, from the branch's own copy of the workflow",
+                json!({}),
+                json!({"event": "pull_request"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run on push, from a branch's copy of the workflow",
+                json!({}),
+                json!({"event": "push"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a /review comment's run, which names no head",
+                json!({}),
+                json!({"event": "issue_comment", "head_sha": "f".repeat(40)}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run of an older head",
+                json!({}),
+                json!({"head_sha": "f".repeat(40)}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run of another repository",
+                json!({}),
+                json!({"repository": {"full_name": "someone/agentic-job"}}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run not finished yet",
+                json!({}),
+                json!({"status": "in_progress"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            // Another workflow copying the marker onto its own approval.
+            (
+                "a review submitted after the run it names finished",
+                json!({}),
+                json!({"updated_at": "2026-10-12T00:59:59Z"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a review from an earlier attempt of the run it names",
+                json!({}),
+                json!({"run_started_at": "2026-10-12T01:00:01Z"}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run with no times",
+                json!({}),
+                json!({"run_started_at": null}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a run other than the one named",
+                json!({}),
+                json!({"id": REVIEW_RUN + 1}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a review that names no run",
+                json!({"reviews": approval("VERDICT: APPROVE")}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a review that names two runs",
+                json!({"reviews": approval(&two)}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a review whose marker is not closed",
+                json!({"reviews": approval(&unclosed)}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a review that names another repository's run",
+                json!({"reviews": approval(&elsewhere)}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+            // A branch of the repository runs its own workflows with a token
+            // that can review: its approval of itself is the bot's too.
+            (
+                "a dispatch branch of the repository itself approving itself",
+                json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"}}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a branch of the bot's fork that is not a dispatch run's",
+                json!({"headRefName": "feature"}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+            (
+                "a private repository",
+                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": true}}),
+                json!({}),
+                Some("review.yml"),
+                "wait",
+            ),
+        ] {
+            let p = pull("pull-470", change);
+            let run = run.as_object().map(|fields| {
+                let mut run = job_run(&HEAD.into());
+                for (field, value) in fields {
+                    run[field] = value.clone();
+                }
+                run
+            });
+            let config = Config {
+                review_workflow: workflow.map(str::to_owned),
+                ..config()
+            };
+            let got = decide(
+                &config,
+                &p,
+                &classify_checks(&p, &required()),
+                &Marker::default(),
+                (None, run.as_ref()),
+                now(),
+            );
+            assert_eq!(got.action, action, "{name}: {}", got.reason);
+        }
+        // A pass reads the run only where the job's verdict could count.
+        for (change, read) in [
+            (json!({}), Some(REVIEW_RUN)),
+            (json!({"reviews": approval(&elsewhere)}), None),
+            (json!({"isCrossRepository": false}), None),
+            (
+                json!({"reviews": {"nodes": [
+                    review("APPROVED", job(), HEAD, ""),
+                    review("APPROVED", user("cgwalters"), HEAD, ""),
+                ]}}),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                review_run_id(&pull("pull-470", change.clone()), &config()),
+                read,
+                "{change}"
+            );
+        }
+        let off = Config {
+            review_workflow: None,
+            ..config()
+        };
+        assert_eq!(review_run_id(&pull("pull-470", json!({})), &off), None);
     }
 
     #[test]
@@ -2788,7 +3433,7 @@ mod tests {
             &p,
             &classify_checks(&p, &[]),
             &Marker::default(),
-            None,
+            (None, review_run(&p).as_ref()),
             now(),
         );
         assert_eq!(got.action, "wait", "{}", got.reason);
@@ -2848,7 +3493,7 @@ mod tests {
             &p,
             &classify_checks(&p, &required()),
             &marker(json!({"rounds": 1, "sha": HEAD, "run": 7})),
-            Some(&run),
+            (Some(&run), review_run(&p).as_ref()),
             now(),
         );
         assert_eq!(got.action, "needs-human");
@@ -3111,6 +3756,21 @@ mod tests {
             None,
             json!([]),
         );
+        // The review job's run, as the API gives it: what the check does not read
+        // is not kept.
+        fake.page(
+            &format!("repos/{REPO}/actions/runs/{REVIEW_RUN}"),
+            Some("\"r1\""),
+            None,
+            {
+                let mut run = job_run(&HEAD.into());
+                run["name"] = "review".into();
+                run["conclusion"] = "success".into();
+                run["head_branch"] = "dispatch/implement/agent-run-38180063797".into();
+                run["repository"]["private"] = false.into();
+                run
+            },
+        );
         fake.page("user", Some("\"u1\""), None, json!({"login": BOT}));
         fake.pulls.insert(470, pull("pull-470", json!({})));
         fake
@@ -3154,6 +3814,10 @@ mod tests {
                 .iter()
                 .all(|(_, validator)| validator.is_none())
         );
+        // The review job's run keeps only what its check reads.
+        let run =
+            &first.state.responses[&format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}")];
+        assert_eq!(run["body"], job_run(&HEAD.into()));
         // Events keep only what the pass reads.
         let events = &first.state.responses[&format!("{API_ROOT}repos/{REPO}/events?per_page=100")];
         assert_eq!(
@@ -3168,7 +3832,7 @@ mod tests {
         let second = pass(&fake, saved, &[], &[REPO]);
         assert_eq!(second.lines, first.lines[3..]);
         let sent = fake.sent.borrow().clone();
-        assert_eq!(sent.len(), 6);
+        assert_eq!(sent.len(), 7);
         assert!(
             sent.iter().all(|(_, validator)| validator.is_some()),
             "{sent:?}"
@@ -3352,17 +4016,27 @@ mod tests {
         let many: Vec<String> = (0..=POLL_REPOSITORY_LIMIT)
             .map(|i| format!("o/r{i}"))
             .collect();
-        for (watch, operator, dispatch) in [
-            (owned(&[]), "cgwalters", "cgwalters-forge/tracker"),
-            (owned(&["o/r/../x"]), "cgwalters", "cgwalters-forge/tracker"),
-            (owned(&[REPO]), "cg walters", "cgwalters-forge/tracker"),
-            (owned(&[REPO]), "cgwalters", "tracker"),
-            (many, "cgwalters", "cgwalters-forge/tracker"),
+        let tracker = "cgwalters-forge/tracker";
+        for (watch, operator, dispatch, review) in [
+            (owned(&[]), "cgwalters", tracker, "review.yml"),
+            (owned(&["o/r/../x"]), "cgwalters", tracker, "review.yml"),
+            (owned(&[REPO]), "cg walters", tracker, "review.yml"),
+            (owned(&[REPO]), "cgwalters", "tracker", "review.yml"),
+            (many, "cgwalters", tracker, "review.yml"),
+            // The review workflow is a file name, as `--dispatch-workflow` is.
+            (
+                owned(&[REPO]),
+                "cgwalters",
+                tracker,
+                ".github/workflows/review.yml",
+            ),
+            (owned(&[REPO]), "cgwalters", tracker, "review"),
         ] {
             let config = Config {
                 operator: operator.into(),
                 bot: BOT.into(),
                 dispatch_repo: dispatch.into(),
+                review_workflow: Some(review.into()),
             };
             assert!(
                 run(
@@ -3554,6 +4228,28 @@ mod tests {
                 vec![label[0].clone(), label[1].clone(), comment.clone()],
                 0,
             ),
+            // The Actions bot is every workflow of the repository; only the review
+            // workflow's run on `pull_request_target` speaks for the job.
+            (
+                "an approval by another workflow is not merged",
+                json!({"run": {"path": ".github/workflows/triage.yml"}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "wait: no approving review of the head yet",
+                vec![],
+                0,
+            ),
+            (
+                "a change request by a branch's own copy of the workflow starts no fix",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "run": {"event": "pull_request"}}),
+                none.clone(),
+                vec![],
+                vec![],
+                "wait: no approving review of the head yet",
+                vec![],
+                0,
+            ),
             (
                 "a pull request that waits is left as it is",
                 json!({"contexts": {"review": null}}),
@@ -3571,6 +4267,15 @@ mod tests {
                 .as_object_mut()
                 .and_then(|c| c.remove("pushed"))
                 .map(|head| (470, head.as_str().unwrap().to_owned()));
+            let run = format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}");
+            for (field, value) in change
+                .as_object_mut()
+                .and_then(|c| c.remove("run"))
+                .iter()
+                .flat_map(|r| r.as_object().unwrap().clone())
+            {
+                fake.rest.get_mut(&run).unwrap().3[field] = value;
+            }
             fake.pulls.insert(470, pull("pull-470", change));
             fake.refused = refused;
             // The label exists already.
@@ -3610,7 +4315,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fix_run_carries_the_operators_review_and_its_marker_the_run() {
+    fn a_fix_run_carries_the_review_and_its_marker_the_run() {
         let mut fake = github();
         fake.pulls.insert(
             470,
@@ -3674,7 +4379,7 @@ mod tests {
             &fake.pulls[&470],
             &classify_checks(&fake.pulls[&470], &required()),
             &last,
-            None,
+            (None, review_run(&fake.pulls[&470]).as_ref()),
             now(),
         );
         assert_eq!(decided.action, "wait", "{}", decided.reason);
@@ -3709,6 +4414,10 @@ mod tests {
             json!({"headRefOid": "newer", "contexts": {"review": {"state": "FAILURE"}}}),
         );
         b.pulls.insert(470, newer.clone());
+        b.rest
+            .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}"))
+            .unwrap()
+            .3["head_sha"] = "newer".into();
         b.rest.get_mut(&comments).unwrap().3 = json!([starting]);
         b.answers.borrow_mut().insert(
             format!("{API_ROOT}repos/{REPO}/issues/470/comments"),
@@ -3740,7 +4449,7 @@ mod tests {
                 &newer,
                 &classify_checks(&newer, &required()),
                 &marker,
-                None,
+                (None, review_run(&newer).as_ref()),
                 now(),
             );
             assert_eq!(decision.action, "needs-human", "{}", decision.reason);

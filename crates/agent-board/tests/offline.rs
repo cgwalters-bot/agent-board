@@ -1221,6 +1221,18 @@ fn poll_guard_table() {
             "invalid workflow",
         ),
         (
+            vec![
+                "--dry-run",
+                "--review-workflow",
+                ".github/workflows/review.yml",
+                "--follow",
+                "o/r",
+            ],
+            true,
+            1,
+            "invalid workflow",
+        ),
+        (
             vec!["--dry-run", "--follow", "o/r"],
             false,
             4,
