@@ -1,7 +1,7 @@
 version: 2
 updates:
-  # Third-party actions are pinned by commit; this proposes their updates.
-  # cgwalters-forge references follow @main and need no updates.
+  # Third-party actions are pinned by commit and agentic-job by release tag;
+  # this proposes their updates. Other cgwalters-forge references follow @main.
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -10,3 +10,10 @@ updates:
     # yanked quickly is never proposed.
     cooldown:
       default-days: 7
+    # One pull request per agentic-job release, whichever of its workflows or
+    # actions are referenced.
+    groups:
+      agentic-job:
+        patterns:
+          - "cgwalters-forge/agentic-job"
+          - "cgwalters-forge/agentic-job/*"
