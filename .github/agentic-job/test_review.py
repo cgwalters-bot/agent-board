@@ -17,7 +17,7 @@ class ReviewContracts(unittest.TestCase):
         caller = (ROOT / ".github/workflows/review.yml").read_text()
         self.assertRegex(
             caller,
-            r"uses: cgwalters-forge/agentic-job/\.github/workflows/review\.yml@v0\.1\.0\n",
+            r"uses: cgwalters-forge/agentic-job/\.github/workflows/review\.yml@v0\.2\.0\n",
         )
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
@@ -53,9 +53,9 @@ class ReviewContracts(unittest.TestCase):
         self.assertIn('groups:\n      agentic-job:\n        patterns:\n          - "cgwalters-forge/agentic-job"\n          - "cgwalters-forge/agentic-job/*"\n', config)
 
     def test_bounds_are_comment_only_and_commands_need_write(self):
-        for name, events, roles in (
-            ("review", ["pull_request_target", "pull_request"], ["all"]),
-            ("review-command", ["issue_comment"], ["admin", "maintain", "write"]),
+        for name, events, roles, bots in (
+            ("review", ["pull_request_target", "pull_request"], ["all"], ["dependabot[bot]"]),
+            ("review-command", ["issue_comment"], ["admin", "maintain", "write"], []),
         ):
             with self.subTest(name=name):
                 bounds = tomllib.loads((ROOT / f"workflow/{name}.toml").read_text())
@@ -66,7 +66,7 @@ class ReviewContracts(unittest.TestCase):
                 self.assertEqual(bounds["outputs"], {"add_comment": {"max": 1}, "noop": {"max": 1}})
                 self.assertEqual(bounds["trigger"]["events"], events)
                 self.assertEqual(bounds["trigger"]["roles"], roles)
-                self.assertEqual(bounds["trigger"]["bots"], [])
+                self.assertEqual(bounds["trigger"]["bots"], bots)
                 self.assertTrue(bounds["trigger"]["forks"])
                 self.assertEqual(bounds["trigger"].get("commands"), ["/review"] if name == "review-command" else None)
 
