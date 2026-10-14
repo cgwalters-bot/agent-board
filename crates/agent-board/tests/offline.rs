@@ -10,6 +10,42 @@ fn fixture() -> String {
 }
 
 #[test]
+fn epic_apply_cli_is_opt_in_and_requires_trusted_config() {
+    for args in [
+        vec!["epic", "apply", "example/work#1"],
+        vec![
+            "epic",
+            "apply",
+            "example/work#1",
+            "--config",
+            "unused",
+            "--apply",
+            "--dry-run",
+        ],
+        vec![
+            "epic",
+            "plan",
+            "example/work#1",
+            "--operator",
+            "operator",
+            "--ready-cap",
+            "1",
+        ],
+    ] {
+        command().args(args).assert().code(1);
+    }
+    let help = command()
+        .args(["epic", "apply", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("the default"));
+    assert!(text.contains("--apply"));
+}
+
+#[test]
 fn status_update_cli_refusals() {
     for (args, reason) in [
         (vec!["project", "status-update"], "--status"),

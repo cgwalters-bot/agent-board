@@ -405,7 +405,7 @@ fn records<'a>(comments: &'a [Comment], logins: &[&str], plan: &str) -> Vec<(u64
 }
 
 /// The login of the account a token belongs to.
-fn viewer<T: Transport>(transport: &T) -> Result<String> {
+pub(crate) fn viewer<T: Transport>(transport: &T) -> Result<String> {
     let data = transport.graphql("query { viewer { login } }", json!({}))?;
     let login = data
         .pointer("/viewer/login")
@@ -416,7 +416,7 @@ fn viewer<T: Transport>(transport: &T) -> Result<String> {
 }
 
 /// One write, which must succeed unless its status is `allowed`.
-fn send<R: Rest>(
+pub(crate) fn send<R: Rest>(
     client: &R,
     method: &str,
     url: &str,

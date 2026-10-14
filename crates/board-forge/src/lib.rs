@@ -6,6 +6,7 @@ use board_core::{Capability, Intent, Plan, Snapshot};
 use serde_json::{Value, json};
 
 pub mod epic;
+pub mod epic_apply;
 pub mod github;
 pub mod plan;
 pub mod poll;
