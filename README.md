@@ -33,7 +33,7 @@ Rust supporting edition 2024; no prebuilt releases, and not installable with `gh
 
 ## Workflows here
 
-- `ci.yml`: fmt, clippy, tests and fixture CLI runs on PRs, merge queue and pushes to main (`contents: read`).
+- `ci.yml`: fmt, clippy, tests and fixture CLI runs on PRs, merge queue and pushes to main (`contents: read`), and `just lint`: the forge's [shared workflow check](https://github.com/cgwalters-forge/actions/blob/main/lint/README.md) (actionlint, zizmor, no `ubuntu-latest`) from a checkout of cgwalters-forge/actions at main. Locally, with that repository at `../actions` or `FORGE_ACTIONS`, run `just lint`.
 - `reconcile.yml`: every ten minutes on main, reads cgwalters-forge-stage project 2 with a read-only environment token and uploads `reconcile plan --emit` proposals as an artifact; nothing is applied.
 - `review.yml`: agentic-job's [review](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md) workflow at release `@v0.1.0` on pull requests and `/review` comments.
 

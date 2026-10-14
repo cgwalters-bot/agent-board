@@ -36,10 +36,37 @@ jobs:
       - run: cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board.json --emit
       - run: cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage
 
+  # The shared workflow check, through the Justfile's lint recipe. The
+  # checked-out actions repository is code run here, with only this job's
+  # contents: read token and no persisted credentials; it follows main like
+  # our other cgwalters-forge references (cgwalters-forge/tracker#544).
+  lint:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: agent-board
+          persist-credentials: false
+      # Beside the repository, not inside it, so it is not linted as ours.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cgwalters-forge/actions
+          ref: main
+          path: actions
+          persist-credentials: false
+      # Pinned as the shared lint action pins it when this was written;
+      # Dependabot updates this copy separately.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just@1.58.0
+      - run: just lint
+        working-directory: agent-board
+
   # Require only ci in the ruleset, on both PR and merge-group commits.
   ci:
     if: ${{ always() }}
-    needs: [specs, rust]
+    needs: [specs, rust, lint]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}

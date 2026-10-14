@@ -1,6 +1,8 @@
 name: review
 on:
-  pull_request_target:
+  # The base's reusable workflow runs; no step here checks out or runs the
+  # head (test_review.py enforces that), so this trigger is accepted.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
     types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]

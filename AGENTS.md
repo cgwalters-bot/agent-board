@@ -35,6 +35,11 @@ cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board
 cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage
 ```
 
+A separate CI job, `lint`, runs `just lint`: the shared workflow check over
+`.github/` (not `live/`) from a checkout of cgwalters-forge/actions (see the
+[Justfile](Justfile)). It needs just, cargo and docker or `CONTAINER=podman`,
+and pulls the linter images.
+
 Measured on a fresh Linux devspace with dependency downloads (2026-10-08):
 format 0.07 s, clippy 15.50 s, tests 20.97 s, CLI commands 7.91/0.07/0.07 s.
 These are observations, not deadlines; CI allows 20 minutes for the job.

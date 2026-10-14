@@ -1,0 +1,5 @@
+# actionlint 1.7.12, the shared check's pin, predates GitHub's ubuntu-26.04
+# label, our standing default; drop this once its pin knows the label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

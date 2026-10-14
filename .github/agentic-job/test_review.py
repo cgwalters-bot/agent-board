@@ -85,15 +85,35 @@ class ReviewContracts(unittest.TestCase):
         self.assertIn("merge_group:\n    types: [checks_requested]", ci)
         sentinel = ci.split("\n  ci:\n", 1)[1]
         self.assertIn("if: ${{ always() }}", sentinel)
-        self.assertIn("needs: [specs, rust]", sentinel)
+        jobs = ("specs", "rust", "lint")
+        self.assertIn(f"needs: [{', '.join(jobs)}]", sentinel)
         expression = re.search(r"run: jq -e '([^']+)'", sentinel).group(1)
-        for results in itertools.product(("success", "failure", "cancelled", "skipped"), repeat=2):
+        for results in itertools.product(("success", "failure", "cancelled", "skipped"), repeat=len(jobs)):
             with self.subTest(results=results):
-                needs = {job: {"result": result} for job, result in zip(("specs", "rust"), results)}
+                needs = {job: {"result": result} for job, result in zip(jobs, results)}
                 checked = subprocess.run(
                     ["jq", "-e", expression], input=json.dumps(needs), text=True, capture_output=True,
                 )
-                self.assertEqual(checked.returncode, 0 if results == ("success", "success") else 1)
+                self.assertEqual(checked.returncode, 0 if set(results) == {"success"} else 1)
+
+    def test_ci_runs_the_shared_workflow_check(self):
+        # Through the Justfile, beside a checkout of the shared actions at
+        # main, on the standing runner label; the check itself denies
+        # ubuntu-latest.
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        lint = ci.split("\n  lint:\n", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("runs-on: ubuntu-26.04", lint)
+        self.assertIn("repository: cgwalters-forge/actions\n          ref: main\n          path: actions\n", lint)
+        self.assertEqual(lint.count("persist-credentials: false"), 2)
+        self.assertIn("- run: just lint\n        working-directory: agent-board", lint)
+        # It runs code from another repository's main: no credential beyond
+        # the workflow's contents: read.
+        for forbidden in ("permissions:", "secrets.", "GH_TOKEN", "token:"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lint)
+        justfile = (ROOT / "Justfile").read_text()
+        self.assertIn('forge_actions := env("FORGE_ACTIONS", "../actions")', justfile)
+        self.assertIn('--justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check', justfile)
 
 
 if __name__ == "__main__":
