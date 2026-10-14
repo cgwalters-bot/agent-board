@@ -120,6 +120,8 @@ enum Command {
 enum Epic {
     /// Print the mutations the newest accepted epic plan on an epic would make (--dry-run only).
     Plan(epic::Plan),
+    /// Apply the newest accepted epic plan once (dry run unless --apply).
+    Apply(epic::Apply),
 }
 
 #[derive(Subcommand)]
@@ -378,6 +380,21 @@ fn execute(cli: Cli) -> Result<()> {
                 &cli.hostname,
                 board_forge::github::Client::from_env,
                 || board_forge::github::Client::from_var("DISPATCH_TOKEN"),
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Epic {
+            command: Epic::Apply(args),
+        } => {
+            ensure!(
+                cli.json.is_none() && cli.snapshot.is_none(),
+                "epic apply does not support --json or --snapshot"
+            );
+            epic::apply(
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+                board_forge::github::Client::from_env,
                 &mut io::stdout().lock(),
             )
         }

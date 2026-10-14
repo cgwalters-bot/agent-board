@@ -1,5 +1,5 @@
 //! `epic plan`: the GitHub mutations the newest accepted epic plan on an epic
-//! would make. Applying them is not implemented yet, so only `--dry-run` runs.
+//! would make, and opt-in `epic apply`.
 use anyhow::{Result, ensure};
 use board_forge::epic::{Bounds, newest_epic_plan};
 use board_forge::github::Transport;
@@ -26,9 +26,6 @@ pub struct Plan {
     /// An option of the board's Priority field; repeat for each.
     #[arg(long = "priority-option", value_name = "OPTION")]
     priorities: Vec<String>,
-    /// Moves to Ready one plan may make.
-    #[arg(long, default_value_t = 0)]
-    ready_cap: usize,
 }
 
 /// Print the mutations, one JSON object a line. Every input is checked
@@ -42,7 +39,7 @@ pub fn plan<T: Transport>(
 ) -> Result<()> {
     ensure!(
         args.dry_run,
-        "applying epic plans is not implemented; pass --dry-run"
+        "epic plan requires --dry-run; use epic apply --apply to act"
     );
     ensure!(
         host == board_forge::github::DEFAULT_HOST,
@@ -58,7 +55,6 @@ pub fn plan<T: Transport>(
     let bounds = Bounds {
         repositories: args.repositories.clone(),
         priorities: args.priorities.clone(),
-        ready_cap: args.ready_cap,
     };
     bounds.validate()?;
     let (plan, epic, from) = newest_epic_plan(&transport()?, &issue, &writers, &bounds)?;
@@ -71,6 +67,58 @@ pub fn plan<T: Transport>(
         from.url,
         from.author.as_deref().unwrap_or("-")
     );
+    Ok(())
+}
+
+#[derive(Args)]
+pub struct Apply {
+    /// Epic URL, OWNER/REPO#N, or N with --repo.
+    issue: String,
+    /// Trusted configuration file from a protected default-branch checkout.
+    #[arg(long)]
+    config: std::path::PathBuf,
+    /// Print requests without writing (the default).
+    #[arg(long, conflicts_with = "apply")]
+    dry_run: bool,
+    /// Write with the configured bot's token.
+    #[arg(long)]
+    apply: bool,
+}
+
+pub fn apply<T: Transport + board_forge::poll::Rest>(
+    args: &Apply,
+    repo: Option<&str>,
+    host: &str,
+    transport: impl FnOnce() -> Result<T>,
+    out: &mut impl Write,
+) -> Result<()> {
+    use anyhow::Context;
+    ensure!(
+        host == board_forge::github::DEFAULT_HOST,
+        "epic apply supports only github.com"
+    );
+    let issue = board_forge::github::parse_github_issue(&args.issue, repo, host)?;
+    let value =
+        serde_json::from_str(&std::fs::read_to_string(&args.config).context("read epic config")?)
+            .context("decode epic config")?;
+    let config = board_forge::epic_apply::Config::from_json(&value)?;
+    let client = transport()?;
+    if args.apply {
+        for line in board_forge::epic_apply::apply(
+            &client,
+            &issue,
+            &config,
+            time::OffsetDateTime::now_utc(),
+        )? {
+            writeln!(out, "{line}")?;
+        }
+    } else {
+        for mutation in board_forge::epic_apply::preview(&client, &issue, &config)? {
+            serde_json::to_writer(&mut *out, &mutation)?;
+            writeln!(out)?;
+        }
+        eprintln!("Dry run; nothing changed. Pass --apply to act.");
+    }
     Ok(())
 }
 
@@ -95,8 +143,7 @@ mod tests {
                 }
                 let plan = json!({"schema": board_forge::epic::EPIC_PLAN_SCHEMA,
                     "epic": "cgwalters-forge/tracker#572", "actions": [
-                        {"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P1"},
-                        {"type": "move_to_ready", "issue": "cgwalters-forge/agent-board#63"}]});
+                        {"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P1"}]});
                 Ok(json!({"repository": {"issue": {"comments": {"nodes": [{
                     "url": "https://github.com/cgwalters-forge/tracker/issues/572#issuecomment-9",
                     "body": format!("```{}\n{plan}\n```", board_forge::epic::EPIC_PLAN_FENCE),
@@ -105,45 +152,35 @@ mod tests {
                     "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}))
             }
         }
-        let args = |dry_run: bool, repo: &str, ready_cap: usize, planner: &str| Plan {
+        let args = |dry_run: bool, repo: &str, planner: &str| Plan {
             issue: "572".into(),
             dry_run,
             operator: "cgwalters".into(),
             planner: Some(planner.into()),
             repositories: vec![repo.into()],
             priorities: vec!["P0".into(), "P1".into()],
-            ready_cap,
         };
         let ok = "cgwalters-forge/agent-board";
         // Arguments, reads made, then mutation lines or error.
         for (args, reads, expected) in [
-            (args(true, ok, 1, "cgwalters-bot"), 2, Ok(2)),
+            (args(true, ok, "cgwalters-bot"), 2, Ok(1)),
+            (args(true, ok, "someone"), 1, Err("no plan on this issue")),
             (
-                args(true, ok, 0, "cgwalters-bot"),
-                2,
-                Err("action 2 (move_to_ready): more than 0 moves to Ready"),
-            ),
-            (
-                args(true, ok, 1, "someone"),
-                1,
-                Err("no plan on this issue"),
-            ),
-            (
-                args(true, "cgwalters-forge/tracker", 1, "cgwalters-bot"),
+                args(true, "cgwalters-forge/tracker", "cgwalters-bot"),
                 2,
                 Err("repository cgwalters-forge/agent-board is not in the configured list"),
             ),
             (
-                args(false, ok, 1, "cgwalters-bot"),
+                args(false, ok, "cgwalters-bot"),
                 0,
-                Err("pass --dry-run"),
+                Err("requires --dry-run"),
             ),
             (
-                args(true, "tracker", 1, "cgwalters-bot"),
+                args(true, "tracker", "cgwalters-bot"),
                 0,
                 Err("invalid configured repository"),
             ),
-            (args(true, ok, 1, "a b"), 0, Err("invalid login")),
+            (args(true, ok, "a b"), 0, Err("invalid login")),
         ] {
             let forge = Forge(Default::default());
             let mut out = Vec::new();
@@ -160,7 +197,7 @@ mod tests {
                     let out = String::from_utf8(out).unwrap();
                     assert_eq!(out.lines().count(), lines, "{out}");
                     let last: Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
-                    assert_eq!(last["value"], "Ready");
+                    assert_eq!(last["value"], "P1");
                 }
                 (Err(error), Err(expected)) => {
                     assert!(format!("{error:#}").contains(expected), "{error:#}");

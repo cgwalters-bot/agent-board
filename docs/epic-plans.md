@@ -5,8 +5,12 @@ written as a comment on the epic (slice 2 of
 [tracker#572](https://github.com/cgwalters-forge/tracker/issues/572)). Like a
 [job plan](job-plans.md) it is a proposal: agent-board checks it against bounds
 from the caller's configuration, and only those bounds limit what it may change.
-`epic plan --dry-run` prints the GitHub mutations a plan would make; applying
-them is a later slice.
+`epic plan --dry-run` prints the GitHub mutations a plan would make.
+`epic apply ISSUE --config FILE` previews by default; `--apply` acts with the
+configured bot's token. Ordering is expressed only by sub-issue Priority.
+Apply and its preview require positive evidence of the parent's `epic` label,
+which the operator supplies; apply checks it again after claiming. This prevents
+the planner from starting decompositions on ordinary issues or its own new children.
 
 ## Format
 
@@ -24,7 +28,6 @@ a line, holding one JSON object:
      "plan": {"schema": "agent-board/job-plan/v1", "kind": "implement",
               "runner": "hosted", "brief": "..."}},
     {"type": "set_priority", "new": 1, "value": "P1"},
-    {"type": "move_to_ready", "new": 1},
     {"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#573", "reason": "..."},
     {"type": "rescope_sub_issue", "issue": "cgwalters-forge/agent-board#63",
      "body": "...", "reason": "..."}
@@ -37,11 +40,10 @@ a line, holding one JSON object:
 
 | `type` | Fields | Mutations |
 |---|---|---|
-| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan` | Create the issue, add it as a sub-issue of the epic, and post `plan` on it as a job plan |
+| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan` | Create the issue, link it to the epic, enroll it in the project with configured default Priority, and post `plan` as a job plan |
 | `close_sub_issue` | `issue`, `reason` | Comment the reason, close as not planned |
 | `rescope_sub_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason |
 | `set_priority` | `issue` or `new`, `value` | Set the board's Priority |
-| `move_to_ready` | `issue` or `new` | Set the board's Status to Ready |
 
 `issue` is `OWNER/REPO#N`; `new` is the 1-based position of an earlier
 `create_sub_issue` in `actions`. A job plan in `plan` has every field of a job
@@ -62,7 +64,6 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
   operator's, and an `epic` label on a new issue, which would let the planner
   start epics of its own;
 - a Priority not given with `--priority-option`;
-- more moves to Ready than `--ready-cap`, which is 0 unless set;
 - unknown fields and action types, anywhere, including in a job plan;
 - two actions of one type on one issue, or any other action on an issue the
   plan closes;
@@ -83,7 +84,7 @@ falling back to an older one. See [job plans](job-plans.md#who-may-write-one).
 
 ```sh
 agent-board epic plan "$EPIC" --dry-run --operator "$OPERATOR" --planner "$PLANNER" \
-  --allow-repo OWNER/REPO ... --priority-option P0 ... --ready-cap N
+  --allow-repo OWNER/REPO ... --priority-option P0 ...
 ```
 
 prints one JSON object a line per mutation, each tagged with its action's
@@ -91,3 +92,53 @@ position, and names the plan's comment on stderr. It needs a token that can
 read the epic. The bounds come from the caller's own configuration (for
 tracker, `schedule.repositories` in its `agent-board.json`), never from a plan
 or a dispatcher's inputs.
+
+## Apply
+
+```sh
+agent-board epic apply "$EPIC" --config epic-config.json --dry-run
+agent-board epic apply "$EPIC" --config epic-config.json --apply
+```
+
+The trusted configuration is a file from the caller repository's protected
+default-branch checkout. Do not populate it from workflow inputs, a plan, or a
+dispatch branch. Its JSON object has these fields (unknown fields are refused):
+
+```json
+{
+  "operator": "OPERATOR_LOGIN",
+  "bot": "BOT_LOGIN",
+  "repositories": ["OWNER/REPO"],
+  "project": "PROJECT_NODE_ID",
+  "priority_field": "Priority",
+  "priority_field_id": "FIELD_NODE_ID",
+  "priorities": {"P0": "OPTION_ID_0", "P1": "OPTION_ID_1"},
+  "default_priority": "P1"
+}
+```
+
+IDs and names are configuration, not planner-controlled values. Creating an
+issue sets the default Priority; a later `set_priority` can override it. The
+configured field must be a single-select field. The bot needs issue write and
+project write access. Neither command dispatches a job or changes Status.
+
+To prevent duplicate creation after a partial or ambiguous write, apply posts
+an `<!-- agent-board-epic-apply: COMMENT-ID@CHANGE-TIME -->` claim before any
+mutation and reads it back, as job dispatch does. The oldest claim wins; only
+operator/bot-authored claims count. Callers must serialize apply passes, since
+GitHub comment reads are not a transactional lock. A claimed plan is a no-op
+on re-run, even if a previous close now makes it invalid. A foreign edit to the
+plan still refuses it; accepted edits identify a new plan.
+
+Apply stops on the first failed request, records each confirmed write (including
+partial actions), and retains the claim. No rollback or automatic retry occurs.
+Inspect a failed or interrupted run and edit/replace the plan to continue.
+Failure to update the claim or post status is also an error, not permission to
+retry. Claim deletion by a repository writer can enable replay, as for dispatch.
+
+A dated status comment lists confirmed changes. Its hidden first line is
+`<!-- agent-board-epic-fingerprint: JSON -->`, where JSON is the sorted list of
+`[lowercase OWNER/REPO#N, OPEN-or-CLOSED]` pairs for all current sub-issues.
+`epic_apply::fingerprint` exposes this canonical representation for a future
+census. It detects membership/state drift, not body or Priority drift; no census
+consumer is implemented in this slice. A failed final read cannot publish status.

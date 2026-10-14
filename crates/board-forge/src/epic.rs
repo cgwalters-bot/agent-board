@@ -5,7 +5,7 @@
 //!
 //! Any run that comments as the planner can write a plan, so the bounds
 //! checked here, which come from the caller's configuration, are what limit
-//! it. Applying a plan is a later slice: nothing here writes.
+//! it. Applying is opt-in and records a claim before making changes.
 use crate::github::{API_ROOT, DEFAULT_HOST, Transport};
 use crate::plan::{Comment, JobPlan, fenced_json, issue_comments, newest_fenced};
 use crate::poll::validate_repository;
@@ -22,9 +22,6 @@ pub const EPIC_PLAN_FENCE: &str = "agent-board-epic-plan";
 /// plan that could would let the planner start epics of its own.
 pub const EPIC_LABEL: &str = "epic";
 pub const PRIORITY_FIELD: &str = "Priority";
-pub const STATUS_FIELD: &str = "Status";
-/// The Status option a move to Ready sets; the scheduler dispatches from it.
-pub const READY: &str = "Ready";
 /// Actions in one plan, so a runaway planner cannot file issues by the dozen.
 pub const ACTION_LIMIT: usize = 20;
 /// Characters of a title, GitHub's own limit.
@@ -41,6 +38,7 @@ const SUB_ISSUES_QUERY: &str = r#"query($owner: String!, $name: String!, $number
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       id
+      labels(first: 100) { nodes { name } }
       subIssues(first: 100) {
         nodes { number state repository { nameWithOwner } }
         pageInfo { hasNextPage }
@@ -116,9 +114,6 @@ pub enum Action {
         target: Target,
         value: String,
     },
-    MoveToReady {
-        target: Target,
-    },
 }
 
 /// Action types, with the fields each takes besides `type`.
@@ -130,7 +125,6 @@ const ACTIONS: &[(&str, &[&str])] = &[
     ("close_sub_issue", &["issue", "reason"]),
     ("rescope_sub_issue", &["issue", "body", "reason"]),
     ("set_priority", &["issue", "new", "value"]),
-    ("move_to_ready", &["issue", "new"]),
 ];
 
 /// What a plan may touch, from the caller's own configuration (never from a
@@ -141,8 +135,6 @@ pub struct Bounds {
     pub repositories: Vec<String>,
     /// The Priority field's options.
     pub priorities: Vec<String>,
-    /// Moves to Ready in one plan.
-    pub ready_cap: usize,
 }
 
 impl Bounds {
@@ -166,10 +158,13 @@ pub struct Epic {
     pub issue: IssueRef,
     /// Its node ID, which addSubIssue takes.
     pub id: String,
+    /// Positive evidence of the operator's epic designation. Missing/redacted
+    /// labels are not authority to apply a decomposition.
+    pub designated: bool,
     /// Its open sub-issues, the only ones a plan may change.
     pub sub_issues: Vec<IssueRef>,
     /// Its closed sub-issues: closed by the operator or by finished work, so
-    /// a plan may not move them to Ready or otherwise revive them.
+    /// a plan may not change or revive them.
     pub closed: Vec<IssueRef>,
 }
 
@@ -236,7 +231,6 @@ impl EpicPlan {
             epic,
             done: Vec::new(),
             seen: BTreeMap::new(),
-            ready: 0,
         };
         let mut errors = Vec::new();
         for (index, value) in actions.iter().enumerate() {
@@ -345,9 +339,6 @@ impl EpicPlan {
                 Action::SetPriority { target: t, value } => {
                     out.push(field(n, target(t), PRIORITY_FIELD, value));
                 }
-                Action::MoveToReady { target: t } => {
-                    out.push(field(n, target(t), STATUS_FIELD, READY));
-                }
             }
         }
         out
@@ -362,7 +353,6 @@ struct Checker<'a> {
     done: Vec<Option<Action>>,
     /// Each (type, issue) acted on, and the action that did.
     seen: BTreeMap<(String, String), usize>,
-    ready: usize,
 }
 
 impl Checker<'_> {
@@ -425,8 +415,7 @@ impl Checker<'_> {
     }
 
     /// One action of a type on any one issue, and nothing else on an issue the
-    /// plan closes: either would repeat or contradict (a closed issue moved to
-    /// Ready, say).
+    /// plan closes: either would repeat or contradict.
     fn once(&mut self, kind: &str, key: String) -> Result<()> {
         const CLOSE: &str = "close_sub_issue";
         let clash = self
@@ -535,17 +524,6 @@ impl Checker<'_> {
                     value: value.into(),
                 }
             }
-            "move_to_ready" => {
-                let target = self.target(object)?;
-                ensure!(
-                    self.ready < self.bounds.ready_cap,
-                    "more than {} moves to Ready",
-                    self.bounds.ready_cap
-                );
-                self.once(kind, target_key(&target))?;
-                self.ready += 1;
-                Action::MoveToReady { target }
-            }
             _ => bail!("unknown action type {kind:?}"),
         })
     }
@@ -601,6 +579,9 @@ pub fn read_epic<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Epic> {
             number: issue.number,
         },
         id: id.into(),
+        designated: node["labels"]["nodes"]
+            .as_array()
+            .is_some_and(|labels| labels.iter().any(|l| l["name"] == EPIC_LABEL)),
         sub_issues: Vec::new(),
         closed: Vec::new(),
     };
@@ -661,6 +642,7 @@ mod tests {
         Epic {
             issue: IssueRef::parse(EPIC).unwrap(),
             id: "I_epic".into(),
+            designated: true,
             sub_issues: vec![
                 IssueRef::parse("cgwalters-forge/agent-board#63").unwrap(),
                 IssueRef::parse("cgwalters-forge/tracker#573").unwrap(),
@@ -677,7 +659,6 @@ mod tests {
                 "cgwalters-forge/agent-board".into(),
             ],
             priorities: vec!["P0".into(), "P1".into(), "P2".into()],
-            ready_cap: 2,
         }
     }
 
@@ -696,7 +677,6 @@ mod tests {
         vec![
             create(),
             json!({"type": "set_priority", "new": 1, "value": "P1"}),
-            json!({"type": "move_to_ready", "new": 1}),
             json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#573",
                 "reason": "Folded into agent-board#63."}),
             json!({"type": "rescope_sub_issue", "issue": "CGWalters-Forge/agent-board#63",
@@ -709,7 +689,7 @@ mod tests {
     fn valid_plan_and_its_mutations() {
         let epic = epic();
         let checked = EpicPlan::validate(&plan(valid()), &bounds(), &epic).unwrap();
-        assert_eq!(checked.actions.len(), 6);
+        assert_eq!(checked.actions.len(), 5);
         let Action::Create {
             plan: Some(job), ..
         } = &checked.actions[0]
@@ -741,13 +721,11 @@ mod tests {
                 format!("1 POST {api}/cgwalters-forge/agent-board/issues/NEW-1/comments"),
                 "2 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#NEW-1 Priority=P1"
                     .into(),
-                "3 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#NEW-1 Status=Ready"
-                    .into(),
-                format!("4 POST {api}/cgwalters-forge/tracker/issues/573/comments"),
-                format!("4 PATCH {api}/cgwalters-forge/tracker/issues/573"),
-                format!("5 PATCH {api}/cgwalters-forge/agent-board/issues/63"),
-                format!("5 POST {api}/cgwalters-forge/agent-board/issues/63/comments"),
-                "6 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#63 Priority=P0".into(),
+                format!("3 POST {api}/cgwalters-forge/tracker/issues/573/comments"),
+                format!("3 PATCH {api}/cgwalters-forge/tracker/issues/573"),
+                format!("4 PATCH {api}/cgwalters-forge/agent-board/issues/63"),
+                format!("4 POST {api}/cgwalters-forge/agent-board/issues/63/comments"),
+                "5 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#63 Priority=P0".into(),
             ]
         );
         assert_eq!(mutations[1]["variables"]["issueId"], "I_epic");
@@ -755,7 +733,7 @@ mod tests {
             mutations[0]["body"],
             json!({"title": "epic apply", "body": "Apply epic plans."})
         );
-        assert_eq!(mutations[6]["body"]["state_reason"], "not_planned");
+        assert_eq!(mutations[5]["body"]["state_reason"], "not_planned");
         let comment = mutations[2]["body"]["body"].as_str().unwrap();
         assert!(comment.starts_with("```agent-board-plan\n"), "{comment}");
         assert!(comment.contains("\"item\": \"NEW-1\""), "{comment}");
@@ -783,7 +761,7 @@ mod tests {
         job_unknown["plan"]["budget"] = json!(5);
         let mut long_title = create();
         long_title["title"] = json!(long);
-        let ready = |issue: &str| json!({"type": "move_to_ready", "issue": issue});
+        let priority = |issue: &str| json!({"type": "set_priority", "issue": issue, "value": "P1"});
         for (extra, error) in [
             // Issues that are neither new nor current sub-issues.
             (
@@ -799,28 +777,31 @@ mod tests {
                 "is neither new nor a current sub-issue",
             ),
             (
-                vec![json!({"type": "move_to_ready", "new": 4})],
+                vec![json!({"type": "set_priority", "new": 4, "value": "P1"})],
                 "does not create a sub-issue",
             ),
             (
-                vec![json!({"type": "move_to_ready", "new": 7})],
+                vec![json!({"type": "set_priority", "new": 6, "value": "P1"})],
                 "not the position of an earlier action",
             ),
             (
-                vec![json!({"type": "move_to_ready", "new": 0})],
+                vec![json!({"type": "set_priority", "new": 0, "value": "P1"})],
                 "not the position of an earlier action",
             ),
             (
-                vec![outside.clone(), json!({"type": "move_to_ready", "new": 7})],
-                "action 8 (move_to_ready): new names action 7, which is refused",
+                vec![
+                    outside.clone(),
+                    json!({"type": "set_priority", "new": 6, "value": "P1"}),
+                ],
+                "action 7 (set_priority): new names action 6, which is refused",
             ),
             (
-                vec![json!({"type": "move_to_ready", "issue": "cgwalters-forge/tracker#574"})],
+                vec![priority("cgwalters-forge/tracker#574")],
                 "cgwalters-forge/tracker#574 is a closed sub-issue; a plan may not change it",
             ),
             (
                 vec![
-                    json!({"type": "move_to_ready", "issue": "cgwalters-forge/agent-board#63", "new": 1}),
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "new": 1, "value": "P1"}),
                 ],
                 "exactly one of issue or new",
             ),
@@ -869,19 +850,15 @@ mod tests {
                 ],
                 "is not one of the field's options",
             ),
-            // More Ready moves than the cap (2, one used by action 3).
+            // Removed action types remain unknown rather than being ignored.
             (
-                vec![
-                    ready("cgwalters-forge/agent-board#63"),
-                    create(),
-                    json!({"type": "move_to_ready", "new": 8}),
-                ],
-                "action 9 (move_to_ready): more than 2 moves to Ready",
+                vec![json!({"type": "move_to_ready", "new": 1})],
+                "unknown action type \"move_to_ready\"",
             ),
             // Nothing else on an issue the plan closes (action 4).
             (
-                vec![ready("cgwalters-forge/tracker#573")],
-                "action 7 (move_to_ready): cgwalters-forge/tracker#573 is already the subject of action 4",
+                vec![priority("cgwalters-forge/tracker#573")],
+                "action 6 (set_priority): cgwalters-forge/tracker#573 is already the subject of action 3",
             ),
             // A reason may not pose as a plan or a record when posted.
             (
@@ -914,13 +891,13 @@ mod tests {
                 vec![
                     json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P1"}),
                 ],
-                "action 7 (set_priority): cgwalters-forge/agent-board#63 is already the subject of action 6",
+                "action 6 (set_priority): cgwalters-forge/agent-board#63 is already the subject of action 5",
             ),
             (
                 vec![
                     json!({"type": "close_sub_issue", "issue": "cgwalters-forge/agent-board#63", "reason": "Gone."}),
                 ],
-                "is already the subject of action 5",
+                "is already the subject of action 4",
             ),
             // Text bounds.
             (vec![long_title], "title exceeds 256 characters"),
@@ -938,7 +915,7 @@ mod tests {
             ),
             (
                 vec![json!("close")],
-                "action 7 (?): action is not a JSON object",
+                "action 6 (?): action is not a JSON object",
             ),
         ] {
             let mut actions = valid();
@@ -960,10 +937,7 @@ mod tests {
             json!({"type": "move_to_ready", "issue": "cgwalters-forge/tracker#573"}),
             json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#1", "reason": "x"}),
         ];
-        let off = Bounds {
-            ready_cap: 0,
-            ..bounds()
-        };
+        let off = bounds();
         let message = format!(
             "{:#}",
             EpicPlan::validate(&plan(actions), &off, &epic()).unwrap_err()
@@ -974,27 +948,24 @@ mod tests {
             lines[1].starts_with("  action 1 (set_priority): "),
             "{message}"
         );
-        // Ready moves are off unless configured.
+        // The removed action is refused.
         assert!(
-            lines[2].contains("action 3 (move_to_ready): more than 0 moves"),
+            lines[2].contains("action 3 (move_to_ready): unknown action type"),
             "{message}"
         );
         assert!(
             lines[3].starts_with("  action 4 (close_sub_issue): "),
             "{message}"
         );
-        // A refused action does not count against its issue or the Ready cap.
-        let ready = json!({"type": "move_to_ready", "issue": "cgwalters-forge/tracker#573"});
+        // A refused action does not count against its issue.
+        let priority =
+            json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P1"});
         let actions = vec![
             json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P3"}),
             json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P1"}),
-            ready.clone(),
-            ready,
+            priority,
         ];
-        let one = Bounds {
-            ready_cap: 1,
-            ..bounds()
-        };
+        let one = bounds();
         let message = format!(
             "{:#}",
             EpicPlan::validate(&plan(actions), &one, &epic()).unwrap_err()
@@ -1002,7 +973,7 @@ mod tests {
         let lines: Vec<_> = message.lines().skip(1).collect();
         assert_eq!(lines.len(), 2, "{message}");
         assert!(lines[0].starts_with("  action 1 (set_priority): Priority \"P3\""));
-        assert!(lines[1].starts_with("  action 4 (move_to_ready): more than 1 moves"));
+        assert!(lines[1].starts_with("  action 3 (set_priority):"));
         // With no configured bounds, nothing passes.
         let none = EpicPlan::validate(&plan(valid()), &Bounds::default(), &epic());
         assert!(format!("{:#}", none.unwrap_err()).contains("not in the configured list"));
@@ -1110,7 +1081,7 @@ mod tests {
         full["subIssues"]["pageInfo"]["hasNextPage"] = json!(true);
         // Comments, sub-issues, then the comment and action count chosen, or an error.
         for (comments, sub_issues, expected) in [
-            (vec![first()], subs.clone(), Ok((1, 6))),
+            (vec![first()], subs.clone(), Ok((1, 5))),
             // A writer replaces the plan; a visitor's newer one is ignored.
             (
                 vec![
