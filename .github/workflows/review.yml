@@ -11,7 +11,11 @@ jobs:
       github.event_name == 'pull_request_target' ||
       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/review'))
     # Base-owned policy; the head is fetched only as data inside the sandbox.
-    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@0d5e8dc31705dd50dfe3900714a13b5e6343355d
+    # Our own workflows follow main (cgwalters-forge/tracker#544); third-party
+    # actions stay pinned by commit. The permissions below go to whatever is on
+    # agentic-job main, so a change merged there can post this repository's
+    # review comment and status: that branch's review is part of this gate.
+    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@main
     permissions:
       contents: read
       issues: read

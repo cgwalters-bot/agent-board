@@ -1,0 +1,10 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # Our own actions follow @main (cgwalters-forge/tracker#544); other
+        # actions must be pinned by commit. zizmor checks step `uses:` only and
+        # is not run in CI; .github/agentic-job/test_review.py enforces both
+        # step and job-level references there.
+        "cgwalters-forge/*": ref-pin
+        "*": hash-pin
