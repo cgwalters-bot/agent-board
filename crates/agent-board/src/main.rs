@@ -84,7 +84,7 @@ enum Command {
         #[command(subcommand)]
         command: Request,
     },
-    /// Start the job an issue's newest accepted plan comment proposes (--dry-run prints the request).
+    /// Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request).
     Dispatch(dispatch::FromPlan),
     /// Save a normalized board snapshot for offline use.
     Snapshot {
@@ -365,6 +365,7 @@ fn execute(cli: Cli) -> Result<()> {
                 cli.repo.as_deref(),
                 &cli.hostname,
                 board_forge::github::Client::from_env,
+                || board_forge::github::Client::from_var("DISPATCH_TOKEN"),
                 &mut io::stdout().lock(),
             )
         }

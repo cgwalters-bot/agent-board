@@ -1288,8 +1288,16 @@ fn dispatch_plan_guard_table() {
     ];
     // Each fails before any request: no case here reaches the network.
     for (args, token, code, reason) in [
-        (vec![], true, 1, "pass --dry-run"),
+        (vec![], true, 1, "pass --dry-run or --apply"),
         (vec!["--dry-run"], false, 4, "authentication"),
+        (vec!["--apply"], false, 4, "authentication"),
+        (vec!["--dry-run", "--apply"], true, 1, "cannot be used with"),
+        (
+            vec!["--apply", "--workflow", "../dispatch.yml"],
+            true,
+            1,
+            "invalid workflow",
+        ),
         (
             vec!["--dry-run", "--ref", "a..b"],
             true,
@@ -1326,14 +1334,12 @@ fn dispatch_plan_guard_table() {
         if token {
             command.env("GH_TOKEN", "unused");
         }
-        let output = command
-            .args(base)
-            .args(&args)
-            .assert()
-            .code(code)
-            .stdout("")
-            .get_output()
-            .clone();
+        command.args(base).args(&args);
+        // The workflow comes from the caller's configuration, as --caller does.
+        if !args.contains(&"--workflow") {
+            command.args(["--workflow", "dispatch.yml"]);
+        }
+        let output = command.assert().code(code).stdout("").get_output().clone();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.contains(reason), "{args:?}: {stderr}");
     }

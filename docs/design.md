@@ -339,14 +339,15 @@ Independently bounded `update_project` application must be configured
 for the exact project, issue, fields and values. Only that separate apply job may
 receive organization Projects write permission; GITHUB_TOKEN does not grant it.
 
-No scheduled admission, automatic recording, run listing, refusal-to-Blocked
+No scheduled admission, automatic Run/Result recording, run listing, refusal-to-Blocked
 conversion or stuck-run recovery is implemented yet. Do not retry an ambiguous
 dispatch automatically. `project init` creates missing Turn/Run/Result
 fields with the operator's own token and never edits existing fields or options. No workflow permissions, token
 placement or action pins are changed in this patch.
 
 `dispatch ISSUE --dry-run` prints the workflow_dispatch request for the newest
-accepted [job plan](job-plans.md) on an issue; it sends nothing yet.
+accepted [job plan](job-plans.md) on an issue; `--apply` sends it once per plan,
+recorded by a comment on the issue that is posted and read back first.
 
 `ask create` opens a question issue, labelled `question` and assigned to the
 operator, with lettered options and a recommendation, and sets it and the item it
