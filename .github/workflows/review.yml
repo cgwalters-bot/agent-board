@@ -16,8 +16,9 @@ jobs:
     # agentic-job is referenced by release tag: following main failed runs that
     # spanned a merge there (cgwalters-forge/tracker#544). Dependabot proposes
     # newer tags. The permissions below go to whatever that tag names, so
-    # agentic-job's release process is part of this gate.
-    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@v0.1.0
+    # agentic-job's release process is part of this gate. v0.2.0 is the
+    # first release whose `if:` admits the bots REVIEW_BOT_IDS lists.
+    uses: cgwalters-forge/agentic-job/.github/workflows/review.yml@v0.2.0
     permissions:
       contents: read
       issues: read
