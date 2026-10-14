@@ -230,13 +230,15 @@ it prints the operator's and the bot's activity from the events of every
 repository on the board (given by `--owner`/`--project` or `--snapshot`) and of
 `--watch`/`--follow`, a step for each of the bot's open pull requests in the
 `--follow` repositories (keyed on the latest submitted review of the head by the
-operator, not a status and a VERDICT comment), and when the next pass is due
+operator, or else, with `--review-workflow`, by the review job as
+`github-actions[bot]`, matched by its fixed user id; not a status and a VERDICT
+comment), and when the next pass is due
 (five minutes while anything changed or a pull request is in flight, doubling
 while idle, at most six hours apart). GETs are conditional against a disposable
 state file; the pull request query is GraphQL and is not. `--dry-run` takes no
 step. `--apply` takes poll.cjs's steps with the bot's `GH_TOKEN` (checked to be
 `--bot`'s, as only the bot's markers and claims are read back): mark ready,
-merge an operator-approved green head at once (pinned to the head that was
+merge an approved green head at once (pinned to the head that was
 read; never auto-merge or the merge queue, which stay pending where a later
 push could ride on the approval), label `needs-human` with the marker comment, and start a fix run
 through the caller's `--dispatch-workflow` with `DISPATCH_TOKEN`, at most three
@@ -252,11 +254,23 @@ so a stop another pass is still writing is not taken for a reset. Steps are take
 repositories only; the board widens what is read, not what is changed. The
 workflow, its bounds and the tokens stay in the tracker, whose poll.yml still
 runs poll.cjs. Promoting operator-approved fork pull requests upstream is not
-implemented. Authenticated review-job verdicts are deferred: the shared
-Actions bot identity does not establish which workflow submitted a review.
-Job-only approvals and change requests therefore wait for an operator verdict,
-unlike poll.cjs; recorded job-only cases test this limitation separately from
-synthetic operator-verdict decisions. Activity is printed, not yet handed to a controller pass, and
+implemented. Every workflow of a repository reviews as the Actions bot, and a
+branch of the repository could add one that approves its own pull request, so
+the bot's review counts only where the pull request's own workflows cannot
+review (a dispatch pull request from the bot's fork into a public repository,
+whose workflows get a read-only token) and only where the run its marker names
+is a `pull_request_target` run of `--review-workflow` for that head that ran
+while the review was submitted, which keeps out the repository's other
+workflows. Anyone who can push a branch to the repository (or change what the
+review workflow calls) can still produce a verdict that counts: a push workflow
+can copy the marker while the job runs, and a branch can be the base of a pull
+request with the same head. Without the flag, and elsewhere,
+only the operator's verdict counts, which is narrower than poll.cjs: it takes
+the `review` status from whoever sets it. The operator's verdict of the head outranks the job's
+either way. Side by
+side with poll.cjs (69 passes in tracker#534), agent-board read 54–166 s later,
+because poll.yml builds it first, and so often sees what poll.cjs just did; a
+fair comparison runs its pass first or from a prebuilt binary. Activity is printed, not yet handed to a controller pass, and
 the events API serves one page of 100 a pass, so a busier gap is reported as
 such. A pull request with more labels, reviews, commits or checks than its one
 query reads waits rather than being decided on part of them. Required checks come from the base branch's rulesets and its classic
