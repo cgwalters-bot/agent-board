@@ -20,7 +20,7 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `request dispatch`, `run record` | Print `gh workflow run` argv for agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md); propose Run/Result field updates. |
 | `dispatch ISSUE --dry-run\|--apply` | Print, or send once and record on the issue, the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)). |
 | `epic plan ISSUE --dry-run` | Check the newest accepted [epic plan](docs/epic-plans.md) on an epic against configured bounds and print the GitHub mutations it would make; applying is not implemented ([tracker#572](https://github.com/cgwalters-forge/tracker/issues/572)). |
-| `poll --dry-run` | Preview one pass of the pull request poll and when the next is due. `--dry-run` is required: no step is taken yet ([#40](https://github.com/cgwalters-forge/agent-board/issues/40)). |
+| `poll --dry-run\|--apply` | Preview one pull request poll pass, or explicitly apply its steps in `--follow` repositories. Apply requires `--dispatch-workflow`; `--review-workflow` selects eligible exact-head job reviews and repeated `--fix-pool` selects fix pools. See [poll behavior and limits](docs/design.md#current-implementation-limits). |
 | `test project` | Staging integration test; holds a write token. Not for local use. |
 
 `output check`/`output apply` are unsupported; sweeping is disabled.
@@ -31,6 +31,110 @@ Rust supporting edition 2024; no prebuilt releases, and not installable with `gh
 
     cargo install --git https://github.com/cgwalters-forge/agent-board agent-board
     agent-board item list --snapshot fixtures/board.json   # from a clone, no token
+
+## New organization
+
+Bring up one lane at a time; a working scripted trial does not establish a
+scheduled real-agent/review loop. Keep writes and scheduling off until their
+previews and prerequisites are checked.
+
+1. **Choose the identities and install.** Start with agentic-job's
+   [Try it](https://github.com/cgwalters-forge/agentic-job/blob/main/README.md#try-it)
+   and [Install](#install) above (Cargo with edition-2024-capable Rust, not
+   `gh extension install`). Choose a public target repository on `main`, a
+   trusted caller repository that holds the workflow/bounds, and an existing
+   organization Project v2. These are separate identities, not an assumption
+   that tracker or its project is already provisioned for your organization.
+
+2. **Prove model-free dispatch first.** Follow the
+   [ten-minute scripted trial](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md#ten-minute-scripted-trial):
+   copy [dispatch.yml](https://github.com/cgwalters-forge/agentic-job/blob/main/.github/workflows/dispatch.yml)
+   and [dispatch.toml](https://github.com/cgwalters-forge/agentic-job/blob/main/.github/agentic-job/dispatch.toml),
+   replace the local reusable call with a reviewed compatible SHA, set exact
+   `repos` and keep `bases = ["main"]`. Commit to the protected default branch,
+   allow the actions, then dispatch `kind=research` against an existing issue.
+   This two-file route does not need `hosted.toml`; it differs from the README's
+   three-file `example.yml` trial. Implement also needs the apply environment/PAT.
+   Bounds protect documentation too: explicitly list intended documentation
+   files in `unprotected_files`, rather than broadly unprotecting the repository.
+
+3. **Provision inference and network before selecting a real agent.** Follow
+   [Switch to a real agent](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md#switch-to-a-real-agent)
+   for `AGENT`, `AGENT_MODEL`, `AGENT_RUNNER`, `INFERENCE_URL`,
+   `INFERENCE_AUDIENCE`, optional runner/agent configuration and `APPLY_ENVIRONMENT`.
+   The current [reusable workflow](https://github.com/cgwalters-forge/agentic-job/blob/main/.github/workflows/agentic-job.yml)
+   has no `tailscale-*` inputs. Hosted access to a private broker needs
+   caller-owned composition: policy → agent (`prepare` → pinned tailnet join
+   with tailnet DNS disabled → `secure-host` → `run`) → check → apply; see
+   [example-compose.yml](https://github.com/cgwalters-forge/agentic-job/blob/main/.github/workflows/example-compose.yml).
+   Match [broker admission](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/inference.md#which-workflows-a-broker-admits)
+   to the identity: repository-narrowed `any_workflow` for composition versus
+   SHA-specific `called_workflows` for reusable jobs. Adapting that example into
+   a production private-broker dispatch still requires operator work.
+
+4. **Install review independently.** Follow review's
+   [Another repository](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md#another-repository)
+   instructions to copy and retarget the caller and three trusted
+   `workflow/review.*` files, including permissions; its
+   [Configuration](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md#configuration)
+   covers model/broker variables and admission. Choose merge policy and rules
+   separately: an agent verdict is not human authorization. If enabling
+   `AGENT_REAL_REVIEWS`, allow Actions review submission and consume exact-head
+   submitted reviews, not verdict comments.
+
+5. **Provision and read the board before writes.** Check access and schema
+   against [Operator decisions](docs/design.md#8-operator-decisions).
+   Pre-create Status options `Triage`, `Backlog`, `Todo`, `In Progress`, `Draft`,
+   `In Review`, `Blocked`, `Needs human`, `Done`, `Cancelled`, and the Priority
+   single-select with `P0`, `P1`, `P2`. `project init` writes only missing
+   Turn/Run/Result fields, not those options. For asks, provision the `question`
+   label and an assignable operator. Start with `snapshot create` and
+   `reconcile plan` previews. To copy/edit the scheduled preview, use
+   [reconcile.yml](.github/workflows/reconcile.yml) and
+   [Provisioning the reconcile preview](#provisioning-the-reconcile-preview):
+   retarget owner/project/repository and keep its read token only in the
+   main-only `staging-project-read` environment, with Projects/Issues Read and
+   no write secret. Live writes are separate: the
+   [live template](live/board-test.yml) documents protected `Main`/`PAT`, Projects
+   and Issues Read and write, organization approval and token-owner project
+   access; `GITHUB_TOKEN` permissions do not grant organization Projects writes.
+
+6. **Preview an accepted plan, then wire scheduling/polling deliberately.** Use
+   [job-plan dispatch](docs/job-plans.md#dispatch), beginning with
+   `dispatch ISSUE --dry-run` and configured caller/workflow/operator/planner.
+   Apply needs a writer's user token and records the plan before dispatch.
+   The plan's `runner`/`pool` inputs target
+   [tracker's dispatch caller](https://github.com/cgwalters-forge/tracker/blob/main/.github/workflows/dispatch.yml),
+   not the generic or existing staging caller. Copy and retarget
+   [agent-board.json](https://github.com/cgwalters-forge/tracker/blob/main/.github/poll/agent-board.json):
+   its owner/project selection, exact repository lists, caller and identities
+   must match your setup. Read the
+   [board scheduler](https://github.com/cgwalters-forge/tracker/blob/main/README.md#the-board-scheduler)
+   and audit dispatch/fix bounds, profiles and pools before enabling
+   `BOARD_DISPATCH=apply`. Identities must come from repository-owned
+   configuration, never dispatcher-set workflow inputs.
+   [Tracker's poll.yml](https://github.com/cgwalters-forge/tracker/blob/main/.github/workflows/poll.yml)
+   still runs the live legacy poll alongside agent-board preview. CLI `poll
+   --apply` support does not enable that preview lane: do not run two appliers.
+
+**Staging is not a green end-to-end example.** The walkthrough's
+[live fixture 38547777384](https://github.com/cgwalters-forge-stage/board-test/actions/runs/38547777384)
+read project 2 and board-test and created a scratch issue, but adding it to the
+project failed with `FORBIDDEN: Resource not accessible by personal access token`;
+cleanup succeeded. This does not identify the exact token setting at fault.
+The staging caller used older `tailscale-*` inputs without `runner`/`pool` or
+explicit `SAFE_OUTPUTS_PAT` forwarding; simply advancing its pin is incompatible.
+Its review was an older fake review (review callers disabled), and no scheduler
+was present. These are walkthrough observations, not a current setup guarantee.
+
+**Operator-only handoff:** provision/authorize tailnet OAuth, federated workflow
+identity, tags/ACLs (document changes in the private wiki); admit the specific
+repository/workflow identities and finite budgets at the broker; keep model
+credentials only at the broker; provision protected apply/reconcile/live-test
+secrets and effective Projects access, including organization approval and
+token-owner access. The walkthrough could not inspect variable names (403) or
+project schema/access with its own token; connectivity, secret correctness and
+end-to-end success remain unverified. No secret values are needed in this guide.
 
 ## Workflows here
 
@@ -59,7 +163,7 @@ is needed or used for this preview.
 
 ## Open
 
-- [#40](https://github.com/cgwalters-forge/agent-board/issues/40) poll: acting on its decisions (only `--dry-run` today).
+- [#40](https://github.com/cgwalters-forge/agent-board/issues/40) poll: CLI apply exists; tracker's agent-board lane remains a preview alongside the live legacy poll.
 - [#44](https://github.com/cgwalters-forge/agent-board/issues/44) promote: open the upstream PR for an approved fork PR; no command yet.
 - [#46](https://github.com/cgwalters-forge/agent-board/issues/46) dispatch from plan comments: the triage profile emitting plans, and several plans per issue.
 - Applying proposals goes through agentic-job's independent [safe-output](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/safe-outputs.md) check/apply; not wired here.
