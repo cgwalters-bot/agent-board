@@ -1,0 +1,1244 @@
+//! Epic plans: a coordinator's proposed changes to an epic's sub-issues,
+//! written as a fenced block in a comment on the epic (slice 2 of
+//! cgwalters-forge/tracker#572), and the GitHub mutations they would make.
+//! Schema: docs/epic-plans.md.
+//!
+//! Any run that comments as the planner can write a plan, so the bounds
+//! checked here, which come from the caller's configuration, are what limit
+//! it. Applying a plan is a later slice: nothing here writes.
+use crate::github::{API_ROOT, DEFAULT_HOST, Transport};
+use crate::plan::{Comment, JobPlan, fenced_json, issue_comments, newest_fenced};
+use crate::poll::validate_repository;
+use anyhow::{Context, Result, bail, ensure};
+use board_core::ItemRef;
+use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
+use std::fmt;
+
+pub const EPIC_PLAN_SCHEMA: &str = "agent-board/epic-plan/v1";
+/// The info string of the fence that holds an epic plan.
+pub const EPIC_PLAN_FENCE: &str = "agent-board-epic-plan";
+/// The label that makes an issue an epic. Only the operator applies it: a
+/// plan that could would let the planner start epics of its own.
+pub const EPIC_LABEL: &str = "epic";
+pub const PRIORITY_FIELD: &str = "Priority";
+pub const STATUS_FIELD: &str = "Status";
+/// The Status option a move to Ready sets; the scheduler dispatches from it.
+pub const READY: &str = "Ready";
+/// Actions in one plan, so a runaway planner cannot file issues by the dozen.
+pub const ACTION_LIMIT: usize = 20;
+/// Characters of a title, GitHub's own limit.
+pub const TITLE_LIMIT: usize = 256;
+/// Characters of a body; GitHub refuses bodies over 65,536.
+pub const BODY_LIMIT: usize = 60_000;
+/// Characters of the reason posted when closing or re-scoping.
+pub const REASON_LIMIT: usize = 4_000;
+const LABEL_LIMIT: usize = 10;
+/// GitHub allows 100 sub-issues per parent, so they fit in one page.
+pub const SUB_ISSUE_LIMIT: usize = 100;
+
+const SUB_ISSUES_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id
+      subIssues(first: 100) {
+        nodes { number state repository { nameWithOwner } }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+}"#;
+
+/// An issue, OWNER/REPO#N.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IssueRef {
+    pub repo: String,
+    pub number: u64,
+}
+
+impl IssueRef {
+    pub fn parse(text: &str) -> Result<Self> {
+        let (repo, number) = text
+            .split_once('#')
+            .with_context(|| format!("{text:?} is not OWNER/REPO#N"))?;
+        validate_repository(repo)?;
+        ensure!(
+            number.starts_with(|c: char| ('1'..='9').contains(&c))
+                && number.bytes().all(|c| c.is_ascii_digit()),
+            "{text:?} has no positive issue number"
+        );
+        Ok(Self {
+            repo: repo.into(),
+            number: number.parse().context("issue number")?,
+        })
+    }
+
+    /// GitHub names repositories without regard to case.
+    fn same(&self, other: &Self) -> bool {
+        self.number == other.number && self.repo.eq_ignore_ascii_case(&other.repo)
+    }
+}
+
+impl fmt::Display for IssueRef {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}#{}", self.repo, self.number)
+    }
+}
+
+/// What an action on the board applies to: an existing issue, or the issue
+/// an earlier create action in the same plan makes (its 1-based position).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Target {
+    Issue(IssueRef),
+    New(usize),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    Create {
+        repo: String,
+        title: String,
+        body: String,
+        labels: Vec<String>,
+        /// Posted on the new issue; its `item` is 0 until the issue exists.
+        plan: Option<JobPlan>,
+    },
+    Close {
+        issue: IssueRef,
+        reason: String,
+    },
+    Rescope {
+        issue: IssueRef,
+        body: String,
+        reason: String,
+    },
+    SetPriority {
+        target: Target,
+        value: String,
+    },
+    MoveToReady {
+        target: Target,
+    },
+}
+
+/// Action types, with the fields each takes besides `type`.
+const ACTIONS: &[(&str, &[&str])] = &[
+    (
+        "create_sub_issue",
+        &["repo", "title", "body", "labels", "plan"],
+    ),
+    ("close_sub_issue", &["issue", "reason"]),
+    ("rescope_sub_issue", &["issue", "body", "reason"]),
+    ("set_priority", &["issue", "new", "value"]),
+    ("move_to_ready", &["issue", "new"]),
+];
+
+/// What a plan may touch, from the caller's own configuration (never from a
+/// plan or a dispatcher's inputs). Empty bounds allow nothing.
+#[derive(Clone, Debug, Default)]
+pub struct Bounds {
+    /// Repositories, OWNER/NAME, whose issues a plan may create or change.
+    pub repositories: Vec<String>,
+    /// The Priority field's options.
+    pub priorities: Vec<String>,
+    /// Moves to Ready in one plan.
+    pub ready_cap: usize,
+}
+
+impl Bounds {
+    pub fn validate(&self) -> Result<()> {
+        for repo in &self.repositories {
+            validate_repository(repo).context("invalid configured repository")?;
+        }
+        for option in &self.priorities {
+            ensure!(
+                !option.trim().is_empty(),
+                "empty configured Priority option"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The epic as GitHub has it now.
+#[derive(Clone, Debug)]
+pub struct Epic {
+    pub issue: IssueRef,
+    /// Its node ID, which addSubIssue takes.
+    pub id: String,
+    /// Its open sub-issues, the only ones a plan may change.
+    pub sub_issues: Vec<IssueRef>,
+    /// Its closed sub-issues: closed by the operator or by finished work, so
+    /// a plan may not move them to Ready or otherwise revive them.
+    pub closed: Vec<IssueRef>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpicPlan {
+    pub actions: Vec<Action>,
+}
+
+fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
+    object
+        .get(key)
+        .with_context(|| format!("no {key}"))?
+        .as_str()
+        .with_context(|| format!("{key} is not a string"))
+}
+
+/// A non-blank string field of at most `limit` characters.
+fn bounded<'a>(object: &'a Map<String, Value>, key: &str, limit: usize) -> Result<&'a str> {
+    let value = text(object, key)?;
+    ensure!(!value.trim().is_empty(), "{key} is empty");
+    ensure!(
+        value.chars().count() <= limit,
+        "{key} exceeds {limit} characters"
+    );
+    Ok(value)
+}
+
+impl EpicPlan {
+    /// Validate one plan object against `bounds` and the epic it was found on.
+    /// Errors in the plan as a whole stop at the first; each action is checked
+    /// in full and every refused action named, so a planner sees all at once.
+    pub fn validate(value: &Value, bounds: &Bounds, epic: &Epic) -> Result<Self> {
+        let object = value
+            .as_object()
+            .context("epic plan is not a JSON object")?;
+        for key in object.keys() {
+            ensure!(
+                ["schema", "epic", "actions"].contains(&key.as_str()),
+                "unknown epic plan field {key:?}"
+            );
+        }
+        let field = |key| text(object, key).with_context(|| "epic plan".to_owned());
+        ensure!(
+            field("schema")? == EPIC_PLAN_SCHEMA,
+            "unsupported epic plan schema (expected {EPIC_PLAN_SCHEMA})"
+        );
+        let named = IssueRef::parse(field("epic")?).context("epic plan epic")?;
+        ensure!(
+            named.same(&epic.issue),
+            "epic plan is for {named}, but was found on {}",
+            epic.issue
+        );
+        let actions = object
+            .get("actions")
+            .context("epic plan has no actions")?
+            .as_array()
+            .context("epic plan actions is not a list")?;
+        ensure!(
+            actions.len() <= ACTION_LIMIT,
+            "epic plan has more than {ACTION_LIMIT} actions"
+        );
+        let mut checker = Checker {
+            bounds,
+            epic,
+            done: Vec::new(),
+            seen: BTreeMap::new(),
+            ready: 0,
+        };
+        let mut errors = Vec::new();
+        for (index, value) in actions.iter().enumerate() {
+            let kind = value["type"].as_str().unwrap_or("?");
+            match checker.action(value) {
+                Ok(action) => checker.done.push(Some(action)),
+                Err(error) => {
+                    errors.push(format!("action {} ({kind}): {error:#}", index + 1));
+                    checker.done.push(None);
+                }
+            }
+        }
+        if !errors.is_empty() {
+            bail!("epic plan refused:\n  {}", errors.join("\n  "));
+        }
+        Ok(Self {
+            actions: checker.done.into_iter().flatten().collect(),
+        })
+    }
+
+    /// The GitHub mutations applying the plan would make, in order, one JSON
+    /// object each, tagged with its action's 1-based position. Where the
+    /// number of an issue the plan creates belongs, they say `NEW-k`. A
+    /// project field is named by field and option rather than node IDs, which
+    /// apply resolves (adding a new issue to the project first).
+    pub fn mutations(&self, epic: &Epic) -> Vec<Value> {
+        let rest = |n: usize, method: &str, path: String, body: Value| json!({"action": n, "method": method, "url": format!("{API_ROOT}{path}"), "body": body});
+        let field = |n: usize, issue: String, field: &str, value: &str| {
+            json!({"action": n, "graphql": "updateProjectV2ItemFieldValue",
+                "issue": issue, "field": field, "value": value})
+        };
+        let target = |target: &Target| match target {
+            Target::Issue(issue) => issue.to_string(),
+            Target::New(k) => match k.checked_sub(1).and_then(|i| self.actions.get(i)) {
+                Some(Action::Create { repo, .. }) => format!("{repo}#NEW-{k}"),
+                _ => format!("NEW-{k}"),
+            },
+        };
+        let mut out = Vec::new();
+        for (index, action) in self.actions.iter().enumerate() {
+            let n = index + 1;
+            match action {
+                Action::Create {
+                    repo,
+                    title,
+                    body,
+                    labels,
+                    plan,
+                } => {
+                    let mut issue = json!({"title": title, "body": body});
+                    if !labels.is_empty() {
+                        issue["labels"] = json!(labels);
+                    }
+                    out.push(rest(n, "POST", format!("repos/{repo}/issues"), issue));
+                    out.push(json!({"action": n, "graphql": "addSubIssue", "variables": {
+                        "issueId": epic.id,
+                        "subIssueUrl": format!("https://{DEFAULT_HOST}/{repo}/issues/NEW-{n}"),
+                    }}));
+                    if let Some(plan) = plan {
+                        let mut fields = json!({"schema": crate::plan::JOB_PLAN_SCHEMA,
+                            "repo": plan.repo, "item": format!("NEW-{n}"), "kind": plan.kind,
+                            "runner": plan.runner, "brief": plan.brief});
+                        if !plan.pool.is_empty() {
+                            fields["pool"] = json!(plan.pool);
+                        }
+                        let fence = crate::plan::PLAN_FENCE;
+                        out.push(rest(
+                            n,
+                            "POST",
+                            format!("repos/{repo}/issues/NEW-{n}/comments"),
+                            json!({"body": format!("```{fence}\n{fields:#}\n```\n")}),
+                        ));
+                    }
+                }
+                Action::Close { issue, reason } => {
+                    let path = format!("repos/{}/issues/{}", issue.repo, issue.number);
+                    out.push(rest(
+                        n,
+                        "POST",
+                        format!("{path}/comments"),
+                        json!({"body": reason}),
+                    ));
+                    // A coordinator closes what it drops; finished work closes
+                    // through its pull request.
+                    out.push(rest(
+                        n,
+                        "PATCH",
+                        path,
+                        json!({"state": "closed", "state_reason": "not_planned"}),
+                    ));
+                }
+                Action::Rescope {
+                    issue,
+                    body,
+                    reason,
+                } => {
+                    let path = format!("repos/{}/issues/{}", issue.repo, issue.number);
+                    out.push(rest(n, "PATCH", path.clone(), json!({"body": body})));
+                    out.push(rest(
+                        n,
+                        "POST",
+                        format!("{path}/comments"),
+                        json!({"body": reason}),
+                    ));
+                }
+                Action::SetPriority { target: t, value } => {
+                    out.push(field(n, target(t), PRIORITY_FIELD, value));
+                }
+                Action::MoveToReady { target: t } => {
+                    out.push(field(n, target(t), STATUS_FIELD, READY));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Checks one action at a time against the bounds and the actions before it.
+struct Checker<'a> {
+    bounds: &'a Bounds,
+    epic: &'a Epic,
+    /// The actions so far; `None` for a refused one.
+    done: Vec<Option<Action>>,
+    /// Each (type, issue) acted on, and the action that did.
+    seen: BTreeMap<(String, String), usize>,
+    ready: usize,
+}
+
+impl Checker<'_> {
+    fn repository(&self, repo: &str) -> Result<()> {
+        ensure!(
+            self.bounds
+                .repositories
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(repo)),
+            "repository {repo} is not in the configured list"
+        );
+        Ok(())
+    }
+
+    /// An existing issue an action may change: an open sub-issue in a
+    /// configured repository, never the epic.
+    fn sub_issue(&self, text: &str) -> Result<IssueRef> {
+        let issue = IssueRef::parse(text)?;
+        ensure!(
+            !issue.same(&self.epic.issue),
+            "{issue} is the epic itself; a plan may not change the epic's text, priority or labels"
+        );
+        ensure!(
+            !self.epic.closed.iter().any(|s| s.same(&issue)),
+            "{issue} is a closed sub-issue; a plan may not change it"
+        );
+        // Spelled as GitHub has it, not as the plan does.
+        let issue = self
+            .epic
+            .sub_issues
+            .iter()
+            .find(|s| s.same(&issue))
+            .with_context(|| {
+                format!(
+                    "{issue} is neither new nor a current sub-issue of {}",
+                    self.epic.issue
+                )
+            })?;
+        self.repository(&issue.repo)?;
+        Ok(issue.clone())
+    }
+
+    fn target(&self, object: &Map<String, Value>) -> Result<Target> {
+        match (object.get("issue"), object.get("new")) {
+            (Some(_), None) => Ok(Target::Issue(self.sub_issue(text(object, "issue")?)?)),
+            (None, Some(new)) => {
+                let k = new
+                    .as_u64()
+                    .and_then(|k| usize::try_from(k).ok())
+                    .filter(|k| (1..=self.done.len()).contains(k))
+                    .context("new is not the position of an earlier action")?;
+                match &self.done[k - 1] {
+                    Some(Action::Create { .. }) => Ok(Target::New(k)),
+                    Some(_) => bail!("new names action {k}, which does not create a sub-issue"),
+                    None => bail!("new names action {k}, which is refused"),
+                }
+            }
+            _ => bail!("needs exactly one of issue or new"),
+        }
+    }
+
+    /// One action of a type on any one issue, and nothing else on an issue the
+    /// plan closes: either would repeat or contradict (a closed issue moved to
+    /// Ready, say).
+    fn once(&mut self, kind: &str, key: String) -> Result<()> {
+        const CLOSE: &str = "close_sub_issue";
+        let clash = self
+            .seen
+            .iter()
+            .find(|((k, issue), _)| *issue == key && (k == kind || k == CLOSE || kind == CLOSE));
+        if let Some((_, earlier)) = clash {
+            bail!("{key} is already the subject of action {earlier}");
+        }
+        self.seen.insert((kind.into(), key), self.done.len() + 1);
+        Ok(())
+    }
+
+    fn action(&mut self, value: &Value) -> Result<Action> {
+        let object = value.as_object().context("action is not a JSON object")?;
+        let kind = text(object, "type")?;
+        let (_, fields) = ACTIONS
+            .iter()
+            .find(|(name, _)| *name == kind)
+            .with_context(|| format!("unknown action type {kind:?}"))?;
+        for key in object.keys() {
+            ensure!(
+                key == "type" || fields.contains(&key.as_str()),
+                "unknown field {key:?}"
+            );
+        }
+        let target_key = |target: &Target| match target {
+            Target::Issue(issue) => issue.to_string().to_ascii_lowercase(),
+            Target::New(k) => format!("NEW-{k}"),
+        };
+        Ok(match kind {
+            "create_sub_issue" => {
+                let repo = text(object, "repo")?;
+                validate_repository(repo)?;
+                self.repository(repo)?;
+                let labels = match object.get("labels") {
+                    None => Vec::new(),
+                    Some(labels) => labels
+                        .as_array()
+                        .context("labels is not a list")?
+                        .iter()
+                        .map(|l| {
+                            let label = l.as_str().context("a label is not a string")?;
+                            ensure!(!label.trim().is_empty(), "a label is empty");
+                            ensure!(
+                                !label.trim().eq_ignore_ascii_case(EPIC_LABEL),
+                                "the {EPIC_LABEL:?} label is the operator's to apply"
+                            );
+                            Ok(label.to_owned())
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                };
+                ensure!(
+                    labels.len() <= LABEL_LIMIT,
+                    "more than {LABEL_LIMIT} labels"
+                );
+                let plan = match object.get("plan") {
+                    None => None,
+                    Some(plan) => Some(job_plan(plan, repo).context("plan")?),
+                };
+                Action::Create {
+                    repo: repo.into(),
+                    title: bounded(object, "title", TITLE_LIMIT)?.into(),
+                    body: bounded(object, "body", BODY_LIMIT)?.into(),
+                    labels,
+                    plan,
+                }
+            }
+            "close_sub_issue" | "rescope_sub_issue" => {
+                let issue = self.sub_issue(text(object, "issue")?)?;
+                let reason: String = bounded(object, "reason", REASON_LIMIT)?.into();
+                // The reason is posted as a comment by the applier, who is a
+                // plan writer: a fence or hidden marker in it would be a job
+                // plan, an epic plan or a dispatch record under that login.
+                ensure!(
+                    !reason.contains("```agent-board") && !reason.contains("<!--"),
+                    "reason holds an agent-board fence or a hidden marker"
+                );
+                let action = if kind == "close_sub_issue" {
+                    Action::Close {
+                        issue: issue.clone(),
+                        reason,
+                    }
+                } else {
+                    Action::Rescope {
+                        issue: issue.clone(),
+                        body: bounded(object, "body", BODY_LIMIT)?.into(),
+                        reason,
+                    }
+                };
+                // Last, so that only an action that passes counts.
+                self.once(kind, target_key(&Target::Issue(issue)))?;
+                action
+            }
+            "set_priority" => {
+                let target = self.target(object)?;
+                let value = text(object, "value")?;
+                ensure!(
+                    self.bounds.priorities.iter().any(|p| p == value),
+                    "Priority {value:?} is not one of the field's options ({})",
+                    self.bounds.priorities.join(", ")
+                );
+                self.once(kind, target_key(&target))?;
+                Action::SetPriority {
+                    target,
+                    value: value.into(),
+                }
+            }
+            "move_to_ready" => {
+                let target = self.target(object)?;
+                ensure!(
+                    self.ready < self.bounds.ready_cap,
+                    "more than {} moves to Ready",
+                    self.bounds.ready_cap
+                );
+                self.once(kind, target_key(&target))?;
+                self.ready += 1;
+                Action::MoveToReady { target }
+            }
+            _ => bail!("unknown action type {kind:?}"),
+        })
+    }
+}
+
+/// A job plan for an issue a plan creates. Its repository and number are the
+/// new issue's, so it must not name them; the rest is checked as any job plan is.
+fn job_plan(value: &Value, repo: &str) -> Result<JobPlan> {
+    let mut object = value.as_object().context("is not a JSON object")?.clone();
+    for key in ["repo", "item"] {
+        ensure!(
+            !object.contains_key(key),
+            "names {key}, which is the new issue's"
+        );
+    }
+    object.insert("repo".into(), repo.into());
+    // A placeholder that passes the number check; reset below.
+    object.insert("item".into(), 1.into());
+    let mut plan = JobPlan::from_json(&Value::Object(object))?;
+    plan.item = 0;
+    Ok(plan)
+}
+
+/// The epic and its current sub-issues.
+pub fn read_epic<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Epic> {
+    ensure!(
+        issue.host == DEFAULT_HOST,
+        "epic plans are read only from github.com"
+    );
+    validate_repository(&issue.repository)?;
+    let (owner, name) = issue
+        .repository
+        .split_once('/')
+        .context("issue repository")?;
+    let data = transport.graphql(
+        SUB_ISSUES_QUERY,
+        json!({"owner": owner, "name": name, "number": issue.number}),
+    )?;
+    let node = data
+        .pointer("/repository/issue")
+        .filter(|c| c.is_object())
+        .with_context(|| format!("{} is not an issue", issue.display()))?;
+    let id = node["id"].as_str().context("the epic has no node id")?;
+    let connection = &node["subIssues"];
+    ensure!(
+        connection["pageInfo"]["hasNextPage"] == false,
+        "{} has more than {SUB_ISSUE_LIMIT} sub-issues, or GitHub did not say",
+        issue.display()
+    );
+    let mut epic = Epic {
+        issue: IssueRef {
+            repo: issue.repository.clone(),
+            number: issue.number,
+        },
+        id: id.into(),
+        sub_issues: Vec::new(),
+        closed: Vec::new(),
+    };
+    for node in connection["nodes"]
+        .as_array()
+        .context("sub-issues have no nodes")?
+    {
+        let repo = node["repository"]["nameWithOwner"]
+            .as_str()
+            .context("sub-issue has no repository")?;
+        validate_repository(repo)?;
+        let sub_issue = IssueRef {
+            repo: repo.into(),
+            number: node["number"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .context("sub-issue has no number")?,
+        };
+        match node["state"].as_str() {
+            Some("OPEN") => epic.sub_issues.push(sub_issue),
+            Some("CLOSED") => epic.closed.push(sub_issue),
+            _ => bail!("sub-issue {sub_issue} has no state"),
+        }
+    }
+    Ok(epic)
+}
+
+/// The newest accepted epic plan on `issue`, checked, with the comment it
+/// came from. Which comment counts is decided as for job plans
+/// ([`crate::plan::newest_plan`]): writers only, newest wins, and a foreign
+/// edit or an invalid newest plan is an error rather than a fallback.
+pub fn newest_epic_plan<T: Transport>(
+    transport: &T,
+    issue: &ItemRef,
+    writers: &[&str],
+    bounds: &Bounds,
+) -> Result<(EpicPlan, Epic, Comment)> {
+    bounds.validate()?;
+    let comments = issue_comments(transport, issue)?;
+    let newest = newest_fenced(&comments, writers, EPIC_PLAN_FENCE)?;
+    let value = fenced_json(&newest.body, EPIC_PLAN_FENCE)
+        .with_context(|| format!("newest epic plan {}", newest.url))?
+        .context("epic plan fence vanished")?;
+    let epic = read_epic(transport, issue)?;
+    let plan = EpicPlan::validate(&value, bounds, &epic)
+        .with_context(|| format!("newest epic plan {}", newest.url))?;
+    Ok((plan, epic, newest.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::JOB_PLAN_SCHEMA;
+
+    const EPIC: &str = "cgwalters-forge/tracker#572";
+
+    fn epic() -> Epic {
+        Epic {
+            issue: IssueRef::parse(EPIC).unwrap(),
+            id: "I_epic".into(),
+            sub_issues: vec![
+                IssueRef::parse("cgwalters-forge/agent-board#63").unwrap(),
+                IssueRef::parse("cgwalters-forge/tracker#573").unwrap(),
+                IssueRef::parse("elsewhere/repo#1").unwrap(),
+            ],
+            closed: vec![IssueRef::parse("cgwalters-forge/tracker#574").unwrap()],
+        }
+    }
+
+    fn bounds() -> Bounds {
+        Bounds {
+            repositories: vec![
+                "cgwalters-forge/tracker".into(),
+                "cgwalters-forge/agent-board".into(),
+            ],
+            priorities: vec!["P0".into(), "P1".into(), "P2".into()],
+            ready_cap: 2,
+        }
+    }
+
+    fn create() -> Value {
+        json!({"type": "create_sub_issue", "repo": "cgwalters-forge/agent-board",
+            "title": "epic apply", "body": "Apply epic plans.",
+            "plan": {"schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted",
+                "brief": "Implement epic apply."}})
+    }
+
+    fn plan(actions: Vec<Value>) -> Value {
+        json!({"schema": EPIC_PLAN_SCHEMA, "epic": EPIC, "actions": actions})
+    }
+
+    fn valid() -> Vec<Value> {
+        vec![
+            create(),
+            json!({"type": "set_priority", "new": 1, "value": "P1"}),
+            json!({"type": "move_to_ready", "new": 1}),
+            json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#573",
+                "reason": "Folded into agent-board#63."}),
+            json!({"type": "rescope_sub_issue", "issue": "CGWalters-Forge/agent-board#63",
+                "body": "Schema and dry run only.", "reason": "Apply is its own slice."}),
+            json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P0"}),
+        ]
+    }
+
+    #[test]
+    fn valid_plan_and_its_mutations() {
+        let epic = epic();
+        let checked = EpicPlan::validate(&plan(valid()), &bounds(), &epic).unwrap();
+        assert_eq!(checked.actions.len(), 6);
+        let Action::Create {
+            plan: Some(job), ..
+        } = &checked.actions[0]
+        else {
+            panic!("{:?}", checked.actions[0])
+        };
+        assert_eq!(
+            (job.repo.as_str(), job.item),
+            ("cgwalters-forge/agent-board", 0)
+        );
+        let mutations = checked.mutations(&epic);
+        let summary: Vec<String> = mutations
+            .iter()
+            .map(|m| {
+                let what = match m["graphql"].as_str() {
+                    Some("addSubIssue") => format!("addSubIssue {}", m["variables"]["subIssueUrl"]),
+                    Some(op) => format!("{op} {} {}={}", m["issue"], m["field"], m["value"]),
+                    None => format!("{} {}", m["method"], m["url"]),
+                };
+                format!("{} {}", m["action"], what.replace('"', ""))
+            })
+            .collect();
+        let api = "https://api.github.com/repos";
+        assert_eq!(
+            summary,
+            [
+                format!("1 POST {api}/cgwalters-forge/agent-board/issues"),
+                "1 addSubIssue https://github.com/cgwalters-forge/agent-board/issues/NEW-1".into(),
+                format!("1 POST {api}/cgwalters-forge/agent-board/issues/NEW-1/comments"),
+                "2 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#NEW-1 Priority=P1"
+                    .into(),
+                "3 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#NEW-1 Status=Ready"
+                    .into(),
+                format!("4 POST {api}/cgwalters-forge/tracker/issues/573/comments"),
+                format!("4 PATCH {api}/cgwalters-forge/tracker/issues/573"),
+                format!("5 PATCH {api}/cgwalters-forge/agent-board/issues/63"),
+                format!("5 POST {api}/cgwalters-forge/agent-board/issues/63/comments"),
+                "6 updateProjectV2ItemFieldValue cgwalters-forge/agent-board#63 Priority=P0".into(),
+            ]
+        );
+        assert_eq!(mutations[1]["variables"]["issueId"], "I_epic");
+        assert_eq!(
+            mutations[0]["body"],
+            json!({"title": "epic apply", "body": "Apply epic plans."})
+        );
+        assert_eq!(mutations[6]["body"]["state_reason"], "not_planned");
+        let comment = mutations[2]["body"]["body"].as_str().unwrap();
+        assert!(comment.starts_with("```agent-board-plan\n"), "{comment}");
+        assert!(comment.contains("\"item\": \"NEW-1\""), "{comment}");
+        // An empty plan is valid and changes nothing.
+        let empty = EpicPlan::validate(&plan(vec![]), &bounds(), &epic).unwrap();
+        assert!(empty.mutations(&epic).is_empty());
+    }
+
+    /// Each refusal: the actions after the valid ones, and the error for the
+    /// first refused one (its position counts from 7).
+    #[test]
+    fn action_refusal_table() {
+        let long = "x".repeat(TITLE_LIMIT + 1);
+        let mut with_repo = create();
+        with_repo["plan"]["repo"] = json!("cgwalters-forge/tracker");
+        let mut bad_job = create();
+        bad_job["plan"]["runner"] = json!("devspace");
+        let mut epic_label = create();
+        epic_label["labels"] = json!(["coordinator", " Epic "]);
+        let mut outside = create();
+        outside["repo"] = json!("someone/else");
+        let mut unknown = create();
+        unknown["assignees"] = json!(["cgwalters"]);
+        let mut job_unknown = create();
+        job_unknown["plan"]["budget"] = json!(5);
+        let mut long_title = create();
+        long_title["title"] = json!(long);
+        let ready = |issue: &str| json!({"type": "move_to_ready", "issue": issue});
+        for (extra, error) in [
+            // Issues that are neither new nor current sub-issues.
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#999", "reason": "Done."}),
+                ],
+                "cgwalters-forge/tracker#999 is neither new nor a current sub-issue of cgwalters-forge/tracker#572",
+            ),
+            (
+                vec![
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#64", "value": "P1"}),
+                ],
+                "is neither new nor a current sub-issue",
+            ),
+            (
+                vec![json!({"type": "move_to_ready", "new": 4})],
+                "does not create a sub-issue",
+            ),
+            (
+                vec![json!({"type": "move_to_ready", "new": 7})],
+                "not the position of an earlier action",
+            ),
+            (
+                vec![json!({"type": "move_to_ready", "new": 0})],
+                "not the position of an earlier action",
+            ),
+            (
+                vec![outside.clone(), json!({"type": "move_to_ready", "new": 7})],
+                "action 8 (move_to_ready): new names action 7, which is refused",
+            ),
+            (
+                vec![json!({"type": "move_to_ready", "issue": "cgwalters-forge/tracker#574"})],
+                "cgwalters-forge/tracker#574 is a closed sub-issue; a plan may not change it",
+            ),
+            (
+                vec![
+                    json!({"type": "move_to_ready", "issue": "cgwalters-forge/agent-board#63", "new": 1}),
+                ],
+                "exactly one of issue or new",
+            ),
+            // Repositories outside the configured list, new or existing.
+            (
+                vec![outside],
+                "repository someone/else is not in the configured list",
+            ),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "elsewhere/repo#1", "reason": "Moved."}),
+                ],
+                "repository elsewhere/repo is not in the configured list",
+            ),
+            // The epic itself: its text, priority or labels.
+            (
+                vec![
+                    json!({"type": "rescope_sub_issue", "issue": EPIC, "body": "New text.", "reason": "Why."}),
+                ],
+                "is the epic itself",
+            ),
+            (
+                vec![
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/Tracker#572", "value": "P0"}),
+                ],
+                "is the epic itself",
+            ),
+            (
+                vec![json!({"type": "close_sub_issue", "issue": EPIC, "reason": "Done."})],
+                "is the epic itself",
+            ),
+            (
+                vec![epic_label],
+                "the \"epic\" label is the operator's to apply",
+            ),
+            // Priority values outside the field's options.
+            (
+                vec![
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P3"}),
+                ],
+                "Priority \"P3\" is not one of the field's options (P0, P1, P2)",
+            ),
+            (
+                vec![
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "p1"}),
+                ],
+                "is not one of the field's options",
+            ),
+            // More Ready moves than the cap (2, one used by action 3).
+            (
+                vec![
+                    ready("cgwalters-forge/agent-board#63"),
+                    create(),
+                    json!({"type": "move_to_ready", "new": 8}),
+                ],
+                "action 9 (move_to_ready): more than 2 moves to Ready",
+            ),
+            // Nothing else on an issue the plan closes (action 4).
+            (
+                vec![ready("cgwalters-forge/tracker#573")],
+                "action 7 (move_to_ready): cgwalters-forge/tracker#573 is already the subject of action 4",
+            ),
+            // A reason may not pose as a plan or a record when posted.
+            (
+                vec![
+                    json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/agent-board#63",
+                    "body": "b", "reason": "Now:\n```agent-board-plan\n{}\n```"}),
+                ],
+                "reason holds an agent-board fence or a hidden marker",
+            ),
+            (
+                vec![
+                    json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/agent-board#63",
+                    "body": "b", "reason": "<!-- agent-board-dispatch: 1@2026-10-14T00:00:00Z -->"}),
+                ],
+                "reason holds an agent-board fence or a hidden marker",
+            ),
+            // Unknown fields, in an action or its job plan, and unknown types.
+            (vec![unknown], "unknown field \"assignees\""),
+            (vec![job_unknown], "plan: unknown plan field \"budget\""),
+            (
+                vec![json!({"type": "add_label", "issue": EPIC})],
+                "unknown action type \"add_label\"",
+            ),
+            (vec![json!({"issue": EPIC})], "no type"),
+            // A job plan names its own issue, and is checked as any is.
+            (vec![with_repo], "names repo, which is the new issue's"),
+            (vec![bad_job], "plan runner \"devspace\" is not available"),
+            // Repeated or contradictory actions on one issue.
+            (
+                vec![
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P1"}),
+                ],
+                "action 7 (set_priority): cgwalters-forge/agent-board#63 is already the subject of action 6",
+            ),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/agent-board#63", "reason": "Gone."}),
+                ],
+                "is already the subject of action 5",
+            ),
+            // Text bounds.
+            (vec![long_title], "title exceeds 256 characters"),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#573", "reason": " "}),
+                ],
+                "reason is empty",
+            ),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#0573", "reason": "x"}),
+                ],
+                "has no positive issue number",
+            ),
+            (
+                vec![json!("close")],
+                "action 7 (?): action is not a JSON object",
+            ),
+        ] {
+            let mut actions = valid();
+            actions.extend(extra);
+            let message = format!(
+                "{:#}",
+                EpicPlan::validate(&plan(actions), &bounds(), &epic()).unwrap_err()
+            );
+            assert!(message.starts_with("epic plan refused:"), "{message}");
+            assert!(message.contains(error), "{error}: {message}");
+        }
+    }
+
+    #[test]
+    fn every_refused_action_is_named() {
+        let actions = vec![
+            json!({"type": "set_priority", "issue": EPIC, "value": "P0"}),
+            create(),
+            json!({"type": "move_to_ready", "issue": "cgwalters-forge/tracker#573"}),
+            json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#1", "reason": "x"}),
+        ];
+        let off = Bounds {
+            ready_cap: 0,
+            ..bounds()
+        };
+        let message = format!(
+            "{:#}",
+            EpicPlan::validate(&plan(actions), &off, &epic()).unwrap_err()
+        );
+        let lines: Vec<_> = message.lines().collect();
+        assert_eq!(lines.len(), 4, "{message}");
+        assert!(
+            lines[1].starts_with("  action 1 (set_priority): "),
+            "{message}"
+        );
+        // Ready moves are off unless configured.
+        assert!(
+            lines[2].contains("action 3 (move_to_ready): more than 0 moves"),
+            "{message}"
+        );
+        assert!(
+            lines[3].starts_with("  action 4 (close_sub_issue): "),
+            "{message}"
+        );
+        // A refused action does not count against its issue or the Ready cap.
+        let ready = json!({"type": "move_to_ready", "issue": "cgwalters-forge/tracker#573"});
+        let actions = vec![
+            json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P3"}),
+            json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P1"}),
+            ready.clone(),
+            ready,
+        ];
+        let one = Bounds {
+            ready_cap: 1,
+            ..bounds()
+        };
+        let message = format!(
+            "{:#}",
+            EpicPlan::validate(&plan(actions), &one, &epic()).unwrap_err()
+        );
+        let lines: Vec<_> = message.lines().skip(1).collect();
+        assert_eq!(lines.len(), 2, "{message}");
+        assert!(lines[0].starts_with("  action 1 (set_priority): Priority \"P3\""));
+        assert!(lines[1].starts_with("  action 4 (move_to_ready): more than 1 moves"));
+        // With no configured bounds, nothing passes.
+        let none = EpicPlan::validate(&plan(valid()), &Bounds::default(), &epic());
+        assert!(format!("{:#}", none.unwrap_err()).contains("not in the configured list"));
+    }
+
+    #[test]
+    fn plan_refusal_table() {
+        let many: Vec<Value> = (0..=ACTION_LIMIT).map(|_| create()).collect();
+        for (key, value, error) in [
+            (
+                "schema",
+                json!("agent-board/epic-plan/v2"),
+                "unsupported epic plan schema",
+            ),
+            ("schema", Value::Null, "epic plan: schema is not a string"),
+            (
+                "epic",
+                json!("cgwalters-forge/tracker#571"),
+                "is for cgwalters-forge/tracker#571, but was found on cgwalters-forge/tracker#572",
+            ),
+            (
+                "epic",
+                json!("cgwalters-forge/tracker"),
+                "is not OWNER/REPO#N",
+            ),
+            ("actions", json!({}), "actions is not a list"),
+            ("actions", json!(many), "more than 20 actions"),
+            (
+                "priority",
+                json!("P0"),
+                "unknown epic plan field \"priority\"",
+            ),
+        ] {
+            let mut edited = plan(vec![]);
+            edited[key] = value;
+            let message = format!(
+                "{:#}",
+                EpicPlan::validate(&edited, &bounds(), &epic()).unwrap_err()
+            );
+            assert!(message.contains(error), "{key}: {message}");
+        }
+        for key in ["schema", "epic", "actions"] {
+            let mut missing = plan(vec![]);
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                EpicPlan::validate(&missing, &bounds(), &epic()).is_err(),
+                "{key}"
+            );
+        }
+        assert!(EpicPlan::validate(&json!([]), &bounds(), &epic()).is_err());
+        let bad = Bounds {
+            repositories: vec!["not a repo".into()],
+            ..bounds()
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    /// The epic's comments and sub-issues, as GitHub answers the two queries.
+    struct Forge {
+        comments: Value,
+        sub_issues: Value,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl Transport for Forge {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            self.reads.set(self.reads.get() + 1);
+            assert_eq!(variables["number"], 572);
+            if query == SUB_ISSUES_QUERY {
+                return Ok(json!({"repository": {"issue": self.sub_issues}}));
+            }
+            Ok(
+                json!({"repository": {"issue": {"comments": {"nodes": self.comments,
+                "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}),
+            )
+        }
+    }
+
+    #[test]
+    fn newest_epic_plan_from_writers_table() {
+        const URL: &str = "https://github.com/cgwalters-forge/tracker/issues/572";
+        let fenced = |actions: Vec<Value>| {
+            format!("Plan:\n\n```{EPIC_PLAN_FENCE}\n{:#}\n```\n", plan(actions))
+        };
+        let node = |id: u32, author: &str, editor: Option<&str>, at: &str, body: String| {
+            json!({"url": format!("{URL}#issuecomment-{id}"), "body": body, "createdAt": at,
+                "lastEditedAt": editor.map(|_| at), "author": {"login": author},
+                "editor": editor.map(|login| json!({"login": login}))})
+        };
+        let subs = json!({"id": "I_epic", "subIssues": {"nodes": [
+            {"number": 63, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/agent-board"}},
+            {"number": 573, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/tracker"}}],
+            "pageInfo": {"hasNextPage": false}}});
+        let first = || {
+            node(
+                1,
+                "cgwalters-bot",
+                None,
+                "2026-10-14T10:00:00Z",
+                fenced(valid()),
+            )
+        };
+        let close = json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#573", "reason": "x"});
+        let mut full = subs.clone();
+        full["subIssues"]["pageInfo"]["hasNextPage"] = json!(true);
+        // Comments, sub-issues, then the comment and action count chosen, or an error.
+        for (comments, sub_issues, expected) in [
+            (vec![first()], subs.clone(), Ok((1, 6))),
+            // A writer replaces the plan; a visitor's newer one is ignored.
+            (
+                vec![
+                    first(),
+                    node(
+                        2,
+                        "cgwalters",
+                        None,
+                        "2026-10-14T11:00:00Z",
+                        fenced(vec![close.clone()]),
+                    ),
+                    node(3, "visitor", None, "2026-10-14T12:00:00Z", fenced(vec![])),
+                ],
+                subs.clone(),
+                Ok((2, 1)),
+            ),
+            // A job plan is not an epic plan.
+            (
+                vec![node(
+                    1,
+                    "cgwalters",
+                    None,
+                    "2026-10-14T10:00:00Z",
+                    first()["body"]
+                        .as_str()
+                        .unwrap()
+                        .replace(EPIC_PLAN_FENCE, crate::plan::PLAN_FENCE),
+                )],
+                subs.clone(),
+                Err("no plan on this issue from an accepted writer (agent-board-epic-plan)"),
+            ),
+            // A foreign edit refuses the plan rather than reviving the one before.
+            (
+                vec![
+                    first(),
+                    node(
+                        2,
+                        "cgwalters",
+                        Some("collaborator"),
+                        "2026-10-14T11:00:00Z",
+                        fenced(vec![]),
+                    ),
+                ],
+                subs.clone(),
+                Err("issuecomment-2 was last edited by collaborator"),
+            ),
+            // So does an invalid newest plan.
+            (
+                vec![
+                    first(),
+                    node(
+                        2,
+                        "cgwalters",
+                        None,
+                        "2026-10-14T11:00:00Z",
+                        fenced(vec![json!({"type": "x"})]),
+                    ),
+                ],
+                subs.clone(),
+                Err(
+                    "newest epic plan https://github.com/cgwalters-forge/tracker/issues/572#issuecomment-2: epic plan refused:\n  action 1 (x): unknown action type",
+                ),
+            ),
+            // Sub-issues are read as they are now.
+            (
+                vec![first()],
+                json!({"id": "I_epic", "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": false}}}),
+                Err("cgwalters-forge/tracker#573 is neither new nor a current sub-issue"),
+            ),
+            (vec![first()], full, Err("more than 100 sub-issues")),
+            (
+                vec![first()],
+                {
+                    let mut closed = subs.clone();
+                    closed["subIssues"]["nodes"][1]["state"] = json!("CLOSED");
+                    closed
+                },
+                Err("cgwalters-forge/tracker#573 is a closed sub-issue"),
+            ),
+            (
+                vec![first()],
+                {
+                    let mut unknown = subs.clone();
+                    unknown["subIssues"]["nodes"][1]["state"] = Value::Null;
+                    unknown
+                },
+                Err("sub-issue cgwalters-forge/tracker#573 has no state"),
+            ),
+            (
+                vec![first()],
+                json!({"id": "I_epic"}),
+                Err("more than 100 sub-issues, or GitHub did not say"),
+            ),
+            (vec![first()], Value::Null, Err("is not an issue")),
+        ] {
+            let forge = Forge {
+                comments: json!(comments),
+                sub_issues,
+                reads: Default::default(),
+            };
+            let issue = crate::github::parse_github_issue(URL, None, "github.com").unwrap();
+            let result =
+                newest_epic_plan(&forge, &issue, &["cgwalters", "cgwalters-bot"], &bounds());
+            match (result, expected) {
+                (Ok((plan, epic, from)), Ok((n, actions))) => {
+                    assert!(from.url.ends_with(&format!("-{n}")), "{}", from.url);
+                    assert_eq!(plan.actions.len(), actions);
+                    assert_eq!(epic.id, "I_epic");
+                }
+                (Err(error), Err(expected)) => {
+                    let error = format!("{error:#}");
+                    assert!(error.contains(expected), "{error}");
+                }
+                (result, expected) => panic!("{:?} != {expected:?}", result.map(|r| r.0)),
+            }
+        }
+        // Invalid bounds are refused before anything is read.
+        let forge = Forge {
+            comments: json!([first()]),
+            sub_issues: subs,
+            reads: Default::default(),
+        };
+        let issue = crate::github::parse_github_issue(URL, None, "github.com").unwrap();
+        let bad = Bounds {
+            repositories: vec!["a/b?c".into()],
+            ..bounds()
+        };
+        assert!(newest_epic_plan(&forge, &issue, &["cgwalters"], &bad).is_err());
+        assert_eq!(forge.reads.get(), 0);
+    }
+}

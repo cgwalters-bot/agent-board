@@ -128,29 +128,9 @@ impl JobPlan {
     /// must open at the start of a line, so a plan quoted in a reply (`> `) or
     /// indented is not one.
     pub fn from_comment(body: &str) -> Result<Option<Self>> {
-        let open = format!("```{PLAN_FENCE}");
-        let mut lines = body.lines();
-        let mut found = None;
-        while let Some(line) = lines.next() {
-            if line.trim_end() != open {
-                continue;
-            }
-            ensure!(found.is_none(), "comment holds more than one plan");
-            let mut json = String::new();
-            let mut closed = false;
-            for line in lines.by_ref() {
-                if line.trim_end() == "```" {
-                    closed = true;
-                    break;
-                }
-                json.push_str(line);
-                json.push('\n');
-            }
-            ensure!(closed, "plan fence is not closed");
-            let value: Value = serde_json::from_str(&json).context("plan is not valid JSON")?;
-            found = Some(Self::from_json(&value)?);
-        }
-        Ok(found)
+        fenced_json(body, PLAN_FENCE)?
+            .map(|value| Self::from_json(&value))
+            .transpose()
     }
 
     /// The REST request that dispatches this plan, as the GitHub API takes it.
@@ -241,6 +221,20 @@ pub fn newest_plan<'a>(
     comments: &'a [Comment],
     writers: &[&str],
 ) -> Result<(JobPlan, &'a Comment)> {
+    let newest = newest_fenced(comments, writers, PLAN_FENCE)?;
+    let plan = JobPlan::from_comment(&newest.body)
+        .with_context(|| format!("newest plan {}", newest.url))?
+        .context("plan fence vanished")?;
+    Ok((plan, newest))
+}
+
+/// The comment holding the newest `fence` block by a writer, by the rules of
+/// [`newest_plan`], which epic plans share; the caller parses the block.
+pub(crate) fn newest_fenced<'a>(
+    comments: &'a [Comment],
+    writers: &[&str],
+    fence: &str,
+) -> Result<&'a Comment> {
     for writer in writers {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
@@ -253,10 +247,10 @@ pub fn newest_plan<'a>(
     let foreign_edit = |c: &Comment| (c.edited || c.editor.is_some()) && !trusted(&c.editor);
     let newest = comments
         .iter()
-        .filter(|c| trusted(&c.author) && (has_fence(&c.body) || foreign_edit(c)))
+        .filter(|c| trusted(&c.author) && (has_fence(&c.body, fence) || foreign_edit(c)))
         // max_by_key keeps the last of equals: the later comment wins a tie.
         .max_by_key(|c| c.changed)
-        .context("no plan on this issue from an accepted writer")?;
+        .with_context(|| format!("no plan on this issue from an accepted writer ({fence})"))?;
     ensure!(
         !foreign_edit(newest),
         "newest plan {} was last edited by {}, who may not write plans",
@@ -266,15 +260,40 @@ pub fn newest_plan<'a>(
             .as_deref()
             .unwrap_or("an unidentified account")
     );
-    let plan = JobPlan::from_comment(&newest.body)
-        .with_context(|| format!("newest plan {}", newest.url))?
-        .context("plan fence vanished")?;
-    Ok((plan, newest))
+    Ok(newest)
 }
 
-fn has_fence(body: &str) -> bool {
-    let open = format!("```{PLAN_FENCE}");
+fn has_fence(body: &str, fence: &str) -> bool {
+    let open = format!("```{fence}");
     body.lines().any(|line| line.trim_end() == open)
+}
+
+/// The JSON of the one `fence` block in a comment body: `None` without one.
+/// The fence must open at the start of a line, so a block quoted in a reply
+/// (`> `) or indented is not one.
+pub(crate) fn fenced_json(body: &str, fence: &str) -> Result<Option<Value>> {
+    let open = format!("```{fence}");
+    let mut lines = body.lines();
+    let mut found = None;
+    while let Some(line) = lines.next() {
+        if line.trim_end() != open {
+            continue;
+        }
+        ensure!(found.is_none(), "comment holds more than one plan");
+        let mut json = String::new();
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.trim_end() == "```" {
+                closed = true;
+                break;
+            }
+            json.push_str(line);
+            json.push('\n');
+        }
+        ensure!(closed, "plan fence is not closed");
+        found = Some(serde_json::from_str(&json).context("plan is not valid JSON")?);
+    }
+    Ok(found)
 }
 
 fn login(node: &Value, key: &str) -> Option<String> {

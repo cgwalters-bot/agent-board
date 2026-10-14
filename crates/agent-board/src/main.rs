@@ -1,5 +1,6 @@
 mod ask;
 mod dispatch;
+mod epic;
 mod item;
 mod live;
 mod poll;
@@ -86,6 +87,11 @@ enum Command {
     },
     /// Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request).
     Dispatch(dispatch::FromPlan),
+    /// Check a coordinator's plan for an epic's sub-issues.
+    Epic {
+        #[command(subcommand)]
+        command: Epic,
+    },
     /// Save a normalized board snapshot for offline use.
     Snapshot {
         #[command(subcommand)]
@@ -108,6 +114,12 @@ enum Command {
         #[command(subcommand)]
         command: Test,
     },
+}
+
+#[derive(Subcommand)]
+enum Epic {
+    /// Print the mutations the newest accepted epic plan on an epic would make (--dry-run only).
+    Plan(epic::Plan),
 }
 
 #[derive(Subcommand)]
@@ -366,6 +378,25 @@ fn execute(cli: Cli) -> Result<()> {
                 &cli.hostname,
                 board_forge::github::Client::from_env,
                 || board_forge::github::Client::from_var("DISPATCH_TOKEN"),
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Epic {
+            command: Epic::Plan(args),
+        } => {
+            ensure!(
+                cli.json.is_none(),
+                "epic plan prints mutations as JSON lines; --json is unsupported"
+            );
+            ensure!(
+                cli.snapshot.is_none(),
+                "epic plans are read from the epic's comments, not a snapshot"
+            );
+            epic::plan(
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+                board_forge::github::Client::from_env,
                 &mut io::stdout().lock(),
             )
         }

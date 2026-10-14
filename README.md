@@ -19,6 +19,7 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `ask create\|list\|resolve` | Put a question to the operator as a `question` issue and mark the blocked item Needs human; write only with `--apply`. |
 | `request dispatch`, `run record` | Print `gh workflow run` argv for agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md); propose Run/Result field updates. |
 | `dispatch ISSUE --dry-run\|--apply` | Print, or send once and record on the issue, the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)). |
+| `epic plan ISSUE --dry-run` | Check the newest accepted [epic plan](docs/epic-plans.md) on an epic against configured bounds and print the GitHub mutations it would make; applying is not implemented ([tracker#572](https://github.com/cgwalters-forge/tracker/issues/572)). |
 | `poll --dry-run` | Preview one pass of the pull request poll and when the next is due. `--dry-run` is required: no step is taken yet ([#40](https://github.com/cgwalters-forge/agent-board/issues/40)). |
 | `test project` | Staging integration test; holds a write token. Not for local use. |
 
