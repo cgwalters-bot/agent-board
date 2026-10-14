@@ -35,7 +35,7 @@ Rust supporting edition 2024; no prebuilt releases, and not installable with `gh
 
 - `ci.yml`: fmt, clippy, tests and fixture CLI runs on PRs, merge queue and pushes to main (`contents: read`).
 - `reconcile.yml`: every ten minutes on main, reads cgwalters-forge-stage project 2 with a read-only environment token and uploads `reconcile plan --emit` proposals as an artifact; nothing is applied.
-- `review.yml`: agentic-job's pinned [review](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md) workflow on pull requests and `/review` comments.
+- `review.yml`: agentic-job's [review](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md) workflow at `@main` on pull requests and `/review` comments.
 
 ### Provisioning the reconcile preview
 

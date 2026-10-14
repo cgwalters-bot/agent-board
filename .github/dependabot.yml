@@ -1,0 +1,12 @@
+version: 2
+updates:
+  # Third-party actions are pinned by commit; this proposes their updates.
+  # cgwalters-forge references follow @main and need no updates.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+    # Skip releases younger than this, so a compromised release that is
+    # yanked quickly is never proposed.
+    cooldown:
+      default-days: 7
