@@ -7,3 +7,7 @@ forge_actions := env("FORGE_ACTIONS", "../actions")
 
 lint:
     {{ just_executable() }} --justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check
+
+# NODE_PATH must provide Ajv 8, the review site's JSON Schema validator.
+test-action-schema:
+    node tests/operator-actions.cjs

@@ -1,0 +1,42 @@
+{
+  "config": {"writers": ["operator", "planner-bot"], "repositories": ["example/work", "example/other"]},
+  "valid": {
+    "schema": "agent-board/operator-action/v1", "title": "Resolve superseded work", "why": "The replacement is complete.",
+    "actions": [
+      {"type": "close_issue", "repo": "example/work", "number": 1, "reason": "Superseded by #2."},
+      {"type": "reopen_issue", "repo": "example/work", "number": 2},
+      {"type": "add_label", "repo": "example/work", "number": 2, "label": "ready"},
+      {"type": "remove_label", "repo": "example/work", "number": 2, "label": "blocked"},
+      {"type": "set_project_field", "repo": "example/work", "number": 2, "project": "https://github.com/orgs/example/projects/1", "field": "Status", "value": "Done"},
+      {"type": "add_sub_issue", "repo": "example/work", "number": 2, "parent_repo": "example/other", "parent_number": 3},
+      {"type": "move_sub_issue", "repo": "example/work", "number": 2, "parent_repo": "example/work", "parent_number": 4, "previous_parent_repo": "example/other", "previous_parent_number": 3},
+      {"type": "approve_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567"},
+      {"type": "merge_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567", "method": "squash"}
+    ]
+  },
+  "invalid_actions": [
+    {"type": "reopen_issue", "repo": "example/work\n", "number": 1},
+    {"type": "approve_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567\n"},
+    {"type": "set_project_field", "repo": "example/work", "number": 2, "project": "https://github.com/orgs/example/projects/1\n", "field": "Status", "value": "Done"},
+    {"type": "set_project_field", "repo": "example/work", "number": 2, "project": "https://github.com/orgs/example/projects/1000000000000000", "field": "Status", "value": "Done"},
+    {"type": "request", "repo": "example/work", "number": 1, "url": "/anything"},
+    {"type": "reopen_issue", "repo": "example/work", "number": 0},
+    {"type": "reopen_issue", "repo": "example/work", "number": 9007199254740992},
+    {"type": "close_issue", "repo": "example/work", "number": 1},
+    {"type": "close_issue", "repo": "example/work", "number": 1, "reason": null},
+    {"type": "add_label", "repo": "example/work", "number": 1, "label": " "},
+    {"type": "reopen_issue", "repo": "example/work", "number": 1, "method": "POST"},
+    {"type": "approve_pull_request", "repo": "example/work", "number": 5, "head_sha": "main"},
+    {"type": "merge_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567", "method": "auto"}
+  ],
+  "valid_actions": [
+    {"type": "reopen_issue", "repo": "example/work", "number": 1.0},
+    {"type": "reopen_issue", "repo": "example/work", "number": 1e0},
+    {"type": "reopen_issue", "repo": "example/work", "number": 9007199254740991},
+    {"type": "set_project_field", "repo": "example/work", "number": 2, "project": "https://github.com/orgs/example/projects/999999999999999", "field": "Priority", "value": "P1"}
+  ],
+  "scope_rejections": [
+    {"type": "reopen_issue", "repo": "outside/work", "number": 1},
+    {"type": "add_sub_issue", "repo": "example/work", "number": 1, "parent_repo": "outside/work", "parent_number": 2}
+  ]
+}

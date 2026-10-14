@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Proposed operator actions v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "title", "why", "actions"],
+  "properties": {
+    "schema": {"const": "agent-board/operator-action/v1"},
+    "title": {"type": "string", "allOf": [{"$ref": "#/$defs/text"}], "pattern": "^[^\\r\\n]*(?![\\s\\S])"},
+    "why": {"$ref": "#/$defs/reason"},
+    "actions": {"type": "array", "minItems": 1, "maxItems": 50, "items": {"$ref": "#/$defs/action"}}
+  },
+  "$defs": {
+    "text": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "\\S"},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 4000, "pattern": "\\S"},
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/(?!\\.{1,2}(?![\\s\\S]))[A-Za-z0-9_.-]{1,100}(?![\\s\\S])"},
+    "number": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{40}(?![\\s\\S])"},
+    "action": {
+      "type": "object",
+      "required": ["type", "repo", "number"],
+      "properties": {
+        "repo": {"$ref": "#/$defs/repo"},
+        "number": {"$ref": "#/$defs/number"}
+      },
+      "unevaluatedProperties": false,
+      "oneOf": [
+        {"required": ["reason"], "properties": {"type": {"const": "close_issue"}, "reason": {"$ref": "#/$defs/reason"}}},
+        {"properties": {"type": {"const": "reopen_issue"}}},
+        {"required": ["label"], "properties": {"type": {"enum": ["add_label", "remove_label"]}, "label": {"$ref": "#/$defs/text"}}},
+        {"required": ["project", "field", "value"], "properties": {
+          "type": {"const": "set_project_field"},
+          "project": {"type": "string", "maxLength": 200, "pattern": "^https://github\\.com/(orgs|users)/[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/projects/[1-9][0-9]{0,14}(?![\\s\\S])"},
+          "field": {"enum": ["Priority", "Status"]}, "value": {"$ref": "#/$defs/text"}
+        }},
+        {"required": ["parent_repo", "parent_number"], "properties": {
+          "type": {"const": "add_sub_issue"}, "parent_repo": {"$ref": "#/$defs/repo"}, "parent_number": {"$ref": "#/$defs/number"}
+        }},
+        {"required": ["parent_repo", "parent_number", "previous_parent_repo", "previous_parent_number"], "properties": {
+          "type": {"const": "move_sub_issue"}, "parent_repo": {"$ref": "#/$defs/repo"}, "parent_number": {"$ref": "#/$defs/number"},
+          "previous_parent_repo": {"$ref": "#/$defs/repo"}, "previous_parent_number": {"$ref": "#/$defs/number"}
+        }},
+        {"required": ["head_sha"], "properties": {"type": {"const": "approve_pull_request"}, "head_sha": {"$ref": "#/$defs/sha"}}},
+        {"required": ["head_sha", "method"], "properties": {"type": {"const": "merge_pull_request"}, "head_sha": {"$ref": "#/$defs/sha"}, "method": {"enum": ["merge", "squash", "rebase"]}}}
+      ]
+    }
+  }
+}
