@@ -12,6 +12,48 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const APPLY_MARKER: &str = "agent-board-epic-apply";
 pub const FINGERPRINT_MARKER: &str = "agent-board-epic-fingerprint";
 
+/// Optional caller observations, never authority to select a different plan.
+#[derive(Debug, Default)]
+pub struct Preconditions {
+    pub request: Option<String>,
+    pub comment: Option<u64>,
+    pub updated_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug)]
+pub struct PlanChanged;
+
+impl std::fmt::Display for PlanChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("epic plan precondition failed: plan changed; re-check before applying")
+    }
+}
+
+impl std::error::Error for PlanChanged {}
+
+impl Preconditions {
+    fn enabled(&self) -> bool {
+        self.request.is_some() || self.comment.is_some() || self.updated_at.is_some()
+    }
+
+    fn check(&self, value: &Value, from: &Comment) -> Result<()> {
+        let comment = from
+            .url
+            .rsplit_once("#issuecomment-")
+            .and_then(|(_, id)| id.parse::<u64>().ok());
+        if self
+            .request
+            .as_ref()
+            .is_some_and(|id| value.get("request").and_then(Value::as_str) != Some(id.as_str()))
+            || self.comment.is_some_and(|id| comment != Some(id))
+            || self.updated_at.is_some_and(|at| from.changed != at)
+        {
+            return Err(PlanChanged.into());
+        }
+        Ok(())
+    }
+}
+
 /// Trusted configuration from the caller's default-branch checkout, not inputs
 /// supplied by a dispatcher or values supplied in a plan.
 #[derive(Debug)]
@@ -162,8 +204,20 @@ fn accepted(comments: &[Comment], config: &Config) -> Result<(Value, Comment)> {
 /// Read-only preview. Apply checks for an existing claim before validating
 /// current sub-issues: a prior close otherwise makes its own plan invalid.
 pub fn preview<T: Transport>(client: &T, issue: &ItemRef, config: &Config) -> Result<Vec<Value>> {
-    let (plan, epic, _) =
-        crate::epic::newest_epic_plan(client, issue, &config.writers(), &config.bounds)?;
+    preview_checked(client, issue, config, &Preconditions::default())
+}
+
+pub fn preview_checked<T: Transport>(
+    client: &T,
+    issue: &ItemRef,
+    config: &Config,
+    expected: &Preconditions,
+) -> Result<Vec<Value>> {
+    let comments = issue_comments(client, issue)?;
+    let (value, from) = accepted(&comments, config)?;
+    expected.check(&value, &from)?;
+    let epic = read_epic(client, issue)?;
+    let plan = EpicPlan::validate(&value, &config.bounds, &epic)?;
     ensure!(
         epic.designated,
         "parent does not have the operator's epic label"
@@ -195,8 +249,19 @@ pub fn apply<C: Transport + Rest>(
     config: &Config,
     now: OffsetDateTime,
 ) -> Result<Vec<String>> {
+    apply_checked(client, issue, config, now, &Preconditions::default())
+}
+
+pub fn apply_checked<C: Transport + Rest>(
+    client: &C,
+    issue: &ItemRef,
+    config: &Config,
+    now: OffsetDateTime,
+    expected: &Preconditions,
+) -> Result<Vec<String>> {
     let comments = issue_comments(client, issue)?;
     let (value, from) = accepted(&comments, config)?;
+    expected.check(&value, &from)?;
     let request = crate::epic::request(&value)?;
     let request_output = || request.as_ref().map(|id| format!("Request: {id}"));
     let id = plan_id(&from)?;
@@ -220,6 +285,16 @@ pub fn apply<C: Transport + Rest>(
         "{API_ROOT}repos/{}/issues/{}/comments",
         issue.repository, issue.number
     );
+    // Prevent replacement or editing between the caller's check and our first
+    // write, including the replay claim. One bounded read, not a polling loop.
+    if expected.enabled() {
+        let latest = issue_comments(client, issue)?;
+        let (current, comment) = accepted(&latest, config)?;
+        expected.check(&current, &comment)?;
+        if plan_id(&comment)? != id || current != value {
+            return Err(PlanChanged.into());
+        }
+    }
     let (_, posted) = send(
         client,
         "POST",
@@ -234,10 +309,10 @@ pub fn apply<C: Transport + Rest>(
     let result = (|| -> Result<()> {
         let again = issue_comments(client, issue)?;
         let (current, comment) = accepted(&again, config)?;
-        ensure!(
-            plan_id(&comment)? == id && current == value,
-            "epic plan changed while claiming; no mutations attempted"
-        );
+        expected.check(&current, &comment)?;
+        if plan_id(&comment)? != id || current != value {
+            return Err(PlanChanged.into());
+        }
         ensure!(
             !records(&again, config, &id).iter().any(|n| *n < mine),
             "an earlier apply claim won; no mutations attempted"
@@ -453,6 +528,7 @@ mod tests {
         closed: Cell<bool>,
         fail: Option<&'static str>,
         foreign_on_recheck: bool,
+        edit_on_read: Option<usize>,
         labelled: bool,
         remove_label_on_recheck: bool,
         epic_reads: Cell<usize>,
@@ -475,6 +551,7 @@ mod tests {
                 closed: Cell::new(false),
                 fail: None,
                 foreign_on_recheck: false,
+                edit_on_read: None,
                 labelled: true,
                 remove_label_on_recheck: false,
                 epic_reads: Cell::new(0),
@@ -509,6 +586,13 @@ mod tests {
             }
             if query.contains("comments(first") {
                 self.reads.set(self.reads.get() + 1);
+                if self.edit_on_read == Some(self.reads.get()) {
+                    let body = self.comments.borrow()[0]["body"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    self.comments.borrow_mut()[0] = comment(1, body, Some("planner"));
+                }
                 if self.foreign_on_recheck && self.reads.get() == 2 {
                     let body = self.comments.borrow()[0]["body"]
                         .as_str()
@@ -602,6 +686,125 @@ mod tests {
                 self.closed.set(true);
             }
             Ok((200, json!({})))
+        }
+    }
+
+    #[test]
+    fn preconditions_refuse_without_writes() {
+        for case in [
+            "match",
+            "request",
+            "comment",
+            "timestamp",
+            "missing",
+            "edit",
+            "replacement",
+            "post-claim-edit",
+        ] {
+            let mut forge = Forge::full();
+            let body = forge.comments.borrow()[0]["body"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let mut value = fenced_json(&body, EPIC_PLAN_FENCE).unwrap().unwrap();
+            if case != "missing" {
+                value["request"] = json!("checked-1");
+            }
+            forge.comments.borrow_mut()[0]["body"] =
+                json!(format!("```{EPIC_PLAN_FENCE}\n{value}\n```"));
+            let expected = Preconditions {
+                request: Some(
+                    if case == "request" {
+                        "other"
+                    } else {
+                        "checked-1"
+                    }
+                    .into(),
+                ),
+                comment: Some(if case == "comment" { 2 } else { 1 }),
+                updated_at: Some(
+                    OffsetDateTime::parse(
+                        if case == "timestamp" {
+                            "2026-10-14T09:00:00Z"
+                        } else {
+                            "2026-10-14T10:00:00Z"
+                        },
+                        &Rfc3339,
+                    )
+                    .unwrap(),
+                ),
+            };
+            if case == "edit" {
+                forge.edit_on_read = Some(2);
+            }
+            if case == "post-claim-edit" {
+                forge.edit_on_read = Some(3);
+            }
+            if case == "replacement" {
+                forge.comments.borrow_mut().push(comment(
+                    2,
+                    format!("```{EPIC_PLAN_FENCE}\n{value}\n```"),
+                    Some("planner"),
+                ));
+            }
+            let result = apply_checked(
+                &forge,
+                &issue(),
+                &config(),
+                OffsetDateTime::UNIX_EPOCH,
+                &expected,
+            );
+            if case == "match" {
+                result.unwrap();
+                let writes = forge.requests.borrow().len();
+                apply_checked(
+                    &forge,
+                    &issue(),
+                    &config(),
+                    OffsetDateTime::UNIX_EPOCH,
+                    &expected,
+                )
+                .unwrap();
+                assert_eq!(forge.requests.borrow().len(), writes);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.downcast_ref::<PlanChanged>().is_some(),
+                    "{case}: {error:#}"
+                );
+                if case == "post-claim-edit" {
+                    assert!(!forge.created.get());
+                    assert!(!forge.closed.get());
+                    assert!(
+                        forge.comments.borrow()[1]["body"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("<!-- agent-board-epic-apply: ")
+                    );
+                } else {
+                    assert!(forge.requests.borrow().is_empty(), "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_preconditions_compare_full_instants() {
+        for (timestamp, matches) in [
+            ("2026-10-14T11:00:00+01:00", true),
+            ("2026-10-14T10:00:00.001Z", false),
+        ] {
+            let forge = Forge::full();
+            let expected = Preconditions {
+                updated_at: Some(OffsetDateTime::parse(timestamp, &Rfc3339).unwrap()),
+                ..Preconditions::default()
+            };
+            let result = preview_checked(&forge, &issue(), &config(), &expected);
+            assert_eq!(result.is_ok(), matches);
+            if let Err(error) = result {
+                assert!(error.downcast_ref::<PlanChanged>().is_some());
+            }
+            assert!(forge.requests.borrow().is_empty());
         }
     }
 

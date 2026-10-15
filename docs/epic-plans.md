@@ -107,7 +107,26 @@ or a dispatcher's inputs.
 ```sh
 agent-board epic apply "$EPIC" --config epic-config.json --dry-run
 agent-board epic apply "$EPIC" --config epic-config.json --apply
+agent-board epic apply "$EPIC" --config epic-config.json --apply \
+  --expect-request "$REQUEST" --expect-comment "$COMMENT_ID" \
+  --expect-updated-at "$UPDATED_AT"
 ```
+
+To avoid applying a replacement or edited plan after checking it, callers can
+optionally supply these preconditions. Selection is unchanged: the newest trusted
+writer's plan must match every supplied expectation. `--expect-request` requires
+that exact request string (a missing field refuses); `--expect-comment` requires
+the numeric comment ID; `--expect-updated-at` requires the RFC 3339 last-edit time,
+or creation time for an unedited comment, equal as an instant without truncation.
+Preview checks them too. A mismatch reports `epic plan precondition failed` and
+exits **3**, distinct from an invalid plan (1) and authentication required (4).
+With no flags, behavior is unchanged.
+
+Apply checks at selection and performs one additional bounded comment read
+immediately before its first write (the claim), then checks again after claiming.
+A mismatch before the claim writes nothing; a change after the claim retains it
+for inspection. These checks do not make GitHub reads and writes transactional;
+callers must still serialize passes. Preconditions do not change replay keys.
 
 The trusted configuration is a file from the caller repository's protected
 default-branch checkout. Do not populate it from workflow inputs, a plan, or a

@@ -83,6 +83,15 @@ pub struct Apply {
     /// Write with the configured bot's token.
     #[arg(long)]
     apply: bool,
+    /// Refuse unless the newest trusted plan has this request identifier.
+    #[arg(long)]
+    expect_request: Option<String>,
+    /// Refuse unless the newest trusted plan is this comment.
+    #[arg(long)]
+    expect_comment: Option<u64>,
+    /// Refuse unless the plan's last edit (or creation) is this RFC 3339 instant.
+    #[arg(long)]
+    expect_updated_at: Option<String>,
 }
 
 pub fn apply<T: Transport + board_forge::poll::Rest>(
@@ -102,18 +111,33 @@ pub fn apply<T: Transport + board_forge::poll::Rest>(
         serde_json::from_str(&std::fs::read_to_string(&args.config).context("read epic config")?)
             .context("decode epic config")?;
     let config = board_forge::epic_apply::Config::from_json(&value)?;
+    let expected = board_forge::epic_apply::Preconditions {
+        request: args.expect_request.clone(),
+        comment: args.expect_comment,
+        updated_at: args
+            .expect_updated_at
+            .as_deref()
+            .map(|at| {
+                time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339)
+                    .context("--expect-updated-at must be RFC 3339")
+            })
+            .transpose()?,
+    };
     let client = transport()?;
     if args.apply {
-        for line in board_forge::epic_apply::apply(
+        for line in board_forge::epic_apply::apply_checked(
             &client,
             &issue,
             &config,
             time::OffsetDateTime::now_utc(),
+            &expected,
         )? {
             writeln!(out, "{line}")?;
         }
     } else {
-        for mutation in board_forge::epic_apply::preview(&client, &issue, &config)? {
+        for mutation in
+            board_forge::epic_apply::preview_checked(&client, &issue, &config, &expected)?
+        {
             serde_json::to_writer(&mut *out, &mutation)?;
             writeln!(out)?;
         }
@@ -126,6 +150,17 @@ pub fn apply<T: Transport + board_forge::poll::Rest>(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn precondition_refusal_has_distinct_exit_status_even_with_context() {
+        let error =
+            anyhow::Error::new(board_forge::epic_apply::PlanChanged).context("apply stopped");
+        assert_eq!(crate::live::error_exit_code(&error), 3);
+        assert_eq!(
+            crate::live::error_exit_code(&anyhow::anyhow!("invalid plan")),
+            1
+        );
+    }
 
     #[test]
     fn epic_plan_dry_run_reads_only_after_checks() {
