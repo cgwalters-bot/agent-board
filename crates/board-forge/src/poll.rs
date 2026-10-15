@@ -1954,16 +1954,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter(|p| p.is_object())
             .context("pull request not found")?
             .clone();
-        ensure!(
-            text(&pull, "/author/login") == self.config.bot
-                || self
-                    .config
-                    .policy
-                    .merge_authors
-                    .iter()
-                    .any(|a| a == text(&pull, "/author/login")),
-            "pull request author is not followed"
-        );
+        if !(text(&pull, "/author/login") == self.config.bot
+            || self
+                .config
+                .policy
+                .merge_authors
+                .iter()
+                .any(|a| a == text(&pull, "/author/login")))
+        {
+            return Ok((
+                format!("{repo}#{number} skip: pull request author is not followed"),
+                false,
+            ));
+        }
         if text(&pull, "/author/login") != self.config.bot {
             marker = Marker::default();
         }
@@ -2043,13 +2046,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut numbers: Vec<(u64, bool)> = open
             .iter()
             .filter(|p| {
-                text(p, "/user/login") == self.config.bot
+                let followed = text(p, "/user/login") == self.config.bot
                     || self
                         .config
                         .policy
                         .merge_authors
                         .iter()
-                        .any(|a| a == text(p, "/user/login"))
+                        .any(|a| a == text(p, "/user/login"));
+                if !followed && let Some(number) = p["number"].as_u64() {
+                    outcome.lines.push(format!(
+                        "{repo}#{number} skip: pull request author is not followed"
+                    ));
+                }
+                followed
             })
             .filter_map(|p| {
                 p["number"]
@@ -4159,6 +4168,7 @@ mod tests {
                 "cgwalters-forge/agentic-job#40 activity: cgwalters-bot labeled needs-human (state)",
                 "cgwalters-forge/agentic-job#537 activity: cgwalters reviewed (approved) (direction)",
                 "cgwalters-forge/agentic-job activity: cgwalters-bot pushed refs/heads/dispatch/x (state)",
+                "cgwalters-forge/agentic-job#5 skip: pull request author is not followed",
                 "cgwalters-forge/agentic-job#470 488f45ebacd0 merge: review approved and checks green",
             ]
         );
@@ -4343,6 +4353,7 @@ mod tests {
             outcome.lines,
             [
                 "cgwalters-forge/agentic-job activity: more than 100 events since the last pass; older ones were not read",
+                "cgwalters-forge/agentic-job#5 skip: pull request author is not followed",
                 "cgwalters-forge/agentic-job#470 error: pagination left the API: https://evil.example/comments",
             ]
         );
@@ -4531,28 +4542,113 @@ mod tests {
     }
 
     #[test]
+    fn unfollowed_authors_are_skips_and_bad_repositories_do_not_block_others() {
+        for (listed_author, queried_author) in [
+            ("stranger", "stranger"),
+            (BOT, "stranger"),
+            ("updater[bot]", "stranger"),
+        ] {
+            for bad_repository in [false, true] {
+                let mut fake = github();
+                fake.page(
+                    &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                    None,
+                    None,
+                    json!([
+                        {"number": 469, "user": {"login": listed_author}},
+                        {"number": 470, "user": {"login": BOT}}
+                    ]),
+                );
+                let mut p = pull("pull-470", json!({}));
+                p["author"]["login"] = queried_author.into();
+                fake.pulls.insert(469, p);
+                fake.page(
+                    &format!("repos/{REPO}/issues/469/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([]),
+                );
+                let mut cfg = config();
+                cfg.policy =
+                    PollPolicy::from_json(&json!({"mergeAuthors": ["updater[bot]"]})).unwrap();
+                let mut follow = vec![REPO.into()];
+                if bad_repository {
+                    // Sorts before the healthy repository; no response is provided.
+                    follow.push("a/missing".into());
+                }
+                let dispatcher = Fake::default();
+                let outcome = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &follow,
+                    applying(&dispatcher),
+                    now(),
+                )
+                .unwrap();
+                assert_eq!(
+                    outcome.errors,
+                    if bad_repository { 2 } else { 0 },
+                    "{:?}",
+                    outcome.lines
+                );
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|l| l
+                            == &format!("{REPO}#469 skip: pull request author is not followed"))
+                );
+                assert!(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("#470") && l.contains("merge:"))
+                );
+                assert_eq!(fake.writes.borrow().len(), 1);
+                assert!(fake.writes.borrow()[0].0.contains("mergePullRequest"));
+                assert!(dispatcher.writes.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn merge_only_authors_cannot_dispatch_or_stop_even_with_harness_branches() {
-        for (change, expected) in [
-            (json!({}), "merge"),
-            (json!({"isDraft": true}), "skip"),
-            (json!({"mergeable": "CONFLICTING"}), "skip"),
-            (json!({"title": "Agent run 123"}), "skip"),
+        for (change, approval, expected) in [
+            (json!({}), "APPROVED", "merge"),
+            (json!({}), "COMMENTED", "wait"),
+            (json!({}), "CHANGES_REQUESTED", "skip"),
+            (json!({"isDraft": true}), "APPROVED", "skip"),
+            (json!({"mergeable": "CONFLICTING"}), "APPROVED", "skip"),
+            (json!({"title": "Agent run 123"}), "APPROVED", "skip"),
             (
                 json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                "APPROVED",
                 "skip",
             ),
             (
                 json!({"contexts": {"ci": {"status": "IN_PROGRESS"}}}),
+                "APPROVED",
                 "wait",
             ),
-            (json!({"mergeQueueEntry": {"state": "QUEUED"}}), "skip"),
-            (json!({"autoMergeRequest": {"enabledAt": "now"}}), "skip"),
+            (
+                json!({"mergeQueueEntry": {"state": "QUEUED"}}),
+                "APPROVED",
+                "skip",
+            ),
+            (
+                json!({"autoMergeRequest": {"enabledAt": "now"}}),
+                "APPROVED",
+                "skip",
+            ),
         ] {
             let mut fake = github();
             let mut p = pull("pull-470", change);
             p["author"]["login"] = "updater[bot]".into();
             p["reviews"]["nodes"] = json!([review(
-                "APPROVED",
+                approval,
                 json!({"__typename": "User", "login": "cgwalters"}),
                 HEAD,
                 "approved"
@@ -4567,7 +4663,7 @@ mod tests {
             fake.rest
                 .retain(|url, _| !url.contains("/comments") && !url.contains("/actions/runs/"));
             let mut cfg = config();
-            cfg.policy.merge_authors = vec!["updater[bot]".into()];
+            cfg.policy = PollPolicy::from_json(&json!({"mergeAuthors": ["updater[bot]"]})).unwrap();
             let dispatcher = Fake::default();
             let outcome = run(
                 &fake,
@@ -4591,6 +4687,7 @@ mod tests {
                 outcome.lines
             );
             assert_eq!(outcome.in_flight, 0);
+            assert_eq!(fake.writes.borrow().len(), usize::from(expected == "merge"));
             assert!(dispatcher.writes.borrow().is_empty());
             assert!(
                 fake.writes
@@ -4613,7 +4710,7 @@ mod tests {
                 .unwrap()
                 .lines
                 .iter()
-                .all(|l| !l.contains("#470"))
+                .any(|l| l.contains("#470 skip: pull request author is not followed"))
             );
         }
     }
