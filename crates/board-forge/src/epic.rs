@@ -30,6 +30,7 @@ pub const TITLE_LIMIT: usize = 256;
 pub const BODY_LIMIT: usize = 60_000;
 /// Characters of the reason posted when closing or re-scoping.
 pub const REASON_LIMIT: usize = 4_000;
+pub const REQUEST_LIMIT: usize = 128;
 const LABEL_LIMIT: usize = 10;
 /// GitHub allows 100 sub-issues per parent, so they fit in one page.
 pub const SUB_ISSUE_LIMIT: usize = 100;
@@ -170,7 +171,28 @@ pub struct Epic {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EpicPlan {
+    pub request: Option<String>,
     pub actions: Vec<Action>,
+}
+
+/// Correlation metadata only, never authority or a replay key. Restrict it to
+/// bounded ASCII so exposing it cannot inject output lines or comment markup.
+pub(crate) fn request(value: &Value) -> Result<Option<String>> {
+    let Some(value) = value.get("request") else {
+        return Ok(None);
+    };
+    let value = value.as_str().context("request is not a string")?;
+    ensure!(
+        !value.is_empty() && value.len() <= REQUEST_LIMIT,
+        "request must have 1 to {REQUEST_LIMIT} characters"
+    );
+    ensure!(
+        value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+        "request must contain only ASCII letters, digits and hyphens"
+    );
+    Ok(Some(value.to_owned()))
 }
 
 fn text<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a str> {
@@ -202,7 +224,7 @@ impl EpicPlan {
             .context("epic plan is not a JSON object")?;
         for key in object.keys() {
             ensure!(
-                ["schema", "epic", "actions"].contains(&key.as_str()),
+                ["schema", "epic", "actions", "request"].contains(&key.as_str()),
                 "unknown epic plan field {key:?}"
             );
         }
@@ -247,6 +269,7 @@ impl EpicPlan {
             bail!("epic plan refused:\n  {}", errors.join("\n  "));
         }
         Ok(Self {
+            request: request(value)?,
             actions: checker.done.into_iter().flatten().collect(),
         })
     }
@@ -342,6 +365,16 @@ impl EpicPlan {
             }
         }
         out
+    }
+
+    /// JSON preview: correlation metadata followed by the proposed mutations.
+    /// Keep metadata out of `mutations`, which is also used by the executor.
+    pub fn preview(&self, epic: &Epic) -> Vec<Value> {
+        self.request
+            .iter()
+            .map(|id| json!({"request": id}))
+            .chain(self.mutations(epic))
+            .collect()
     }
 }
 
@@ -683,6 +716,46 @@ mod tests {
                 "body": "Schema and dry run only.", "reason": "Apply is its own slice."}),
             json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P0"}),
         ]
+    }
+
+    #[test]
+    fn request_validation_table() {
+        for (request, valid) in [
+            (None, true),
+            (Some(json!("Az09-request")), true),
+            (Some(json!("a".repeat(REQUEST_LIMIT))), true),
+            (Some(json!("")), false),
+            (Some(json!("a".repeat(REQUEST_LIMIT + 1))), false),
+            (Some(json!("has_underscore")), false),
+            (Some(json!("has space")), false),
+            (Some(json!("id\n")), false),
+            (Some(json!("é")), false),
+            (Some(Value::Null), false),
+            (Some(json!(123)), false),
+        ] {
+            let mut value = plan(vec![]);
+            if let Some(request) = &request {
+                value["request"] = request.clone();
+            }
+            let checked = EpicPlan::validate(&value, &bounds(), &epic());
+            assert_eq!(checked.is_ok(), valid, "{value}: {checked:?}");
+            if let Ok(checked) = checked {
+                assert_eq!(
+                    checked.request.as_deref(),
+                    request.as_ref().and_then(Value::as_str)
+                );
+                let expected: Vec<Value> = request
+                    .into_iter()
+                    .map(|id| json!({"request": id}))
+                    .collect();
+                assert_eq!(checked.preview(&epic()), expected);
+                assert!(checked.mutations(&epic()).is_empty());
+            }
+        }
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../docs/epic-plans.schema.json")).unwrap();
+        assert_eq!(schema["properties"]["request"]["maxLength"], REQUEST_LIMIT);
+        assert_eq!(schema["additionalProperties"], false);
     }
 
     #[test]

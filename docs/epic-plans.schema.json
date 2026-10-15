@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Epic plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "epic", "actions"],
+  "properties": {
+    "schema": {"const": "agent-board/epic-plan/v1"},
+    "epic": {"$ref": "#/$defs/issue"},
+    "request": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9-]+(?![\\s\\S])"},
+    "actions": {"type": "array", "maxItems": 20, "items": {"$ref": "#/$defs/action"}}
+  },
+  "$defs": {
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/(?!\\.{1,2}(?![\\s\\S]))[A-Za-z0-9_.-]{1,100}(?![\\s\\S])"},
+    "issue": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/[A-Za-z0-9_.-]{1,100}#[1-9][0-9]*(?![\\s\\S])"},
+    "body": {"type": "string", "minLength": 1, "maxLength": 60000, "pattern": "\\S"},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 4000, "pattern": "\\S"},
+    "job": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "kind", "runner", "brief"],
+      "properties": {
+        "schema": {"const": "agent-board/job-plan/v1"},
+        "kind": {"enum": ["implement", "triage", "research"]}, "runner": {"const": "hosted"},
+        "pool": {"type": "string", "maxLength": 32, "pattern": "^[a-z]*(?![\\s\\S])"},
+        "brief": {"type": "string", "minLength": 1, "maxLength": 16000, "pattern": "\\S"}
+      }
+    },
+    "action": {
+      "type": "object", "required": ["type"], "unevaluatedProperties": false,
+      "oneOf": [
+        {"required": ["repo", "title", "body"], "properties": {
+          "type": {"const": "create_sub_issue"}, "repo": {"$ref": "#/$defs/repo"},
+          "title": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
+          "body": {"$ref": "#/$defs/body"},
+          "labels": {"type": "array", "maxItems": 10, "items": {"type": "string", "pattern": "\\S"}},
+          "plan": {"$ref": "#/$defs/job"}
+        }},
+        {"required": ["issue", "reason"], "properties": {
+          "type": {"const": "close_sub_issue"}, "issue": {"$ref": "#/$defs/issue"}, "reason": {"$ref": "#/$defs/reason"}
+        }},
+        {"required": ["issue", "body", "reason"], "properties": {
+          "type": {"const": "rescope_sub_issue"}, "issue": {"$ref": "#/$defs/issue"},
+          "body": {"$ref": "#/$defs/body"}, "reason": {"$ref": "#/$defs/reason"}
+        }},
+        {"required": ["value"], "oneOf": [{"required": ["issue"]}, {"required": ["new"]}], "properties": {
+          "type": {"const": "set_priority"}, "issue": {"$ref": "#/$defs/issue"},
+          "new": {"type": "integer", "minimum": 1, "maximum": 20}, "value": {"type": "string"}
+        }}
+      ]
+    }
+  }
+}

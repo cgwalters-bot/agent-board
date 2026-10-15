@@ -58,7 +58,7 @@ pub fn plan<T: Transport>(
     };
     bounds.validate()?;
     let (plan, epic, from) = newest_epic_plan(&transport()?, &issue, &writers, &bounds)?;
-    for mutation in plan.mutations(&epic) {
+    for mutation in plan.preview(&epic) {
         serde_json::to_writer(&mut *out, &mutation)?;
         writeln!(out)?;
     }
