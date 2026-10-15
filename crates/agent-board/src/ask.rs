@@ -50,6 +50,8 @@ pub struct Create {
 
 #[derive(Args)]
 pub struct Resolve {
+    #[command(flatten)]
+    pub settings: crate::decisions::Settings,
     /// The ask: URL, OWNER/REPO#N, or N with --repo.
     pub item: String,
     /// The answer, posted as a comment before the ask is closed.

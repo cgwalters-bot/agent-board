@@ -17,6 +17,7 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `project status-update --status on-track\|at-risk\|off-track` | Publish a project status update (writes); see [docs/status-updates.md](docs/status-updates.md). |
 | `item add`, `item edit` | Add an issue / set fields; write only with `--apply`. |
 | `ask create\|list\|resolve` | Put a question to the operator as a `question` issue and mark the blocked item Needs human; write only with `--apply`. |
+| `ask add`, `ask read`, `ask resolve D<n> TEXT` | Use one configured operator-editable [decisions document](docs/decisions.md); writes require `--apply`. |
 | `request dispatch`, `run record` | Print `gh workflow run` argv for agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md); propose Run/Result field updates. |
 | `dispatch ISSUE --dry-run\|--apply` | Print, or send once and record on the issue, the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)). |
 | `epic plan ISSUE --dry-run` | Check the newest accepted [epic plan](docs/epic-plans.md) and print its mutations. |
