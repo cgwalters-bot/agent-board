@@ -1559,6 +1559,13 @@ fn dispatch_plan_guard_table() {
             1,
             "plans are read only from github.com",
         ),
+        // The batch bound is checked before a token is read.
+        (
+            vec!["--dry-run", "--batch", "6"],
+            true,
+            1,
+            "6 is not in 0..=5",
+        ),
     ] {
         let mut command = command();
         command.env_remove("GH_TOKEN").env_remove("GITHUB_TOKEN");

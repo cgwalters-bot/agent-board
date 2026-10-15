@@ -99,3 +99,32 @@ ambiguous dispatch is not retried, and a writer edits or replaces the plan to
 try again. Anyone who can delete comments on the issue can remove a record and
 so have its plan dispatched again. The run is started with `DISPATCH_TOKEN` if
 it is set, else with `GH_TOKEN`.
+
+## Batching
+
+`--batch N` (0 to 5, default 0: off; take N from the caller's configuration)
+lets one implement run and its pull request also do up to N other sub-issues of
+the issue's epic ([#86](https://github.com/cgwalters-forge/agent-board/issues/86)),
+so small fixes stop paying a runner, a review and a merge round each, and stop
+conflicting with each other while they wait. The issue and every extra must be:
+
+- open, in the same repository, labelled `small` and not `no-batch`: the label
+  is the size, so an unlabelled issue, large or P0, runs alone;
+- unblocked: no open dependency, and no "blocked by", "depends on" or
+  "waiting on/for" in its body; batch members cannot depend on each other;
+- without a pull request that closes it, open, merged or closed;
+- for an extra, planned by its own accepted implement plan for that issue, with
+  the primary's runner and pool, and not recorded already.
+
+Extras are taken oldest first, from at most ten candidates read, while the
+whole task stays within 32,000 characters. The task is the primary plan's brief,
+then a request for one commit per issue and one pull request with a
+`Closes #N` line for each issue finished (and the unfinished ones named, with
+why), then each extra's brief. Every extra gets the same kind of record as the primary,
+with a hidden second line `<!-- agent-board-batch: OWNER/REPO#N -->` naming the
+primary, and all are read back before the run starts. A conflict on any record
+starts nothing. While a record is in place, the plan is not dispatched again.
+GitHub closes the finished issues when the pull request merges. Once the primary
+is closed, an extra still open was not finished, and its batch record no longer
+holds its plan, so a later dispatch may take it. `--dry-run` prints the batched
+request and names the extras and the candidates it left out on stderr.

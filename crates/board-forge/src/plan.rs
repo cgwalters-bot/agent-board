@@ -5,6 +5,7 @@
 //! A plan carries only what the caller's dispatch.yml (cgwalters-forge/tracker)
 //! has an input for, so nothing in it is silently dropped on the way; the
 //! caller's bounds still decide whether the run may do what the plan asks.
+use crate::batch::{BATCH_LIMIT, batch_line, held};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::poll::{Rest, validate_repository, validate_workflow};
 use anyhow::{Context, Result, bail, ensure};
@@ -389,7 +390,11 @@ fn marker_line(plan: &str) -> String {
 /// the issue can remove a record and so have its plan dispatched again; that
 /// is repository write access, which can start the caller's workflows anyway
 /// when it is the same repository.
-fn records<'a>(comments: &'a [Comment], logins: &[&str], plan: &str) -> Vec<(u64, &'a Comment)> {
+pub(crate) fn records<'a>(
+    comments: &'a [Comment],
+    logins: &[&str],
+    plan: &str,
+) -> Vec<(u64, &'a Comment)> {
     let marker = marker_line(plan);
     comments
         .iter()
@@ -435,12 +440,27 @@ pub(crate) fn send<R: Rest>(
     Ok((status, response))
 }
 
-/// What a dispatch did: the comment that records it, and its run where
-/// GitHub names it.
+/// What a dispatch did: the comment that records it, its run where GitHub
+/// names it, and what a batch added.
 #[derive(Debug)]
 pub struct Dispatched {
     pub record: String,
     pub run: Option<String>,
+    /// The extra issues the run also does, OWNER/REPO#N.
+    pub batched: Vec<String>,
+    /// Why candidates for the batch were left out.
+    pub notes: Vec<String>,
+}
+
+/// One issue's record of a dispatch: the comment and the plan it records.
+struct Record {
+    issue: ItemRef,
+    plan: String,
+    plan_url: String,
+    /// Its hidden lines, which every edit keeps.
+    header: String,
+    id: u64,
+    url: String,
 }
 
 /// Start the job that the newest accepted plan on `issue` proposes, once.
@@ -453,17 +473,25 @@ pub struct Dispatched {
 /// after its record, or a dispatch that fails, leaves the plan recorded and
 /// not dispatched again, since an ambiguous dispatch must not be retried
 /// blindly (docs/design.md); a writer edits or replaces the plan to try again.
+///
+/// With `batch` above zero the run also does up to that many extra issues
+/// ([`crate::batch`]), each recorded and read back the same way before the
+/// one run starts; a conflict on any of them starts nothing.
 pub fn dispatch<C: Transport + Rest, D: Rest>(
     client: &C,
     dispatcher: &D,
     issue: &ItemRef,
     writers: &[&str],
     target: &Target,
+    batch: usize,
 ) -> Result<Dispatched> {
     target.validate()?;
+    ensure!(
+        batch <= BATCH_LIMIT,
+        "a batch has at most {BATCH_LIMIT} extra issues"
+    );
     let comments = issue_comments(client, issue)?;
     let (plan, from) = newest_plan(&comments, writers)?;
-    let request = plan.dispatch_request(target)?;
     let id = plan_id(from)?;
     // Records count only from writers, so every dispatching account must be
     // one: two accounts that each read only their own records would both
@@ -473,82 +501,127 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
         writers.iter().any(|w| w.eq_ignore_ascii_case(&login)),
         "{login} is not a plan writer; dispatch with the operator's or the planner's token"
     );
-    // The first record of this plan older than comment `before`.
-    let earlier = |comments: &[Comment], before: u64| {
-        records(comments, writers, &id)
-            .into_iter()
-            .find(|(n, _)| *n < before)
-            .map(|(_, c)| c.url.clone())
-    };
-    if let Some(record) = earlier(&comments, u64::MAX) {
+    if let Some((_, record)) = held(client, &comments, writers, &id, issue)?.first() {
         bail!(
-            "the plan in {} has a dispatch record already, {record}; edit or replace the plan to dispatch it again",
-            from.url
+            "the plan in {} has a dispatch record already, {}; edit or replace the plan to dispatch it again",
+            from.url,
+            record.url
         );
     }
-    let repo = &issue.repository;
-    let marker = marker_line(&id);
-    let note = |text: String| json!({"body": format!("{marker}\n{text}")});
-    let (_, posted) = send(
-        client,
-        "POST",
-        &format!("{API_ROOT}repos/{repo}/issues/{}/comments", issue.number),
-        &note(format!("Dispatching the plan in {}.", from.url)),
-        0,
-    )?;
-    let mine = posted["id"].as_u64().context("the new comment has no id")?;
-    let record = posted["html_url"]
-        .as_str()
-        .context("the new comment has no URL")?
-        .to_owned();
-    let edit = |text: String| {
+    let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
+    let request = JobPlan {
+        brief: crate::batch::brief(&plan, &chosen.extras),
+        ..plan.clone()
+    }
+    .dispatch_request(target)?;
+    let post = |on: &ItemRef, plan: &str, plan_url: &str, header: String, text: String| {
+        let (_, posted) = send(
+            client,
+            "POST",
+            &format!(
+                "{API_ROOT}repos/{}/issues/{}/comments",
+                on.repository, on.number
+            ),
+            &json!({"body": format!("{header}\n{text}")}),
+            0,
+        )?;
+        anyhow::Ok(Record {
+            issue: on.clone(),
+            plan: plan.into(),
+            plan_url: plan_url.into(),
+            header,
+            id: posted["id"].as_u64().context("the new comment has no id")?,
+            url: posted["html_url"]
+                .as_str()
+                .context("the new comment has no URL")?
+                .to_owned(),
+        })
+    };
+    let edit = |record: &Record, text: String| {
         send(
             client,
             "PATCH",
-            &format!("{API_ROOT}repos/{repo}/issues/comments/{mine}"),
-            &note(text),
+            &format!(
+                "{API_ROOT}repos/{}/issues/comments/{}",
+                record.issue.repository, record.id
+            ),
+            &json!({"body": format!("{}\n{text}", record.header)}),
             0,
         )
         .map(drop)
     };
-    let url = request["url"].as_str().context("dispatch request URL")?;
-    let mut body = request["body"].clone();
-    body["return_run_details"] = true.into();
     // Read again without a cache. Our own record counts even where the list
     // does not show it yet: only an earlier one stops this dispatch. This
     // relies on GitHub's reads showing comments posted before them; a caller
     // that runs dispatch in one concurrency group does not need it.
-    let started = issue_comments(client, issue)
-        .and_then(|again| {
-            // A writer's edit since the first read is a new plan, for the next pass.
-            let (_, now) = newest_plan(&again, writers)?;
-            ensure!(
-                plan_id(now)? == id,
-                "the plan changed while it was being dispatched"
-            );
-            match earlier(&again, mine) {
-                Some(first) => bail!("{first} recorded this plan first"),
-                None => Ok(()),
+    let check = |record: &Record| -> Result<()> {
+        let again = issue_comments(client, &record.issue)?;
+        // A writer's edit since the first read is a new plan, for the next pass.
+        let (_, now) = newest_plan(&again, writers)?;
+        ensure!(
+            plan_id(now)? == record.plan,
+            "the plan changed while it was being dispatched"
+        );
+        match held(client, &again, writers, &record.plan, &record.issue)?
+            .into_iter()
+            .find(|(n, _)| *n < record.id)
+        {
+            Some((_, first)) => bail!("{} recorded this plan first", first.url),
+            None => Ok(()),
+        }
+    };
+    let mut records = vec![post(
+        issue,
+        &id,
+        &from.url,
+        marker_line(&id),
+        format!("Dispatching the plan in {}.", from.url),
+    )?];
+    let url = request["url"].as_str().context("dispatch request URL")?;
+    let mut body = request["body"].clone();
+    body["return_run_details"] = true.into();
+    let started = (|| -> Result<Value> {
+        for extra in &chosen.extras {
+            records.push(post(
+                &extra.issue,
+                &extra.id,
+                &extra.from.url,
+                format!("{}\n{}", marker_line(&extra.id), batch_line(issue)),
+                format!(
+                    "Dispatching the plan in {} with {}.",
+                    extra.from.url,
+                    issue.display()
+                ),
+            )?);
+        }
+        for (n, record) in records.iter().enumerate() {
+            match n {
+                0 => check(record)?,
+                _ => {
+                    check(record).with_context(|| format!("batched {}", record.issue.display()))?
+                }
             }
-        })
+        }
         // The run id comes back only where the API knows `return_run_details`;
         // elsewhere it is refused with a 422, and asked again without.
-        .and_then(|()| send(dispatcher, "POST", url, &body, 422))
-        .and_then(|(status, run)| {
-            if status != 422 {
-                return Ok(run);
-            }
-            body.as_object_mut().map(|b| b.remove("return_run_details"));
-            Ok(send(dispatcher, "POST", url, &body, 0)?.1)
-        });
+        let (status, run) = send(dispatcher, "POST", url, &body, 422)?;
+        if status != 422 {
+            return Ok(run);
+        }
+        body.as_object_mut().map(|b| b.remove("return_run_details"));
+        Ok(send(dispatcher, "POST", url, &body, 0)?.1)
+    })();
     let run = match started {
         Ok(run) => run,
         Err(error) => {
             let why: String = format!("{error:#}").chars().take(ERROR_LIMIT).collect();
-            let noted = edit(format!(
-                "The plan in {} was not dispatched, or not knowingly ({why}). It is not tried again; edit or replace the plan to dispatch it.",
-                from.url
-            ));
+            let mut noted = Ok(());
+            for record in &records {
+                noted = noted.and(edit(record, format!(
+                    "The plan in {} was not dispatched, or not knowingly ({why}). It is not tried again; edit or replace the plan to dispatch it.",
+                    record.plan_url
+                )));
+            }
             return Err(match noted {
                 Ok(()) => error,
                 Err(also) => error.context(format!("its record was not updated: {also:#}")),
@@ -558,21 +631,39 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     let run = run["workflow_run_id"]
         .as_u64()
         .map(|n| format!("https://github.com/{}/actions/runs/{n}", target.caller));
-    edit(match &run {
-        Some(run) => format!("Dispatched the plan in {}: [run]({run}).", from.url),
-        None => format!(
-            "Dispatched the plan in {} to {} {}; GitHub did not name the run.",
-            from.url, target.caller, target.workflow
-        ),
-    })
-    // The run started: say so, rather than only that the record is stale.
-    .with_context(|| {
-        format!(
-            "dispatched {}, but {record} still says it is starting",
-            run.as_deref().unwrap_or("the plan")
+    for (n, record) in records.iter().enumerate() {
+        let with = match n {
+            0 => String::new(),
+            _ => format!(" with {}", issue.display()),
+        };
+        edit(
+            record,
+            match &run {
+                Some(run) => format!(
+                    "Dispatched the plan in {}{with}: [run]({run}).",
+                    record.plan_url
+                ),
+                None => format!(
+                    "Dispatched the plan in {}{with} to {} {}; GitHub did not name the run.",
+                    record.plan_url, target.caller, target.workflow
+                ),
+            },
         )
-    })?;
-    Ok(Dispatched { record, run })
+        // The run started: say so, rather than only that the record is stale.
+        .with_context(|| {
+            format!(
+                "dispatched {}, but {} still says it is starting",
+                run.as_deref().unwrap_or("the plan"),
+                record.url
+            )
+        })?;
+    }
+    Ok(Dispatched {
+        record: records[0].url.clone(),
+        run,
+        batched: chosen.extras.iter().map(|e| e.issue.display()).collect(),
+        notes: chosen.notes,
+    })
 }
 
 #[cfg(test)]
@@ -918,6 +1009,12 @@ mod tests {
         /// fails", "read-back fails" or "final edit fails".
         twist: &'static str,
         reads: std::cell::Cell<usize>,
+        /// The comments of the primary's epic siblings, by issue number,
+        /// for a batch ("extra race": another pass records #541 first).
+        others: RefCell<std::collections::BTreeMap<u64, Vec<Value>>>,
+        /// The answer to the batch's epic read; null when none is expected.
+        family: Value,
+        closed: RefCell<Vec<u64>>,
     }
 
     const ISSUE: &str = "https://github.com/cgwalters-forge/tracker/issues/540";
@@ -942,6 +1039,9 @@ mod tests {
                 dispatches: RefCell::new(vec![]),
                 twist: "",
                 reads: Default::default(),
+                others: Default::default(),
+                family: Value::Null,
+                closed: Default::default(),
             }
         }
 
@@ -966,8 +1066,22 @@ mod tests {
             if query.contains("viewer") {
                 return Ok(json!({"viewer": {"login": self.viewer}}));
             }
+            if query.contains("subIssues") {
+                assert!(!self.family.is_null(), "unexpected epic read");
+                return Ok(self.family.clone());
+            }
+            let number = variables["number"].as_u64().unwrap();
+            if query.contains("{ state }") {
+                let closed = self.closed.borrow().contains(&number);
+                let state = if closed { "CLOSED" } else { "OPEN" };
+                return Ok(json!({"repository": {"issue": {"state": state}}}));
+            }
             assert_eq!(query, COMMENTS_QUERY);
-            assert_eq!(variables["number"], 540);
+            if number != 540 {
+                return Ok(json!({"repository": {"issue": {"comments": {
+                    "nodes": self.others.borrow()[&number],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}));
+            }
             self.reads.set(self.reads.get() + 1);
             ensure!(
                 !(self.twist == "read-back fails" && self.reads.get() == 2),
@@ -1007,7 +1121,45 @@ mod tests {
                     json!({"id": id, "html_url": format!("{ISSUE}#issuecomment-{id}")}),
                 ));
             }
+            let other = url
+                .strip_prefix("https://api.github.com/repos/cgwalters-forge/tracker/issues/")
+                .and_then(|u| u.strip_suffix("/comments")?.parse::<u64>().ok());
+            if let (Some(n), "POST") = (other, method) {
+                let mut others = self.others.borrow_mut();
+                let comments = others.get_mut(&n).unwrap();
+                let mut post = |author: &str, body: &str| {
+                    let id = 1000 * n + comments.len() as u64;
+                    let url = format!(
+                        "https://github.com/cgwalters-forge/tracker/issues/{n}#issuecomment-{id}"
+                    );
+                    comments.push(
+                        json!({"url": url, "body": body, "createdAt": "2026-10-14T09:00:00Z",
+                        "lastEditedAt": null, "author": {"login": author}, "editor": null}),
+                    );
+                    (id, url)
+                };
+                if self.twist == "extra race" && n == 541 {
+                    post(
+                        OPERATOR,
+                        &record(&format!("{}@2026-10-13T10:00:00Z", 1000 * n)),
+                    );
+                }
+                let (id, url) = post(self.viewer, text);
+                return Ok((201, json!({"id": id, "html_url": url})));
+            }
             if let (Some(id), "PATCH") = (url.strip_prefix(edits), method) {
+                if let Some(node) = self
+                    .others
+                    .borrow_mut()
+                    .values_mut()
+                    .flatten()
+                    .find(|c| c["url"].as_str().unwrap().ends_with(&format!("-{id}")))
+                {
+                    node["body"] = text.into();
+                    node["lastEditedAt"] = json!("2026-10-14T09:00:01Z");
+                    node["editor"] = json!({"login": self.viewer});
+                    return Ok((200, json!({})));
+                }
                 if self.twist == "final edit fails" && text.contains("\nDispatched the plan") {
                     return Ok((500, json!({"message": "down"})));
                 }
@@ -1105,7 +1257,7 @@ mod tests {
             };
             // The run is started with the dispatch token only.
             let dispatcher = Forge::new(vec![], answers);
-            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target());
+            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0);
             assert!(forge.dispatches.borrow().is_empty(), "{name}");
             assert!(dispatcher.comments.borrow().is_empty(), "{name}");
             assert_eq!(dispatcher.reads.get(), 0, "{name}");
@@ -1136,7 +1288,7 @@ mod tests {
             // However it ended, once recorded the plan is not dispatched again.
             // (An edited plan is a new one, which may be dispatched.)
             if !["record fails", "plan edited"].contains(&twist) && name != "no plan" {
-                let again = dispatch(&forge, &dispatcher, &issue, &writers, &target());
+                let again = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0);
                 let again = format!("{:#}", again.unwrap_err());
                 assert!(again.contains("record already"), "{name}: {again}");
                 assert_eq!(dispatcher.dispatches.borrow().len(), sent, "{name}");
@@ -1152,7 +1304,7 @@ mod tests {
                 viewer,
                 ..Forge::new(vec![planned()], vec![])
             };
-            let result = dispatch(&forge, &forge, &issue, &writers, &target());
+            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0);
             let message = result.unwrap_err().to_string();
             assert!(message.contains(error), "{message}");
             assert_eq!(forge.bodies().len(), 1);
@@ -1163,8 +1315,201 @@ mod tests {
             workflow: "x/../dispatch.yml".into(),
             ..target()
         };
-        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad).is_err());
+        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0).is_err());
         assert_eq!(forge.reads.get(), 0);
+    }
+
+    #[test]
+    fn batched_dispatch_records_each_issue_and_frees_unfinished_ones() {
+        let tracker = "https://github.com/cgwalters-forge/tracker/issues";
+        let planned = |n: u64, kind: &str| {
+            let mut p = plan();
+            p["repo"] = json!("cgwalters-forge/tracker");
+            p["item"] = json!(n);
+            p["kind"] = json!(kind);
+            p["brief"] = json!(format!("Do #{n}."));
+            body(&p)
+        };
+        let comment = |n: u64, id: u64, body: String| {
+            json!({"url": format!("{tracker}/{n}#issuecomment-{id}"), "body": body,
+                "createdAt": "2026-10-13T10:00:00Z", "lastEditedAt": null,
+                "author": {"login": PLANNER}, "editor": null})
+        };
+        let sub = |n: u64, labels: &[&str]| {
+            json!({"number": n, "state": "OPEN", "body": "",
+                "repository": {"nameWithOwner": "cgwalters-forge/tracker"},
+                "labels": {"nodes": labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+                    "totalCount": labels.len()},
+                "issueDependenciesSummary": {"blockedBy": 0},
+                "closedByPullRequestsReferences": {"totalCount": 0}})
+        };
+        let plan_id = |n: u64| format!("{}@2026-10-13T10:00:00Z", 1000 * n);
+        // The epic's other sub-issues: #542 is recorded already, #543 has a
+        // research plan, #544 is not small, and #545 was left over by a batch
+        // whose primary #539 is closed, which frees it.
+        let siblings = || {
+            let mut others = std::collections::BTreeMap::new();
+            for n in 541..=546 {
+                let kind = if n == 543 { "research" } else { "implement" };
+                others.insert(n, vec![comment(n, 1000 * n, planned(n, kind))]);
+            }
+            let held = record(&plan_id(542));
+            others.get_mut(&542).unwrap().push(comment(542, 5421, held));
+            let left = format!(
+                "<!-- {DISPATCH_MARKER}: {} -->\n<!-- {}: cgwalters-forge/tracker#539 -->\nDispatched.",
+                plan_id(545),
+                crate::batch::BATCH_MARKER
+            );
+            others.get_mut(&545).unwrap().push(comment(545, 5451, left));
+            others
+        };
+        let family = |primary: &[&str]| {
+            let mut nodes = vec![sub(540, primary)];
+            nodes.extend((541..=546).map(|n| sub(n, if n == 544 { &[] } else { &["small"] })));
+            let mut issue = sub(540, primary);
+            issue["parent"] =
+                json!({"subIssues": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}});
+            json!({"repository": {"issue": issue}})
+        };
+        let run_url = "https://github.com/cgwalters-forge/tracker/actions/runs/99";
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        // Name, batch size, what goes wrong, the primary's labels; then the
+        // extras the run does, or the error.
+        type Case<'a> = (
+            &'a str,
+            usize,
+            &'a str,
+            &'a [&'a str],
+            Result<&'a [u64], &'a str>,
+        );
+        #[rustfmt::skip]
+        let cases: &[Case] = &[
+            ("off", 0, "", &["small"], Ok(&[])),
+            ("three", 3, "", &["small"], Ok(&[541, 545, 546])),
+            ("two", 2, "", &["small"], Ok(&[541, 545])),
+            ("primary not small", 3, "", &["P2"], Ok(&[])),
+            ("primary opted out", 3, "", &["small", "no-batch"], Ok(&[])),
+            ("extra race", 2, "extra race", &["small"],
+                Err("batched cgwalters-forge/tracker#541: https://github.com/cgwalters-forge/tracker/issues/541#issuecomment-541001 recorded this plan first")),
+        ];
+        for (name, batch, twist, labels, expected) in cases {
+            let forge = Forge {
+                twist,
+                others: RefCell::new(siblings()),
+                family: if *batch == 0 {
+                    Value::Null
+                } else {
+                    family(labels)
+                },
+                closed: RefCell::new(vec![539]),
+                ..Forge::new(
+                    vec![node(
+                        7,
+                        PLANNER,
+                        "2026-10-13T10:00:00Z",
+                        &planned(540, "implement"),
+                    )],
+                    vec![],
+                )
+            };
+            let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target(), *batch);
+            let others = forge.others.borrow();
+            let last = |n: u64| {
+                others[&n].last().unwrap()["body"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            match (result, expected) {
+                (Ok(done), Ok(extras)) => {
+                    let task = &dispatcher.dispatches.borrow()[0]["inputs"]["task"];
+                    let task = task.as_str().unwrap();
+                    assert!(task.starts_with("Do #540."), "{name}: {task}");
+                    assert_eq!(
+                        task.contains("one commit per issue"),
+                        !extras.is_empty(),
+                        "{name}"
+                    );
+                    let names: Vec<String> = extras
+                        .iter()
+                        .map(|n| format!("cgwalters-forge/tracker#{n}"))
+                        .collect();
+                    assert_eq!(done.batched, names, "{name}");
+                    for n in 541..=546 {
+                        let section = format!("## cgwalters-forge/tracker#{n}\n\nDo #{n}.");
+                        assert_eq!(task.contains(&section), extras.contains(&n), "{name} #{n}");
+                    }
+                    for n in *extras {
+                        let header = format!(
+                            "<!-- {DISPATCH_MARKER}: {} -->\n<!-- agent-board-batch: cgwalters-forge/tracker#540 -->\n",
+                            plan_id(*n)
+                        );
+                        let text = last(*n);
+                        assert!(text.starts_with(&header), "{name}: {text}");
+                        assert!(
+                            text.ends_with(&format!(
+                                "with cgwalters-forge/tracker#540: [run]({run_url})."
+                            )),
+                            "{name}: {text}"
+                        );
+                    }
+                    if *name == "three" {
+                        let notes = done.notes.join("\n");
+                        assert!(notes.contains("#542: recorded already"), "{name}: {notes}");
+                        assert!(
+                            notes.contains("#543: not an implement plan"),
+                            "{name}: {notes}"
+                        );
+                    }
+                }
+                (Err(error), Err(expected)) => {
+                    let error = format!("{error:#}");
+                    assert!(error.contains(expected), "{name}: {error}");
+                    assert!(dispatcher.dispatches.borrow().is_empty(), "{name}");
+                    // Every record this pass posted says it started nothing.
+                    for text in [forge.bodies().last().unwrap().clone(), last(541), last(545)] {
+                        assert!(
+                            text.ends_with("edit or replace the plan to dispatch it."),
+                            "{name}: {text}"
+                        );
+                    }
+                }
+                (result, expected) => panic!("{name}: {result:?} != {expected:?}"),
+            }
+        }
+        // An extra left open is held while its batch's primary is open, and
+        // free for a run of its own once the primary is closed.
+        let forge = Forge {
+            others: RefCell::new(siblings()),
+            family: family(&["small"]),
+            ..Forge::new(
+                vec![node(
+                    7,
+                    PLANNER,
+                    "2026-10-13T10:00:00Z",
+                    &planned(540, "implement"),
+                )],
+                vec![],
+            )
+        };
+        let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99})); 2]);
+        dispatch(&forge, &dispatcher, &issue, &writers, &target(), 1).unwrap();
+        let extra =
+            crate::github::parse_github_issue(&format!("{tracker}/541"), None, "github.com")
+                .unwrap();
+        let held = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0).unwrap_err();
+        assert!(
+            held.to_string().contains("has a dispatch record already"),
+            "{held}"
+        );
+        forge.closed.borrow_mut().push(540);
+        let freed = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0).unwrap();
+        assert_eq!(freed.run.as_deref(), Some(run_url));
+        assert_eq!(dispatcher.dispatches.borrow().len(), 2);
+        // A configured batch past the bound is refused before anything is read.
+        assert!(dispatch(&forge, &dispatcher, &issue, &writers, &target(), 6).is_err());
     }
 
     #[test]
