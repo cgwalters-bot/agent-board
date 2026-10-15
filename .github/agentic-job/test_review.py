@@ -13,11 +13,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReviewContracts(unittest.TestCase):
-    def test_caller_uses_a_release_and_never_checks_out_the_head(self):
+    def test_caller_uses_a_pinned_wrapper_and_never_checks_out_the_head(self):
         caller = (ROOT / ".github/workflows/review.yml").read_text()
         self.assertRegex(
             caller,
-            r"uses: cgwalters-forge/agentic-job/\.github/workflows/review\.yml@v0\.2\.0\n",
+            r"uses: cgwalters-forge/actions/\.github/workflows/cgwalters-review\.yml@[0-9a-f]{40} # ",
         )
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
@@ -31,7 +31,8 @@ class ReviewContracts(unittest.TestCase):
         # Covers step-level and job-level (reusable workflow) uses:, which
         # zizmor's unpinned-uses does not. agentic-job is referenced by release
         # tag; other cgwalters-forge references follow main
-        # (cgwalters-forge/tracker#544).
+        # (cgwalters-forge/tracker#544), except the review wrapper, which holds
+        # review.yml's write grants and so is pinned by commit.
         workflows = sorted((ROOT / ".github/workflows").glob("*.yml")) + sorted((ROOT / "live").glob("*.yml"))
         self.assertTrue(workflows)
         for path in workflows:
@@ -42,6 +43,8 @@ class ReviewContracts(unittest.TestCase):
                     target, _, pin = ref.partition("@")
                     if re.match(r"cgwalters-forge/agentic-job(/|\Z)", target):
                         self.assertRegex(pin, r"\Av\d+\.\d+\.\d+\Z")
+                    elif target == "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml":
+                        self.assertRegex(pin, r"\A[0-9a-f]{40}\Z")
                     elif target.startswith("cgwalters-forge/"):
                         self.assertEqual(pin, "main")
                     else:
