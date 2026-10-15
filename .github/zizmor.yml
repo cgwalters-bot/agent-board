@@ -3,8 +3,8 @@ rules:
     config:
       policies:
         # Our own actions follow @main, or a release tag for agentic-job
-        # (cgwalters-forge/tracker#544); other actions must be pinned by
-        # commit. CI runs zizmor through `just lint`, but it checks step
+        # (cgwalters-forge/tracker#544), or a commit for the review wrapper;
+        # other actions must be pinned by commit. CI runs zizmor through `just lint`, but it checks step
         # `uses:` only; .github/agentic-job/test_review.py enforces both step
         # and job-level references.
         "cgwalters-forge/*": ref-pin
