@@ -1,5 +1,6 @@
 mod action;
 mod ask;
+mod decisions;
 mod dispatch;
 mod epic;
 mod item;
@@ -193,6 +194,10 @@ struct List {
 
 #[derive(Subcommand)]
 enum Ask {
+    /// Append to the configured decisions document (preview unless --apply).
+    Add(decisions::Add),
+    /// Report edits since the bot's last write to the decisions document.
+    Read(decisions::Settings),
     /// Open a question issue and set it and the blocked item Needs human (writes with --apply).
     Create(ask::Create),
     /// List open board issues labelled question.
@@ -578,8 +583,32 @@ fn execute(cli: Cli) -> Result<()> {
             )
         }
         Command::Ask {
+            command: Ask::Add(args),
+        } => {
+            decisions::cli_check(cli.snapshot.is_some(), &cli.hostname, cli.json.is_some())?;
+            decisions::run(&args.settings, decisions::Operation::Add(args), args.apply)
+        }
+        Command::Ask {
+            command: Ask::Read(settings),
+        } => {
+            decisions::cli_check(cli.snapshot.is_some(), &cli.hostname, cli.json.is_some())?;
+            decisions::run(settings, decisions::Operation::Read, false)
+        }
+        Command::Ask {
             command: Ask::Resolve(args),
         } => {
+            if args
+                .item
+                .strip_prefix('D')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+            {
+                decisions::cli_check(cli.snapshot.is_some(), &cli.hostname, cli.json.is_some())?;
+                return decisions::run(
+                    &args.settings,
+                    decisions::Operation::Resolve(&args.item, &args.answer),
+                    args.apply,
+                );
+            }
             ensure!(cli.json.is_none(), "--json is unsupported for ask resolve");
             let identity = item::issue_identity(&args.item, cli.repo.as_deref(), &cli.hostname)?;
             ask::check_answer(&args.answer)?;

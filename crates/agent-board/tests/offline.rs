@@ -10,6 +10,99 @@ fn fixture() -> String {
 }
 
 #[test]
+fn decisions_cli_configuration_table() {
+    let dir = std::env::temp_dir().join(format!("agent-board-decisions-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("agent-board.json");
+    for (contents, message, code) in [
+        (r#"{}"#, "decisions are not configured", 1),
+        (
+            r#"{"decisions":{"repository":"sample/coordination","issue":3,"extra":true}}"#,
+            "unknown field",
+            1,
+        ),
+        (
+            r#"{"decisions":{"repository":"bad","issue":3}}"#,
+            "repository",
+            1,
+        ),
+        (
+            r#"{"decisions":{"repository":"sample/coordination","issue":0}}"#,
+            "positive GraphQL Int",
+            1,
+        ),
+        (
+            r#"{"decisions":{"repository":"sample/coordination","issue":3}}"#,
+            "GH_TOKEN",
+            4,
+        ),
+    ] {
+        std::fs::write(&config, contents).unwrap();
+        for args in [
+            vec!["ask", "read"],
+            vec!["ask", "resolve", "D12", "Keep the text."],
+            vec![
+                "ask",
+                "add",
+                "Proceed?",
+                "--context",
+                "Trial passed.",
+                "--option",
+                "Yes",
+                "--option",
+                "No",
+                "--recommend",
+                "ready",
+                "--item",
+                "sample/work#7",
+                "--priority",
+                "P0",
+            ],
+        ] {
+            let output = command()
+                .args(args)
+                .arg("--config")
+                .arg(&config)
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .assert()
+                .code(code)
+                .get_output()
+                .clone();
+            assert!(
+                String::from_utf8(output.stderr).unwrap().contains(message),
+                "{contents}"
+            );
+            assert!(output.stdout.is_empty());
+        }
+        assert!(!config.with_extension("decisions-state.md").exists());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+    let output = command()
+        .args([
+            "ask",
+            "resolve",
+            "Demo/repo#12",
+            "answer",
+            "--snapshot",
+            &fixture(),
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !error.contains("decisions use an issue transport"),
+        "{error}"
+    );
+    assert!(
+        error.contains("not on the board in this snapshot"),
+        "{error}"
+    );
+}
+
+#[test]
 fn reconcile_config_is_opt_in() {
     let dir = std::env::temp_dir().join(format!(
         "agent-board-reconcile-config-{}",
