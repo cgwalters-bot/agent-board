@@ -61,6 +61,13 @@ const STATE_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
   repository(owner: $owner, name: $name) { issue(number: $number) { state } }
 }"#;
 
+/// Open pull requests that close an issue; ten is plenty to find one.
+const OPEN_PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { issue(number: $number) {
+    closedByPullRequestsReferences(first: 10, includeClosedPrs: false) { nodes { state } }
+  } }
+}"#;
+
 /// An issue as far as choosing a batch needs it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Candidate {
@@ -222,8 +229,9 @@ pub struct Batch {
 ///
 /// Each needs an accepted implement plan of its own, by the rules primary
 /// plans follow, for the same issue, runner and pool, and no record that
-/// still holds it ([`held`]). Unreadable comments fail the dispatch; an
-/// unusable plan only leaves its issue out.
+/// still holds it ([`held`]). An epic or a sibling that cannot be read, like
+/// an unusable plan, only leaves extras out: the issue then runs alone, as
+/// it would without batching.
 pub fn select<T: Transport>(
     transport: &T,
     issue: &ItemRef,
@@ -245,7 +253,16 @@ pub fn select<T: Transport>(
             .push("the plan is not an implement plan for its own issue".into());
         return Ok(batch);
     }
-    let numbers = match eligible(&family(transport, issue)?) {
+    let family = match family(transport, issue) {
+        Ok(family) => family,
+        Err(why) => {
+            batch
+                .notes
+                .push(format!("the epic could not be read: {why:#}"));
+            return Ok(batch);
+        }
+    };
+    let numbers = match eligible(&family) {
         Ok(numbers) => numbers,
         Err(why) => {
             batch.notes.push(why);
@@ -261,8 +278,9 @@ pub fn select<T: Transport>(
             number,
             ..issue.clone()
         };
-        let comments = issue_comments(transport, &extra)?;
-        let found = newest_plan(&comments, writers).and_then(|(p, from)| {
+        let comments = issue_comments(transport, &extra);
+        let found = comments.and_then(|comments| {
+            let (p, from) = newest_plan(&comments, writers)?;
             ensure!(
                 p.kind == "implement" && targets(&p, &extra),
                 "not an implement plan for this issue"
@@ -313,7 +331,7 @@ fn section(issue: &ItemRef, plan: &JobPlan) -> String {
 
 /// The run's task: the primary plan's brief, unchanged without extras, else
 /// followed by what a batched run must do and each extra's brief.
-pub fn brief(plan: &JobPlan, extras: &[Extra]) -> String {
+pub fn brief(plan: &JobPlan, extras: &[&Extra]) -> String {
     if extras.is_empty() {
         return plan.brief.clone();
     }
@@ -337,10 +355,13 @@ pub(crate) fn batch_line(primary: &ItemRef) -> String {
 
 /// The records of `plan` on `issue` that still hold it, oldest first.
 ///
-/// An extra's record is released once the batch's primary issue is closed:
-/// the run's pull request merged or the operator closed it, and an extra still
-/// open was not finished, so a later run may take it (the partial-completion
-/// reset). An unreadable primary holds the record.
+/// An extra's record is released once the batch's primary issue is closed
+/// and no open pull request closes the extra: the run's pull request merged
+/// or the operator closed the primary, and an extra still open was not
+/// finished, so a later run may take it (the partial-completion reset). An
+/// operator who closes the primary early, while the batch's pull request is
+/// still open, frees nothing that pull request closes, so it is not done
+/// twice. An unreadable primary or extra holds the record.
 pub(crate) fn held<'a, T: Transport>(
     transport: &T,
     comments: &'a [Comment],
@@ -364,7 +385,9 @@ pub(crate) fn held<'a, T: Transport>(
             })
         });
         let released = match primary {
-            Some(primary) if primary != *issue => closed(transport, &primary)?,
+            Some(primary) if primary != *issue => {
+                closed(transport, &primary)? && !open_pull(transport, issue)?
+            }
             _ => false,
         };
         if !released {
@@ -374,20 +397,36 @@ pub(crate) fn held<'a, T: Transport>(
     Ok(out)
 }
 
-fn closed<T: Transport>(transport: &T, issue: &ItemRef) -> Result<bool> {
+fn issue_node<T: Transport>(transport: &T, query: &str, issue: &ItemRef) -> Result<Value> {
     let (owner, name) = issue
         .repository
         .split_once('/')
         .context("issue repository")?;
     let data = transport.graphql(
-        STATE_QUERY,
+        query,
         json!({"owner": owner, "name": name, "number": issue.number}),
     )?;
-    let state = data
-        .pointer("/repository/issue/state")
-        .and_then(Value::as_str)
+    data.pointer("/repository/issue")
+        .filter(|n| n.is_object())
+        .cloned()
+        .with_context(|| format!("{} is not an issue", issue.display()))
+}
+
+fn closed<T: Transport>(transport: &T, issue: &ItemRef) -> Result<bool> {
+    let state = issue_node(transport, STATE_QUERY, issue)?["state"]
+        .as_str()
+        .map(str::to_owned)
         .with_context(|| format!("{} has no state", issue.display()))?;
     Ok(state == "CLOSED")
+}
+
+fn open_pull<T: Transport>(transport: &T, issue: &ItemRef) -> Result<bool> {
+    let node = issue_node(transport, OPEN_PULLS_QUERY, issue)?;
+    let pulls = node
+        .pointer("/closedByPullRequestsReferences/nodes")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{} has no closing pull requests", issue.display()))?;
+    Ok(pulls.iter().any(|p| p["state"] == "OPEN"))
 }
 
 #[cfg(test)]

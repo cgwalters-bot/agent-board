@@ -121,7 +121,7 @@ The five tracker#405 drift cases become explicit construction/repair contracts:
 
 Turn follows facts: active run → Worker; unresolved ask → Operator; a newer authenticated operator reply → Coordinator for interpretation; external review/dependency → External; terminal → None. A reply is consumed by exact comment identity/revision, not unrelated updated_at changes. It is not automatically approval. A cancelled blocker requires replacement or explicit waiver. An epic does not consume a slot because its children are active, nor complete merely because all children closed if parent criteria remain.
 
-The [GitHub work queue comparison](github-workqueue-comparison.md) records the operator's 2026-10-09 choice of option (b): finish the narrow one-slot approval→run→checked result seam toward a somewhat hardened functional PoC, with agentic-job the more important primitive. Multi-worker fairness, batching and general dependency scheduling are out of near-term scope per that decision; the broader scheduling ideas below are not near-term requirements.
+The [GitHub work queue comparison](github-workqueue-comparison.md) records the operator's 2026-10-09 choice of option (b): finish the narrow one-slot approval→run→checked result seam toward a somewhat hardened functional PoC, with agentic-job the more important primitive. Multi-worker fairness and general dependency scheduling are out of near-term scope per that decision; the broader scheduling ideas below are not near-term requirements. The operator later asked for batching and overlap checks to stop bot pull requests conflicting (#86, #88): `dispatch --batch` and `--bot` are both off by default; see [batching](job-plans.md#batching) and [overlap](job-plans.md#overlap).
 
 Scheduling starts with one operator-approved worker slot and a bounded coordinator allowance, rather than a fair multi-worker selector. Execution eligibility is independent of editable Status: record an authenticated admission authorization or an explicitly permitted low-risk policy classification. Before dispatch, reserve the full bounded run allowance; available = period ceiling minus trusted spend minus outstanding reservations. Missing usage holds new admission. Runner/broker enforce token/request/time limits during execution; later board observation cannot be the hard stop. Implement this seam incrementally, not by front-loading a general inventory/accounting system.
 
@@ -389,7 +389,9 @@ placement or action pins are changed in this patch.
 
 `dispatch ISSUE --dry-run` prints the workflow_dispatch request for the newest
 accepted [job plan](job-plans.md) on an issue; `--apply` sends it once per plan,
-recorded by a comment on the issue that is posted and read back first.
+recorded by a comment on the issue that is posted and read back first. `--batch N` adds small
+sibling sub-issues to the run, and `--bot LOGIN` first holds it back while that
+login's open pull requests or runs overlap it.
 
 `ask create` opens a question issue, labelled `question` and assigned to the
 operator, with lettered options and a recommendation, and sets it and the item it

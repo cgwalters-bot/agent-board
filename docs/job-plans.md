@@ -88,7 +88,8 @@ two dispatches racing on the same plan start one run as long as GitHub's reads
 show the comments posted before them; a caller that runs dispatch in one
 concurrency group does not rely on that. The comment is then edited to link
 the run, or to say why it was not started, and `record=` and (where GitHub
-names it) `run=` lines go to stdout.
+names it) `run=` lines go to stdout; with `--bot`, a run held back writes no
+record and prints `waiting=true` instead ([overlap](#overlap)).
 
 Records count only from the writers, so a visitor's copied marker does not
 block a plan, and `GH_TOKEN` must be a writer's user token (dispatch asks
@@ -117,14 +118,46 @@ conflicting with each other while they wait. The issue and every extra must be:
   the primary's runner and pool, and not recorded already.
 
 Extras are taken oldest first, from at most ten candidates read, while the
-whole task stays within 32,000 characters. The task is the primary plan's brief,
+whole task stays within 32,000 characters. An epic or a sibling that cannot be
+read only leaves extras out, and the issue runs alone. The task is the primary plan's brief,
 then a request for one commit per issue and one pull request with a
 `Closes #N` line for each issue finished (and the unfinished ones named, with
 why), then each extra's brief. Every extra gets the same kind of record as the primary,
 with a hidden second line `<!-- agent-board-batch: OWNER/REPO#N -->` naming the
-primary, and all are read back before the run starts. A conflict on any record
-starts nothing. While a record is in place, the plan is not dispatched again.
+primary, and all are read back before the run starts. A conflict on the
+primary's record starts nothing; a conflict on an extra's leaves only that extra
+out, and its record says so. An extra whose record cannot be read back is left
+out too, and its record loses its marker, so a later dispatch may take it. While a record is in place, the plan is not dispatched again.
 GitHub closes the finished issues when the pull request merges. Once the primary
 is closed, an extra still open was not finished, and its batch record no longer
-holds its plan, so a later dispatch may take it. `--dry-run` prints the batched
+holds its plan, so a later dispatch may take it, unless an open pull request
+still closes it (the primary was closed before the batch's pull request merged). `--dry-run` prints the batched
 request and names the extras and the candidates it left out on stderr.
+
+## Overlap
+
+`--bot LOGIN` (off by default; the login that opens the implement runs' pull
+requests, from the caller's configuration) checks an issue against that
+login's open pull requests and the implement runs in flight on the repository
+the plan changes (its `repo`, which may not be the issue's) before it is dispatched
+([#88](https://github.com/cgwalters-forge/agent-board/issues/88)), since runs
+that change the same files end in rebase fix rounds, and a pull request can run
+out of them. The overlap is a coarse guess: the paths the issue's title, body
+and plan brief name (tokens with a file extension, dotfiles, or ending in `/`), against
+the files each of the newest 50 open pull requests changes (100 each) and the
+paths each of up to ten running issues names. Runs in flight are the caller
+workflow's queued and running runs whose name is `implement OWNER/REPO#N`.
+Then:
+
+- a run in flight or an open pull request overlaps: dispatch waits. Nothing is
+  written, `waiting=true` goes to stdout, and the next pass decides again;
+- otherwise the issue runs independently.
+
+The run is not stacked on an overlapping pull request: the caller has no input
+for a base branch, and the poll does not hold a pull request until one it
+depends on merges, so a stacked run's pull request would carry the other's
+unmerged commits and could merge first.
+
+Each record (the primary's and each extra's) ends with the decision. A check
+that cannot read runs the issue independently, as without `--bot`: it is a
+scheduling heuristic, not a boundary. `--dry-run` prints the decision on stderr.

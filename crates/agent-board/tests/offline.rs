@@ -1559,6 +1559,12 @@ fn dispatch_plan_guard_table() {
             1,
             "plans are read only from github.com",
         ),
+        (
+            vec!["--apply", "--bot", "bad/login"],
+            true,
+            1,
+            "invalid login",
+        ),
         // The batch bound is checked before a token is read.
         (
             vec!["--dry-run", "--batch", "6"],

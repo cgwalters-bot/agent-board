@@ -1,8 +1,9 @@
 //! Offline join to agentic-job's dispatch caller, and `project init`, which creates the
 //! join's missing fields with the operator's own token. Nothing here grants a run write authority.
 use anyhow::{Context, Result, ensure};
-use board_core::{Item, Snapshot, Status, Turn};
+use board_core::{Item, ItemRef, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
+use board_forge::overlap::{self, Decision};
 use board_forge::poll::Rest;
 use board_forge::{batch, is_github_login, parse_github_item, plan, validate_github_project};
 use clap::Args;
@@ -53,6 +54,9 @@ pub struct FromPlan {
     /// Add up to N small, ready sub-issues of the issue's epic, each with its own implement plan, to one run; 0 runs the issue alone. From the caller's configuration.
     #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=board_forge::batch::BATCH_LIMIT as i64))]
     batch: u8,
+    /// Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration.
+    #[arg(long, value_name = "LOGIN")]
+    bot: Option<String>,
 }
 
 #[derive(Args)]
@@ -377,7 +381,7 @@ pub fn from_plan<T: Transport + Rest>(
     let writers: Vec<&str> = std::iter::once(args.operator.as_str())
         .chain(args.planner.as_deref())
         .collect();
-    for writer in &writers {
+    for writer in writers.iter().chain(&args.bot.as_deref()) {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
     let target = plan::Target {
@@ -396,12 +400,24 @@ pub fn from_plan<T: Transport + Rest>(
             &writers,
             &target,
             args.batch.into(),
+            args.bot.as_deref(),
         )?;
         for note in &done.notes {
             eprintln!("Not batched: {note}");
         }
         // Ready for `$GITHUB_OUTPUT`; GitHub does not always name the run.
-        writeln!(out, "record={}", done.record)?;
+        match &done.overlap {
+            Some(decision @ Decision::Wait(_)) => {
+                eprintln!("{}", decision.sentence());
+                writeln!(out, "waiting=true")?;
+            }
+            Some(decision) => eprintln!("{}", decision.sentence()),
+            None => {}
+        }
+        let Some(record) = &done.record else {
+            return Ok(());
+        };
+        writeln!(out, "record={record}")?;
         if let Some(run) = &done.run {
             writeln!(out, "run={run}")?;
         }
@@ -412,6 +428,25 @@ pub fn from_plan<T: Transport + Rest>(
     }
     let comments = plan::issue_comments(&client, &issue)?;
     let (plan, from) = plan::newest_plan(&comments, &writers)?;
+    let dest = ItemRef {
+        repository: plan.repo.clone(),
+        number: plan.item,
+        ..issue.clone()
+    };
+    let overlap = args
+        .bot
+        .as_deref()
+        .map(|bot| overlap::decide(&client, &issue, &dest, &plan.brief, bot, &target));
+    if let Some(decision) = &overlap {
+        eprintln!("{}", decision.sentence());
+    }
+    if let Some(Decision::Wait(_)) = overlap {
+        eprintln!(
+            "Dry run: the plan in {} would wait; nothing was sent.",
+            from.url
+        );
+        return Ok(());
+    }
     let chosen = batch::select(&client, &issue, &plan, &writers, args.batch.into())?;
     for note in &chosen.notes {
         eprintln!("Not batched: {note}");
@@ -424,7 +459,7 @@ pub fn from_plan<T: Transport + Rest>(
         );
     }
     let request = plan::JobPlan {
-        brief: batch::brief(&plan, &chosen.extras),
+        brief: batch::brief(&plan, &chosen.extras.iter().collect::<Vec<_>>()),
         ..plan
     }
     .dispatch_request(&target)?;
@@ -982,6 +1017,7 @@ mod tests {
             operator: "cgwalters".into(),
             planner: planner.map(Into::into),
             batch: 0,
+            bot: None,
         };
         let issue = "https://github.com/cgwalters-forge/tracker/issues/540";
         let tracker = "cgwalters-forge/tracker";
