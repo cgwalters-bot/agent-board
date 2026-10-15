@@ -21,6 +21,7 @@ a line, holding one JSON object:
 ```agent-board-epic-plan
 {
   "schema": "agent-board/epic-plan/v1",
+  "request": "coordinator-123",
   "epic": "cgwalters-forge/tracker#572",
   "actions": [
     {"type": "create_sub_issue", "repo": "cgwalters-forge/agent-board",
@@ -35,6 +36,11 @@ a line, holding one JSON object:
 }
 ```
 ````
+
+`request` is optional correlation metadata: a string of 1 to 128 ASCII letters,
+digits or hyphens (`[A-Za-z0-9-]`). It grants no authority and is not a replay key.
+Plans without it remain valid. See [the schema](epic-plans.schema.json) for the
+structural format; runtime checks also enforce the bounds and relationships below.
 
 `epic` must be the issue the plan is on. Each action is one of:
 
@@ -88,7 +94,10 @@ agent-board epic plan "$EPIC" --dry-run --operator "$OPERATOR" --planner "$PLANN
 ```
 
 prints one JSON object a line per mutation, each tagged with its action's
-position, and names the plan's comment on stderr. It needs a token that can
+position, preceded by a `{"request":"..."}` metadata object when supplied
+(even for an empty plan). Apply's preview uses the same metadata object;
+successful apply and already-claimed output print `Request: ...` when supplied.
+The dry run names the plan's comment on stderr. It needs a token that can
 read the epic. The bounds come from the caller's own configuration (for
 tracker, `schedule.repositories` in its `agent-board.json`), never from a plan
 or a dispatcher's inputs.

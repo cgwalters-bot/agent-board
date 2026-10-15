@@ -169,7 +169,7 @@ pub fn preview<T: Transport>(client: &T, issue: &ItemRef, config: &Config) -> Re
         "parent does not have the operator's epic label"
     );
     let mut out = Vec::new();
-    for mut mutation in plan.mutations(&epic) {
+    for mut mutation in plan.preview(&epic) {
         if mutation["graphql"] == "updateProjectV2ItemFieldValue" {
             mutation["field"] = config.priority_field.clone().into();
             out.push(json!({"action": mutation["action"], "graphql": "addProjectV2ItemById", "project": config.project, "issue": mutation["issue"]}));
@@ -197,13 +197,18 @@ pub fn apply<C: Transport + Rest>(
 ) -> Result<Vec<String>> {
     let comments = issue_comments(client, issue)?;
     let (value, from) = accepted(&comments, config)?;
+    let request = crate::epic::request(&value)?;
+    let request_output = || request.as_ref().map(|id| format!("Request: {id}"));
     let id = plan_id(&from)?;
     ensure!(
         viewer(client)?.eq_ignore_ascii_case(&config.bot),
         "epic apply requires the configured bot's token"
     );
     if !records(&comments, config, &id).is_empty() {
-        return Ok(vec!["Already claimed; nothing changed.".into()]);
+        return Ok(request_output()
+            .into_iter()
+            .chain(["Already claimed; nothing changed.".into()])
+            .collect());
     }
     let epic = read_epic(client, issue)?;
     ensure!(
@@ -284,7 +289,7 @@ pub fn apply<C: Transport + Rest>(
     result.with_context(|| {
         format!("epic apply stopped; confirmed writes:\n{progress}\nClaim retained; do not replay.")
     })?;
-    Ok(done)
+    Ok(request_output().into_iter().chain(done).collect())
 }
 
 fn execute<C: Transport + Rest>(
@@ -695,6 +700,40 @@ mod tests {
             if when != "claim" {
                 assert!(forge.requests.borrow().is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn request_is_exposed_without_changing_writes() {
+        for actions in [
+            json!([]),
+            json!([{"type": "set_priority", "issue": "example/work#2", "value": "High"}]),
+        ] {
+            let plain = Forge::new(actions.clone());
+            let tagged = Forge::new(actions);
+            let mut value = fenced_json(
+                tagged.comments.borrow()[0]["body"].as_str().unwrap(),
+                EPIC_PLAN_FENCE,
+            )
+            .unwrap()
+            .unwrap();
+            value["request"] = json!("Request-123");
+            tagged.comments.borrow_mut()[0]["body"] =
+                json!(format!("```{EPIC_PLAN_FENCE}\n{value}\n```"));
+            let plain_preview = preview(&plain, &issue(), &config()).unwrap();
+            let tagged_preview = preview(&tagged, &issue(), &config()).unwrap();
+            assert_eq!(tagged_preview[0], json!({"request": "Request-123"}));
+            assert_eq!(tagged_preview[1..], plain_preview);
+            let now = OffsetDateTime::UNIX_EPOCH;
+            let plain_output = apply(&plain, &issue(), &config(), now).unwrap();
+            let tagged_output = apply(&tagged, &issue(), &config(), now).unwrap();
+            assert_eq!(tagged_output[0], "Request: Request-123");
+            assert_eq!(tagged_output[1..], plain_output);
+            assert_eq!(*tagged.requests.borrow(), *plain.requests.borrow());
+            assert_eq!(
+                apply(&tagged, &issue(), &config(), now).unwrap(),
+                ["Request: Request-123", "Already claimed; nothing changed."]
+            );
         }
     }
 
