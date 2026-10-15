@@ -291,6 +291,9 @@ are merge-only, cannot mark drafts ready, start fix runs, read fix markers/runs,
 or receive `needs-human`, even on harness-shaped branches. Existing review
 provenance requirements are unchanged: outside the public bot-fork harness,
 only the operator's head approval counts.
+Unfollowed authors are reported as skips, including when the pull request query
+disagrees with the open-list author; they do not count as pass errors. API and
+repository failures still count as errors, without stopping other repositories.
 
 An absent/empty `toilFixPool` leaves normal fix-round pool selection unchanged.
 When set, only a first round with no failed check and either no rejected review
