@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use board_core::{Item, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
 use board_forge::poll::Rest;
-use board_forge::{is_github_login, parse_github_item, plan, validate_github_project};
+use board_forge::{batch, is_github_login, parse_github_item, plan, validate_github_project};
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -50,6 +50,9 @@ pub struct FromPlan {
     /// Login the planning run comments as, whose plans also count.
     #[arg(long, value_name = "LOGIN")]
     planner: Option<String>,
+    /// Add up to N small, ready sub-issues of the issue's epic, each with its own implement plan, to one run; 0 runs the issue alone. From the caller's configuration.
+    #[arg(long, value_name = "N", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=board_forge::batch::BATCH_LIMIT as i64))]
+    batch: u8,
 }
 
 #[derive(Args)]
@@ -392,17 +395,39 @@ pub fn from_plan<T: Transport + Rest>(
             &issue,
             &writers,
             &target,
+            args.batch.into(),
         )?;
+        for note in &done.notes {
+            eprintln!("Not batched: {note}");
+        }
         // Ready for `$GITHUB_OUTPUT`; GitHub does not always name the run.
         writeln!(out, "record={}", done.record)?;
         if let Some(run) = &done.run {
             writeln!(out, "run={run}")?;
         }
+        if !done.batched.is_empty() {
+            writeln!(out, "batched={}", done.batched.join(" "))?;
+        }
         return Ok(());
     }
     let comments = plan::issue_comments(&client, &issue)?;
     let (plan, from) = plan::newest_plan(&comments, &writers)?;
-    let request = plan.dispatch_request(&target)?;
+    let chosen = batch::select(&client, &issue, &plan, &writers, args.batch.into())?;
+    for note in &chosen.notes {
+        eprintln!("Not batched: {note}");
+    }
+    for extra in &chosen.extras {
+        eprintln!(
+            "Batched: {} from the plan in {}",
+            extra.issue.display(),
+            extra.from.url
+        );
+    }
+    let request = plan::JobPlan {
+        brief: batch::brief(&plan, &chosen.extras),
+        ..plan
+    }
+    .dispatch_request(&target)?;
     serde_json::to_writer(&mut *out, &request)?;
     writeln!(out)?;
     eprintln!(
@@ -956,6 +981,7 @@ mod tests {
             git_ref: "main".into(),
             operator: "cgwalters".into(),
             planner: planner.map(Into::into),
+            batch: 0,
         };
         let issue = "https://github.com/cgwalters-forge/tracker/issues/540";
         let tracker = "cgwalters-forge/tracker";
