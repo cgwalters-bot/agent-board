@@ -10,6 +10,7 @@ pub mod batch;
 pub mod epic;
 pub mod epic_apply;
 pub mod github;
+pub mod overlap;
 pub mod plan;
 pub mod poll;
 pub mod status;

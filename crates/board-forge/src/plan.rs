@@ -7,6 +7,7 @@
 //! caller's bounds still decide whether the run may do what the plan asks.
 use crate::batch::{BATCH_LIMIT, batch_line, held};
 use crate::github::{API_ROOT, Transport, is_github_login};
+use crate::overlap::Decision;
 use crate::poll::{Rest, validate_repository, validate_workflow};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
@@ -441,15 +442,18 @@ pub(crate) fn send<R: Rest>(
 }
 
 /// What a dispatch did: the comment that records it, its run where GitHub
-/// names it, and what a batch added.
+/// names it, what a batch added, and what the overlap check decided.
 #[derive(Debug)]
 pub struct Dispatched {
-    pub record: String,
+    /// `None` when the overlap check holds the run back: nothing is recorded.
+    pub record: Option<String>,
     pub run: Option<String>,
     /// The extra issues the run also does, OWNER/REPO#N.
     pub batched: Vec<String>,
     /// Why candidates for the batch were left out.
     pub notes: Vec<String>,
+    /// With a `bot`, what [`crate::overlap::decide`] decided.
+    pub overlap: Option<Decision>,
 }
 
 /// One issue's record of a dispatch: the comment and the plan it records.
@@ -476,7 +480,15 @@ struct Record {
 ///
 /// With `batch` above zero the run also does up to that many extra issues
 /// ([`crate::batch`]), each recorded and read back the same way before the
-/// one run starts; a conflict on any of them starts nothing.
+/// one run starts. A conflict on the primary starts nothing; a conflict on an
+/// extra only leaves that extra out, and its record says so. An extra whose
+/// read-back fails is left out too, but its record is released (its marker
+/// removed), since it is known not to be in the run and nothing confirmed
+/// another claim: a later pass may dispatch it.
+///
+/// With a `bot`, the issue is first checked against the bot's open pull
+/// requests and the runs in flight ([`crate::overlap`]): a wait returns before
+/// anything is written, and any other decision goes into every record.
 pub fn dispatch<C: Transport + Rest, D: Rest>(
     client: &C,
     dispatcher: &D,
@@ -484,12 +496,16 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     writers: &[&str],
     target: &Target,
     batch: usize,
+    bot: Option<&str>,
 ) -> Result<Dispatched> {
     target.validate()?;
     ensure!(
         batch <= BATCH_LIMIT,
         "a batch has at most {BATCH_LIMIT} extra issues"
     );
+    if let Some(bot) = bot {
+        ensure!(is_github_login(bot), "invalid login {bot:?}");
+    }
     let comments = issue_comments(client, issue)?;
     let (plan, from) = newest_plan(&comments, writers)?;
     let id = plan_id(from)?;
@@ -508,12 +524,39 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
             record.url
         );
     }
-    let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
-    let request = JobPlan {
-        brief: crate::batch::brief(&plan, &chosen.extras),
-        ..plan.clone()
+    // The plan may change another repository than the issue it is on: its
+    // pull requests and runs are that repository's.
+    let dest = ItemRef {
+        repository: plan.repo.clone(),
+        number: plan.item,
+        ..issue.clone()
+    };
+    let overlap =
+        bot.map(|bot| crate::overlap::decide(client, issue, &dest, &plan.brief, bot, target));
+    if let Some(Decision::Wait(_)) = overlap {
+        // Unrecorded, so the next pass decides again on fresh state.
+        return Ok(Dispatched {
+            record: None,
+            run: None,
+            batched: vec![],
+            notes: vec![],
+            overlap,
+        });
     }
-    .dispatch_request(target)?;
+    let note = overlap
+        .as_ref()
+        .map(|d| format!(" {}", d.sentence()))
+        .unwrap_or_default();
+    let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
+    let request = |extras: &[&crate::batch::Extra]| {
+        JobPlan {
+            brief: crate::batch::brief(&plan, extras),
+            ..plan.clone()
+        }
+        .dispatch_request(target)
+    };
+    // Built before anything is written, so a bad request posts no record.
+    request(&chosen.extras.iter().collect::<Vec<_>>())?;
     let post = |on: &ItemRef, plan: &str, plan_url: &str, header: String, text: String| {
         let (_, posted) = send(
             client,
@@ -522,7 +565,7 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
                 "{API_ROOT}repos/{}/issues/{}/comments",
                 on.repository, on.number
             ),
-            &json!({"body": format!("{header}\n{text}")}),
+            &json!({"body": format!("{header}\n{text}{note}")}),
             0,
         )?;
         anyhow::Ok(Record {
@@ -545,7 +588,7 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
                 "{API_ROOT}repos/{}/issues/comments/{}",
                 record.issue.repository, record.id
             ),
-            &json!({"body": format!("{}\n{text}", record.header)}),
+            &json!({"body": format!("{}\n{text}{note}", record.header)}),
             0,
         )
         .map(drop)
@@ -554,21 +597,20 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     // does not show it yet: only an earlier one stops this dispatch. This
     // relies on GitHub's reads showing comments posted before them; a caller
     // that runs dispatch in one concurrency group does not need it.
-    let check = |record: &Record| -> Result<()> {
+    // `Ok(Some(why))` is a confirmed conflict; `Err` a read that failed.
+    let check = |record: &Record| -> Result<Option<String>> {
         let again = issue_comments(client, &record.issue)?;
         // A writer's edit since the first read is a new plan, for the next pass.
         let (_, now) = newest_plan(&again, writers)?;
-        ensure!(
-            plan_id(now)? == record.plan,
-            "the plan changed while it was being dispatched"
-        );
-        match held(client, &again, writers, &record.plan, &record.issue)?
+        if plan_id(now)? != record.plan {
+            return Ok(Some(
+                "the plan changed while it was being dispatched".into(),
+            ));
+        }
+        Ok(held(client, &again, writers, &record.plan, &record.issue)?
             .into_iter()
             .find(|(n, _)| *n < record.id)
-        {
-            Some((_, first)) => bail!("{} recorded this plan first", first.url),
-            None => Ok(()),
-        }
+            .map(|(_, first)| format!("{} recorded this plan first", first.url)))
     };
     let mut records = vec![post(
         issue,
@@ -577,9 +619,9 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
         marker_line(&id),
         format!("Dispatching the plan in {}.", from.url),
     )?];
-    let url = request["url"].as_str().context("dispatch request URL")?;
-    let mut body = request["body"].clone();
-    body["return_run_details"] = true.into();
+    // Extras left out, by index into `chosen.extras`, why, and whether their
+    // record is released (the read-back failed rather than found a conflict).
+    let mut dropped: Vec<(usize, String, bool)> = Vec::new();
     let started = (|| -> Result<Value> {
         for extra in &chosen.extras {
             records.push(post(
@@ -594,14 +636,25 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
                 ),
             )?);
         }
-        for (n, record) in records.iter().enumerate() {
-            match n {
-                0 => check(record)?,
-                _ => {
-                    check(record).with_context(|| format!("batched {}", record.issue.display()))?
-                }
+        if let Some(why) = check(&records[0])? {
+            bail!(why);
+        }
+        // Another pass taking one extra first leaves only that extra out.
+        for (n, record) in records.iter().enumerate().skip(1) {
+            match check(record) {
+                Ok(None) => {}
+                Ok(Some(why)) => dropped.push((n - 1, why, false)),
+                Err(why) => dropped.push((n - 1, format!("{why:#}"), true)),
             }
         }
+        let taken: Vec<_> = (chosen.extras.iter().enumerate())
+            .filter(|(n, _)| !dropped.iter().any(|(d, ..)| d == n))
+            .map(|(_, e)| e)
+            .collect();
+        let request = request(&taken)?;
+        let url = request["url"].as_str().context("dispatch request URL")?;
+        let mut body = request["body"].clone();
+        body["return_run_details"] = true.into();
         // The run id comes back only where the API knows `return_run_details`;
         // elsewhere it is refused with a 422, and asked again without.
         let (status, run) = send(dispatcher, "POST", url, &body, 422)?;
@@ -631,26 +684,69 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     let run = run["workflow_run_id"]
         .as_u64()
         .map(|n| format!("https://github.com/{}/actions/runs/{n}", target.caller));
+    let mut notes = chosen.notes;
     for (n, record) in records.iter().enumerate() {
-        let with = match n {
-            0 => String::new(),
-            _ => format!(" with {}", issue.display()),
+        let left = n
+            .checked_sub(1)
+            .and_then(|e| dropped.iter().find(|(d, ..)| *d == e));
+        let text = match (left, &run) {
+            (Some((_, why, true)), _) => {
+                let why: String = why.chars().take(ERROR_LIMIT).collect();
+                notes.push(format!("{}: {why}", record.issue.display()));
+                // Without its marker the comment no longer holds the plan.
+                send(
+                    client,
+                    "PATCH",
+                    &format!(
+                        "{API_ROOT}repos/{}/issues/comments/{}",
+                        record.issue.repository, record.id
+                    ),
+                    &json!({"body": format!(
+                        "The plan in {} was left out of the run for {}: it could not be checked ({why}). A later dispatch may take it.{note}",
+                        record.plan_url,
+                        issue.display()
+                    )}),
+                    0,
+                )
+                .with_context(|| {
+                    format!(
+                        "dispatched {}, but {} still holds a plan it left out",
+                        run.as_deref().unwrap_or("the plan"),
+                        record.url
+                    )
+                })?;
+                continue;
+            }
+            (Some((_, why, false)), _) => {
+                let why: String = why.chars().take(ERROR_LIMIT).collect();
+                notes.push(format!("{}: {why}", record.issue.display()));
+                format!(
+                    "The plan in {} was left out of the run for {} ({why}). It is not tried again; edit or replace the plan to dispatch it.",
+                    record.plan_url,
+                    issue.display()
+                )
+            }
+            (None, Some(run)) if n > 0 => format!(
+                "Dispatched the plan in {} with {}: [run]({run}).",
+                record.plan_url,
+                issue.display()
+            ),
+            (None, Some(run)) => {
+                format!("Dispatched the plan in {}: [run]({run}).", record.plan_url)
+            }
+            (None, None) => format!(
+                "Dispatched the plan in {}{} to {} {}; GitHub did not name the run.",
+                record.plan_url,
+                match n {
+                    0 => String::new(),
+                    _ => format!(" with {}", issue.display()),
+                },
+                target.caller,
+                target.workflow
+            ),
         };
-        edit(
-            record,
-            match &run {
-                Some(run) => format!(
-                    "Dispatched the plan in {}{with}: [run]({run}).",
-                    record.plan_url
-                ),
-                None => format!(
-                    "Dispatched the plan in {}{with} to {} {}; GitHub did not name the run.",
-                    record.plan_url, target.caller, target.workflow
-                ),
-            },
-        )
         // The run started: say so, rather than only that the record is stale.
-        .with_context(|| {
+        edit(record, text).with_context(|| {
             format!(
                 "dispatched {}, but {} still says it is starting",
                 run.as_deref().unwrap_or("the plan"),
@@ -659,10 +755,14 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
         })?;
     }
     Ok(Dispatched {
-        record: records[0].url.clone(),
+        record: Some(records[0].url.clone()),
         run,
-        batched: chosen.extras.iter().map(|e| e.issue.display()).collect(),
-        notes: chosen.notes,
+        batched: (chosen.extras.iter().enumerate())
+            .filter(|(n, _)| !dropped.iter().any(|(d, ..)| d == n))
+            .map(|(_, e)| e.issue.display())
+            .collect(),
+        notes,
+        overlap,
     })
 }
 
@@ -1010,11 +1110,19 @@ mod tests {
         twist: &'static str,
         reads: std::cell::Cell<usize>,
         /// The comments of the primary's epic siblings, by issue number,
-        /// for a batch ("extra race": another pass records #541 first).
+        /// for a batch ("extra race": another pass records #541 first;
+        /// "extra unreadable": reading #541 back after its batch record fails).
         others: RefCell<std::collections::BTreeMap<u64, Vec<Value>>>,
-        /// The answer to the batch's epic read; null when none is expected.
+        /// The answer to the batch's epic read; null when none is expected,
+        /// "fail" when it fails.
         family: Value,
         closed: RefCell<Vec<u64>>,
+        /// Issues an open pull request closes.
+        pulled: RefCell<Vec<u64>>,
+        /// For the overlap check, `{"text", "pulls", "runs"}`: the issue's text,
+        /// the open pull requests and the titles of runs in flight; null when
+        /// none is expected.
+        overlap: Value,
     }
 
     const ISSUE: &str = "https://github.com/cgwalters-forge/tracker/issues/540";
@@ -1042,6 +1150,8 @@ mod tests {
                 others: Default::default(),
                 family: Value::Null,
                 closed: Default::default(),
+                pulled: Default::default(),
+                overlap: Value::Null,
             }
         }
 
@@ -1068,9 +1178,38 @@ mod tests {
             }
             if query.contains("subIssues") {
                 assert!(!self.family.is_null(), "unexpected epic read");
+                ensure!(self.family != "fail", "epic unreadable");
                 return Ok(self.family.clone());
             }
+            if query.contains("pullRequests(") {
+                assert!(!self.overlap.is_null(), "unexpected overlap read");
+                // The plan's repository, not the issue's.
+                assert_eq!(
+                    (&variables["owner"], &variables["name"]),
+                    (&json!("ostreedev"), &json!("ostree"))
+                );
+                return Ok(
+                    json!({"repository": {"pullRequests": {"nodes": self.overlap["pulls"]}}}),
+                );
+            }
             let number = variables["number"].as_u64().unwrap();
+            if query.contains("{ title body }") {
+                // The task text is the issue's own.
+                assert_eq!((&variables["name"], number), (&json!("tracker"), 540));
+                return Ok(
+                    json!({"repository": {"issue": {"title": "", "body": self.overlap["text"]}}}),
+                );
+            }
+            if query.contains("includeClosedPrs: false") {
+                let state = if self.pulled.borrow().contains(&number) {
+                    "OPEN"
+                } else {
+                    "MERGED"
+                };
+                return Ok(
+                    json!({"repository": {"issue": {"closedByPullRequestsReferences": {"nodes": [{"state": state}]}}}}),
+                );
+            }
             if query.contains("{ state }") {
                 let closed = self.closed.borrow().contains(&number);
                 let state = if closed { "CLOSED" } else { "OPEN" };
@@ -1078,6 +1217,17 @@ mod tests {
             }
             assert_eq!(query, COMMENTS_QUERY);
             if number != 540 {
+                let starting = |c: &Value| {
+                    c["body"].as_str().unwrap().ends_with(
+                        "Dispatching the plan in https://github.com/cgwalters-forge/tracker/issues/541#issuecomment-541000 with cgwalters-forge/tracker#540.",
+                    )
+                };
+                ensure!(
+                    !(self.twist == "extra unreadable"
+                        && number == 541
+                        && self.others.borrow()[&541].iter().any(starting)),
+                    "GitHub transport failed"
+                );
                 return Ok(json!({"repository": {"issue": {"comments": {
                     "nodes": self.others.borrow()[&number],
                     "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}));
@@ -1095,7 +1245,18 @@ mod tests {
 
     impl Rest for Forge {
         fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
-            panic!("unexpected GET {url}")
+            assert!(!self.overlap.is_null(), "unexpected GET {url}");
+            let runs: Vec<Value> = (self.overlap["runs"].as_array().unwrap().iter())
+                .filter(|_| url.contains("status=in_progress"))
+                .map(|t| json!({"display_title": t}))
+                .collect();
+            Ok(crate::poll::RestResponse {
+                status: 200,
+                etag: None,
+                last_modified: None,
+                link: None,
+                body: json!({"workflow_runs": runs}),
+            })
         }
 
         fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
@@ -1257,7 +1418,7 @@ mod tests {
             };
             // The run is started with the dispatch token only.
             let dispatcher = Forge::new(vec![], answers);
-            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0);
+            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0, None);
             assert!(forge.dispatches.borrow().is_empty(), "{name}");
             assert!(dispatcher.comments.borrow().is_empty(), "{name}");
             assert_eq!(dispatcher.reads.get(), 0, "{name}");
@@ -1271,7 +1432,7 @@ mod tests {
                     assert_eq!(done.run.as_deref().unwrap_or("-"), run, "{name}");
                     assert_eq!(
                         done.record,
-                        format!("{ISSUE}#issuecomment-{}", 100 + before)
+                        Some(format!("{ISSUE}#issuecomment-{}", 100 + before))
                     );
                     assert_eq!(dispatches[0]["return_run_details"], true, "{name}");
                     assert_eq!(forge.bodies().len(), before + 1, "{name}");
@@ -1288,7 +1449,7 @@ mod tests {
             // However it ended, once recorded the plan is not dispatched again.
             // (An edited plan is a new one, which may be dispatched.)
             if !["record fails", "plan edited"].contains(&twist) && name != "no plan" {
-                let again = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0);
+                let again = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0, None);
                 let again = format!("{:#}", again.unwrap_err());
                 assert!(again.contains("record already"), "{name}: {again}");
                 assert_eq!(dispatcher.dispatches.borrow().len(), sent, "{name}");
@@ -1304,7 +1465,7 @@ mod tests {
                 viewer,
                 ..Forge::new(vec![planned()], vec![])
             };
-            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0);
+            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None);
             let message = result.unwrap_err().to_string();
             assert!(message.contains(error), "{message}");
             assert_eq!(forge.bodies().len(), 1);
@@ -1315,7 +1476,7 @@ mod tests {
             workflow: "x/../dispatch.yml".into(),
             ..target()
         };
-        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0).is_err());
+        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0, None).is_err());
         assert_eq!(forge.reads.get(), 0);
     }
 
@@ -1390,8 +1551,15 @@ mod tests {
             ("two", 2, "", &["small"], Ok(&[541, 545])),
             ("primary not small", 3, "", &["P2"], Ok(&[])),
             ("primary opted out", 3, "", &["small", "no-batch"], Ok(&[])),
-            ("extra race", 2, "extra race", &["small"],
-                Err("batched cgwalters-forge/tracker#541: https://github.com/cgwalters-forge/tracker/issues/541#issuecomment-541001 recorded this plan first")),
+            // Another pass taking an extra first leaves only that one out.
+            ("extra race", 2, "extra race", &["small"], Ok(&[545])),
+            // An extra that cannot be read back is left out and released.
+            ("extra unreadable", 2, "extra unreadable", &["small"], Ok(&[545])),
+            // An unreadable epic runs the issue alone.
+            ("epic fails", 3, "epic fails", &["small"], Ok(&[])),
+            // Another pass taking the primary first starts nothing.
+            ("primary race", 2, "race", &["small"],
+                Err("issues/540#issuecomment-101 recorded this plan first")),
         ];
         for (name, batch, twist, labels, expected) in cases {
             let forge = Forge {
@@ -1399,6 +1567,8 @@ mod tests {
                 others: RefCell::new(siblings()),
                 family: if *batch == 0 {
                     Value::Null
+                } else if *twist == "epic fails" {
+                    json!("fail")
                 } else {
                     family(labels)
                 },
@@ -1414,7 +1584,15 @@ mod tests {
                 )
             };
             let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
-            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target(), *batch);
+            let result = dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                *batch,
+                None,
+            );
             let others = forge.others.borrow();
             let last = |n: u64| {
                 others[&n].last().unwrap()["body"]
@@ -1453,6 +1631,43 @@ mod tests {
                                 "with cgwalters-forge/tracker#540: [run]({run_url})."
                             )),
                             "{name}: {text}"
+                        );
+                    }
+                    if *name == "extra race" {
+                        let text = last(541);
+                        assert!(text.contains("was left out of the run for cgwalters-forge/tracker#540 (https://github.com/cgwalters-forge/tracker/issues/541#issuecomment-541001 recorded this plan first)"), "{name}: {text}");
+                    }
+                    if *name == "extra unreadable" {
+                        let text = last(541);
+                        assert_eq!(
+                            text,
+                            "The plan in https://github.com/cgwalters-forge/tracker/issues/541#issuecomment-541000 was left out of the run for cgwalters-forge/tracker#540: it could not be checked (GitHub transport failed). A later dispatch may take it.",
+                            "{name}"
+                        );
+                        assert!(
+                            done.notes
+                                .join("\n")
+                                .contains("#541: GitHub transport failed"),
+                            "{name}"
+                        );
+                        // Released, so a later pass dispatches it.
+                        drop(others);
+                        let extra = crate::github::parse_github_issue(
+                            &format!("{tracker}/541"),
+                            None,
+                            "github.com",
+                        )
+                        .unwrap();
+                        let again = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+                        let freed = dispatch(&forge, &again, &extra, &writers, &target(), 0, None);
+                        assert_eq!(freed.unwrap().run.as_deref(), Some(run_url), "{name}");
+                        continue;
+                    }
+                    if *name == "epic fails" {
+                        let notes = done.notes.join("\n");
+                        assert!(
+                            notes.contains("the epic could not be read: epic unreadable"),
+                            "{name}: {notes}"
                         );
                     }
                     if *name == "three" {
@@ -1495,21 +1710,93 @@ mod tests {
             )
         };
         let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99})); 2]);
-        dispatch(&forge, &dispatcher, &issue, &writers, &target(), 1).unwrap();
+        dispatch(&forge, &dispatcher, &issue, &writers, &target(), 1, None).unwrap();
         let extra =
             crate::github::parse_github_issue(&format!("{tracker}/541"), None, "github.com")
                 .unwrap();
-        let held = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0).unwrap_err();
+        let held = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0, None).unwrap_err();
         assert!(
             held.to_string().contains("has a dispatch record already"),
             "{held}"
         );
+        // Closed early, while the batch's pull request that closes #541 is open,
+        // the primary frees nothing.
         forge.closed.borrow_mut().push(540);
-        let freed = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0).unwrap();
+        forge.pulled.borrow_mut().push(541);
+        let held = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0, None).unwrap_err();
+        assert!(
+            held.to_string().contains("has a dispatch record already"),
+            "{held}"
+        );
+        forge.pulled.borrow_mut().clear();
+        let freed = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0, None).unwrap();
         assert_eq!(freed.run.as_deref(), Some(run_url));
         assert_eq!(dispatcher.dispatches.borrow().len(), 2);
         // A configured batch past the bound is refused before anything is read.
-        assert!(dispatch(&forge, &dispatcher, &issue, &writers, &target(), 6).is_err());
+        assert!(dispatch(&forge, &dispatcher, &issue, &writers, &target(), 6, None).is_err());
+    }
+
+    #[test]
+    fn dispatch_checks_overlap_with_the_bot() {
+        // A tracker issue whose plan changes ostreedev/ostree#3665: the pull
+        // requests compared are ostree's (the fake asserts it).
+        let p = plan();
+        let planned = node(7, PLANNER, "2026-10-13T10:00:00Z", &body(&p));
+        let pull = |n: u64| {
+            json!({"number": n, "author": {"login": "agentic-bot"},
+                "files": {"nodes": [{"path": "src/safe_outputs.rs"}]}})
+        };
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        // Name, open pull requests; then whether it ran, and what its record says.
+        for (name, pulls, ran, says) in [
+            (
+                "independent",
+                json!([]),
+                true,
+                "Run independently: no open pull request of agentic-bot changes a path it names.",
+            ),
+            ("waits for one", json!([pull(9)]), false, ""),
+            ("waits for two", json!([pull(9), pull(8)]), false, ""),
+        ] {
+            let forge = Forge {
+                overlap: json!({"text": "Fix safe_outputs.rs.", "pulls": pulls, "runs": []}),
+                ..Forge::new(vec![planned.clone()], vec![])
+            };
+            let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+            let done = dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                0,
+                Some("agentic-bot"),
+            )
+            .unwrap();
+            let dispatches = dispatcher.dispatches.borrow();
+            assert_eq!(dispatches.len(), usize::from(ran), "{name}");
+            assert_eq!(done.record.is_some(), ran, "{name}");
+            if !ran {
+                // A wait writes nothing, so the next pass decides again.
+                assert_eq!(forge.bodies().len(), 1, "{name}");
+                assert!(matches!(done.overlap, Some(Decision::Wait(_))), "{name}");
+                continue;
+            }
+            let record = forge.bodies().last().unwrap().clone();
+            assert!(
+                record.ends_with(&format!(
+                    "[run](https://github.com/cgwalters-forge/tracker/actions/runs/99). {says}"
+                )),
+                "{name}: {record}"
+            );
+            let task = dispatches[0]["inputs"]["task"].as_str().unwrap();
+            assert_eq!(task, p["brief"].as_str().unwrap(), "{name}");
+        }
+        // The bot's login goes into a query: it must be one.
+        let forge = Forge::new(vec![planned], vec![]);
+        assert!(dispatch(&forge, &forge, &issue, &writers, &target(), 0, Some("a b")).is_err());
+        assert_eq!(forge.reads.get(), 0);
     }
 
     #[test]
