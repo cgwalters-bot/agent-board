@@ -11,6 +11,7 @@ pub mod epic_apply;
 pub mod github;
 pub mod plan;
 pub mod poll;
+pub mod status;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 
 pub trait Forge {
@@ -43,7 +44,10 @@ impl OutputBackend for GitHubSafeOutputs {
                 ensure!(item.host == "github.com", "item host mismatch");
                 item.validate()?;
                 ensure!(item.repository.split('/').count() == 2, "invalid GitHub repository");
-                Ok(json!({"type":"update_project", "project":plan.project, "content_type":"issue", "content_number":item.number, "target_repo":item.repository, "fields":{"Status":value}}))
+                let kind = action.prerequisites.iter().find(|p| p.field == board_core::BoardField::ContentKind)
+                    .and_then(|p| p.expected.as_deref()).unwrap_or("issue");
+                ensure!(matches!(kind, "issue" | "pull_request"), "unknown content kind");
+                Ok(json!({"type":"update_project", "project":plan.project, "content_type":kind, "content_number":item.number, "target_repo":item.repository, "fields":{"Status":value}}))
             }
         }).collect()
     }

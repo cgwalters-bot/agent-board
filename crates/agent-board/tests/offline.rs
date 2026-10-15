@@ -10,6 +10,63 @@ fn fixture() -> String {
 }
 
 #[test]
+fn reconcile_config_is_opt_in() {
+    let dir = std::env::temp_dir().join(format!(
+        "agent-board-reconcile-config-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("agent-board.json");
+    let baseline = command()
+        .args(["reconcile", "plan", "--snapshot", &fixture(), "--emit"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    for contents in [r#"{}"#, r#"{"statusReconcile":{"enabled":false}}"#] {
+        std::fs::write(&config, contents).unwrap();
+        let output = command()
+            .args([
+                "reconcile",
+                "plan",
+                "--snapshot",
+                &fixture(),
+                "--emit",
+                "--config",
+                config.to_str().unwrap(),
+            ])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert_eq!(output.stdout, baseline);
+    }
+    std::fs::write(&config, r#"{"statusReconcile":{"enabled":"yes"}}"#).unwrap();
+    let output = command()
+        .args([
+            "reconcile",
+            "plan",
+            "--snapshot",
+            &fixture(),
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("invalid statusReconcile enabled")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn epic_apply_cli_is_opt_in_and_requires_trusted_config() {
     for args in [
         vec!["epic", "apply", "example/work#1"],
