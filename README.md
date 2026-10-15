@@ -145,6 +145,58 @@ end-to-end success remain unverified. No secret values are needed in this guide.
 
 ### Provisioning the reconcile preview
 
+To preview whole-board status drift on every poll, add `statusReconcile` to the
+caller's trusted default-branch `agent-board.json` (not workflow inputs):
+
+```json
+{
+  "statusReconcile": {
+    "enabled": true,
+    "project": "https://github.com/orgs/example/projects/1",
+    "repositories": ["example/intake", "example/code"],
+    "runRepositories": ["example/runners"]
+  }
+}
+```
+
+This is off by default. Supply the board with `--owner`/`--project` or
+`--snapshot`; it must match the configured project. Each poll prints a
+`status-preview=` plan to stderr, even with `poll --apply`: **board proposals are
+never applied**. `reconcile plan --config agent-board.json` uses the same rules;
+`--emit` lowers proposals, retaining issue versus PR identity. Existing poll
+settings, including `operator`, remain required. There are at most 500 additional
+read requests per pass; exceeding the bound fails without publishing a partial
+status plan. Preview errors are reported on stderr and in the final exit status,
+but do not stop the existing PR poll from running. Run URLs are only read in
+`runRepositories` so editable board text
+cannot send token-bearing reads to arbitrary repositories or API paths.
+
+The opt-in rules inspect every in-scope issue and PR without Lead, Workflow or
+assignment exemptions: closed/merged content or a nonempty set of all-merged
+linked PRs becomes Done; an open `needs-human`/`question` label or an outstanding
+operator review request becomes Needs human; otherwise a draft PR or active
+recorded Run becomes In Progress. A completed recorded Run releases In Progress
+or Needs human to Todo. Terminal facts win, then human asks, then active work.
+Missing run data is unknown, not proof that no live job exists. Linked PR facts
+come from complete native PR-valued project fields. Existing coverage and status
+schema checks still block incomplete or ambiguous repairs.
+
+Plan preconditions are not sufficient authority to apply these proposals. An
+independent checker must reread the decisive facts for each reason: content and
+linked PR states for `terminal_content`, open labels/current-head review requests
+for `open_human_ask`, and draft state plus the recorded run's identity/status for
+`active_work` or `inactive_work`. A board Run URL is not proof of run/item
+correlation; completion of that run alone is not proof of no other live job.
+
+Relative to tracker#443: missing Status (Triage) and terminal-drift previews were
+already present; the above rules extend them to PRs and current work facts.
+This opt-in mode deliberately maps all closed content to Done, including
+NOT_PLANNED; the default legacy rules retain Cancelled. Tracker closure with a
+reason, Draft-item action generation, gist/waiting-patch inventory, complete
+live-job absence detection, umbrella/epic classification, Priority defaults and
+off-board inventory remain deferred: these need facts or proposal types not
+provided by this board snapshot. None are silently inferred from board prose.
+
 Before enabling the preview, create the dedicated `staging-project-read`
 environment here. Set its deployment branches and tags to **Selected branches
 and tags**, with only a **branch** rule for `main` and no tag rules. Do not use

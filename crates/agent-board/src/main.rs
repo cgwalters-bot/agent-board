@@ -241,6 +241,9 @@ enum Reconcile {
         /// Write safe-output proposals as JSONL, not authorized mutations.
         #[arg(long)]
         emit: bool,
+        /// Trusted default-branch agent-board.json; statusReconcile is off by default.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -632,7 +635,7 @@ fn execute(cli: Cli) -> Result<()> {
                 }),
         } => item_write(&cli, item, fields, item::Mode::Edit, *apply),
         Command::Reconcile {
-            command: Reconcile::Plan { emit },
+            command: Reconcile::Plan { emit, config },
         } => {
             let snapshot = load(&cli)?;
             // Offline scope is only a proposal; independent policy checking is mandatory.
@@ -645,7 +648,24 @@ fn execute(cli: Cli) -> Result<()> {
                     .collect(),
                 capabilities: vec![Capability::ProjectFieldEdit, Capability::CloseIssue],
             };
-            let plan = board_core::reconcile(&snapshot, &policy, &snapshot.clock)?;
+            let plan = if let Some(path) = config {
+                let value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+                let settings = board_forge::status::configured(&value)?;
+                if settings.enabled {
+                    board_forge::status::plan(
+                        &board_forge::github::Client::from_env()?,
+                        &snapshot,
+                        &settings,
+                        value["operator"]
+                            .as_str()
+                            .context("config missing operator")?,
+                    )?
+                } else {
+                    board_core::reconcile(&snapshot, &policy, &snapshot.clock)?
+                }
+            } else {
+                board_core::reconcile(&snapshot, &policy, &snapshot.clock)?
+            };
             if *emit {
                 ensure!(cli.json.is_none(), "--emit cannot be combined with --json");
                 for (target, diagnostic) in &plan.diagnostics {
@@ -677,14 +697,9 @@ fn execute(cli: Cli) -> Result<()> {
             poll::run(args, || {
                 // Every repository on the board, upstream included, is watched.
                 if cli.snapshot.is_none() && cli.owner.is_none() && cli.project.is_none() {
-                    return Ok(Vec::new());
+                    return Ok(None);
                 }
-                Ok(load(&cli)?
-                    .items
-                    .iter()
-                    .filter(|item| item.identity.host == board_forge::github::DEFAULT_HOST)
-                    .map(|item| item.identity.repository.clone())
-                    .collect())
+                Ok(Some(load(&cli)?))
             })
         }
         Command::Test {

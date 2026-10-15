@@ -101,7 +101,10 @@ fn configured(args: &Poll, value: Option<&serde_json::Value>) -> Result<(Poll, p
 
 /// One pass. Lines go to stdout as poll.cjs prints them, then when the next
 /// pass is due as `next-due=` and `next-due-seconds=`, ready for `$GITHUB_OUTPUT`.
-pub fn run(args: &Poll, board: impl FnOnce() -> Result<Vec<String>>) -> Result<()> {
+pub fn run(
+    args: &Poll,
+    board: impl FnOnce() -> Result<Option<board_core::Snapshot>>,
+) -> Result<()> {
     let value = args
         .config
         .as_ref()
@@ -139,8 +142,25 @@ pub fn run(args: &Poll, board: impl FnOnce() -> Result<Vec<String>>) -> Result<(
         policy,
     };
     let mut watch = args.watch.clone();
-    watch.extend(board()?);
+    let snapshot = board()?;
+    if let Some(snapshot) = &snapshot {
+        watch.extend(
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.identity.host == board_forge::github::DEFAULT_HOST)
+                .map(|item| item.identity.repository.clone()),
+        );
+    }
     let client = board_forge::github::Client::from_env()?;
+    // Editable/stale Run text must not suppress the existing PR poll's duties.
+    let preview_error = status_preview(
+        &client,
+        snapshot.as_ref(),
+        value.as_ref(),
+        &args.operator,
+        &mut std::io::stderr().lock(),
+    );
     let dispatcher = board_forge::github::Client::from_var("DISPATCH_TOKEN");
     let apply = args.apply.then(|| poll::Apply {
         dispatcher: dispatcher.as_ref().unwrap_or(&client),
@@ -181,7 +201,40 @@ pub fn run(args: &Poll, board: impl FnOnce() -> Result<Vec<String>>) -> Result<(
         "{} pull request(s) or repositories could not be handled",
         outcome.errors
     );
+    ensure!(
+        preview_error.is_none(),
+        "status preview failed: {}",
+        preview_error.unwrap_or_default()
+    );
     Ok(())
+}
+
+/// Deliberately does not return Result: run the normal poll before reporting
+/// this optional preview's failure in the final exit status.
+fn status_preview<R: poll::Rest>(
+    client: &R,
+    snapshot: Option<&board_core::Snapshot>,
+    value: Option<&serde_json::Value>,
+    operator: &str,
+    err: &mut impl Write,
+) -> Option<String> {
+    let result = (|| -> Result<()> {
+        if let Some(value) = value {
+            let settings = board_forge::status::configured(value)?;
+            if settings.enabled {
+                let snapshot = snapshot.context("statusReconcile requires a board snapshot")?;
+                let plan = board_forge::status::plan(client, snapshot, &settings, operator)?;
+                // Including with --apply, keep this off the poll's stdout.
+                writeln!(err, "status-preview={}", serde_json::to_string(&plan)?)?;
+            }
+        }
+        Ok(())
+    })();
+    result.err().map(|error| {
+        let message = format!("{error:#}");
+        let _ = writeln!(err, "status-preview-error={message}");
+        message
+    })
 }
 
 #[cfg(test)]
@@ -194,6 +247,122 @@ mod tests {
     struct Args {
         #[command(flatten)]
         poll: Poll,
+    }
+
+    #[test]
+    fn status_preview_is_isolated_from_normal_poll() {
+        use board_forge::{
+            github::Transport,
+            poll::{Rest, RestResponse},
+        };
+        use std::cell::RefCell;
+        struct Offline(RefCell<Vec<String>>);
+
+        impl Rest for Offline {
+            fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+                self.0.borrow_mut().push(url.into());
+                let body = if url.ends_with("/user") {
+                    json!({"login":"worker"})
+                } else {
+                    json!([])
+                };
+                Ok(RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body,
+                })
+            }
+
+            fn send(
+                &self,
+                _: &str,
+                _: &str,
+                _: &serde_json::Value,
+            ) -> Result<(u16, serde_json::Value)> {
+                panic!("no mutation expected")
+            }
+        }
+
+        impl Transport for Offline {
+            fn graphql(&self, _: &str, _: serde_json::Value) -> Result<serde_json::Value> {
+                panic!("no GraphQL request expected")
+            }
+        }
+
+        for case in ["disabled", "missing_board", "bad_run", "project", "enabled"] {
+            let client = Offline(RefCell::new(vec![]));
+            let mut snapshot: board_core::Snapshot =
+                serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+            let mut value = json!({"statusReconcile":{
+                "enabled":case != "disabled", "project":snapshot.project,
+                "repositories":["example/intake"], "runRepositories":["example/runners"]
+            }});
+            if case == "bad_run" {
+                snapshot.items[0].fields.insert(
+                    "Run".into(),
+                    json!("https://evil.test/example/runners/actions/runs/42"),
+                );
+            }
+            if case == "project" {
+                value["statusReconcile"]["project"] =
+                    json!("https://github.com/orgs/example/projects/2");
+            }
+            let mut stderr = vec![];
+            let error = status_preview(
+                &client,
+                if case == "missing_board" {
+                    None
+                } else {
+                    Some(&snapshot)
+                },
+                Some(&value),
+                "operator",
+                &mut stderr,
+            );
+            assert_eq!(
+                error.is_some(),
+                matches!(case, "missing_board" | "bad_run" | "project"),
+                "{case}"
+            );
+            assert!(client.0.borrow().is_empty());
+            let stderr = String::from_utf8(stderr).unwrap();
+            if error.is_some() {
+                assert!(stderr.starts_with("status-preview-error="));
+            } else if case == "enabled" {
+                assert!(stderr.starts_with("status-preview={"));
+            } else {
+                assert!(stderr.is_empty());
+            }
+            // Exercise normal apply polling after a failed preview. Its auth
+            // and activity reads must still occur, and no board write occurs.
+            let config = poll::Config {
+                operator: "operator".into(),
+                bot: "worker".into(),
+                dispatch_repo: "example/runners".into(),
+                review_workflow: None,
+                policy: poll::PollPolicy::default(),
+            };
+            let outcome = poll::run(
+                &client,
+                &client,
+                &config,
+                State::default(),
+                &["example/intake".into()],
+                &[],
+                Some(poll::Apply {
+                    dispatcher: &client,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec![],
+                }),
+                time::OffsetDateTime::UNIX_EPOCH,
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0);
+            assert!(client.0.borrow().iter().any(|url| url.ends_with("/user")));
+            assert!(client.0.borrow().iter().any(|url| url.contains("/events")));
+        }
     }
 
     #[test]

@@ -77,6 +77,7 @@ pub enum BoardField {
     IssueState,
     IssueStateReason,
     Status,
+    ContentKind,
     Priority,
     Turn,
     Ask,
@@ -308,6 +309,33 @@ pub struct Plan {
 }
 
 pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan> {
+    reconcile_inner(snapshot, policy, now, None)
+}
+
+/// Additional observed facts for the opt-in whole-board status pass. Unknown
+/// run state must not be mistaken for an observed absence of running work.
+#[derive(Clone, Debug, Default)]
+pub struct StatusFacts {
+    pub draft: bool,
+    pub review_requested: bool,
+    pub linked_prs_all_merged: bool,
+    pub active_run: Option<bool>,
+}
+
+pub fn reconcile_status(
+    snapshot: &Snapshot,
+    policy: &Policy,
+    facts: &BTreeMap<ItemRef, StatusFacts>,
+) -> Result<Plan> {
+    reconcile_inner(snapshot, policy, &snapshot.clock, Some(facts))
+}
+
+fn reconcile_inner(
+    snapshot: &Snapshot,
+    policy: &Policy,
+    now: &str,
+    status_facts: Option<&BTreeMap<ItemRef, StatusFacts>>,
+) -> Result<Plan> {
     snapshot.validate()?;
     ensure!(
         snapshot.project == policy.project,
@@ -334,10 +362,10 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
         return Ok(plan);
     }
     for item in &snapshot.items {
-        if item.content_kind == "pull_request" {
+        if item.content_kind == "pull_request" && status_facts.is_none() {
             continue;
         }
-        if item.content_kind != "issue" {
+        if !matches!(item.content_kind.as_str(), "issue" | "pull_request") {
             plan.diagnostics.insert(
                 item.identity.display(),
                 "missing_data: unknown content kind; issue identity required".into(),
@@ -358,47 +386,82 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
             Some(item.identity.host.as_str()) == snapshot.project.host_str(),
             "item host differs from project host"
         );
-        let (reason, intent) = match (&item.status, item.state.as_str()) {
-            (Some(Status::Done), "open") => {
-                plan.diagnostics.insert(
+        let derived = status_facts
+            .and_then(|facts| facts.get(&item.identity))
+            .and_then(|facts| {
+                if item.state == "closed" || facts.linked_prs_all_merged {
+                    Some(("terminal_content", Status::Done))
+                } else if facts.review_requested
+                    || item
+                        .labels
+                        .iter()
+                        .any(|label| label == "needs-human" || label == "question")
+                {
+                    Some(("open_human_ask", Status::NeedsHuman))
+                } else if facts.draft || facts.active_run == Some(true) {
+                    Some(("active_work", Status::InProgress))
+                } else if facts.active_run == Some(false)
+                    && matches!(item.status, Some(Status::InProgress | Status::NeedsHuman))
+                {
+                    Some(("inactive_work", Status::Todo))
+                } else {
+                    None
+                }
+            });
+        let (reason, intent) = if let Some((reason, value)) = derived {
+            if item.status.as_ref() == Some(&value) {
+                continue;
+            }
+            (
+                reason,
+                Intent::SetStatus {
+                    item: item.identity.clone(),
+                    value,
+                },
+            )
+        } else {
+            match (&item.status, item.state.as_str()) {
+                (Some(Status::Done), "open") => {
+                    plan.diagnostics.insert(
                     item.identity.display(),
                     "needs_review: Done issue is open, possibly reopened; no closure proposed. Review completion evidence and reset Status if needed".into(),
                 );
-                continue;
-            }
-            (status, "closed") => {
-                let target = match item.state_reason.as_deref() {
-                    Some("NOT_PLANNED") => Status::Cancelled,
-                    Some("COMPLETED") => Status::Done,
-                    _ => {
-                        plan.diagnostics.insert(item.identity.display(),
-                            "missing_data: closed issue has unknown state reason; no terminal repair proposed".into());
-                        continue;
-                    }
-                };
-                if *status == Some(target.clone()) {
                     continue;
                 }
-                (
-                    if target == Status::Cancelled {
-                        "closed_issue_not_cancelled"
-                    } else {
-                        "closed_issue_not_done"
-                    },
+                (status, "closed") => {
+                    let target = match item.state_reason.as_deref() {
+                        Some("NOT_PLANNED") => Status::Cancelled,
+                        Some("COMPLETED") => Status::Done,
+                        _ => {
+                            plan.diagnostics.insert(item.identity.display(),
+                            "missing_data: closed issue has unknown state reason; no terminal repair proposed".into());
+                            continue;
+                        }
+                    };
+                    if *status == Some(target.clone()) {
+                        continue;
+                    }
+                    (
+                        if target == Status::Cancelled {
+                            "closed_issue_not_cancelled"
+                        } else {
+                            "closed_issue_not_done"
+                        },
+                        Intent::SetStatus {
+                            item: item.identity.clone(),
+                            value: target,
+                        },
+                    )
+                }
+                (None, "open") => (
+                    "missing_status",
                     Intent::SetStatus {
                         item: item.identity.clone(),
-                        value: target,
+                        value: Status::Triage,
                     },
-                )
+                ),
+                _ => continue,
             }
-            (None, "open") => (
-                "missing_status",
-                Intent::SetStatus {
-                    item: item.identity.clone(),
-                    value: Status::Triage,
-                },
-            ),
-            _ => continue,
         };
         if let Intent::SetStatus { value, .. } = &intent {
             let name = serde_json::to_value(value)?;
@@ -416,28 +479,38 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
             key: format!("{:x}", Sha256::digest(key_input)),
             reason: reason.into(),
             intent,
-            prerequisites: vec![
-                Precondition {
-                    item: item.identity.clone(),
-                    field: BoardField::Status,
-                    expected: item
-                        .status
-                        .as_ref()
-                        .map(serde_json::to_value)
-                        .transpose()?
-                        .and_then(|value| value.as_str().map(str::to_owned)),
-                },
-                Precondition {
-                    item: item.identity.clone(),
-                    field: BoardField::IssueState,
-                    expected: Some(item.state.clone()),
-                },
-                Precondition {
-                    item: item.identity.clone(),
-                    field: BoardField::IssueStateReason,
-                    expected: item.state_reason.clone(),
-                },
-            ],
+            prerequisites: {
+                let mut prerequisites = vec![
+                    Precondition {
+                        item: item.identity.clone(),
+                        field: BoardField::Status,
+                        expected: item
+                            .status
+                            .as_ref()
+                            .map(serde_json::to_value)
+                            .transpose()?
+                            .and_then(|value| value.as_str().map(str::to_owned)),
+                    },
+                    Precondition {
+                        item: item.identity.clone(),
+                        field: BoardField::IssueState,
+                        expected: Some(item.state.clone()),
+                    },
+                    Precondition {
+                        item: item.identity.clone(),
+                        field: BoardField::IssueStateReason,
+                        expected: item.state_reason.clone(),
+                    },
+                ];
+                if status_facts.is_some() {
+                    prerequisites.push(Precondition {
+                        item: item.identity.clone(),
+                        field: BoardField::ContentKind,
+                        expected: Some(item.content_kind.clone()),
+                    });
+                }
+                prerequisites
+            },
             evidence: item.evidence.clone(),
         });
     }
