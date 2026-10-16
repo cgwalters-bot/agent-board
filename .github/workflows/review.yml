@@ -14,10 +14,10 @@ jobs:
       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/review'))
     # Base-owned policy; the head is fetched only as data inside the sandbox.
     # Our deployment's wrapper (tailnet join, agent and inference defaults)
-    # around agentic-job v0.5.1, pinned by commit: the permissions below go
+    # around agentic-job v0.5.2, pinned by commit: the permissions below go
     # to whatever this names, so a change to it is reviewed here. The
     # tailnet and inference broker must admit its job_workflow_ref.
-    uses: cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@5324df93558c10d2d8276bea4f8ea9eda158b130 # agentic-job v0.5.1
+    uses: cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@bc0ea824a5c77a191eca503e493dbbb7fe991610 # agentic-job v0.5.2
     permissions:
       contents: read
       issues: read
