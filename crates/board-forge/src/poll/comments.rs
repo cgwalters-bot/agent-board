@@ -4,6 +4,12 @@
 //! or review comment of the operator's starts a fix round on a pull request of
 //! the bot's, or a triage run on any other issue or pull request.
 //!
+//! A run's item on someone else's pull request is a tracking issue in
+//! `Config::dispatch_repo` instead (agent-board#106): the dispatch workflow
+//! takes only review and fix runs on a pull request. The thread's claim
+//! records the issue, so that later comments go to the same one. Only a
+//! public repository's comments are copied to the tracker that way.
+//!
 //! A search a pass, of a few pages, finds the threads the operator commented
 //! on that were updated since a cursor in the state. Each new comment is
 //! claimed on its thread by the bot before its run starts, and a claim, or a
@@ -13,6 +19,7 @@
 //! dispatch workflow like any other, with its fork and bounds, and a fix
 //! round here is one of the pull request's `MAX_FIX_ROUNDS`.
 use super::*;
+use crate::github::NotFound;
 use time::Duration;
 
 /// The most entries `operatorComments.repositories` may hold: each is a
@@ -155,9 +162,25 @@ fn handled(comments: &[Value], bot: &str) -> (BTreeSet<String>, BTreeMap<String,
 
 /// Whether a line of the operator's asks the bot for action explicitly.
 fn explicit(body: &str, bot: &str) -> bool {
+    addressed(body, bot).next().is_some()
+}
+
+/// The run kind the operator's comments ask for: `research` where a line
+/// addressed to the bot asks for an investigation, else `triage`.
+fn run_kind(said: &[Said], bot: &str) -> &'static str {
+    let research = said.iter().any(|c| {
+        addressed(&c.body, bot).any(|line| {
+            let line = line.to_lowercase();
+            line.contains("research") || line.contains("investigat")
+        })
+    });
+    if research { "research" } else { "triage" }
+}
+
+/// The lines of a comment that address the bot: `/bot` or `@BOT`.
+fn addressed<'a>(body: &'a str, bot: &str) -> impl Iterator<Item = &'a str> {
     let mention = format!("@{bot}");
-    body.lines().any(|line| {
-        let line = line.trim();
+    body.lines().map(str::trim).filter(move |line| {
         let addressed = |rest: &str| {
             !rest
                 .chars()
@@ -222,7 +245,8 @@ fn fix_brief(
     lines.join("\n")
 }
 
-/// The task of a triage run on someone else's issue or pull request.
+/// The task of a triage or research run on someone else's issue or pull
+/// request, or on the issue that tracks it, `tracking`.
 fn triage_brief(
     repo: &str,
     number: u64,
@@ -230,6 +254,7 @@ fn triage_brief(
     url: &str,
     said: &[Said],
     config: &Config,
+    (kind, tracking): (&str, Option<&str>),
 ) -> String {
     let (operator, bot) = (&config.operator, &config.bot);
     let intent = if said.iter().any(|c| explicit(&c.body, bot)) {
@@ -239,9 +264,19 @@ fn triage_brief(
             "No comment has a `/bot` or `@{bot}` line, so decide whether action is wanted; where none is, say nothing."
         )
     };
+    let task = match kind {
+        "research" => "Research it: read the thread, investigate what they ask",
+        _ => "Triage it: read the thread",
+    };
+    let answer = match tracking {
+        Some(issue) => format!(
+            "then propose a plan as an `agent-board-plan` comment, or answer, on {issue}, the issue that tracks it, which is your item: not on the {what}"
+        ),
+        None => "then propose a plan as an `agent-board-plan` comment, or answer there".into(),
+    };
     let mut lines = vec![
         format!(
-            "The operator, {operator}, commented on {what} {repo}#{number} ({url}). Triage it: read the thread, then propose a plan as an `agent-board-plan` comment, or answer there. {intent}"
+            "The operator, {operator}, commented on {what} {repo}#{number} ({url}). {task}, {answer}. {intent}"
         ),
         String::new(),
         format!(
@@ -605,9 +640,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok((true, format!("fix round {round} -> {run}")))
     }
 
-    /// A triage run on an issue, or a pull request not the bot's, claimed
-    /// from the oldest of the comments it is started on, and how often a run
-    /// for it was refused.
+    /// A triage (or research) run on an issue, or a pull request not the
+    /// bot's through its tracking issue, claimed from the oldest of the
+    /// comments it is started on, and how often a run for it was refused.
     fn comment_triage(
         &mut self,
         repo: &str,
@@ -616,8 +651,30 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         (read, tries): (&[Value], usize),
         said: &[Said],
     ) -> Result<Handled> {
+        let kind = run_kind(said, &self.config.bot);
+        // The tracking issue and the run's brief quote the operator's
+        // comments in the tracker, which may be read more widely than the
+        // pull request: only a public one's are copied there.
+        if pull {
+            let source = self.get(&format!("repos/{repo}"))?;
+            if source["private"] != false || source["visibility"] != "public" {
+                return Ok((
+                    true,
+                    format!(
+                        "left: {repo} is not public, so nothing of it is copied to {}",
+                        self.config.dispatch_repo
+                    ),
+                ));
+            }
+        }
         let Some(apply) = &self.apply else {
-            return Ok((true, "triage".into()));
+            return Ok((
+                true,
+                match pull {
+                    true => format!("{kind} on a tracking issue"),
+                    false => kind.into(),
+                },
+            ));
         };
         if self.dispatched >= POLL_DISPATCH_LIMIT {
             return Ok((
@@ -654,13 +711,41 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         self.dispatched += 1;
+        let mut state = state;
+        let claim_body = |state: &Value, text: &str| {
+            format!("<!-- {CLAIM}: {state} -->\n{of}: {text}\n\n{FOOTER}")
+        };
+        // Someone else's pull request: the run's item is its tracking issue,
+        // recorded on the claim, which is also the link to it from here. It
+        // is recorded with the dispatch's outcome, not before: a claim that
+        // names the comments without refusing them reads as done, so a write
+        // that failed between the claim and the dispatch would drop them.
+        let (item_repo, item, tracking) = if pull {
+            let tracked = self.tracking_issue(repo, number, &url, read, said);
+            let issue = match tracked {
+                Ok(issue) => issue,
+                // Nothing was started: tried again, as a refused run is.
+                Err(error) => {
+                    state["refused"] = state["comments"].clone();
+                    self.rewrite(repo, claim, claim_body(&state, "not started."))?;
+                    return Err(error);
+                }
+            };
+            let tracker = self.config.dispatch_repo.clone();
+            let link = format!("https://github.com/{tracker}/issues/{issue}");
+            state["issue"] = issue.into();
+            (tracker, issue, Some(link))
+        } else {
+            (repo.to_owned(), number, None)
+        };
+        let brief = (kind, tracking.as_deref());
         let mut inputs = json!({
-            "task": triage_brief(repo, number, what, &url, said, self.config),
-            "repo": repo,
-            "item": number.to_string(),
-            "kind": "triage",
+            "task": triage_brief(repo, number, what, &url, said, self.config, brief),
+            "repo": item_repo,
+            "item": item.to_string(),
+            "kind": kind,
         });
-        if let Some(pool) = self.config.policy.kind_pools.get("triage") {
+        if let Some(pool) = self.config.policy.kind_pools.get(kind) {
             inputs["pool"] = pool.as_str().into();
         }
         let run = match self.dispatch(dispatcher, &workflow, inputs) {
@@ -668,24 +753,109 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             // Refused: the claim names the comments as refused, for the next
             // pass to try. Anything else may have started the run.
             Err(error) if error.is::<NotStarted>() => {
-                let mut state = state;
                 state["refused"] = state["comments"].clone();
-                let body = format!("<!-- {CLAIM}: {state} -->\n{of}: not started.\n\n{FOOTER}");
-                self.rewrite(repo, claim, body)?;
+                self.rewrite(repo, claim, claim_body(&state, "not started."))?;
                 return Err(error);
             }
             Err(error) => return Err(error),
+        };
+        let on = match &tracking {
+            Some(link) => {
+                // The run started: a failure here only loses the mapping, and
+                // the next request opens a new issue.
+                self.rewrite(
+                    repo,
+                    claim,
+                    claim_body(&state, &format!("claimed; tracked in {link}.")),
+                )
+                .context("the run started, but its claim does not record its issue")?;
+                format!(" on {item_repo}#{item}")
+            }
+            None => String::new(),
         };
         Ok((
             true,
             match run["workflow_run_id"].as_u64() {
                 Some(id) => format!(
-                    "triage -> https://github.com/{}/actions/runs/{id}",
+                    "{kind}{on} -> https://github.com/{}/actions/runs/{id}",
                     self.config.dispatch_repo
                 ),
-                None => "triage -> run started".into(),
+                None => format!("{kind}{on} -> run started"),
             },
         ))
+    }
+
+    /// The issue in `Config::dispatch_repo` that tracks someone else's pull
+    /// request: the one the newest claim of the bot's on it names, with the
+    /// new comments quoted on it; else a new one that quotes them.
+    fn tracking_issue(
+        &mut self,
+        repo: &str,
+        number: u64,
+        url: &str,
+        read: &[Value],
+        said: &[Said],
+    ) -> Result<u64> {
+        let tracker = self.config.dispatch_repo.clone();
+        let bot = self.config.bot.clone();
+        let title = format!("{repo}#{number}: operator request");
+        // Quoted for people to read, not run: nothing in it can carry a
+        // marker or claim of the bot's.
+        let quoted = quote(said, url, &self.config.operator)
+            .join("\n")
+            .replace("<!--", "<!- -");
+        let mapped = read
+            .iter()
+            .filter(|c| text(c, "/user/login") == bot)
+            .filter_map(|c| {
+                let issue = parse_marker(CLAIM, text(c, "/body"))?["issue"].as_u64()?;
+                Some((c["id"].as_u64()?, issue))
+            })
+            .max()
+            .map(|(_, issue)| issue);
+        if let Some(issue) = mapped {
+            let found = match self.get(&format!("repos/{tracker}/issues/{issue}")) {
+                Ok(found) => found,
+                // Deleted, or never there: a new issue is opened instead.
+                // Any other failure, such as authentication or a transient
+                // one, is the pass's error, and the request is tried again.
+                Err(error) if error.is::<NotFound>() => Value::Null,
+                Err(error) => return Err(error),
+            };
+            // The upstream repository's admins may edit the bot's claim: only
+            // an open issue the bot opened for this pull request is reused,
+            // so the run cannot be pointed at another issue in the tracker,
+            // nor at one transferred out of it.
+            if text(&found, "/repository_url") == format!("{API_ROOT}repos/{tracker}")
+                && text(&found, "/user/login") == bot
+                && text(&found, "/title") == title
+                && found["state"] == "open"
+                && found.get("pull_request").is_none_or(Value::is_null)
+            {
+                let rest = self.rest;
+                self.send(
+                    rest,
+                    "POST",
+                    &format!("repos/{tracker}/issues/{issue}/comments"),
+                    json!({"body": format!("More from {url}:\n{quoted}\n\n{FOOTER}")}),
+                    0,
+                )?;
+                return Ok(issue);
+            }
+        }
+        let rest = self.rest;
+        let (_, created) = self.send(
+            rest,
+            "POST",
+            &format!("repos/{tracker}/issues"),
+            json!({"title": title, "body": format!(
+                "The operator commented on {url}, a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it.\n{quoted}\n\n{FOOTER}"
+            )}),
+            0,
+        )?;
+        created["number"]
+            .as_u64()
+            .context("the new issue has no number")
     }
 
     /// A new body for a comment of this pass's.
@@ -739,6 +909,10 @@ mod tests {
         writes: RefCell<Vec<(String, Value)>>,
         /// The status a dispatch gets, where not a success.
         refused: RefCell<Option<u16>>,
+        /// URLs whose GET fails as a server error would.
+        unavailable: RefCell<BTreeSet<String>>,
+        /// Whether a PATCH answers 502.
+        broken: RefCell<bool>,
     }
 
     impl Fake {
@@ -765,12 +939,15 @@ mod tests {
                     .take(THREADS_PAGE)
                     .collect();
                 found
+            } else if self.unavailable.borrow().contains(url) {
+                bail!("GET {url}: GitHub HTTP status 502")
+            } else if let Some(body) = self.rest.borrow().get(url) {
+                body.clone()
+            } else if url.starts_with(&format!("{API_ROOT}repos/{DISPATCH}/issues/")) {
+                // An issue of the tracker's that is not there.
+                return Err(anyhow::Error::from(NotFound).context(format!("GET {url}: 404")));
             } else {
-                self.rest
-                    .borrow()
-                    .get(url)
-                    .cloned()
-                    .with_context(|| format!("unexpected GET {url}"))?
+                bail!("unexpected GET {url}")
             };
             Ok(RestResponse {
                 status: 200,
@@ -791,7 +968,22 @@ mod tests {
                     None => (200, json!({"workflow_run_id": 1234})),
                 });
             }
+            if method == "PATCH" && *self.broken.borrow() {
+                return Ok((502, json!({"message": "unavailable"})));
+            }
             let id = 1000 + self.writes.borrow().len() as u64;
+            // A new issue, numbered as its id, with an empty thread.
+            if method == "POST" && url.ends_with("/issues") {
+                let issue = format!("{url}/{id}");
+                let mut rest = self.rest.borrow_mut();
+                rest.insert(format!("{issue}/comments?per_page=100"), json!([]));
+                rest.insert(
+                    issue,
+                    json!({"number": id, "user": {"login": BOT}, "state": "open", "title": body["title"], "body": body["body"],
+                        "repository_url": url.strip_suffix("/issues").unwrap()}),
+                );
+                return Ok((201, json!({"id": id, "number": id})));
+            }
             if method == "POST" && url.ends_with("/comments") {
                 let list = format!("{url}?per_page=100");
                 let mut rest = self.rest.borrow_mut();
@@ -842,6 +1034,10 @@ mod tests {
     fn github() -> Fake {
         let fake = Fake::default();
         fake.page("user", json!({"login": BOT}));
+        fake.page(
+            "repos/upstream/app",
+            json!({"private": false, "visibility": "public"}),
+        );
         fake.page(
             "search",
             json!({"total_count": 4, "incomplete_results": false, "items": [
@@ -1078,10 +1274,11 @@ mod tests {
             ("rounds", "left to a person: 2 fix rounds used", false),
             ("running", "waiting: fix round 1 is running", true),
             ("closed", "left: the pull request is closed", false),
-            // Someone else's pull request, wherever it is, is triaged.
+            // Someone else's pull request, wherever it is, is triaged, on
+            // the issue that tracks it.
             (
                 "visitor",
-                "triage -> https://github.com/example/tracker/actions/runs/1234",
+                "triage on example/tracker#1002 -> https://github.com/example/tracker/actions/runs/1234",
                 false,
             ),
         ] {
@@ -1140,6 +1337,239 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// GitHub where upstream/app#7 is someone's, and the issue and #9 are
+    /// left out of the search.
+    fn someones_pull() -> Fake {
+        let fake = github();
+        fake.rest
+            .borrow_mut()
+            .get_mut(&format!("{API_ROOT}search"))
+            .unwrap()["items"] = json!([hit(BOT_PULL, "someone", true, "2026-10-16T10:00:00Z")]);
+        fake
+    }
+
+    #[test]
+    fn someone_elses_pull_request_is_tracked_in_one_issue() {
+        let fake = someones_pull();
+        let thread = format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100");
+        let created = |fake: &Fake| -> Vec<Value> {
+            fake.writes
+                .borrow()
+                .iter()
+                .filter(|(w, _)| w == &format!("POST {API_ROOT}repos/{DISPATCH}/issues"))
+                .map(|(_, body)| body.clone())
+                .collect()
+        };
+        let mapped = |fake: &Fake| -> Vec<Value> {
+            fake.rest.borrow()[&thread]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| parse_marker(CLAIM, text(c, "/body")))
+                .map(|claim| claim["issue"].clone())
+                .collect()
+        };
+        let operator_says = |fake: &Fake, id: u64, body: &str| {
+            fake.rest
+                .borrow_mut()
+                .get_mut(&thread)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(said(id, OPERATOR, "2026-10-16T11:50:00Z", body));
+        };
+
+        let preview = pass(&fake, None, false);
+        assert_eq!(
+            preview.lines,
+            [
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: triage on a tracking issue"
+            ]
+        );
+        let first = pass(&fake, None, true);
+        assert_eq!(first.errors, 0, "{:?}", first.lines);
+        let issues = created(&fake);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["title"], "upstream/app#7: operator request");
+        let body = issues[0]["body"].as_str().unwrap();
+        assert!(
+            body.contains("https://github.com/upstream/app/pull/7"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<comment>\nPlease rename `frob` to `twiddle`.\n</comment>"),
+            "{body}"
+        );
+        let issue = mapped(&fake)[0].as_u64().unwrap();
+        assert_eq!(
+            first.lines,
+            [format!(
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: triage on {DISPATCH}#{issue} -> https://github.com/example/tracker/actions/runs/1234"
+            )]
+        );
+        let inputs = dispatches(&fake);
+        assert_eq!(
+            (&inputs[0]["repo"], &inputs[0]["item"], &inputs[0]["kind"]),
+            (
+                &json!(DISPATCH),
+                &json!(issue.to_string()),
+                &json!("triage")
+            )
+        );
+        let task = inputs[0]["task"].as_str().unwrap();
+        assert!(
+            task.contains(&format!(
+                "on https://github.com/{DISPATCH}/issues/{issue}, the issue that tracks it"
+            )),
+            "{task}"
+        );
+        assert!(task.contains("<comment>\nPlease rename"));
+
+        // A second comment, asking for an investigation, reuses the issue.
+        operator_says(&fake, 102, "@worker investigate why this is slow <!-- x");
+        let second = pass(&fake, None, true);
+        assert_eq!(second.errors, 0, "{:?}", second.lines);
+        assert_eq!(created(&fake).len(), 1);
+        let inputs = dispatches(&fake);
+        assert_eq!(
+            (&inputs[1]["item"], &inputs[1]["kind"]),
+            (&json!(issue.to_string()), &json!("research"))
+        );
+        assert!(inputs[1]["task"].as_str().unwrap().starts_with("The operator, op, commented on pull request upstream/app#7 (https://github.com/upstream/app/pull/7). Research it"));
+        let more = fake.rest.borrow()
+            [&format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}/comments?per_page=100")]
+            .clone();
+        assert!(
+            more[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("investigate why this is slow <!- - x")
+        );
+
+        // A claim edited upstream to name an issue the bot did not open for
+        // this pull request, in the tracker, is not followed: a new one is
+        // opened, and the next comment goes to that.
+        let tracker = format!("{API_ROOT}repos/{DISPATCH}");
+        let mut last = issue;
+        for (n, (field, value)) in [
+            ("user", json!({"login": "someone"})),
+            ("title", json!("upstream/app#8: operator request")),
+            ("state", json!("closed")),
+            (
+                "repository_url",
+                json!(format!("{API_ROOT}repos/elsewhere/tracker")),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut forged = fake.rest.borrow()[&format!("{tracker}/issues/{issue}")].clone();
+            forged[field] = value;
+            fake.page(&format!("repos/{DISPATCH}/issues/5"), forged);
+            for comment in fake
+                .rest
+                .borrow_mut()
+                .get_mut(&thread)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+            {
+                let body =
+                    text(comment, "/body").replace(&format!("\"issue\":{last}"), "\"issue\":5");
+                comment["body"] = body.into();
+            }
+            operator_says(&fake, 103 + n as u64, "And this?");
+            let outcome = pass(&fake, None, true);
+            assert_eq!(outcome.errors, 0, "{field}: {:?}", outcome.lines);
+            assert_eq!(created(&fake).len(), 2 + n, "{field}");
+            last = mapped(&fake).last().unwrap().as_u64().unwrap();
+            assert!(last != 5 && last != issue, "{field}");
+            assert_eq!(
+                dispatches(&fake).last().unwrap()["item"],
+                json!(last.to_string())
+            );
+        }
+
+        // A mapped issue that cannot be read for now is an error, and the
+        // request is tried again; one that is gone is replaced, and the next
+        // comment goes to the replacement.
+        let url = format!("{tracker}/issues/{last}");
+        fake.unavailable.borrow_mut().insert(url.clone());
+        operator_says(&fake, 110, "Still there?");
+        let started = dispatches(&fake).len();
+        let outcome = pass(&fake, None, true);
+        assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+        assert_eq!(
+            (created(&fake).len(), dispatches(&fake).len()),
+            (5, started)
+        );
+        fake.unavailable.borrow_mut().clear();
+        let outcome = pass(&fake, None, true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(created(&fake).len(), 5);
+        assert_eq!(
+            dispatches(&fake).last().unwrap()["item"],
+            json!(last.to_string())
+        );
+        fake.rest.borrow_mut().remove(&url);
+        for id in [111, 112] {
+            operator_says(&fake, id, "And now?");
+            let outcome = pass(&fake, None, true);
+            assert_eq!(outcome.errors, 0, "{id}: {:?}", outcome.lines);
+            assert_eq!(created(&fake).len(), 6, "{id}");
+            let replaced = mapped(&fake).last().unwrap().as_u64().unwrap();
+            assert!(replaced != last, "{id}");
+            assert_eq!(
+                dispatches(&fake).last().unwrap()["item"],
+                json!(replaced.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn someone_elses_pull_request_is_copied_only_when_public_and_once() {
+        // Nothing of a pull request that is not public goes to the tracker.
+        for (case, repo) in [
+            ("private", json!({"private": true, "visibility": "private"})),
+            (
+                "internal",
+                json!({"private": true, "visibility": "internal"}),
+            ),
+            ("unsaid", json!({})),
+        ] {
+            let fake = someones_pull();
+            fake.page("repos/upstream/app", repo);
+            for apply in [false, true] {
+                let outcome = pass(&fake, None, apply);
+                assert_eq!(
+                    outcome.lines,
+                    [format!(
+                        "upstream/app#7 operator comments issuecomment-100, discussion_r200: left: upstream/app is not public, so nothing of it is copied to {DISPATCH}"
+                    )],
+                    "{case}"
+                );
+            }
+            assert!(fake.writes.borrow().is_empty(), "{case}");
+        }
+
+        // The claim records the issue once the run started: where that write
+        // fails, the run is not started again.
+        let fake = someones_pull();
+        *fake.broken.borrow_mut() = true;
+        let first = pass(&fake, None, true);
+        assert_eq!(first.errors, 1, "{:?}", first.lines);
+        assert!(
+            first.lines[0].contains("the run started, but its claim does not record its issue"),
+            "{:?}",
+            first.lines
+        );
+        assert_eq!(dispatches(&fake).len(), 1);
+        *fake.broken.borrow_mut() = false;
+        let again = resume(&fake, &first);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
     }
 
     #[test]
@@ -1338,6 +1768,20 @@ mod tests {
             ("nothing", false),
         ] {
             assert_eq!(explicit(body, BOT), wanted, "{body}");
+        }
+        // Research only where a line for the bot asks for an investigation.
+        for (body, kind) in [
+            ("/bot research the history", "research"),
+            ("@worker: please Investigate", "research"),
+            ("I investigated this myself", "triage"),
+            ("/bot fix this", "triage"),
+        ] {
+            let said = [Said {
+                key: "issuecomment-1".into(),
+                at: now(),
+                body: body.into(),
+            }];
+            assert_eq!(run_kind(&said, BOT), kind, "{body}");
         }
     }
 

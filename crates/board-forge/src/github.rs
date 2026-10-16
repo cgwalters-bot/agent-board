@@ -138,6 +138,18 @@ impl std::fmt::Display for AuthenticationRequired {
 
 impl std::error::Error for AuthenticationRequired {}
 
+/// A GET answered 404 or 410: what it names is not there, or was deleted.
+#[derive(Debug)]
+pub struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("not found")
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
 }
@@ -558,6 +570,10 @@ impl crate::poll::Rest for Client {
             401 => {
                 return Err(anyhow::Error::from(AuthenticationRequired)
                     .context(format!("GET {path}: GitHub HTTP status 401")));
+            }
+            404 | 410 => {
+                return Err(anyhow::Error::from(NotFound)
+                    .context(format!("GET {path}: GitHub HTTP status {status}")));
             }
             _ => anyhow::bail!("GET {path}: GitHub HTTP status {status}"),
         };
