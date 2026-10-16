@@ -456,6 +456,25 @@ pub struct Dispatched {
     pub overlap: Option<Decision>,
 }
 
+/// [`crate::input::check`] each issue a run reads: the one holding the plan,
+/// the one it targets, and each extra of its batch. A target in a repository
+/// the token cannot read collaborators of is refused with the rest.
+pub fn check_inputs<T: Transport + Rest>(
+    client: &T,
+    issue: &ItemRef,
+    dest: &ItemRef,
+    extras: &[crate::batch::Extra],
+) -> Result<()> {
+    let mut items = vec![issue, dest];
+    items.extend(extras.iter().map(|e| &e.issue));
+    items.sort_by_key(|i| (i.repository.to_ascii_lowercase(), i.number));
+    items.dedup_by_key(|i| (i.repository.to_ascii_lowercase(), i.number));
+    for item in items {
+        crate::input::check(client, item).context("not dispatched: --collaborators-only")?;
+    }
+    Ok(())
+}
+
 /// One issue's record of a dispatch: the comment and the plan it records.
 struct Record {
     issue: ItemRef,
@@ -489,6 +508,11 @@ struct Record {
 /// With a `bot`, the issue is first checked against the bot's open pull
 /// requests and the runs in flight ([`crate::overlap`]): a wait returns before
 /// anything is written, and any other decision goes into every record.
+///
+/// With `collaborators`, every issue the run reads is checked with
+/// [`crate::input::check`] before anything is written, and one that fails
+/// refuses the whole dispatch.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch<C: Transport + Rest, D: Rest>(
     client: &C,
     dispatcher: &D,
@@ -497,6 +521,7 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     target: &Target,
     batch: usize,
     bot: Option<&str>,
+    collaborators: bool,
 ) -> Result<Dispatched> {
     target.validate()?;
     ensure!(
@@ -548,6 +573,9 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
         .map(|d| format!(" {}", d.sentence()))
         .unwrap_or_default();
     let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
+    if collaborators {
+        check_inputs(client, issue, &dest, &chosen.extras)?;
+    }
     let request = |extras: &[&crate::batch::Extra]| {
         JobPlan {
             brief: crate::batch::brief(&plan, extras),
@@ -1123,6 +1151,8 @@ mod tests {
         /// the open pull requests and the titles of runs in flight; null when
         /// none is expected.
         overlap: Value,
+        /// Items the collaborator check read, OWNER/REPO#N.
+        checked: RefCell<Vec<String>>,
     }
 
     const ISSUE: &str = "https://github.com/cgwalters-forge/tracker/issues/540";
@@ -1152,6 +1182,7 @@ mod tests {
                 closed: Default::default(),
                 pulled: Default::default(),
                 overlap: Value::Null,
+                checked: Default::default(),
             }
         }
 
@@ -1175,6 +1206,23 @@ mod tests {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
             if query.contains("viewer") {
                 return Ok(json!({"viewer": {"login": self.viewer}}));
+            }
+            if query.contains("issueOrPullRequest") {
+                // Locked and written only by the operator, unless "unlocked".
+                let repo = format!(
+                    "{}/{}",
+                    variables["owner"].as_str().unwrap(),
+                    variables["name"].as_str().unwrap()
+                );
+                self.checked
+                    .borrow_mut()
+                    .push(format!("{repo}#{}", variables["number"]));
+                return Ok(
+                    json!({"repository": {"issueOrPullRequest": {"__typename": "Issue",
+                    "locked": self.twist != "unlocked", "author": {"__typename": "User", "login": OPERATOR},
+                    "userContentEdits": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+                    "comments": {"nodes": [], "pageInfo": {"hasNextPage": false}}}}}),
+                );
             }
             if query.contains("subIssues") {
                 assert!(!self.family.is_null(), "unexpected epic read");
@@ -1245,6 +1293,15 @@ mod tests {
 
     impl Rest for Forge {
         fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+            if url.contains("/collaborators/") {
+                return Ok(crate::poll::RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body: json!({"permission": "admin"}),
+                });
+            }
             assert!(!self.overlap.is_null(), "unexpected GET {url}");
             let runs: Vec<Value> = (self.overlap["runs"].as_array().unwrap().iter())
                 .filter(|_| url.contains("status=in_progress"))
@@ -1418,7 +1475,16 @@ mod tests {
             };
             // The run is started with the dispatch token only.
             let dispatcher = Forge::new(vec![], answers);
-            let result = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0, None);
+            let result = dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                0,
+                None,
+                false,
+            );
             assert!(forge.dispatches.borrow().is_empty(), "{name}");
             assert!(dispatcher.comments.borrow().is_empty(), "{name}");
             assert_eq!(dispatcher.reads.get(), 0, "{name}");
@@ -1449,7 +1515,16 @@ mod tests {
             // However it ended, once recorded the plan is not dispatched again.
             // (An edited plan is a new one, which may be dispatched.)
             if !["record fails", "plan edited"].contains(&twist) && name != "no plan" {
-                let again = dispatch(&forge, &dispatcher, &issue, &writers, &target(), 0, None);
+                let again = dispatch(
+                    &forge,
+                    &dispatcher,
+                    &issue,
+                    &writers,
+                    &target(),
+                    0,
+                    None,
+                    false,
+                );
                 let again = format!("{:#}", again.unwrap_err());
                 assert!(again.contains("record already"), "{name}: {again}");
                 assert_eq!(dispatcher.dispatches.borrow().len(), sent, "{name}");
@@ -1465,7 +1540,7 @@ mod tests {
                 viewer,
                 ..Forge::new(vec![planned()], vec![])
             };
-            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None);
+            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, false);
             let message = result.unwrap_err().to_string();
             assert!(message.contains(error), "{message}");
             assert_eq!(forge.bodies().len(), 1);
@@ -1476,8 +1551,40 @@ mod tests {
             workflow: "x/../dispatch.yml".into(),
             ..target()
         };
-        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0, None).is_err());
+        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0, None, false).is_err());
         assert_eq!(forge.reads.get(), 0);
+        // With the collaborator check, the issue holding the plan and the one
+        // it targets are checked, and a refusal writes and starts nothing.
+        for (twist, sent) in [("", 1), ("unlocked", 0)] {
+            let forge = Forge {
+                twist,
+                ..Forge::new(vec![planned()], vec![])
+            };
+            let dispatcher = Forge::new(vec![], vec![run.clone()]);
+            let result = dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                0,
+                None,
+                true,
+            );
+            assert_eq!(
+                *forge.checked.borrow(),
+                ["cgwalters-forge/tracker#540", "ostreedev/ostree#3665"][..sent + 1]
+            );
+            assert_eq!(dispatcher.dispatches.borrow().len(), sent, "{twist}");
+            match result {
+                Ok(_) => assert_eq!(forge.bodies().len(), 2),
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    assert!(error.contains("not dispatched: --collaborators-only: cgwalters-forge/tracker#540: the conversation is not locked"), "{error}");
+                    assert_eq!(forge.bodies().len(), 1);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1592,6 +1699,7 @@ mod tests {
                 &target(),
                 *batch,
                 None,
+                false,
             );
             let others = forge.others.borrow();
             let last = |n: u64| {
@@ -1659,7 +1767,8 @@ mod tests {
                         )
                         .unwrap();
                         let again = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
-                        let freed = dispatch(&forge, &again, &extra, &writers, &target(), 0, None);
+                        let freed =
+                            dispatch(&forge, &again, &extra, &writers, &target(), 0, None, false);
                         assert_eq!(freed.unwrap().run.as_deref(), Some(run_url), "{name}");
                         continue;
                     }
@@ -1710,11 +1819,31 @@ mod tests {
             )
         };
         let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99})); 2]);
-        dispatch(&forge, &dispatcher, &issue, &writers, &target(), 1, None).unwrap();
+        dispatch(
+            &forge,
+            &dispatcher,
+            &issue,
+            &writers,
+            &target(),
+            1,
+            None,
+            false,
+        )
+        .unwrap();
         let extra =
             crate::github::parse_github_issue(&format!("{tracker}/541"), None, "github.com")
                 .unwrap();
-        let held = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0, None).unwrap_err();
+        let held = dispatch(
+            &forge,
+            &dispatcher,
+            &extra,
+            &writers,
+            &target(),
+            0,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(
             held.to_string().contains("has a dispatch record already"),
             "{held}"
@@ -1723,17 +1852,49 @@ mod tests {
         // the primary frees nothing.
         forge.closed.borrow_mut().push(540);
         forge.pulled.borrow_mut().push(541);
-        let held = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0, None).unwrap_err();
+        let held = dispatch(
+            &forge,
+            &dispatcher,
+            &extra,
+            &writers,
+            &target(),
+            0,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert!(
             held.to_string().contains("has a dispatch record already"),
             "{held}"
         );
         forge.pulled.borrow_mut().clear();
-        let freed = dispatch(&forge, &dispatcher, &extra, &writers, &target(), 0, None).unwrap();
+        let freed = dispatch(
+            &forge,
+            &dispatcher,
+            &extra,
+            &writers,
+            &target(),
+            0,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(freed.run.as_deref(), Some(run_url));
         assert_eq!(dispatcher.dispatches.borrow().len(), 2);
         // A configured batch past the bound is refused before anything is read.
-        assert!(dispatch(&forge, &dispatcher, &issue, &writers, &target(), 6, None).is_err());
+        assert!(
+            dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                6,
+                None,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1772,6 +1933,7 @@ mod tests {
                 &target(),
                 0,
                 Some("agentic-bot"),
+                false,
             )
             .unwrap();
             let dispatches = dispatcher.dispatches.borrow();
@@ -1795,7 +1957,19 @@ mod tests {
         }
         // The bot's login goes into a query: it must be one.
         let forge = Forge::new(vec![planned], vec![]);
-        assert!(dispatch(&forge, &forge, &issue, &writers, &target(), 0, Some("a b")).is_err());
+        assert!(
+            dispatch(
+                &forge,
+                &forge,
+                &issue,
+                &writers,
+                &target(),
+                0,
+                Some("a b"),
+                false
+            )
+            .is_err()
+        );
         assert_eq!(forge.reads.get(), 0);
     }
 

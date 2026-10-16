@@ -57,6 +57,9 @@ pub struct FromPlan {
     /// Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration.
     #[arg(long, value_name = "LOGIN")]
     bot: Option<String>,
+    /// Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository (#111). Off without it; from the caller's configuration.
+    #[arg(long)]
+    collaborators_only: bool,
 }
 
 #[derive(Args)]
@@ -401,6 +404,7 @@ pub fn from_plan<T: Transport + Rest>(
             &target,
             args.batch.into(),
             args.bot.as_deref(),
+            args.collaborators_only,
         )?;
         for note in &done.notes {
             eprintln!("Not batched: {note}");
@@ -448,6 +452,9 @@ pub fn from_plan<T: Transport + Rest>(
         return Ok(());
     }
     let chosen = batch::select(&client, &issue, &plan, &writers, args.batch.into())?;
+    if args.collaborators_only {
+        plan::check_inputs(&client, &issue, &dest, &chosen.extras)?;
+    }
     for note in &chosen.notes {
         eprintln!("Not batched: {note}");
     }
@@ -1018,6 +1025,7 @@ mod tests {
             planner: planner.map(Into::into),
             batch: 0,
             bot: None,
+            collaborators_only: false,
         };
         let issue = "https://github.com/cgwalters-forge/tracker/issues/540";
         let tracker = "cgwalters-forge/tracker";
@@ -1063,6 +1071,18 @@ mod tests {
                 "cgwalters",
                 0,
                 Err("not pull requests"),
+            ),
+            // The dry run checks input too; an item it cannot read is refused.
+            (
+                FromPlan {
+                    collaborators_only: true,
+                    ..args(issue, true, tracker, None)
+                },
+                "cgwalters",
+                2,
+                Err(
+                    "not dispatched: --collaborators-only: cgwalters-forge/tracker#540 was not found",
+                ),
             ),
             (
                 args(issue, true, tracker, Some("a b")),
