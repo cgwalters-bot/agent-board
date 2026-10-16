@@ -282,7 +282,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -319,6 +319,30 @@ may say little more than the exit code. A failure after it goes to
 `needs-human`, and the stop comment quotes the same excerpt in a fenced block,
 its backticks and `<!--` defused.
 Setting it lets the poll start three runs for a pull request instead of two.
+
+`brokerOutage` (absent by default, which charges every failed run) keeps a
+broker outage from using a round (agent-board#108):
+`{"repository": "OWNER/REPO", "author": "LOGIN", "leadSeconds": N}`, all
+required, `N` 0 to 25200 (the run timeout). Only for a fix or continuation run
+the marker names that completed other than `success`, the pass reads one page
+of 30 each of the open and the last two days' closed issues labelled `outage`
+in that repository, and keeps those `author` opened whose body starts with
+`<!-- tracker-broker-outage -->`, as tracker's `.github/poll/broker.cjs`
+writes them. Each is an outage from `N` seconds before it was opened until it
+was closed. A run whose `updated_at` falls in an open one waits; in a closed
+one, the round is given back in a new marker (fix rounds or continuation
+rounds one fewer, no head or run named), so the next pass starts it again
+under the usual rules and the run is not given back twice. The refund is
+claimed from the marker it gives back, as a round is, so a pass that read the
+same run late cannot roll back a round started since. A cap raise that run
+used is given back with it. The decision names the issue. A read that fails or
+fills a page charges the run as before and says so. A run that succeeded
+without a push, a round with no run id that timed out, or a round started on
+the operator's comments (which stay handled) is charged during an outage too.
+Anyone who can open
+issues as `author` in that repository can give rounds back; one outage can
+cost at most one extra run a round, as a run that fails while it is still open
+waits for it to close.
 
 `mergeQueue` (absent by default, which leaves a removed pull request to be
 enqueued again like any other) has the poll own the merge queue
