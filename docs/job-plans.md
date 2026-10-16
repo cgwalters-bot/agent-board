@@ -165,7 +165,8 @@ that change the same files end in rebase fix rounds, and a pull request can run
 out of them. The overlap is a coarse guess: the paths the issue's title, body
 and plan brief name (tokens with a file extension, dotfiles, or ending in `/`), against
 the files each of the newest 50 open pull requests changes (100 each) and the
-paths each of up to ten running issues names. Runs in flight are the caller
+paths each of up to ten running issues names (the same bare `.name`, such as
+`.patch`, in both texts is taken for an extension, not a shared file). Runs in flight are the caller
 workflow's queued and running runs whose name is `implement OWNER/REPO#N`.
 Then:
 
