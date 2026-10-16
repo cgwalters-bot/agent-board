@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub mod comments;
+
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
 // Every GET and GraphQL query of one pass, 304s included. Exhaustion fails the
 // rest of the pass (and so shortens the next interval), never the decisions
@@ -222,6 +224,10 @@ pub struct PollPolicy {
     /// (the default) labels it after the fix rounds as before; set, a pull
     /// request gets one run more than `MAX_FIX_ROUNDS`.
     pub diagnostic_pool: String,
+    /// `operatorComments.repositories`: where the operator's comments start
+    /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
+    /// reads none.
+    pub operator_comments: Vec<String>,
 }
 
 /// `continuation`: how the bot's checkpoint drafts are continued.
@@ -338,6 +344,7 @@ impl PollPolicy {
                 value.get("diagnosticPool").cloned().unwrap_or(json!("")),
             )
             .context("diagnosticPool is not a string")?,
+            operator_comments: comments::scopes(value.get("operatorComments"))?,
         })
     }
 }
@@ -420,6 +427,13 @@ pub struct State {
     pub interval_seconds: i64,
     /// Responses by URL: `etag`, `last_modified`, `next` and `body`.
     pub responses: BTreeMap<String, Value>,
+    /// Where the search for the operator's comments resumes ([`comments`]):
+    /// like the cache, losing it costs requests, as the claims on the threads
+    /// keep a comment from being acted on twice.
+    pub operator_cursor: Option<String>,
+    /// The page of the cursor's search that the next pass reads from, past
+    /// the first; none for the first.
+    pub operator_page: Option<u64>,
 }
 
 impl State {
@@ -431,7 +445,14 @@ impl State {
         );
         for key in object.keys() {
             ensure!(
-                ["schema", "interval_seconds", "responses"].contains(&key.as_str()),
+                [
+                    "schema",
+                    "interval_seconds",
+                    "responses",
+                    "operator_cursor",
+                    "operator_page"
+                ]
+                .contains(&key.as_str()),
                 "unknown poll state field {key}"
             );
         }
@@ -454,18 +475,44 @@ impl State {
                 Ok((url.clone(), entry.clone()))
             })
             .collect::<Result<_>>()?;
+        let operator_cursor = object
+            .get("operator_cursor")
+            .map(|c| {
+                c.as_str()
+                    .filter(|c| OffsetDateTime::parse(c, &Rfc3339).is_ok())
+                    .map(str::to_owned)
+                    .context("poll state operator_cursor is not a time")
+            })
+            .transpose()?;
+        let operator_page = object
+            .get("operator_page")
+            .map(|p| {
+                p.as_u64()
+                    .filter(|p| (2..=comments::OPERATOR_PAGE_LIMIT).contains(p))
+                    .context("poll state operator_page is out of bounds")
+            })
+            .transpose()?;
         Ok(Self {
             interval_seconds,
             responses,
+            operator_cursor,
+            operator_page,
         })
     }
 
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut state = json!({
             "schema": POLL_STATE_SCHEMA,
             "interval_seconds": self.interval_seconds,
             "responses": self.responses,
-        })
+        });
+        if let Some(cursor) = &self.operator_cursor {
+            state["operator_cursor"] = cursor.as_str().into();
+        }
+        if let Some(page) = self.operator_page {
+            state["operator_page"] = page.into();
+        }
+        state
     }
 }
 
@@ -846,6 +893,9 @@ pub struct Marker {
     pub continuing: bool,
     /// Whether the `cap` pool was used: it raises the cap once.
     pub raised: bool,
+    /// The operator's comments a round was started on ([`comments`]), which
+    /// no later pass starts one on again.
+    pub comments: Vec<String>,
 }
 
 /// The merge queue as the marker records it: every removal the poll acted on
@@ -950,6 +1000,9 @@ impl Marker {
         if self.raised {
             state["raised"] = true.into();
         }
+        if !self.comments.is_empty() {
+            state["comments"] = self.comments.iter().map(|c| plain(c)).collect();
+        }
         state
     }
 
@@ -1015,12 +1068,36 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
                 .map_or(0, |c| c.min(CONTINUATION_ROUNDS_LIMIT)),
             continuing: state["continuing"].as_bool().unwrap_or(false),
             raised: state["raised"].as_bool().unwrap_or(false),
+            comments: nodes(&state, "/comments")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(plain)
+                .collect(),
         };
         if latest.id.is_none() || marker.id > latest.id {
             latest = marker;
         }
     }
     latest
+}
+
+/// A run that cannot have started: GitHub refused its dispatch with a 4xx, or
+/// the pass's request budget was spent before it was sent.
+#[derive(Debug)]
+struct NotStarted(String);
+
+impl std::fmt::Display for NotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotStarted {}
+
+/// What a round's claim is claimed from: the marker it was decided from. A
+/// stop is a marker of its own, so a reset is claimed from it alone.
+fn claim_from(marker: &Marker) -> String {
+    marker.id.map_or("none".into(), |id| id.to_string())
 }
 
 /// The id and creation time of the bot's first claim from marker `from`.
@@ -2158,8 +2235,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// Markers are added, never rewritten by another write: the newest by id
     /// is the state, every claim names the one it was decided from, and a new
     /// stop is a new comment, so each stop is a fresh generation for its reset
-    /// to be claimed from. The one PATCH is [`Self::record_run`], of a round's
-    /// own comment by the pass that wrote it.
+    /// to be claimed from. The PATCHes are [`Self::record_run`], and the undoing
+    /// of a refused round ([`comments`]), of a round's own comment by the pass
+    /// that wrote it.
     fn post_marker(
         &mut self,
         repo: &str,
@@ -2252,9 +2330,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         self.post_marker(repo, number, &mut stop, &text)
     }
 
-    /// A claim on starting fix round `round` from a marker comment; the
-    /// earlier claim on that marker, or the newer marker, where another pass
-    /// came first.
+    /// A claim on starting fix round `round` from a marker comment: this
+    /// pass's claim where it won; else the earlier claim on that marker, or
+    /// the newer marker, where another pass came first.
     ///
     /// GitHub cannot compare-and-swap a comment, so two passes that read the
     /// same marker would both start the next round and the marker would count
@@ -2268,21 +2346,25 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// claims were posted could hide the earlier one. A claim already among
     /// the comments `read` is lost without posting another, so a claim whose
     /// pass died does not draw one more from every pass until it times out.
+    ///
+    /// `state` is what the claim carries; its `from` names what is claimed,
+    /// which for a round is the marker (see [`claim_from`]).
     fn claim(
         &mut self,
         repo: &str,
         number: u64,
         marker: &Marker,
         read: &[Value],
-        (round, head, of): (u64, &str, &str),
-    ) -> Result<Option<(u64, Option<String>)>> {
-        // A stop is a marker of its own, so a reset is claimed from it alone.
-        let from = marker.id.map_or("none".into(), |id| id.to_string());
+        (state, of): (Value, &str),
+    ) -> Result<std::result::Result<u64, (u64, Option<String>)>> {
+        let from = state["from"]
+            .as_str()
+            .context("a claim names what it claims")?
+            .to_owned();
         let bot = &self.config.bot;
         if let Some(earlier) = earliest_claim(read, bot, &from) {
-            return Ok(Some(earlier));
+            return Ok(Err(earlier));
         }
-        let state = json!({"from": from, "round": round, "sha": head});
         let rest = self.rest;
         let comments = format!("repos/{repo}/issues/{number}/comments");
         let (_, posted) = self.send(
@@ -2300,10 +2382,55 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // posted without a claim, and a reset of it may be under way.
         let newest = find_marker(&again, &self.config.bot).id;
         if newest != marker.id {
-            return Ok(newest.map(|id| (id, None)));
+            return Ok(newest.map_or(Ok(mine), |id| Err((id, None))));
         }
         // Our own claim counts even where the list does not show it yet.
-        Ok(earliest_claim(&again, &self.config.bot, &from).filter(|(id, _)| *id < mine))
+        Ok(
+            match earliest_claim(&again, &self.config.bot, &from).filter(|(id, _)| *id < mine) {
+                Some(earlier) => Err(earlier),
+                None => Ok(mine),
+            },
+        )
+    }
+
+    /// Start a run of the caller's `workflow` with `inputs`; the response,
+    /// which names the run where the API gives its details. An error is
+    /// [`NotStarted`] where no run can have started.
+    fn dispatch(&mut self, dispatcher: &R, workflow: &str, inputs: Value) -> Result<Value> {
+        let path = format!(
+            "repos/{}/actions/workflows/{workflow}/dispatches",
+            self.config.dispatch_repo
+        );
+        let mut request =
+            json!({"ref": DISPATCH_REF, "inputs": inputs, "return_run_details": true});
+        loop {
+            self.spend().map_err(|e| NotStarted(format!("{e:#}")))?;
+            let (status, run) = dispatcher.send("POST", &format!("{API_ROOT}{path}"), &request)?;
+            if (200..300).contains(&status) {
+                return Ok(run);
+            }
+            // The run id comes back only where the API knows
+            // `return_run_details`; elsewhere it is refused with a 422, and
+            // asked again without.
+            if status == 422
+                && request
+                    .as_object_mut()
+                    .and_then(|r| r.remove("return_run_details"))
+                    .is_some()
+            {
+                continue;
+            }
+            let error = format!(
+                "POST {path}: GitHub HTTP status {status}: {}",
+                run["message"].as_str().unwrap_or("message unavailable")
+            );
+            // A refusal started nothing; a server error or a lost response
+            // may have.
+            if (400..500).contains(&status) {
+                return Err(NotStarted(error).into());
+            }
+            bail!(error);
+        }
     }
 
     /// Start a fix or continuation run with the caller's workflow, once this
@@ -2403,7 +2530,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 ),
             )
         };
-        if let Some((id, at)) = self.claim(repo, number, marker, read, (round, head, &of))? {
+        let state = json!({"from": claim_from(marker), "round": round, "sha": head});
+        if let Err((id, at)) = self.claim(repo, number, marker, read, (state, &of))? {
             // A claim that won and was never followed by the marker's write:
             // its pass died, and the round may have started a run or not.
             if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
@@ -2434,6 +2562,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             continued: if continuing { round } else { carried.continued },
             continuing,
             raised,
+            comments: Vec::new(),
         };
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
         let task = match &checkpoint {
@@ -2455,26 +2584,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(pool) = pool {
             inputs["pool"] = pool.into();
         }
-        let path = format!(
-            "repos/{}/actions/workflows/{workflow}/dispatches",
-            self.config.dispatch_repo
-        );
-        let mut request =
-            json!({"ref": DISPATCH_REF, "inputs": inputs, "return_run_details": true});
-        // The run id comes back only where the API knows `return_run_details`;
-        // elsewhere it is refused with a 422, and asked again without.
-        let started = self
-            .send(dispatcher, "POST", &path, request.clone(), 422)
-            .and_then(|(status, run)| {
-                if status != 422 {
-                    return Ok(run);
-                }
-                request
-                    .as_object_mut()
-                    .map(|r| r.remove("return_run_details"));
-                Ok(self.send(dispatcher, "POST", &path, request, 0)?.1)
-            });
-        let run = match started {
+        let run = match self.dispatch(dispatcher, &workflow, inputs) {
             Ok(run) => run,
             Err(error) => {
                 let why: String = format!("{error:#}").chars().take(200).collect();
@@ -3269,7 +3379,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 
 /// One pass: activity in `watch` and `follow`, then a decision for each open
 /// pull request of the bot in `follow`, taken with `apply` and only printed
-/// without. Steps are taken in `follow` only, whatever the board holds.
+/// without. Steps are taken in `follow` only, whatever the board holds,
+/// besides the runs the operator's comments start ([`comments`]).
 #[allow(clippy::too_many_arguments)]
 pub fn run<R: Rest, G: Transport>(
     rest: &R,
@@ -3293,7 +3404,7 @@ pub fn run<R: Rest, G: Transport>(
     }
     let repositories: BTreeSet<&String> = watch.iter().chain(follow).collect();
     ensure!(
-        !repositories.is_empty(),
+        !repositories.is_empty() || !config.policy.operator_comments.is_empty(),
         "poll needs at least one repository"
     );
     ensure!(
@@ -3350,10 +3461,30 @@ pub fn run<R: Rest, G: Transport>(
         }
     }
     let follow: BTreeSet<&String> = follow.iter().collect();
-    for repo in follow {
+    for repo in &follow {
         if let Err(error) = pass.follow(repo, &mut outcome) {
             outcome.errors += 1;
             outcome.lines.push(format!("{repo} error: {error:#}"));
+        }
+    }
+    // After the followed pull requests, which come first for the runs a pass
+    // may start. A preview keeps the cursor, so that it hides nothing from the
+    // next pass that applies.
+    let (mut operator_cursor, mut operator_page) = (state.operator_cursor, state.operator_page);
+    if !config.policy.operator_comments.is_empty() {
+        let at = (operator_cursor.as_deref(), operator_page.unwrap_or(1));
+        match pass.operator_comments(&follow, at, &mut outcome) {
+            Ok((cursor, page)) if pass.apply.is_some() => {
+                operator_cursor = Some(cursor);
+                operator_page = Some(page).filter(|p| *p > 1);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                outcome.errors += 1;
+                outcome
+                    .lines
+                    .push(format!("operator comments error: {error:#}"));
+            }
         }
     }
     // What could not be read counts as a change: an API error must not stretch
@@ -3367,6 +3498,8 @@ pub fn run<R: Rest, G: Transport>(
     outcome.state = State {
         interval_seconds: next_interval(previous, active),
         responses: pass.used,
+        operator_cursor,
+        operator_page,
     };
     Ok(outcome)
 }
@@ -5823,6 +5956,7 @@ mod tests {
                 json!({"etag": "\"e0\"", "body": [{"id": "7"}]}),
             )]
             .into(),
+            ..State::default()
         };
         let outcome = pass(&fake, state, &[], &[REPO]);
         assert_eq!(
@@ -7253,6 +7387,7 @@ mod tests {
                 json!({"etag": "\"c1\"", "next": null, "body": [read]}),
             )]
             .into(),
+            ..State::default()
         };
         let dispatcher = Fake::default();
         let outcome = applied_after(&fake, &dispatcher, state);

@@ -254,7 +254,7 @@ late result cannot roll back a newer round or stop, and each removal of the
 label is claimed from a stop of its own. A stop is added after its label, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
-repositories only; the board widens what is read, not what is changed. The
+repositories only, besides the runs `operatorComments` starts (below); the board widens what is read, not what is changed. The
 workflow, its bounds and the tokens stay in the tracker, whose poll.yml still
 runs poll.cjs. Promoting operator-approved fork pull requests upstream is not
 implemented. Every workflow of a repository reviews as the Actions bot, and a
@@ -282,7 +282,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -343,6 +343,31 @@ failed for other entries is not read as shared, because the groups behind an
 entry carry its change. Re-queuing only goes through the normal merge decision,
 pinned to the approved head; the setting adds no write the poll did not
 already make.
+
+`operatorComments` (absent by default, which reads none) picks up the
+operator's comments outside the followed repositories (agent-board#104):
+`{"repositories": ["OWNER/*", "OWNER/REPO"]}`, 1 to 10 entries, each an
+organization or a repository. Each pass makes one search
+(`commenter:OPERATOR updated:>=CURSOR` in those scopes, oldest update first,
+three pages of 20 threads), resuming from a cursor and page in the state file
+at the first thread not done with, and reads the
+comments, reviews and review comments of each thread found. The operator's
+comments from the last two days that no round's marker or triage claim of
+the bot's names start one run a thread: on an open pull request the bot opened
+(upstream or in its fork), a fix round counted in its marker like any other (within
+the 2 fix rounds, not while one runs for the head, not once labelled
+`needs-human`), whose task quotes them; on any other issue or pull request,
+a `triage` run whose task quotes them, says the operator wrote them, and says
+whether a `/bot` or `@BOT` line asks for action. Each is claimed on its
+thread first, as a fix round is, so a comment is acted on once whether or not
+the cursor survives. A run GitHub refuses (a 4xx) is recorded on its claim or
+marker, without using the round, and tried again on later passes, three times
+at most; a fix round's claim that no marker followed within the run timeout is
+superseded by a marker restating the state. The runs count against the three a pass and go through
+`--dispatch-workflow` and its bounds. Followed repositories are left to the
+steps above. Each thread acted on gets a decision line; a preview does not
+advance the cursor. The tracker's configuration and the review site's
+status listing are not part of this repository.
 
 The poll never takes a pull request out of draft. Since agentic-job v0.5.1
 (agentic-job#691) opens complete work ready and only a
