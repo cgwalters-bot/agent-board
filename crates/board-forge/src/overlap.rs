@@ -180,7 +180,15 @@ fn check<C: Transport + Rest>(
     // A run in flight has not pushed, and a batch cannot join a run that
     // started, so an overlap waits for its pull request.
     for running in in_flight(client, dest, target)?.iter().take(RUN_READS) {
-        let theirs = shared(&named, &paths(&text(client, running)?));
+        // Text against text, the same bare `.name` in both is as often an
+        // extension as a file: agentic-job#636 waited on #882 only because
+        // both said `.patch`. Against a path with a directory, or a pull
+        // request's files, it still overlaps.
+        let bare = |path: &str| path.starts_with('.') && !path.contains('/');
+        let theirs: Vec<String> = paths(&text(client, running)?)
+            .into_iter()
+            .filter(|o| named.iter().any(|n| overlaps(n, o) && !(n == o && bare(n))))
+            .collect();
         if !theirs.is_empty() {
             return Ok(Decision::Wait(format!(
                 "the run for {} in flight names {}",
@@ -545,12 +553,39 @@ mod tests {
                 json!([]),
                 independent(none),
             ),
+            // Two briefs that both say `.patch` name an extension, not the
+            // same file (agentic-job#636 and #882).
+            (
+                "shared extension",
+                "Fix src/a.rs and the `.patch` it writes.",
+                vec!["implement example/work#15"],
+                json!([]),
+                independent(none),
+            ),
+            // A bare dotfile still overlaps a path with a directory...
+            (
+                "dotfile in flight",
+                "Add target/ to .gitignore.",
+                vec!["implement example/work#16"],
+                json!([]),
+                wait("the run for example/work#16 in flight names `sub/.gitignore`"),
+            ),
+            // ...and the file a pull request changes.
+            (
+                "dotfile pull request",
+                "Add target/ to .gitignore.",
+                vec![],
+                json!([pull(5, bot, &[".gitignore"])]),
+                wait("open pull request example/work#5 changes `.gitignore`"),
+            ),
         ];
         let texts = |text| {
             [
                 ("example/work#10", text),
                 ("example/work#11", "Touches a.rs."),
                 ("example/work#14", "Touches docs/y.md."),
+                ("example/work#15", "Hand back a `.patch` (*.patch)."),
+                ("example/work#16", "Touches sub/.gitignore."),
                 ("example/tracker#11", "Touches a.rs."),
             ]
             .into()
