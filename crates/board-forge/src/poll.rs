@@ -243,6 +243,11 @@ pub struct PollPolicy {
     /// `brokerOutage`: where the inference broker's outages are recorded, so
     /// that a run they failed is not charged; none (the default) charges it.
     pub broker_outage: Option<BrokerOutage>,
+    /// `operatorAnswers`: the operator's comments on a pull request the poll
+    /// labelled `needs-human` are the answer the label waits for, which takes
+    /// it off and starts a round on them ([`comments`]). Off (the default),
+    /// only a person taking the label off starts the rounds again.
+    pub operator_answers: bool,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -480,6 +485,11 @@ impl PollPolicy {
             .context("diagnosticPool is not a string")?,
             operator_comments: comments::scopes(value.get("operatorComments"))?,
             broker_outage: BrokerOutage::from_json(value.get("brokerOutage"))?,
+            operator_answers: value
+                .get("operatorAnswers")
+                .map(|a| a.as_bool().context("operatorAnswers is not a boolean"))
+                .transpose()?
+                .unwrap_or(false),
         })
     }
 }
@@ -1034,6 +1044,9 @@ pub struct Marker {
     /// The operator's comments a round was started on ([`comments`]), which
     /// no later pass starts one on again.
     pub comments: Vec<String>,
+    /// An operator answer must finish successfully and publish a new head
+    /// before the unchanged head's approvals can authorize a merge.
+    pub answering: bool,
 }
 
 /// The merge queue as the marker records it: every removal the poll acted on
@@ -1141,6 +1154,9 @@ impl Marker {
         if self.raising {
             state["raising"] = true.into();
         }
+        if self.answering {
+            state["answering"] = true.into();
+        }
         if !self.comments.is_empty() {
             state["comments"] = self.comments.iter().map(|c| plain(c)).collect();
         }
@@ -1234,6 +1250,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             continuing: state["continuing"].as_bool().unwrap_or(false),
             raised: state["raised"].as_bool().unwrap_or(false),
             raising: state["raising"].as_bool().unwrap_or(false),
+            answering: state["answering"].as_bool().unwrap_or(false),
             comments: nodes(&state, "/comments")
                 .iter()
                 .filter_map(Value::as_str)
@@ -1300,9 +1317,10 @@ pub fn is_harness(pull: &Value, bot: &str) -> bool {
 
 /// Whether the pull request is still ours to follow after this pass decided
 /// `action` for it, which keeps the interval short: an open dispatch pull
-/// request that is not (and was not just) handed to a human.
+/// request that is not (and was not just) handed to a human, or whose label
+/// the operator's answer just took off.
 pub fn in_flight(pull: &Value, bot: &str, action: &str) -> bool {
-    is_harness(pull, bot) && action != "needs-human" && !labelled(pull)
+    is_harness(pull, bot) && (action == "answer" || action != "needs-human" && !labelled(pull))
 }
 
 /// The connections the query did not read whole. A head with no checks at all
@@ -1833,7 +1851,8 @@ pub fn fix_task(
 
 #[derive(Debug, PartialEq)]
 pub struct Decision {
-    /// skip, wait, continue, fix, refund, retitle, merge or needs-human.
+    /// skip, wait, continue, fix, refund, retitle, merge, needs-human or
+    /// answer (the operator's answer to `needs-human`, [`comments`]).
     pub action: &'static str,
     pub reason: String,
     pub round: Option<u64>,
@@ -2043,6 +2062,23 @@ pub fn decide(
     let reset = marker.stopped;
     let fresh = Marker::default();
     let marker = if reset { &fresh } else { marker };
+    // The answer may say to close this PR. Its old green head is not evidence
+    // that the instruction was carried out. Even a changed head must wait for
+    // the recorded run to succeed; no run id waits until timeout, then stops.
+    // A successful answer with no new head deliberately returns to a person.
+    if marker.answering
+        && !(marker.sha.as_deref().is_some_and(|sha| sha != head)
+            && fix_run.is_some_and(|r| r["status"] == "completed" && r["conclusion"] == "success"))
+    {
+        return started(
+            config,
+            marker,
+            (fix_run, outages),
+            head,
+            "operator answer pending",
+            now,
+        );
+    }
     let merge_only = config
         .policy
         .merge_authors
@@ -2780,6 +2816,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             raised,
             raising,
             comments: Vec::new(),
+            answering: false,
         };
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
         let task = match &checkpoint {
@@ -3542,7 +3579,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // unreadable run must not keep a person from taking the label off.
         let fix_run = match marker.run {
             Some(run)
-                if marker.sha.as_deref() == Some(head) && !marker.stopped && !labelled(&pull) =>
+                if (marker.answering || marker.sha.as_deref() == Some(head))
+                    && !marker.stopped
+                    && !labelled(&pull) =>
             {
                 Some(self.get(&format!(
                     "repos/{}/actions/runs/{run}",
@@ -3568,15 +3607,46 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .as_ref()
             .is_some_and(|r| r["status"] == "completed" && r["conclusion"] != "success");
         let outages = if failed { self.outages() } else { Outages::Off };
-        let decision = decide(
-            self.config,
-            &pull,
-            &checks,
-            &marker,
-            (fix_run.as_ref(), review_run.as_ref()),
-            &outages,
-            self.now,
-        );
+        // Only where the label is the poll's own stop, the newest marker: a
+        // label a person put on is theirs, and a stop already reset is not
+        // waiting for anyone.
+        let (answer, labelled_by) = if self.config.policy.operator_answers
+            && !merge_only
+            && marker.stopped
+            && labelled(&pull)
+            && is_harness(&pull, &self.config.bot)
+        {
+            self.answer(repo, number, &comments, &marker)?
+        } else {
+            (Vec::new(), Value::Null)
+        };
+        let decision = if answer.is_empty() {
+            decide(
+                self.config,
+                &pull,
+                &checks,
+                &marker,
+                (fix_run.as_ref(), review_run.as_ref()),
+                &outages,
+                self.now,
+            )
+        } else {
+            Decision {
+                round: Some(1),
+                ..step(
+                    "answer",
+                    format!(
+                        "{} answered after it was labelled {LABEL} ({}), so the label comes off and the rounds start again",
+                        self.config.operator,
+                        answer
+                            .iter()
+                            .map(|s| s.key.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            }
+        };
         let mut decision = match (tries, removal) {
             (Some(tries), Some((removal, state))) => queue_step(decision, removal, state, tries),
             _ => decision,
@@ -3609,6 +3679,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             });
         }
         let done = match self.apply {
+            Some(_) if !answer.is_empty() => Some(self.answer_round(
+                repo,
+                &pull,
+                (&marker, &comments),
+                (&answer, &labelled_by),
+            )?),
             Some(_) => self.take(
                 repo,
                 &pull,
@@ -4049,6 +4125,69 @@ mod tests {
         // fix run, action and round.
         type Case<'a> = (&'a str, &'a str, Value, Value, Value, &'a str, Option<u64>);
         let cases: Vec<Case> = vec![
+            (
+                "a green approved answer waits while queued",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7, "answering": true}),
+                json!({"status": "queued"}),
+                "wait",
+                None,
+            ),
+            (
+                "a green approved answer waits while running even after a push",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": "older", "run": 7, "answering": true}),
+                running.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "a green approved answer with a failed run stops",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7, "answering": true}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "an answer without a run id waits even after a push",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": "older", "answering": true, "at": "2026-10-12T01:59:30Z"}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "an answer without a run id eventually stops",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": "older", "answering": true, "at": "2026-10-01T01:59:30Z"}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a successful answer with no change eventually stops",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7, "answering": true}),
+                json!({"status": "completed", "conclusion": "success", "updated_at": "2026-10-01T01:59:30Z"}),
+                "needs-human",
+                None,
+            ),
+            (
+                "a successful answer with a new head releases the hold",
+                "pull-470",
+                json!({}),
+                json!({"rounds": 1, "sha": "older", "run": 7, "answering": true}),
+                json!({"status": "completed", "conclusion": "success"}),
+                "merge",
+                None,
+            ),
             (
                 "approved and green merges",
                 "pull-470",
@@ -6055,6 +6194,12 @@ mod tests {
         /// Comments another pass posts on #470 while this one posts its own:
         /// its first page shows them only after this pass's first post there.
         late: Vec<Value>,
+        /// Events on #470 after this pass's first write: a person putting
+        /// `needs-human` back while it starts a round.
+        relabel: Vec<Value>,
+        /// Events on #470 after this pass's DELETE of the label: a person
+        /// put it back after the pass last read the events, before the DELETE.
+        relabel_raced: Vec<Value>,
         /// The base branch's merge queue entries, as its query gives them.
         queue: Vec<Value>,
     }
@@ -6096,6 +6241,22 @@ mod tests {
                 && let Some(list) = body.as_array_mut()
             {
                 list.extend(self.late.iter().cloned());
+            }
+            if url.ends_with("issues/470/events?per_page=100")
+                && !self.writes.borrow().is_empty()
+                && let Some(list) = body.as_array_mut()
+            {
+                list.extend(self.relabel.iter().cloned());
+            }
+            if url.ends_with("issues/470/events?per_page=100")
+                && self
+                    .writes
+                    .borrow()
+                    .iter()
+                    .any(|(w, _)| w.starts_with("DELETE "))
+                && let Some(list) = body.as_array_mut()
+            {
+                list.extend(self.relabel_raced.iter().cloned());
             }
             Ok(RestResponse {
                 status: if fresh { 200 } else { 304 },
@@ -8017,6 +8178,444 @@ mod tests {
         );
     }
 
+    /// With `operatorAnswers`, the operator's comment, review or review
+    /// comment after the poll's stop is the answer the label waits for: the
+    /// label comes off and round 1 starts on it, quoting it. Anyone else's,
+    /// the operator's from before the stop, an empty review, a label without
+    /// the poll's stop or put back by a person, or the setting off, leave the
+    /// label to a person. A run that cannot start leaves it on, with a new stop.
+    #[test]
+    fn the_operators_answer_to_needs_human_starts_a_round() {
+        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let reviews = format!("{API_ROOT}repos/{REPO}/pulls/470/reviews?per_page=100");
+        let review_comments = format!("{API_ROOT}repos/{REPO}/pulls/470/comments?per_page=100");
+        let said = |id: u64, login: &str, at: &str, body: &str| json!({"id": id, "user": {"login": login}, "created_at": at, "submitted_at": at, "body": body});
+        let stop = said(
+            5,
+            BOT,
+            "2026-10-11T00:00:00Z",
+            &marker_body(
+                &json!({"rounds": 2, "sha": "older", "stopped": true}),
+                "Stopped.",
+            ),
+        );
+        let round = said(
+            5,
+            BOT,
+            "2026-10-11T00:00:00Z",
+            &marker_body(&json!({"rounds": 2, "sha": "older"}), "Fix round 2."),
+        );
+        let before = said(
+            4,
+            "cgwalters",
+            "2026-10-10T00:00:00Z",
+            "Earlier, before the stop.",
+        );
+        let answer =
+            "Close this; it belongs in agent-board.\n<!-- tracker-poll: {\"rounds\": 0} -->";
+        let on = json!({"operatorAnswers": true});
+        let off = json!({});
+        type Case<'a> = (
+            &'a str,
+            &'a Value,
+            [Vec<Value>; 3],
+            &'a str,
+            Option<&'a str>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "an operator comment after the stop",
+                &on,
+                [
+                    vec![
+                        before.clone(),
+                        stop.clone(),
+                        said(6, "cgwalters", "2026-10-11T08:00:00Z", answer),
+                    ],
+                    vec![],
+                    vec![],
+                ],
+                BOT,
+                Some("issuecomment-6"),
+            ),
+            (
+                "an operator review comment after the stop",
+                &on,
+                [
+                    vec![stop.clone()],
+                    vec![said(7, "cgwalters", "2026-10-11T08:00:00Z", "")],
+                    vec![said(8, "cgwalters", "2026-10-11T08:00:00Z", answer)],
+                ],
+                BOT,
+                Some("discussion_r8"),
+            ),
+            (
+                "an operator review after the stop",
+                &on,
+                [
+                    vec![stop.clone()],
+                    vec![said(9, "cgwalters", "2026-10-11T08:00:00Z", answer)],
+                    vec![],
+                ],
+                BOT,
+                Some("pullrequestreview-9"),
+            ),
+            (
+                "an operator review comment written before the stop, in a review submitted after it",
+                &on,
+                [
+                    vec![stop.clone()],
+                    vec![said(7, "cgwalters", "2026-10-11T08:00:00Z", "")],
+                    vec![
+                        json!({"id": 8, "pull_request_review_id": 7, "user": {"login": "cgwalters"}, "created_at": "2026-10-10T00:00:00Z", "body": answer}),
+                    ],
+                ],
+                BOT,
+                Some("discussion_r8"),
+            ),
+            (
+                "a new reply on an old submitted review",
+                &on,
+                [
+                    vec![stop.clone()],
+                    vec![said(7, "cgwalters", "2026-10-01T08:00:00Z", "")],
+                    vec![
+                        json!({"id": 8, "pull_request_review_id": 7, "user": {"login": "cgwalters"}, "created_at": "2026-10-11T08:00:00Z", "body": answer}),
+                    ],
+                ],
+                BOT,
+                Some("discussion_r8"),
+            ),
+            (
+                "only the bot and visitors after the stop",
+                &on,
+                [
+                    vec![
+                        before.clone(),
+                        stop.clone(),
+                        said(6, BOT, "2026-10-11T08:00:00Z", answer),
+                        said(7, "someone", "2026-10-11T08:00:00Z", answer),
+                    ],
+                    vec![
+                        said(9, "cgwalters", "2026-10-11T08:00:00Z", ""),
+                        // Pending: its comments are not posted yet.
+                        json!({"id": 11, "state": "PENDING", "user": {"login": "cgwalters"}, "submitted_at": null, "body": ""}),
+                    ],
+                    vec![
+                        said(10, "github-actions[bot]", "2026-10-11T08:00:00Z", answer),
+                        json!({"id": 12, "pull_request_review_id": 11, "user": {"login": "cgwalters"}, "created_at": "2026-10-11T08:00:00Z", "body": answer}),
+                    ],
+                ],
+                BOT,
+                None,
+            ),
+            (
+                "a label the poll's stop did not put on",
+                &on,
+                [
+                    vec![round, said(6, "cgwalters", "2026-10-11T08:00:00Z", answer)],
+                    vec![],
+                    vec![],
+                ],
+                BOT,
+                None,
+            ),
+            (
+                "a label a person put back after the stop",
+                &on,
+                [
+                    vec![
+                        stop.clone(),
+                        said(6, "cgwalters", "2026-10-11T08:00:00Z", answer),
+                    ],
+                    vec![],
+                    vec![],
+                ],
+                "cgwalters",
+                None,
+            ),
+            (
+                "the setting off",
+                &off,
+                [
+                    vec![
+                        stop.clone(),
+                        said(6, "cgwalters", "2026-10-11T08:00:00Z", answer),
+                    ],
+                    vec![],
+                    vec![],
+                ],
+                BOT,
+                None,
+            ),
+        ];
+        let github_with = |issue: Vec<Value>,
+                           review: Vec<Value>,
+                           inline: Vec<Value>,
+                           labeller: &str| {
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull(
+                    "pull-470",
+                    json!({"labels": {"nodes": [{"name": LABEL}]}, "contexts": {"review": {"state": "FAILURE"}}}),
+                ),
+            );
+            fake.rest.get_mut(&comments).unwrap().3 = Value::Array(issue);
+            for (url, list) in [(&reviews, review), (&review_comments, inline)] {
+                fake.rest
+                    .insert(url.clone(), (None, None, None, Value::Array(list)));
+            }
+            // A person took the label off and put it back, or not.
+            let events = json!([
+                {"id": 1, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": BOT}},
+                {"id": 2, "event": "unlabeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}},
+                {"id": 3, "event": "labeled", "label": {"name": "other"}, "actor": {"login": BOT}},
+                {"id": 4, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": labeller}},
+            ]);
+            fake.page(
+                &format!("repos/{REPO}/issues/470/events?per_page=100"),
+                None,
+                None,
+                events,
+            );
+            fake
+        };
+        for (name, policy, [issue, review, inline], labeller, key) in cases {
+            let fake = github_with(issue, review, inline, labeller);
+            let dispatcher = Fake::default();
+            dispatcher.answers.borrow_mut().insert(
+                DISPATCHES.into(),
+                vec![(200, json!({"workflow_run_id": 1234}))],
+            );
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(policy).unwrap();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            let line = outcome.lines.last().unwrap();
+            let Some(key) = key else {
+                assert!(
+                    line.ends_with("skip: labelled needs-human"),
+                    "{name}: {line}"
+                );
+                assert!(fake.writes.borrow().is_empty(), "{name}");
+                assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+                assert_eq!(outcome.in_flight, 0, "{name}");
+                continue;
+            };
+            assert!(
+                line.contains(&format!(
+                    "answer: cgwalters answered after it was labelled needs-human ({key})"
+                )),
+                "{name}: {line}"
+            );
+            assert!(
+                line.ends_with(
+                    "-> https://github.com/cgwalters-forge/tracker/actions/runs/1234, label removed"
+                ),
+                "{name}: {line}"
+            );
+            assert_eq!(outcome.in_flight, 1, "{name}");
+            // Claimed from the stop, then the round's marker and its run, and
+            // the label last.
+            assert_eq!(
+                written(&fake.writes),
+                [
+                    format!("POST repos/{REPO}/issues/470/comments"),
+                    format!("POST repos/{REPO}/issues/470/comments"),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
+                    format!("DELETE repos/{REPO}/issues/470/labels/{LABEL}"),
+                ],
+                "{name}"
+            );
+            let writes = fake.writes.borrow();
+            assert_eq!(
+                parse_marker(CLAIM, writes[0].1["body"].as_str().unwrap()).unwrap(),
+                json!({"from": "5", "round": 1, "sha": HEAD, "comments": [key]}),
+                "{name}"
+            );
+            let marker = find_marker(
+                &[json!({"id": 99, "user": {"login": BOT}, "body": writes[2].1["body"]})],
+                BOT,
+            );
+            assert_eq!(
+                (
+                    marker.rounds,
+                    marker.stopped,
+                    marker.run,
+                    marker.comments.clone()
+                ),
+                (1, false, Some(1234), vec![key.to_owned()]),
+                "{name}"
+            );
+            assert_eq!(marker.pool.as_deref(), Some("claude"), "{name}");
+            assert!(marker.answering, "{name}");
+            let dispatched = dispatcher.writes.borrow();
+            let task = dispatched[0].1["inputs"]["task"].as_str().unwrap();
+            assert_eq!(dispatched[0].1["inputs"]["kind"], "fix", "{name}");
+            // Word for word but for its hidden HTML comment, as every quote
+            // of the operator's; what was before the stop not among it.
+            assert!(
+                task.contains("<comment>\nClose this; it belongs in agent-board.\n</comment>"),
+                "{name}: {task}"
+            );
+            assert!(!task.contains("tracker-poll"), "{name}");
+            assert!(!task.contains("Earlier, before the stop."), "{name}");
+            assert!(task.contains("This is fix round 1 of 2."), "{name}");
+            assert!(task.contains("`close_pull_request`"), "{name}");
+        }
+
+        let answered = || {
+            github_with(
+                vec![
+                    stop.clone(),
+                    said(6, "cgwalters", "2026-10-11T08:00:00Z", answer),
+                ],
+                vec![],
+                vec![],
+                BOT,
+            )
+        };
+        let mut cfg = config();
+        cfg.policy = PollPolicy::from_json(&on).unwrap();
+        // A preview says so and writes nothing.
+        let fake = answered();
+        let follow = [REPO.to_owned()];
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            None,
+            now(),
+        )
+        .unwrap();
+        let line = outcome.lines.last().unwrap();
+        assert!(
+            line.ends_with("so the label comes off and the rounds start again"),
+            "{line}"
+        );
+        assert!(fake.writes.borrow().is_empty());
+        // A run GitHub refuses leaves the label on, with a new stop after
+        // the answer, which a person answers again.
+        let fake = answered();
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            DISPATCHES.into(),
+            vec![(403, json!({"message": "refused"}))],
+        );
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+        let writes = written(&fake.writes);
+        assert!(
+            !writes.iter().any(|w| w.starts_with("DELETE")),
+            "{writes:?}"
+        );
+        let body = fake.writes.borrow().last().unwrap().1["body"].clone();
+        let restop = find_marker(
+            &[json!({"id": 100, "user": {"login": BOT}, "body": body})],
+            BOT,
+        );
+        assert_eq!((restop.stopped, restop.rounds), (true, 1), "{body}");
+        // A person puts the label back while the round starts: the round
+        // goes on, but their hold stays.
+        let mut fake = answered();
+        fake.relabel = vec![
+            json!({"id": 5, "event": "unlabeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}}),
+            json!({"id": 6, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}}),
+        ];
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            DISPATCHES.into(),
+            vec![(200, json!({"workflow_run_id": 1234}))],
+        );
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        let line = outcome.lines.last().unwrap();
+        assert!(
+            line.ends_with("runs/1234, label kept: cgwalters put it back"),
+            "{line}"
+        );
+        let writes = written(&fake.writes);
+        assert!(
+            !writes.iter().any(|w| w.starts_with("DELETE")),
+            "{writes:?}"
+        );
+        assert_eq!(dispatcher.writes.borrow().len(), 1);
+        // They put it back after that last read, so the DELETE takes theirs
+        // off: the events read after it show theirs, and it goes back on.
+        let mut fake = answered();
+        fake.relabel_raced = vec![
+            json!({"id": 5, "event": "unlabeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}}),
+            json!({"id": 6, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}}),
+            json!({"id": 7, "event": "unlabeled", "label": {"name": LABEL}, "actor": {"login": BOT}}),
+        ];
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            DISPATCHES.into(),
+            vec![(200, json!({"workflow_run_id": 1234}))],
+        );
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        let line = outcome.lines.last().unwrap();
+        assert!(
+            line.ends_with("runs/1234, label put back: cgwalters put it back meanwhile"),
+            "{line}"
+        );
+        let writes = written(&fake.writes);
+        assert_eq!(
+            writes[writes.len() - 2..],
+            [
+                format!("DELETE repos/{REPO}/issues/470/labels/{LABEL}"),
+                format!("POST repos/{REPO}/issues/470/labels"),
+            ],
+            "{writes:?}"
+        );
+        assert_eq!(
+            fake.writes.borrow().last().unwrap().1,
+            json!({"labels": [LABEL]})
+        );
+    }
+
     /// Another pass labels and then adds its stop while this one reads. The
     /// stop it finds was labelled before this pass reads the label, so it is
     /// not taken for a person's reset.
@@ -8368,6 +8967,22 @@ mod tests {
             (json!({"mergeQueue": true}), None),
         ] {
             let got = PollPolicy::from_json(&value).ok().map(|p| p.merge_queue);
+            assert_eq!(got, want, "{value}");
+        }
+    }
+
+    #[test]
+    fn operator_answers_policy_table() {
+        for (value, want) in [
+            (json!({}), Some(false)),
+            (json!({"operatorAnswers": false}), Some(false)),
+            (json!({"operatorAnswers": true}), Some(true)),
+            (json!({"operatorAnswers": "true"}), None),
+            (json!({"operatorAnswers": null}), None),
+        ] {
+            let got = PollPolicy::from_json(&value)
+                .ok()
+                .map(|p| p.operator_answers);
             assert_eq!(got, want, "{value}");
         }
     }

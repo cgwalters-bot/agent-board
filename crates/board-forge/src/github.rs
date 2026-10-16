@@ -551,16 +551,21 @@ impl crate::poll::Rest for Client {
         );
         let path = url.trim_start_matches(API_ROOT);
         let request = |request: ureq::RequestBuilder<ureq::typestate::WithBody>| {
-            request
+            let request = request
                 .header("Authorization", &format!("Bearer {}", self.token))
                 .header("User-Agent", "agent-board")
                 .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .send_json(body)
+                .header("X-GitHub-Api-Version", "2022-11-28");
+            // A DELETE (of a label) is sent with `null`, which means no body.
+            match body {
+                Value::Null => request.send_empty(),
+                body => request.send_json(body),
+            }
         };
         let mut response = match method {
             "POST" => request(self.agent.post(url)),
             "PATCH" => request(self.agent.patch(url)),
+            "DELETE" => request(self.agent.delete(url).force_send_body()),
             _ => anyhow::bail!("unsupported method {method}"),
         }
         .map_err(transport_error)?;

@@ -282,7 +282,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -402,6 +402,29 @@ superseded by a marker restating the state. The runs count against the three a p
 steps above. Each thread acted on gets a decision line; a preview does not
 advance the cursor. The tracker's configuration and the review site's
 status listing are not part of this repository.
+
+`operatorAnswers` (`true`; absent or `false` by default, which leaves a
+`needs-human` pull request to a person taking the label off) takes the
+operator's comment as the answer the label waits for (agent-board#113). On
+a followed pull request of the bot's whose newest marker is the poll's stop,
+which still carries the label and whose newest `labeled` event for it is the
+bot's, the operator's comments, reviews and review comments with text, from
+the stop on and named by no marker, start fix round 1, with fresh counts as
+a person's reset gives: claimed from the stop (the claim a reset's round
+makes, so one of them goes on), then the round's marker, which names the
+comments, and the run, whose task quotes them; the label comes off last, so
+a pass that dies first leaves it on, and only while that bot's `labeled`
+event is still the newest, so a person who puts it back meanwhile keeps
+their hold; their `labeled` event seen after the removal puts it back on. A review comment is dated by its review's submission. Any comment of theirs counts, a "wait"
+too: the rounds then go as after a reset, which may merge a head that is
+approved and green. The task lets the run close the pull request with a
+comment saying where the work goes, where the operator says it belongs
+elsewhere; that needs `close_pull_request` in the dispatch workflow's bounds
+for a fix run, which is not this repository's to set. Only `operator`'s
+comments count; a label a person put on is theirs. A run that cannot
+start, or a claim never recorded, adds a new stop, after which the operator
+answers again. Issues are not followed, so a `needs-human` issue is left as
+before.
 
 The poll never takes a pull request out of draft. Since agentic-job v0.5.1
 (agentic-job#691) opens complete work ready and only a
