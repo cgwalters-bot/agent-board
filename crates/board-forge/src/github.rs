@@ -408,6 +408,55 @@ impl Client {
         Some(Self::with_token(token))
     }
 
+    /// The body of a GET that the API answers with a redirect off itself, as
+    /// it does for job logs, at most `limit` bytes. The redirect is followed
+    /// by hand, without the token, so the token goes only to the API.
+    pub fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        ensure!(
+            url.starts_with(API_ROOT),
+            "refusing to send the token outside {API_ROOT}"
+        );
+        let path = url.trim_start_matches(API_ROOT);
+        let mut response = self
+            .agent
+            .get(url)
+            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("User-Agent", "agent-board")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .config()
+            .max_redirects(0)
+            .build()
+            .call()
+            .map_err(transport_error)?;
+        let status = response.status().as_u16();
+        if (300..400).contains(&status) {
+            let location = response
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .filter(|l| l.starts_with("https://"))
+                .with_context(|| format!("GET {path}: redirect without an HTTPS location"))?
+                .to_owned();
+            response = self
+                .agent
+                .get(&location)
+                .header("User-Agent", "agent-board")
+                .call()
+                .map_err(transport_error)?;
+        }
+        let status = response.status().as_u16();
+        ensure!(
+            (200..300).contains(&status),
+            "GET {path}: GitHub HTTP status {status}"
+        );
+        response
+            .body_mut()
+            .with_config()
+            .limit(limit)
+            .read_to_vec()
+            .with_context(|| format!("GET {path}: body unreadable or over {limit} bytes"))
+    }
+
     fn with_token(token: String) -> Self {
         Self {
             token,

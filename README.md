@@ -31,6 +31,7 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `epic plan ISSUE --dry-run` | Check the newest accepted [epic plan](docs/epic-plans.md) and print its mutations. |
 | `epic apply ISSUE --config FILE` | Preview an epic plan, or apply once with the bot's token and `--apply`; a claim prevents replay after partial failure. |
 | `poll --dry-run\|--apply` | Preview one pull request poll pass, or explicitly apply its steps in `--follow` repositories. `--config` reads trusted repository-owned settings; apply requires `--dispatch-workflow` or the file's `dispatchWorkflow`. `--review-workflow` selects eligible exact-head job reviews and repeated `--fix-pool` selects fix pools. See [poll behavior and limits](docs/design.md#current-implementation-limits). |
+| `supervise health\|trigger\|execute` | The controller's supervisor: a read-only health report, whether its agent runs, and an executor whose one action is a capped, fixed-brief triage or research dispatch on a collaborator-only, locked issue. See [supervisor limits](docs/design.md#current-implementation-limits). |
 | `test project` | Staging integration test; holds a write token. Not for local use. |
 
 `output check`/`output apply` are unsupported; sweeping is disabled.

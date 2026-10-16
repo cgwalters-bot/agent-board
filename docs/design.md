@@ -445,6 +445,40 @@ an intermediate Triage proposal. No live reads or live terminal repair have
 been verified against GitHub. Recorded responses exercise the lifecycle and its
 failure cleanup without credentials.
 
+`agent-board supervise` is the controller's supervisor, moved from tracker's
+`.github/supervisor` (agent-board#112). `supervise health` reads the poll,
+probe, dispatch and scheduler runs, the followed repositories' pull requests,
+the epics, the decisions, the wrapper's agentic-job pin and the usage snapshot
+with a read-only token, within a request count and a deadline. It writes a
+report of eighteen checks. Each check is `ok`, `warn` or `fail`, and the report
+holds only links. An observation it cannot read whole is `warn`, and becomes
+`fail` once `--previous` shows it has been unavailable for an hour. The
+previous report now comes from a file the workflow downloads, not from an
+artifact the binary unzips. The epics check reads each live epic's checkpoint
+without the census's board read. `supervise trigger` decides whether the agent
+runs: on a failing check, outside a cooldown, or on the daily pass. It prints
+the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
+the policy and the report. `supervise execute` holds the bot's token. It takes
+the agent's one unedited comment on the requests issue and accepts a single
+kind of request: a triage or research run on an open issue in a `follow`
+repository, with a pool from the pools file and one of a fixed set of reasons.
+The executor writes the brief itself. A batch is refused whole if any request
+is invalid, if any issue's body or comments were written or edited by anyone
+without write access, if a conversation is unlocked (agent-board#111's check),
+if an issue has a dispatch run in flight, or if the batch would pass
+`maxDispatchesPerPass` or `maxDispatchesPerDay`. The day's count comes from the
+executor's own entries in the log issue, each written before the dispatches it
+names. That count holds only if the caller runs one executor at a time, as
+tracker's execute job does with its own concurrency group. Both caps default
+to zero, which admits nothing. The agent cannot
+enqueue, close, label, comment, cancel, re-run or set variables any more:
+merges, rebases and closing done issues are the poll's and triage runs'. Its
+settings are the poll's agent-board.json (`--config`), the supervisor's file
+(`--supervisor-config`, tracker's `.github/supervisor/config.json` with
+`agent.maxDispatchesPerPass`, `agent.maxDispatchesPerDay` and `agent.kinds`)
+and, optionally, the usage snapshot's location (`--usage-config`). The checks
+have been exercised against recorded responses only.
+
 `test project --sweep` fails before authentication or network access. Editable
 project descriptions and completed Actions runs cannot prove who created a
 project. Re-enabling sweeping requires an independently authenticated creation
