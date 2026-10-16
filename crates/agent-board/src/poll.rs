@@ -11,7 +11,7 @@ pub struct Poll {
     /// Print the step a pass would take for each pull request and take none.
     #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
-    /// Take the steps: mark ready, start fix runs, merge an approved green head, and label needs-human, with GH_TOKEN (the bot's); fix runs are started with DISPATCH_TOKEN if set. Only in --follow repositories.
+    /// Take the steps: start fix and continuation runs, merge an approved green head, and label needs-human, with GH_TOKEN (the bot's); fix runs are started with DISPATCH_TOKEN if set. Only in --follow repositories.
     #[arg(long)]
     pub apply: bool,
     /// Poll state file (cached responses, the events pages last read, the idle interval); created if missing. Keep it where only the poll writes it: its bodies are trusted.
