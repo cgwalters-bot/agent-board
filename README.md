@@ -118,7 +118,10 @@ previews and prerequisites are checked.
    not the generic or existing staging caller. Copy and retarget
    [agent-board.json](https://github.com/cgwalters-forge/tracker/blob/main/.github/poll/agent-board.json):
    its owner/project selection, exact repository lists, caller and identities
-   must match your setup. Read the
+   must match your setup. Its optional `brokerOutage` names tracker's
+   broker outage issues, so a fix or continuation run that failed during one
+   gets its round back instead of `needs-human`; see
+   [poll limits](docs/design.md#current-implementation-limits). Read the
    [board scheduler](https://github.com/cgwalters-forge/tracker/blob/main/README.md#the-board-scheduler)
    and audit dispatch/fix bounds, profiles and pools before enabling
    `BOARD_DISPATCH=apply`. Identities must come from repository-owned

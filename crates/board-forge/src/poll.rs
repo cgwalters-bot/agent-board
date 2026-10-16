@@ -150,6 +150,18 @@ const QUEUE_LOG_LIMIT: usize = 2000;
 const QUEUE_TEXT_LIMIT: usize = 200;
 /// The branch GitHub runs a merge group on: `gh-readonly-queue/BASE/pr-N-SHA`.
 const QUEUE_BRANCH_PREFIX: &str = "gh-readonly-queue/";
+/// `brokerOutage` (agent-board#108): tracker's outage issues, as its
+/// `.github/poll/broker.cjs` writes them, are read with one page of each of
+/// open and recently closed ones; a fuller list is not read on.
+const OUTAGE_LABEL: &str = "outage";
+const OUTAGE_MARKER: &str = "<!-- tracker-broker-outage -->";
+const OUTAGE_ISSUE_LIMIT: usize = 30;
+/// How long after its close an outage still refunds a run: passes are at most
+/// [`MAX_INTERVAL_SECONDS`] apart, so a few of them see it.
+const OUTAGE_CLOSED_SECONDS: i64 = 2 * 24 * 60 * 60;
+/// The most `leadSeconds` may reach back before an issue was opened: a run in
+/// flight when the broker went down started at most a run's timeout before.
+const OUTAGE_LEAD_LIMIT: u64 = FIX_RUN_TIMEOUT_SECONDS as u64;
 const FAILED_RUNS: &[&str] = &["failure", "timed_out"];
 
 // Both writes admit only the head we approved. A queue is required by the base
@@ -228,6 +240,128 @@ pub struct PollPolicy {
     /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
     /// reads none.
     pub operator_comments: Vec<String>,
+    /// `brokerOutage`: where the inference broker's outages are recorded, so
+    /// that a run they failed is not charged; none (the default) charges it.
+    pub broker_outage: Option<BrokerOutage>,
+}
+
+/// `brokerOutage`: the open or recently closed issues labelled `outage` in
+/// `repository` that `author` opened with tracker's marker, each an outage
+/// from `lead_seconds` before it was opened until it was closed. Only the
+/// caller's configuration names them, so only that author's issues can give a
+/// round back; anyone else's issue, or a plan, cannot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrokerOutage {
+    pub repository: String,
+    pub author: String,
+    pub lead_seconds: i64,
+}
+
+impl BrokerOutage {
+    fn from_json(value: Option<&Value>) -> Result<Option<Self>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let object = value.as_object().context("brokerOutage is not an object")?;
+        for key in object.keys() {
+            ensure!(
+                ["repository", "author", "leadSeconds"].contains(&key.as_str()),
+                "unknown brokerOutage field {key}"
+            );
+        }
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .with_context(|| format!("brokerOutage {key} is not a string"))
+        };
+        let repository = string("repository")?;
+        validate_repository(repository).context("brokerOutage repository")?;
+        let author = string("author")?;
+        ensure!(
+            is_github_login(author),
+            "brokerOutage author {author:?} is not a login"
+        );
+        let lead_seconds = object
+            .get("leadSeconds")
+            .and_then(Value::as_u64)
+            .filter(|s| *s <= OUTAGE_LEAD_LIMIT)
+            .with_context(|| format!("brokerOutage leadSeconds is not 0 to {OUTAGE_LEAD_LIMIT}"))?;
+        Ok(Some(Self {
+            repository: repository.to_owned(),
+            author: author.to_owned(),
+            lead_seconds: lead_seconds as i64,
+        }))
+    }
+}
+
+/// What a pass read of the broker's outages, for a run that failed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Outages {
+    /// Not configured, or not needed: a failed run is charged.
+    #[default]
+    Off,
+    /// Configured but not read whole: charged too, and the reason says why.
+    Unread(String),
+    Read(Vec<Window>),
+}
+
+/// One outage: from `lead_seconds` before its issue was opened until it was
+/// closed, or still going.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Window {
+    /// `OWNER/REPO#N`.
+    pub issue: String,
+    pub from: OffsetDateTime,
+    pub to: Option<OffsetDateTime>,
+}
+
+/// The windows of the outage issues read (as [`slim_outage`] keeps them):
+/// the configured author's, with tracker's marker, open or closed within
+/// [`OUTAGE_CLOSED_SECONDS`].
+pub fn outage_windows(issues: &[Value], outage: &BrokerOutage, now: OffsetDateTime) -> Vec<Window> {
+    let recent = now - time::Duration::seconds(OUTAGE_CLOSED_SECONDS);
+    issues
+        .iter()
+        .filter(|i| {
+            i["marked"] == true
+                && i["pull_request"] != true
+                && text(i, "/user/login") == outage.author
+        })
+        .filter_map(|i| {
+            let opened = timestamp(i["created_at"].as_str())?;
+            let to = match text(i, "/state") {
+                "open" => None,
+                _ => Some(timestamp(i["closed_at"].as_str()).filter(|at| *at >= recent)?),
+            };
+            Some(Window {
+                issue: format!("{}#{}", outage.repository, i["number"].as_u64()?),
+                from: opened.checked_sub(time::Duration::seconds(outage.lead_seconds))?,
+                to,
+            })
+        })
+        .collect()
+}
+
+/// An outage issue as the pass keeps it: whether its body starts with the
+/// marker, not the body.
+fn slim_outage(body: &Value) -> Value {
+    body.as_array().map_or(Value::Null, |issues| {
+        issues
+            .iter()
+            .map(|i| {
+                json!({
+                    "number": i["number"],
+                    "state": i["state"],
+                    "created_at": i["created_at"],
+                    "closed_at": i["closed_at"],
+                    "user": {"login": i["user"]["login"]},
+                    "pull_request": !i["pull_request"].is_null(),
+                    "marked": text(i, "/body").starts_with(OUTAGE_MARKER),
+                })
+            })
+            .collect()
+    })
 }
 
 /// `continuation`: how the bot's checkpoint drafts are continued.
@@ -345,6 +479,7 @@ impl PollPolicy {
             )
             .context("diagnosticPool is not a string")?,
             operator_comments: comments::scopes(value.get("operatorComments"))?,
+            broker_outage: BrokerOutage::from_json(value.get("brokerOutage"))?,
         })
     }
 }
@@ -893,6 +1028,9 @@ pub struct Marker {
     pub continuing: bool,
     /// Whether the `cap` pool was used: it raises the cap once.
     pub raised: bool,
+    /// Whether the run `sha` and `run` name is the one that raised it, so
+    /// that a refund of that run ([`Marker::refunded`]) gives the raise back.
+    pub raising: bool,
     /// The operator's comments a round was started on ([`comments`]), which
     /// no later pass starts one on again.
     pub comments: Vec<String>,
@@ -1000,10 +1138,37 @@ impl Marker {
         if self.raised {
             state["raised"] = true.into();
         }
+        if self.raising {
+            state["raising"] = true.into();
+        }
         if !self.comments.is_empty() {
             state["comments"] = self.comments.iter().map(|c| plain(c)).collect();
         }
         state
+    }
+
+    /// The marker with the round of the run it names given back, as a broker
+    /// outage failed that run: the next pass starts the round again. With
+    /// `sha` and `run` gone, no later pass reads that run, so it is given
+    /// back once. A raise of the cap that run used is given back with it, as
+    /// its retry needs the cap pool again; one an earlier run used is not.
+    fn refunded(&self) -> Marker {
+        let mut marker = Marker {
+            id: None,
+            sha: None,
+            run: None,
+            at: None,
+            continuing: false,
+            raised: self.raised && !self.raising,
+            raising: false,
+            ..self.clone()
+        };
+        if self.continuing {
+            marker.continued = marker.continued.saturating_sub(1);
+        } else {
+            marker.rounds = marker.rounds.saturating_sub(1);
+        }
+        marker
     }
 
     /// The round of the run the marker names, as a decision line says it.
@@ -1068,6 +1233,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
                 .map_or(0, |c| c.min(CONTINUATION_ROUNDS_LIMIT)),
             continuing: state["continuing"].as_bool().unwrap_or(false),
             raised: state["raised"].as_bool().unwrap_or(false),
+            raising: state["raising"].as_bool().unwrap_or(false),
             comments: nodes(&state, "/comments")
                 .iter()
                 .filter_map(Value::as_str)
@@ -1667,7 +1833,7 @@ pub fn fix_task(
 
 #[derive(Debug, PartialEq)]
 pub struct Decision {
-    /// skip, wait, continue, fix, retitle, merge or needs-human.
+    /// skip, wait, continue, fix, refund, retitle, merge or needs-human.
     pub action: &'static str,
     pub reason: String,
     pub round: Option<u64>,
@@ -1752,10 +1918,16 @@ pub fn queue_step(
 /// The step for a head the marker's run was started for, fix or continuation:
 /// wait for it, or hand a run that is over and left the head as it was to a
 /// human. Only one that succeeded gets the grace for its push to show.
+///
+/// A run that failed while a broker outage was open (`outages`) is not the
+/// pull request's failure: it waits out the outage, then its round is given
+/// back (`refund`) for the next pass to start again. An open outage that
+/// covers the run comes first, so its round does not start again while that
+/// outage lasts; a later, separate outage is not waited for.
 fn started(
     config: &Config,
     marker: &Marker,
-    fix_run: Option<&Value>,
+    (fix_run, outages): (Option<&Value>, &Outages),
     head: &str,
     why: &str,
     now: OffsetDateTime,
@@ -1763,15 +1935,55 @@ fn started(
     let round = marker.round_name();
     if let Some(run) = fix_run.filter(|r| r["status"] == "completed") {
         let conclusion = run["conclusion"].as_str().unwrap_or("null");
+        let url = format!(
+            "https://github.com/{}/actions/runs/{}",
+            config.dispatch_repo,
+            marker.run.unwrap_or_default()
+        );
+        let mut charged = String::new();
+        if conclusion != "success" {
+            match outages {
+                Outages::Read(windows) => {
+                    let at = timestamp(run["updated_at"].as_str());
+                    let mut covering: Vec<&Window> = windows
+                        .iter()
+                        .filter(|w| {
+                            at.is_some_and(|at| w.from <= at && w.to.is_none_or(|to| at <= to))
+                        })
+                        .collect();
+                    covering.sort_by_key(|w| w.to.is_some());
+                    // The operator's comments a round was started on stay
+                    // handled ([`comments`]), so its retry would not be theirs.
+                    if !marker.comments.is_empty() && !covering.is_empty() {
+                        charged =
+                            "; a round on the operator's comments is not given back for an outage"
+                                .into();
+                    } else if let Some(window) = covering.first() {
+                        let ended = format!(
+                            "{round}'s run {url} ended ({conclusion}) during the broker outage {}",
+                            window.issue
+                        );
+                        return match window.to {
+                            None => step("wait", format!("{ended}, which is still open")),
+                            Some(_) => {
+                                step("refund", format!("{ended}, so the round is given back"))
+                            }
+                        };
+                    }
+                }
+                Outages::Unread(error) => {
+                    charged = format!("; the broker outages could not be read ({error})");
+                }
+                Outages::Off => {}
+            }
+        }
         if conclusion != "success"
             || older_than(now, run["updated_at"].as_str(), FIX_RUN_GRACE_SECONDS)
         {
             return step(
                 "needs-human",
                 format!(
-                    "{round} is blocked: its run https://github.com/{}/actions/runs/{} ended ({conclusion}) and pushed no new head for {} ({why})",
-                    config.dispatch_repo,
-                    marker.run.unwrap_or_default(),
+                    "{round} is blocked: its run {url} ended ({conclusion}) and pushed no new head for {} ({why}){charged}",
                     short(head)
                 ),
             );
@@ -1792,13 +2004,15 @@ fn started(
 /// The one step for a pull request, as poll.cjs's `decide`, except that the
 /// verdict is the review of the head rather than a status and a comment.
 /// `fix_run` is the marker's run when the marker names one for this head;
-/// `review_run` the run of [`review_run_id`].
+/// `review_run` the run of [`review_run_id`]; `outages` what the pass read of
+/// the broker's outages, where `fix_run` failed.
 pub fn decide(
     config: &Config,
     pull: &Value,
     checks: &Checks,
     marker: &Marker,
     (fix_run, review_run): (Option<&Value>, Option<&Value>),
+    outages: &Outages,
     now: OffsetDateTime,
 ) -> Decision {
     let head = text(pull, "/headRefOid");
@@ -1873,7 +2087,7 @@ pub fn decide(
             Ok(Some(at)) => {
                 let why = format!("its checkpoint says {}", at.reason);
                 if marker.sha.as_deref() == Some(head) {
-                    return started(config, marker, fix_run, head, &why, now);
+                    return started(config, marker, (fix_run, outages), head, &why, now);
                 }
                 let rounds = config.policy.continuation.rounds;
                 if marker.continued >= rounds {
@@ -1902,7 +2116,7 @@ pub fn decide(
             return step("skip", format!("{why}; {not_ours}"));
         }
         if marker.sha.as_deref() == Some(head) {
-            return started(config, marker, fix_run, head, &why, now);
+            return started(config, marker, (fix_run, outages), head, &why, now);
         }
         // The diagnostic round is one more, counted in `rounds` as the next
         // fix round, so it is claimed and recorded like one and runs once.
@@ -2113,6 +2327,8 @@ struct Pass<'a, R, G> {
     /// entries were read, and the entries and their files, with what this pass
     /// added to it after.
     queues: BTreeMap<(String, String), (bool, Vec<Entry>)>,
+    /// The broker's outages, read once a pass and only for a failed run.
+    outages: Option<Outages>,
 }
 
 /// A merge queue entry: its number and the files it changes, if all were read.
@@ -2501,8 +2717,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .cloned()
                 .or_else(|| self.config.policy.kind_pools.get("fix").cloned())
         };
-        let raised = carried.raised
-            || (raise.is_some() && checkpoint.as_ref().is_some_and(|at| at.reason == "cap"));
+        let raising = raise.is_some() && checkpoint.as_ref().is_some_and(|at| at.reason == "cap");
+        let raised = carried.raised || raising;
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
@@ -2562,6 +2778,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             continued: if continuing { round } else { carried.continued },
             continuing,
             raised,
+            raising,
             comments: Vec::new(),
         };
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
@@ -2696,6 +2913,41 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     Ok(Some("merged".into()))
                 }
             }
+            // A new marker, as every round's is: the next round is claimed
+            // from it, not from the one whose claim the refunded round used.
+            // The refund is claimed from the marker it gives back, as a round
+            // is: two passes that read the same failed run would each post
+            // one, and the later, after a round started from the first, would
+            // roll that round's marker back and start it a second time.
+            "refund" => {
+                let round = marker.round_name();
+                let of = format!("Refund of {round} for `{}`", short(head));
+                let state = json!({"from": claim_from(marker), "refund": round, "sha": head});
+                if let Err((id, at)) = self.claim(repo, number, marker, read, (state, &of))? {
+                    // As for a round: the winner died before its marker.
+                    if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
+                        self.needs_human(
+                            repo,
+                            number,
+                            marker,
+                            &format!("the refund of {round} lost to comment {id}'s claim, which was never recorded"),
+                            None,
+                        )?;
+                        return Ok(Some(format!("labelled {LABEL}")));
+                    }
+                    return Ok(Some(format!(
+                        "not given back: another pass went first, in comment {id}"
+                    )));
+                }
+                let mut refunded = marker.refunded();
+                self.post_marker(
+                    repo,
+                    number,
+                    &mut refunded,
+                    &format!("Round given back: {}.", decision.reason),
+                )?;
+                Ok(Some("round given back".into()))
+            }
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
                 self.needs_human(repo, number, marker, &decision.reason, excerpt)?;
@@ -2811,6 +3063,53 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             url = next;
         }
         Ok(all)
+    }
+
+    /// The windows of `brokerOutage`'s issues, read once a pass. A read that
+    /// fails or fills its page leaves none, so the run is charged as without
+    /// the setting, and says why.
+    fn outages(&mut self) -> Outages {
+        let Some(outage) = &self.config.policy.broker_outage else {
+            return Outages::Off;
+        };
+        if let Some(read) = &self.outages {
+            return read.clone();
+        }
+        let since = (self.now - time::Duration::seconds(OUTAGE_CLOSED_SECONDS))
+            .replace_nanosecond(0)
+            .ok()
+            .and_then(|at| at.format(&Rfc3339).ok())
+            .unwrap_or_default();
+        let base = format!(
+            "{API_ROOT}repos/{}/issues?labels={OUTAGE_LABEL}&per_page={OUTAGE_ISSUE_LIMIT}",
+            outage.repository
+        );
+        let mut issues = Vec::new();
+        let mut read = || -> Result<()> {
+            for url in [
+                format!("{base}&state=open"),
+                format!("{base}&state=closed&since={since}"),
+            ] {
+                let (body, next) = self.get_url(&url, slim_outage, false)?;
+                ensure!(
+                    next.is_none(),
+                    "more than {OUTAGE_ISSUE_LIMIT} outage issues"
+                );
+                issues.extend(
+                    body.as_array()
+                        .context("outage issues are not an array")?
+                        .iter()
+                        .cloned(),
+                );
+            }
+            Ok(())
+        };
+        let read = match read() {
+            Ok(()) => Outages::Read(outage_windows(&issues, outage, self.now)),
+            Err(error) => Outages::Unread(format!("{error:#}")),
+        };
+        self.outages = Some(read.clone());
+        read
     }
 
     /// The operator's and the bot's activity since the last pass, oldest first.
@@ -3265,12 +3564,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ),
             _ => None,
         };
+        let failed = fix_run
+            .as_ref()
+            .is_some_and(|r| r["status"] == "completed" && r["conclusion"] != "success");
+        let outages = if failed { self.outages() } else { Outages::Off };
         let decision = decide(
             self.config,
             &pull,
             &checks,
             &marker,
             (fix_run.as_ref(), review_run.as_ref()),
+            &outages,
             self.now,
         );
         let mut decision = match (tries, removal) {
@@ -3425,6 +3729,7 @@ pub fn run<R: Rest, G: Transport>(
         apply,
         dispatched: 0,
         queues: BTreeMap::new(),
+        outages: None,
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -3722,9 +4027,26 @@ mod tests {
         let continued = json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"});
         let retitle = json!({"continuation": {"retitle": true}});
         let diagnostic = json!({"diagnosticPool": "large"});
+        // An outage issue as tracker's broker.cjs opens it, and the policy
+        // that reads them with a ten-minute lead.
+        let outage = |lead: u64| json!({"brokerOutage": {"repository": "cgwalters-forge/tracker", "author": BOT, "leadSeconds": lead}});
+        let issue = |created: &str, closed: Option<&str>| {
+            json!({"number": 9, "state": if closed.is_some() { "closed" } else { "open" },
+            "created_at": created, "closed_at": closed, "user": {"login": BOT},
+            "body": format!("{OUTAGE_MARKER}\nBroker unreachable from the dispatch tailnet path.")})
+        };
+        let closed = issue("2026-10-12T01:50:00Z", Some("2026-10-12T01:59:50Z"));
+        let open = issue("2026-10-12T01:50:00Z", None);
+        let changed = |key: &str, value: Value| {
+            let mut changed = closed.clone();
+            changed[key] = value;
+            changed
+        };
+        let refunded = json!({"rounds": 0, "pool": "claude"});
         #[rustfmt::skip]
-        // Name, fixture, change (with the head commit's `message` and the
-        // `policy`), marker, fix run, action and round.
+        // Name, fixture, change (with the head commit's `message`, the
+        // `policy`, and the `outage` issues read or why they were not), marker,
+        // fix run, action and round.
         type Case<'a> = (&'a str, &'a str, Value, Value, Value, &'a str, Option<u64>);
         let cases: Vec<Case> = vec![
             (
@@ -4734,6 +5056,150 @@ mod tests {
                 "skip",
                 None,
             ),
+            (
+                "a fix run that failed during a closed broker outage gets its round back",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [closed]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "refund",
+                None,
+            ),
+            (
+                "a continuation that failed during a closed broker outage gets its round back",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "policy": outage(600), "outage": [closed]}),
+                json!({"rounds": 0, "continued": 1, "continuing": true, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "refund",
+                None,
+            ),
+            (
+                "a fix run that failed during an open broker outage waits it out",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [open]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "an open outage is waited out before a closed one gives the round back",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [closed, open]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the lead covers a run that failed just before the outage issue was opened",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [issue("2026-10-12T01:59:50Z", None)]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "without the lead, a run that failed before the outage issue is charged",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(0), "outage": [issue("2026-10-12T01:59:50Z", None)]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a fix run that failed outside every broker outage is charged",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [issue("2026-10-12T01:00:00Z", Some("2026-10-12T01:30:00Z"))]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "an outage closed before the recent period is not read as one",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [issue("2026-10-09T00:00:00Z", Some("2026-10-09T01:00:00Z"))]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                json!({"status": "completed", "conclusion": "failure", "updated_at": "2026-10-09T00:30:00Z"}),
+                "needs-human",
+                None,
+            ),
+            (
+                "an outage issue someone else opened gives nothing back",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [changed("user", json!({"login": "someone"}))]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "an outage issue without tracker's marker line gives nothing back",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [changed("body", json!("Broker unreachable."))]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "an outage issue is not read without brokerOutage",
+                "pull-470",
+                json!({"contexts": changes, "outage": [closed]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "outages that could not be read give nothing back",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": "more than 30 outage issues"}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a run that succeeded without a push is charged during an outage too",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [open]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                json!({"status": "completed", "conclusion": "success", "updated_at": "2026-10-12T01:52:00Z"}),
+                "needs-human",
+                None,
+            ),
+            (
+                "a round with no run id times out to a human during an outage too",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [open]}),
+                json!({"rounds": 1, "sha": HEAD, "at": "2026-10-11T12:00:00Z"}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a round on the operator's comments is charged during an outage",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [closed]}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7, "comments": ["issuecomment-100"]}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a round given back starts again, and its run is not read again",
+                "pull-470",
+                json!({"contexts": changes, "policy": outage(600), "outage": [closed]}),
+                refunded.clone(),
+                failed_run.clone(),
+                "fix",
+                Some(1),
+            ),
         ];
         for (name, fixture, mut change, state, fix_run, action, round) in cases {
             let mut cfg = config();
@@ -4742,6 +5208,15 @@ mod tests {
                 cfg.policy = PollPolicy::from_json(&policy).unwrap();
             }
             let message = fields.remove("message");
+            let outages = match (fields.remove("outage"), &cfg.policy.broker_outage) {
+                (Some(Value::String(error)), Some(_)) => Outages::Unread(error),
+                (Some(issues), Some(outage)) => Outages::Read(outage_windows(
+                    nodes(&slim_outage(&issues), ""),
+                    outage,
+                    now(),
+                )),
+                _ => Outages::Off,
+            };
             let mut p = pull(fixture, change);
             if let Some(message) = message {
                 p["commits"]["nodes"][0]["commit"]["message"] = message;
@@ -4755,6 +5230,7 @@ mod tests {
                     Some(&fix_run).filter(|r| !r.is_null()),
                     review_run(&p).as_ref(),
                 ),
+                &outages,
                 now(),
             );
             assert_eq!(
@@ -4894,6 +5370,7 @@ mod tests {
                     &checks,
                     &Marker::default(),
                     (None, review_run(&p).as_ref()),
+                    &Outages::Off,
                     now(),
                 );
                 assert_eq!(decision.action == "merge", !failed && !pending, "{state}");
@@ -4910,6 +5387,7 @@ mod tests {
                     &checks,
                     &Marker::default(),
                     (None, review_run(&p).as_ref()),
+                    &Outages::Off,
                     now()
                 )
                 .action,
@@ -4999,6 +5477,7 @@ mod tests {
                 &checks,
                 &Marker::default(),
                 (None, review_run(&p).as_ref()),
+                &Outages::Off,
                 now(),
             );
             assert_eq!(got.action, "wait", "{name}: {}", got.reason);
@@ -5050,6 +5529,7 @@ mod tests {
                     &checks,
                     &Marker::default(),
                     (None, review_run(&p).as_ref()),
+                    &Outages::Off,
                     now()
                 )
                 .action,
@@ -5080,6 +5560,7 @@ mod tests {
                     &checks,
                     &Marker::default(),
                     (None, review_run(&p).as_ref()),
+                    &Outages::Off,
                     now()
                 )
                 .action,
@@ -5337,6 +5818,7 @@ mod tests {
                 &classify_checks(&p, &required()),
                 &Marker::default(),
                 (None, run.as_ref()),
+                &Outages::Off,
                 now(),
             );
             assert_eq!(got.action, action, "{name}: {}", got.reason);
@@ -5394,6 +5876,7 @@ mod tests {
             &classify_checks(&p, &[]),
             &Marker::default(),
             (None, review_run(&p).as_ref()),
+            &Outages::Off,
             now(),
         );
         assert_eq!(got.action, "wait", "{}", got.reason);
@@ -5454,6 +5937,7 @@ mod tests {
             &classify_checks(&p, &required()),
             &marker(json!({"rounds": 1, "sha": HEAD, "run": 7})),
             (Some(&run), review_run(&p).as_ref()),
+            &Outages::Off,
             now(),
         );
         assert_eq!(got.action, "needs-human");
@@ -6764,19 +7248,43 @@ mod tests {
     #[test]
     fn a_continuation_carries_the_checkpoint_and_raises_the_cap_once() {
         // The reason in the body, the head commit's message (a continuation's,
-        // which wins when it has one), the marker before, and the pool and
-        // `raised` the round gets.
-        for (body, message, before, pool, raised) in [
-            ("runtime", None, json!(null), "long", false),
-            ("budget", Some("runtime"), json!(null), "long", false),
-            ("incomplete", None, json!(null), "claude", false),
-            ("cap", None, json!(null), "big", true),
+        // which wins when it has one), the marker before, and the pool,
+        // `raised` and `raising` the round gets.
+        let refunded = |state: Value| marker(state).refunded().state();
+        for (body, message, before, pool, raised, raising) in [
+            ("runtime", None, json!(null), "long", false, false),
+            ("budget", Some("runtime"), json!(null), "long", false, false),
+            ("incomplete", None, json!(null), "claude", false, false),
+            ("cap", None, json!(null), "big", true, true),
             (
                 "cap",
                 None,
                 json!({"rounds": 0, "continued": 1, "raised": true, "sha": "older"}),
                 "openai",
                 true,
+                false,
+            ),
+            // The retry of a raised run that an outage failed is raised again;
+            // after a raise a completed run used, it is not.
+            (
+                "cap",
+                None,
+                refunded(
+                    json!({"rounds": 0, "continued": 1, "continuing": true, "raised": true, "raising": true, "sha": HEAD, "run": 7}),
+                ),
+                "big",
+                true,
+                true,
+            ),
+            (
+                "cap",
+                None,
+                refunded(
+                    json!({"rounds": 0, "continued": 2, "continuing": true, "raised": true, "sha": HEAD, "run": 7}),
+                ),
+                "openai",
+                true,
+                false,
             ),
         ] {
             let mut fake = github();
@@ -6846,9 +7354,10 @@ mod tests {
                     marker.rounds,
                     marker.continued,
                     marker.continuing,
-                    marker.raised
+                    marker.raised,
+                    marker.raising
                 ),
-                (0, round, true, raised),
+                (0, round, true, raised, raising),
                 "{label}"
             );
             assert_eq!(marker.sha.as_deref(), Some(HEAD), "{label}");
@@ -7174,6 +7683,7 @@ mod tests {
             &classify_checks(&p, &required()),
             &Marker::default(),
             (None, None),
+            &Outages::Off,
             now(),
         );
         assert_eq!(got.action, "needs-human", "{}", got.reason);
@@ -7189,6 +7699,7 @@ mod tests {
             &classify_checks(&p, &required()),
             &Marker::default(),
             (None, None),
+            &Outages::Off,
             now(),
         );
         assert_eq!(refused.action, "needs-human", "{}", refused.reason);
@@ -7270,6 +7781,7 @@ mod tests {
             &classify_checks(&fake.pulls[&470], &required()),
             &last,
             (None, review_run(&fake.pulls[&470]).as_ref()),
+            &Outages::Off,
             now(),
         );
         assert_eq!(decided.action, "wait", "{}", decided.reason);
@@ -7340,6 +7852,7 @@ mod tests {
                 &classify_checks(&newer, &required()),
                 &marker,
                 (None, review_run(&newer).as_ref()),
+                &Outages::Off,
                 now(),
             );
             assert_eq!(decision.action, "needs-human", "{}", decision.reason);
@@ -7857,6 +8370,277 @@ mod tests {
             let got = PollPolicy::from_json(&value).ok().map(|p| p.merge_queue);
             assert_eq!(got, want, "{value}");
         }
+    }
+
+    #[test]
+    fn broker_outage_policy_table() {
+        let good =
+            json!({"repository": "cgwalters-forge/tracker", "author": BOT, "leadSeconds": 600});
+        let changed = |key: &str, value: Value| {
+            let mut changed = good.clone();
+            changed[key] = value;
+            changed
+        };
+        let without = |key: &str| {
+            let mut without = good.clone();
+            without.as_object_mut().unwrap().remove(key);
+            without
+        };
+        for (value, want) in [
+            (json!({}), Some(None)),
+            (
+                json!({"brokerOutage": good}),
+                Some(Some(BrokerOutage {
+                    repository: "cgwalters-forge/tracker".into(),
+                    author: BOT.into(),
+                    lead_seconds: 600,
+                })),
+            ),
+            (
+                json!({"brokerOutage": changed("leadSeconds", json!(0))}),
+                Some(Some(BrokerOutage {
+                    repository: "cgwalters-forge/tracker".into(),
+                    author: BOT.into(),
+                    lead_seconds: 0,
+                })),
+            ),
+            (json!({"brokerOutage": true}), None),
+            (json!({"brokerOutage": changed("pool", json!("x"))}), None),
+            (
+                json!({"brokerOutage": changed("repository", json!("tracker"))}),
+                None,
+            ),
+            (
+                json!({"brokerOutage": changed("repository", json!(["o/r"]))}),
+                None,
+            ),
+            (
+                json!({"brokerOutage": changed("author", json!("not a login"))}),
+                None,
+            ),
+            (
+                json!({"brokerOutage": changed("leadSeconds", json!(-1))}),
+                None,
+            ),
+            (
+                json!({"brokerOutage": changed("leadSeconds", json!("600"))}),
+                None,
+            ),
+            (
+                json!({"brokerOutage": changed("leadSeconds", json!(OUTAGE_LEAD_LIMIT + 1))}),
+                None,
+            ),
+            (json!({"brokerOutage": without("author")}), None),
+            (json!({"brokerOutage": without("leadSeconds")}), None),
+        ] {
+            let got = PollPolicy::from_json(&value).ok().map(|p| p.broker_outage);
+            assert_eq!(got, want, "{value}");
+        }
+        // A refund gives back the round of the run the marker names, once.
+        let fix = marker(
+            json!({"rounds": 2, "continued": 1, "sha": HEAD, "run": 7, "at": "x", "pool": "openai"}),
+        );
+        let continued =
+            marker(json!({"rounds": 1, "continued": 2, "continuing": true, "sha": HEAD, "run": 7}));
+        for (from, rounds, continued) in [(fix, 1, 1), (continued, 1, 1)] {
+            let refunded = from.refunded();
+            assert_eq!(
+                (
+                    refunded.rounds,
+                    refunded.continued,
+                    refunded.sha,
+                    refunded.run,
+                    refunded.continuing
+                ),
+                (rounds, continued, None, None, false)
+            );
+            assert_eq!((refunded.pool, refunded.queue), (from.pool, from.queue));
+        }
+    }
+
+    /// A pass with `brokerOutage` reads the outage issues once, only for a
+    /// run that failed, gives its round back in a new marker without a
+    /// label, and charges it as before where they could not be read.
+    #[test]
+    fn a_round_a_broker_outage_failed_is_given_back() {
+        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let issues =
+            format!("{API_ROOT}repos/cgwalters-forge/tracker/issues?labels=outage&per_page=30");
+        let open = format!("{issues}&state=open");
+        let closed = format!("{issues}&state=closed&since=2026-10-10T02:00:00Z");
+        let outage = json!({"number": 9, "state": "closed", "created_at": "2026-10-12T01:50:00Z",
+            "closed_at": "2026-10-12T01:59:50Z", "user": {"login": BOT},
+            "body": format!("{OUTAGE_MARKER}\nBroker unreachable.")});
+        let refund = "refund: fix round 1's run https://github.com/cgwalters-forge/tracker/actions/runs/7 ended (failure) during the broker outage cgwalters-forge/tracker#9, so the round is given back";
+        // Another pass's comments, shown once this one has posted its claim.
+        let claim = |id: u64, from: &str, at: &str| {
+            json!({"id": id, "user": {"login": BOT}, "created_at": at,
+                "body": format!("<!-- {CLAIM}: {} -->\nclaimed.", json!({"from": from}))})
+        };
+        let posted = |id: u64, state: Value| json!({"id": id, "user": {"login": BOT}, "body": marker_body(&state, "Round.")});
+        // Name, the closed issues' page and its next, the other passes'
+        // comments, and the line's end.
+        type Case<'a> = (&'a str, Value, Option<String>, Vec<Value>, String);
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            (
+                "a run inside the outage gets its round back",
+                json!([outage]), None, vec![],
+                format!("{refund} -> round given back"),
+            ),
+            (
+                "a refund another pass claimed first is not given again",
+                json!([outage]), None, vec![claim(6, "5", "2026-10-12T01:59:00Z")],
+                format!("{refund} -> not given back: another pass went first, in comment 6"),
+            ),
+            (
+                "a stale refund is not posted over the round started after another's",
+                json!([outage]), None,
+                vec![
+                    claim(6, "5", "2026-10-12T01:59:00Z"),
+                    posted(7, json!({"rounds": 0})),
+                    claim(8, "7", "2026-10-12T01:59:30Z"),
+                    posted(9, json!({"rounds": 1, "sha": HEAD, "run": 8})),
+                ],
+                format!("{refund} -> not given back: another pass went first, in comment 9"),
+            ),
+            (
+                "a refund claimed by a pass that died is handed to a human",
+                json!([outage]), None, vec![claim(6, "5", "2026-10-11T00:00:00Z")],
+                format!("{refund} -> labelled needs-human"),
+            ),
+            (
+                "a page that reaches its bound is charged, and says so",
+                json!([outage]), Some(format!("{closed}&page=2")), vec![],
+                "the broker outages could not be read (more than 30 outage issues) -> labelled needs-human".into(),
+            ),
+        ];
+        for (name, page, next, late, line) in cases {
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull(
+                    "pull-470",
+                    json!({"contexts": {"review": {"state": "FAILURE"}}}),
+                ),
+            );
+            fake.rest.get_mut(&comments).unwrap().3 = json!([
+                {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": HEAD, "run": 7}), "Fix round.")}
+            ]);
+            fake.page(
+                "repos/cgwalters-forge/tracker/actions/runs/7",
+                None,
+                None,
+                json!({"status": "completed", "conclusion": "failure", "updated_at": "2026-10-12T01:55:00Z"}),
+            );
+            fake.rest
+                .insert(open.clone(), (None, None, None, json!([])));
+            fake.rest.insert(closed.clone(), (None, None, next, page));
+            let contended = !late.is_empty();
+            fake.late = late;
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(&json!({"brokerOutage": {
+                "repository": "cgwalters-forge/tracker", "author": BOT, "leadSeconds": 600}}))
+            .unwrap();
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            let got = outcome.lines.last().unwrap();
+            assert!(got.ends_with(&line), "{name}: {got}");
+            let reads = fake
+                .sent
+                .borrow()
+                .iter()
+                .filter(|(url, _)| url.starts_with(&issues))
+                .count();
+            assert_eq!(reads, 2, "{name}");
+            // The outage issues' bodies are not kept in the state file.
+            assert!(
+                !outcome
+                    .state
+                    .to_json()
+                    .to_string()
+                    .contains("Broker unreachable"),
+                "{name}"
+            );
+            let writes = written(&fake.writes);
+            let post = format!("POST repos/{REPO}/issues/470/comments");
+            // The claim goes first; a refund that lost it posts no marker.
+            if line.starts_with(refund) {
+                assert!(
+                    fake.writes.borrow()[0].1["body"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("<!-- {CLAIM}: ")),
+                    "{name}"
+                );
+            }
+            if contended && line.contains("not given back") {
+                assert_eq!(writes, std::slice::from_ref(&post), "{name}");
+            }
+            if line.ends_with("round given back") {
+                assert_eq!(writes, [post.clone(), post], "{name}");
+                let body = &fake.writes.borrow()[1].1["body"];
+                let refunded = find_marker(
+                    &[json!({"id": 99, "user": {"login": BOT}, "body": body})],
+                    BOT,
+                );
+                assert_eq!(
+                    (refunded.rounds, refunded.sha, refunded.run),
+                    (0, None, None),
+                    "{name}"
+                );
+                assert!(
+                    body.as_str().unwrap().contains("cgwalters-forge/tracker#9"),
+                    "{name}"
+                );
+            }
+        }
+        // Without the setting, the same failure reads no outage issue.
+        let mut fake = github();
+        fake.pulls.insert(
+            470,
+            pull(
+                "pull-470",
+                json!({"contexts": {"review": {"state": "FAILURE"}}}),
+            ),
+        );
+        fake.rest.get_mut(&comments).unwrap().3 = json!([
+            {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": HEAD, "run": 7}), "Fix round.")}
+        ]);
+        fake.page(
+            "repos/cgwalters-forge/tracker/actions/runs/7",
+            None,
+            None,
+            json!({"status": "completed", "conclusion": "failure", "updated_at": "2026-10-12T01:55:00Z"}),
+        );
+        let outcome = applied(&fake, &Fake::default());
+        assert!(
+            outcome
+                .lines
+                .last()
+                .unwrap()
+                .ends_with("-> labelled needs-human"),
+            "{:?}",
+            outcome.lines
+        );
+        assert!(
+            !fake
+                .sent
+                .borrow()
+                .iter()
+                .any(|(url, _)| url.starts_with(&issues))
+        );
     }
 
     /// Names from the pull request's workflows cannot end the marker early,
