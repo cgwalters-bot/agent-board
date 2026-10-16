@@ -282,7 +282,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -305,6 +305,21 @@ not an authorization decision. The pool is recorded in the marker so the next
 round after toil uses `fixPools[0]`. `kindPools.fix` supplies a pool only when
 the fix-round list is empty; other kinds are not dispatched by poll.
 
+`diagnosticPool` (absent by default, which labels a pull request `needs-human`
+once its 2 fix rounds are used) gives a pull request that still fails one more
+round, the diagnostic round, on that pool, before `needs-human`
+(tracker#649). It is counted as fix round 3 in the marker, claimed and recorded
+like any round, and given once. Its task also carries the first failed check
+that is an Actions job of the repository, the step it failed at, and the last
+2000 characters of the first 50 failure annotations of its check run, besides
+the review's text as every fix task does; the merge queue's failure, where that
+is the one, is its own excerpt. These are annotations, not the log, which the
+API serves only from a redirect off the API, so for a plain test failure they
+may say little more than the exit code. A failure after it goes to
+`needs-human`, and the stop comment quotes the same excerpt in a fenced block,
+its backticks and `<!--` defused.
+Setting it lets the poll start three runs for a pull request instead of two.
+
 `mergeQueue` (absent by default, which leaves a removed pull request to be
 enqueued again like any other) has the poll own the merge queue
 (agent-board#91). `{"tries": N}` (1 to 10, default 3) bounds the re-queues of
@@ -313,8 +328,10 @@ one head. For the bot's dispatch pull requests the newest
 `stack_invalidated`, `merge_conflict` on a head that no longer conflicts, and a
 `failed_checks` or `checks_timed_out` whose merge-group run is gone or failed in
 setup or checkout are re-queued; a job that fails the head's merge-group run
-twice becomes a failed check (only a group created after the head's commit and
-the previous removal, and not one already read, counts), so the head gets a fix round whose task names the
+twice at the same step becomes a failed check (only a run created after the head's commit and
+the previous removal, and not the run already read, counts; runs are told apart
+by id, as a head re-queued onto an unchanged base gets a group on the same
+branch), so the head gets a fix round whose task names the
 job and step and carries its failure annotations; any other reason, even
 where a fix round is due, or a removal past the tries, goes to `needs-human`
 with the reasons. Each re-queue,
@@ -343,7 +360,16 @@ by default) names a pool for a `budget`, `runtime` or `cap` checkpoint, as
 pools are how a run gets more budget, time or a higher cap; the `cap` pool
 is used once a pull request. A continuation that completes is marked ready
 by agentic-job, which in v0.5.1 does not rewrite the title or description
-from its commits.
+from its commits. With `continuation.retitle: true` (off by default) the poll
+does: a ready pull request of the bot still titled or described as partial
+work (or with the placeholder title), where the newest round is a
+continuation and the head moved since, gets the head commit's subject as its
+title and the rest of its message as its description, with the old
+description's closing references (`Closes #N`) kept. A failure is fixed first,
+and after a fix round the head commit is the fix's, so a person writes them. A message that is the
+harness's own words, carries a checkpoint, has no body, or does not fit
+GitHub's bounds (256 and 65536 characters) is not copied, and the pull request
+goes to `needs-human` as before. The edit cannot be pinned to the head.
 
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done
