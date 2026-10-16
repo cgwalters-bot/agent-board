@@ -4,6 +4,14 @@
 
 agent-board is the board and control side of a coding-agent coordinator that keeps its whole record on GitHub: a project board, its issues and their pull requests. It reads the board, previews repairs, decides what job an issue should get and follows the pull requests that come back. [agentic-job](https://github.com/cgwalters-forge/agentic-job) runs one agent job safely; the [tracker](https://github.com/cgwalters-forge/tracker) repository holds the bounds and the token. agent-board does not run agents itself.
 
+## Where it fits
+
+The pitch is "gh-aw, but more flexible, supporting containers, and helping secure the rest of CI". agent-board is the board and scheduling side of that; agents run through agentic-job, and [Why not GitHub Agentic Workflows](https://github.com/cgwalters-forge/agentic-job/blob/main/README.md#why-not-github-agentic-workflows) explains that choice.
+
+gh-aw's `update-project` and `dispatch-workflow` safe outputs let an agent edit a project item or start a workflow. On top of that, agent-board keeps the [job plan](docs/job-plans.md) on the issue, dispatches it once per plan with a record on the issue, can [batch](docs/job-plans.md#batching) small sibling sub-issues into one run, [holds back](docs/job-plans.md#overlap) runs that overlap open bot pull requests, and previews board repairs with `reconcile plan`.
+
+What it lacks today: reconcile repairs are previewed but not applied from CI ([#7](https://github.com/cgwalters-forge/agent-board/issues/7)); a default board has no Turn, Run or Result field, and while `project init` now creates them, Turn is still set on each item by hand ([#18](https://github.com/cgwalters-forge/agent-board/issues/18)); and much of the join (finding the run, applying `run record` proposals, linking the pull request) is still manual ([#19](https://github.com/cgwalters-forge/agent-board/issues/19)).
+
 ## Commands
 
 All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project and issue read) or offline (`--snapshot FILE`). Output follows `gh`: `--json`/`--jq`, gh exit codes; the binary is also built as `gh-agent-board`.
