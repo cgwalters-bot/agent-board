@@ -69,7 +69,7 @@ impl Decision {
     }
 }
 
-fn shown(paths: &[String]) -> String {
+pub(crate) fn shown(paths: &[String]) -> String {
     let mut out: Vec<String> = paths.iter().take(SHOWN).map(|p| format!("`{p}`")).collect();
     if paths.len() > SHOWN {
         out.push(format!("{} more", paths.len() - SHOWN));
