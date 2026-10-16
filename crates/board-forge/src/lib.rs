@@ -14,6 +14,7 @@ pub mod overlap;
 pub mod plan;
 pub mod poll;
 pub mod status;
+pub mod supervise;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 
 pub trait Forge {

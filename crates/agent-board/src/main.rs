@@ -6,6 +6,7 @@ mod epic;
 mod item;
 mod live;
 mod poll;
+mod supervise;
 
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{Capability, Policy, Snapshot};
@@ -116,6 +117,8 @@ enum Command {
     },
     /// One pass of the pull request poll, previewed or applied; says when the next is due.
     Poll(poll::Poll),
+    /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
+    Supervise(supervise::Supervise),
     /// Run the credential-bearing staging integration test.
     Test {
         #[command(subcommand)]
@@ -730,6 +733,13 @@ fn execute(cli: Cli) -> Result<()> {
                 }
                 Ok(Some(load(&cli)?))
             })
+        }
+        Command::Supervise(args) => {
+            ensure!(
+                cli.json.is_none() && cli.repo.is_none() && cli.snapshot.is_none(),
+                "supervise reads its settings from --config and --supervisor-config only"
+            );
+            supervise::run(args)
         }
         Command::Test {
             command: Test::Project(options),

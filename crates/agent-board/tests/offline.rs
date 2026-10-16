@@ -1588,3 +1588,158 @@ fn dispatch_plan_guard_table() {
         assert!(stderr.contains(reason), "{args:?}: {stderr}");
     }
 }
+
+#[test]
+fn supervise_offline_table() {
+    let dir = std::env::temp_dir().join(format!("agent-board-supervise-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |name: &str, value: Value| {
+        let path = dir.join(name);
+        std::fs::write(&path, value.to_string()).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let config = write(
+        "agent-board.json",
+        serde_json::json!({"operator": "operator", "bot": "worker", "dispatchRepo": "o/tracker",
+            "dispatchWorkflow": "dispatch.yml", "follow": ["o/repo"], "epics": {"repository": "o/tracker"},
+            "schedule": {"repositories": ["o/repo"]}}),
+    );
+    let mut supervisor = serde_json::json!({"pollWorkflow": "poll.yml", "probeWorkflow": "probe.yml",
+        "supervisorWorkflow": "supervisor.yml", "schedulerJob": "board",
+        "implementBranchPrefix": "dispatch/implement/agent-run-", "releaseRepository": "o/agentic-job",
+        "wrapperRepository": "o/actions", "wrapperPath": ".github/workflows/wrapper.yml"});
+    let off = write("off.json", supervisor.clone());
+    supervisor["agent"] = serde_json::json!({"pool": "large", "cooldownHours": 1,
+        "requests": {"repository": "o/tracker", "issue": 5}, "log": {"repository": "o/operator", "issue": 2},
+        "kinds": ["research"], "maxDispatchesPerPass": 1, "maxDispatchesPerDay": 3});
+    let on = write("on.json", supervisor.clone());
+    supervisor["wrapperPath"] = "../elsewhere".into();
+    let bad = write("bad.json", supervisor);
+    let pools = write(
+        "pools.json",
+        serde_json::json!({"large": {"agent": "a", "model": "m", "budget": "1"}}),
+    );
+    let other_pools = write("other-pools.json", serde_json::json!({"small": {}}));
+    let ok = write(
+        "ok.json",
+        serde_json::json!([{"id": "poll", "status": "ok"}, {"id": "release", "status": "warn"}]),
+    );
+    let failing = write(
+        "failing.json",
+        serde_json::json!([{"id": "release", "status": "fail"}]),
+    );
+    // Each case is decided before any request: none reaches the network.
+    for (args, token, code, stdout, stderr) in [
+        (
+            vec![
+                "trigger",
+                "--supervisor-config",
+                &on,
+                "--pools",
+                &pools,
+                "--health",
+                &ok,
+            ],
+            true,
+            0,
+            "act=false\n",
+            "no check fails",
+        ),
+        (
+            vec![
+                "trigger",
+                "--supervisor-config",
+                &off,
+                "--pools",
+                &pools,
+                "--health",
+                &failing,
+            ],
+            true,
+            0,
+            "act=false\n",
+            "not configured",
+        ),
+        (
+            vec![
+                "trigger",
+                "--supervisor-config",
+                &on,
+                "--pools",
+                &other_pools,
+                "--health",
+                &ok,
+            ],
+            true,
+            1,
+            "",
+            "not in the pools file",
+        ),
+        (
+            vec!["health", "--supervisor-config", &bad],
+            true,
+            1,
+            "",
+            "invalid repository path",
+        ),
+        (
+            vec!["health", "--supervisor-config", &on],
+            false,
+            4,
+            "",
+            "authentication",
+        ),
+        (
+            vec![
+                "execute",
+                "--supervisor-config",
+                &off,
+                "--pools",
+                &pools,
+                "--result-url",
+                "u",
+            ],
+            true,
+            1,
+            "",
+            "not configured",
+        ),
+    ] {
+        let mut command = command();
+        command
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env("GITHUB_REPOSITORY", "o/tracker")
+            .env("GITHUB_RUN_ID", "9")
+            .env("DEFAULT_BRANCH", "main");
+        if token {
+            command.env("GH_TOKEN", "unused");
+        }
+        let output = command
+            .args(["supervise", args[0], "--config", &config])
+            .args(&args[1..])
+            .assert()
+            .code(code)
+            .stdout(stdout)
+            .get_output()
+            .clone();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(err.contains(stderr), "{args:?}: {err}");
+    }
+    command()
+        .args([
+            "supervise",
+            "trigger",
+            "--config",
+            &config,
+            "--supervisor-config",
+            &on,
+            "--pools",
+            &pools,
+            "--json",
+            "x",
+        ])
+        .assert()
+        .code(1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
