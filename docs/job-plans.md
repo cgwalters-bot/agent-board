@@ -101,6 +101,26 @@ try again. Anyone who can delete comments on the issue can remove a record and
 so have its plan dispatched again. The run is started with `DISPATCH_TOKEN` if
 it is set, else with `GH_TOKEN`.
 
+## Collaborator input
+
+`--collaborators-only` (off by default; from the caller's configuration)
+refuses a plan unless every issue the run reads (the one holding the plan, the
+one it targets, and each batched extra) has a locked conversation and was
+written only by accounts with `write`, `maintain` or `admin` permission on its
+repository: its body and the body's edits (`userContentEdits`), every comment
+and its last editor, and on a pull request every review and review comment
+([#111](https://github.com/cgwalters-forge/agent-board/issues/111)). It stops a
+visitor's text from reaching a run as task data. The error names the login and
+where it wrote; `--dry-run` checks the same.
+
+It reads whole or refuses: an item with more than 100 of any of those, or more
+than 30 distinct writers, is refused, as is a deleted or unnamed account, any
+app bot, or an issue whose repository's collaborators `GH_TOKEN` cannot read
+(a target in a repository we do not own). Titles and a pull request's commits
+are not checked, nor a comment's editors before its last.
+Locking new items, the poll's backstop and fix-round check, and the dispatched
+agent's own sanity check are not implemented here.
+
 ## Batching
 
 `--batch N` (0 to 5, default 0: off; take N from the caller's configuration)
