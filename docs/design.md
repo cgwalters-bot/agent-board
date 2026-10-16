@@ -282,7 +282,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -304,6 +304,28 @@ alongside rejected reviews. This is cost routing under the same fix bounds,
 not an authorization decision. The pool is recorded in the marker so the next
 round after toil uses `fixPools[0]`. `kindPools.fix` supplies a pool only when
 the fix-round list is empty; other kinds are not dispatched by poll.
+
+`mergeQueue` (absent by default, which leaves a removed pull request to be
+enqueued again like any other) has the poll own the merge queue
+(agent-board#91). `{"tries": N}` (1 to 10, default 3) bounds the re-queues of
+one head. For the bot's dispatch pull requests the newest
+`RemovedFromMergeQueueEvent` the marker has not seen is read once:
+`stack_invalidated`, `merge_conflict` on a head that no longer conflicts, and a
+`failed_checks` or `checks_timed_out` whose merge-group run is gone or failed in
+setup or checkout are re-queued; a job that fails the head's merge-group run
+twice becomes a failed check (only a group created after the head's commit and
+the previous removal, and not one already read, counts), so the head gets a fix round whose task names the
+job and step and carries its failure annotations; any other reason, even
+where a fix round is due, or a removal past the tries, goes to `needs-human`
+with the reasons. Each re-queue,
+fix and stop records the queue state in the marker, and the decision line says
+why. A merge, or a rebase fix round, of any followed pull request waits while
+an entry of the base branch's queue changes one of its files, compared by exact
+path, or while the files or the queue were not read whole. A job that also
+failed for other entries is not read as shared, because the groups behind an
+entry carry its change. Re-queuing only goes through the normal merge decision,
+pinned to the approved head; the setting adds no write the poll did not
+already make.
 
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done
