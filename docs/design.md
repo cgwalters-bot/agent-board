@@ -237,7 +237,7 @@ comment), and when the next pass is due
 while idle, at most six hours apart). GETs are conditional against a disposable
 state file; the pull request query is GraphQL and is not. `--dry-run` takes no
 step. `--apply` takes poll.cjs's steps with the bot's `GH_TOKEN` (checked to be
-`--bot`'s, as only the bot's markers and claims are read back): mark ready,
+`--bot`'s, as only the bot's markers and claims are read back):
 merge an approved green head (pinned to the head that was read), enqueuing it
 when the base branch's rules require a merge queue, otherwise using an allowed
 repository merge method (rebase, squash, then merge in preference order).
@@ -282,12 +282,12 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
 is built into these settings. `mergeAuthors` defaults to empty; these authors
-are merge-only, cannot mark drafts ready, start fix runs, read fix markers/runs,
+are merge-only, cannot start fix or continuation runs, read fix markers/runs,
 or receive `needs-human`, even on harness-shaped branches. Existing review
 provenance requirements are unchanged: outside the public bot-fork harness,
 only the operator's head approval counts.
@@ -326,6 +326,24 @@ failed for other entries is not read as shared, because the groups behind an
 entry carry its change. Re-queuing only goes through the normal merge decision,
 pinned to the approved head; the setting adds no write the poll did not
 already make.
+
+The poll never takes a pull request out of draft. Since agentic-job v0.5.1
+(agentic-job#691) opens complete work ready and only a
+[checkpoint](https://github.com/cgwalters-forge/agentic-job/blob/v0.5.1/docs/safe-outputs.md#ready-or-draft)
+as a draft, a draft of the bot's dispatch pull requests whose head commit
+message or body holds one gets a continuation: a `fix`-kind run on its branch
+whose task carries the checkpoint, before any fix round (its checks are of
+unfinished work). Its decision line reads `continue: continuing (round N): its
+checkpoint says REASON`. Continuation rounds are counted in the marker apart
+from fix rounds; `continuation.rounds` (0 to 5, default 2) caps them, past
+which, or for a malformed checkpoint, the pull request gets `needs-human`
+with the reason. A draft with no checkpoint also goes to `needs-human`
+instead of being marked ready on green checks. `continuation.pools` (absent
+by default) names a pool for a `budget`, `runtime` or `cap` checkpoint, as
+pools are how a run gets more budget, time or a higher cap; the `cap` pool
+is used once a pull request. A continuation that completes is marked ready
+by agentic-job, which in v0.5.1 does not rewrite the title or description
+from its commits.
 
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done
