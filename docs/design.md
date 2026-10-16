@@ -358,7 +358,17 @@ the bot's names start one run a thread: on an open pull request the bot opened
 the 2 fix rounds, not while one runs for the head, not once labelled
 `needs-human`), whose task quotes them; on any other issue or pull request,
 a `triage` run whose task quotes them, says the operator wrote them, and says
-whether a `/bot` or `@BOT` line asks for action. Each is claimed on its
+whether a `/bot` or `@BOT` line asks for action (a `research` run where such a
+line asks for research or an investigation). The dispatch workflow takes only
+review and fix runs on a pull request, so on someone else's pull request the
+run's item is a tracking issue in the dispatch repository, titled
+`OWNER/REPO#N: operator request`, that quotes the comments and links the pull
+request (agent-board#106). Only a public repository's pull request gets one, so
+nothing private is copied to the tracker; any other is left. The claim on the
+pull request records its number and links it once the run is dispatched; later
+comments are quoted on the issue the newest claim names, if the bot opened it
+for that pull request and it is open, else (also where it is gone) on a new one.
+Each is claimed on its
 thread first, as a fix round is, so a comment is acted on once whether or not
 the cursor survives. A run GitHub refuses (a 4xx) is recorded on its claim or
 marker, without using the round, and tried again on later passes, three times
