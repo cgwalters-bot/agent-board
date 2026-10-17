@@ -4,26 +4,25 @@
 //! in that comment as data and performs the ones that pass.
 //!
 //! The agent may have read prompt-injected text in any issue, log or comment
-//! it inspected, so its requests are the attacker's to choose. There is one
-//! kind: start a triage or research run on an open issue of a followed
-//! repository. What that could cost is bounded here: a closed brief (no
-//! agent text reaches the run), kinds that cannot merge anything, items
+//! it inspected, so its requests are the attacker's to choose. Dispatches
+//! use a closed brief (no agent text reaches the run), items
 //! whose every author is a collaborator and whose conversation is locked
 //! (so the run reads no outsider's text), and caps per pass and per day
 //! counted from the executor's own log, not from anything the agent says.
+//! Judgment writes share that log and fail closed without configured caps.
 use super::{AgentSettings, Api, HOUR_MS, IssueRef, Settings, encode, iso, millis, run_title};
 use crate::plan::Target;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+pub(super) mod judgment;
+
 /// The instructions the agent's task opens with.
 pub const PLAYBOOK: &str = include_str!("playbook.md");
-/// The only kinds an agent may ask for. An implement run's pull request is
-/// one the poll merges once it is approved and green, so an injected
-/// request for one is a path to the default branch; these two only read
-/// and comment.
-pub const DISPATCH_KINDS: &[&str] = &["triage", "research"];
+/// Implementation additionally requires native parentage under a live,
+/// epic-labeled plan in the configured epics repository.
+pub const DISPATCH_KINDS: &[&str] = &["triage", "research", "implement"];
 /// The brief's one variable sentence, picked by the agent from these: the
 /// scheduler's own briefs are fixed text too, and a run reads the issue and
 /// its links as data. Free text from the agent would reach a run that posts
@@ -210,6 +209,10 @@ pub fn compose(checks: &[Value], policy: &Policy, reason: &str) -> Result<String
         "reasons": REASONS.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
         "maxDispatchesPerPass": policy.agent.max_dispatches_per_pass,
         "maxDispatchesPerDay": policy.agent.max_dispatches_per_day,
+        "dailyCaps": policy.agent.daily_caps,
+        "state": policy.agent.state.as_ref().map(|s| json!({"repository": s.repository, "issue": s.issue})),
+        "tracker": policy.agent.tracker,
+        "project": policy.agent.project,
     });
     let task = format!(
         "{PLAYBOOK}\n## This pass\n\nWhy you run: {reason}.\n\nPolicy:\n\n```json\n{}\n```\n\nHealth report:\n\n```json\n{}\n```\n",
@@ -311,9 +314,14 @@ pub fn validate_batch(source: &str, policy: &Policy) -> Result<Vec<Request>> {
             // The requests issue holds the agents' own comments, and the log
             // quotes them: a run there would read the injected text this
             // closed brief keeps out, and post as the bot.
-            let own = [&policy.agent.requests, &policy.agent.log]
-                .iter()
-                .any(|i| i.repository.eq_ignore_ascii_case(repository) && i.issue == item);
+            let own = [
+                Some(&policy.agent.requests),
+                Some(&policy.agent.log),
+                policy.agent.state.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|i| i.repository.eq_ignore_ascii_case(repository) && i.issue == item);
             ensure!(!own, "The supervisor's own issues are not targets");
             let kind = request["kind"].as_str().unwrap_or_default();
             let pool = request["pool"].as_str().unwrap_or_default();
@@ -419,7 +427,7 @@ const COLLABORATORS: &str = r#"query($owner: String!, $name: String!, $number: I
   repository(owner: $owner, name: $name) { issue(number: $number) {
     locked author { login } editor { login }
     userContentEdits(first: 100) { totalCount nodes { editor { login } } }
-    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url author { login } editor { login } } }
+    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url body author { login } editor { login } } }
   } }
 }"#;
 
@@ -474,6 +482,13 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
         let comments = &issue["comments"];
         for comment in comments["nodes"].as_array().context("comments")? {
             let place = comment["url"].as_str().unwrap_or("a comment").to_owned();
+            // The bot posted it, but the agent chose its words.
+            ensure!(
+                !comment["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains(crate::input::SUPERVISOR_NOTE)),
+                "{place} is the supervisor agent's text"
+            );
             add(&comment["author"], &place)?;
             if !comment["editor"].is_null() {
                 add(&comment["editor"], &place)?;
@@ -508,6 +523,7 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
 /// run on it in flight.
 fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
     let issue = api.get(&format!("/repos/{}/issues/{}", r.repository, r.item))?;
+    ensure!(issue["labels"].is_array(), "Missing issue labels");
     ensure!(
         issue["state"] == "open" && issue.get("pull_request").is_none_or(Value::is_null),
         "Not an open issue"
@@ -521,6 +537,36 @@ fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
     });
     ensure!(!held, "The issue is the operator's or held");
     collaborators(api, &r.repository, r.item)?;
+    if r.kind == "implement" {
+        // The supervisor must not turn an ordinary issue into approved work.
+        // Native parentage and the operator's epic label are read, not supplied
+        // by the request or inferred from links in attacker-controlled prose.
+        let parent = api.get(&format!("/repos/{}/issues/{}/parent", r.repository, r.item))?;
+        let repo = &policy.settings.epics_repository;
+        ensure!(
+            parent["repository_url"] == format!("https://api.github.com/repos/{repo}"),
+            "Parent outside approved plans repository"
+        );
+        let number = parent["number"]
+            .as_u64()
+            .filter(|n| (1..=(1u64 << 53) - 1).contains(n))
+            .context("No approved parent")?;
+        let epic = api.get(&format!("/repos/{repo}/issues/{number}"))?;
+        ensure!(epic["labels"].is_array(), "Missing parent labels");
+        ensure!(
+            epic["state"] == "open" && judgment::has_label(&epic, "epic"),
+            "Parent is not an approved epic"
+        );
+    }
+    ensure!(
+        !in_flight(api, policy, &r.repository, r.item)?,
+        "The issue has a run in flight"
+    );
+    Ok(())
+}
+
+/// Whether a dispatch run on the item is queued or running.
+fn in_flight(api: &dyn Api, policy: &Policy, repository: &str, item: u64) -> Result<bool> {
     let s = policy.settings;
     for status in RUNNING {
         for page in 1.. {
@@ -532,24 +578,24 @@ fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
             let runs = runs["workflow_runs"].as_array().context("workflow runs")?;
             let busy = runs.iter().any(|run| {
                 run_title(run["display_title"].as_str().unwrap_or_default()).is_some_and(
-                    |(_, repo, number)| {
-                        repo.eq_ignore_ascii_case(&r.repository) && number == r.item
-                    },
+                    |(_, repo, number)| repo.eq_ignore_ascii_case(repository) && number == item,
                 )
             });
-            ensure!(!busy, "The issue has a run in flight");
+            if busy {
+                return Ok(true);
+            }
             if runs.len() < 100 {
                 break;
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The dispatches the executor recorded in its log since `since`: a line for
 /// each in its own run records, whatever the agent says. A line not
 /// attempted started nothing; one starting or failed may have.
-fn dispatches_since(api: &dyn Api, policy: &Policy, since: i64) -> Result<usize> {
+fn dispatches_since(api: &dyn Api, policy: &Policy, since: i64, action: &str) -> Result<usize> {
     let IssueRef { repository, issue } = &policy.agent.log;
     let after = encode(&iso(since));
     let mut count = 0;
@@ -569,7 +615,9 @@ fn dispatches_since(api: &dyn Api, policy: &Policy, since: i64) -> Result<usize>
             }
             count += body
                 .lines()
-                .filter(|l| l.starts_with("- `dispatch` ") && !l.ends_with(": not attempted"))
+                .filter(|l| {
+                    l.starts_with(&format!("- `{action}` ")) && !l.ends_with(": not attempted")
+                })
                 .count();
         }
         if comments.len() < 100 {
@@ -605,7 +653,11 @@ fn log_path(log: &IssueRef) -> String {
 
 /// Everything up to the first write: the comment, the batch, every target
 /// and the daily cap. Then the record of what is about to start.
-fn prepare(api: &dyn Api, policy: &Policy, ctx: &Run) -> Result<(Vec<Request>, Option<u64>)> {
+fn prepare(
+    api: &dyn Api,
+    policy: &Policy,
+    ctx: &Run,
+) -> Result<(Vec<judgment::Checked>, Option<u64>)> {
     // A re-run would perform the same batch again, possibly long after the
     // pass that asked for it; the next scheduled pass asks afresh instead.
     ensure!(ctx.attempt == 1, "Only a run's first attempt executes");
@@ -629,7 +681,7 @@ fn prepare(api: &dyn Api, policy: &Policy, ctx: &Run) -> Result<(Vec<Request>, O
                 .as_str(),
         "The requests comment is not the bot's as posted"
     );
-    let requests = validate_batch(
+    let requests = judgment::parse_batch(
         &extract(comment["body"].as_str().unwrap_or_default())?,
         policy,
     )?;
@@ -645,16 +697,19 @@ fn prepare(api: &dyn Api, policy: &Policy, ctx: &Run) -> Result<(Vec<Request>, O
     .validate()
     .context("No default branch to dispatch on")?;
     for r in &requests {
-        preflight(api, policy, r)?;
+        r.preflight(api, policy)?;
     }
     // Counted, then recorded: two executors at once could both count before
     // either records. The caller runs one at a time (supervisor.yml's
     // execute job has a concurrency group of its own).
-    let used = dispatches_since(api, policy, ctx.now - DAY_MS)?;
-    ensure!(
-        (used + requests.len()) as u64 <= policy.agent.max_dispatches_per_day,
-        "The daily dispatch cap is reached"
-    );
+    for action in requests.iter().map(|r| r.action()).collect::<BTreeSet<_>>() {
+        let used = dispatches_since(api, policy, ctx.now - DAY_MS, action)?;
+        let count = requests.iter().filter(|r| r.action() == action).count();
+        ensure!(
+            (used + count) as u64 <= judgment::cap(policy, action),
+            "The daily {action} cap is reached"
+        );
+    }
     // Recorded before the first dispatch and edited with the outcome after,
     // so that a dispatch counts against the cap even when its outcome is
     // never logged.
@@ -688,7 +743,6 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
             };
         }
     };
-    let s = policy.settings;
     let mut ok = true;
     let mut lines = vec![];
     for r in &requests {
@@ -696,25 +750,8 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
             lines.push(format!("- {}: not attempted", r.describe()));
             continue;
         }
-        let sent = api.send(
-            "POST",
-            &format!(
-                "/repos/{}/actions/workflows/{}/dispatches",
-                s.dispatch_repo, s.dispatch_workflow
-            ),
-            &json!({
-                "ref": ctx.default_branch,
-                "inputs": {
-                    "task": r.task(&ctx.run_url),
-                    "repo": r.repository,
-                    // workflow_dispatch inputs are strings.
-                    "item": r.item.to_string(),
-                    "kind": r.kind,
-                    "pool": r.pool,
-                },
-            }),
-        );
-        let link = format!("https://github.com/{}/issues/{}", r.repository, r.item);
+        let sent = r.apply(api, policy, ctx);
+        let link = r.link(policy);
         match sent {
             Ok(_) => lines.push(format!("- {}: done, {link}", r.describe())),
             Err(error) => {

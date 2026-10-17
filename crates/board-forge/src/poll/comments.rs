@@ -646,6 +646,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     repo,
                     number,
                     stop,
+                    &head,
                     &format!("the round on {operator}'s answer was claimed in comment {id} and never recorded; answer again or remove the label"),
                     None,
                 )?;
@@ -687,6 +688,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     repo,
                     number,
                     &marker,
+                    &head,
                     &format!("the run on {operator}'s answer could not be started ({why})"),
                     None,
                 )?;

@@ -3,6 +3,9 @@ use crate::supervise::tests::{board, settings, supervisor};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+#[path = "judgment_tests.rs"]
+mod judgment_tests;
+
 fn pools() -> Value {
     json!({"large": {"agent": "a", "model": "m", "budget": "1"}, "small": {}})
 }
@@ -123,11 +126,12 @@ fn rejects_every_other_action_and_any_field_outside_the_policy() {
             "{r}"
         );
     }
-    // A kind the config lists but that is not triage or research is refused too.
+    // Implementation is admitted only when explicitly enabled in trusted config;
+    // preflight separately requires membership under an epic-labeled plan.
     let mut s = settings();
     s.agent.as_mut().unwrap().kinds = vec!["implement".into(), "research".into()];
     let p = policy(&s);
-    assert!(validate_batch(&lines(&[request(json!({"kind": "implement"}))]), &p).is_err());
+    assert!(validate_batch(&lines(&[request(json!({"kind": "implement"}))]), &p).is_ok());
 }
 
 #[test]
@@ -321,6 +325,11 @@ impl Api for Fake {
             .borrow_mut()
             .push(("GRAPHQL".into(), String::new(), variables.clone()));
         let n = variables["number"].as_u64().unwrap();
+        if query.contains("pullRequest(number:") {
+            return Ok(
+                json!({"repository": {"pullRequest": self.objects.get("conflict").cloned().unwrap_or(Value::Null)}}),
+            );
+        }
         Ok(json!({"repository": {"issue": self.issues.get(&n).cloned().unwrap_or(Value::Null)}}))
     }
 
@@ -334,6 +343,11 @@ impl Api for Fake {
             .push((method.into(), path.into(), body.clone()));
         if self.fail.as_deref() == Some(path) {
             bail!("{method} {path}: HTTP 422");
+        }
+        if path == "/graphql" {
+            return Ok(
+                json!({"data": {"createProjectV2StatusUpdate": {"statusUpdate": {"id": "update"}}}}),
+            );
         }
         let mut id = self.next_id.borrow_mut();
         *id += 1;

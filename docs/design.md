@@ -499,8 +499,8 @@ without the census's board read. `supervise trigger` decides whether the agent
 runs: on a failing check, outside a cooldown, or on the daily pass. It prints
 the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
 the policy and the report. `supervise execute` holds the bot's token. It takes
-the agent's one unedited comment on the requests issue and accepts a single
-kind of request: a triage or research run on an open issue in a `follow`
+the agent's one unedited comment on the requests issue and accepts bounded
+requests: a triage or research run on an open issue in a `follow`
 repository, with a pool from the pools file and one of a fixed set of reasons.
 The executor writes the brief itself. A batch is refused whole if any request
 is invalid, if any issue's body or comments were written or edited by anyone
@@ -510,9 +510,13 @@ if an issue has a dispatch run in flight, or if the batch would pass
 executor's own entries in the log issue, each written before the dispatches it
 names. That count holds only if the caller runs one executor at a time, as
 tracker's execute job does with its own concurrency group. Both caps default
-to zero, which admits nothing. The agent cannot
-enqueue, close, label, comment, cancel, re-run or set variables any more:
-merges, rebases and closing done issues are the poll's and triage runs'. Its
+to zero, which admits nothing. Explicitly enabled implement dispatches additionally
+require native membership under an open, epic-labeled plan. Judgment writes
+(comments, operator-assigned tracker issues, triage-proven closure, conflict-only
+poll hold removal, state replacement and a daily project update) have separate
+trusted-config daily caps, all off by default. See the
+[request protocol and evidence requirements](supervisor-requests.md). It never
+merges, enqueues, changes variables or reads secrets. Its
 settings are the poll's agent-board.json (`--config`), the supervisor's file
 (`--supervisor-config`, tracker's `.github/supervisor/config.json` with
 `agent.maxDispatchesPerPass`, `agent.maxDispatchesPerDay` and `agent.kinds`)
