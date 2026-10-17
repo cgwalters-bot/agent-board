@@ -620,11 +620,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
-        let pool = apply
-            .pools
-            .first()
-            .cloned()
-            .or_else(|| self.config.policy.kind_pools.get("fix").cloned());
+        let candidates = fix_pools(&apply.pools, self.config);
+        let pool = match self.paced(candidates.first().cloned(), &candidates) {
+            Ok(pool) => pool,
+            Err(why) => return Ok(format!("not started: {why}")),
+        };
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
@@ -842,11 +842,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
-        let pool = apply
-            .pools
-            .get((round as usize - 1) % apply.pools.len().max(1))
-            .cloned()
-            .or_else(|| self.config.policy.kind_pools.get("fix").cloned());
+        let candidates = fix_pools(&apply.pools, self.config);
+        let turn = candidates
+            .get((round as usize - 1) % candidates.len().max(1))
+            .cloned();
+        let pool = match self.paced(turn, &candidates) {
+            Ok(pool) => pool,
+            Err(why) => return Ok((false, format!("not started: {why}"))),
+        };
         let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
         let operator = self.config.operator.clone();
         let of = format!(
@@ -984,6 +987,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
+        let kind_pool: Vec<String> = self
+            .config
+            .policy
+            .kind_pools
+            .get(kind)
+            .cloned()
+            .into_iter()
+            .collect();
+        let pool = match self.paced(kind_pool.first().cloned(), &kind_pool) {
+            Ok(pool) => pool,
+            Err(why) => return Ok((false, format!("not started: {why}"))),
+        };
         let (what, path) = if pull {
             ("pull request", "pull")
         } else {
@@ -1046,8 +1061,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "item": item.to_string(),
             "kind": kind,
         });
-        if let Some(pool) = self.config.policy.kind_pools.get(kind) {
-            inputs["pool"] = pool.as_str().into();
+        if let Some(pool) = pool {
+            inputs["pool"] = pool.into();
         }
         let run = match self.dispatch(dispatcher, &workflow, inputs) {
             Ok(run) => run,

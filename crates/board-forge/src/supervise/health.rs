@@ -76,7 +76,7 @@ const HOLD: &str = "needs-human";
 /// Coordinator checkpoints on an epic: `<!-- coordinator/v1: {...} -->`.
 const CHECKPOINT_MARKER: &str = "coordinator/v1";
 /// The usage snapshot comment (tracker's usage.yml) and its JSON's schema.
-const USAGE_MARKER: &str = "<!-- bot-usage v1 -->";
+pub(crate) const USAGE_MARKER: &str = "<!-- bot-usage v1 -->";
 const USAGE_SCHEMA: &str = "bot-usage/v1";
 /// agentic-job's status comment on a run's target ends with this.
 fn status_end(run: u64) -> String {
@@ -398,7 +398,7 @@ fn checkpoint(comments: &[Value], bot: &str) -> Result<Option<Value>> {
 }
 
 /// The JSON of the usage snapshot comment, if it holds one of its schema.
-fn usage_snapshot(body: &str) -> Option<Value> {
+pub(crate) fn usage_snapshot(body: &str) -> Option<Value> {
     let start = if body.starts_with("```json\n") {
         0
     } else {

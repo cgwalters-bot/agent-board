@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub mod comments;
+pub mod pace;
 
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
 // Every GET and GraphQL query of one pass, 304s included. Exhaustion fails the
@@ -302,6 +303,9 @@ pub struct PollPolicy {
     /// counted apart from its fix rounds: a moved base is not the change's
     /// failure (agent-board#109). 0 (the default) charges them as fix rounds.
     pub rebase_rounds: u64,
+    /// `pace`: each run's pool follows the usage snapshot ([`pace`]); none
+    /// (the default) leaves the pools as configured.
+    pub pace: Option<pace::Pace>,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -553,6 +557,7 @@ impl PollPolicy {
                 })
                 .transpose()?
                 .unwrap_or(0),
+            pace: pace::Pace::from_json(value.get("pace"))?,
         })
     }
 }
@@ -582,6 +587,20 @@ pub struct Apply<'a, R> {
     pub workflow: String,
     /// Its `pool` input for each fix round in turn; none leaves its default.
     pub pools: Vec<String>,
+}
+
+/// The pools a fix round takes in turn: `fixPools`, else `kindPools.fix`.
+fn fix_pools(pools: &[String], config: &Config) -> Vec<String> {
+    match pools.is_empty() {
+        true => config
+            .policy
+            .kind_pools
+            .get("fix")
+            .cloned()
+            .into_iter()
+            .collect(),
+        false => pools.to_vec(),
+    }
 }
 
 /// A workflow file name, which goes into an API path with the dispatch token.
@@ -2561,6 +2580,8 @@ struct Pass<'a, R, G> {
     queues: BTreeMap<(String, String), (bool, Vec<Entry>)>,
     /// The broker's outages, read once a pass and only for a failed run.
     outages: Option<Outages>,
+    /// The pools' modes, read once a pass where `pace` is set.
+    paces: Option<pace::Paces>,
 }
 
 /// A merge queue entry: its number and the files it changes, if all were read.
@@ -2934,13 +2955,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // A rebase is picked for as a first fix round is: the toil pool where
         // one is set, as an approved conflict is toil, else the first pool.
         let pool_round = if rebasing { 1 } else { round };
-        let pool = if let Some(raise) = raise {
-            Some(raise.clone())
+        // With `pace`, a pool named for the round is still the only one it
+        // may take, and the fix pools' turn is whichever has most room.
+        let single = |pool: Option<String>| (pool.clone(), pool.into_iter().collect());
+        let (pool, candidates): (Option<String>, Vec<String>) = if let Some(raise) = raise {
+            single(Some(raise.clone()))
         } else if diagnostic {
             // Decide gives the round only where the pool is set.
-            Some(self.config.policy.diagnostic_pool.clone()).filter(|p| !p.is_empty())
+            single(Some(self.config.policy.diagnostic_pool.clone()).filter(|p| !p.is_empty()))
         } else if !toil_pool.is_empty() && pool_round == 1 && toil {
-            Some(toil_pool.clone())
+            single(Some(toil_pool.clone()))
         } else {
             let index = if !continuing
                 && !marker.stopped
@@ -2951,11 +2975,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             } else {
                 pool_round.saturating_sub(1) as usize
             };
-            apply
-                .pools
-                .get(index % apply.pools.len().max(1))
-                .cloned()
-                .or_else(|| self.config.policy.kind_pools.get("fix").cloned())
+            let pools = fix_pools(&apply.pools, self.config);
+            (pools.get(index % pools.len().max(1)).cloned(), pools)
+        };
+        let pool = match self.paced(pool, &candidates) {
+            Ok(pool) => pool,
+            Err(why) => return Ok(format!("not started: {why}")),
         };
         let raising = raise.is_some() && checkpoint.as_ref().is_some_and(|at| at.reason == "cap");
         let raised = carried.raised || raising;
@@ -4217,6 +4242,7 @@ pub fn run<R: Rest, G: Transport>(
         dispatched: 0,
         queues: BTreeMap::new(),
         outages: None,
+        paces: None,
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -4278,6 +4304,9 @@ pub fn run<R: Rest, G: Transport>(
                     .push(format!("operator comments error: {error:#}"));
             }
         }
+    }
+    if let Some(line) = pass.pace_line() {
+        outcome.lines.push(line);
     }
     // What could not be read counts as a change: an API error must not stretch
     // the gap while a pull request may be waiting on it.
@@ -7732,6 +7761,99 @@ mod tests {
                     .as_str()
                     .is_some_and(|s| s.contains(&format!("\"pool\":\"{expected}\"")))
             }));
+        }
+    }
+
+    #[test]
+    fn pace_sends_a_fix_round_to_a_pool_with_room_and_holds_it_when_none_has() {
+        // A pool `passed` hours into a week, having used `used` percent of it.
+        let pool = |used: f64, passed: i64| {
+            let resets = now() + time::Duration::hours(7 * 24 - passed);
+            json!({"used_percent": used, "window_minutes": 7 * 24 * 60,
+                "resets_at": resets.format(&Rfc3339).unwrap()})
+        };
+        let usage = |pools: Value| {
+            let updated = (now() - time::Duration::minutes(1))
+                .format(&Rfc3339)
+                .unwrap();
+            let snapshot = json!({"schema": "bot-usage/v1", "updated_at": updated, "pools": pools});
+            json!([{"user": {"login": BOT}, "body": format!("<!-- bot-usage v1 -->\n```json\n{snapshot}\n```\n")}])
+        };
+        for (case, comments, expected) in [
+            (
+                // Round 2 would be openai's turn.
+                "an openai hold sends the round to claude",
+                usage(json!({"claude": pool(40.0, 84), "openai": pool(26.0, 7)})),
+                Ok("claude"),
+            ),
+            (
+                "every pool held",
+                usage(json!({"claude": pool(90.0, 84), "openai": pool(26.0, 7)})),
+                Err(
+                    "not started: every pool is held (claude until 2026-10-14T21:12Z, openai until 2026-10-13T14:40Z)",
+                ),
+            ),
+            (
+                "missing usage",
+                json!([]),
+                Err("not started: there is no usage snapshot, so new runs wait"),
+            ),
+        ] {
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"mergeable": "CONFLICTING"})));
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "pool": "claude", "sha": "old"}), "old")}]),
+            );
+            fake.page(
+                "repos/o/ops/issues/1/comments?per_page=100",
+                None,
+                None,
+                comments,
+            );
+            let mut cfg = config();
+            cfg.policy.pace = pace::Pace::from_json(Some(
+                &json!({"repository": "o/ops", "issue": 1, "bot": BOT}),
+            ))
+            .unwrap();
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
+            let line = outcome.lines.last().unwrap();
+            assert!(line.starts_with("pools: "), "{case}: {line}");
+            match expected {
+                Ok(expected) => {
+                    assert_eq!(
+                        dispatcher.writes.borrow()[0].1["inputs"]["pool"],
+                        expected,
+                        "{case}"
+                    );
+                    assert!(line.contains("openai held until"), "{line}");
+                }
+                Err(why) => {
+                    // Nothing is claimed, so the next pass tries again.
+                    assert!(dispatcher.writes.borrow().is_empty(), "{case}");
+                    assert!(fake.writes.borrow().is_empty(), "{case}");
+                    assert!(
+                        outcome.lines.iter().any(|l| l.ends_with(why)),
+                        "{case}: {:?}",
+                        outcome.lines
+                    );
+                }
+            }
         }
     }
 
