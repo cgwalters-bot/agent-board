@@ -53,7 +53,8 @@ use exactly these fields in addition to `type` and `action`:
   label are fixed by configuration.
 - `close`: `repository`, `item`, `triage_run` (URL), `triage_comment` (comment ID).
   The configured workflow must have completed a successful triage on this issue;
-  its unedited bot comment must say exactly `Triage found this issue done: URL`
+   its unedited bot comment must contain exactly one `schedule-triage` fenced
+   JSON block with `"verdict":"done"`
   and have been posted during that run. A run link alone is not evidence, nor
   is a receipt followed by a reopen, rename, body edit or further discussion.
 - `remove_needs_human`: `repository`, `item`. Only the poll's hold on a bot pull
@@ -71,6 +72,11 @@ Titles are at most 256 characters. State can hold arbitrary text within the
 your claims about usage. Dispatches also obey `maxDispatchesPerPass`.
 
 The reasons:
+
+The triage dispatch brief asks for a conclusion with evidence and exactly one
+`schedule-triage` fenced JSON block, choosing `done`, `partly`, `not-done` or
+`needs-design` as its `verdict`. Only `done` is close evidence; the named run
+binds the answer to this issue, without a scheduler question's `request` ID.
 
 - `no-plan`: the issue has no accepted job plan.
 - `no-pull-request`: its last implement run ended without a pull request.

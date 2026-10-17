@@ -60,7 +60,7 @@ fn evidence(fake: &mut Fake) {
     fake.objects.insert("/repos/example/project/issues/comments/23".into(), json!({
         "user": {"login": "worker"}, "created_at": "2026-10-16T10:30:00Z", "updated_at": "2026-10-16T10:30:00Z",
         "issue_url": "https://api.github.com/repos/example/project/issues/3",
-        "body": "Triage found this issue done: https://github.com/example/control/actions/runs/22"}));
+        "body": "Done with evidence.\n```schedule-triage\n{\"request\":\"question\",\"verdict\":\"done\"}\n```"}));
     // Discussion and a reopen before the triage, and its run's own status after.
     fake.objects.insert(
         "/repos/example/project/issues/3/comments?per_page=100&page=1".into(),
@@ -376,6 +376,75 @@ fn closure_needs_a_successful_targeted_triage_and_its_unedited_done_finding() {
     refuses(&s, actions()[2].clone(), |f| {
         f.issues.get_mut(&3).unwrap()["lastEditedAt"] = json!(later);
     });
+}
+
+#[test]
+fn closure_reads_exactly_one_scheduler_answer() {
+    let s = configured();
+    for (body, accepted) in [
+        (
+            "```schedule-triage\n{\"verdict\":\"not-done\",\"verdict\":\"done\"}\n```",
+            true,
+        ),
+        (
+            "```schedule-triage\n{\"verdict\":\"done\",\"verdict\":\"not-done\"}\n```",
+            false,
+        ),
+        ("```schedule-triage\r\r\n{\"verdict\":\"done\"}\n```", false),
+        ("```schedule-triage\n{\"verdict\":\"done\"}\r```\n", true),
+        (
+            "```schedule-triage\n{\"verdict\":\"done\",\"extra\":1e400}\n```",
+            true,
+        ),
+        (
+            "```schedule-triage\n{\"verdict\":\"done\",\"extra\":\"\\ud800\"}\n```",
+            true,
+        ),
+        ("```schedule-triage\n{\"verdict\":\"done\"}\n```", true),
+        (
+            "Evidence\n```schedule-triage \t\r\n{\"request\":\"q\",\"verdict\":\"done\",\"extra\":true}\r\n```\r\nMore evidence",
+            true,
+        ),
+        ("```schedule-triage\n{\"verdict\":\"not-done\"}\n```", false),
+        ("```schedule-triage\n{\"verdict\":\"partly\"}\n```", false),
+        (
+            "```schedule-triage\n{\"verdict\":\"needs-design\"}\n```",
+            false,
+        ),
+        (
+            "```schedule-triage\n{\"verdict\":\"done\"}\n```\n```schedule-triage\n{}\n```",
+            false,
+        ),
+        ("```schedule-triage\nnot json\n```", false),
+        ("```schedule-triage\n{}\n```", false),
+        ("```schedule-triage\n{\"verdict\":\"done\"}", false),
+        (" ```schedule-triage\n{\"verdict\":\"done\"}\n```", false),
+        ("```Schedule-triage\n{\"verdict\":\"done\"}\n```", false),
+        (
+            "Triage found this issue done: https://github.com/example/control/actions/runs/22",
+            false,
+        ),
+    ] {
+        let mut fake = Fake::new(&block(&[actions()[2].clone()]));
+        evidence(&mut fake);
+        fake.objects
+            .get_mut("/repos/example/project/issues/comments/23")
+            .unwrap()["body"] = json!(body);
+        assert_eq!(run(&fake, &s, RESULT_URL, 1).ok, accepted, "{body}");
+        if !accepted {
+            assert!(fake.writes().is_empty());
+        }
+    }
+    for at in ["2026-10-16T09:59:59Z", "2026-10-16T11:00:01Z"] {
+        refuses(&s, actions()[2].clone(), |f| {
+            let c = f
+                .objects
+                .get_mut("/repos/example/project/issues/comments/23")
+                .unwrap();
+            c["created_at"] = json!(at);
+            c["updated_at"] = json!(at);
+        });
+    }
 }
 
 #[test]
