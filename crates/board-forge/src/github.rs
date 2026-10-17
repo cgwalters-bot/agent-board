@@ -461,6 +461,12 @@ impl Client {
         Self {
             token,
             agent: ureq::Agent::config_builder()
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        // Honor locally installed CAs, including sandbox egress proxies.
+                        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                        .build(),
+                )
                 .http_status_as_error(false)
                 .timeout_global(Some(std::time::Duration::from_secs(30)))
                 .build()
@@ -1517,6 +1523,17 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::VecDeque;
+
+    #[test]
+    fn client_uses_platform_trust_with_verification_enabled() {
+        let client = Client::with_token("test-key-not-secret".into());
+        let tls = client.agent.config().tls_config();
+        assert!(matches!(
+            tls.root_certs(),
+            ureq::tls::RootCerts::PlatformVerifier
+        ));
+        assert!(!tls.disable_verification());
+    }
 
     struct Recorded {
         responses: RefCell<VecDeque<Value>>,

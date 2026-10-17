@@ -40,6 +40,12 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 
 Rust supporting edition 2024; no prebuilt releases, and not installable with `gh extension install`.
 
+Live HTTPS requests use the platform trust store through rustls-platform-verifier,
+not bundled Mozilla roots. Install sandbox egress proxy or corporate/private CA
+certificates in the system trust store; TLS certificate and hostname verification
+remain enabled. The offline client test checks this verifier selection, not an
+end-to-end TLS handshake with a locally installed CA.
+
     cargo install --git https://github.com/cgwalters-forge/agent-board agent-board
     agent-board item list --snapshot fixtures/board.json   # from a clone, no token
 
