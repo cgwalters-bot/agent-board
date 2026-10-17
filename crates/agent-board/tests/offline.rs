@@ -10,6 +10,37 @@ fn fixture() -> String {
 }
 
 #[test]
+fn readme_credential_free_rehearsal() {
+    let readme = include_str!("../../../README.md");
+    let section = readme
+        .split_once("### Rehearse without credentials\n")
+        .unwrap()
+        .1
+        .split_once("### Connect one lane\n")
+        .unwrap()
+        .0;
+    let commands = section.split_once("```sh\n").unwrap().1;
+    let commands = commands.split_once("```").unwrap().0;
+    let mut count = 0;
+    for line in commands.lines() {
+        let mut args = line.split_whitespace();
+        assert_eq!(args.next(), Some("agent-board"));
+        let output = command()
+            .args(args)
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(!output.stdout.is_empty(), "{line}");
+        count += 1;
+    }
+    assert_eq!(count, 3);
+}
+
+#[test]
 fn decisions_cli_configuration_table() {
     let dir = std::env::temp_dir().join(format!("agent-board-decisions-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

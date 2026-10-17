@@ -51,6 +51,25 @@ end-to-end TLS handshake with a locally installed CA.
 
 ## New organization
 
+### Rehearse without credentials
+
+From a clone of this repository, after [installing](#install), run:
+
+```sh
+agent-board item list --snapshot fixtures/board.json
+agent-board reconcile plan --snapshot fixtures/board.json --emit
+agent-board project view --snapshot fixtures/board.json --json project,coverage
+```
+
+All three should exit 0 without `GH_TOKEN` or `GITHUB_TOKEN`. The fixture is
+sample data, not your staging board: listing it proves the CLI works, the plan
+is a proposal rather than a write, and coverage describes which facts the
+snapshot contains. This does not prove live token access, dispatch, inference,
+review or container isolation. The offline CLI test executes these README
+commands so this starting point stays reproducible.
+
+### Connect one lane
+
 Bring up one lane at a time; a working scripted trial does not establish a
 scheduled real-agent/review loop. Keep writes and scheduling off until their
 previews and prerequisites are checked.
@@ -159,6 +178,36 @@ secrets and effective Projects access, including organization approval and
 token-owner access. The walkthrough could not inspect variable names (403) or
 project schema/access with its own token; connectivity, secret correctness and
 end-to-end success remain unverified. No secret values are needed in this guide.
+
+### Repeat the staging trial
+
+After the prerequisites above are satisfied, use a disposable staging repository
+and project selected by the operator's trusted repository configuration. Do not
+reuse a production board or enable a scheduled applier for this trial. Follow
+the [job-plan format and dispatch commands](docs/job-plans.md): the caller must
+actually accept the plan's inputs before proceeding.
+
+Use at most three small, independent issues: one research task and two harmless
+documentation tasks. Add them with `item add` previews before explicitly applying
+each addition. For each issue, have an accepted writer post a plan, inspect
+`dispatch --dry-run`, then explicitly dispatch it once. Stop at the first failed
+prerequisite; do not work around bounds, expand token permissions blindly, or
+replace an ambiguous dispatch record to force a retry. Keep batching and
+scheduled dispatch off so each result can be attributed to its own plan.
+
+Inspect the dispatch record and linked Actions run, then follow
+`agent-board run record --help` to preview the matching Run/Result update before
+applying it. Verify any returned PR and exact-head review separately; neither a
+successful dispatch nor a recorded run proves the task succeeded. Result linking
+and reconcile repair application are not automatic (see [Commands](#commands)).
+
+Report the date, reviewed workflow revision, non-secret configuration names,
+issue/plan/run/PR links, exact commands and exit statuses, expected versus actual
+results, and every undocumented guess or workaround. Mark unattempted steps as
+unverified, including container execution and CI security claims unless actually
+tested. Record any cleanup failures; only remove scratch objects created by the
+trial. Fix the first blocker and repeat from the published instructions rather
+than treating this checklist as evidence of a successful end-to-end run.
 
 ## Workflows here
 
