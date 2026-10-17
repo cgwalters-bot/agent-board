@@ -461,10 +461,11 @@ by agentic-job, which in v0.5.1 does not rewrite the title or description
 from its commits. With `continuation.retitle: true` (off by default) the poll
 does: a ready pull request of the bot still titled or described as partial
 work (or with the placeholder title), where the newest round is a
-continuation and the head moved since, gets the head commit's subject as its
+continuation or fix and the head moved since, is approved and has green checks,
+gets the head commit's subject as its
 title and the rest of its message as its description, with the old
 description's closing references (`Closes #N`) kept. A failure is fixed first,
-and after a fix round the head commit is the fix's, so a person writes them. A message that is the
+hence no failing or pending checks authorize this edit. A message that is the
 harness's own words, carries a checkpoint, has no body, or does not fit
 GitHub's bounds (256 and 65536 characters) is not copied, and the pull request
 goes to `needs-human` as before. The edit cannot be pinned to the head.
