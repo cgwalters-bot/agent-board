@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 board-core = { path = "../board-core" }
+serde.workspace = true
 serde_json.workspace = true
 url = "2"
 ureq = { version = "3", features = ["json"] }

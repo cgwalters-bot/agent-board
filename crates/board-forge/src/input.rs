@@ -21,6 +21,11 @@ use std::collections::BTreeMap;
 const WRITERS: &[&str] = &["admin", "maintain", "write"];
 /// Distinct accounts whose permission one check reads: each is a request.
 pub const INPUT_LOGIN_LIMIT: usize = 30;
+/// Appended by `supervise execute` to each comment it posts for the
+/// supervisor agent. That text is the agent's, which may be injected, though
+/// it is posted by the write-capable bot; a conversation holding it is not
+/// collaborator input.
+pub const SUPERVISOR_NOTE: &str = "<!-- agent-board-supervisor-note -->";
 
 /// One page of each connection; `hasNextPage` anywhere refuses the item. The
 /// fields are the same on issues and pull requests, but a union's members
@@ -32,16 +37,16 @@ const INPUT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
       ... on Issue {
         locked author { ...Actor }
         userContentEdits(first: 100) { nodes { editor { ...Actor } } pageInfo { hasNextPage } }
-        comments(first: 100) { nodes { url lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
+        comments(first: 100) { nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
       }
       ... on PullRequest {
         locked author { ...Actor }
         userContentEdits(first: 100) { nodes { editor { ...Actor } } pageInfo { hasNextPage } }
-        comments(first: 100) { nodes { url lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
+        comments(first: 100) { nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
         reviews(first: 100) {
           nodes {
-            url lastEditedAt author { ...Actor } editor { ...Actor }
-            comments(first: 100) { nodes { url lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
+            url body lastEditedAt author { ...Actor } editor { ...Actor }
+            comments(first: 100) { nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
           }
           pageInfo { hasNextPage }
         }
@@ -89,6 +94,12 @@ pub fn check<T: Transport + Rest>(client: &T, item: &ItemRef) -> Result<()> {
     }
     for comment in written {
         let url = comment["url"].as_str().unwrap_or("a comment").to_owned();
+        ensure!(
+            !comment["body"]
+                .as_str()
+                .is_some_and(|b| b.contains(SUPERVISOR_NOTE)),
+            "{url} is the supervisor agent's text, not a collaborator's"
+        );
         authors.add(&comment["author"], || url.clone())?;
         // GitHub leaves `editor` null where it cannot name the account, so an
         // edit without one counts as an unknown account's.
@@ -334,6 +345,17 @@ mod tests {
                 ),
                 Err(
                     "an account GitHub does not name wrote an edit of https://github.com/example/intake/issues/7#issuecomment-1",
+                ),
+            ),
+            // The bot is a collaborator, but this text is the supervisor agent's.
+            (
+                set("/comments/nodes/0", {
+                    let mut note = comment(1, login("cgwalters-bot"), Value::Null);
+                    note["body"] = json!(format!("Do this instead.\n\n{SUPERVISOR_NOTE}"));
+                    note
+                }),
+                Err(
+                    "https://github.com/example/intake/issues/7#issuecomment-1 is the supervisor agent's text",
                 ),
             ),
             (

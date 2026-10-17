@@ -39,6 +39,8 @@ pub const POLL_DISPATCH_LIMIT: usize = 3;
 
 // The protocol poll.cjs shares with dispatch.yml and fix.toml in the tracker.
 const MARKER: &str = "tracker-poll";
+#[cfg(test)]
+pub(crate) use tests::conflict_stop_fixture;
 /// This poll's own: the claim a pass posts before it starts a fix round.
 const CLAIM: &str = "agent-board-fix-claim";
 const LABEL: &str = "needs-human";
@@ -2607,6 +2609,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         repo: &str,
         number: u64,
         marker: &Marker,
+        head: &str,
         reason: &str,
         excerpt: Option<&str>,
     ) -> Result<()> {
@@ -2626,10 +2629,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             json!({"labels": [LABEL]}),
             0,
         )?;
-        // A reset starts afresh, so the stop keeps only the count it ends, and
-        // of the queue only the removal it saw, which a reset does not redo.
+        // A reset starts afresh. Keep the stopped head as evidence for the
+        // supervisor's conflict-only hold removal, not as a running round.
+        // Of the queue keep only the removal, which a reset does not redo.
         let mut stop = Marker {
             rounds: marker.rounds,
+            sha: Some(head.to_owned()),
             stopped: true,
             queue: marker.queue.as_ref().map(|q| QueueState {
                 seen: q.seen.clone(),
@@ -2872,6 +2877,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     repo,
                     number,
                     marker,
+                    head,
                     &format!("{name} was claimed in comment {id} and never recorded"),
                     None,
                 )?;
@@ -2934,6 +2940,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     repo,
                     number,
                     &marker,
+                    head,
                     &format!("the fix run could not be started ({why})"),
                     None,
                 )?;
@@ -3055,6 +3062,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                             repo,
                             number,
                             marker,
+                            head,
                             &format!("the refund of {round} lost to comment {id}'s claim, which was never recorded"),
                             None,
                         )?;
@@ -3075,7 +3083,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
-                self.needs_human(repo, number, marker, &decision.reason, excerpt)?;
+                self.needs_human(repo, number, marker, head, &decision.reason, excerpt)?;
                 Ok(Some(format!("labelled {LABEL}")))
             }
             // The bot's own pull request, so its token may edit it. Not pinned
@@ -7924,13 +7932,35 @@ mod tests {
         drop(writes);
 
         // Off (the default), the same pull request goes to a human as before.
-        let (line, _, dispatcher) =
+        let (line, fake, dispatcher) =
             applied_with(json!({}), conflict, json!({"rounds": 2, "sha": "older"}));
         assert!(
             line.ends_with("needs-human: 2 fix rounds used and 488f45ebacd0 still fails (conflicts with main) -> labelled needs-human"),
             "{line}"
         );
         assert!(dispatcher.writes.borrow().is_empty());
+        // The actual stop producer must name the current head, not the previous
+        // fix head: supervise execute only lifts a conflict hold on that head.
+        let writes = fake.writes.borrow();
+        let stop = find_marker(
+            &[json!({"id": 99, "user": {"login": BOT}, "body": writes[2].1["body"]})],
+            BOT,
+        );
+        assert!(stop.stopped);
+        assert_eq!(stop.sha.as_deref(), Some(HEAD));
+    }
+
+    /// Exercise the real producer for the supervisor's offline consumer tests.
+    pub(crate) fn conflict_stop_fixture() -> String {
+        let (_, fake, _) = applied_with(
+            json!({}),
+            json!({"mergeable": CONFLICTING}),
+            json!({"rounds": 2, "sha": "older"}),
+        );
+        fake.writes.borrow()[2].1["body"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     /// A round that completed partial work, marked ready by
@@ -8458,7 +8488,7 @@ mod tests {
         let stop = find_marker(std::slice::from_ref(&restop), BOT);
         assert_eq!(
             (stop.stopped, stop.rounds, stop.sha, stop.run),
-            (true, 2, None, None)
+            (true, 2, Some(HEAD.to_owned()), None)
         );
 
         // The label is taken off again: that stop is claimed and a round starts.

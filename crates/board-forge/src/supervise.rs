@@ -1,7 +1,7 @@
 //! The controller's supervisor, moved from tracker's `.github/supervisor`: a
 //! read-only health pass over the poll, scheduler and dispatch runs
 //! ([`health`]), whether an agent reads its report ([`agent::decide`]), and
-//! an executor that performs the one kind of request that agent may make
+//! an executor that performs only configured, bounded request kinds
 //! ([`agent::execute`]). Its settings are the poll's agent-board.json plus
 //! the supervisor's own file, both from the caller's default branch.
 use crate::github::{API_ROOT, Client, Transport};
@@ -268,6 +268,11 @@ pub struct AgentSettings {
     /// admits none.
     pub max_dispatches_per_pass: u64,
     pub max_dispatches_per_day: u64,
+    /// Judgment writes are disabled unless their daily cap is configured.
+    pub daily_caps: BTreeMap<String, u64>,
+    pub state: Option<IssueRef>,
+    pub tracker: Option<String>,
+    pub project: Option<String>,
 }
 
 /// Everything the supervisor is configured with. None of it may come from a
@@ -452,6 +457,54 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
             .unwrap_or(Some(0))
             .with_context(|| format!("supervisor agent.{key}: 0 to 100"))
     };
+    let daily_caps: BTreeMap<String, u64> = agent
+        .get("dailyCaps")
+        .map(|v| serde_json::from_value(v.clone()).context("supervisor agent.dailyCaps"))
+        .transpose()?
+        .unwrap_or_default();
+    for (kind, cap) in &daily_caps {
+        ensure!(
+            agent::judgment::ACTIONS.contains(&kind.as_str()) && *cap <= 100,
+            "supervisor agent.dailyCaps: unknown action or cap over 100"
+        );
+        ensure!(
+            kind != "status_update" || *cap <= 1,
+            "status updates are capped at one per day"
+        );
+    }
+    let tracker = agent
+        .get("tracker")
+        .map(|v| -> Result<String> {
+            let repo = v.as_str().context("supervisor agent.tracker")?;
+            validate_repository(repo)?;
+            Ok(repo.to_owned())
+        })
+        .transpose()?;
+    let project = agent
+        .get("project")
+        .map(|v| -> Result<String> {
+            let id = v.as_str().context("supervisor agent.project")?;
+            ensure!(
+                !id.is_empty()
+                    && id.len() <= 200
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+                "invalid supervisor project node ID"
+            );
+            Ok(id.to_owned())
+        })
+        .transpose()?;
+    let state = IssueRef::from_json(agent.get("state"), "supervisor agent.state")?;
+    if let Some(state) = &state {
+        ensure!(
+            [&requests, &log]
+                .iter()
+                .all(|i| !i.repository.eq_ignore_ascii_case(&state.repository)
+                    || i.issue != state.issue),
+            "state must differ from requests and log"
+        );
+    }
     Ok(Some(AgentSettings {
         pool: string(agent, "pool", "supervisor agent")?,
         cooldown_hours: agent["cooldownHours"]
@@ -463,6 +516,10 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         kinds: strings(agent.get("kinds"), "supervisor agent.kinds")?,
         max_dispatches_per_pass: cap("maxDispatchesPerPass")?,
         max_dispatches_per_day: cap("maxDispatchesPerDay")?,
+        daily_caps,
+        state,
+        tracker,
+        project,
     }))
 }
 
