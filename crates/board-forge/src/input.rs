@@ -1,4 +1,4 @@
-//! Agent in                body: json!({"permission": found, "role_name": found}),ut from collaborators only (agent-board#111): an issue or pull
+//! Agent input from collaborators only (agent-board#111): an issue or pull
 //! request is fit to hand to a run only when its conversation is locked and
 //! everyone who wrote in it, its body, comments, reviews and review comments
 //! and their edits, has write access to its repository.
@@ -61,6 +61,16 @@ fragment Actor on Actor { __typename login }"#;
 /// the login and where it wrote. `client` needs push access to the repository
 /// to read its collaborators' permissions, so an item elsewhere is refused.
 pub fn check<T: Transport + Rest>(client: &T, item: &ItemRef) -> Result<()> {
+    inspect(client, item, true)
+}
+
+/// [`check`] without the lock: whether everyone who wrote in `item` may write
+/// to its repository, so that the poll may lock it ([`crate::poll`]).
+pub fn check_writers<T: Transport + Rest>(client: &T, item: &ItemRef) -> Result<()> {
+    inspect(client, item, false)
+}
+
+fn inspect<T: Transport + Rest>(client: &T, item: &ItemRef, locked: bool) -> Result<()> {
     ensure!(
         item.host == crate::github::DEFAULT_HOST,
         "input is checked only on github.com"
@@ -77,7 +87,7 @@ pub fn check<T: Transport + Rest>(client: &T, item: &ItemRef) -> Result<()> {
         .with_context(|| format!("{} was not found", item.display()))?;
     let at = item.display();
     ensure!(
-        node["locked"] == true,
+        !locked || node["locked"] == true,
         "{at}: the conversation is not locked, so anyone may add to it; lock it first"
     );
     let mut authors = Authors::default();
@@ -431,5 +441,20 @@ mod tests {
                 (result, expected) => panic!("{result:?} != {expected:?}"),
             }
         }
+        // The poll checks the writers of an item before it locks it.
+        let mut unlocked = pull();
+        unlocked["locked"] = json!(false);
+        let forge = Forge {
+            node: unlocked,
+            permissions,
+            asked: RefCell::default(),
+        };
+        let item = ItemRef {
+            host: "github.com".into(),
+            repository: "example/intake".into(),
+            number: 7,
+        };
+        check_writers(&forge, &item).unwrap();
+        assert!(check(&forge, &item).is_err());
     }
 }

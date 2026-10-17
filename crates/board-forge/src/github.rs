@@ -571,6 +571,7 @@ impl crate::poll::Rest for Client {
         let mut response = match method {
             "POST" => request(self.agent.post(url)),
             "PATCH" => request(self.agent.patch(url)),
+            "PUT" => request(self.agent.put(url)),
             "DELETE" => request(self.agent.delete(url).force_send_body()),
             _ => anyhow::bail!("unsupported method {method}"),
         }

@@ -285,7 +285,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -453,6 +453,17 @@ superseded by a marker restating the state. The runs count against the three a p
 steps above. Each thread acted on gets a decision line; a preview does not
 advance the cursor. The tracker's configuration and the review site's
 status listing are not part of this repository.
+
+`lockCollaboratorItems` (1 to 100; absent by default, which locks nothing)
+is the poll's backstop for the supervisor, whose `supervise execute` takes
+only a locked item (agent-board#139). Each pass, after its other steps, it
+checks up to that many open, unlocked issues and pull requests of the
+followed repositories with the input check `dispatch` makes, and with
+`--apply` locks those with input only from collaborators (`lock_reason`
+`resolved`). An item with anyone else's input stays unlocked, with a line
+saying why, and waits behind the others until it changes. A line counts the
+items locked, left unlocked and not checked. The dispatching check still
+reads the locked conversation whole.
 
 `operatorAnswers` (`true`; absent or `false` by default, which leaves a
 `needs-human` pull request to a person taking the label off) takes the
