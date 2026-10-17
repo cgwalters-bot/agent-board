@@ -2257,23 +2257,28 @@ pub fn decide(
     let unwritten = undescribed(pull);
     if !unwritten.is_empty() {
         let what = unwritten.join(" and ");
-        // Only where a continuation ran and pushed: agentic-job marked the
-        // work ready and the head commit is the continuation's, written for
-        // the title and description. A pull request never continued may be
-        // partial work someone marked ready, which a person looks at.
-        // The newest round must be the continuation: after a fix round, the
-        // head commit is the fix's, which describes the fix, not the change.
-        let continued = marker.continuing && marker.sha.as_deref() != Some(head);
+        // Do not replace an author's description from an unreviewed or
+        // unchanged head. Both continuations and fixes can finish partial
+        // work; a rebase alone is not evidence that the work was completed.
+        let completed = (marker.continuing || marker.rounds > 0)
+            && !marker.rebasing
+            && marker.sha.as_deref().is_some_and(|sha| sha != head);
         if harness
             && config.policy.continuation.retitle
-            && continued
+            && completed
             && !draft
             && head_description(pull).is_some()
         {
+            if review != Some(Review::Approved) || !checks.pending.is_empty() {
+                return step(
+                    "wait",
+                    format!("{what}; waiting for approval and green checks before retitling"),
+                );
+            }
             return step(
                 "retitle",
                 format!(
-                    "{what}; a continuation completed it, so its head commit's message is its title and description"
+                    "{what}; a later round completed it, so its approved head commit's message is its title and description"
                 ),
             );
         }
@@ -2281,7 +2286,7 @@ pub fn decide(
             step(
                 "needs-human",
                 format!(
-                    "{what}, which a fix run cannot change; write the title and description (and see that the work is whole) before removing the label"
+                    "{what}; write the title and description (and see that the work is whole) before removing the label"
                 ),
             )
         } else {
@@ -4942,12 +4947,12 @@ mod tests {
                 None,
             ),
             (
-                "or where a fix round came after the continuation",
+                "a fix round after the continuation can complete it too",
                 "pull-470",
                 json!({"title": partial_title, "message": described, "policy": retitle}),
                 json!({"rounds": 1, "continued": 1, "sha": "older"}),
                 none.clone(),
-                "needs-human",
+                "retitle",
                 None,
             ),
             (
@@ -7928,10 +7933,10 @@ mod tests {
         assert!(dispatcher.writes.borrow().is_empty());
     }
 
-    /// A continuation that completed partial work, marked ready by
+    /// A round that completed partial work, marked ready by
     /// agentic-job, has its title and description set from its head commit.
     #[test]
-    fn a_completed_continuation_is_retitled_from_its_head_commit() {
+    fn a_completed_round_is_retitled_from_its_head_commit() {
         let message = "docs: Explain the exemption\n\nThe review relies on it, so say why.\n";
         let change = |message: &str| {
             let mut p = json!({"title": "[partial: stopped at a limit] Agent run 7", "body": "**Partial work.** Stopped.\n\nCloses #12\nfixes: https://github.com/o/r/issues/3\nCloses the gap."});
@@ -7960,6 +7965,88 @@ mod tests {
             "{line}"
         );
         assert!(!written(&fake.writes).iter().any(|w| w.starts_with("PATCH")),);
+
+        for marker in [
+            json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"}),
+            json!({"rounds": 1, "sha": "older"}),
+            json!({"rounds": 1, "continued": 1, "sha": "older"}),
+        ] {
+            let (line, fake, _) = applied_with(
+                json!({"continuation": {"retitle": true}}),
+                change(message),
+                marker.clone(),
+            );
+            assert!(line.ends_with("-> retitled from its head commit"), "{line}");
+            assert_eq!(
+                fake.writes.borrow()[0].1["title"],
+                "docs: Explain the exemption"
+            );
+            assert_eq!(
+                fake.writes.borrow()[0].1["body"],
+                "The review relies on it, so say why.\n\nCloses #12\nfixes: https://github.com/o/r/issues/3"
+            );
+
+            for contexts in [
+                json!({"review": null}),
+                json!({"ci": {"conclusion": null, "status": "IN_PROGRESS"}}),
+            ] {
+                let mut pending = change(message);
+                pending["contexts"] = contexts;
+                let (line, fake, _) = applied_with(
+                    json!({"continuation": {"retitle": true}}),
+                    pending,
+                    marker.clone(),
+                );
+                assert!(line.contains(" wait: "), "{line}");
+                assert!(fake.writes.borrow().is_empty(), "{line}");
+                let (line, _, _) = applied_with(
+                    json!({"continuation": {"retitle": true}}),
+                    change(message),
+                    marker.clone(),
+                );
+                assert!(line.ends_with("-> retitled from its head commit"), "{line}");
+            }
+
+            for (policy, fields, marker) in [
+                (json!({}), json!({}), marker.clone()),
+                (
+                    json!({"continuation": {"retitle": true}}),
+                    json!({"contexts": {"review": null}}),
+                    marker.clone(),
+                ),
+                (
+                    json!({"continuation": {"retitle": true}}),
+                    json!({"contexts": {"ci": {"conclusion": null, "status": "IN_PROGRESS"}}}),
+                    marker.clone(),
+                ),
+                (
+                    json!({"continuation": {"retitle": true}}),
+                    json!({}),
+                    json!({"rounds": 1, "sha": HEAD}),
+                ),
+                (
+                    json!({"continuation": {"retitle": true}}),
+                    json!({}),
+                    json!({"rounds": 1}),
+                ),
+                (
+                    json!({"continuation": {"retitle": true}}),
+                    json!({}),
+                    json!({"rounds": 1, "rebasing": true, "sha": "older"}),
+                ),
+            ] {
+                let mut pull = change(message);
+                pull.as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let (line, fake, _) = applied_with(policy, pull, marker);
+                assert!(!line.contains("-> retitled"), "{line}");
+                assert!(
+                    !written(&fake.writes).iter().any(|w| w.starts_with("PATCH")),
+                    "{line}"
+                );
+            }
+        }
     }
 
     #[test]
