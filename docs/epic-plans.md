@@ -46,7 +46,7 @@ structural format; runtime checks also enforce the bounds and relationships belo
 
 | `type` | Fields | Mutations |
 |---|---|---|
-| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan` | Create the issue, link it to the epic, enroll it in the project with configured default Priority, and post `plan` as a job plan |
+| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan`, `stacks_on` | Create the issue, link it to the epic, enroll it in the project with configured default Priority, and post `plan` as a job plan |
 | `close_sub_issue` | `issue`, `reason` | Comment the reason, close as not planned |
 | `rescope_sub_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason |
 | `set_priority` | `issue` or `new`, `value` | Set the board's Priority |
@@ -56,6 +56,16 @@ structural format; runtime checks also enforce the bounds and relationships belo
 plan except `repo` and `item`, which are the new issue's. In the dry run's
 output the new issue's number is `NEW-k`, and project fields are named by field
 and option, which apply resolves to node IDs.
+
+`stacks_on` names the slice a new one builds on: `k`, an earlier
+`create_sub_issue` with an implement plan, or `OWNER/REPO#N`, an open
+sub-issue, in the same repository either way. It needs an implement `plan`,
+which gets it as its [`stacks_on`](job-plans.md#stacking) (apply fills in a
+new slice's number), so its run starts from the lower slice's pull request
+branch and its pull request targets that branch. Slices that change the same
+files should stack, in the order they can land; independent slices name no
+`stacks_on` and stay on the default branch. The planning brief that asks for
+these plans is the caller's, and should say so.
 
 ## Refusals
 
@@ -70,7 +80,10 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
   operator's, and an `epic` label on a new issue, which would let the planner
   start epics of its own;
 - a Priority not given with `--priority-option`;
-- unknown fields and action types, anywhere, including in a job plan;
+- unknown fields and action types, anywhere, including in a job plan, and a
+  `stacks_on` in a job plan rather than on its action;
+- a `stacks_on` without an implement plan, or naming anything but an earlier
+  new slice with one or an open sub-issue, of the same repository;
 - two actions of one type on one issue, or any other action on an issue the
   plan closes;
 - a `reason` holding an `` ```agent-board `` fence or a `<!--` marker: it is

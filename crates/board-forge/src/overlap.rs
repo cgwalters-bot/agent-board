@@ -7,10 +7,10 @@
 //! flight on the repository the plan changes, and the run is held back while
 //! it overlaps either, or else run independently.
 //!
-//! Waiting, not stacking: the caller has no input for a base branch and the
-//! poll does not hold a pull request for its dependency, so a run started from
-//! another pull request's head would carry its unmerged commits into a second
-//! pull request that may merge first.
+//! Waiting, not stacking: a guess from named paths does not choose a base.
+//! Only a plan that names the slice it stacks on starts from another pull
+//! request's head ([`crate::stack`]), and that run is not checked here: it
+//! shares the files of the stack below it by design.
 //!
 //! Off unless the caller's configuration names the bot (`dispatch --bot`).
 //! The overlap is a coarse guess: the paths an issue's text names, against

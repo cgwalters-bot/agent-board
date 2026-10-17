@@ -289,6 +289,8 @@ pub fn select<T: Transport>(
                 p.runner == plan.runner && p.pool == plan.pool,
                 "plan asks for another runner or pool"
             );
+            // Its run starts from another branch than the primary's.
+            ensure!(p.stacks_on.is_none(), "plan stacks on another issue");
             let id = plan_id(from)?;
             if let Some(record) = held(transport, &comments, writers, &id, &extra)?.first() {
                 anyhow::bail!("recorded already, {}", record.1.url);

@@ -411,6 +411,16 @@ fn execute<C: Transport + Rest>(
                     if job["item"] == format!("NEW-{k}") {
                         let mut job = job;
                         job["item"] = issue.number.into();
+                        // A slice stacks only on an earlier one, created by now.
+                        if let Some(lower) = job["stacks_on"]
+                            .as_str()
+                            .and_then(|s| s.strip_prefix("NEW-"))
+                        {
+                            let lower = created
+                                .get(&lower.parse::<u64>().context("stacks_on placeholder")?)
+                                .context("stacks_on was not created")?;
+                            job["stacks_on"] = lower.number.into();
+                        }
                         body["body"] =
                             format!("```{}\n{job:#}\n```\n", crate::plan::PLAN_FENCE).into();
                     }
@@ -630,9 +640,11 @@ mod tests {
             }
             if query.contains("addSubIssue(") {
                 self.log("graphql", "link", variables.clone())?;
-                assert_eq!(
-                    variables,
-                    json!({"issueId": "E", "subIssueUrl": "https://github.com/example/work/issues/10"})
+                assert_eq!(variables["issueId"], "E");
+                assert!(
+                    (variables["subIssueUrl"].as_str().unwrap())
+                        .starts_with("https://github.com/example/work/issues/1"),
+                    "{variables}"
                 );
                 return Ok(json!({"addSubIssue": {"issue": {"id": "E"}}}));
             }
@@ -668,7 +680,11 @@ mod tests {
             self.log(method, path, body.clone())?;
             if method == "POST" && path == "repos/example/work/issues" {
                 self.created.set(true);
-                return Ok((201, json!({"number": 10})));
+                // Numbered from 10 in the order created.
+                let made = (self.requests.borrow().iter())
+                    .filter(|(m, p, _)| m == "POST" && p == path)
+                    .count();
+                return Ok((201, json!({"number": 9 + made})));
             }
             if method == "POST" && path == "repos/example/epics/issues/1/comments" {
                 let id = self.comments.borrow().len() as u64 + 1;
@@ -857,6 +873,33 @@ mod tests {
             ["Already claimed; nothing changed."]
         );
         assert_eq!(forge.requests.borrow().len(), requests.len());
+    }
+
+    #[test]
+    fn stacked_slice_plan_names_the_created_lower_issue() {
+        let job = json!({"schema": crate::plan::JOB_PLAN_SCHEMA, "kind": "implement",
+            "runner": "hosted", "brief": "do it"});
+        let forge = Forge::new(json!([
+            {"type": "create_sub_issue", "repo": "example/work", "title": "lower", "body": "a", "plan": job},
+            {"type": "create_sub_issue", "repo": "example/work", "title": "upper", "body": "b",
+             "plan": job, "stacks_on": 1}
+        ]));
+        apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap();
+        let requests = forge.requests.borrow();
+        let jobs: Vec<_> = requests
+            .iter()
+            .filter_map(|(_, target, body)| {
+                let job = crate::plan::JobPlan::from_comment(body["body"].as_str()?).unwrap()?;
+                Some((target.as_str(), job.item, job.stacks_on))
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            [
+                ("repos/example/work/issues/10/comments", 10, None),
+                ("repos/example/work/issues/11/comments", 11, Some(10)),
+            ]
+        );
     }
 
     #[test]

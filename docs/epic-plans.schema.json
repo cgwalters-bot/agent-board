@@ -33,7 +33,8 @@
           "title": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
           "body": {"$ref": "#/$defs/body"},
           "labels": {"type": "array", "maxItems": 10, "items": {"type": "string", "pattern": "\\S"}},
-          "plan": {"$ref": "#/$defs/job"}
+          "plan": {"$ref": "#/$defs/job"},
+          "stacks_on": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 20}, {"$ref": "#/$defs/issue"}]}
         }},
         {"required": ["issue", "reason"], "properties": {
           "type": {"const": "close_sub_issue"}, "issue": {"$ref": "#/$defs/issue"}, "reason": {"$ref": "#/$defs/reason"}

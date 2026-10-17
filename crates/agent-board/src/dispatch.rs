@@ -463,9 +463,24 @@ pub fn from_plan<T: Transport + Rest>(
         number: plan.item,
         ..issue.clone()
     };
+    let (plan, base, stacked) = match plan::stack(&client, &dest, plan, args.bot.as_deref())? {
+        Ok(stack) => stack,
+        Err(wait) => {
+            eprintln!("{}", wait.sentence());
+            eprintln!(
+                "Dry run: the plan in {} would wait; nothing was sent.",
+                from.url
+            );
+            return Ok(());
+        }
+    };
+    if !stacked.is_empty() {
+        eprintln!("{}", stacked.trim_start());
+    }
     let overlap = args
         .bot
         .as_deref()
+        .filter(|_| base.is_none())
         .map(|bot| overlap::decide(&client, &issue, &dest, &plan.brief, bot, &target));
     if let Some(decision) = &overlap {
         eprintln!("{}", decision.sentence());
@@ -477,7 +492,8 @@ pub fn from_plan<T: Transport + Rest>(
         );
         return Ok(());
     }
-    let chosen = batch::select(&client, &issue, &plan, &writers, args.batch.into())?;
+    let batch = if base.is_some() { 0 } else { args.batch.into() };
+    let chosen = batch::select(&client, &issue, &plan, &writers, batch)?;
     if args.collaborators_only {
         plan::check_inputs(&client, &issue, &dest, &chosen.extras)?;
     }
@@ -495,7 +511,7 @@ pub fn from_plan<T: Transport + Rest>(
         brief: batch::brief(&plan, &chosen.extras.iter().collect::<Vec<_>>()),
         ..plan
     }
-    .dispatch_request(&target)?;
+    .dispatch_request(&target, base.as_ref().map(|b| b.branch.as_str()))?;
     serde_json::to_writer(&mut *out, &request)?;
     writeln!(out)?;
     eprintln!(

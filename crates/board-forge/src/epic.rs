@@ -101,6 +101,9 @@ pub enum Action {
         labels: Vec<String>,
         /// Posted on the new issue; its `item` is 0 until the issue exists.
         plan: Option<JobPlan>,
+        /// The slice in the same repository whose pull request the plan's
+        /// run builds on ([`crate::stack`]); posted as the plan's `stacks_on`.
+        stacks_on: Option<Target>,
     },
     Close {
         issue: IssueRef,
@@ -121,7 +124,7 @@ pub enum Action {
 const ACTIONS: &[(&str, &[&str])] = &[
     (
         "create_sub_issue",
-        &["repo", "title", "body", "labels", "plan"],
+        &["repo", "title", "body", "labels", "plan", "stacks_on"],
     ),
     ("close_sub_issue", &["issue", "reason"]),
     ("rescope_sub_issue", &["issue", "body", "reason"]),
@@ -302,6 +305,7 @@ impl EpicPlan {
                     body,
                     labels,
                     plan,
+                    stacks_on,
                 } => {
                     let mut issue = json!({"title": title, "body": body});
                     if !labels.is_empty() {
@@ -318,6 +322,12 @@ impl EpicPlan {
                             "runner": plan.runner, "brief": plan.brief});
                         if !plan.pool.is_empty() {
                             fields["pool"] = json!(plan.pool);
+                        }
+                        // Apply puts the created issue's number in place of NEW-k.
+                        match stacks_on {
+                            Some(Target::Issue(lower)) => fields["stacks_on"] = lower.number.into(),
+                            Some(Target::New(k)) => fields["stacks_on"] = format!("NEW-{k}").into(),
+                            None => {}
                         }
                         let fence = crate::plan::PLAN_FENCE;
                         out.push(rest(
@@ -447,6 +457,43 @@ impl Checker<'_> {
         }
     }
 
+    /// The slice a new one in `repo` stacks on: an open sub-issue (`OWNER/REPO#N`)
+    /// or the position of an earlier create action, in the same repository,
+    /// since a pull request's base is a branch of its own repository.
+    fn lower(&self, value: &Value, repo: &str) -> Result<Target> {
+        let (lower, in_repo) = match value {
+            Value::String(issue) => {
+                let issue = self.sub_issue(issue).context("stacks_on")?;
+                let in_repo = issue.repo.clone();
+                (Target::Issue(issue), in_repo)
+            }
+            Value::Number(k) => {
+                let k = k
+                    .as_u64()
+                    .and_then(|k| usize::try_from(k).ok())
+                    .filter(|k| (1..=self.done.len()).contains(k))
+                    .context("stacks_on is not the position of an earlier action")?;
+                match &self.done[k - 1] {
+                    Some(Action::Create {
+                        repo,
+                        plan: Some(plan),
+                        ..
+                    }) if plan.kind == "implement" => (Target::New(k), repo.clone()),
+                    Some(_) => bail!(
+                        "stacks_on names action {k}, which does not create a sub-issue with an implement plan"
+                    ),
+                    None => bail!("stacks_on names action {k}, which is refused"),
+                }
+            }
+            _ => bail!("stacks_on is neither OWNER/REPO#N nor the position of an earlier action"),
+        };
+        ensure!(
+            in_repo.eq_ignore_ascii_case(repo),
+            "stacks_on is in {in_repo}, not {repo}"
+        );
+        Ok(lower)
+    }
+
     /// One action of a type on any one issue, and nothing else on an issue the
     /// plan closes: either would repeat or contradict.
     fn once(&mut self, kind: &str, key: String) -> Result<()> {
@@ -509,12 +556,23 @@ impl Checker<'_> {
                     None => None,
                     Some(plan) => Some(job_plan(plan, repo).context("plan")?),
                 };
+                let stacks_on = match object.get("stacks_on") {
+                    None => None,
+                    Some(lower) => {
+                        ensure!(
+                            plan.as_ref().is_some_and(|p| p.kind == "implement"),
+                            "stacks_on needs an implement plan, whose run opens the pull request"
+                        );
+                        Some(self.lower(lower, repo)?)
+                    }
+                };
                 Action::Create {
                     repo: repo.into(),
                     title: bounded(object, "title", TITLE_LIMIT)?.into(),
                     body: bounded(object, "body", BODY_LIMIT)?.into(),
                     labels,
                     plan,
+                    stacks_on,
                 }
             }
             "close_sub_issue" | "rescope_sub_issue" => {
@@ -572,6 +630,10 @@ fn job_plan(value: &Value, repo: &str) -> Result<JobPlan> {
             "names {key}, which is the new issue's"
         );
     }
+    ensure!(
+        !object.contains_key("stacks_on"),
+        "names stacks_on, which the action names, as a slice of the epic"
+    );
     object.insert("repo".into(), repo.into());
     // A placeholder that passes the number check; reset below.
     object.insert("item".into(), 1.into());
@@ -813,6 +875,22 @@ mod tests {
         // An empty plan is valid and changes nothing.
         let empty = EpicPlan::validate(&plan(vec![]), &bounds(), &epic).unwrap();
         assert!(empty.mutations(&epic).is_empty());
+        // Slices that stack name a new slice or a current one; their job plans
+        // carry it, a new one's number to be filled in by apply.
+        let mut on_new = create();
+        on_new["stacks_on"] = json!(1);
+        let mut on_current = create();
+        on_current["stacks_on"] = json!("CGWalters-Forge/agent-board#63");
+        let stacked = plan(vec![create(), on_new, on_current]);
+        let checked = EpicPlan::validate(&stacked, &bounds(), &epic).unwrap();
+        let jobs: Vec<Value> = checked
+            .mutations(&epic)
+            .iter()
+            .filter_map(|m| m["body"]["body"].as_str())
+            .filter_map(|b| fenced_json(b, crate::plan::PLAN_FENCE).unwrap())
+            .collect();
+        let stacks: Vec<&Value> = jobs.iter().map(|j| &j["stacks_on"]).collect();
+        assert_eq!(stacks, [&Value::Null, &json!("NEW-1"), &json!(63)]);
     }
 
     /// Each refusal: the actions after the valid ones, and the error for the
@@ -835,7 +913,54 @@ mod tests {
         let mut long_title = create();
         long_title["title"] = json!(long);
         let priority = |issue: &str| json!({"type": "set_priority", "issue": issue, "value": "P1"});
+        let stacked = |lower: Value| {
+            let mut action = create();
+            action["stacks_on"] = lower;
+            action
+        };
+        let mut job_stacked = create();
+        job_stacked["plan"]["stacks_on"] = json!(63);
+        let mut unplanned = stacked(json!(1));
+        unplanned.as_object_mut().unwrap().remove("plan");
+        let mut research = stacked(json!(1));
+        research["plan"]["kind"] = json!("research");
+        let mut tracker_slice = create();
+        tracker_slice["repo"] = json!("cgwalters-forge/tracker");
         for (extra, error) in [
+            // A slice stacks on another of the epic's in its own repository,
+            // named by the action, and only for an implement run.
+            (
+                vec![job_stacked],
+                "plan: names stacks_on, which the action names",
+            ),
+            (vec![unplanned], "stacks_on needs an implement plan"),
+            (vec![research], "stacks_on needs an implement plan"),
+            (
+                vec![stacked(json!(3))],
+                "stacks_on names action 3, which does not create a sub-issue with an implement plan",
+            ),
+            (
+                vec![stacked(json!(6))],
+                "stacks_on is not the position of an earlier action",
+            ),
+            (
+                vec![stacked(json!(0))],
+                "stacks_on is not the position of an earlier action",
+            ),
+            (
+                vec![stacked(json!("cgwalters-forge/agent-board#64"))],
+                "is neither new nor a current sub-issue",
+            ),
+            (
+                vec![stacked(json!("cgwalters-forge/tracker#573"))],
+                "stacks_on is in cgwalters-forge/tracker, not cgwalters-forge/agent-board",
+            ),
+            (
+                vec![tracker_slice, stacked(json!(6))],
+                "stacks_on is in cgwalters-forge/tracker, not cgwalters-forge/agent-board",
+            ),
+            (vec![stacked(json!("dispatch/63"))], "is not OWNER/REPO#N"),
+            (vec![stacked(json!(true))], "stacks_on is neither"),
             // Issues that are neither new nor current sub-issues.
             (
                 vec![

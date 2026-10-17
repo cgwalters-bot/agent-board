@@ -193,7 +193,7 @@ const PULL_QUERY: &str = concat!(
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id number url title body isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
-      baseRepository { nameWithOwner isPrivate }
+      baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
       author { login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
@@ -201,6 +201,7 @@ const PULL_QUERY: &str = concat!(
       mergeQueueEntry { state }
       files(first: 100) { nodes { path } pageInfo { hasNextPage } }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason } } }
+      baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
       commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { contexts(first: 100) { "#,
@@ -228,6 +229,18 @@ const CHECKS_QUERY: &str = concat!(
 /// The most pages of checks read for one head, the first included. Past them
 /// the pull request waits, as it did before any were read on.
 const CHECK_PAGES: usize = 5;
+
+/// The bot's pull requests from a stacked pull request's base branch: the one
+/// below it in the stack ([`crate::stack`]), open or since merged.
+const LOWER_QUERY: &str = r#"query($owner: String!, $name: String!, $branch: String!, $pulls: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(headRefName: $branch, first: $pulls, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { number state baseRefName isCrossRepository author { login } }
+    }
+  }
+}"#;
+/// Pull requests read from one branch; the bot opens one per branch.
+const LOWER_READS: u64 = 10;
 
 /// The entries of a base branch's merge queue, in its order, and their files:
 /// what an approved pull request that changes the same files waits behind.
@@ -955,10 +968,36 @@ fn head_review<'a>(
     config: &Config,
     review_run: Option<&Value>,
 ) -> Option<(Review, &'a str)> {
+    head_verdict(pull, config, review_run).map(|(verdict, r)| (verdict, text(r, "/body")))
+}
+
+/// [`head_review`] with the review itself.
+fn head_verdict<'a>(pull: &'a Value, config: &Config, review_run: Option<&Value>) -> Verdict<'a> {
     let (operator, job) = verdicts(pull, config);
-    operator
-        .or_else(|| job.filter(|(_, r)| review_run_matches(pull, r, review_run, config)))
-        .map(|(verdict, r)| (verdict, text(r, "/body")))
+    operator.or_else(|| job.filter(|(_, r)| review_run_matches(pull, r, review_run, config)))
+}
+
+/// Whether the head's verdict was given against its current base: after the
+/// newest change of its base, if there was one. A review of a stacked pull
+/// request read its change against the branch below it, with that branch's
+/// own review workflow, so once it is retargeted that approval says nothing
+/// of what merging it into the new base brings (agent-board#133). The review
+/// job's run must also have started after the change: one started before ran
+/// the old base's workflow, which could wait out the retarget to approve. A
+/// change whose time cannot be read is taken to be newer than any review.
+fn reviewed_on_base(pull: &Value, config: &Config, review_run: Option<&Value>) -> bool {
+    let Some(change) = nodes(pull, "/baseChange/nodes").last() else {
+        return true;
+    };
+    let Some(changed) = timestamp(change["createdAt"].as_str()) else {
+        return false;
+    };
+    let after = |at: Option<&str>| timestamp(at).is_some_and(|at| at > changed);
+    let operator = verdicts(pull, config).0.is_some();
+    head_verdict(pull, config, review_run).is_some_and(|(_, r)| {
+        after(r["submittedAt"].as_str())
+            && (operator || after(review_run.and_then(|run| run["run_started_at"].as_str())))
+    })
 }
 
 /// The run of the review job a pass reads to decide `pull`: the one its marker
@@ -2392,6 +2431,29 @@ pub fn decide(
     if pull["mergeable"] != "MERGEABLE" {
         return step("wait", format!("mergeability with {base} not known yet"));
     }
+    // A stacked pull request merged into its lower one's branch would carry
+    // its change into that one's unreviewed head; it waits to be retargeted
+    // ([`Pass::stacked`]). An unread default branch is not the base either.
+    let default = text(pull, "/baseRepository/defaultBranchRef/name");
+    if default.is_empty() {
+        return step(
+            "wait",
+            "the default branch is not known; merged only into it",
+        );
+    }
+    if base != default {
+        return step(
+            "wait",
+            format!("its base {base} is not the default branch {default}; merged only into that"),
+        );
+    }
+    // Nothing asks the review job to run again for a new base, so a person
+    // reviews it rather than the poll waiting on it for good.
+    if !reviewed_on_base(pull, config, review_run) {
+        let why =
+            format!("approved before its base became {base}; the head needs a review against it");
+        return step(if harness { "needs-human" } else { "wait" }, why);
+    }
     step("merge", "review approved and checks green")
 }
 
@@ -3737,6 +3799,81 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(())
     }
 
+    /// For the bot's pull request stacked on another's `dispatch/` branch
+    /// ([`crate::stack`]): once the pull request below it merged, the step that
+    /// retargets it to the branch that one merged into, and that branch, so its
+    /// review and merge go on there; a conflict that leaves is then a rebase
+    /// or fix round as any other. With no pull request of the bot from its base
+    /// open or merged, the stack is broken, which is a person's to mend. `None`
+    /// while the one below is open, or for a pull request not stacked.
+    fn stacked(&mut self, repo: &str, pull: &Value) -> Result<Option<(Decision, Option<String>)>> {
+        let base = text(pull, "/baseRefName");
+        let default = text(pull, "/baseRepository/defaultBranchRef/name");
+        if default.is_empty()
+            || base == default
+            || !base.starts_with(crate::stack::STACK_BRANCH_PREFIX)
+            || labelled(pull)
+            || !is_harness(pull, &self.config.bot)
+        {
+            return Ok(None);
+        }
+        let (owner, name) = repo.split_once('/').context("repository")?;
+        self.spend()?;
+        let data = self.graphql.graphql(
+            LOWER_QUERY,
+            json!({"owner": owner, "name": name, "branch": base, "pulls": LOWER_READS}),
+        )?;
+        // The base is a branch of the repository: a fork's branch of the same
+        // name is another branch, whose pull request says nothing of it.
+        let bots: Vec<&Value> = data
+            .pointer("/repository/pullRequests/nodes")
+            .and_then(Value::as_array)
+            .context("pull requests have no nodes")?
+            .iter()
+            .filter(|p| {
+                text(p, "/author/login") == self.config.bot && p["isCrossRepository"] == false
+            })
+            .collect();
+        if bots.iter().any(|p| p["state"] == "OPEN") {
+            return Ok(None);
+        }
+        // The newest, so that an abandoned pull request from a reused branch
+        // does not lend an older one's merge to the commits it left there.
+        let Some(lower) = bots.first().filter(|p| p["state"] == "MERGED") else {
+            return Ok(Some((
+                step(
+                    "needs-human",
+                    format!(
+                        "stacked on {base}, whose newest pull request of {} is not open or merged",
+                        self.config.bot
+                    ),
+                ),
+                None,
+            )));
+        };
+        let number = lower["number"].as_u64().unwrap_or_default();
+        let onto = text(lower, "/baseRefName");
+        // Only where a stack may lead: down it, or to the default branch.
+        if onto != default && crate::stack::validate_branch(onto).is_err() {
+            return Ok(Some((
+                step(
+                    "needs-human",
+                    format!(
+                        "stacked on {base}, whose pull request #{number} merged into {onto}, which is not the default branch or a stacked one"
+                    ),
+                ),
+                None,
+            )));
+        }
+        Ok(Some((
+            step(
+                "retarget",
+                format!("stacked on {base}, whose pull request #{number} merged into {onto}"),
+            ),
+            Some(onto.to_owned()),
+        )))
+    }
+
     /// One pull request's decision line, and whether it is in flight.
     fn pull(
         &mut self,
@@ -3788,6 +3925,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             marker = Marker::default();
         }
         self.more_checks(owner, name, number, &mut pull)?;
+        let stacked = if merge_only {
+            None
+        } else {
+            self.stacked(repo, &pull)?
+        };
         let base = text(&pull, "/baseRefName").to_owned();
         if !required.contains_key(&base) {
             let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
@@ -3909,6 +4051,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 ),
             );
         }
+        // Whatever its checks say of the old base, a broken or moved stack
+        // comes first: a round started against a merged branch is wasted.
+        let mut retarget = None;
+        if let Some((step, onto)) = stacked {
+            // A removal the queue step saw is still recorded with a stop.
+            decision = Decision {
+                queue: decision.queue.take(),
+                ..step
+            };
+            retarget = onto;
+        }
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
         // in its place, so that it cannot hold the round or the stop.
@@ -3922,14 +4075,28 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 Some(format!("Its failing job could not be read ({error})."))
             });
         }
-        let done = match self.apply {
-            Some(_) if !answer.is_empty() => Some(self.answer_round(
+        let done = match (&self.apply, &retarget) {
+            (Some(_), _) if !answer.is_empty() => Some(self.answer_round(
                 repo,
                 &pull,
                 (&marker, &comments),
                 (&answer, &labelled_by),
             )?),
-            Some(_) => self.take(
+            // The bot's own pull request, so its token may edit it. The head is
+            // unchanged, so its approval stands, and the next pass reads how it
+            // fares against the new base.
+            (Some(_), Some(onto)) => {
+                let rest = self.rest;
+                self.send(
+                    rest,
+                    "PATCH",
+                    &format!("repos/{repo}/pulls/{number}"),
+                    json!({"base": onto}),
+                    0,
+                )?;
+                Some(format!("retargeted to {onto}"))
+            }
+            (Some(_), None) => self.take(
                 repo,
                 &pull,
                 &checks,
@@ -3937,7 +4104,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 &decision,
                 review_run.as_ref(),
             )?,
-            None => None,
+            (None, _) => None,
         };
         let line = format!(
             "{repo}#{number} {} {}: {}{}",
@@ -4244,7 +4411,8 @@ mod tests {
         let mut p = fixture(name);
         p["mergeable"] = "MERGEABLE".into();
         // The recordings predate `baseRepository`; the forge is public.
-        p["baseRepository"] = json!({"nameWithOwner": REPO, "isPrivate": false});
+        p["baseRepository"] = json!({"nameWithOwner": REPO, "isPrivate": false,
+            "defaultBranchRef": {"name": "main"}});
         p["baseRefName"] = "main".into();
         let mut change = change.as_object().cloned().unwrap_or_default();
         let contexts = change.remove("contexts");
@@ -5352,7 +5520,7 @@ mod tests {
             (
                 "the review job's approval in a private repository waits",
                 "pull-470",
-                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": true}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
+                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": true, "defaultBranchRef": {"name": "main"}}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
                 json!({"rounds": 0}),
                 none.clone(),
                 "wait",
@@ -5361,7 +5529,7 @@ mod tests {
             (
                 "the review job's approval where privacy is unknown waits",
                 "pull-470",
-                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": null}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
+                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": null, "defaultBranchRef": {"name": "main"}}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
                 json!({"rounds": 0}),
                 none.clone(),
                 "wait",
@@ -6259,7 +6427,7 @@ mod tests {
             ),
             (
                 "a private repository",
-                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": true}}),
+                json!({"baseRepository": {"nameWithOwner": REPO, "isPrivate": true, "defaultBranchRef": {"name": "main"}}}),
                 json!({}),
                 Some("review.yml"),
                 "wait",
@@ -6694,6 +6862,10 @@ mod tests {
         check_pages_head: Option<String>,
         check_pages_total: Option<u64>,
         check_page_reads: RefCell<usize>,
+        /// The pull requests from a stacked pull request's base branch, as
+        /// `LOWER_QUERY` gives them, and the branches it was asked for.
+        lower: Vec<Value>,
+        lower_reads: RefCell<Vec<Value>>,
     }
 
     impl Fake {
@@ -6819,6 +6991,12 @@ mod tests {
                         }},
                     }}]}}}}),
                 );
+            }
+            if query == LOWER_QUERY {
+                self.lower_reads
+                    .borrow_mut()
+                    .push(variables["branch"].clone());
+                return Ok(json!({"repository": {"pullRequests": {"nodes": self.lower}}}));
             }
             assert_eq!(query, PULL_QUERY);
             let number = variables["number"].as_u64().unwrap();
@@ -7714,6 +7892,167 @@ mod tests {
     }
 
     const DISPATCHES: &str = "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches";
+
+    #[test]
+    fn stacked_pull_requests_are_retargeted_and_never_queued() {
+        let comment = format!("POST repos/{REPO}/issues/470/comments");
+        let labelled = vec![
+            format!("POST repos/{REPO}/labels"),
+            format!("POST repos/{REPO}/issues/470/labels"),
+            comment,
+        ];
+        let retargeted = vec![format!("PATCH repos/{REPO}/pulls/470")];
+        // A pull request of the repository's own branch dispatch/469.
+        let lower = |author: &str, state: &str, base: &str| json!({"number": 469, "state": state, "baseRefName": base, "author": {"login": author}, "isCrossRepository": false});
+        let mut forked = lower(BOT, "MERGED", "main");
+        forked["isCrossRepository"] = true.into();
+        let broken = format!(
+            "needs-human: stacked on dispatch/469, whose newest pull request of {BOT} is not open or merged -> labelled needs-human"
+        );
+        #[rustfmt::skip]
+        // Name, the pull requests from #470's base, dispatch/469; then the
+        // line, the bot's writes and the base it retargets to.
+        type Case<'a> = (&'a str, Vec<Value>, String, Vec<String>, Option<&'a str>);
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            // Approved and green, but merged only once its base is the default branch.
+            ("the pull request below is open", vec![lower(BOT, "OPEN", "main")],
+                "wait: its base dispatch/469 is not the default branch main; merged only into that".into(),
+                vec![], None),
+            ("the pull request below merged", vec![lower(BOT, "MERGED", "main")],
+                "retarget: stacked on dispatch/469, whose pull request #469 merged into main -> retargeted to main".into(),
+                retargeted.clone(), Some("main")),
+            // A deeper stack moves down one step.
+            ("it merged into the one below it", vec![lower(BOT, "MERGED", "dispatch/468")],
+                "retarget: stacked on dispatch/469, whose pull request #469 merged into dispatch/468 -> retargeted to dispatch/468".into(),
+                retargeted, Some("dispatch/468")),
+            ("it merged elsewhere", vec![lower(BOT, "MERGED", "release")],
+                "needs-human: stacked on dispatch/469, whose pull request #469 merged into release, which is not the default branch or a stacked one -> labelled needs-human".into(),
+                labelled.clone(), None),
+            ("it was closed", vec![lower(BOT, "CLOSED", "main")], broken.clone(), labelled.clone(), None),
+            // An older merge from a reused branch does not stand for the newest, abandoned one.
+            ("the newest was closed, an older merged",
+                vec![lower(BOT, "CLOSED", "main"), lower(BOT, "MERGED", "main")],
+                broken.clone(), labelled.clone(), None),
+            // Only the bot's pull request from the repository's own branch is the one below.
+            ("someone else's merged", vec![lower("someone", "MERGED", "main")], broken.clone(), labelled.clone(), None),
+            ("the fork's branch of that name merged", vec![forked], broken, labelled, None),
+        ];
+        for (name, pulls, line, writes, onto) in cases {
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull("pull-470", json!({"baseRefName": "dispatch/469"})),
+            );
+            fake.lower = pulls;
+            for path in ["rules/branches", "branches"] {
+                let main = fake.rest[&format!("{API_ROOT}repos/{REPO}/{path}/main")].clone();
+                fake.rest.insert(
+                    format!("{API_ROOT}repos/{REPO}/{path}/dispatch%2F469"),
+                    main,
+                );
+            }
+            fake.answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{REPO}/labels"),
+                vec![(422, json!({}))],
+            );
+            let outcome = applied(&fake, &Fake::default());
+            let got = outcome.lines.last().unwrap();
+            assert!(got.ends_with(&line), "{name}: {got}");
+            assert_eq!(written(&fake.writes), writes, "{name}");
+            assert_eq!(
+                *fake.lower_reads.borrow(),
+                [json!("dispatch/469")],
+                "{name}"
+            );
+            let bases: Vec<Value> = (fake.writes.borrow().iter())
+                .filter(|(w, _)| w.contains("/pulls/470"))
+                .map(|(_, body)| body.clone())
+                .collect();
+            let expected: Vec<Value> = onto.map(|b| json!({"base": b})).into_iter().collect();
+            assert_eq!(bases, expected, "{name}");
+        }
+        // On the default branch nothing is read of a stack; with that branch
+        // unread, it is not merged. Once retargeted, an approval from before
+        // its base changed read it against the branch below, and is for a
+        // person to renew. The review job's run here starts at 00:50 and
+        // approves at 01:00: a run started before the change ran the old
+        // base's workflow, even if it approved after. The operator's approval
+        // at 01:30 counts by itself.
+        let stale =
+            "needs-human: approved before its base became main; the head needs a review against it";
+        let merge = "merge: review approved and checks green";
+        let operator = json!({"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]});
+        for (default, changed, reviews, line) in [
+            (json!({"name": "main"}), None, None, merge),
+            (
+                Value::Null,
+                None,
+                None,
+                "wait: the default branch is not known; merged only into it",
+            ),
+            (
+                json!({"name": "main"}),
+                Some("2026-10-12T00:00:00Z"),
+                None,
+                merge,
+            ),
+            (
+                json!({"name": "main"}),
+                Some("2026-10-12T00:55:00Z"),
+                None,
+                stale,
+            ),
+            (
+                json!({"name": "main"}),
+                Some("2026-10-12T02:00:00Z"),
+                None,
+                stale,
+            ),
+            (json!({"name": "main"}), Some("not a time"), None, stale),
+            (
+                json!({"name": "main"}),
+                Some("2026-10-12T00:55:00Z"),
+                Some(operator.clone()),
+                merge,
+            ),
+            (
+                json!({"name": "main"}),
+                Some("2026-10-12T02:00:00Z"),
+                Some(operator),
+                stale,
+            ),
+        ] {
+            let mut fake = github();
+            let change = match reviews {
+                Some(mut reviews) => {
+                    reviews["nodes"][0]["submittedAt"] = "2026-10-12T01:30:00Z".into();
+                    json!({"reviews": reviews})
+                }
+                None => json!({}),
+            };
+            let mut p = pull("pull-470", change);
+            p["baseRepository"]["defaultBranchRef"] = default;
+            if let Some(at) = changed {
+                p["baseChange"] = json!({"nodes": [{"createdAt": at}]});
+            }
+            fake.pulls.insert(470, p);
+            let outcome = run(
+                &fake,
+                &fake,
+                &config(),
+                State::default(),
+                &[],
+                &[REPO.into()],
+                None,
+                now(),
+            )
+            .unwrap();
+            let got = outcome.lines.last().unwrap();
+            assert!(got.ends_with(line), "{got}");
+            assert!(fake.lower_reads.borrow().is_empty());
+        }
+    }
 
     #[test]
     fn apply_takes_the_step_the_preview_prints() {
