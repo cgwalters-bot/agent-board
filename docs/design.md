@@ -275,8 +275,11 @@ side with poll.cjs (69 passes in tracker#534), agent-board read 54–166 s later
 because poll.yml builds it first, and so often sees what poll.cjs just did; a
 fair comparison runs its pass first or from a prebuilt binary. Activity is printed, not yet handed to a controller pass, and
 the events API serves one page of 100 a pass, so a busier gap is reported as
-such. A pull request with more labels, reviews, commits or checks than its one
-query reads waits rather than being decided on part of them. Required checks come from the base branch's rulesets and its classic
+such. A pull request with more labels, reviews or commits than its one query
+reads waits rather than being decided on part of them; its head's checks are
+read on for up to 5 pages of 100, and past them, or if the head moves or the
+count changes between pages, it waits too. Of a check that ran more than once
+(by the same app, workflow and event), only the newest run counts. Required checks come from the base branch's rulesets and its classic
 protection; a required check that never reported is pending, and a protected
 branch whose requirements cannot be read is an error. It has been exercised against recorded responses only.
 
