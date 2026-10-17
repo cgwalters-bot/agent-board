@@ -123,7 +123,9 @@ previews and prerequisites are checked.
    broker outage issues, so a fix or continuation run that failed during one
    gets its round back instead of `needs-human`, and its optional
    `operatorAnswers` takes the operator's comment on a `needs-human` pull
-   request as the answer, starting a round on it; see
+   request as the answer, starting a round on it, and its optional
+   `rebaseRounds` rebases an approved pull request that only conflicts
+   without using its fix rounds; see
    [poll limits](docs/design.md#current-implementation-limits). Read the
    [board scheduler](https://github.com/cgwalters-forge/tracker/blob/main/README.md#the-board-scheduler)
    and audit dispatch/fix bounds, profiles and pools before enabling
