@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub mod comments;
+pub mod lock;
 pub mod pace;
 
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
@@ -306,6 +307,10 @@ pub struct PollPolicy {
     /// `pace`: each run's pool follows the usage snapshot ([`pace`]); none
     /// (the default) leaves the pools as configured.
     pub pace: Option<pace::Pace>,
+    /// `lockCollaboratorItems`: the open, unlocked items in the followed
+    /// repositories one pass checks, locking those with input only from
+    /// collaborators ([`lock`]); none (the default) locks nothing.
+    pub lock_items: Option<usize>,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -558,6 +563,20 @@ impl PollPolicy {
                 .transpose()?
                 .unwrap_or(0),
             pace: pace::Pace::from_json(value.get("pace"))?,
+            lock_items: value
+                .get("lockCollaboratorItems")
+                .map(|n| {
+                    n.as_u64()
+                        .filter(|n| (1..=lock::LOCK_ITEMS_LIMIT as u64).contains(n))
+                        .map(|n| n as usize)
+                        .with_context(|| {
+                            format!(
+                                "lockCollaboratorItems is not 1 to {}",
+                                lock::LOCK_ITEMS_LIMIT
+                            )
+                        })
+                })
+                .transpose()?,
         })
     }
 }
@@ -661,6 +680,10 @@ pub struct State {
     /// The page of the cursor's search that the next pass reads from, past
     /// the first; none for the first.
     pub operator_page: Option<u64>,
+    /// `lockCollaboratorItems` ([`lock`]): the open, unlocked items whose
+    /// input check refused them, `OWNER/REPO#N` to the `updated_at` it read,
+    /// which go to the back of the next pass's queue until they change.
+    pub lock_refused: BTreeMap<String, String>,
 }
 
 impl State {
@@ -677,7 +700,8 @@ impl State {
                     "interval_seconds",
                     "responses",
                     "operator_cursor",
-                    "operator_page"
+                    "operator_page",
+                    "lock_refused"
                 ]
                 .contains(&key.as_str()),
                 "unknown poll state field {key}"
@@ -719,11 +743,31 @@ impl State {
                     .context("poll state operator_page is out of bounds")
             })
             .transpose()?;
+        let lock_refused = match object.get("lock_refused") {
+            None => BTreeMap::new(),
+            Some(refused) => refused
+                .as_object()
+                .context("poll state lock_refused is not an object")?
+                .iter()
+                .map(|(item, updated)| {
+                    let valid = item.split_once('#').is_some_and(|(repo, number)| {
+                        validate_repository(repo).is_ok() && number.parse::<u64>().is_ok()
+                    });
+                    ensure!(valid, "poll state lock_refused item {item:?}");
+                    let updated = updated
+                        .as_str()
+                        .filter(|u| OffsetDateTime::parse(u, &Rfc3339).is_ok())
+                        .context("poll state lock_refused time")?;
+                    Ok((item.clone(), updated.to_owned()))
+                })
+                .collect::<Result<_>>()?,
+        };
         Ok(Self {
             interval_seconds,
             responses,
             operator_cursor,
             operator_page,
+            lock_refused,
         })
     }
 
@@ -738,6 +782,9 @@ impl State {
         }
         if let Some(page) = self.operator_page {
             state["operator_page"] = page.into();
+        }
+        if !self.lock_refused.is_empty() {
+            state["lock_refused"] = json!(self.lock_refused);
         }
         state
     }
@@ -4308,6 +4355,11 @@ pub fn run<R: Rest, G: Transport>(
     if let Some(line) = pass.pace_line() {
         outcome.lines.push(line);
     }
+    // Last, on what is left of the request budget.
+    let lock_refused = match config.policy.lock_items {
+        Some(limit) => pass.lock(&follow, limit, &state.lock_refused, &mut outcome),
+        None => BTreeMap::new(),
+    };
     // What could not be read counts as a change: an API error must not stretch
     // the gap while a pull request may be waiting on it.
     let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
@@ -4321,6 +4373,7 @@ pub fn run<R: Rest, G: Transport>(
         responses: pass.used,
         operator_cursor,
         operator_page,
+        lock_refused,
     };
     Ok(outcome)
 }
