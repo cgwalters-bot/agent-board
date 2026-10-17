@@ -9,5 +9,5 @@ anyhow.workspace = true
 board-core = { path = "../board-core" }
 serde_json.workspace = true
 url = "2"
-ureq = { version = "3", features = ["json"] }
+ureq = { version = "3", features = ["json", "platform-verifier"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
