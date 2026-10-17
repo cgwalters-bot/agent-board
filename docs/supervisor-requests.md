@@ -78,19 +78,30 @@ and a comment is refused while a dispatch run on its target is in flight.
 
 Closing requires both a successful completed triage run of the configured
 dispatch workflow targeting this exact issue and an unedited comment by the
-configured bot on that issue. Its complete body must be:
+configured bot on that issue. It must contain exactly one `schedule-triage`
+fenced JSON block, parsed like tracker's `.github/poll/schedule.cjs` `readTriage`,
+with a `done` verdict, for example:
 
-```text
-Triage found this issue done: https://github.com/OWNER/tracker/actions/runs/456
+````text
+Completed, with links to evidence.
+```schedule-triage
+{"verdict":"done"}
 ```
+````
+
+Fences are case-sensitive and start in column zero, with optional trailing
+spaces or tabs. Prose and other fields (including a scheduler `request`) are
+allowed; malformed JSON, multiple matching blocks, or any other verdict refuse.
+The supervisor's triage dispatch brief asks for this answer. The named run and
+issue bind it here, rather than a scheduler question's request ID.
 
 The comment must have been created within that run's start/end timestamps.
 The finding must still describe the issue: no reopen or rename event, body
 edit, or comment may follow the receipt, except the bot's own comments before
 the triage run ended.
 `triage_comment` names its comment ID, not an issue number. A run link alone is
-not a done finding. Existing triage runs without this explicit receipt remain
-ineligible; no triage producer or workflow is changed here.
+not a done finding. The old exact-body `Triage found this issue done: URL`
+receipt is no longer accepted.
 
 Removing `needs-human` is only for an open pull request of the bot's: the newest
 label-add event must be the bot's, preceding its newest unedited poll stop

@@ -431,6 +431,89 @@ fn run_id(url: &str, p: &Policy) -> Result<u64> {
     id.parse().context("Malformed triage run ID")
 }
 
+fn triage_answer_done(body: &str) -> bool {
+    // Match tracker's .github/poll/schedule.cjs readTriage VERDICT_RE:
+    // column-zero, case-sensitive fences, optional horizontal whitespace,
+    // exactly one complete block, JSON with a done verdict. The named run
+    // and time window below replace the scheduler's question/request binding.
+    struct Answer {
+        verdict: Value,
+    }
+
+    impl<'de> Deserialize<'de> for Answer {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+            struct Visitor;
+
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Answer;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a triage answer object")
+                }
+
+                fn visit_map<M: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> std::result::Result<Answer, M::Error> {
+                    let mut verdict = Value::Null;
+                    while let Some(key) = map.next_key::<String>()? {
+                        if key == "verdict" {
+                            // JSON.parse keeps the last duplicate key.
+                            verdict = map.next_value()?;
+                        } else {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                    Ok(Answer { verdict })
+                }
+            }
+
+            d.deserialize_map(Visitor)
+        }
+    }
+
+    // JavaScript multiline anchors also recognize CR and Unicode separators;
+    // the opening fence still requires LF (optionally preceded by one CR).
+    let boundary = |c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
+    let starts = std::iter::once(0)
+        .chain(
+            body.char_indices()
+                .filter_map(|(i, c)| boundary(c).then_some(i + c.len_utf8())),
+        )
+        .collect::<Vec<_>>();
+    let mut answer = None;
+    let mut consumed = 0;
+    for &start in &starts {
+        if start < consumed {
+            continue;
+        }
+        let Some(tail) = body[start..].strip_prefix("```schedule-triage") else {
+            continue;
+        };
+        let tail = tail.trim_start_matches([' ', '\t']);
+        let tail = tail.strip_prefix('\r').unwrap_or(tail);
+        let Some(json) = tail.strip_prefix('\n') else {
+            continue;
+        };
+        let json_start = body.len() - json.len();
+        if let Some((end, after)) = starts.iter().filter(|&&i| i >= json_start).find_map(|&i| {
+            let rest = body[i..]
+                .strip_prefix("```")?
+                .trim_start_matches([' ', '\t']);
+            (rest.is_empty() || rest.starts_with(boundary)).then_some((i, body.len() - rest.len()))
+        }) {
+            if answer.is_some() {
+                return false;
+            }
+            consumed = after;
+            // Ignore unrelated fields like readTriage; their numeric range or
+            // escaped Unicode need not fit Rust's typed JSON values.
+            answer = Some(serde_json::from_str::<Answer>(&body[json_start..end]).ok());
+        }
+    }
+    answer.flatten().is_some_and(|v| v.verdict == "done")
+}
+
 fn triage_done(
     api: &dyn Api,
     p: &Policy,
@@ -455,13 +538,12 @@ fn triage_done(
     let c = api.get(&format!("/repos/{repo}/issues/comments/{comment}"))?;
     // A successful run alone says nothing about its finding. Require its explicit
     // done receipt as well, on this issue, rather than trusting request prose.
-    let expected = format!("Triage found this issue done: {url}");
     ensure!(
         c["user"]["login"] == p.settings.bot
             && c["created_at"].is_string()
             && c["updated_at"] == c["created_at"]
             && c["issue_url"] == format!("https://api.github.com/repos/{repo}/issues/{item}")
-            && c["body"] == expected,
+            && c["body"].as_str().is_some_and(triage_answer_done),
         "Missing unedited triage done receipt"
     );
     let at = millis(&c["created_at"]).context("Triage receipt timestamp")?;
