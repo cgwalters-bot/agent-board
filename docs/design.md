@@ -339,6 +339,26 @@ are used, a conflict is a fix round as before. Setting it lets the poll start
 up to that many more runs for a pull request; the cap bounds runs on a base
 that keeps moving under it or a rebase that never lands.
 
+Stacked pull requests ([job plans](job-plans.md#stacking), agent-board#133):
+the poll merges or queues a pull request only into its repository's default
+branch (`defaultBranchRef`; one not read waits), so an approved, green pull
+request stacked on another's branch waits rather than landing on an
+unreviewed head. For the bot's pull request on a `dispatch/` base, it reads
+the bot's pull requests from that branch of the repository itself (at most
+10; a fork's branch of the same name is another branch): while one is open it
+decides as usual; once the newest has merged, it retargets the upper pull
+request to the branch that one merged into, the default branch or a
+`dispatch/` one, with a `PATCH` of its base and no round; with the newest
+closed unmerged, none at all, or a merge into anything else, it labels it
+`needs-human`. A conflict with the new base is then a rebase round under
+`rebaseRounds`, or a fix round, as any conflict is. A head whose verdict
+predates its newest base change (`BaseRefChangedEvent`, also GitHub's own
+retargeting when a merged head branch is deleted), or whose review job run
+started before it, is not merged on it: that review read the change against
+the branch below, with that branch's review workflow. Nothing asks the review
+job to run again, so the bot's pull request goes to `needs-human` for the
+operator to review the head against the new base.
+
 `brokerOutage` (absent by default, which charges every failed run) keeps a
 broker outage from using a round (agent-board#108):
 `{"repository": "OWNER/REPO", "author": "LOGIN", "leadSeconds": N}`, all

@@ -37,13 +37,14 @@ start of a line, holding one JSON object:
 | `runner` | yes | `hosted`, the only runner the caller has |
 | `pool` | no | Inference pool named in the caller's `pools.json`; absent leaves it to the caller's variables |
 | `brief` | yes | The task, at most 16,000 characters; the run gets it after the kind's profile |
+| `stacks_on` | no | Another issue number in `repo` whose pull request this implement run builds on ([stacking](#stacking)) |
 
 Every field maps onto one input of the caller's
 [dispatch.yml](https://github.com/cgwalters-forge/tracker/blob/main/.github/workflows/dispatch.yml)
-(`brief` is `task`). Anything else, including `null` for a field, is refused:
-the base branch, budget, allowed outputs and what a job stacks on have no
-caller input yet, and a plan that names them must not look honoured when it is
-not. A `devspace` runner is refused for the same reason; the caller has no
+(`brief` is `task`; `stacks_on` becomes `base`, a branch dispatch finds).
+Anything else, including `null` for a field, is refused: the base branch,
+budget and allowed outputs have no caller input yet, and a plan that names
+them must not look honoured when it is not. A `devspace` runner is refused for the same reason; the caller has no
 devspace runner for upstream forks yet. Each is added to the schema when the
 caller can carry it. One plan per comment; a comment with two is refused.
 
@@ -174,11 +175,47 @@ Then:
   written, `waiting=true` goes to stdout, and the next pass decides again;
 - otherwise the issue runs independently.
 
-The run is not stacked on an overlapping pull request: the caller has no input
-for a base branch, and the poll does not hold a pull request until one it
-depends on merges, so a stacked run's pull request would carry the other's
-unmerged commits and could merge first.
+The run is not stacked on an overlapping pull request it was not planned to
+stack on: a guess from named paths does not choose a base. A run that
+[stacks](#stacking) is not checked for overlap.
 
 Each record (the primary's and each extra's) ends with the decision. A check
 that cannot read runs the issue independently, as without `--bot`: it is a
 scheduling heuristic, not a boundary. `--dry-run` prints the decision on stderr.
+
+## Stacking
+
+Slices of one piece of work that change the same files stack instead of
+conflicting while they wait
+([#133](https://github.com/cgwalters-forge/agent-board/issues/133)). An
+implement plan with `stacks_on: N` (an issue of its own `repo`, usually set by
+an [epic plan](epic-plans.md)) is dispatched only with `--bot`, and then:
+
+- with one open pull request of the bot from a `dispatch/` branch of `repo`
+  itself whose description closes #N (`Closes #N`, `OWNER/REPO#N` or the
+  issue's URL), among the repository's newest 50 open ones, the request
+  carries that branch as the `base` input, the run's task says what it stacks
+  on and asks the pull request description to begin with `Stacks on #P.`, and
+  the record says `Stacked on URL (branch)`. The run is neither checked for
+  overlap, as it shares the files of the stack below it by design, nor batched;
+- with #N open and no such pull request, it waits, as an overlap does, naming
+  why; with two, it is refused;
+- with #N closed, it runs on the default branch like any plan, and the record
+  says it was not stacked.
+
+A read that fails refuses the dispatch rather than running it unstacked. The
+base is never the plan's to name: only the bot's own `dispatch/` branch can
+become the code a run starts from, so a visitor's pull request that claims to
+close #N, or a release branch, cannot. A pull request's base is a branch of
+its own repository, so a lower pull request from the bot's fork, where
+dispatch pull requests come from today, is not one to stack on: the upper
+slice waits. A plan without `stacks_on` sends no `base`, so a caller without
+that input is unaffected; a stacked one needs the caller to take `base`, to
+open the lower slice's pull request from a `dispatch/` branch of the target
+repository, and its bounds to allow such bases. That is the caller's part.
+
+The poll keeps the stack moving: it never merges or queues a pull request
+whose base is not the repository's default branch, and when the bot's newest
+pull request from that base has merged it retargets the upper one to the
+branch that one merged into. An approval from before the base changed does
+not merge it (see [the design](design.md)).

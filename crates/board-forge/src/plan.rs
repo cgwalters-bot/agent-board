@@ -35,7 +35,16 @@ pub const PLAN_BRIEF_LIMIT: usize = 16_000;
 /// since the newest plan could be in the part not read.
 pub const PLAN_COMMENT_PAGES: usize = 10;
 const POOL_LIMIT: usize = 32;
-const FIELDS: &[&str] = &["schema", "repo", "item", "kind", "runner", "pool", "brief"];
+const FIELDS: &[&str] = &[
+    "schema",
+    "repo",
+    "item",
+    "kind",
+    "runner",
+    "pool",
+    "brief",
+    "stacks_on",
+];
 
 const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -60,6 +69,9 @@ pub struct JobPlan {
     pub pool: String,
     /// The task, given to the run after the kind's profile.
     pub brief: String,
+    /// An issue in `repo` whose open pull request this run builds on
+    /// ([`crate::stack`]): an implement run only, and never the plan's own item.
+    pub stacks_on: Option<u64>,
 }
 
 impl JobPlan {
@@ -116,6 +128,20 @@ impl JobPlan {
             brief.chars().count() <= PLAN_BRIEF_LIMIT,
             "plan brief exceeds {PLAN_BRIEF_LIMIT} characters"
         );
+        let stacks_on = match object.get("stacks_on") {
+            None => None,
+            Some(lower) => Some(
+                lower
+                    .as_u64()
+                    .filter(|n| (1..1 << 53).contains(n) && *n != item)
+                    .context("plan stacks_on is not another positive issue number")?,
+            ),
+        };
+        // Only an implement run opens a pull request to stack.
+        ensure!(
+            stacks_on.is_none() || kind == "implement",
+            "plan stacks_on needs kind implement"
+        );
         Ok(Self {
             repo: repo.into(),
             item,
@@ -123,6 +149,7 @@ impl JobPlan {
             runner: runner.into(),
             pool: pool.into(),
             brief: brief.into(),
+            stacks_on,
         })
     }
 
@@ -136,15 +163,24 @@ impl JobPlan {
     }
 
     /// The REST request that dispatches this plan, as the GitHub API takes it.
-    /// The inputs are dispatch.yml's, and the plan's own: nothing is added.
-    pub fn dispatch_request(&self, target: &Target) -> Result<Value> {
+    /// The inputs are dispatch.yml's, and the plan's own; a stacked plan's
+    /// `base` is the branch [`crate::stack::resolve`] found, and only a
+    /// stacked plan sends one, so a caller without that input is unaffected.
+    pub fn dispatch_request(&self, target: &Target, base: Option<&str>) -> Result<Value> {
         target.validate()?;
+        ensure!(
+            base.is_some() == self.stacks_on.is_some(),
+            "a base branch is sent for a stacked plan only, and always for one"
+        );
+        if let Some(base) = base {
+            crate::stack::validate_branch(base)?;
+        }
         let Target {
             caller,
             workflow,
             git_ref,
         } = target;
-        Ok(json!({
+        let mut request = json!({
             "method": "POST",
             "url": format!("{API_ROOT}repos/{caller}/actions/workflows/{workflow}/dispatches"),
             "body": {
@@ -158,7 +194,11 @@ impl JobPlan {
                     "pool": self.pool,
                 },
             },
-        }))
+        });
+        if let Some(base) = base {
+            request["body"]["inputs"]["base"] = base.into();
+        }
+        Ok(request)
     }
 }
 
@@ -475,6 +515,46 @@ pub fn check_inputs<T: Transport + Rest>(
     Ok(())
 }
 
+/// A plan as [`stack`] leaves it: the plan to dispatch, the base its run
+/// starts from, and the sentence its record carries.
+pub type Stacked = (JobPlan, Option<crate::stack::Base>, String);
+
+/// What a plan's `stacks_on` makes of it ([`crate::stack`]): on the lower
+/// slice's open pull request, the plan with the stack in its brief and that
+/// pull request's branch as its base; with the lower slice closed, the plan
+/// unstacked; with neither, `Err` with the wait. A plan that stacks on
+/// nothing is returned as it is, and reads nothing.
+pub fn stack<T: Transport>(
+    client: &T,
+    dest: &ItemRef,
+    plan: JobPlan,
+    bot: Option<&str>,
+) -> Result<std::result::Result<Stacked, Decision>> {
+    let Some(lower) = plan.stacks_on else {
+        return Ok(Ok((plan, None, String::new())));
+    };
+    // Whose pull requests count is the caller's configuration, never the plan's.
+    let bot = bot.context(
+        "a plan that stacks_on another issue needs --bot, whose pull request its run starts from",
+    )?;
+    Ok(match crate::stack::resolve(client, dest, lower, bot)? {
+        crate::stack::Stack::Wait(why) => Err(Decision::Wait(why)),
+        crate::stack::Stack::Unstacked(why) => Ok((
+            JobPlan {
+                stacks_on: None,
+                ..plan
+            },
+            None,
+            format!(" Not stacked: {why}."),
+        )),
+        crate::stack::Stack::On(base) => {
+            let sentence = format!(" Stacked on {} (`{}`).", base.url, base.branch);
+            let brief = crate::stack::brief(&plan.brief, dest, lower, &base);
+            Ok((JobPlan { brief, ..plan }, Some(base), sentence))
+        }
+    })
+}
+
 /// One issue's record of a dispatch: the comment and the plan it records.
 struct Record {
     issue: ItemRef,
@@ -556,8 +636,23 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
         number: plan.item,
         ..issue.clone()
     };
-    let overlap =
-        bot.map(|bot| crate::overlap::decide(client, issue, &dest, &plan.brief, bot, target));
+    let (plan, base, stacked) = match stack(client, &dest, plan, bot)? {
+        Ok(stack) => stack,
+        Err(wait) => {
+            return Ok(Dispatched {
+                record: None,
+                run: None,
+                batched: vec![],
+                notes: vec![],
+                overlap: Some(wait),
+            });
+        }
+    };
+    // A stacked run shares the files of the stack below it by design: its
+    // plan, not a guess from paths, decided how it runs.
+    let overlap = bot
+        .filter(|_| base.is_none())
+        .map(|bot| crate::overlap::decide(client, issue, &dest, &plan.brief, bot, target));
     if let Some(Decision::Wait(_)) = overlap {
         // Unrecorded, so the next pass decides again on fresh state.
         return Ok(Dispatched {
@@ -571,7 +666,10 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     let note = overlap
         .as_ref()
         .map(|d| format!(" {}", d.sentence()))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        + &stacked;
+    // A batch's other issues would land on the lower slice's branch too.
+    let batch = if base.is_some() { 0 } else { batch };
     let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
     if collaborators {
         check_inputs(client, issue, &dest, &chosen.extras)?;
@@ -581,7 +679,7 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
             brief: crate::batch::brief(&plan, extras),
             ..plan.clone()
         }
-        .dispatch_request(target)
+        .dispatch_request(target, base.as_ref().map(|b| b.branch.as_str()))
     };
     // Built before anything is written, so a bad request posts no record.
     request(&chosen.extras.iter().collect::<Vec<_>>())?;
@@ -867,12 +965,28 @@ mod tests {
             // Fields the caller has no input for are refused, not dropped.
             ("budget", json!(500), "unknown plan field \"budget\""),
             ("base", json!("main"), "unknown plan field \"base\""),
+            // The plan names the slice it stacks on, never a branch.
+            ("stacks_on", Value::Null, "another positive issue number"),
+            ("stacks_on", json!(0), "another positive issue number"),
+            ("stacks_on", json!("3664"), "another positive issue number"),
+            (
+                "stacks_on",
+                json!("dispatch/x"),
+                "another positive issue number",
+            ),
+            ("stacks_on", json!(3665), "another positive issue number"),
         ] {
             let mut edited = plan();
             edited[key] = value;
             let message = format!("{:#}", JobPlan::from_json(&edited).unwrap_err());
             assert!(message.contains(error), "{key}: {message}");
         }
+        let mut stacked = plan();
+        stacked["stacks_on"] = json!(3664);
+        assert_eq!(JobPlan::from_json(&stacked).unwrap().stacks_on, Some(3664));
+        stacked["kind"] = json!("research");
+        let message = JobPlan::from_json(&stacked).unwrap_err().to_string();
+        assert!(message.contains("needs kind implement"), "{message}");
         for key in ["schema", "repo", "item", "kind", "runner", "brief"] {
             let mut missing = plan();
             missing.as_object_mut().unwrap().remove(key);
@@ -1077,7 +1191,7 @@ mod tests {
     fn dispatch_request_carries_only_the_plan() {
         let plan = JobPlan::from_json(&plan()).unwrap();
         assert_eq!(
-            plan.dispatch_request(&target()).unwrap(),
+            plan.dispatch_request(&target(), None).unwrap(),
             json!({
                 "method": "POST",
                 "url": "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches",
@@ -1109,9 +1223,25 @@ mod tests {
                 git_ref: git_ref.into(),
             };
             assert!(
-                plan.dispatch_request(&target).is_err(),
+                plan.dispatch_request(&target, None).is_err(),
                 "{caller} {workflow} {git_ref}"
             );
+        }
+        // Only a stacked plan sends a base, always one, and only a dispatch/ branch.
+        let stacked = JobPlan {
+            stacks_on: Some(3664),
+            ..plan.clone()
+        };
+        let request = stacked
+            .dispatch_request(&target(), Some("dispatch/3664"))
+            .unwrap();
+        assert_eq!(request["body"]["inputs"]["base"], "dispatch/3664");
+        for (plan, base) in [
+            (&plan, Some("dispatch/3664")),
+            (&stacked, None),
+            (&stacked, Some("main")),
+        ] {
+            assert!(plan.dispatch_request(&target(), base).is_err(), "{base:?}");
         }
     }
 
@@ -1153,6 +1283,9 @@ mod tests {
         overlap: Value,
         /// Items the collaborator check read, OWNER/REPO#N.
         checked: RefCell<Vec<String>>,
+        /// For a stacked plan, the lower issue's state and the open pull
+        /// requests ([`crate::stack::resolve`]); null when none is expected.
+        stack: Value,
     }
 
     const ISSUE: &str = "https://github.com/cgwalters-forge/tracker/issues/540";
@@ -1183,6 +1316,7 @@ mod tests {
                 pulled: Default::default(),
                 overlap: Value::Null,
                 checked: Default::default(),
+                stack: Value::Null,
             }
         }
 
@@ -1228,6 +1362,14 @@ mod tests {
                 assert!(!self.family.is_null(), "unexpected epic read");
                 ensure!(self.family != "fail", "epic unreadable");
                 return Ok(self.family.clone());
+            }
+            if query.contains("headRefName") {
+                assert!(!self.stack.is_null(), "unexpected stack read");
+                assert_eq!(
+                    (&variables["name"], &variables["number"]),
+                    (&json!("ostree"), &json!(3664))
+                );
+                return Ok(self.stack.clone());
             }
             if query.contains("pullRequests(") {
                 assert!(!self.overlap.is_null(), "unexpected overlap read");
@@ -1971,6 +2113,113 @@ mod tests {
             .is_err()
         );
         assert_eq!(forge.reads.get(), 0);
+    }
+
+    #[test]
+    fn stacked_plan_dispatches_on_the_lower_slices_branch() {
+        // Two slices of ostree: #3665's plan stacks on #3664, whose run opened
+        // #9 from dispatch/3664, which changes the same file.
+        let mut p = plan();
+        p["stacks_on"] = json!(3664);
+        let planned = node(7, PLANNER, "2026-10-13T10:00:00Z", &body(&p));
+        let lower = json!({"number": 9, "author": {"login": "agentic-bot"},
+            "headRefName": "dispatch/3664", "body": "Work.\n\nCloses #3664",
+            "isCrossRepository": false, "files": {"nodes": [{"path": "src/safe_outputs.rs"}]}});
+        let mut forked = lower.clone();
+        forked["isCrossRepository"] = true.into();
+        let none_yet = "it stacks on ostreedev/ostree#3664, which has no open pull request of agentic-bot from a dispatch/ branch of ostreedev/ostree among the newest 50";
+        let stack = |state: &str, pulls: Value| json!({"repository": {"issue": {"state": state}, "pullRequests": {"nodes": pulls}}});
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        // Name, the lower issue's state and pull requests; then the base sent
+        // (none: nothing ran) and what the record ends with, or the wait.
+        for (name, state, pulls, base, says) in [
+            (
+                "on the lower pull request",
+                "OPEN",
+                json!([lower]),
+                Some("dispatch/3664"),
+                "Stacked on https://github.com/ostreedev/ostree/pull/9 (`dispatch/3664`).",
+            ),
+            (
+                "no lower pull request yet",
+                "OPEN",
+                json!([]),
+                None,
+                none_yet,
+            ),
+            // Its base would be a branch of the fork, which no pull request
+            // of ostree can target.
+            (
+                "lower pull request from the fork",
+                "OPEN",
+                json!([forked]),
+                None,
+                none_yet,
+            ),
+            (
+                "lower slice closed",
+                "CLOSED",
+                json!([]),
+                Some(""),
+                "Not stacked: ostreedev/ostree#3664 is closed, so it runs on the default branch.",
+            ),
+        ] {
+            let forge = Forge {
+                stack: stack(state, pulls.clone()),
+                // Read only for an unstacked run, which then runs alone.
+                family: json!("fail"),
+                overlap: json!({"text": "Fix safe_outputs.rs.", "pulls": pulls, "runs": []}),
+                ..Forge::new(vec![planned.clone()], vec![])
+            };
+            let dispatcher = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
+            let done = dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                3,
+                Some("agentic-bot"),
+                false,
+            )
+            .unwrap();
+            let dispatches = dispatcher.dispatches.borrow();
+            let Some(base) = base else {
+                // Nothing is written, so the next pass decides again.
+                assert!(dispatches.is_empty(), "{name}");
+                assert_eq!(forge.bodies().len(), 1, "{name}");
+                assert_eq!(done.overlap, Some(Decision::Wait(says.into())), "{name}");
+                continue;
+            };
+            let inputs = &dispatches[0]["inputs"];
+            let task = inputs["task"].as_str().unwrap();
+            let record = forge.bodies().last().unwrap().clone();
+            assert!(record.ends_with(says), "{name}: {record}");
+            if base.is_empty() {
+                assert!(inputs.get("base").is_none(), "{name}");
+                assert_eq!(task, p["brief"], "{name}");
+                continue;
+            }
+            // Its pull request says what it stacks on; the lower one's files
+            // are not an overlap to wait for, and nothing is batched onto it.
+            assert_eq!(inputs["base"], base, "{name}");
+            assert!(task.starts_with(p["brief"].as_str().unwrap()), "{name}");
+            assert!(
+                task.contains("stacks on ostreedev/ostree#9 (https://github.com/ostreedev/ostree/pull/9), the pull request for #3664: the run starts from its branch `dispatch/3664`"),
+                "{name}: {task}"
+            );
+            assert!(task.contains("\"Stacks on #9.\""), "{name}: {task}");
+            assert!(done.notes.is_empty() && done.batched.is_empty(), "{name}");
+        }
+        // Whose pull request it stacks on is the caller's to say: without
+        // --bot a stacked plan is refused before anything is written.
+        let forge = Forge::new(vec![planned], vec![]);
+        let error = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs --bot"), "{error}");
+        assert_eq!(forge.bodies().len(), 1);
     }
 
     #[test]
