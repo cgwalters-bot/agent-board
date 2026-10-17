@@ -73,7 +73,8 @@ const WORKFLOWS_DIR: &str = ".github/workflows/";
 /// The connections of `PULL_QUERY` the decision reads as whole. One that is not
 /// known to be complete (more than the query asks for, or no `pageInfo`)
 /// leaves the pull request waiting: a label, a change request, a failed check
-/// or a placeholder subject past the cut would otherwise go unseen.
+/// or a placeholder subject past the cut would otherwise go unseen. Checks are
+/// read on with `CHECKS_QUERY` first, up to [`CHECK_PAGES`].
 const CONNECTIONS: &[(&str, &str)] = &[
     ("/labels/pageInfo/hasNextPage", "labels"),
     ("/reviews/pageInfo/hasPreviousPage", "reviews"),
@@ -175,7 +176,20 @@ const FAILED_RUNS: &[&str] = &["failure", "timed_out"];
 const MERGE: &str = "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: REBASE, expectedHeadOid: $head}) { clientMutationId } }";
 const ENQUEUE: &str = "mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { clientMutationId } }";
 
-const PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+/// What `PULL_QUERY` and `CHECKS_QUERY` read of each check, so a later page
+/// is read as the first one is.
+macro_rules! check_fields {
+    () => {
+        r#"nodes {
+        __typename
+        ... on CheckRun { id databaseId name status conclusion detailsUrl checkSuite { app { databaseId } workflowRun { event workflow { databaseId } } } isRequired(pullRequestNumber: $number) }
+        ... on StatusContext { id context state targetUrl description isRequired(pullRequestNumber: $number) }
+      } totalCount pageInfo { hasNextPage endCursor }"#
+    };
+}
+
+const PULL_QUERY: &str = concat!(
+    r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id number url title body isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
@@ -189,14 +203,31 @@ const PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
-      commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { contexts(first: 100) { nodes {
-        __typename
-        ... on CheckRun { name status conclusion detailsUrl checkSuite { app { databaseId } } isRequired(pullRequestNumber: $number) }
-        ... on StatusContext { context state targetUrl description isRequired(pullRequestNumber: $number) }
-      } pageInfo { hasNextPage } } } } } }
+      commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { contexts(first: 100) { "#,
+    check_fields!(),
+    r#" } } } } }
     }
   }
-}"#;
+}"#
+);
+
+/// The rest of a head's checks, a page after `$after` (cgwalters-forge/agent-board#129):
+/// re-running a review adds a second set of check runs, which can take a pull
+/// request past one page.
+const CHECKS_QUERY: &str = concat!(
+    r#"query($owner: String!, $name: String!, $number: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100, after: $after) { "#,
+    check_fields!(),
+    r#" } } } } }
+    }
+  }
+}"#
+);
+/// The most pages of checks read for one head, the first included. Past them
+/// the pull request waits, as it did before any were read on.
+const CHECK_PAGES: usize = 5;
 
 /// The entries of a base branch's merge queue, in its order, and their files:
 /// what an approved pull request that changes the same files waits behind.
@@ -785,33 +816,64 @@ pub struct Checks {
 /// nothing is judged on all its checks.
 pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
     type Check<'a> = (&'a str, Option<&'a str>, bool, &'a str, Option<u64>);
-    let checks: Vec<Check<'_>> = nodes(
+    let all_runs = nodes(
         pull,
         "/commits/nodes/0/commit/statusCheckRollup/contexts/nodes",
-    )
-    .iter()
-    .map(|c| {
-        let flag = c["isRequired"].as_bool().unwrap_or(false);
-        if c["__typename"] == "CheckRun" {
-            let state = if c["status"] == "COMPLETED" {
-                c["conclusion"].as_str().unwrap_or("")
-            } else {
-                "PENDING"
-            };
+    );
+    // A re-run (or a close and reopen) leaves the old run of a check next to
+    // the new one; only the newest of each is decided on. A run is the same
+    // check only from the same app, workflow and event, so a same-named run
+    // another app or workflow posts later, or the push run of a workflow that
+    // also runs on pull_request, cannot hide a failure. A run is dropped only
+    // for a strictly newer id: without ids both stand, failures included.
+    type RunKey<'a> = (&'a str, Option<u64>, Option<u64>, Option<&'a str>);
+    fn run_key(c: &Value) -> Option<RunKey<'_>> {
+        (c["__typename"] == "CheckRun").then(|| {
             (
                 text(c, "/name"),
-                c["detailsUrl"].as_str(),
-                flag,
-                state,
                 c.pointer("/checkSuite/app/databaseId")
                     .and_then(Value::as_u64),
+                c.pointer("/checkSuite/workflowRun/workflow/databaseId")
+                    .and_then(Value::as_u64),
+                c.pointer("/checkSuite/workflowRun/event")
+                    .and_then(Value::as_str),
             )
-        } else {
-            let name = text(c, "/context");
-            (name, c["targetUrl"].as_str(), flag, text(c, "/state"), None)
+        })
+    }
+    let id = |c: &Value| c["databaseId"].as_u64();
+    let mut newest = BTreeMap::new();
+    for c in all_runs {
+        if let (Some(key), Some(id)) = (run_key(c), id(c)) {
+            let top = newest.entry(key).or_insert(id);
+            *top = (*top).max(id);
         }
-    })
-    .collect();
+    }
+    let superseded = |c: &Value| matches!((run_key(c).and_then(|k| newest.get(&k)), id(c)), (Some(top), Some(this)) if *top > this);
+    let checks: Vec<Check<'_>> = all_runs
+        .iter()
+        .filter(|c| !superseded(c))
+        .map(|c| {
+            let flag = c["isRequired"].as_bool().unwrap_or(false);
+            if c["__typename"] == "CheckRun" {
+                let state = if c["status"] == "COMPLETED" {
+                    c["conclusion"].as_str().unwrap_or("")
+                } else {
+                    "PENDING"
+                };
+                (
+                    text(c, "/name"),
+                    c["detailsUrl"].as_str(),
+                    flag,
+                    state,
+                    c.pointer("/checkSuite/app/databaseId")
+                        .and_then(Value::as_u64),
+                )
+            } else {
+                let name = text(c, "/context");
+                (name, c["targetUrl"].as_str(), flag, text(c, "/state"), None)
+            }
+        })
+        .collect();
     let mut names = required.to_vec();
     let context = |r: &Value| r.as_str().unwrap_or_else(|| text(r, "/context")).to_owned();
     // StatusContext has no app provenance in this query. It cannot satisfy an
@@ -3590,6 +3652,91 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }))
     }
 
+    /// Reads the rest of the head's checks onto `pull`, at most [`CHECK_PAGES`]
+    /// in all. The rollup's `hasNextPage` is left as the last page read gives
+    /// it, so a head with more checks than that, or one that moved between
+    /// pages (whose checks would be another commit's), still waits.
+    fn more_checks(
+        &mut self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        pull: &mut Value,
+    ) -> Result<()> {
+        const COMMIT: &str = "/commits/nodes/0/commit";
+        const CONTEXTS: &str = "/commits/nodes/0/commit/statusCheckRollup/contexts";
+        let head = text(pull, &format!("{COMMIT}/oid")).to_owned();
+        let total = pull
+            .pointer(&format!("{CONTEXTS}/totalCount"))
+            .and_then(Value::as_u64);
+        let mut paged = false;
+        for _ in 1..CHECK_PAGES {
+            let Some(contexts) = pull.pointer(CONTEXTS) else {
+                break;
+            };
+            let (Some(true), Some(after)) = (
+                contexts
+                    .pointer("/pageInfo/hasNextPage")
+                    .and_then(Value::as_bool),
+                contexts
+                    .pointer("/pageInfo/endCursor")
+                    .and_then(Value::as_str),
+            ) else {
+                break;
+            };
+            let after = after.to_owned();
+            self.spend()?;
+            let data = self.graphql.graphql(
+                CHECKS_QUERY,
+                json!({"owner": owner, "name": name, "number": number, "after": after}),
+            )?;
+            let commit = data
+                .pointer(&format!("/repository/pullRequest{COMMIT}"))
+                .context("checks page has no head commit")?;
+            let page = commit
+                .pointer("/statusCheckRollup/contexts")
+                .context("checks page has no checks")?;
+            if head.is_empty()
+                || text(commit, "/oid") != head
+                || total.is_none()
+                || page["totalCount"].as_u64() != total
+            {
+                break;
+            }
+            paged = true;
+            let more = page["nodes"]
+                .as_array()
+                .context("checks page has no checks")?;
+            let Some(contexts) = pull.pointer_mut(CONTEXTS) else {
+                break;
+            };
+            let Some(list) = contexts.get_mut("nodes").and_then(Value::as_array_mut) else {
+                break;
+            };
+            list.extend(more.iter().cloned());
+            // `nodes` was found, so `contexts` is an object.
+            contexts["pageInfo"] = page["pageInfo"].clone();
+        }
+        // Cursors are offsets into a list GitHub may reorder as runs arrive: a
+        // check that slipped back past a cursor would go unread, leaving an
+        // older passing run of it to decide. With the count unchanged, that
+        // reads another check twice, so the distinct checks fall short of it.
+        if paged {
+            let ids: BTreeSet<&str> = nodes(pull, &format!("{CONTEXTS}/nodes"))
+                .iter()
+                .filter_map(|c| c["id"].as_str())
+                .collect();
+            if Some(ids.len() as u64) != total
+                && let Some(info) = pull
+                    .pointer_mut(&format!("{CONTEXTS}/pageInfo"))
+                    .and_then(Value::as_object_mut)
+            {
+                info.insert("hasNextPage".into(), true.into());
+            }
+        }
+        Ok(())
+    }
+
     /// One pull request's decision line, and whether it is in flight.
     fn pull(
         &mut self,
@@ -3619,7 +3766,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             PULL_QUERY,
             json!({"owner": owner, "name": name, "number": number}),
         )?;
-        let pull = data
+        let mut pull = data
             .pointer("/repository/pullRequest")
             .filter(|p| p.is_object())
             .context("pull request not found")?
@@ -3640,6 +3787,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if text(&pull, "/author/login") != self.config.bot {
             marker = Marker::default();
         }
+        self.more_checks(owner, name, number, &mut pull)?;
         let base = text(&pull, "/baseRefName").to_owned();
         if !required.contains_key(&base) {
             let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
@@ -6199,6 +6347,164 @@ mod tests {
         assert_eq!(got.action, "wait", "{}", got.reason);
     }
 
+    /// A check run of Actions (app 15368) from workflow 7 on pull_request.
+    fn check_run(id: Option<u64>, name: &str, conclusion: &str) -> Value {
+        json!({"__typename": "CheckRun", "id": id.map(|i| format!("CR_{i}")), "databaseId": id,
+            "name": name, "status": "COMPLETED", "conclusion": conclusion, "isRequired": false,
+            "checkSuite": {"app": {"databaseId": 15368},
+                "workflowRun": {"event": "pull_request", "workflow": {"databaseId": 7}}}})
+    }
+
+    #[test]
+    fn only_the_newest_run_of_a_check_is_decided_on() {
+        let other_app = |mut r: Value| {
+            r["checkSuite"]["app"]["databaseId"] = 99.into();
+            r
+        };
+        let other_workflow = |mut r: Value| {
+            r["checkSuite"]["workflowRun"]["workflow"]["databaseId"] = 8.into();
+            r
+        };
+        for (what, runs, failed) in [
+            (
+                "an older failure, re-run green",
+                vec![
+                    check_run(Some(1), "ci", "FAILURE"),
+                    check_run(Some(2), "ci", "SUCCESS"),
+                ],
+                false,
+            ),
+            (
+                "a re-run that failed, listed first",
+                vec![
+                    check_run(Some(2), "ci", "FAILURE"),
+                    check_run(Some(1), "ci", "SUCCESS"),
+                ],
+                true,
+            ),
+            (
+                "another app's newer run",
+                vec![
+                    check_run(Some(1), "ci", "FAILURE"),
+                    other_app(check_run(Some(2), "ci", "SUCCESS")),
+                ],
+                true,
+            ),
+            (
+                "another workflow's newer run",
+                vec![
+                    check_run(Some(1), "ci", "FAILURE"),
+                    other_workflow(check_run(Some(2), "ci", "SUCCESS")),
+                ],
+                true,
+            ),
+            (
+                "a newer run of the workflow on another event",
+                vec![check_run(Some(1), "ci", "FAILURE"), {
+                    let mut r = check_run(Some(2), "ci", "SUCCESS");
+                    r["checkSuite"]["workflowRun"]["event"] = "push".into();
+                    r
+                }],
+                true,
+            ),
+            (
+                "runs without ids",
+                vec![
+                    check_run(None, "ci", "FAILURE"),
+                    check_run(Some(2), "ci", "SUCCESS"),
+                ],
+                true,
+            ),
+            (
+                "runs with one id",
+                vec![
+                    check_run(Some(2), "ci", "FAILURE"),
+                    check_run(Some(2), "ci", "SUCCESS"),
+                ],
+                true,
+            ),
+        ] {
+            let mut p = pull("pull-470", json!({}));
+            *p.pointer_mut("/commits/nodes/0/commit/statusCheckRollup/contexts/nodes")
+                .unwrap() = runs.into();
+            let checks = classify_checks(&p, &[json!({"context": "ci", "integration_id": 15368})]);
+            assert_eq!(!checks.failed.is_empty(), failed, "{what}");
+            assert!(checks.pending.is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_pass_pages_through_checks() {
+        // A page of 100 green checks, the last of them the required `ci` with
+        // `ci`'s conclusion, if given.
+        let page = |n: u64, ci: Option<&str>| -> Value {
+            let from = 1000 * n;
+            let mut nodes: Vec<Value> = (from..from + 100)
+                .map(|i| check_run(Some(i), &format!("c{i}"), "SUCCESS"))
+                .collect();
+            if let Some(conclusion) = ci {
+                nodes[99] = check_run(Some(from + 99), "ci", conclusion);
+            }
+            nodes.into()
+        };
+        let decided = |fake: &mut Fake, pages: Vec<Value>| {
+            let p = fake.pulls.get_mut(&470).unwrap();
+            let contexts = p
+                .pointer_mut("/commits/nodes/0/commit/statusCheckRollup/contexts")
+                .unwrap();
+            contexts["nodes"] = page(1, None);
+            contexts["totalCount"] = (100 * (1 + pages.len())).into();
+            contexts["pageInfo"] = json!({"hasNextPage": true, "endCursor": "p1"});
+            fake.check_pages = pages;
+            *fake.check_page_reads.borrow_mut() = 0;
+            let line = pass(fake, State::default(), &[], &[REPO])
+                .lines
+                .pop()
+                .unwrap();
+            line.split_once(' ')
+                .unwrap()
+                .1
+                .split_once(' ')
+                .unwrap()
+                .1
+                .to_owned()
+        };
+        let mut fake = github();
+        let merge = "merge: review approved and checks green";
+        // Read on the third page, a re-run's green `ci` stands over the
+        // failed run on the second.
+        assert_eq!(
+            decided(
+                &mut fake,
+                vec![page(2, Some("FAILURE")), page(3, Some("SUCCESS"))]
+            ),
+            merge
+        );
+        // A failure on a later page is seen.
+        assert!(decided(&mut fake, vec![page(2, Some("FAILURE"))]).starts_with("fix:"));
+        // Up to the bound on pages, all are read; past it, the pull request waits.
+        let wait = "wait: more checks than one query reads; not decided on part of them";
+        let mut pages: Vec<Value> = (2..CHECK_PAGES as u64).map(|n| page(n, None)).collect();
+        pages.push(page(CHECK_PAGES as u64, Some("SUCCESS")));
+        assert_eq!(decided(&mut fake, pages.clone()), merge);
+        pages.push(page(CHECK_PAGES as u64 + 1, None));
+        assert_eq!(decided(&mut fake, pages.clone()), wait);
+        assert_eq!(*fake.check_page_reads.borrow(), CHECK_PAGES - 1);
+        pages.pop();
+        // A check read twice means another slipped past a cursor unread.
+        let mut twice = pages.clone();
+        twice[0][0] = page(1, None)[0].clone();
+        assert_eq!(decided(&mut fake, twice), wait);
+        // Nor are pages read on once the checks are counted differently.
+        fake.check_pages_total = Some(100 * CHECK_PAGES as u64 + 1);
+        assert_eq!(decided(&mut fake, pages.clone()), wait);
+        assert_eq!(*fake.check_page_reads.borrow(), 1);
+        fake.check_pages_total = None;
+        // Pages of a head pushed after the first are not read as this one's.
+        fake.check_pages_head = Some("f".repeat(40));
+        assert_eq!(decided(&mut fake, pages), wait);
+    }
+
     #[test]
     fn only_the_bots_marker_counts() {
         let state = json!({"rounds": 1, "sha": HEAD, "run": 42});
@@ -6380,6 +6686,14 @@ mod tests {
         relabel_raced: Vec<Value>,
         /// The base branch's merge queue entries, as its query gives them.
         queue: Vec<Value>,
+        /// The head's checks past its first page, a list of nodes a page, read
+        /// after cursors `p1`, `p2`, …; and the head those pages are of, if
+        /// it moved after the first. Each page counts the checks as the first
+        /// does unless `check_pages_total` says otherwise.
+        check_pages: Vec<Value>,
+        check_pages_head: Option<String>,
+        check_pages_total: Option<u64>,
+        check_page_reads: RefCell<usize>,
     }
 
     impl Fake {
@@ -6481,6 +6795,30 @@ mod tests {
                 return Ok(json!({"repository": {"mergeQueue": {"entries": {
                     "nodes": self.queue, "pageInfo": {"hasNextPage": !whole},
                 }}}}));
+            }
+            if query == CHECKS_QUERY {
+                let after = variables["after"].as_str().unwrap();
+                let index: usize = after.strip_prefix('p').unwrap().parse().unwrap();
+                let number = variables["number"].as_u64().unwrap();
+                *self.check_page_reads.borrow_mut() += 1;
+                let first = &self.pulls[&number]["commits"]["nodes"][0]["commit"];
+                let head = self
+                    .check_pages_head
+                    .clone()
+                    .unwrap_or_else(|| text(first, "/oid").to_owned());
+                let total = self
+                    .check_pages_total
+                    .or(first["statusCheckRollup"]["contexts"]["totalCount"].as_u64());
+                return Ok(
+                    json!({"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
+                        "oid": head,
+                        "statusCheckRollup": {"contexts": {
+                            "totalCount": total,
+                            "nodes": self.check_pages[index - 1],
+                            "pageInfo": {"hasNextPage": index < self.check_pages.len(), "endCursor": format!("p{}", index + 1)},
+                        }},
+                    }}]}}}}),
+                );
             }
             assert_eq!(query, PULL_QUERY);
             let number = variables["number"].as_u64().unwrap();
