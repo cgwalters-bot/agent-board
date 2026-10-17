@@ -15,6 +15,9 @@ pub struct Add {
     /// Priority option to set, for example P1.
     #[arg(long)]
     pub priority: Option<String>,
+    /// Turn option; defaults to Coordinator when the board offers it.
+    #[arg(long)]
+    pub turn: Option<String>,
     /// Write to the live board with your token; without it, only print the proposal.
     #[arg(long)]
     pub apply: bool,
@@ -37,6 +40,7 @@ impl Add {
         self.priority
             .iter()
             .map(|priority| format!("Priority={priority}"))
+            .chain(self.turn.iter().map(|turn| format!("Turn={turn}")))
             .collect()
     }
 }
@@ -45,6 +49,23 @@ impl Add {
 pub enum Mode {
     Add,
     Edit,
+}
+
+fn add_defaults(fields: &[Value], edits: &[String], mode: Mode) -> Vec<String> {
+    let mut edits = edits.to_vec();
+    if mode == Mode::Add
+        && !edits.iter().any(|edit| edit.starts_with("Turn="))
+        && fields.iter().any(|field| {
+            field["name"] == "Turn"
+                && field["dataType"] == "SINGLE_SELECT"
+                && field["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option["name"] == "Coordinator")
+                })
+        })
+    {
+        edits.push("Turn=Coordinator".into());
+    }
+    edits
 }
 
 /// Parse an issue to write. The proposal names neither host nor content type, so an
@@ -84,7 +105,10 @@ pub fn preview(
     out: &mut impl Write,
 ) -> Result<()> {
     board_forge::validate_github_project(&snapshot.project)?;
-    let writes = field_writes(&snapshot.fields, edits)?;
+    let writes = field_writes(
+        &snapshot.fields,
+        &add_defaults(&snapshot.fields, edits, mode),
+    )?;
     let item = snapshot
         .items
         .iter()
@@ -120,7 +144,7 @@ pub fn write<T: Transport>(
 ) -> Result<()> {
     let (project, url, fields) = github.schema()?;
     // Every edit is resolved before membership is read or anything is written.
-    let writes = field_writes(&fields, edits)?;
+    let writes = field_writes(&fields, &add_defaults(&fields, edits, mode))?;
     let (issue, member) = github.issue_item(&project, identity)?;
     ensure!(
         mode == Mode::Add || member.is_some(),
@@ -524,6 +548,33 @@ mod tests {
             if !apply || error.is_some_and(|e| !e.contains("rows above")) {
                 assert!(github.transport.mutations.borrow().is_empty(), "{label}");
             }
+        }
+    }
+
+    #[test]
+    fn add_turn_defaults_table() {
+        let fields = [
+            json!({"name":"Turn","dataType":"SINGLE_SELECT","options":[{"name":"Coordinator"},{"name":"Worker"}]}),
+        ];
+        for (schema, mode, edits, expected) in [
+            (&fields[..], Mode::Add, vec![], vec!["Turn=Coordinator"]),
+            (
+                &fields[..],
+                Mode::Add,
+                vec!["Priority=P1"],
+                vec!["Priority=P1", "Turn=Coordinator"],
+            ),
+            (
+                &fields[..],
+                Mode::Add,
+                vec!["Turn=Worker"],
+                vec!["Turn=Worker"],
+            ),
+            (&fields[..], Mode::Edit, vec![], vec![]),
+            (&[][..], Mode::Add, vec![], vec![]),
+        ] {
+            let edits: Vec<_> = edits.iter().map(|s| s.to_string()).collect();
+            assert_eq!(add_defaults(schema, &edits, mode), expected);
         }
     }
 }

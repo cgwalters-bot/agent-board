@@ -10,7 +10,7 @@ The pitch is "gh-aw, but more flexible, supporting containers, and helping secur
 
 gh-aw's `update-project` and `dispatch-workflow` safe outputs let an agent edit a project item or start a workflow. On top of that, agent-board keeps the [job plan](docs/job-plans.md) on the issue, dispatches it once per plan with a record on the issue, can [batch](docs/job-plans.md#batching) small sibling sub-issues into one run, [holds back](docs/job-plans.md#overlap) runs that overlap open bot pull requests, and previews board repairs with `reconcile plan`.
 
-What it lacks today: reconcile repairs are previewed but not applied from CI ([#7](https://github.com/cgwalters-forge/agent-board/issues/7)); a default board has no Turn, Run or Result field, and while `project init` now creates them, Turn is still set on each item by hand ([#18](https://github.com/cgwalters-forge/agent-board/issues/18)); and much of the join (finding the run, applying `run record` proposals, linking the pull request) is still manual ([#19](https://github.com/cgwalters-forge/agent-board/issues/19)).
+What it lacks today: reconcile repairs are previewed but not applied from CI ([#7](https://github.com/cgwalters-forge/agent-board/issues/7)); a default board still needs `project init` for Turn, Run and Result fields; result discovery and linking the pull request remain manual. Operators can now look up a dispatch run and apply its board update at a terminal.
 
 ## Commands
 
@@ -23,10 +23,10 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 | `check proposals --as ID` | Refuse proposals outside an identity's assignment/field policy (`policy/agents.toml`). Not complete output validation. |
 | `project init` | Create the Turn, Run and Result fields if missing (writes). |
 | `project status-update --status on-track\|at-risk\|off-track` | Publish a project status update (writes); see [docs/status-updates.md](docs/status-updates.md). |
-| `item add`, `item edit` | Add an issue / set fields; write only with `--apply`. |
+| `item add [--priority P1] [--turn OPTION]`, `item edit` | Add an issue / set fields; add defaults Turn to Coordinator when available. Write only with `--apply`. |
 | `ask create\|list\|resolve` | Put a question to the operator as a `question` issue and mark the blocked item Needs human; write only with `--apply`. |
 | `ask add`, `ask read`, `ask resolve D<n> TEXT` | Use one configured operator-editable [decisions document](docs/decisions.md); writes require `--apply`. |
-| `request dispatch`, `run record` | Print `gh workflow run` argv for agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md); propose Run/Result field updates. |
+| `request dispatch`, `run record [--apply] [--caller OWNER/REPO --kind implement --yes]` | Print `gh workflow run` argv for agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md); propose Run/Result updates or apply with the operator's GH_TOKEN. With no Run, caller lookup requires one exact match in a single complete page of at most 100 runs; prints it and requires `--yes` (or explicit `--run`) before use. CI still uses independent check/apply only. |
 | `dispatch ISSUE --dry-run\|--apply` | Print, or send once and record on the issue, the `workflow_dispatch` request the newest accepted [job plan](docs/job-plans.md) comment proposes ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)); `--batch N` adds small sibling sub-issues to one run ([batching](docs/job-plans.md#batching)), and `--bot LOGIN` holds it back while bot pull requests or runs overlap it ([overlap](docs/job-plans.md#overlap)); `--collaborators-only` refuses issues that are unlocked or have input from non-collaborators ([collaborator input](docs/job-plans.md#collaborator-input)). |
 | `epic plan ISSUE --dry-run` | Check the newest accepted [epic plan](docs/epic-plans.md) and print its mutations. |
 | `epic apply ISSUE --config FILE` | Preview an epic plan, or apply once with the bot's token and `--apply`; a claim prevents replay after partial failure. |

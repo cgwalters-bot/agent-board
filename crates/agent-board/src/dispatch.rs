@@ -1,5 +1,5 @@
-//! Offline join to agentic-job's dispatch caller, and `project init`, which creates the
-//! join's missing fields with the operator's own token. Nothing here grants a run write authority.
+//! Operator join to agentic-job's dispatch caller. A person at a terminal can
+//! apply with their own token; CI still uses independent check/apply only.
 use anyhow::{Context, Result, ensure};
 use board_core::{Item, ItemRef, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
@@ -62,7 +62,7 @@ pub struct FromPlan {
     collaborators_only: bool,
 }
 
-#[derive(Args)]
+#[derive(Args, Default, Clone)]
 pub struct Record {
     /// Dispatched issue: URL, OWNER/REPO#N, or N with --repo.
     #[arg(long)]
@@ -73,6 +73,32 @@ pub struct Record {
     /// Applied pull request or issue comment URL. Omit for admission only.
     #[arg(long)]
     result: Option<String>,
+    /// Write the validated proposal to the live board with your GH_TOKEN.
+    #[arg(long)]
+    pub apply: bool,
+    /// Dispatch caller repository to search when no Run is recorded.
+    #[arg(long)]
+    caller: Option<String>,
+    /// Dispatch kind to match when looking up a run.
+    #[arg(long, default_value = "implement", value_parser = ["implement", "triage", "research"])]
+    kind: String,
+    /// Accept the unique run printed by caller lookup.
+    #[arg(long)]
+    yes: bool,
+}
+
+impl Record {
+    pub fn needs_lookup(
+        &self,
+        snapshot: &Snapshot,
+        repo: Option<&str>,
+        host: &str,
+    ) -> Result<bool> {
+        let item = resolve(snapshot, &self.item, repo, host)?;
+        Ok(self.caller.is_some()
+            && self.run.is_none()
+            && text_field(item, "Run")?.is_none_or(str::is_empty))
+    }
 }
 
 fn resolve<'a>(
@@ -543,11 +569,69 @@ fn proposal(snapshot: &Snapshot, args: &Record, repo: Option<&str>, host: &str) 
     )
 }
 
+pub fn discover(
+    snapshot: &Snapshot,
+    args: &mut Record,
+    repo: Option<&str>,
+    host: &str,
+    transport: &impl Rest,
+    out: &mut impl Write,
+) -> Result<()> {
+    let item = resolve(snapshot, &args.item, repo, host)?;
+    if args.run.is_some() || text_field(item, "Run")?.is_some_and(|run| !run.is_empty()) {
+        return Ok(());
+    }
+    let caller = args
+        .caller
+        .as_deref()
+        .context("no recorded Run; supply --run or --caller")?;
+    let run = board_forge::runs::find(transport, caller, &item.identity, &args.kind)?;
+    writeln!(out, "{run}")?;
+    ensure!(
+        args.yes,
+        "re-run with --yes to use this run, or pass --run explicitly"
+    );
+    args.run = Some(run);
+    Ok(())
+}
+
+pub fn apply<T: Transport>(
+    github: &GitHub<T>,
+    snapshot: &Snapshot,
+    args: &Record,
+    repo: Option<&str>,
+    host: &str,
+    out: &mut impl Write,
+) -> Result<()> {
+    let value = proposal(snapshot, args, repo, host)?;
+    let edits = value["fields"]
+        .as_object()
+        .context("missing proposal fields")?
+        .iter()
+        .map(|(name, value)| {
+            Ok(format!(
+                "{name}={}",
+                value.as_str().context("non-text proposal field")?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let identity = &resolve(snapshot, &args.item, repo, host)?.identity;
+    crate::item::write(
+        github,
+        identity,
+        &edits,
+        crate::item::Mode::Edit,
+        true,
+        &mut None,
+        out,
+    )
+}
+
 pub fn record(snapshot: &Snapshot, args: &Record, repo: Option<&str>, host: &str) -> Result<()> {
     serde_json::to_writer(io::stdout().lock(), &proposal(snapshot, args, repo, host)?)?;
     writeln!(io::stdout().lock())?;
     eprintln!(
-        "Proposed only; operator must verify run/item correlation and applied result. Independent project check/apply is required."
+        "Proposed only; operator must verify run/item correlation and applied result. A person at a terminal can use --apply; CI requires independent check/apply."
     );
     Ok(())
 }
@@ -660,6 +744,7 @@ mod tests {
             item: s.items[0].identity.display(),
             run: Some("https://github.com/example/runners/actions/runs/42".into()),
             result: None,
+            ..Record::default()
         };
         assert_eq!(
             proposal(&s, &args, None, "github.com").unwrap()["fields"]["Status"],
@@ -696,6 +781,133 @@ mod tests {
             args.run = Some(run.into());
             assert!(proposal(&s, &args, None, "github.com").is_err());
         }
+        args.run = Some("https://github.com/example/runners/actions/runs/42".into());
+        // The same proposal guards apply to the operator write path.
+        for (complete, state, status, turn, existing_run) in [
+            (true, "open", Status::Todo, Turn::Coordinator, None),
+            (false, "open", Status::Todo, Turn::Coordinator, None),
+            (true, "closed", Status::Todo, Turn::Coordinator, None),
+            (true, "open", Status::Todo, Turn::Worker, None),
+            (true, "open", Status::InProgress, Turn::Coordinator, None),
+            (
+                true,
+                "open",
+                Status::Todo,
+                Turn::Coordinator,
+                Some("https://github.com/example/runners/actions/runs/43"),
+            ),
+        ] {
+            s.coverage.complete = complete;
+            s.items[0].state = state.into();
+            s.items[0].status = Some(status.clone());
+            s.items[0].turn = Some(turn.clone());
+            s.items[0].fields.remove("Run");
+            if let Some(run) = existing_run {
+                s.items[0].fields.insert("Run".into(), json!(run));
+            }
+            assert_eq!(
+                proposal(&s, &args, None, "github.com").is_ok(),
+                complete
+                    && state == "open"
+                    && status == Status::Todo
+                    && turn == Turn::Coordinator
+                    && existing_run.is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn operator_record_edits_only_after_validation() {
+        struct Board {
+            fields: Vec<Value>,
+            member: bool,
+            writes: std::cell::Cell<usize>,
+        }
+
+        impl Transport for Board {
+            fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+                if query.contains("repositoryOwner(login:") {
+                    return Ok(
+                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
+                    );
+                }
+                if query.contains("fields(first") {
+                    return Ok(
+                        json!({"node":{"fields":{"nodes":self.fields,"pageInfo":{"hasNextPage":false}}}}),
+                    );
+                }
+                if query.contains("issue(number:") {
+                    let nodes = if self.member {
+                        json!([{"id":"M","project":{"id":"P"}}])
+                    } else {
+                        json!([])
+                    };
+                    return Ok(
+                        json!({"repository":{"issue":{"id":"I","number":1,"repository":{"nameWithOwner":"example/intake"},"projectItems":{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}}}),
+                    );
+                }
+                assert!(
+                    query.contains("updateProjectV2ItemFieldValue("),
+                    "must never add an item: {query}"
+                );
+                self.writes.set(self.writes.get() + 1);
+                let value = &variables["value"];
+                let readback = if value["text"].is_string() {
+                    json!({"text":value["text"]})
+                } else {
+                    json!({"optionId":value["singleSelectOptionId"]})
+                };
+                Ok(
+                    json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"M","fieldValueByName":readback}}}),
+                )
+            }
+        }
+
+        for (member, complete, expected_writes, success) in [
+            (true, true, 3, true),
+            (false, true, 0, false),
+            (true, false, 0, false),
+        ] {
+            let mut s = snapshot();
+            s.coverage.complete = complete;
+            s.items[0].status = Some(Status::Todo);
+            let mut fields = s.fields.clone();
+            for field in &mut fields {
+                field["id"] = field["name"].clone();
+                if let Some(options) = field["options"].as_array_mut() {
+                    for option in options {
+                        option["id"] = option["name"].clone();
+                    }
+                }
+            }
+            let github = GitHub {
+                owner: "example".into(),
+                number: 1,
+                transport: Board {
+                    fields,
+                    member,
+                    writes: Default::default(),
+                },
+            };
+            let args = Record {
+                item: s.items[0].identity.display(),
+                run: Some("https://github.com/example/runners/actions/runs/42".into()),
+                ..Record::default()
+            };
+            let mut out = Vec::new();
+            assert_eq!(
+                apply(&github, &s, &args, None, "github.com", &mut out).is_ok(),
+                success
+            );
+            assert_eq!(github.transport.writes.get(), expected_writes);
+            if success {
+                assert!(
+                    String::from_utf8(out)
+                        .unwrap()
+                        .contains("Run\thttps://github.com/example/runners/actions/runs/42\tset")
+                );
+            }
+        }
     }
 
     #[test]
@@ -707,6 +919,7 @@ mod tests {
             item: s.items[0].identity.display(),
             run: Some("https://github.com/example/runners/actions/runs/42".into()),
             result: Some("https://github.com/example/intake/pull/3".into()),
+            ..Record::default()
         };
         let native = |text: &str| json!({"__typename": "ProjectV2ItemFieldTextValue", "text": text, "field": {"name": "Run"}});
         s.items[0]
@@ -1127,6 +1340,7 @@ mod tests {
             item: s.items[0].identity.display(),
             run: None,
             result: Some("https://github.com/example/intake/pull/3".into()),
+            ..Record::default()
         };
         assert!(proposal(&s, &args, None, "github.com").is_err());
         s.items[0].fields.insert(
@@ -1165,6 +1379,67 @@ mod tests {
             assert!(proposal(&bad, &args, None, "github.com").is_err(), "{name}");
             bad.fields.last_mut().unwrap()["dataType"] = json!("TEXT");
             assert!(proposal(&bad, &args, None, "github.com").is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn discovered_run_requires_confirmation_table() {
+        struct Runs;
+
+        impl Rest for Runs {
+            fn get(
+                &self,
+                _: &str,
+                _: Option<(&str, &str)>,
+            ) -> Result<board_forge::poll::RestResponse> {
+                Ok(board_forge::poll::RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body: json!({"total_count":1,"workflow_runs":[{"display_title":"implement example/intake#1","html_url":"https://github.com/example/runners/actions/runs/42"}]}),
+                })
+            }
+
+            fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+                panic!("discovery cannot write")
+            }
+        }
+
+        for (yes, explicit, recorded, printed, success) in [
+            (false, false, false, true, false),
+            (true, false, false, true, true),
+            (false, true, false, false, true),
+            (false, false, true, false, true),
+        ] {
+            let mut s = snapshot();
+            if recorded {
+                s.items[0].fields.insert(
+                    "Run".into(),
+                    json!("https://github.com/example/runners/actions/runs/41"),
+                );
+            }
+            let mut args = Record {
+                item: s.items[0].identity.display(),
+                caller: Some("example/runners".into()),
+                kind: "implement".into(),
+                yes,
+                run: explicit.then(|| "https://github.com/example/runners/actions/runs/40".into()),
+                ..Record::default()
+            };
+            let mut out = Vec::new();
+            let result = discover(&s, &mut args, None, "github.com", &Runs, &mut out);
+            assert_eq!(result.is_ok(), success);
+            assert_eq!(!out.is_empty(), printed);
+            if !success {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("re-run with --yes")
+                );
+                assert!(args.run.is_none());
+            }
         }
     }
 }
