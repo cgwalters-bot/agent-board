@@ -282,7 +282,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -319,6 +319,22 @@ may say little more than the exit code. A failure after it goes to
 `needs-human`, and the stop comment quotes the same excerpt in a fenced block,
 its backticks and `<!--` defused.
 Setting it lets the poll start three runs for a pull request instead of two.
+
+`rebaseRounds` (0 to 3; absent or 0 by default, which charges a conflict to the
+fix rounds as any failure) gives a pull request of the bot's whose head the
+review approved, and whose only failure is a conflict with its base, that many
+rebase rounds apart from its fix rounds (agent-board#109): a base that moved
+is not the change's failure, and an approved pull request that used its fix
+rounds on review changes went to `needs-human` for a rebase alone. A rebase
+round is a fix-kind run whose task asks only for the rebase, counted in the
+marker as `rebased`, claimed, recorded, waited for, refunded after an outage
+and stopped like a fix round; its pool is picked as a first fix round's is.
+The rebased head needs the review's approval again before it merges, so a
+base that moves again before that approval is a fix round. With a
+failed check, a requested change or no verdict, or once the rebase rounds
+are used, a conflict is a fix round as before. Setting it lets the poll start
+up to that many more runs for a pull request; the cap bounds runs on a base
+that keeps moving under it or a rebase that never lands.
 
 `brokerOutage` (absent by default, which charges every failed run) keeps a
 broker outage from using a round (agent-board#108):

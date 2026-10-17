@@ -888,6 +888,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             queue: marker.queue.clone(),
             continued: carried.continued,
             raised: carried.raised,
+            rebased: carried.rebased,
             comments: keys,
             ..Marker::default()
         };

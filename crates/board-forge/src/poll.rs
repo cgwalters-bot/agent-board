@@ -120,6 +120,9 @@ pub const CONTINUATION_ROUNDS: u64 = 2;
 /// The most `continuation.rounds` may ask for: a run that checkpoints every
 /// time cannot be continued without end.
 pub const CONTINUATION_ROUNDS_LIMIT: u64 = 5;
+/// The most `rebaseRounds` may ask for: a base that keeps moving under an
+/// approved head, or a rebase that never lands, cannot start runs without end.
+pub const REBASE_ROUNDS_LIMIT: u64 = 3;
 /// The events that are activity on an issue, a pull request or a branch.
 const ACTIVITY_EVENTS: &[&str] = &[
     "IssueCommentEvent",
@@ -248,6 +251,11 @@ pub struct PollPolicy {
     /// it off and starts a round on them ([`comments`]). Off (the default),
     /// only a person taking the label off starts the rounds again.
     pub operator_answers: bool,
+    /// `rebaseRounds`: the rebase rounds of a pull request whose head the
+    /// review approved and whose only failure is a conflict with its base,
+    /// counted apart from its fix rounds: a moved base is not the change's
+    /// failure (agent-board#109). 0 (the default) charges them as fix rounds.
+    pub rebase_rounds: u64,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -490,6 +498,15 @@ impl PollPolicy {
                 .map(|a| a.as_bool().context("operatorAnswers is not a boolean"))
                 .transpose()?
                 .unwrap_or(false),
+            rebase_rounds: value
+                .get("rebaseRounds")
+                .map(|r| {
+                    r.as_u64()
+                        .filter(|r| *r <= REBASE_ROUNDS_LIMIT)
+                        .with_context(|| format!("rebaseRounds is not 0 to {REBASE_ROUNDS_LIMIT}"))
+                })
+                .transpose()?
+                .unwrap_or(0),
         })
     }
 }
@@ -1047,6 +1064,10 @@ pub struct Marker {
     /// An operator answer must finish successfully and publish a new head
     /// before the unchanged head's approvals can authorize a merge.
     pub answering: bool,
+    /// Rebase rounds used ([`PollPolicy::rebase_rounds`]), counted apart.
+    pub rebased: u64,
+    /// Whether the run `sha` and `run` name is a rebase round.
+    pub rebasing: bool,
 }
 
 /// The merge queue as the marker records it: every removal the poll acted on
@@ -1160,6 +1181,12 @@ impl Marker {
         if !self.comments.is_empty() {
             state["comments"] = self.comments.iter().map(|c| plain(c)).collect();
         }
+        if self.rebased > 0 {
+            state["rebased"] = self.rebased.into();
+        }
+        if self.rebasing {
+            state["rebasing"] = true.into();
+        }
         state
     }
 
@@ -1175,12 +1202,15 @@ impl Marker {
             run: None,
             at: None,
             continuing: false,
+            rebasing: false,
             raised: self.raised && !self.raising,
             raising: false,
             ..self.clone()
         };
         if self.continuing {
             marker.continued = marker.continued.saturating_sub(1);
+        } else if self.rebasing {
+            marker.rebased = marker.rebased.saturating_sub(1);
         } else {
             marker.rounds = marker.rounds.saturating_sub(1);
         }
@@ -1191,6 +1221,8 @@ impl Marker {
     fn round_name(&self) -> String {
         if self.continuing {
             format!("continuation round {}", self.continued)
+        } else if self.rebasing {
+            format!("rebase round {}", self.rebased)
         } else if self.rounds > MAX_FIX_ROUNDS {
             "the diagnostic round".into()
         } else {
@@ -1251,6 +1283,11 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
             raised: state["raised"].as_bool().unwrap_or(false),
             raising: state["raising"].as_bool().unwrap_or(false),
             answering: state["answering"].as_bool().unwrap_or(false),
+            // As `continued`: more than the cap reads as the cap reached.
+            rebased: state["rebased"]
+                .as_u64()
+                .map_or(0, |r| r.min(REBASE_ROUNDS_LIMIT)),
+            rebasing: state["rebasing"].as_bool().unwrap_or(false),
             comments: nodes(&state, "/comments")
                 .iter()
                 .filter_map(Value::as_str)
@@ -1758,6 +1795,23 @@ fn toil_only(pull: &Value, checks: &Checks, review: Option<(Review, &str)>) -> b
     findings > 0
 }
 
+fn conflict_text(base: &str) -> String {
+    format!(
+        "Its branch conflicts with {base}. Rebase its commits onto current {base}, resolve the conflicts keeping the intent of both sides, and rerun the tests the change touches. Hand back the rebased commits as the replacement your brief describes (at most {FIX_SERIES_MAX_COMMITS} commits), which replaces the branch. Add no commit on top: only the rebased series resolves a conflict."
+    )
+}
+
+/// The task of a rebase round ([`PollPolicy::rebase_rounds`]): only the
+/// conflict, as the review approved the change and nothing else failed.
+pub fn rebase_task(repo: &str, pull: &Value, round: u64, rounds: u64) -> String {
+    let head = text(pull, "/headRefOid");
+    let number = pull["number"].as_u64().unwrap_or_default();
+    format!(
+        "Pull request {repo}#{number} at head {head} was approved but cannot merge as it is. Change nothing but what rebasing it needs. This is rebase round {round} of {rounds}.\n\n{}",
+        conflict_text(text(pull, "/baseRefName"))
+    )
+}
+
 /// The task a fix run is started with, as poll.cjs's `fixTask`. `review` is
 /// the text of the change request of the head (the operator's, or else the
 /// review job's), when that is what failed.
@@ -1782,9 +1836,7 @@ pub fn fix_task(
         "Pull request {repo}#{number} at head {head} cannot merge as it is. Make the smallest change to its branch that addresses what follows, and nothing else. {which}"
     )];
     if pull["mergeable"] == CONFLICTING {
-        lines.extend([String::new(), format!(
-            "Its branch conflicts with {base}. Rebase its commits onto current {base}, resolve the conflicts keeping the intent of both sides, and rerun the tests the change touches. Hand back the rebased commits as the replacement your brief describes (at most {FIX_SERIES_MAX_COMMITS} commits), which replaces the branch. Add no commit on top: only the rebased series resolves a conflict."
-        )]);
+        lines.extend([String::new(), conflict_text(base)]);
     }
     if !checks.failed.is_empty() || review.is_some() {
         lines.extend([String::new(), format!(
@@ -1851,7 +1903,7 @@ pub fn fix_task(
 
 #[derive(Debug, PartialEq)]
 pub struct Decision {
-    /// skip, wait, continue, fix, refund, retitle, merge, needs-human or
+    /// skip, wait, continue, fix, rebase, refund, retitle, merge, needs-human or
     /// answer (the operator's answer to `needs-human`, [`comments`]).
     pub action: &'static str,
     pub reason: String,
@@ -1923,10 +1975,10 @@ pub fn queue_step(
         }
         // Before a fix too: a person's removal is not answered by a fix round,
         // which would leave the removal seen and so the queue to the poll.
-        ("merge" | "fix", Removal::Stop(why)) => {
+        ("merge" | "fix" | "rebase", Removal::Stop(why)) => {
             stop(format!("{why}, which the poll does not retry"), state)
         }
-        ("fix" | "needs-human", _) => Decision {
+        ("fix" | "rebase" | "needs-human", _) => Decision {
             queue: Some(state),
             ..decision
         },
@@ -2153,6 +2205,19 @@ pub fn decide(
         }
         if marker.sha.as_deref() == Some(head) {
             return started(config, marker, (fix_run, outages), head, &why, now);
+        }
+        // Only a conflict, on a head the review approved: the base moved, and
+        // the change did not fail. Past its own rounds it is a fix as before.
+        let rebases = config.policy.rebase_rounds;
+        let conflict_only = failing.len() == 1 && pull["mergeable"] == CONFLICTING;
+        if conflict_only && review == Some(Review::Approved) && marker.rebased < rebases {
+            let round = marker.rebased + 1;
+            return Decision {
+                action: "rebase",
+                reason: format!("{why}; approved, so rebase round {round} of {rebases}"),
+                round: Some(round),
+                queue: None,
+            };
         }
         // The diagnostic round is one more, counted in `rounds` as the next
         // fix round, so it is claimed and recorded like one and runs once.
@@ -2702,9 +2767,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         checks: &Checks,
         (marker, read): (&Marker, &[Value]),
         round: u64,
-        continuing: bool,
+        action: &str,
         review_run: Option<&Value>,
     ) -> Result<String> {
+        let continuing = action == "continue";
+        let rebasing = action == "rebase";
         let apply = self.apply.as_ref().context("not applying")?;
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
         // After a reset, the counts start again as decide read them.
@@ -2729,13 +2796,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .get(&at.reason)
                 .filter(|_| at.reason != "cap" || !carried.raised)
         });
-        let diagnostic = !continuing && round > MAX_FIX_ROUNDS;
+        let diagnostic = !continuing && !rebasing && round > MAX_FIX_ROUNDS;
+        // A rebase is picked for as a first fix round is: the toil pool where
+        // one is set, as an approved conflict is toil, else the first pool.
+        let pool_round = if rebasing { 1 } else { round };
         let pool = if let Some(raise) = raise {
             Some(raise.clone())
         } else if diagnostic {
             // Decide gives the round only where the pool is set.
             Some(self.config.policy.diagnostic_pool.clone()).filter(|p| !p.is_empty())
-        } else if !toil_pool.is_empty() && round == 1 && toil {
+        } else if !toil_pool.is_empty() && pool_round == 1 && toil {
             Some(toil_pool.clone())
         } else {
             let index = if !continuing
@@ -2745,7 +2815,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             {
                 0
             } else {
-                round.saturating_sub(1) as usize
+                pool_round.saturating_sub(1) as usize
             };
             apply
                 .pools
@@ -2767,6 +2837,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     "Continuation round {round} of {rounds} for `{}`",
                     short(head)
                 ),
+            )
+        } else if rebasing {
+            let rebases = self.config.policy.rebase_rounds;
+            (
+                format!("rebase round {round}"),
+                format!("Rebase round {round} of {rebases} for `{}`", short(head)),
             )
         } else if diagnostic {
             (
@@ -2804,7 +2880,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         self.dispatched += 1;
         let mut marker = Marker {
             id: None,
-            rounds: if continuing { carried.rounds } else { round },
+            rounds: if continuing || rebasing {
+                carried.rounds
+            } else {
+                round
+            },
             sha: Some(head.to_owned()),
             run: None,
             at: Some(self.now.replace_nanosecond(0)?.format(&Rfc3339)?),
@@ -2817,10 +2897,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             raising,
             comments: Vec::new(),
             answering: false,
+            rebased: if rebasing { round } else { carried.rebased },
+            rebasing,
         };
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
         let task = match &checkpoint {
             Some(at) => continue_task(repo, pull, at, round, rounds),
+            None if rebasing => rebase_task(repo, pull, round, self.config.policy.rebase_rounds),
             None => {
                 let review = match review {
                     Some((Review::ChangesRequested, body)) => Some(body),
@@ -3006,21 +3089,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 )?;
                 Ok(Some("retitled from its head commit".into()))
             }
-            action @ ("fix" | "continue") => {
+            action @ ("fix" | "continue" | "rebase") => {
                 let round = decision.round.context("a run without a round")?;
                 if self.dispatched >= POLL_DISPATCH_LIMIT {
                     return Ok(Some(format!(
                         "not started: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
                     )));
                 }
-                let continuing = action == "continue";
                 self.start_fix(
                     repo,
                     pull,
                     checks,
                     (marker, read),
                     round,
-                    continuing,
+                    action,
                     review_run,
                 )
                 .map(Some)
@@ -3652,7 +3734,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             _ => decision,
         };
         // Ordering holds for every followed pull request, as it needs no marker.
-        let rebase = decision.action == "fix" && pull["mergeable"] == CONFLICTING;
+        let rebase =
+            matches!(decision.action, "fix" | "rebase") && pull["mergeable"] == CONFLICTING;
         if tries.is_some()
             && (decision.action == "merge" || rebase)
             && let Some(ahead) = self.ahead(repo, &pull)?
@@ -4103,6 +4186,7 @@ mod tests {
         let continued = json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"});
         let retitle = json!({"continuation": {"retitle": true}});
         let diagnostic = json!({"diagnosticPool": "large"});
+        let rebase = json!({"rebaseRounds": 2});
         // An outage issue as tracker's broker.cjs opens it, and the policy
         // that reads them with a ten-minute lead.
         let outage = |lead: u64| json!({"brokerOutage": {"repository": "cgwalters-forge/tracker", "author": BOT, "leadSeconds": lead}});
@@ -4248,6 +4332,87 @@ mod tests {
                 json!({"mergeable": CONFLICTING}),
                 json!({"rounds": 2, "sha": "older"}),
                 none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "an approved conflict past its fix rounds is rebased apart from them",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 2, "sha": "older"}),
+                none.clone(),
+                "rebase",
+                Some(1),
+            ),
+            (
+                "the next rebase round counts on from the marker",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 1, "rebased": 1, "sha": "older"}),
+                none.clone(),
+                "rebase",
+                Some(2),
+            ),
+            (
+                "rebase rounds used, an approved conflict is a fix round",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 0, "rebased": 2, "sha": "older"}),
+                none.clone(),
+                "fix",
+                Some(1),
+            ),
+            (
+                "a marker's rebase count past the cap reads as the cap",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": {"rebaseRounds": REBASE_ROUNDS_LIMIT}}),
+                json!({"rounds": 2, "rebased": 99, "sha": "older"}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "both kinds of rounds used goes to a human",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 2, "rebased": 2, "sha": "older"}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a conflict with no verdict is not a rebase round",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "contexts": {"review": null}, "policy": rebase.clone()}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "fix",
+                Some(1),
+            ),
+            (
+                "a conflict with a failed check is not a rebase round",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "contexts": ci_failed.clone(), "policy": rebase.clone()}),
+                json!({"rounds": 2, "sha": "older"}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "a rebase round running for this head waits",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 2, "rebased": 1, "rebasing": true, "sha": HEAD, "run": 7}),
+                running.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "a rebase round that failed goes to a human",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 0, "rebased": 1, "rebasing": true, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
                 "needs-human",
                 None,
             ),
@@ -7711,6 +7876,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_rebase_round_keeps_the_fix_rounds_and_is_given_back_apart() {
+        let policy = json!({"rebaseRounds": 2});
+        let conflict = json!({"mergeable": CONFLICTING});
+        let (line, fake, dispatcher) = applied_with(
+            policy.clone(),
+            conflict.clone(),
+            json!({"rounds": 2, "continued": 1, "sha": "older"}),
+        );
+        assert!(
+            line.ends_with("rebase: conflicts with main; approved, so rebase round 1 of 2 -> https://github.com/cgwalters-forge/tracker/actions/runs/1234"),
+            "{line}"
+        );
+        let (_, request) = dispatcher.writes.borrow()[0].clone();
+        let task = request["inputs"]["task"].as_str().unwrap();
+        assert!(task.contains("This is rebase round 1 of 2."), "{task}");
+        assert!(task.contains("Its branch conflicts with main."), "{task}");
+        assert!(!task.contains("fix round"), "{task}");
+        let writes = fake.writes.borrow();
+        assert!(text(&writes[1].1, "/body").contains("Rebase round 1 of 2 for `488f45ebacd0`"));
+        let marker = find_marker(
+            &[json!({"id": 99, "user": {"login": BOT}, "body": writes[1].1["body"]})],
+            BOT,
+        );
+        assert_eq!(
+            (
+                marker.rounds,
+                marker.continued,
+                marker.rebased,
+                marker.rebasing
+            ),
+            (2, 1, 1, true)
+        );
+        assert_eq!(marker.round_name(), "rebase round 1");
+        // An outage's refund gives back the rebase round, not a fix round.
+        let refunded = marker.refunded();
+        assert_eq!(
+            (refunded.rounds, refunded.rebased, refunded.rebasing),
+            (2, 0, false)
+        );
+        drop(writes);
+
+        // Off (the default), the same pull request goes to a human as before.
+        let (line, _, dispatcher) =
+            applied_with(json!({}), conflict, json!({"rounds": 2, "sha": "older"}));
+        assert!(
+            line.ends_with("needs-human: 2 fix rounds used and 488f45ebacd0 still fails (conflicts with main) -> labelled needs-human"),
+            "{line}"
+        );
+        assert!(dispatcher.writes.borrow().is_empty());
+    }
+
     /// A continuation that completed partial work, marked ready by
     /// agentic-job, has its title and description set from its head commit.
     #[test]
@@ -8983,6 +9200,26 @@ mod tests {
             let got = PollPolicy::from_json(&value)
                 .ok()
                 .map(|p| p.operator_answers);
+            assert_eq!(got, want, "{value}");
+        }
+    }
+
+    #[test]
+    fn rebase_rounds_policy_table() {
+        for (value, want) in [
+            (json!({}), Some(0)),
+            (json!({"rebaseRounds": 0}), Some(0)),
+            (json!({"rebaseRounds": 1}), Some(1)),
+            (
+                json!({"rebaseRounds": REBASE_ROUNDS_LIMIT}),
+                Some(REBASE_ROUNDS_LIMIT),
+            ),
+            (json!({"rebaseRounds": REBASE_ROUNDS_LIMIT + 1}), None),
+            (json!({"rebaseRounds": -1}), None),
+            (json!({"rebaseRounds": "1"}), None),
+            (json!({"rebaseRounds": null}), None),
+        ] {
+            let got = PollPolicy::from_json(&value).ok().map(|p| p.rebase_rounds);
             assert_eq!(got, want, "{value}");
         }
     }
