@@ -462,7 +462,35 @@ fn execute(cli: Cli) -> Result<()> {
                 cli.json.is_none(),
                 "record prints JSONL proposals; --json is unsupported"
             );
-            dispatch::record(&load(&cli)?, args, cli.repo.as_deref(), &cli.hostname)
+            ensure!(
+                !args.apply || cli.snapshot.is_none(),
+                "--apply writes to the live board; it cannot use --snapshot"
+            );
+            let snapshot = load(&cli)?;
+            // Lookup is lazy: existing Run and explicit --run retain the offline path.
+            let mut args = args.clone();
+            if args.needs_lookup(&snapshot, cli.repo.as_deref(), &cli.hostname)? {
+                dispatch::discover(
+                    &snapshot,
+                    &mut args,
+                    cli.repo.as_deref(),
+                    &cli.hostname,
+                    &board_forge::github::Client::from_env()?,
+                    &mut io::stdout().lock(),
+                )?;
+            }
+            if args.apply {
+                dispatch::apply(
+                    &github(&cli)?,
+                    &snapshot,
+                    &args,
+                    cli.repo.as_deref(),
+                    &cli.hostname,
+                    &mut io::stdout().lock(),
+                )
+            } else {
+                dispatch::record(&snapshot, &args, cli.repo.as_deref(), &cli.hostname)
+            }
         }
         Command::Snapshot {
             command: SnapshotCommand::Create,
