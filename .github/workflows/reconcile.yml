@@ -18,19 +18,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # Until the environment secret is provisioned, skip with a notice rather
+      # than failing every scheduled run; the failure list then shows real failures.
+      - name: Check for the staging read token
+        id: read-token
+        run: |
+          if [ -n "$STAGING_PROJECT_READ_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::STAGING_PROJECT_READ_TOKEN is not set; skipping this staging reconciliation preview run."
+          fi
+        env:
+          STAGING_PROJECT_READ_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.read-token.outputs.present == 'true'
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - run: cargo build --locked --release -p agent-board
+        if: steps.read-token.outputs.present == 'true'
       - name: Read staging project
+        if: steps.read-token.outputs.present == 'true'
         run: ./target/release/agent-board snapshot create --owner cgwalters-forge-stage --project 2 > snapshot.json
         env:
           GH_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}
       - name: Propose without a token
+        if: steps.read-token.outputs.present == 'true'
         run: ./target/release/agent-board reconcile plan --snapshot snapshot.json --emit > proposals.jsonl
       # Preview only. Never give this job the staging write token.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.read-token.outputs.present == 'true'
         with:
           name: staging-reconcile-proposals
           path: |
