@@ -136,6 +136,10 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
                 assert_eq!(path, "/repos/example/control/issues");
                 assert_eq!(body["assignees"], json!(["owner"]));
                 assert_eq!(body["labels"], json!(["needs-human"]));
+                assert!(
+                    out.lines[0].contains(": done, https://github.com/example/control/issues/738"),
+                    "{out:?}"
+                );
             }
             "close" => {
                 assert_eq!(method, "PATCH");
@@ -151,10 +155,15 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
             "replace_state" => {
                 assert_eq!(path, "/repos/example/control/issues/8");
                 assert_eq!(body["body"], r["body"]);
+                assert!(
+                    out.lines[0].contains(": done, https://github.com/example/control/issues/8"),
+                    "{out:?}"
+                );
             }
             "status_update" => {
                 assert_eq!(path, "/graphql");
                 assert_eq!(body["variables"]["project"], "PVT_project");
+                assert_eq!(out.lines[0], "- `status_update` configured target: done, ");
             }
             _ => unreachable!(),
         }
@@ -171,6 +180,26 @@ fn refuses(s: &Settings, r: Value, change: impl FnOnce(&mut Fake)) {
         fake.writes().is_empty(),
         "refusal must precede the first write: {r}"
     );
+}
+
+#[test]
+fn a_created_issue_link_comes_from_the_tracker_and_the_receipt_number() {
+    let s = configured();
+    let p = policy(&s);
+    let r = judgment::Checked::Write(judgment::Write::CreateIssue {
+        title: "A decision is needed".into(),
+        body: "Please decide.".into(),
+    });
+    assert_eq!(
+        r.link(&p, Some(&json!({"number": 738}))),
+        "https://github.com/example/control/issues/738"
+    );
+    // The issue exists even when the receipt carries no usable number; the
+    // write is done, only the link is missing.
+    assert_eq!(r.link(&p, Some(&json!({"number": "738"}))), "");
+    assert_eq!(r.link(&p, Some(&json!({"number": 0}))), "");
+    assert_eq!(r.link(&p, Some(&json!({}))), "");
+    assert_eq!(r.link(&p, None), "");
 }
 
 #[test]

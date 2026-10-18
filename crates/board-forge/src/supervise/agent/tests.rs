@@ -351,6 +351,10 @@ impl Api for Fake {
         }
         let mut id = self.next_id.borrow_mut();
         *id += 1;
+        // A created issue answers with its number, as GitHub's API does.
+        if path == "/repos/example/control/issues" {
+            return Ok(json!({"id": *id, "number": 738}));
+        }
         Ok(json!({"id": *id}))
     }
 }

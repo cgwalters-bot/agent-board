@@ -756,7 +756,7 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
             continue;
         }
         let sent = r.apply(api, policy, ctx);
-        let link = r.link(policy);
+        let link = r.link(policy, sent.as_ref().ok());
         match sent {
             Ok(_) => lines.push(format!("- {}: done, {link}", r.describe())),
             Err(error) => {
