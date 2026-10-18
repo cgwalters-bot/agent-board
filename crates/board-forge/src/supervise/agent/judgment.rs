@@ -265,8 +265,15 @@ impl Checked {
         }
     }
 
-    pub fn link(&self, p: &Policy) -> String {
+    /// The issue the log line links to. `receipt` is the write's API answer;
+    /// a created issue is only addressable through the number it reports.
+    pub fn link(&self, p: &Policy, receipt: Option<&Value>) -> String {
         let target = self.issue().or_else(|| match self {
+            Self::Write(Write::CreateIssue { .. }) => p
+                .agent
+                .tracker
+                .as_deref()
+                .zip(receipt.and_then(|r| r["number"].as_u64().filter(|n| *n > 0))),
             Self::Write(Write::ReplaceState { .. }) => p
                 .agent
                 .state
