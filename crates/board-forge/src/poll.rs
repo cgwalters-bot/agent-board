@@ -155,6 +155,9 @@ const QUEUE_RUNS_PAGE: u64 = 100;
 const QUEUE_LOG_LIMIT: usize = 2000;
 /// The most of one text the queue state keeps in a marker.
 const QUEUE_TEXT_LIMIT: usize = 200;
+/// The most failed jobs of one merge-group run the queue state keeps, so a
+/// workflow with many failing jobs cannot grow the marker without bound.
+const QUEUE_JOBS_LIMIT: usize = 20;
 /// The branch GitHub runs a merge group on: `gh-readonly-queue/BASE/pr-N-SHA`.
 const QUEUE_BRANCH_PREFIX: &str = "gh-readonly-queue/";
 /// `brokerOutage` (agent-board#108): tracker's outage issues, as its
@@ -1257,8 +1260,9 @@ pub struct QueueState {
     /// stops: an old removal is never read as a new one.
     pub seen: String,
     pub tries: u64,
-    /// The job that failed the head's last merge-group run, once.
-    pub job: Option<String>,
+    /// The jobs and steps that failed the head's last merge-group run, once,
+    /// sorted and cut to [`QUEUE_JOBS_LIMIT`].
+    pub jobs: Vec<String>,
     /// The job and step that failed it twice: the head's own failure, which
     /// stands as a failed check until the head changes.
     pub failed: Option<String>,
@@ -1288,7 +1292,7 @@ impl QueueState {
             "head": plain(&self.head),
             "seen": plain(&self.seen),
             "tries": self.tries,
-            "job": some(&self.job),
+            "jobs": self.jobs.iter().map(|j| plain(j)).collect::<Vec<_>>(),
             "failed": some(&self.failed),
             "reasons": self.reasons.iter().map(|r| plain(r)).collect::<Vec<_>>(),
             "group": some(&self.group),
@@ -1304,7 +1308,14 @@ impl QueueState {
             tries: value["tries"]
                 .as_u64()
                 .filter(|t| *t <= QUEUE_TRIES_LIMIT)?,
-            job: string("job"),
+            jobs: nodes(value, "/jobs")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(plain)
+                // A marker written before the set was kept names one job.
+                .chain(string("job"))
+                .take(QUEUE_JOBS_LIMIT)
+                .collect(),
             failed: string("failed"),
             reasons: nodes(value, "/reasons")
                 .iter()
@@ -2708,15 +2719,18 @@ fn failed_step(job: &Value) -> Option<String> {
 enum Group {
     /// Nothing of its own: the cascade or the infrastructure, as described.
     Infra(String),
-    /// A job and step of its own, with the run it failed, the job's check
-    /// run where its `check_run_url` names one in the repository, and its URL.
-    Job {
-        job: String,
-        step: String,
-        run: u64,
-        check_run: Option<u64>,
-        url: Option<String>,
-    },
+    /// Jobs that failed at steps of their own in `run`, sorted by what failed
+    /// and never empty.
+    Job { run: u64, jobs: Vec<FailedJob> },
+}
+
+/// A job of a merge-group run that failed at a step of its own: `job J failed
+/// at step S`, the job's check run where its `check_run_url` names one in the
+/// repository, and its URL.
+struct FailedJob {
+    what: String,
+    check_run: Option<u64>,
+    url: Option<String>,
 }
 
 impl<R: Rest, G: Transport> Pass<'_, R, G> {
@@ -3551,27 +3565,33 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let consumed = state.group.as_deref();
                 match self.group_failure(repo, pull, (since.as_deref(), removed_at), consumed)? {
                     Group::Infra(why) => Removal::Retry(why),
-                    Group::Job {
-                        job,
-                        step,
-                        run,
-                        check_run,
-                        url,
-                    } => {
-                        // The same job failing at the same step for this head
+                    Group::Job { run, jobs } => {
+                        // A job failing at the same step for this head again
                         // is the same failure; a second one is not re-queued
-                        // (agentic-job#777 went back three times). A failure
+                        // (agentic-job#777 went back three times). Every failed
+                        // job is compared, not the first listed: with several
+                        // failing, the listing's order changes between runs
+                        // (agentic-job#1177 went back three times). A failure
                         // elsewhere starts the count again. Compared as the
-                        // marker keeps it, cut to its bound.
-                        let what = format!("job {job} failed at step {step}");
+                        // marker keeps them, cut to their bounds.
                         state.group = Some(run.to_string());
-                        if state.job.as_deref() == Some(plain(&what).as_str()) {
-                            state.failed = Some(format!("merge queue {what}"));
-                            let log = self.annotations(repo, check_run)?;
-                            return Ok((Removal::None, state, Some((url, log))));
+                        if let Some(same) =
+                            jobs.iter().find(|j| state.jobs.contains(&plain(&j.what)))
+                        {
+                            state.failed = Some(format!("merge queue {}", same.what));
+                            let log = self.annotations(repo, same.check_run)?;
+                            return Ok((Removal::None, state, Some((same.url.clone(), log))));
                         }
-                        state.job = Some(plain(&what));
-                        Removal::Retry(format!("{what}, once"))
+                        state.jobs = jobs
+                            .iter()
+                            .map(|j| plain(&j.what))
+                            .take(QUEUE_JOBS_LIMIT)
+                            .collect();
+                        let first = jobs.first().map_or("", |j| j.what.as_str());
+                        Removal::Retry(match jobs.len().saturating_sub(1) {
+                            0 => format!("{first}, once"),
+                            more => format!("{first} (and {more} more jobs), once"),
+                        })
                     }
                 }
             }
@@ -3662,6 +3682,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let jobs = self.get(&format!(
                 "repos/{repo}/actions/runs/{run}/jobs?per_page=100"
             ))?;
+            // Keyed by what failed, so the order is not the listing's and a
+            // job listed twice is kept once.
+            let mut own = BTreeMap::new();
             for job in nodes(&jobs, "/jobs") {
                 if !FAILED_RUNS.contains(&text(job, "/conclusion")) {
                     continue;
@@ -3669,10 +3692,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let name = plain(text(job, "/name"));
                 match failed_step(job) {
                     Some(step) if !before_own_steps(&step) => {
-                        return Ok(Group::Job {
-                            job: name,
-                            step,
-                            run,
+                        let what = format!("job {name} failed at step {step}");
+                        own.entry(what.clone()).or_insert_with(|| FailedJob {
+                            what,
                             check_run: check_run_id(repo, job),
                             url: job["html_url"].as_str().map(str::to_owned),
                         });
@@ -3684,6 +3706,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         ));
                     }
                 }
+            }
+            if !own.is_empty() {
+                let jobs = own.into_values().collect();
+                return Ok(Group::Job { run, jobs });
             }
         }
         Ok(Group::Infra(early.unwrap_or_else(|| {
@@ -10566,7 +10592,7 @@ mod tests {
             head: HEAD.into(),
             seen: "RFMQE_1".into(),
             tries: 2,
-            job: Some("rust\"} --> {\"rounds\": 0".into()),
+            jobs: vec!["rust\"} --> {\"rounds\": 0".into()],
             failed: None,
             reasons: vec!["the queue rebuilt around it".into()],
             group: Some("gh-readonly-queue/main/pr-470-aaa".into()),
@@ -10583,11 +10609,23 @@ mod tests {
         let read = find_marker(&[comment(&queue)], BOT);
         assert_eq!(read.rounds, 1);
         let read = read.queue.unwrap();
-        assert_eq!(read.job.as_deref(), Some("rust -- rounds: 0"));
+        assert_eq!(read.jobs, ["rust -- rounds: 0"]);
         assert_eq!(read.tries, 2);
         assert_eq!(read.reasons, queue.reasons);
         let reread = find_marker(&[comment(&read)], BOT).queue.unwrap();
         assert_eq!(reread, read);
+        // A marker naming more failed jobs than the bound is read cut to it.
+        let mut many = queue.clone();
+        many.jobs = (0..QUEUE_JOBS_LIMIT + 5)
+            .map(|i| format!("job {i}"))
+            .collect();
+        let read = find_marker(&[comment(&many)], BOT).queue.unwrap();
+        assert_eq!(read.jobs, many.jobs[..QUEUE_JOBS_LIMIT]);
+        // A marker from before the set names its one job as `job`.
+        let mut old = queue.to_json();
+        old["job"] = old["jobs"][0].take();
+        old.as_object_mut().unwrap().remove("jobs");
+        assert_eq!(QueueState::from_json(&old), Some(reread));
         let mut over = queue.clone();
         over.tries = QUEUE_TRIES_LIMIT + 1;
         assert_eq!(find_marker(&[comment(&over)], BOT).queue, None);
@@ -10601,17 +10639,34 @@ mod tests {
     fn the_poll_owns_the_merge_queue() {
         // The failure every failing case's merge-group run has, as recorded.
         const SAME: &str = "job rust failed at step Run cargo test";
+        // The e2e jobs of agentic-job#1177's merge-group runs, in the order
+        // its first run listed them, and as the marker records their failure.
+        const E2E: &[&str] = &[
+            "e2e-full",
+            "e2e-check-run",
+            "e2e-people",
+            "e2e-review",
+            "e2e-fix",
+            "e2e-queue",
+            "e2e-outage",
+            "e2e-supervise",
+        ];
+        let mut e2e_failed: Vec<String> = E2E
+            .iter()
+            .map(|j| format!("job {j} failed at step Set up secure host"))
+            .collect();
+        e2e_failed.sort();
         let comment = format!("POST repos/{REPO}/issues/470/comments");
         let label = [
             format!("POST repos/{REPO}/labels"),
             format!("POST repos/{REPO}/issues/470/labels"),
         ];
         let removed = |id: &str, reason: &str| json!({"nodes": [{"id": id, "createdAt": "2026-10-12T01:30:00Z", "reason": reason}]});
-        let state = |seen: &str, tries: u64, job: Value, failed: Value| json!({"rounds": 0, "queue": {"head": HEAD, "seen": seen, "tries": tries, "job": job, "failed": failed, "reasons": (["a", "b", "c"][..tries as usize])}});
+        let state = |seen: &str, tries: u64, jobs: &[&str], failed: Value| json!({"rounds": 0, "queue": {"head": HEAD, "seen": seen, "tries": tries, "jobs": jobs, "failed": failed, "reasons": (["a", "b", "c"][..tries as usize])}});
         let files = |paths: &[&str]| json!({"nodes": paths.iter().map(|p| json!({"path": p})).collect::<Vec<_>>(), "pageInfo": {"hasNextPage": false}});
         let ahead = json!([{"pullRequest": {"number": 471, "files": files(&["crates/a.rs"])}}]);
         let read = |seen: &str, group: &str, since: &str| {
-            let mut s = state(seen, 1, json!(SAME), Value::Null);
+            let mut s = state(seen, 1, &[SAME], Value::Null);
             s["queue"]["group"] = group.into();
             s["queue"]["since"] = since.into();
             s
@@ -10649,12 +10704,12 @@ mod tests {
                 "a run that failed in its checkout is the cascade, not its own",
                 Some(3),
                 json!({"timelineItems": removed("R2", "failed_checks")}),
-                state("R1", 1, json!("rust"), none.clone()),
+                state("R1", 1, &["rust"], none.clone()),
                 Some("Run actions/checkout@v4"),
                 json!([]),
                 "re-queue 2 of 3, after job rust failed before its own steps (at Run actions/checkout@v4) -> added to the merge queue",
                 vec![comment.clone(), "enqueuePullRequest".into()],
-                json!({"seen": "R2", "tries": 2, "job": "rust"}),
+                json!({"seen": "R2", "tries": 2, "jobs": ["rust"]}),
             ),
             (
                 "a job's first failure is retried, and the job remembered",
@@ -10665,7 +10720,7 @@ mod tests {
                 json!([]),
                 "re-queue 1 of 3, after job rust failed at step Run cargo test, once -> added to the merge queue",
                 vec![comment.clone(), "enqueuePullRequest".into()],
-                json!({"seen": "R1", "tries": 1, "job": "job rust failed at step Run cargo test", "group": "77"}),
+                json!({"seen": "R1", "tries": 1, "jobs": ["job rust failed at step Run cargo test"], "group": "77"}),
             ),
             (
                 "the same job failing at another step is another failure, and retried",
@@ -10674,20 +10729,20 @@ mod tests {
                 state(
                     "R1",
                     1,
-                    json!("job rust failed at step Run cargo build"),
+                    &["job rust failed at step Run cargo build"],
                     none.clone(),
                 ),
                 Some("Run cargo test"),
                 json!([]),
                 "re-queue 2 of 3, after job rust failed at step Run cargo test, once -> added to the merge queue",
                 vec![comment.clone(), "enqueuePullRequest".into()],
-                json!({"seen": "R2", "tries": 2, "job": "job rust failed at step Run cargo test", "failed": null}),
+                json!({"seen": "R2", "tries": 2, "jobs": ["job rust failed at step Run cargo test"], "failed": null}),
             ),
             (
                 "the same job failing twice is its own failure, and starts a fix round",
                 Some(3),
                 json!({"timelineItems": removed("R2", "failed_checks")}),
-                state("R1", 1, json!(SAME), none.clone()),
+                state("R1", 1, &[SAME], none.clone()),
                 Some("Run cargo test"),
                 json!([]),
                 "fix: check merge queue job rust failed at step Run cargo test failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
@@ -10697,6 +10752,57 @@ mod tests {
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R2", "failed": "merge queue job rust failed at step Run cargo test", "group": "77", "since": "2026-10-12T01:30:00Z"}),
+            ),
+            (
+                "several failed jobs are all remembered, in order of what failed, and retried once",
+                Some(3),
+                json!({"timelineItems": removed("R1", "failed_checks"), "failedJobs": E2E}),
+                none.clone(),
+                Some("Set up secure host"),
+                json!([]),
+                "re-queue 1 of 3, after job e2e-check-run failed at step Set up secure host (and 7 more jobs), once -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"seen": "R1", "tries": 1, "jobs": e2e_failed.clone(), "group": "77"}),
+            ),
+            (
+                // agentic-job#1177: eight jobs failed alike on each of three
+                // runs, each listed first in turn, and it went back each time.
+                "the same jobs failing again, listed in another order, are its own failure, and start a fix round",
+                Some(3),
+                json!({"timelineItems": removed("R2", "failed_checks"), "failedJobs": E2E.iter().rev().collect::<Vec<_>>()}),
+                {
+                    let failed: Vec<&str> = e2e_failed.iter().map(String::as_str).collect();
+                    state("R1", 1, &failed, none.clone())
+                },
+                Some("Set up secure host"),
+                json!([]),
+                "fix: check merge queue job e2e-check-run failed at step Set up secure host failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![
+                    comment.clone(),
+                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
+                ],
+                json!({"seen": "R2", "failed": "merge queue job e2e-check-run failed at step Set up secure host", "group": "77"}),
+            ),
+            (
+                "one job failing again among others is its own failure, named as it failed twice",
+                Some(3),
+                json!({"timelineItems": removed("R2", "failed_checks"), "failedJobs": E2E}),
+                state(
+                    "R1",
+                    1,
+                    &["job e2e-people failed at step Set up secure host"],
+                    none.clone(),
+                ),
+                Some("Set up secure host"),
+                json!([]),
+                "fix: check merge queue job e2e-people failed at step Set up secure host failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![
+                    comment.clone(),
+                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
+                ],
+                json!({"seen": "R2", "failed": "merge queue job e2e-people failed at step Set up secure host"}),
             ),
             (
                 "a group on the branch of the one read before, re-queued onto an unchanged base, is a new failure",
@@ -10747,7 +10853,7 @@ mod tests {
                 "nor a run of an older head",
                 Some(3),
                 json!({"timelineItems": removed("R2", "failed_checks"), "committedDate": "2026-10-12T01:20:00Z"}),
-                state("R1", 1, json!("rust"), none.clone()),
+                state("R1", 1, &["rust"], none.clone()),
                 Some("Run cargo test"),
                 json!([]),
                 "re-queue 2 of 3, after no merge-group run of it was found, as when the queue deleted its branch -> added to the merge queue",
@@ -10762,7 +10868,7 @@ mod tests {
                     let mut s = state(
                         "R2",
                         1,
-                        json!("rust"),
+                        &["rust"],
                         json!("merge queue job rust failed at step Run cargo test"),
                     );
                     s["rounds"] = 1.into();
@@ -10780,7 +10886,7 @@ mod tests {
                 "a removal already acted on is not counted again",
                 Some(3),
                 json!({"timelineItems": removed("R1", "stack_invalidated")}),
-                state("R1", 1, json!(null), none.clone()),
+                state("R1", 1, &[], none.clone()),
                 None,
                 json!([]),
                 "merge: review approved and checks green -> added to the merge queue",
@@ -10791,7 +10897,7 @@ mod tests {
                 "past the tries it goes to a human, with the reasons",
                 Some(3),
                 json!({"timelineItems": removed("R4", "stack_invalidated")}),
-                state("R3", 3, json!(null), none.clone()),
+                state("R3", 3, &[], none.clone()),
                 None,
                 json!([]),
                 "needs-human: removed from the merge queue 4 times at 488f45ebacd0 (a; b; c; the queue rebuilt around it) -> labelled needs-human",
@@ -10906,6 +11012,13 @@ mod tests {
                 .unwrap()
                 .remove("committedDate")
                 .unwrap_or("2026-10-12T00:50:00Z".into());
+            // The jobs failing at the step, in the listing's order: rust alone
+            // unless the case names them.
+            let failed_jobs = change
+                .as_object_mut()
+                .unwrap()
+                .remove("failedJobs")
+                .unwrap_or(json!(["rust"]));
             let mut p = pull("pull-470", change);
             p["commits"]["nodes"][0]["commit"]["committedDate"] = committed;
             fake.pulls.insert(470, p);
@@ -10935,18 +11048,20 @@ mod tests {
                         group(74, "gh-readonly-queue/main/pr-470-old", "2026-10-12T00:40:00Z"),
                     ]}),
                 );
+                let mut jobs =
+                    vec![json!({"id": 87, "name": "specs", "conclusion": "success", "steps": []})];
+                for (id, name) in (88..).zip(failed_jobs.as_array().unwrap()) {
+                    // A job's id is not its check run's.
+                    jobs.push(json!({"id": id, "name": name, "conclusion": "failure", "html_url": format!("https://github.com/x/job/{id}"), "check_run_url": format!("{API_ROOT}repos/{REPO}/check-runs/99"), "steps": [
+                        {"name": "Set up job", "conclusion": "success"},
+                        {"name": failing, "conclusion": "failure"},
+                    ]}));
+                }
                 fake.page(
                     &format!("repos/{REPO}/actions/runs/77/jobs?per_page=100"),
                     None,
                     None,
-                    json!({"jobs": [
-                        {"id": 87, "name": "specs", "conclusion": "success", "steps": []},
-                        // A job's id is not its check run's.
-                        {"id": 88, "name": "rust", "conclusion": "failure", "html_url": "https://github.com/x/job/88", "check_run_url": format!("{API_ROOT}repos/{REPO}/check-runs/99"), "steps": [
-                            {"name": "Set up job", "conclusion": "success"},
-                            {"name": failing, "conclusion": "failure"},
-                        ]},
-                    ]}),
+                    json!({"jobs": jobs}),
                 );
                 fake.page(
                     &format!("repos/{REPO}/check-runs/99/annotations?per_page=50"),
@@ -11005,6 +11120,13 @@ mod tests {
                     assert!(task.contains(want), "{name}: {task}");
                 }
                 assert!(!task.contains("unused"), "{name}");
+            }
+            if name.contains("listed in another order") {
+                // The job named is the one it links: e2e-check-run, listed
+                // seventh of the eight here.
+                let task = &dispatcher.writes.borrow()[0].1["inputs"]["task"];
+                let want = "- merge queue job e2e-check-run failed at step Set up secure host: https://github.com/x/job/94";
+                assert!(task.as_str().unwrap().contains(want), "{name}: {task}");
             }
         }
     }
