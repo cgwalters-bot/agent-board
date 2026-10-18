@@ -287,7 +287,7 @@ branch whose requirements cannot be read is an error. It has been exercised agai
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -307,7 +307,9 @@ simple top-level formatting, rebase and message findings, rejecting ambiguous
 prose, severe findings, code references, stale or cut reviews and conflicts
 alongside rejected reviews. This is cost routing under the same fix bounds,
 not an authorization decision. The pool is recorded in the marker so the next
-round after toil uses `fixPools[0]`. `kindPools.fix` supplies a pool only when
+round after toil uses `fixPools[0]`. An optional `conflictFixPool` takes such
+a round, and a rebase round, where the pull request conflicts with its base;
+absent/empty, those stay on `toilFixPool`. `kindPools.fix` supplies a pool only when
 the fix-round list is empty; other kinds are not dispatched by poll.
 
 `pace` (absent by default, which leaves pool selection as above) names the
