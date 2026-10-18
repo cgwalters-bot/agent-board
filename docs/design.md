@@ -260,8 +260,10 @@ runs poll.cjs. Promoting operator-approved fork pull requests upstream is not
 implemented. Every workflow of a repository reviews as the Actions bot, and a
 branch of the repository could add one that approves its own pull request, so
 the bot's review counts only where the pull request's own workflows cannot
-review (a dispatch pull request from the bot's fork into a public repository,
-whose workflows get a read-only token) and only where the run its marker names
+review (the bot's pull request from its fork into a public repository, on
+any branch of the fork, `dispatch/` or another such as the release train's,
+which also get fix and rebase rounds (agent-board#142); its workflows get a
+read-only token) and only where the run its marker names
 is a `pull_request_target` run of `--review-workflow` for that head that ran
 while the review was submitted, which keeps out the repository's other
 workflows. Anyone who can push a branch to the repository (or change what the
@@ -398,7 +400,7 @@ waits for it to close.
 `mergeQueue` (absent by default, which leaves a removed pull request to be
 enqueued again like any other) has the poll own the merge queue
 (agent-board#91). `{"tries": N}` (1 to 10, default 3) bounds the re-queues of
-one head. For the bot's dispatch pull requests the newest
+one head. For the bot's pull requests from its fork the newest
 `RemovedFromMergeQueueEvent` the marker has not seen is read once:
 `stack_invalidated`, `merge_conflict` on a head that no longer conflicts, and a
 `failed_checks` or `checks_timed_out` whose merge-group run is gone or failed in
@@ -492,7 +494,7 @@ before.
 The poll never takes a pull request out of draft. Since agentic-job v0.5.1
 (agentic-job#691) opens complete work ready and only a
 [checkpoint](https://github.com/cgwalters-forge/agentic-job/blob/v0.5.1/docs/safe-outputs.md#ready-or-draft)
-as a draft, a draft of the bot's dispatch pull requests whose head commit
+as a draft, a draft of the bot's pull requests from its fork whose head commit
 message or body holds one gets a continuation: a `fix`-kind run on its branch
 whose task carries the checkpoint, before any fix round (its checks are of
 unfinished work). Its decision line reads `continue: continuing (round N): its
