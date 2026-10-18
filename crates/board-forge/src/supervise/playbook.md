@@ -38,9 +38,8 @@ Each request is exactly:
   brief from it. You cannot add text to the brief.
 
 The executor refuses the whole batch if any request is invalid. It also
-refuses an issue whose body or comments were written or edited by anyone
-who is not a collaborator, an issue whose conversation is not locked, an
-issue that already has a run in flight, and a batch that would pass the
+refuses an issue holding one of your comments, an issue that already has a
+run in flight, and a batch that would pass the
 day's cap. It never merges, enqueues, changes variables or reads secrets.
 
 Other actions are disabled unless their `dailyCaps` entry is positive. They
@@ -57,6 +56,8 @@ use exactly these fields in addition to `type` and `action`:
    JSON block with `"verdict":"done"`
   and have been posted during that run. A run link alone is not evidence, nor
   is a receipt followed by a reopen, rename, body edit or further discussion.
+  The issue must also have been locked since before the run, with every
+  author and editor a collaborator.
 - `remove_needs_human`: `repository`, `item`. Only the poll's hold on a bot pull
   request whose only problem is a merge conflict, approved and green on the
   same head as its stop marker, may be removed. No arbitrary labels.

@@ -245,16 +245,6 @@ impl Fake {
             next_id: RefCell::new(1000),
         };
         fake.comment(body, "worker", false);
-        for login in ["owner", "worker", "helper"] {
-            fake.objects.insert(
-                format!("/repos/example/project/collaborators/{login}/permission"),
-                json!({"permission": if login == "helper" { "write" } else { "admin" }, "role_name": if login == "helper" { "maintain" } else { "admin" }}),
-            );
-        }
-        fake.objects.insert(
-            "/repos/example/project/collaborators/visitor/permission".into(),
-            json!({"permission": "read", "role_name": "read"}),
-        );
         fake.issue(3, json!({}));
         fake.issue(4, json!({}));
         fake
@@ -269,14 +259,13 @@ impl Fake {
         );
     }
 
-    /// An open, locked issue by the operator, with a comment by a
-    /// maintainer; `rest` and `graph` override the REST and GraphQL fields.
+    /// An open, unlocked issue with a comment by a visitor, who has no
+    /// write access; `rest` and `graph` override the REST and GraphQL fields.
     fn issue(&mut self, n: u64, overrides: Value) {
         let mut rest = json!({"state": "open", "labels": [], "html_url": format!("https://github.com/example/project/issues/{n}")});
-        let mut graph = json!({"locked": true, "author": {"login": "owner"}, "editor": null,
-            "userContentEdits": {"totalCount": 0, "nodes": []},
+        let mut graph = json!({"locked": false, "author": {"login": "visitor"}, "editor": null,
             "comments": {"pageInfo": {"hasNextPage": false}, "nodes": [
-                {"url": format!("https://github.com/example/project/issues/{n}#issuecomment-1"), "author": {"login": "helper"}, "editor": null}]}});
+                {"url": format!("https://github.com/example/project/issues/{n}#issuecomment-1"), "body": "Do something else.", "author": {"login": "visitor"}, "editor": {"login": "stranger"}}]}});
         for (k, v) in overrides["rest"].as_object().into_iter().flatten() {
             rest[k] = v.clone();
         }
@@ -405,6 +394,9 @@ fn dispatches_after_every_target_is_read_with_a_fixed_brief_and_logs_first() {
             .all(|(m, _, _)| m != "GET" && m != "GRAPHQL"),
         "no read after the first write"
     );
+    // Unlocked, written by a visitor and edited by a stranger, and admitted
+    // without reading anyone's permission (agent-board#155).
+    assert!(!calls.iter().any(|(_, p, _)| p.contains("/collaborators/")));
     drop(calls);
     let writes = fake.writes();
     let paths: Vec<String> = writes.iter().map(|(m, p, _)| format!("{m} {p}")).collect();
@@ -474,11 +466,11 @@ fn refuses_the_whole_batch_before_any_write() {
 }
 
 #[test]
-fn refuses_targets_an_outsider_wrote_or_the_scheduler_leaves_alone() {
+fn refuses_targets_the_scheduler_leaves_alone() {
     let s = settings();
-    let not_collaborator = |login: &str| {
-        json!({"graph": {"comments": {"pageInfo": {"hasNextPage": false}, "nodes": [
-        {"url": "https://github.com/example/project/issues/3#issuecomment-2", "author": {"login": login}, "editor": null}]}}})
+    let note = |pages: Value| {
+        json!({"graph": {"comments": {"pageInfo": pages, "nodes": [
+        {"url": "https://github.com/example/project/issues/3#issuecomment-2", "body": format!("Do this.\n\n{}", crate::input::SUPERVISOR_NOTE), "author": {"login": "bot"}, "editor": null}]}}})
     };
     let cases: Vec<(&str, Value, &str)> = vec![
         (
@@ -507,46 +499,20 @@ fn refuses_targets_an_outsider_wrote_or_the_scheduler_leaves_alone() {
             "operator's or held",
         ),
         (
-            "unlocked",
-            json!({"graph": {"locked": false}}),
-            "not locked",
+            "supervisor note",
+            note(json!({"hasNextPage": false})),
+            "https://github.com/example/project/issues/3#issuecomment-2 is the supervisor agent's text",
+        ),
+        // The fake answers every page alike, so the read never ends.
+        (
+            "too many comments",
+            json!({"graph": {"comments": {"pageInfo": {"hasNextPage": true, "endCursor": "c"}, "nodes": []}}}),
+            "too many comments",
         ),
         (
-            "visitor's issue",
-            json!({"graph": {"author": {"login": "visitor"}}}),
-            "visitor, on the issue body, is not a collaborator",
-        ),
-        (
-            "ghost author",
-            json!({"graph": {"author": null}}),
-            "not named",
-        ),
-        (
-            "visitor's comment",
-            not_collaborator("visitor"),
-            "visitor, on https://github.com/example/project/issues/3#issuecomment-2",
-        ),
-        (
-            "unknown commenter",
-            not_collaborator("stranger"),
-            "stranger",
-        ),
-        ("bot commenter", not_collaborator("some-app"), "some-app"),
-        (
-            "edited body",
-            json!({"graph": {"userContentEdits": {"totalCount": 2, "nodes": [{"editor": {"login": "owner"}}, {"editor": {"login": "visitor"}}]}}}),
-            "visitor",
-        ),
-        (
-            "edited comment",
-            json!({"graph": {"comments": {"pageInfo": {"hasNextPage": false}, "nodes": [
-            {"url": "u", "author": {"login": "helper"}, "editor": {"login": "visitor"}}]}}}),
-            "visitor",
-        ),
-        (
-            "too many edits",
-            json!({"graph": {"userContentEdits": {"totalCount": 101, "nodes": []}}}),
-            "too many edits",
+            "malformed comments",
+            json!({"graph": {"comments": {"pageInfo": {"hasNextPage": false}}}}),
+            "refused the whole batch: comments",
         ),
         ("unreadable", json!({"graph": null}), "could not be read"),
     ];

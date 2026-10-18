@@ -5,10 +5,14 @@
 //!
 //! The agent may have read prompt-injected text in any issue, log or comment
 //! it inspected, so its requests are the attacker's to choose. Dispatches
-//! use a closed brief (no agent text reaches the run), items
-//! whose every author is a collaborator and whose conversation is locked
-//! (so the run reads no outsider's text), and caps per pass and per day
-//! counted from the executor's own log, not from anything the agent says.
+//! use a closed brief (no agent text reaches the run), items without the
+//! agent's own notes, and caps per pass and per day counted from the
+//! executor's own log, not from anything the agent says. Anyone's text on an
+//! item is the run's data: the sandbox, its bounded safe outputs and the
+//! review before merge are the boundary, not who wrote it (agent-board#155).
+//! A closure has no review after it, so it takes a triage verdict only on an
+//! issue whose body and comments only collaborators wrote, locked throughout
+//! the run.
 //! Judgment writes share that log and fail closed without configured caps.
 use super::{AgentSettings, Api, HOUR_MS, IssueRef, Settings, encode, iso, millis, run_title};
 use crate::plan::Target;
@@ -68,8 +72,8 @@ const RUN_PAGES: usize = 5;
 /// 1500 comments: four passes an hour log 96 a day. More refuses
 /// dispatches rather than undercount them.
 const LOG_PAGES: usize = 15;
-/// An issue with more comments, or more distinct authors and editors, than
-/// these is refused rather than half checked.
+/// An issue with more comments, or (for a closure) more distinct authors and
+/// editors, than these is refused rather than half checked.
 const COMMENT_PAGES: usize = 10;
 const MAX_PEOPLE: usize = 30;
 const DAY_MS: i64 = 24 * HOUR_MS;
@@ -428,19 +432,32 @@ pub struct Outcome {
     pub log_comment: Option<u64>,
 }
 
-const COLLABORATORS: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+const CONVERSATION: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
-    locked author { login } editor { login }
-    userContentEdits(first: 100) { totalCount nodes { editor { login } } }
-    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url body author { login } editor { login } } }
+    locked author { ...Actor } editor { ...Actor }
+    userContentEdits(first: 100) { totalCount nodes { editor { ...Actor } } }
+    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } }
   } }
-}"#;
+}
+fragment Actor on Actor { __typename login }"#;
 
-/// agent-board#111's check at dispatch: the run will read the issue's body
-/// and comments, so each of their authors and editors must be a
-/// collaborator with write access, and the conversation locked, so that no
-/// one else can add text between this check and the run.
-fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
+/// Who wrote the issue is not checked (agent-board#155): the run reads it as
+/// data in its sandbox, its writes are bounded safe outputs, and its pull
+/// request needs review before merge. Only the supervisor's own comments,
+/// marked with the note, are refused. The closed brief keeps the agent's
+/// free text out of the runs it dispatches, as it may be injected; a note it
+/// had the bot post on the target would carry that text in anyway, and the
+/// run's answer would be read by the next pass, so one agent run would steer
+/// the next in a loop. An issue it created is held `needs-human` for the
+/// operator, so it is not dispatched until a person takes it on.
+///
+/// `writers` adds agent-board#111's check, for a closure: a triage verdict
+/// closes the issue with no review after it, so the run must have read only
+/// collaborators' text. Each author and editor of the body and comments must
+/// have write access, and the conversation must be locked, so that no one
+/// else could add, edit or delete text; `triage_done` checks the lock held for
+/// the whole triage run.
+fn conversation(api: &dyn Api, repo: &str, number: u64, writers: bool) -> Result<()> {
     let (owner, name) = repo.split_once('/').context("repository")?;
     let mut people: Vec<(String, String)> = vec![];
     let mut add = |actor: &Value, place: &str| -> Result<()> {
@@ -448,6 +465,12 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
             .as_str()
             .filter(|l| crate::is_github_login(l))
             .with_context(|| format!("An author or editor of {place} is not named"))?;
+        // An app's bot shares no permission with the user account its login
+        // names (`renovate` for `renovate[bot]`), so only users are checked.
+        ensure!(
+            actor["__typename"] == "User",
+            "{login}, on {place}, is not a user account"
+        );
         if !people.iter().any(|(l, _)| l.eq_ignore_ascii_case(login)) {
             people.push((login.to_owned(), place.to_owned()));
         }
@@ -460,12 +483,12 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
             "The issue has too many comments to check"
         );
         let data = api.graphql(
-            COLLABORATORS,
+            CONVERSATION,
             json!({"owner": owner, "name": name, "number": number, "cursor": cursor}),
         )?;
         let issue = &data["repository"]["issue"];
         ensure!(issue.is_object(), "The issue could not be read");
-        if page == 0 {
+        if writers && page == 0 {
             ensure!(
                 issue["locked"] == true,
                 "The issue's conversation is not locked"
@@ -486,7 +509,7 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
         }
         let comments = &issue["comments"];
         for comment in comments["nodes"].as_array().context("comments")? {
-            let place = comment["url"].as_str().unwrap_or("a comment").to_owned();
+            let place = comment["url"].as_str().unwrap_or("a comment");
             // The bot posted it, but the agent chose its words.
             ensure!(
                 !comment["body"]
@@ -494,9 +517,13 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
                     .is_some_and(|b| b.contains(crate::input::SUPERVISOR_NOTE)),
                 "{place} is the supervisor agent's text"
             );
-            add(&comment["author"], &place)?;
-            if !comment["editor"].is_null() {
-                add(&comment["editor"], &place)?;
+            if writers {
+                add(&comment["author"], place)?;
+                // GitHub leaves `editor` null where it cannot name the
+                // account, so an edit without one is an unknown account's.
+                if comment["lastEditedAt"].is_string() || !comment["editor"].is_null() {
+                    add(&comment["editor"], place)?;
+                }
             }
         }
         if comments["pageInfo"]["hasNextPage"] != true {
@@ -524,8 +551,8 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
 }
 
 /// Reads only. The schema says what a request names; this says it is an
-/// issue the scheduler would act on, written by collaborators only, with no
-/// run on it in flight.
+/// issue the scheduler would act on, holding no supervisor note, with no run
+/// on it in flight.
 fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
     let issue = api.get(&format!("/repos/{}/issues/{}", r.repository, r.item))?;
     ensure!(issue["labels"].is_array(), "Missing issue labels");
@@ -541,7 +568,7 @@ fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
         })
     });
     ensure!(!held, "The issue is the operator's or held");
-    collaborators(api, &r.repository, r.item)?;
+    conversation(api, &r.repository, r.item, false)?;
     if r.kind == "implement" {
         // The supervisor must not turn an ordinary issue into approved work.
         // Native parentage and the operator's epic label are read, not supplied

@@ -1,15 +1,14 @@
 //! `lockCollaboratorItems`: lock the open issues of the followed repositories
-//! whose input is only from collaborators (agent-board#139), so that the
-//! supervisor, whose `supervise execute` takes only a locked item
-//! ([`crate::input::check`]), has something to dispatch. A lock-on-open
-//! workflow is meant to lock new items; this backstop covers the ones that
-//! were open before it, and any it misses.
+//! whose input is only from collaborators ([`crate::input::check`],
+//! agent-board#139). It was the supervisor's backstop when `supervise
+//! execute` took only a locked item; dispatch no longer needs a lock
+//! (agent-board#155), so this stays only for a caller that opts in.
 //!
 //! Off by default. Locking only stops people without write access from
-//! adding to an item; it never makes one dispatchable by itself, as the
-//! dispatching check reads the whole conversation again. So an item with any
-//! other input is left unlocked: locked, it would look ready while its text
-//! could still steer a run. The bound is on the items checked a pass, each a
+//! adding to an item; it never makes one dispatchable by itself, as
+//! `dispatch --collaborators-only` reads the whole conversation again. So an
+//! item with any other input is left unlocked: locked, it would look ready
+//! to that check while its text could still steer a run. The bound is on the items checked a pass, each a
 //! query and a read of each writer's permission, so that the first passes
 //! over a backlog do not spend the rate limit; the pass's request budget
 //! bounds them too, and the rest wait for later passes.

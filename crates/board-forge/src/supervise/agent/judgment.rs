@@ -554,11 +554,9 @@ fn triage_done(
         "Missing unedited triage done receipt"
     );
     let at = millis(&c["created_at"]).context("Triage receipt timestamp")?;
+    let start = millis(&run["created_at"]).context("Triage start timestamp")?;
     let end = millis(&run["updated_at"]).context("Triage end timestamp")?;
-    ensure!(
-        at >= millis(&run["created_at"]).context("Triage start timestamp")? && at <= end,
-        "Receipt outside triage run"
-    );
+    ensure!(at >= start && at <= end, "Receipt outside triage run");
     // The finding is about the issue as triage read it. A later reopen, title
     // or body edit, or discussion outdates it; only the triage run's own
     // closing comments may follow its receipt.
@@ -573,7 +571,21 @@ fn triage_done(
         issue["lastEditedAt"].is_null() || millis(&issue["lastEditedAt"]).is_some_and(|e| e < at),
         "The issue was edited after its triage"
     );
+    // A verdict closes the issue with no review after it, so triage must have
+    // read only collaborators' text: locked from before its run started to
+    // now, so that no one else could add, edit or delete any, and written
+    // only by collaborators (agent-board#155 left that check to closure).
+    let (mut locked, mut unlocked) = (None, None);
     for e in paged(api, repo, item, "events")? {
+        let newest = match e["event"].as_str() {
+            Some("locked") => Some(&mut locked),
+            Some("unlocked") => Some(&mut unlocked),
+            _ => None,
+        };
+        if let Some(newest) = newest {
+            let t = millis(&e["created_at"]).context("Lock timestamp")?;
+            *newest = (*newest).max(Some(t));
+        }
         if e["event"] == "reopened" || e["event"] == "renamed" {
             ensure!(
                 millis(&e["created_at"]).is_some_and(|t| t < at),
@@ -588,7 +600,11 @@ fn triage_done(
             "The issue was discussed after its triage"
         );
     }
-    Ok(())
+    ensure!(
+        locked.is_some_and(|t| t < start && unlocked < Some(t)),
+        "The issue was not locked throughout its triage"
+    );
+    super::conversation(api, repo, item, true)
 }
 
 const LAST_EDITED: &str = r#"query($owner:String!,$name:String!,$number:Int!){

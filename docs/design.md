@@ -459,15 +459,15 @@ advance the cursor. The tracker's configuration and the review site's
 status listing are not part of this repository.
 
 `lockCollaboratorItems` (1 to 100; absent by default, which locks nothing)
-is the poll's backstop for the supervisor, whose `supervise execute` takes
-only a locked item (agent-board#139). Each pass, after its other steps, it
+is an opt-in left from when `supervise execute` took only a locked item
+(agent-board#139); dispatch no longer needs it (agent-board#155), but a
+supervisor `close` still takes only a locked, collaborator-only issue. Each pass, after its other steps, it
 checks up to that many open, unlocked issues of the
 followed repositories with the input check `dispatch` makes, and with
 `--apply` locks those with input only from collaborators (`lock_reason`
 `resolved`). An item with anyone else's input stays unlocked, with a line
 saying why, and waits behind the others until it changes. A line counts the
-items locked, left unlocked and not checked. The dispatching check still
-reads the locked conversation whole. Pull requests are excluded: the supervisor
+items locked, left unlocked and not checked. Pull requests are excluded: the supervisor
 does not dispatch them, and locking them can prevent job tokens from reviewing.
 
 `operatorAnswers` (`true`; absent or `false` by default, which leaves a
@@ -554,10 +554,13 @@ the agent's one unedited comment on the requests issue and accepts bounded
 requests: a triage or research run on an open issue in a `follow`
 repository, with a pool from the pools file and one of a fixed set of reasons.
 The executor writes the brief itself. A batch is refused whole if any request
-is invalid, if any issue's body or comments were written or edited by anyone
-without write access, if a conversation is unlocked (agent-board#111's check),
-if an issue has a dispatch run in flight, or if the batch would pass
-`maxDispatchesPerPass` or `maxDispatchesPerDay`. The day's count comes from the
+is invalid, if an issue holds a supervisor note, if an issue has a dispatch
+run in flight, or if the batch would pass
+`maxDispatchesPerPass` or `maxDispatchesPerDay`. Who wrote an issue is not
+checked, nor whether it is locked (agent-board#155, operator decision on #138):
+the run reads the issue as data inside its sandbox, can write only through its
+bounded safe outputs, and its pull request needs the required review before
+merge; those are the boundary. The day's count comes from the
 executor's own entries in the log issue, each written before the dispatches it
 names. That count holds only if the caller runs one executor at a time, as
 tracker's execute job does with its own concurrency group. Both caps default
