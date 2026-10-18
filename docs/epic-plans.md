@@ -74,7 +74,10 @@ its position and reason. Only the epic the plan is on is protected as an
 epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused are:
 
 - an issue that is neither new nor a current sub-issue of the epic (read from
-  GitHub at check time), and a closed sub-issue, which a plan may not revive;
+  GitHub at check time), and a closed sub-issue, which a plan may not revive
+  (a `close_sub_issue` of one is not refused but satisfied: it makes no
+  mutations, and the dry run and status list it as `satisfied`, so a plan that
+  went stale when its pull request merged still applies);
 - a repository not given with `--allow-repo`;
 - any change to the epic itself, whose text, priority and labels are the
   operator's, and an `epic` label on a new issue, which would let the planner
@@ -168,7 +171,8 @@ an `<!-- agent-board-epic-apply: COMMENT-ID@CHANGE-TIME -->` claim before any
 mutation and reads it back, as job dispatch does. The oldest claim wins; only
 operator/bot-authored claims count. Callers must serialize apply passes, since
 GitHub comment reads are not a transactional lock. A claimed plan is a no-op
-on re-run, even if a previous close now makes it invalid. A foreign edit to the
+on re-run. The claim, not validation, is what stops a replay: a close the plan
+made is satisfied when it is checked again. A foreign edit to the
 plan still refuses it; accepted edits identify a new plan.
 
 Apply stops on the first failed request, records each confirmed write (including
