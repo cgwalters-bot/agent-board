@@ -46,7 +46,6 @@ pub(crate) use tests::conflict_stop_fixture;
 /// This poll's own: the claim a pass posts before it starts a fix round.
 const CLAIM: &str = "agent-board-fix-claim";
 const LABEL: &str = "needs-human";
-const FIX_BRANCH_PREFIX: &str = "dispatch/";
 const MAX_FIX_ROUNDS: u64 = 2;
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
@@ -1017,8 +1016,8 @@ pub fn review_at_head(pull: &Value, config: &Config, review_run: Option<&Value>)
 /// the repository adds or changes for its own pull request, which could
 /// approve itself, and any of them may edit what another wrote. So it counts
 /// only where the caller named the review workflow
-/// ([`Config::review_workflow`]), on a dispatch pull request from the bot's
-/// fork ([`is_harness`]) into a public repository, and where the run its marker
+/// ([`Config::review_workflow`]), on a pull request from the bot's fork
+/// ([`is_harness`]) into a public repository, and where the run its marker
 /// names is that workflow's, run from the base repository's own branch on
 /// `pull_request_target` for this head while the review was submitted
 /// ([`review_run_matches`]). There the pull request's own workflows get a
@@ -1512,18 +1511,21 @@ fn labelled(pull: &Value) -> bool {
         .any(|l| l["name"] == LABEL)
 }
 
-/// What a dispatch run opened: a fix can push nowhere else, and a draft on any
-/// other branch is its author's to mark ready.
+/// The bot's own pull request from its fork, whatever the head branch: a
+/// dispatch run's `dispatch/` head, or another the bot pushed, such as the
+/// release train's bumps (agent-board#142). Who can push to a head of the
+/// bot's fork (the bot, and the base's maintainers where it allows their
+/// edits) does not depend on the branch's name, so the review job's verdict,
+/// fix rounds and rebases apply to all of them alike.
 pub fn is_harness(pull: &Value, bot: &str) -> bool {
     text(pull, "/author/login") == bot
         && pull["isCrossRepository"].as_bool().unwrap_or(false)
         && text(pull, "/headRepositoryOwner/login") == bot
-        && text(pull, "/headRefName").starts_with(FIX_BRANCH_PREFIX)
 }
 
 /// Whether the pull request is still ours to follow after this pass decided
-/// `action` for it, which keeps the interval short: an open dispatch pull
-/// request that is not (and was not just) handed to a human, or whose label
+/// `action` for it, which keeps the interval short: an open pull request of
+/// the bot's fork that is not (and was not just) handed to a human, or whose label
 /// the operator's answer just took off.
 pub fn in_flight(pull: &Value, bot: &str, action: &str) -> bool {
     is_harness(pull, bot) && (action == "answer" || action != "needs-human" && !labelled(pull))
@@ -2306,8 +2308,7 @@ pub fn decide(
         .iter()
         .any(|a| a == text(pull, "/author/login"));
     let harness = !merge_only && is_harness(pull, &config.bot);
-    let not_ours =
-        format!("not a {FIX_BRANCH_PREFIX} branch of the bot's fork, left to its author");
+    let not_ours = "not a pull request from the bot's fork, left to its author";
     let review = review_at_head(pull, config, review_run);
     let mut failing = Vec::new();
     if review == Some(Review::ChangesRequested) {
@@ -4011,7 +4012,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let mut checks = classify_checks(&pull, &required[&base]);
         let head = text(&pull, "/headRefOid");
-        // Removals are read only for the bot's own dispatch pull requests,
+        // Removals are read only for the bot's own pull requests from its fork,
         // whose marker can count them; out of the queue and not handed to a
         // human. A head that failed twice in the queue fails like a check.
         let tries = self.config.policy.merge_queue;
@@ -4826,6 +4827,24 @@ mod tests {
                 failed_run.clone(),
                 "needs-human",
                 None,
+            ),
+            (
+                "the bot's release-train conflict is rebased as a dispatch one is",
+                "pull-470",
+                json!({"mergeable": CONFLICTING, "headRefName": "release-train/v1.2.3", "policy": rebase.clone()}),
+                json!({"rounds": 2, "sha": "older"}),
+                none.clone(),
+                "rebase",
+                Some(1),
+            ),
+            (
+                "the bot's release-train branch gets a fix round as a dispatch one does",
+                "pull-470",
+                json!({"headRefName": "release-train/v1.2.3", "contexts": ci_failed.clone()}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "fix",
+                Some(1),
             ),
             (
                 "another fork's conflicting branch gets no fix",
@@ -5997,6 +6016,13 @@ mod tests {
                 false,
             ),
             (
+                "the bot's pull request from another branch of its fork",
+                "pull-470",
+                json!({"headRefName": "release-train/v1.2.3"}),
+                "wait",
+                true,
+            ),
+            (
                 "another fork's dispatch/ branch",
                 "pull-470",
                 json!({"headRepositoryOwner": {"login": "someone"}}),
@@ -6500,9 +6526,18 @@ mod tests {
                 Some("review.yml"),
                 "wait",
             ),
+            // The bot's other branches, such as the release train's bumps,
+            // are its own as much as a dispatch run's (agent-board#142).
             (
-                "a branch of the bot's fork that is not a dispatch run's",
-                json!({"headRefName": "feature"}),
+                "the review of a release-train branch of the bot's fork merges",
+                json!({"headRefName": "release-train/v1.2.3"}),
+                json!({}),
+                Some("review.yml"),
+                "merge",
+            ),
+            (
+                "the bot's branch of a fork it does not own",
+                json!({"headRefName": "release-train/v1.2.3", "headRepositoryOwner": {"login": "someone"}}),
                 json!({}),
                 Some("review.yml"),
                 "wait",
