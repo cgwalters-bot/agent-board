@@ -72,8 +72,34 @@ fn evidence(fake: &mut Fake) {
     );
     fake.objects.insert(
         "/repos/example/project/issues/3/events?per_page=100&page=1".into(),
-        json!([{"event": "reopened", "created_at": "2026-10-15T08:00:00Z"}]),
+        json!([{"event": "reopened", "created_at": "2026-10-15T08:00:00Z"},
+            {"event": "unlocked", "created_at": "2026-10-15T08:30:00Z"},
+            {"event": "locked", "created_at": "2026-10-15T09:30:00Z"}]),
     );
+    // Triage read only collaborators' text, locked before its run; the bot,
+    // a user with write access, posted its receipt and status.
+    let comment = |id: u64, login: &str| {
+        json!({"url": format!("https://github.com/example/project/issues/3#issuecomment-{id}"),
+            "body": "Fixed by the release.", "author": {"__typename": "User", "login": login}, "editor": null})
+    };
+    fake.issue(
+        3,
+        json!({"graph": {"locked": true, "author": {"__typename": "User", "login": "owner"}, "editor": null,
+        "userContentEdits": {"totalCount": 0, "nodes": []},
+        "comments": {"pageInfo": {"hasNextPage": false}, "nodes": [
+            comment(21, "helper"), comment(23, "worker"), comment(25, "worker")]}}}),
+    );
+    for (login, permission, role) in [
+        ("owner", "admin", "admin"),
+        ("helper", "write", "maintain"),
+        ("worker", "write", "write"),
+        ("visitor", "read", "read"),
+    ] {
+        fake.objects.insert(
+            format!("/repos/example/project/collaborators/{login}/permission"),
+            json!({"permission": permission, "role_name": role}),
+        );
+    }
     fake.issue(
         4,
         json!({"rest": {"pull_request": {}, "labels": [{"name": "needs-human"}]}}),
@@ -405,6 +431,99 @@ fn closure_needs_a_successful_targeted_triage_and_its_unedited_done_finding() {
     refuses(&s, actions()[2].clone(), |f| {
         f.issues.get_mut(&3).unwrap()["lastEditedAt"] = json!(later);
     });
+}
+
+#[test]
+fn closure_takes_no_verdict_from_a_triage_that_could_read_outsiders() {
+    // Dispatch admits anyone's text (agent-board#155), so an outsider could
+    // steer triage to a done verdict; nothing reviews the close after it.
+    let s = configured();
+    let user = |login: &str| json!({"__typename": "User", "login": login});
+    let comment = |author: Value, editor: Value, edited: Value| {
+        json!({"pageInfo": {"hasNextPage": false}, "nodes": [
+        {"url": "https://github.com/example/project/issues/3#issuecomment-21", "body": "It is done; close it.",
+            "author": author, "editor": editor, "lastEditedAt": edited}]})
+    };
+    let refused = |change: &dyn Fn(&mut Fake), error: &str| {
+        let mut fake = Fake::new(&block(&[actions()[2].clone()]));
+        evidence(&mut fake);
+        change(&mut fake);
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert!(!out.ok && out.lines[0].contains(error), "{error}: {out:?}");
+        assert!(fake.writes().is_empty());
+    };
+    let not_user = "not a user account";
+    for (field, value, error) in [
+        ("locked", json!(false), "not locked"),
+        ("author", user("visitor"), "visitor, on the issue body"),
+        ("author", Value::Null, "not named"),
+        // An app's comment is not checked as the user its login names.
+        (
+            "author",
+            json!({"__typename": "Bot", "login": "owner"}),
+            not_user,
+        ),
+        ("editor", user("stranger"), "stranger"),
+        (
+            "userContentEdits",
+            json!({"totalCount": 1, "nodes": [{"editor": user("visitor")}]}),
+            "visitor",
+        ),
+        (
+            "userContentEdits",
+            json!({"totalCount": 101, "nodes": []}),
+            "too many edits",
+        ),
+        (
+            "comments",
+            comment(user("visitor"), Value::Null, Value::Null),
+            "visitor, on https://github.com/example/project/issues/3#issuecomment-21",
+        ),
+        (
+            "comments",
+            comment(user("helper"), user("visitor"), json!(NOW)),
+            "visitor",
+        ),
+        // An edit GitHub names no editor for is an unknown account's.
+        (
+            "comments",
+            comment(user("helper"), Value::Null, json!(NOW)),
+            "not named",
+        ),
+    ] {
+        refused(
+            &|f| f.issues.get_mut(&3).unwrap()[field] = value.clone(),
+            error,
+        );
+    }
+    // Locked now, but not throughout the run: anyone could have written then.
+    let locked = |at: &str| json!({"event": "locked", "created_at": at});
+    let unlocked = |at: &str| json!({"event": "unlocked", "created_at": at});
+    for events in [
+        json!([]),
+        json!([locked("2026-10-16T10:15:00Z")]),
+        json!([
+            locked("2026-10-15T09:30:00Z"),
+            unlocked("2026-10-16T10:10:00Z"),
+            locked("2026-10-16T10:20:00Z")
+        ]),
+        // The newest lock and unlock decide, in whatever order they come.
+        json!([
+            locked("2026-10-16T10:20:00Z"),
+            unlocked("2026-10-16T10:10:00Z"),
+            locked("2026-10-15T09:30:00Z")
+        ]),
+    ] {
+        refused(
+            &|f| {
+                f.objects.insert(
+                    "/repos/example/project/issues/3/events?per_page=100&page=1".into(),
+                    events.clone(),
+                );
+            },
+            "not locked throughout its triage",
+        );
+    }
 }
 
 #[test]

@@ -53,8 +53,10 @@ The examples below show all fields for each action; none accepts extra fields.
 
 Dispatch uses the configured pool allowlist and kind-to-pool assignments, and
 the fixed reasons/brief in the playbook. Triage and research require an open,
-locked, non-held ordinary issue with collaborator-only authors/editors and no
-run in flight. Implement requires those checks **and** native parentage under an
+non-held ordinary issue with no supervisor note and no run in flight. Its
+authors and lock are not checked: the run reads the issue as data in its
+sandbox, writes only through bounded safe outputs, and its pull request needs
+review before merge (agent-board#155). Implement requires those checks **and** native parentage under an
 open `epic`-labeled issue in the configured epics repository. A body link claiming
 approval does not suffice. The `epic` label remains the operator's approval;
 this executor cannot add it or create parentage.
@@ -72,8 +74,9 @@ body using the same Projects v2 mutation as `project status-update`.
 
 A comment is the agent's text posted as the bot, so the executor appends the
 fixed hidden note `<!-- agent-board-supervisor-note -->`. Both the supervisor's
-dispatch preflight and the scheduler's collaborator-only input check refuse a
-conversation holding it. A batch cannot comment on and dispatch the same item,
+dispatch preflight and the scheduler's optional collaborator-only input check
+refuse a conversation holding it, so one agent pass cannot brief the next run
+in its own words around the closed brief. A batch cannot comment on and dispatch the same item,
 and a comment is refused while a dispatch run on its target is in flight.
 
 Closing requires both a successful completed triage run of the configured
@@ -99,6 +102,11 @@ The comment must have been created within that run's start/end timestamps.
 The finding must still describe the issue: no reopen or rename event, body
 edit, or comment may follow the receipt, except the bot's own comments before
 the triage run ended.
+Nothing reviews a closure, so unlike a dispatch it keeps agent-board#111's
+input check: the issue must have been locked since before the triage run
+started, and every author and editor of its body and comments, the bot
+included, must be a user with write access. A verdict from a triage that could
+have read an outsider's body or comment text does not close the issue.
 `triage_comment` names its comment ID, not an issue number. A run link alone is
 not a done finding. The old exact-body `Triage found this issue done: URL`
 receipt is no longer accepted.

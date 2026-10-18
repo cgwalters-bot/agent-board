@@ -112,7 +112,9 @@ repository: its body and the body's edits (`userContentEdits`), every comment
 and its last editor, and on a pull request every review and review comment
 ([#111](https://github.com/cgwalters-forge/agent-board/issues/111)). It stops a
 visitor's text from reaching a run as task data. The error names the login and
-where it wrote; `--dry-run` checks the same.
+where it wrote; `--dry-run` checks the same. Nothing requires it: the
+supervisor's dispatches do not (agent-board#155), as the sandbox, the bounded
+safe outputs and the review before merge are the boundary.
 
 It reads whole or refuses: an item with more than 100 of any of those, or more
 than 30 distinct writers, is refused, as is a deleted or unnamed account, any
