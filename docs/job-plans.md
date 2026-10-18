@@ -116,17 +116,9 @@ where it wrote; `--dry-run` checks the same.
 
 It reads whole or refuses: an item with more than 100 of any of those, or more
 than 30 distinct writers, is refused, as is a deleted or unnamed account, any
-app bot other than `github-actions[bot]` (the exact GraphQL `Bot` login
-`github-actions`), or an issue whose
-repository's collaborators `GH_TOKEN` cannot read
+app bot, or an issue whose repository's collaborators `GH_TOKEN` cannot read
 (a target in a repository we do not own). Titles and a pull request's commits
 are not checked, nor a comment's editors before its last.
-The GitHub Actions exception trusts all content posted by repository workflows,
-including forwarded visitor text or generated content. Fork pull requests normally
-get read-only job tokens, and `pull_request_target` uses the base branch's workflow;
-repository administrators must keep those workflows and token settings trusted.
-It skips the app's collaborator lookup, not the lock, pagination or supervisor-note
-checks; all other apps and lookalike logins are refused.
 Locking new items, the poll's backstop and fix-round check, and the dispatched
 agent's own sanity check are not implemented here.
 

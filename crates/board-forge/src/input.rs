@@ -1,8 +1,7 @@
 //! Agent input from collaborators only (agent-board#111): an issue or pull
 //! request is fit to hand to a run only when its conversation is locked and
 //! everyone who wrote in it, its body, comments, reviews and review comments
-//! and their edits, has write access to its repository, or is the GitHub Actions
-//! app running that repository's workflows.
+//! and their edits, has write access to its repository.
 //!
 //! The threat is a visitor's text steering a run: anyone can comment on an
 //! open conversation, and a run reads the item it works on. Locking the
@@ -170,12 +169,6 @@ impl Authors {
         let Some(login) = actor["login"].as_str() else {
             bail!("an account GitHub does not name wrote {}", place());
         };
-        // Trust content posted by repository workflows, including anything they
-        // forward or generate. GraphQL names github-actions[bot] without [bot].
-        // Do not query this app as a collaborator or generalize to other bots.
-        if actor["__typename"] == "Bot" && login == "github-actions" {
-            return Ok(());
-        }
         // An app's bot shares no permission with the user account its login
         // names (`renovate` for `renovate[bot]`), so only users are checked.
         ensure!(
@@ -393,50 +386,7 @@ mod tests {
                     "visitor wrote https://github.com/example/intake/issues/7#issuecomment-3; their permission",
                 ),
             ),
-            // Only the exact GitHub Actions app bypasses permission lookups.
-            (
-                set(
-                    "/comments/nodes/0/author",
-                    json!({"__typename": "Bot", "login": "github-actions"}),
-                ),
-                Ok(vec!["cgwalters", "cgwalters-bot", "maintainer"]),
-            ),
-            (
-                set(
-                    "/comments/nodes/0/author",
-                    json!({"__typename": "Bot", "login": "renovate[bot]"}),
-                ),
-                Err("renovate[bot], not a user account"),
-            ),
-            (
-                set(
-                    "/comments/nodes/0/author",
-                    json!({"__typename": "Bot", "login": "github-actions-bot[bot]"}),
-                ),
-                Err("github-actions-bot[bot], not a user account"),
-            ),
-            (
-                set("/comments/nodes/0/author", login("github-actions")),
-                Err(
-                    "github-actions wrote https://github.com/example/intake/issues/7#issuecomment-1; their permission",
-                ),
-            ),
-            (
-                set("/comments/nodes/0", {
-                    let mut note = comment(
-                        1,
-                        json!({"__typename": "Bot", "login": "github-actions"}),
-                        Value::Null,
-                    );
-                    note["body"] = json!(SUPERVISOR_NOTE);
-                    note
-                }),
-                Err("is the supervisor agent's text"),
-            ),
-            (
-                set("/comments/nodes/0/author", login("github-actions[bot]")),
-                Err("invalid login"),
-            ),
+            // A bot's login names a user account, not the app.
             (
                 set(
                     "/reviews/nodes/0/author",
