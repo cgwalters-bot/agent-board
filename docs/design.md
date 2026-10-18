@@ -283,7 +283,11 @@ read on for up to 5 pages of 100, and past them, or if the head moves or the
 count changes between pages, it waits too. Of a check that ran more than once
 (by the same app, workflow and event), only the newest run counts. Required checks come from the base branch's rulesets and its classic
 protection; a required check that never reported is pending, and a protected
-branch whose requirements cannot be read is an error. It has been exercised against recorded responses only.
+branch whose requirements cannot be read is an error. Where the base has no
+merge queue, the poll's own merge is the last gate, so every check on the head,
+required or not, must have passed, been skipped or be neutral, but for an optional
+`review` status (agent-board#163); a failed optional check gets fix rounds as a
+required one does. It has been exercised against recorded responses only.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
