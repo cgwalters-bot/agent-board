@@ -254,10 +254,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut configured: BTreeSet<String> = policy.kind_pools.values().cloned().collect();
         configured.extend(policy.continuation.pools.values().cloned());
         configured.extend(
-            [&policy.toil_fix_pool, &policy.diagnostic_pool]
-                .into_iter()
-                .filter(|p| !p.is_empty())
-                .cloned(),
+            [
+                &policy.toil_fix_pool,
+                &policy.conflict_fix_pool,
+                &policy.diagnostic_pool,
+            ]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .cloned(),
         );
         if let Some(apply) = &self.apply {
             configured.extend(apply.pools.iter().cloned());

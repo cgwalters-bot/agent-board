@@ -275,6 +275,11 @@ pub struct Config {
 pub struct PollPolicy {
     pub merge_authors: Vec<String>,
     pub toil_fix_pool: String,
+    /// `conflictFixPool`: the pool for a toil or rebase round whose pull
+    /// request conflicts with its base, where conflicts and the other toil
+    /// suit different pools (agent-board#144). Empty (the default) leaves
+    /// them on `toilFixPool`.
+    pub conflict_fix_pool: String,
     pub kind_pools: BTreeMap<String, String>,
     /// `mergeQueue`: the re-queues of a head the poll may make, where it owns
     /// the merge queue; none (the default) leaves a removal as it was.
@@ -539,6 +544,10 @@ impl PollPolicy {
             toil_fix_pool: serde_json::from_value(
                 value.get("toilFixPool").cloned().unwrap_or(json!("")),
             )?,
+            conflict_fix_pool: serde_json::from_value(
+                value.get("conflictFixPool").cloned().unwrap_or(json!("")),
+            )
+            .context("conflictFixPool is not a string")?,
             kind_pools: serde_json::from_value(
                 value.get("kindPools").cloned().unwrap_or(json!({})),
             )?,
@@ -2989,7 +2998,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         let review = head_review(pull, self.config, review_run);
         let toil = !continuing && toil_only(pull, checks, review);
-        let toil_pool = &self.config.policy.toil_fix_pool;
+        let policy = &self.config.policy;
+        // A conflict is toil, but its round needs a pool that hands back a
+        // rebased series, which not every toil pool does (agent-board#144).
+        let toil_pool = if pull["mergeable"] == CONFLICTING && !policy.conflict_fix_pool.is_empty()
+        {
+            &policy.conflict_fix_pool
+        } else {
+            &policy.toil_fix_pool
+        };
+        let after_toil = marker.pool.as_ref().is_some_and(|p| {
+            !p.is_empty() && (*p == policy.toil_fix_pool || *p == policy.conflict_fix_pool)
+        });
         let raise = checkpoint.as_ref().and_then(|at| {
             self.config
                 .policy
@@ -3013,11 +3033,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         } else if !toil_pool.is_empty() && pool_round == 1 && toil {
             single(Some(toil_pool.clone()))
         } else {
-            let index = if !continuing
-                && !marker.stopped
-                && !toil_pool.is_empty()
-                && marker.pool.as_ref() == Some(toil_pool)
-            {
+            let index = if !continuing && !marker.stopped && after_toil {
                 0
             } else {
                 pool_round.saturating_sub(1) as usize
@@ -7753,8 +7769,9 @@ mod tests {
 
     #[test]
     fn toil_pool_is_opt_in_and_the_next_round_uses_the_first_normal_pool() {
-        for (toil_pool, change, marker, expected) in [
+        for (toil_pool, conflict_pool, change, marker, expected) in [
             (
+                "",
                 "",
                 json!({"mergeable": "CONFLICTING"}),
                 json!({"rounds": 0}),
@@ -7762,27 +7779,66 @@ mod tests {
             ),
             (
                 "small",
+                "",
                 json!({"mergeable": "CONFLICTING"}),
                 json!({"rounds": 0}),
                 "small",
             ),
             (
                 "small",
+                "",
                 json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
                 json!({"rounds": 0}),
                 "claude",
             ),
             (
                 "small",
+                "",
                 json!({"mergeable": "CONFLICTING"}),
                 json!({"rounds": 1, "pool": "small", "sha": "old"}),
                 "claude",
             ),
             (
                 "small",
+                "",
                 json!({"mergeable": "CONFLICTING"}),
                 json!({"rounds": 1, "pool": "claude", "sha": "old"}),
                 "openai",
+            ),
+            (
+                "small",
+                "rebaser",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 0}),
+                "rebaser",
+            ),
+            (
+                "",
+                "rebaser",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 0}),
+                "rebaser",
+            ),
+            (
+                "small",
+                "rebaser",
+                json!({"mergeable": "CONFLICTING", "contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                json!({"rounds": 0}),
+                "claude",
+            ),
+            (
+                "small",
+                "rebaser",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 1, "pool": "rebaser", "sha": "old"}),
+                "claude",
+            ),
+            (
+                "small",
+                "rebaser",
+                json!({"mergeable": "CONFLICTING"}),
+                json!({"rounds": 1, "pool": "small", "sha": "old"}),
+                "claude",
             ),
         ] {
             let mut fake = github();
@@ -7795,6 +7851,7 @@ mod tests {
             );
             let mut cfg = config();
             cfg.policy.toil_fix_pool = toil_pool.into();
+            cfg.policy.conflict_fix_pool = conflict_pool.into();
             let dispatcher = Fake::default();
             let outcome = run(
                 &fake,
@@ -7991,7 +8048,8 @@ mod tests {
             fake.pulls.insert(470, p);
             let mut cfg = config();
             cfg.policy = PollPolicy::from_json(
-                &json!({"toilFixPool": "small", "kindPools": {"triage": "small"}}),
+                // A conflict pool leaves toil without a conflict where it was.
+                &json!({"toilFixPool": "small", "conflictFixPool": "rebaser", "kindPools": {"triage": "small"}}),
             )
             .unwrap();
             let dispatcher = Fake::default();
@@ -8028,6 +8086,7 @@ mod tests {
         for value in [
             json!({"mergeAuthors": "not an array"}),
             json!({"toilFixPool": false}),
+            json!({"conflictFixPool": 1}),
             json!({"kindPools": []}),
             json!({"diagnosticPool": ["large"]}),
         ] {
