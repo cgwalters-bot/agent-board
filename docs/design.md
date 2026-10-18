@@ -457,13 +457,14 @@ status listing are not part of this repository.
 `lockCollaboratorItems` (1 to 100; absent by default, which locks nothing)
 is the poll's backstop for the supervisor, whose `supervise execute` takes
 only a locked item (agent-board#139). Each pass, after its other steps, it
-checks up to that many open, unlocked issues and pull requests of the
+checks up to that many open, unlocked issues of the
 followed repositories with the input check `dispatch` makes, and with
 `--apply` locks those with input only from collaborators (`lock_reason`
 `resolved`). An item with anyone else's input stays unlocked, with a line
 saying why, and waits behind the others until it changes. A line counts the
 items locked, left unlocked and not checked. The dispatching check still
-reads the locked conversation whole.
+reads the locked conversation whole. Pull requests are excluded: the supervisor
+does not dispatch them, and locking them can prevent job tokens from reviewing.
 
 `operatorAnswers` (`true`; absent or `false` by default, which leaves a
 `needs-human` pull request to a person taking the label off) takes the

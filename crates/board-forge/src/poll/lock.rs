@@ -1,4 +1,4 @@
-//! `lockCollaboratorItems`: lock the open items of the followed repositories
+//! `lockCollaboratorItems`: lock the open issues of the followed repositories
 //! whose input is only from collaborators (agent-board#139), so that the
 //! supervisor, whose `supervise execute` takes only a locked item
 //! ([`crate::input::check`]), has something to dispatch. A lock-on-open
@@ -63,6 +63,9 @@ fn slim_items(body: &Value) -> Value {
     body.as_array().map_or(Value::Null, |items| {
         items
             .iter()
+            // PR locks block reviews by non-collaborator job tokens, and the
+            // supervisor only dispatches issues.
+            .filter(|i| i.get("pull_request").is_none())
             .map(|i| json!({"number": i["number"], "locked": i["locked"], "updated_at": i["updated_at"]}))
             .collect()
     })
@@ -168,7 +171,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         kept
     }
 
-    /// Every page of a followed repository's open issues and pull requests.
+    /// Every page of a followed repository's open issues, excluding pull requests.
     fn open_items(&mut self, repo: &str) -> Result<Vec<Value>> {
         let mut url = Some(format!(
             "{API_ROOT}repos/{repo}/issues?state=open&per_page=100"
@@ -179,7 +182,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 page.starts_with(API_ROOT),
                 "pagination left the API: {page}"
             );
-            let (body, next) = self.get_url(&page, slim_items, false)?;
+            // Older cached lists omitted the issue/PR marker. Read fresh so
+            // those entries cannot cause a pull request to be locked.
+            let (body, next) = self.get_url(&page, slim_items, true)?;
             all.extend(
                 body.as_array()
                     .context("open issues are not an array")?
@@ -213,13 +218,16 @@ mod tests {
     }
 
     impl Rest for Forge {
-        fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+        fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
             self.gets.borrow_mut().push(url.into());
             let path = url.strip_prefix(API_ROOT).context("outside the API")?;
             let prefix = format!("repos/{REPO}/");
             let body = match path.strip_prefix(&prefix) {
                 Some("events?per_page=100") | Some("pulls?state=open&per_page=100") => json!([]),
-                Some("issues?state=open&per_page=100") => json!(self.items),
+                Some("issues?state=open&per_page=100") => {
+                    assert!(validator.is_none(), "item identity requires a fresh list");
+                    json!(self.items)
+                }
                 Some(rest) if rest.starts_with("collaborators/") => {
                     let login = rest
                         .trim_start_matches("collaborators/")
@@ -320,6 +328,45 @@ mod tests {
 
     fn lock_url(number: u64) -> String {
         format!("PUT {API_ROOT}repos/{REPO}/issues/{number}/lock")
+    }
+
+    #[test]
+    fn collaborator_pull_requests_are_not_locked_or_counted_against_the_bound() {
+        for apply in [false, true] {
+            let mut forge = Forge {
+                writers: BTreeSet::from(["operator", BOT]),
+                ..Forge::default()
+            };
+            issue(&mut forge, 1, false, BOT);
+            forge.items[0]["pull_request"] = json!({"url": "pull request"});
+            forge.conversations.get_mut(&1).unwrap()["__typename"] = json!("PullRequest");
+            issue(&mut forge, 2, false, BOT);
+            // A pre-fix cache has no way to distinguish the PR from an issue.
+            let state = State {
+                responses: BTreeMap::from([(
+                    format!("{API_ROOT}repos/{REPO}/issues?state=open&per_page=100"),
+                    json!({"etag": "old-list", "body": [
+                        {"number": 1, "locked": false, "updated_at": UPDATED},
+                        {"number": 2, "locked": false, "updated_at": UPDATED}
+                    ]}),
+                )]),
+                ..State::default()
+            };
+            let outcome = pass(&forge, json!({"lockCollaboratorItems": 1}), state, apply);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(*forge.queried.borrow(), [2]);
+            let expected = if apply {
+                vec![(lock_url(2), json!({"lock_reason": "resolved"}))]
+            } else {
+                vec![]
+            };
+            assert_eq!(*forge.writes.borrow(), expected);
+            assert!(outcome.state.lock_refused.is_empty());
+            assert_eq!(
+                outcome.lines.last().unwrap(),
+                "lock: 1 locked, 0 left unlocked, 0 unchecked (at most 1 a pass)"
+            );
+        }
     }
 
     #[test]
