@@ -202,7 +202,9 @@ fn accepted(comments: &[Comment], config: &Config) -> Result<(Value, Comment)> {
 }
 
 /// Read-only preview. Apply checks for an existing claim before validating
-/// current sub-issues: a prior close otherwise makes its own plan invalid.
+/// current sub-issues: a prior rescope's target may have closed since, which
+/// makes its own plan invalid. A prior close is satisfied, so only the claim
+/// stops that plan's replay.
 pub fn preview<T: Transport>(client: &T, issue: &ItemRef, config: &Config) -> Result<Vec<Value>> {
     preview_checked(client, issue, config, &Preconditions::default())
 }
@@ -379,7 +381,10 @@ fn execute<C: Transport + Rest>(
         let n = mutation["action"]
             .as_u64()
             .context("mutation has no action")?;
-        if let Some(method) = mutation["method"].as_str() {
+        // Generated text (an IssueRef), never API output, so safe to record.
+        if let Some(note) = mutation["satisfied"].as_str() {
+            done.push(format!("Action {n}: {note}; nothing to do."));
+        } else if let Some(method) = mutation["method"].as_str() {
             let mut url = mutation["url"]
                 .as_str()
                 .context("mutation has no URL")?
@@ -873,6 +878,50 @@ mod tests {
             ["Already claimed; nothing changed."]
         );
         assert_eq!(forge.requests.borrow().len(), requests.len());
+    }
+
+    /// tracker#596: the sub-issue a plan closes closed before apply. The rest
+    /// applies, nothing touches the closed one, and the claim ends the retries.
+    #[test]
+    fn close_of_an_already_closed_sub_issue_applies_the_rest() {
+        let forge = Forge::full();
+        forge.closed.set(true);
+        apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap();
+        let targets: Vec<_> = (forge.requests.borrow().iter())
+            .map(|(_, target, _)| target.clone())
+            .collect();
+        // As applies_once_with_configured_ids_and_real_job_plan_number, less
+        // the close's comment and PATCH.
+        assert_eq!(
+            targets,
+            [
+                "repos/example/epics/issues/1/comments",
+                "repos/example/work/issues",
+                "link",
+                "enroll",
+                "priority",
+                "repos/example/work/issues/10/comments",
+                "enroll",
+                "priority",
+                "repos/example/work/issues/2",
+                "repos/example/work/issues/2/comments",
+                "repos/example/epics/issues/comments/2",
+                "repos/example/epics/issues/1/comments"
+            ]
+        );
+        let status = forge.comments.borrow().last().unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(status.contains("Applied."), "{status}");
+        assert!(
+            status.contains("- Action 4: example/work#3 is already closed; nothing to do."),
+            "{status}"
+        );
+        assert_eq!(
+            apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap(),
+            ["Already claimed; nothing changed."]
+        );
     }
 
     #[test]

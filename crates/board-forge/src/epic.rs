@@ -109,6 +109,12 @@ pub enum Action {
         issue: IssueRef,
         reason: String,
     },
+    /// A close whose sub-issue closed after the plan was written, typically
+    /// by its merged pull request. Satisfied, so it makes no mutations; kept
+    /// in place so that later actions' `new` positions still line up.
+    AlreadyClosed {
+        issue: IssueRef,
+    },
     Rescope {
         issue: IssueRef,
         body: String,
@@ -355,6 +361,11 @@ impl EpicPlan {
                         json!({"state": "closed", "state_reason": "not_planned"}),
                     ));
                 }
+                // Neither comment nor re-close: the reason was written for an
+                // open issue, and closing again would change how it closed.
+                // Listed, not sent, so a dry run and apply's status say so.
+                Action::AlreadyClosed { issue } => out
+                    .push(json!({"action": n, "satisfied": format!("{issue} is already closed")})),
                 Action::Rescope {
                     issue,
                     body,
@@ -436,6 +447,12 @@ impl Checker<'_> {
             })?;
         self.repository(&issue.repo)?;
         Ok(issue.clone())
+    }
+
+    /// A closed sub-issue of the epic, spelled as GitHub has it, if `text` is one.
+    fn closed_sub_issue(&self, text: &str) -> Result<Option<IssueRef>> {
+        let issue = IssueRef::parse(text)?;
+        Ok(self.epic.closed.iter().find(|s| s.same(&issue)).cloned())
     }
 
     fn target(&self, object: &Map<String, Value>) -> Result<Target> {
@@ -576,7 +593,23 @@ impl Checker<'_> {
                 }
             }
             "close_sub_issue" | "rescope_sub_issue" => {
-                let issue = self.sub_issue(text(object, "issue")?)?;
+                let named = text(object, "issue")?;
+                // A plan goes stale when a sub-issue it closes closes first
+                // (tracker#596: its pull request merged); refusing would block
+                // the epic's every later pass. Only a close is satisfied so;
+                // anything else on a closed sub-issue still revives it.
+                let stale = match kind {
+                    "close_sub_issue" => self.closed_sub_issue(named)?,
+                    _ => None,
+                };
+                let issue = match &stale {
+                    // Still bounded as an open one would be.
+                    Some(issue) => {
+                        self.repository(&issue.repo)?;
+                        issue.clone()
+                    }
+                    None => self.sub_issue(named)?,
+                };
                 let reason: String = bounded(object, "reason", REASON_LIMIT)?.into();
                 // The reason is posted as a comment by the applier, who is a
                 // plan writer: a fence or hidden marker in it would be a job
@@ -585,7 +618,11 @@ impl Checker<'_> {
                     !reason.contains("```agent-board") && !reason.contains("<!--"),
                     "reason holds an agent-board fence or a hidden marker"
                 );
-                let action = if kind == "close_sub_issue" {
+                let action = if stale.is_some() {
+                    Action::AlreadyClosed {
+                        issue: issue.clone(),
+                    }
+                } else if kind == "close_sub_issue" {
                     Action::Close {
                         issue: issue.clone(),
                         reason,
@@ -743,7 +780,10 @@ mod tests {
                 IssueRef::parse("cgwalters-forge/tracker#573").unwrap(),
                 IssueRef::parse("elsewhere/repo#1").unwrap(),
             ],
-            closed: vec![IssueRef::parse("cgwalters-forge/tracker#574").unwrap()],
+            closed: vec![
+                IssueRef::parse("cgwalters-forge/tracker#574").unwrap(),
+                IssueRef::parse("elsewhere/repo#2").unwrap(),
+            ],
         }
     }
 
@@ -893,6 +933,37 @@ mod tests {
         assert_eq!(stacks, [&Value::Null, &json!("NEW-1"), &json!(63)]);
     }
 
+    /// A plan written while a sub-issue was open, which closed before apply
+    /// (tracker#596), is satisfied there rather than refused on every pass.
+    #[test]
+    fn closing_an_already_closed_sub_issue_is_satisfied() {
+        let epic = epic();
+        let mut actions = valid();
+        actions.insert(
+            1,
+            json!({"type": "close_sub_issue", "issue": "CGWalters-Forge/tracker#574", "reason": "Done."}),
+        );
+        let checked = EpicPlan::validate(&plan(actions), &bounds(), &epic).unwrap();
+        assert_eq!(
+            checked.actions[1],
+            Action::AlreadyClosed {
+                issue: IssueRef::parse("cgwalters-forge/tracker#574").unwrap()
+            }
+        );
+        // Listed but no writes, and the `new` of the set_priority after it
+        // still names the create before it.
+        let mutations = checked.mutations(&epic);
+        let of =
+            |n: usize| -> Vec<&Value> { mutations.iter().filter(|m| m["action"] == n).collect() };
+        assert_eq!(
+            of(2),
+            [&json!({"action": 2, "satisfied": "cgwalters-forge/tracker#574 is already closed"})]
+        );
+        assert_eq!(of(3).len(), 1);
+        assert_eq!(of(3)[0]["issue"], "cgwalters-forge/agent-board#NEW-1");
+        assert_eq!(mutations.len(), 10, "{mutations:?}");
+    }
+
     /// Each refusal: the actions after the valid ones, and the error for the
     /// first refused one (its position counts from 7).
     #[test]
@@ -996,6 +1067,33 @@ mod tests {
             (
                 vec![priority("cgwalters-forge/tracker#574")],
                 "cgwalters-forge/tracker#574 is a closed sub-issue; a plan may not change it",
+            ),
+            // Only a close of a closed sub-issue is satisfied; it is checked
+            // as any close is, and still counts as the issue's one action.
+            (
+                vec![
+                    json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/tracker#574", "body": "b", "reason": "r"}),
+                ],
+                "cgwalters-forge/tracker#574 is a closed sub-issue; a plan may not change it",
+            ),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "elsewhere/repo#2", "reason": "Moved."}),
+                ],
+                "repository elsewhere/repo is not in the configured list",
+            ),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#574", "reason": "<!-- x -->"}),
+                ],
+                "reason holds an agent-board fence or a hidden marker",
+            ),
+            (
+                vec![
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#574", "reason": "x"}),
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#574", "reason": "y"}),
+                ],
+                "action 7 (close_sub_issue): cgwalters-forge/tracker#574 is already the subject of action 6",
             ),
             (
                 vec![
@@ -1350,6 +1448,17 @@ mod tests {
                 Err("cgwalters-forge/tracker#573 is neither new nor a current sub-issue"),
             ),
             (vec![first()], full, Err("more than 100 sub-issues")),
+            // A closed one the plan rescopes is refused; one it closes is
+            // satisfied (closing_an_already_closed_sub_issue_is_satisfied).
+            (
+                vec![first()],
+                {
+                    let mut closed = subs.clone();
+                    closed["subIssues"]["nodes"][0]["state"] = json!("CLOSED");
+                    closed
+                },
+                Err("cgwalters-forge/agent-board#63 is a closed sub-issue"),
+            ),
             (
                 vec![first()],
                 {
@@ -1357,7 +1466,7 @@ mod tests {
                     closed["subIssues"]["nodes"][1]["state"] = json!("CLOSED");
                     closed
                 },
-                Err("cgwalters-forge/tracker#573 is a closed sub-issue"),
+                Ok((1, 5)),
             ),
             (
                 vec![first()],
