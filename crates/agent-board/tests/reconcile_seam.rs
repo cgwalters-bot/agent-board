@@ -122,3 +122,39 @@ fn staging_reader_uses_dedicated_environment() {
     assert!(documentation.contains("only a **branch** rule for `main` and no tag rules"));
     assert!(documentation.contains("Remove any repository or organization secret"));
 }
+
+#[test]
+fn missing_read_token_skips_instead_of_failing() {
+    // Until the environment secret is provisioned, the scheduled preview must
+    // log one notice and succeed rather than fail every ten minutes.
+    let workflow = include_str!("../../../.github/workflows/reconcile.yml");
+    let steps: Vec<&str> = workflow.split("\n      - ").skip(1).collect();
+    assert!(steps.len() >= 2, "no steps found");
+    let (first, rest) = steps.split_first().unwrap();
+    assert!(first.contains("id: read-token"));
+    // A typo in either output value would silently disable the gates below.
+    assert!(first.contains("present=true"));
+    assert!(first.contains("present=false"));
+    assert!(first.contains("::notice::"));
+    assert!(
+        first.contains("STAGING_PROJECT_READ_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}")
+    );
+    // Gating the check on its own output would make every run a silent no-op.
+    assert!(!first.contains("\n        if:"));
+    for step in rest {
+        assert!(
+            step.contains("if: steps.read-token.outputs.present == 'true'"),
+            "step missing skip condition: {}",
+            step.lines().next().unwrap_or(step)
+        );
+    }
+    // The no-write-token rule stays.
+    assert!(workflow.contains("# Preview only. Never give this job the staging write token."));
+    // Every secret reference is the read token, never the write token.
+    assert_eq!(
+        workflow.matches("secrets.").count(),
+        workflow
+            .matches("secrets.STAGING_PROJECT_READ_TOKEN")
+            .count()
+    );
+}
