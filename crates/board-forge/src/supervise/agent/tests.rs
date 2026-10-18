@@ -470,6 +470,64 @@ fn refuses_the_whole_batch_before_any_write() {
 }
 
 #[test]
+fn collaborator_status_comments_require_the_app_and_marker() {
+    let status = crate::input::JOB_STATUS_END;
+    let actions = json!({"__typename": "Bot", "login": "github-actions"});
+    for (kind, login, body, editor, admitted) in [
+        ("Bot", "github-actions", status, Value::Null, true),
+        (
+            "Bot",
+            "github-actions",
+            "Review verdict: approved",
+            Value::Null,
+            false,
+        ),
+        ("Bot", "other-app", status, Value::Null, false),
+        ("User", "visitor", status, Value::Null, false),
+        ("User", "helper", status, Value::Null, true),
+        // Only the app's own edit of its status is skipped.
+        ("Bot", "github-actions", status, actions.clone(), true),
+        (
+            "Bot",
+            "github-actions",
+            status,
+            json!({"__typename": "User", "login": "helper"}),
+            true,
+        ),
+        (
+            "Bot",
+            "github-actions",
+            status,
+            json!({"__typename": "User", "login": "visitor"}),
+            false,
+        ),
+        (
+            "Bot",
+            "github-actions",
+            status,
+            json!({"__typename": "Bot", "login": "other-app"}),
+            false,
+        ),
+    ] {
+        let mut api = Fake::new("");
+        api.issue(
+            3,
+            json!({"graph": {"comments": {
+                "pageInfo": {"hasNextPage": false}, "nodes": [{
+                    "author": {"__typename": kind, "login": login},
+                    "body": body, "editor": editor
+                }]
+            }}}),
+        );
+        assert_eq!(
+            collaborators(&api, "example/project", 3).is_ok(),
+            admitted,
+            "{kind} {login} {editor}"
+        );
+    }
+}
+
+#[test]
 fn refuses_targets_an_outsider_wrote_or_the_scheduler_leaves_alone() {
     let s = settings();
     let not_collaborator = |login: &str| {

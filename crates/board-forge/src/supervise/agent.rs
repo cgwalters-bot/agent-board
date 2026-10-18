@@ -430,9 +430,9 @@ pub struct Outcome {
 
 const COLLABORATORS: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
-    locked author { login } editor { login }
-    userContentEdits(first: 100) { totalCount nodes { editor { login } } }
-    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url body author { login } editor { login } } }
+    locked author { __typename login } editor { __typename login }
+    userContentEdits(first: 100) { totalCount nodes { editor { __typename login } } }
+    comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url body author { __typename login } editor { __typename login } } }
   } }
 }"#;
 
@@ -444,6 +444,7 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
     let (owner, name) = repo.split_once('/').context("repository")?;
     let mut people: Vec<(String, String)> = vec![];
     let mut add = |actor: &Value, place: &str| -> Result<()> {
+        ensure!(actor["__typename"] != "Bot", "A bot wrote {place}");
         let login = actor["login"]
             .as_str()
             .filter(|l| crate::is_github_login(l))
@@ -494,8 +495,11 @@ fn collaborators(api: &dyn Api, repo: &str, number: u64) -> Result<()> {
                     .is_some_and(|b| b.contains(crate::input::SUPERVISOR_NOTE)),
                 "{place} is the supervisor agent's text"
             );
-            add(&comment["author"], &place)?;
-            if !comment["editor"].is_null() {
+            let status = crate::input::is_job_status(comment);
+            if !status {
+                add(&comment["author"], &place)?;
+            }
+            if !comment["editor"].is_null() && (!status || comment["editor"] != comment["author"]) {
                 add(&comment["editor"], &place)?;
             }
         }

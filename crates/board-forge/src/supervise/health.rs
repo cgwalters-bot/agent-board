@@ -80,7 +80,10 @@ pub(crate) const USAGE_MARKER: &str = "<!-- bot-usage v1 -->";
 const USAGE_SCHEMA: &str = "bot-usage/v1";
 /// agentic-job's status comment on a run's target ends with this.
 fn status_end(run: u64) -> String {
-    format!("\n\n<!-- agentic-job-run: {run} -->\n\n<!-- agentic-job-status -->")
+    format!(
+        "\n\n<!-- agentic-job-run: {run} -->\n\n{}",
+        crate::input::JOB_STATUS_END
+    )
 }
 const STATUS_REASON: &str = " Its reason:";
 const RUNNING: &[&str] = &["in_progress", "queued", "waiting", "pending"];

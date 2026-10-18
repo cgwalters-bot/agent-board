@@ -1,8 +1,8 @@
 //! Agent input from collaborators only (agent-board#111): an issue or pull
 //! request is fit to hand to a run only when its conversation is locked and
 //! everyone who wrote in it, its body, comments, reviews and review comments
-//! and their edits, has write access to its repository, or is the GitHub Actions
-//! app running that repository's workflows.
+//! and their edits, has write access to its repository, except for GitHub Actions
+//! agentic-job run-status comments.
 //!
 //! The threat is a visitor's text steering a run: anyone can comment on an
 //! open conversation, and a run reads the item it works on. Locking the
@@ -27,6 +27,19 @@ pub const INPUT_LOGIN_LIMIT: usize = 30;
 /// it is posted by the write-capable bot; a conversation holding it is not
 /// collaborator input.
 pub const SUPERVISOR_NOTE: &str = "<!-- agent-board-supervisor-note -->";
+
+pub(crate) const JOB_STATUS_END: &str = "<!-- agentic-job-status -->";
+
+/// Do not admit arbitrary workflow output: review verdicts can be model-written.
+/// Status outcomes (including quoted hand-back reasons) are acceptable because
+/// these runs were started by collaborators' plans, and report those runs' outcomes.
+pub(crate) fn is_job_status(comment: &Value) -> bool {
+    comment["author"]["__typename"] == "Bot"
+        && comment["author"]["login"] == "github-actions"
+        && comment["body"]
+            .as_str()
+            .is_some_and(|body| body.trim_end().ends_with(JOB_STATUS_END))
+}
 
 /// One page of each connection; `hasNextPage` anywhere refuses the item. The
 /// fields are the same on issues and pull requests, but a union's members
@@ -111,10 +124,15 @@ fn inspect<T: Transport + Rest>(client: &T, item: &ItemRef, locked: bool) -> Res
                 .is_some_and(|b| b.contains(SUPERVISOR_NOTE)),
             "{url} is the supervisor agent's text, not a collaborator's"
         );
-        authors.add(&comment["author"], || url.clone())?;
+        let status = is_job_status(comment);
+        if !status {
+            authors.add(&comment["author"], || url.clone())?;
+        }
         // GitHub leaves `editor` null where it cannot name the account, so an
         // edit without one counts as an unknown account's.
-        if comment["lastEditedAt"].is_string() || !comment["editor"].is_null() {
+        if (comment["lastEditedAt"].is_string() || !comment["editor"].is_null())
+            && (!status || comment["editor"] != comment["author"])
+        {
             authors.add(&comment["editor"], || format!("an edit of {url}"))?;
         }
     }
@@ -170,12 +188,6 @@ impl Authors {
         let Some(login) = actor["login"].as_str() else {
             bail!("an account GitHub does not name wrote {}", place());
         };
-        // Trust content posted by repository workflows, including anything they
-        // forward or generate. GraphQL names github-actions[bot] without [bot].
-        // Do not query this app as a collaborator or generalize to other bots.
-        if actor["__typename"] == "Bot" && login == "github-actions" {
-            return Ok(());
-        }
         // An app's bot shares no permission with the user account its login
         // names (`renovate` for `renovate[bot]`), so only users are checked.
         ensure!(
@@ -393,13 +405,13 @@ mod tests {
                     "visitor wrote https://github.com/example/intake/issues/7#issuecomment-3; their permission",
                 ),
             ),
-            // Only the exact GitHub Actions app bypasses permission lookups.
+            // Actions output without a status marker is not collaborator input.
             (
                 set(
                     "/comments/nodes/0/author",
                     json!({"__typename": "Bot", "login": "github-actions"}),
                 ),
-                Ok(vec!["cgwalters", "cgwalters-bot", "maintainer"]),
+                Err("github-actions, not a user account"),
             ),
             (
                 set(
@@ -506,5 +518,88 @@ mod tests {
         };
         check_writers(&forge, &item).unwrap();
         assert!(check(&forge, &item).is_err());
+    }
+
+    #[test]
+    fn status_comments_require_the_app_and_end_marker() {
+        let actions = json!({"__typename": "Bot", "login": "github-actions"});
+        let none = Value::Null;
+        for (kind, name, body, edited, editor, admitted) in [
+            ("Bot", "github-actions", JOB_STATUS_END, false, &none, true),
+            (
+                "Bot",
+                "github-actions",
+                "Review verdict: approved",
+                false,
+                &none,
+                false,
+            ),
+            ("Bot", "other-app", JOB_STATUS_END, false, &none, false),
+            ("User", "visitor", JOB_STATUS_END, false, &none, false),
+            (
+                "Bot",
+                "github-actions",
+                "<!-- agentic-job-status --> more",
+                false,
+                &none,
+                false,
+            ),
+            // The app updating its own status comment is still its status;
+            // anyone else's edit is checked as theirs.
+            (
+                "Bot",
+                "github-actions",
+                JOB_STATUS_END,
+                true,
+                &actions,
+                true,
+            ),
+            (
+                "Bot",
+                "github-actions",
+                JOB_STATUS_END,
+                true,
+                &login("cgwalters"),
+                true,
+            ),
+            (
+                "Bot",
+                "github-actions",
+                JOB_STATUS_END,
+                true,
+                &login("visitor"),
+                false,
+            ),
+            ("Bot", "github-actions", JOB_STATUS_END, true, &none, false),
+        ] {
+            let mut node = pull();
+            node["comments"]["nodes"][0] = json!({
+                "author": {"__typename": kind, "login": name},
+                "body": body, "editor": editor,
+                "lastEditedAt": if edited { json!("2026-10-18T08:00:00Z") } else { Value::Null }
+            });
+            let forge = Forge {
+                node,
+                permissions: BTreeMap::from([
+                    ("cgwalters", "admin"),
+                    ("cgwalters-bot", "write"),
+                    ("maintainer", "write"),
+                ]),
+                asked: RefCell::default(),
+            };
+            let item = ItemRef {
+                host: "github.com".into(),
+                repository: "example/intake".into(),
+                number: 7,
+            };
+            assert_eq!(
+                check(&forge, &item).is_ok(),
+                admitted,
+                "{kind} {name} {body} {editor}"
+            );
+            if kind == "User" {
+                assert!(forge.asked.borrow().iter().any(|login| login == name));
+            }
+        }
     }
 }
