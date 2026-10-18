@@ -898,6 +898,9 @@ pub struct Checks {
     /// For a diagnostic round and the stop after it: the failed check read,
     /// its failing step and the end of its annotations; see [`Pass::diagnose`].
     pub diagnosis: Option<String>,
+    /// Every check was judged, not only the required ones
+    /// ([`classify_all_checks`]): only such a head may be merged directly.
+    pub every: bool,
 }
 
 /// The checks that gate a merge. `required` is the base branch's required
@@ -905,7 +908,33 @@ pub struct Checks {
 /// false on drafts, so it is not enough alone). A repository that requires
 /// nothing is judged on all its checks.
 pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
-    type Check<'a> = (&'a str, Option<&'a str>, bool, &'a str, Option<u64>);
+    judge_checks(pull, required, false)
+}
+
+/// [`classify_checks`] for a head the poll merges itself: every check on it
+/// is judged, required or not, and a required one that has not reported is
+/// still pending. A merge queue runs the required checks again before it
+/// merges, but a direct merge does not, and a base that requires only some
+/// checks would otherwise let a failed one through (cgwalters-forge/actions#79
+/// merged with its `egress-policy` job failing).
+pub fn classify_all_checks(pull: &Value, required: &[Value]) -> Checks {
+    judge_checks(pull, required, true)
+}
+
+/// Whether a base branch's rules (`GET rules/branches/{b}`) merge through a
+/// merge queue.
+fn merge_queued(rules: &Value) -> Result<bool> {
+    Ok(rules
+        .as_array()
+        .context("rules are not an array")?
+        .iter()
+        .any(|r| r["type"] == "merge_queue"))
+}
+
+fn judge_checks(pull: &Value, required: &[Value], every: bool) -> Checks {
+    // Name, URL, required flag, state, app, and whether it is the review
+    // status (a StatusContext; a check run of that name is an ordinary check).
+    type Check<'a> = (&'a str, Option<&'a str>, bool, &'a str, Option<u64>, bool);
     let all_runs = nodes(
         pull,
         "/commits/nodes/0/commit/statusCheckRollup/contexts/nodes",
@@ -957,10 +986,13 @@ pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
                     state,
                     c.pointer("/checkSuite/app/databaseId")
                         .and_then(Value::as_u64),
+                    false,
                 )
             } else {
                 let name = text(c, "/context");
-                (name, c["targetUrl"].as_str(), flag, text(c, "/state"), None)
+                let review = name == REVIEW_CONTEXT;
+                let state = text(c, "/state");
+                (name, c["targetUrl"].as_str(), flag, state, None, review)
             }
         })
         .collect();
@@ -975,19 +1007,24 @@ pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
                 .and_then(Value::as_u64)
                 .is_none_or(|id| Some(id) == integration)
     };
-    for (name, _, flag, _, integration) in &checks {
+    for (name, _, flag, _, integration, _) in &checks {
         if *flag && !names.iter().any(|r| matches(r, name, *integration)) {
             names.push(json!({"context": name, "integration_id": integration}));
         }
     }
-    let all = names.is_empty();
+    let all = every || names.is_empty();
     // An optional review status is handled by the operator-approval gate, but
     // an explicitly required status remains an independent merge requirement.
-    let relevant = checks.iter().filter(|(name, _, _, _, integration)| {
-        (all && *name != REVIEW_CONTEXT) || names.iter().any(|r| matches(r, name, *integration))
-    });
-    let mut out = Checks::default();
-    for (name, url, _, state, _) in relevant {
+    let relevant = checks
+        .iter()
+        .filter(|(name, _, _, _, integration, review)| {
+            (all && !review) || names.iter().any(|r| matches(r, name, *integration))
+        });
+    let mut out = Checks {
+        every,
+        ..Checks::default()
+    };
+    for (name, url, _, state, _, _) in relevant {
         if FAILED.contains(state) {
             out.failed.push(((*name).into(), url.map(str::to_owned)));
         } else if !PASSED.contains(state) {
@@ -998,7 +1035,7 @@ pub fn classify_checks(pull: &Value, required: &[Value]) -> Checks {
     for name in names {
         if !checks
             .iter()
-            .any(|(n, _, _, _, integration)| matches(&name, n, *integration))
+            .any(|(n, _, _, _, integration, _)| matches(&name, n, *integration))
         {
             out.pending.push(context(&name));
         }
@@ -3223,12 +3260,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     url::form_urlencoded::byte_serialize(text(pull, "/baseRefName").as_bytes())
                         .collect::<String>()
                 ))?;
-                let queued = rules
-                    .as_array()
-                    .context("rules are not an array")?
-                    .iter()
-                    .any(|r| r["type"] == "merge_queue");
-                if queued {
+                if merge_queued(&rules)? {
                     // A re-queue is recorded first: a pass that dies after it
                     // has spent the try, rather than re-queuing for nothing.
                     if let Some(queue) = &decision.queue {
@@ -3254,6 +3286,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         entries.push((number, changed(pull)));
                     }
                     Ok(Some("added to the merge queue".into()))
+                } else if !checks.every {
+                    // The queue was removed since the checks were judged on
+                    // the required ones alone; the next pass judges them all.
+                    Ok(Some(
+                        "not merged: the base no longer has a merge queue".into(),
+                    ))
                 } else {
                     let repo_settings = self.get(&format!("repos/{repo}"))?;
                     let method = [
@@ -3995,7 +4033,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         repo: &str,
         number: u64,
         merge_only: bool,
-        required: &mut BTreeMap<String, Vec<Value>>,
+        required: &mut BTreeMap<String, (Vec<Value>, bool)>,
     ) -> Result<(String, bool)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
         // The marker decides what is written, so a pass that applies reads it
@@ -4050,9 +4088,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let encoded: String = url::form_urlencoded::byte_serialize(base.as_bytes()).collect();
             let rules = self.get(&format!("repos/{repo}/rules/branches/{encoded}"))?;
             let branch = self.get(&format!("repos/{repo}/branches/{encoded}"))?;
-            required.insert(base.clone(), required_checks(&rules, &branch)?);
+            let queued = merge_queued(&rules)?;
+            required.insert(base.clone(), (required_checks(&rules, &branch)?, queued));
         }
-        let mut checks = classify_checks(&pull, &required[&base]);
+        let (base_required, queued) = &required[&base];
+        // Without a merge queue the poll's own merge is the last gate, so
+        // every check on the head holds it, required or not (#163).
+        let mut checks = if *queued {
+            classify_checks(&pull, base_required)
+        } else {
+            classify_all_checks(&pull, base_required)
+        };
         let head = text(&pull, "/headRefOid");
         // Removals are read only for the bot's own pull requests from its fork,
         // whose marker can count them; out of the queue and not handed to a
@@ -6114,6 +6160,30 @@ mod tests {
             json!({"contexts": {"review": {"state": "FAILURE"}}}),
         );
         assert_eq!(classify_checks(&p, &[]), Checks::default());
+        assert_eq!(
+            classify_all_checks(&p, &[]),
+            Checks {
+                every: true,
+                ..Checks::default()
+            }
+        );
+        // A direct merge judges every check, and still waits for a required
+        // one that has not reported.
+        let p = pull(
+            "pull-470",
+            json!({"contexts": {"docs": {"conclusion": "FAILURE"}, "ci": null}}),
+        );
+        assert!(classify_checks(&p, &required()).failed.is_empty());
+        assert_eq!(classify_all_checks(&p, &required()).pending, ["ci"]);
+        assert_eq!(names(classify_all_checks(&p, &required())), ["docs"]);
+        // Only the review status is left to the review: a check run of its
+        // name is an ordinary check.
+        let p = pull(
+            "pull-470",
+            json!({"contexts": {"docs": {"name": "review", "conclusion": "FAILURE"}}}),
+        );
+        assert!(classify_checks(&p, &required()).failed.is_empty());
+        assert_eq!(names(classify_all_checks(&p, &required())), ["review"]);
     }
 
     #[test]
@@ -7645,6 +7715,73 @@ mod tests {
                 assert_eq!(writes[0].0, ENQUEUE);
             } else {
                 assert!(writes[0].0.contains(&format!("mergeMethod: {method}")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_direct_merge_waits_for_every_check_and_a_queue_for_the_required() {
+        // `docs` is not required on main; only `ci` is.
+        for (queue, docs, merged) in [
+            (false, json!({"conclusion": "SUCCESS"}), true),
+            (false, json!({"conclusion": "SKIPPED"}), true),
+            (false, json!({"conclusion": "NEUTRAL"}), true),
+            (false, json!({"conclusion": "FAILURE"}), false),
+            (false, json!({"conclusion": "TIMED_OUT"}), false),
+            (false, json!({"conclusion": "CANCELLED"}), false),
+            (false, json!({"conclusion": "ACTION_REQUIRED"}), false),
+            (
+                false,
+                json!({"status": "IN_PROGRESS", "conclusion": null}),
+                false,
+            ),
+            // A check run named `review` is not the review status.
+            (
+                false,
+                json!({"name": "review", "conclusion": "FAILURE"}),
+                false,
+            ),
+            (
+                false,
+                json!({"name": "review", "status": "IN_PROGRESS", "conclusion": null}),
+                false,
+            ),
+            (true, json!({"conclusion": "FAILURE"}), true),
+        ] {
+            let mut fake = github();
+            if queue {
+                fake.rest
+                    .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                    .unwrap()
+                    .3
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "merge_queue"}));
+            } else {
+                fake.page(
+                    &format!("repos/{REPO}"),
+                    None,
+                    None,
+                    json!({"allow_rebase_merge": true}),
+                );
+            }
+            fake.pulls.insert(
+                470,
+                pull("pull-470", json!({"contexts": {"docs": docs.clone()}})),
+            );
+            let outcome = applied(&fake, &Fake::default());
+            let writes = fake.writes.borrow();
+            let merging = writes
+                .iter()
+                .any(|(query, _)| *query == ENQUEUE || query.contains("mergeMethod"));
+            assert_eq!(merging, merged, "{queue} {docs}: {:?}", outcome.lines);
+            if !merged {
+                let name = docs["name"].as_str().unwrap_or("docs");
+                assert!(
+                    outcome.lines.iter().any(|l| l.contains(name)),
+                    "{docs}: {:?}",
+                    outcome.lines
+                );
             }
         }
     }
