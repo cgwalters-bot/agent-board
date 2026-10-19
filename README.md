@@ -293,4 +293,4 @@ is needed or used for this preview.
 - [#46](https://github.com/cgwalters-forge/agent-board/issues/46) dispatch from plan comments: the triage profile emitting plans, and several plans per issue.
 - Applying proposals goes through agentic-job's independent [safe-output](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/safe-outputs.md) check/apply; not wired here.
 
-Design: [docs/design.md](docs/design.md). License: Apache-2.0 or MIT.
+Design: [docs/design.md](docs/design.md); per-role GitHub Apps (planned, not implemented): [docs/apps.md](docs/apps.md). License: Apache-2.0 or MIT.
