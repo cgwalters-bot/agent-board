@@ -1,4 +1,5 @@
 mod action;
+mod apps;
 mod ask;
 mod decisions;
 mod dispatch;
@@ -119,6 +120,11 @@ enum Command {
     Poll(poll::Poll),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
+    /// Create the per-role GitHub Apps (docs/apps.md).
+    Apps {
+        #[command(subcommand)]
+        command: Apps,
+    },
     /// Run the credential-bearing staging integration test.
     Test {
         #[command(subcommand)]
@@ -272,6 +278,12 @@ enum Check {
         #[arg(long)]
         proposals: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum Apps {
+    /// Register a role's GitHub App from the roles config through GitHub's manifest flow (one browser click).
+    Create(apps::Create),
 }
 
 #[derive(Subcommand)]
@@ -768,6 +780,25 @@ fn execute(cli: Cli) -> Result<()> {
                 "supervise reads its settings from --config and --supervisor-config only"
             );
             supervise::run(args)
+        }
+        Command::Apps {
+            command: Apps::Create(args),
+        } => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.policy.is_none(),
+                "apps create takes only its own options"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported_capability: apps create supports only {}",
+                board_forge::github::DEFAULT_HOST
+            );
+            apps::create(args)
         }
         Command::Test {
             command: Test::Project(options),

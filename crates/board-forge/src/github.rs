@@ -408,6 +408,18 @@ impl Client {
         Some(Self::with_token(token))
     }
 
+    /// A REST client that sends no token, for endpoints that need none.
+    pub fn anonymous() -> Self {
+        Self::with_token(String::new())
+    }
+
+    fn authorize<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        if self.token.is_empty() {
+            return request;
+        }
+        request.header("Authorization", &format!("Bearer {}", self.token))
+    }
+
     /// The body of a GET that the API answers with a redirect off itself, as
     /// it does for job logs, at most `limit` bytes. The redirect is followed
     /// by hand, without the token, so the token goes only to the API.
@@ -557,8 +569,8 @@ impl crate::poll::Rest for Client {
         );
         let path = url.trim_start_matches(API_ROOT);
         let request = |request: ureq::RequestBuilder<ureq::typestate::WithBody>| {
-            let request = request
-                .header("Authorization", &format!("Bearer {}", self.token))
+            let request = self
+                .authorize(request)
                 .header("User-Agent", "agent-board")
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28");
@@ -601,9 +613,7 @@ impl crate::poll::Rest for Client {
             "refusing to send the token outside {API_ROOT}"
         );
         let mut request = self
-            .agent
-            .get(url)
-            .header("Authorization", &format!("Bearer {}", self.token))
+            .authorize(self.agent.get(url))
             .header("User-Agent", "agent-board")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");

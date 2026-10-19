@@ -4,7 +4,8 @@ Design for [tracker#766](https://github.com/cgwalters-forge/tracker/issues/766)
 (revising [tracker#749](https://github.com/cgwalters-forge/tracker/issues/749)):
 each automation role writes as its own GitHub App, so that authorship says which
 step wrote a comment, review or push, and each role holds only the permissions
-its writes need. **Nothing here is implemented yet.** Today every write in
+its writes need. **Only app creation is implemented** (`agent-board apps create`,
+[below](#agent-board-apps-create)); no workflow uses the apps yet. Today every write in
 tracker's workflows uses one organization secret, `CGWALTERS_BOT_PAT`, the
 cgwalters-bot user's token, or the job's `GITHUB_TOKEN` (`github-actions[bot]`).
 Sources were read at tracker, cgwalters-forge/actions and agentic-job `main` and
@@ -17,6 +18,9 @@ smallest [GitHub App permissions](https://docs.github.com/en/rest/authentication
 that cover them. Every app also gets Metadata: read, which GitHub always grants.
 No role's token reaches an agent: agents keep the read-only job token
 (operator decision of 2026-10-09), as the wrappers already arrange.
+[`policy/apps.json`](../policy/apps.json) holds this table as the default roles
+config of `agent-board apps create` (below), with the implement/fix role named
+`implement`.
 
 | Role | Steps that write today | Writes | Permissions | Token |
 | --- | --- | --- | --- | --- |
@@ -164,6 +168,46 @@ mints a fresh client (`refreshClient`) before posting the start and again before
 posting the completion, so the completion of a long run never uses the token
 minted at its start. tracker#766's `apps create` step follows the
 first; the actions mint step follows the second.
+
+### `agent-board apps create`
+
+```sh
+agent-board apps create --org cgwalters-forge --role status --key-file status.pem
+```
+
+It reads the role from the roles config (`--config FILE`, JSON, unknown fields
+refused; default [`policy/apps.json`](../policy/apps.json)): each role's app
+`name`, optional `slug` (when GitHub's differs from the name lowercased with
+hyphens), `description`, `url` (default `https://github.com/ORG`) and `public`
+(default false), its `permissions` and its `events`. The manifest it builds has
+an inactive webhook, as no role receives events.
+
+1. It looks the app up with `GET /apps/SLUG`, using `GH_TOKEN` if set (a private
+   app is visible only to a member's token). An app owned by another account is
+   refused. An existing app is reused only with `--key-stored`, the operator's
+   word that its key is stored; it then prints the app's id and stops. Without
+   that flag it reports the key lost and how to generate a new one in the app's
+   settings, and creates nothing: GitHub returns a key only at creation.
+2. Otherwise it serves a page on `127.0.0.1` on an ephemeral port and prints its
+   URL. Opened in a browser signed in as an organization owner, the page posts
+   the manifest to `https://github.com/organizations/ORG/settings/apps/new` with a
+   random `state`; the operator clicks **Create GitHub App**, and GitHub redirects
+   to the localhost callback with a code. A callback with any other `state` ends
+   the run without converting, since any site the browser visits could send one.
+   The server waits at most 15 minutes and answers at most 32 requests.
+3. It exchanges the code with `POST /app-manifests/CODE/conversions` and writes the
+   private key only where the operator named: `--key-file FILE` (created with
+   mode 0600, before the flow starts, and never overwritten) or `--key-stdout`
+   (then everything else goes to stderr). One of them is required to create.
+   The client secret and webhook secret in the response are discarded.
+4. It prints the app id, slug, settings and install URLs, and the names to store
+   them under: variable `ROLE_APP_ID` and secret `ROLE_APP_PRIVATE_KEY` (role
+   uppercased, hyphens as underscores), plus the client id for the device flow.
+
+Installing the app, and for implement and executor enabling device flow and
+opting out of user-token expiry in the app's settings, remain browser steps; a
+manifest cannot set them. Not verified against github.com yet: the tests use
+fake transports and a localhost client.
 
 ## Where tokens live and expiry
 
