@@ -504,13 +504,14 @@ pub fn check_inputs<T: Transport + Rest>(
     issue: &ItemRef,
     dest: &ItemRef,
     extras: &[crate::batch::Extra],
+    rule: crate::input::Rule,
 ) -> Result<()> {
     let mut items = vec![issue, dest];
     items.extend(extras.iter().map(|e| &e.issue));
     items.sort_by_key(|i| (i.repository.to_ascii_lowercase(), i.number));
     items.dedup_by_key(|i| (i.repository.to_ascii_lowercase(), i.number));
     for item in items {
-        crate::input::check(client, item).context("not dispatched: --collaborators-only")?;
+        crate::input::check(client, item, rule).context("not dispatched: --collaborators-only")?;
     }
     Ok(())
 }
@@ -590,8 +591,8 @@ struct Record {
 /// anything is written, and any other decision goes into every record.
 ///
 /// With `collaborators`, every issue the run reads is checked with
-/// [`crate::input::check`] before anything is written, and one that fails
-/// refuses the whole dispatch.
+/// [`crate::input::check`] under that rule before anything is written, and
+/// one that fails refuses the whole dispatch.
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch<C: Transport + Rest, D: Rest>(
     client: &C,
@@ -601,7 +602,7 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     target: &Target,
     batch: usize,
     bot: Option<&str>,
-    collaborators: bool,
+    collaborators: Option<crate::input::Rule>,
 ) -> Result<Dispatched> {
     target.validate()?;
     ensure!(
@@ -671,8 +672,8 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     // A batch's other issues would land on the lower slice's branch too.
     let batch = if base.is_some() { 0 } else { batch };
     let chosen = crate::batch::select(client, issue, &plan, writers, batch)?;
-    if collaborators {
-        check_inputs(client, issue, &dest, &chosen.extras)?;
+    if let Some(rule) = collaborators {
+        check_inputs(client, issue, &dest, &chosen.extras, rule)?;
     }
     let request = |extras: &[&crate::batch::Extra]| {
         JobPlan {
@@ -1625,7 +1626,7 @@ mod tests {
                 &target(),
                 0,
                 None,
-                false,
+                None,
             );
             assert!(forge.dispatches.borrow().is_empty(), "{name}");
             assert!(dispatcher.comments.borrow().is_empty(), "{name}");
@@ -1665,7 +1666,7 @@ mod tests {
                     &target(),
                     0,
                     None,
-                    false,
+                    None,
                 );
                 let again = format!("{:#}", again.unwrap_err());
                 assert!(again.contains("record already"), "{name}: {again}");
@@ -1682,7 +1683,7 @@ mod tests {
                 viewer,
                 ..Forge::new(vec![planned()], vec![])
             };
-            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, false);
+            let result = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, None);
             let message = result.unwrap_err().to_string();
             assert!(message.contains(error), "{message}");
             assert_eq!(forge.bodies().len(), 1);
@@ -1693,7 +1694,7 @@ mod tests {
             workflow: "x/../dispatch.yml".into(),
             ..target()
         };
-        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0, None, false).is_err());
+        assert!(dispatch(&forge, &forge, &issue, &[OPERATOR], &bad, 0, None, None).is_err());
         assert_eq!(forge.reads.get(), 0);
         // With the collaborator check, the issue holding the plan and the one
         // it targets are checked, and a refusal writes and starts nothing.
@@ -1711,7 +1712,7 @@ mod tests {
                 &target(),
                 0,
                 None,
-                true,
+                Some(crate::input::Rule::default()),
             );
             assert_eq!(
                 *forge.checked.borrow(),
@@ -1841,7 +1842,7 @@ mod tests {
                 &target(),
                 *batch,
                 None,
-                false,
+                None,
             );
             let others = forge.others.borrow();
             let last = |n: u64| {
@@ -1910,7 +1911,7 @@ mod tests {
                         .unwrap();
                         let again = Forge::new(vec![], vec![(200, json!({"workflow_run_id": 99}))]);
                         let freed =
-                            dispatch(&forge, &again, &extra, &writers, &target(), 0, None, false);
+                            dispatch(&forge, &again, &extra, &writers, &target(), 0, None, None);
                         assert_eq!(freed.unwrap().run.as_deref(), Some(run_url), "{name}");
                         continue;
                     }
@@ -1969,7 +1970,7 @@ mod tests {
             &target(),
             1,
             None,
-            false,
+            None,
         )
         .unwrap();
         let extra =
@@ -1983,7 +1984,7 @@ mod tests {
             &target(),
             0,
             None,
-            false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -2002,7 +2003,7 @@ mod tests {
             &target(),
             0,
             None,
-            false,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -2018,7 +2019,7 @@ mod tests {
             &target(),
             0,
             None,
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(freed.run.as_deref(), Some(run_url));
@@ -2033,7 +2034,7 @@ mod tests {
                 &target(),
                 6,
                 None,
-                false
+                None
             )
             .is_err()
         );
@@ -2075,7 +2076,7 @@ mod tests {
                 &target(),
                 0,
                 Some("agentic-bot"),
-                false,
+                None,
             )
             .unwrap();
             let dispatches = dispatcher.dispatches.borrow();
@@ -2108,7 +2109,7 @@ mod tests {
                 &target(),
                 0,
                 Some("a b"),
-                false
+                None
             )
             .is_err()
         );
@@ -2181,7 +2182,7 @@ mod tests {
                 &target(),
                 3,
                 Some("agentic-bot"),
-                false,
+                None,
             )
             .unwrap();
             let dispatches = dispatcher.dispatches.borrow();
@@ -2215,7 +2216,7 @@ mod tests {
         // Whose pull request it stacks on is the caller's to say: without
         // --bot a stacked plan is refused before anything is written.
         let forge = Forge::new(vec![planned], vec![]);
-        let error = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, false)
+        let error = dispatch(&forge, &forge, &issue, &writers, &target(), 0, None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("needs --bot"), "{error}");

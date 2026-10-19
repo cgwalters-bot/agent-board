@@ -128,7 +128,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 repository: repo.clone(),
                 number,
             };
-            let result = input::check_writers(&Charged(RefCell::new(&mut *self)), &item);
+            // No app is admitted: an item with a bot's comment stays unlocked.
+            let rule = input::Rule::default();
+            let result = input::check_writers(&Charged(RefCell::new(&mut *self)), &item, rule);
             match result {
                 Err(error) => {
                     left += 1;

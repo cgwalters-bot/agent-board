@@ -4,8 +4,10 @@ Design for [tracker#766](https://github.com/cgwalters-forge/tracker/issues/766)
 (revising [tracker#749](https://github.com/cgwalters-forge/tracker/issues/749)):
 each automation role writes as its own GitHub App, so that authorship says which
 step wrote a comment, review or push, and each role holds only the permissions
-its writes need. **Only app creation is implemented** (`agent-board apps create`,
-[below](#agent-board-apps-create)); no workflow uses the apps yet. Today every write in
+its writes need. **Only app creation and the input rule's status-app admission are
+implemented** (`agent-board apps create`, [below](#agent-board-apps-create), and
+[provenance](#provenance-agent-board-can-read)); no workflow uses the apps yet.
+Today every write in
 tracker's workflows uses one organization secret, `CGWALTERS_BOT_PAT`, the
 cgwalters-bot user's token, or the job's `GITHUB_TOKEN` (`github-actions[bot]`).
 Sources were read at tracker, cgwalters-forge/actions and agentic-job `main` and
@@ -130,15 +132,16 @@ so in GraphQL a user-token comment is indistinguishable from the PAT's.
 
 So: an installation token's provenance is readable everywhere, by author;
 a user token's only through REST. agent-board's input rule reads authors
-through GraphQL and refuses any non-`User` author (`board-forge/src/input.rs`),
-so it admits the status app only after the input-rule step of tracker#766. That
-step compares an id from the caller's trusted configuration: the app id with REST
-`performed_via_github_app.id`, or, in GraphQL, the app's bot account id
-(`GET /users/SLUG[bot]`) with `Bot.databaseId`. Login text alone is not enough
-because the `SLUG` user name of a `Bot` author is a separate account anyone may
-hold (the input rule's `renovate` note). Poll and executor read comments through
-REST and can compare `performed_via_github_app.id` once that is configured; until
-then they keep matching `cgwalters-bot`, which user tokens preserve.
+through GraphQL and refuses any non-`User` author (`board-forge/src/input.rs`)
+unless the caller passes the status app's id (`dispatch --collaborators-only
+--status-app-id ID`, the input-rule step of tracker#766): then an issue
+comment by a `Bot` author is admitted when REST's `performed_via_github_app.id`
+on that comment is the configured app id ([collaborator input](job-plans.md#collaborator-input)).
+Login text alone is not enough because the `SLUG` user name of a `Bot` author
+is a separate account anyone may hold (the input rule's `renovate` note), and
+another app's bot may write too. Poll and executor match their own markers,
+which the status app does not write, and keep matching `cgwalters-bot`, which
+user tokens preserve.
 
 Moving review has the same prerequisite on the poll side: poll counts a review
 job's verdict only when the review's GraphQL author is `github-actions[bot]`

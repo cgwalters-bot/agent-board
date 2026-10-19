@@ -119,7 +119,16 @@ safe outputs and the review before merge are the boundary.
 It reads whole or refuses: an item with more than 100 of any of those, or more
 than 30 distinct writers, is refused, as is a deleted or unnamed account, any
 app bot, or an issue whose repository's collaborators `GH_TOKEN` cannot read
-(a target in a repository we do not own). Titles and a pull request's commits
+(a target in a repository we do not own).
+
+`--status-app-id ID` (with `--collaborators-only`; off by default; from the
+caller's configuration, never from a plan) admits the status app's run-status
+comments ([per-role apps](apps.md)): an issue comment whose author is an app's
+bot counts when REST's `performed_via_github_app.id` on it is `ID`, and so do
+that bot's edits of it, at one request per bot. The bot's login is not
+evidence: another app's bot, or a user account of the same name, is refused
+as before, and so is a bot anywhere else (a body, review or review comment).
+The poll's `lockCollaboratorItems` admits no app. Titles and a pull request's commits
 are not checked, nor a comment's editors before its last.
 Locking new items, the poll's backstop and fix-round check, and the dispatched
 agent's own sanity check are not implemented here.
