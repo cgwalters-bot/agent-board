@@ -37,12 +37,12 @@ const INPUT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
       ... on Issue {
         locked author { ...Actor }
         userContentEdits(first: 100) { nodes { editor { ...Actor } } pageInfo { hasNextPage } }
-        comments(first: 100) { nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
+        comments(first: 100) { nodes { url databaseId body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
       }
       ... on PullRequest {
         locked author { ...Actor }
         userContentEdits(first: 100) { nodes { editor { ...Actor } } pageInfo { hasNextPage } }
-        comments(first: 100) { nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
+        comments(first: 100) { nodes { url databaseId body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
         reviews(first: 100) {
           nodes {
             url body lastEditedAt author { ...Actor } editor { ...Actor }
@@ -56,21 +56,43 @@ const INPUT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
 }
 fragment Actor on Actor { __typename login }"#;
 
+/// Who besides collaborators may write input, from the caller's trusted
+/// configuration only, never from a plan or the item.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rule {
+    /// The status app's id (tracker#766, `docs/apps.md`): an issue comment
+    /// whose author is an app's bot is admitted when REST names this app in
+    /// its `performed_via_github_app`, and edits of it by the same bot. The
+    /// threat is text that only looks like the status app's: GraphQL's `Bot`
+    /// login is a slug whose user account anyone may hold, and another app's
+    /// bot may write too; GitHub sets the app id from the token, so neither
+    /// can show this one. Its run-status comment is all the app writes, so a
+    /// bot elsewhere (a body, review or review comment) stays refused. None
+    /// (the default) refuses every bot.
+    pub status_app: Option<u64>,
+}
+
 /// Refuse `item` unless its conversation is locked and every account that
-/// wrote or edited text in it may write to its repository. The error names
-/// the login and where it wrote. `client` needs push access to the repository
-/// to read its collaborators' permissions, so an item elsewhere is refused.
-pub fn check<T: Transport + Rest>(client: &T, item: &ItemRef) -> Result<()> {
-    inspect(client, item, true)
+/// wrote or edited text in it may write to its repository, or is admitted
+/// by `rule`. The error names the login and where it wrote. `client` needs
+/// push access to the repository to read its collaborators' permissions, so
+/// an item elsewhere is refused.
+pub fn check<T: Transport + Rest>(client: &T, item: &ItemRef, rule: Rule) -> Result<()> {
+    inspect(client, item, true, rule)
 }
 
 /// [`check`] without the lock: whether everyone who wrote in `item` may write
 /// to its repository, so that the poll may lock it ([`crate::poll`]).
-pub fn check_writers<T: Transport + Rest>(client: &T, item: &ItemRef) -> Result<()> {
-    inspect(client, item, false)
+pub fn check_writers<T: Transport + Rest>(client: &T, item: &ItemRef, rule: Rule) -> Result<()> {
+    inspect(client, item, false, rule)
 }
 
-fn inspect<T: Transport + Rest>(client: &T, item: &ItemRef, locked: bool) -> Result<()> {
+fn inspect<T: Transport + Rest>(
+    client: &T,
+    item: &ItemRef,
+    locked: bool,
+    rule: Rule,
+) -> Result<()> {
     ensure!(
         item.host == crate::github::DEFAULT_HOST,
         "input is checked only on github.com"
@@ -91,18 +113,29 @@ fn inspect<T: Transport + Rest>(client: &T, item: &ItemRef, locked: bool) -> Res
         "{at}: the conversation is not locked, so anyone may add to it; lock it first"
     );
     let mut authors = Authors::default();
-    authors.add(&node["author"], || format!("the body of {at}"))?;
+    authors.add(&node["author"], None, || format!("the body of {at}"))?;
     for edit in nodes(node, "userContentEdits", &at)? {
-        authors.add(&edit["editor"], || format!("an edit of the body of {at}"))?;
+        authors.add(&edit["editor"], None, || {
+            format!("an edit of the body of {at}")
+        })?;
     }
-    let mut written = nodes(node, "comments", &at)?;
+    // Each with its id where an app's bot may have written it: issue
+    // comments, with a status app configured.
+    let mut written: Vec<_> = nodes(node, "comments", &at)?
+        .into_iter()
+        .map(|c| (c, rule.status_app.and(c["databaseId"].as_u64())))
+        .collect();
     if node["__typename"] == "PullRequest" {
         for review in nodes(node, "reviews", &at)? {
-            written.push(review);
-            written.extend(nodes(review, "comments", &at)?);
+            written.push((review, None));
+            written.extend(
+                nodes(review, "comments", &at)?
+                    .into_iter()
+                    .map(|c| (c, None)),
+            );
         }
     }
-    for comment in written {
+    for (comment, id) in written {
         let url = comment["url"].as_str().unwrap_or("a comment").to_owned();
         ensure!(
             !comment["body"]
@@ -110,14 +143,29 @@ fn inspect<T: Transport + Rest>(client: &T, item: &ItemRef, locked: bool) -> Res
                 .is_some_and(|b| b.contains(SUPERVISOR_NOTE)),
             "{url} is the supervisor agent's text, not a collaborator's"
         );
-        authors.add(&comment["author"], || url.clone())?;
+        authors.add(&comment["author"], id, || url.clone())?;
         // GitHub leaves `editor` null where it cannot name the account, so an
-        // edit without one counts as an unknown account's.
+        // edit without one counts as an unknown account's. A bot's edit of
+        // its own comment is that bot's, checked with it.
         if comment["lastEditedAt"].is_string() || !comment["editor"].is_null() {
-            authors.add(&comment["editor"], || format!("an edit of {url}"))?;
+            let own = comment["editor"] == comment["author"];
+            authors.add(&comment["editor"], id.filter(|_| own), || {
+                format!("an edit of {url}")
+            })?;
         }
     }
-    for (login, place) in &authors.0 {
+    for (login, (place, comment)) in &authors.0 {
+        if let Some(comment) = comment {
+            let app = status_app(client, item, *comment).with_context(|| {
+                format!("{at}: {login} wrote {place}; its app could not be read")
+            })?;
+            ensure!(
+                app.is_some() && app == rule.status_app,
+                "{at}: {login} wrote {place}, but not as the status app (app {})",
+                app.map_or("none".into(), |a| a.to_string())
+            );
+            continue;
+        }
         // GitHub answers 404 for an account that is not a collaborator.
         let response = client
             .get(
@@ -144,6 +192,28 @@ fn inspect<T: Transport + Rest>(client: &T, item: &ItemRef, locked: bool) -> Res
     Ok(())
 }
 
+/// The app a bot's issue comment was written through, from REST: GraphQL's
+/// `IssueComment` has no app field. A comment REST says a user wrote is not
+/// the bot's that GraphQL named, so it names no app.
+fn status_app<T: Rest>(client: &T, item: &ItemRef, comment: u64) -> Result<Option<u64>> {
+    let response = client.get(
+        &format!(
+            "{API_ROOT}repos/{}/issues/comments/{comment}",
+            item.repository
+        ),
+        None,
+    )?;
+    ensure!(
+        response.status == 200,
+        "GitHub HTTP status {}",
+        response.status
+    );
+    let body = &response.body;
+    Ok(body["performed_via_github_app"]["id"]
+        .as_u64()
+        .filter(|_| body["user"]["type"] == "Bot"))
+}
+
 /// The nodes of one page of `node[key]`, refusing a connection with more.
 fn nodes<'a>(node: &'a Value, key: &str, at: &str) -> Result<Vec<&'a Value>> {
     let connection = &node[key];
@@ -159,20 +229,30 @@ fn nodes<'a>(node: &'a Value, key: &str, at: &str) -> Result<Vec<&'a Value>> {
         .collect())
 }
 
-/// Each account that wrote, by lowercase login, with the first place it wrote.
+/// Each account that wrote, by lowercase login, with the first place it
+/// wrote; an app's bot as `SLUG[bot]`, with the comment that shows its app.
 #[derive(Default)]
-struct Authors(BTreeMap<String, String>);
+struct Authors(BTreeMap<String, (String, Option<u64>)>);
 
 impl Authors {
-    fn add(&mut self, actor: &Value, place: impl FnOnce() -> String) -> Result<()> {
+    /// `comment` is the id of the issue comment `actor` wrote, where a bot
+    /// may be admitted ([`Rule::status_app`]).
+    fn add(
+        &mut self,
+        actor: &Value,
+        comment: Option<u64>,
+        place: impl FnOnce() -> String,
+    ) -> Result<()> {
         // A deleted account, or one GitHub will not name, cannot be checked.
         let Some(login) = actor["login"].as_str() else {
             bail!("an account GitHub does not name wrote {}", place());
         };
         // An app's bot shares no permission with the user account its login
-        // names (`renovate` for `renovate[bot]`), so only users are checked.
+        // names (`renovate` for `renovate[bot]`), so only users' permissions
+        // are checked, and a bot only by its app.
+        let bot = actor["__typename"] == "Bot" && comment.is_some();
         ensure!(
-            actor["__typename"] == "User",
+            actor["__typename"] == "User" || bot,
             "{login}, not a user account, wrote {}",
             place()
         );
@@ -182,13 +262,18 @@ impl Authors {
             "invalid login {login:?} in {}",
             place()
         );
-        if !self.0.contains_key(&login.to_ascii_lowercase()) {
+        let (key, comment) = match bot {
+            true => (format!("{}[bot]", login.to_ascii_lowercase()), comment),
+            false => (login.to_ascii_lowercase(), None),
+        };
+        if !self.0.contains_key(&key) {
+            // Each is one request.
             ensure!(
                 self.0.len() < INPUT_LOGIN_LIMIT,
                 "more than {INPUT_LOGIN_LIMIT} accounts wrote in {}; it cannot be checked whole",
                 place()
             );
-            self.0.insert(login.to_ascii_lowercase(), place());
+            self.0.insert(key, (place(), comment));
         }
         Ok(())
     }
@@ -221,6 +306,30 @@ mod tests {
     impl Rest for Forge {
         fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
             assert!(validator.is_none());
+            // Comment 4 is the status app's, 5 another app's under the same
+            // bot login, and 6 the status app's on a user's behalf.
+            if let Some(id) =
+                url.strip_prefix(&format!("{API_ROOT}repos/example/intake/issues/comments/"))
+            {
+                self.asked.borrow_mut().push(format!("comment {id}"));
+                let (app, user) = match id {
+                    "4" => (
+                        STATUS_APP,
+                        json!({"login": "board-status[bot]", "type": "Bot"}),
+                    ),
+                    "5" => (7, json!({"login": "board-status[bot]", "type": "Bot"})),
+                    "6" => (STATUS_APP, json!({"login": "board-status", "type": "User"})),
+                    _ => panic!("unexpected GET {url}"),
+                };
+                return Ok(RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body: json!({"user": user,
+                        "performed_via_github_app": {"id": app, "slug": "board-status"}}),
+                });
+            }
             let login = url
                 .strip_prefix(&format!("{API_ROOT}repos/example/intake/collaborators/"))
                 .and_then(|rest| rest.strip_suffix("/permission"))
@@ -259,12 +368,22 @@ mod tests {
             json!("2026-10-15T10:00:00Z")
         };
         json!({"url": format!("https://github.com/example/intake/issues/7#issuecomment-{id}"),
-            "lastEditedAt": edited, "author": author, "editor": editor})
+            "databaseId": id, "lastEditedAt": edited, "author": author, "editor": editor})
     }
 
     fn login(login: &str) -> Value {
         json!({"__typename": "User", "login": login})
     }
+
+    /// GraphQL names an app's bot by its slug, without `[bot]`.
+    fn bot(slug: &str) -> Value {
+        json!({"__typename": "Bot", "login": slug})
+    }
+
+    const STATUS_APP: u64 = 42;
+    const STATUS: Rule = Rule {
+        status_app: Some(STATUS_APP),
+    };
 
     /// A locked pull request by the operator, with a comment, an edit of the
     /// body and a review with one comment, all by collaborators.
@@ -396,6 +515,80 @@ mod tests {
                     "cgwalters, not a user account, wrote https://github.com/example/intake/pull/7#pullrequestreview-2",
                 ),
             ),
+            // The status app's comment, and its own edit of it, are admitted
+            // by the app REST names.
+            (
+                set(
+                    "/comments/nodes/0",
+                    comment(4, bot("board-status"), Value::Null),
+                ),
+                Ok(vec![
+                    "comment 4",
+                    "cgwalters",
+                    "cgwalters-bot",
+                    "maintainer",
+                ]),
+            ),
+            (
+                set(
+                    "/comments/nodes/0",
+                    comment(4, bot("board-status"), bot("board-status")),
+                ),
+                Ok(vec![
+                    "comment 4",
+                    "cgwalters",
+                    "cgwalters-bot",
+                    "maintainer",
+                ]),
+            ),
+            // The same login text is not the app: another app's bot, ...
+            (
+                set(
+                    "/comments/nodes/0",
+                    comment(5, bot("board-status"), Value::Null),
+                ),
+                Err(
+                    "board-status[bot] wrote https://github.com/example/intake/issues/7#issuecomment-5, but not as the status app (app 7)",
+                ),
+            ),
+            // ... a comment REST says a user wrote, ...
+            (
+                set(
+                    "/comments/nodes/0",
+                    comment(6, bot("board-status"), Value::Null),
+                ),
+                Err("issuecomment-6, but not as the status app (app none)"),
+            ),
+            // ... a user account of that name, ...
+            (
+                set(
+                    "/comments/nodes/0",
+                    comment(4, login("board-status"), Value::Null),
+                ),
+                Err(
+                    "board-status wrote https://github.com/example/intake/issues/7#issuecomment-4; their permission",
+                ),
+            ),
+            // ... or another bot editing the app's comment.
+            (
+                set(
+                    "/comments/nodes/0",
+                    comment(4, bot("board-status"), bot("other")),
+                ),
+                Err(
+                    "other, not a user account, wrote an edit of https://github.com/example/intake/issues/7#issuecomment-4",
+                ),
+            ),
+            // The app writes only issue comments.
+            (
+                set(
+                    "/reviews/nodes/0/comments/nodes/0/author",
+                    bot("board-status"),
+                ),
+                Err(
+                    "board-status, not a user account, wrote https://github.com/example/intake/issues/7#issuecomment-3",
+                ),
+            ),
             (
                 set("/comments/nodes/0/author", login("a/../b")),
                 Err("invalid login \"a/../b\""),
@@ -433,7 +626,7 @@ mod tests {
                 repository: "example/intake".into(),
                 number: 7,
             };
-            match (check(&forge, &item), expected) {
+            match (check(&forge, &item, STATUS), expected) {
                 (Ok(()), Ok(asked)) => assert_eq!(*forge.asked.borrow(), asked),
                 (Err(error), Err(expected)) => {
                     assert!(format!("{error:#}").contains(expected), "{error:#}")
@@ -441,6 +634,25 @@ mod tests {
                 (result, expected) => panic!("{result:?} != {expected:?}"),
             }
         }
+        let item = ItemRef {
+            host: "github.com".into(),
+            repository: "example/intake".into(),
+            number: 7,
+        };
+        // Without a status app configured, no bot is admitted or looked up.
+        let mut status = pull();
+        status["comments"] = page(json!([comment(4, bot("board-status"), Value::Null)]));
+        let forge = Forge {
+            node: status,
+            permissions: permissions.clone(),
+            asked: RefCell::default(),
+        };
+        let error = check(&forge, &item, Rule::default()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("board-status, not a user account, wrote"),
+            "{error:#}"
+        );
+        assert!(forge.asked.borrow().is_empty());
         // The poll checks the writers of an item before it locks it.
         let mut unlocked = pull();
         unlocked["locked"] = json!(false);
@@ -449,12 +661,7 @@ mod tests {
             permissions,
             asked: RefCell::default(),
         };
-        let item = ItemRef {
-            host: "github.com".into(),
-            repository: "example/intake".into(),
-            number: 7,
-        };
-        check_writers(&forge, &item).unwrap();
-        assert!(check(&forge, &item).is_err());
+        check_writers(&forge, &item, Rule::default()).unwrap();
+        assert!(check(&forge, &item, Rule::default()).is_err());
     }
 }

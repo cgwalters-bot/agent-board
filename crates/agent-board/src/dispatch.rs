@@ -5,7 +5,9 @@ use board_core::{Item, ItemRef, Snapshot, Status, Turn};
 use board_forge::github::{GitHub, Transport};
 use board_forge::overlap::{self, Decision};
 use board_forge::poll::Rest;
-use board_forge::{batch, is_github_login, parse_github_item, plan, validate_github_project};
+use board_forge::{
+    batch, input, is_github_login, parse_github_item, plan, validate_github_project,
+};
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::{self, Write};
@@ -60,6 +62,9 @@ pub struct FromPlan {
     /// Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository (#111). Off without it; from the caller's configuration.
     #[arg(long)]
     collaborators_only: bool,
+    /// With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration.
+    #[arg(long, value_name = "ID", requires = "collaborators_only")]
+    status_app_id: Option<u64>,
 }
 
 #[derive(Args, Default, Clone)]
@@ -420,6 +425,9 @@ pub fn from_plan<T: Transport + Rest>(
     };
     target.validate()?;
     let client = transport()?;
+    let collaborators = args.collaborators_only.then_some(input::Rule {
+        status_app: args.status_app_id,
+    });
     if args.apply {
         let dispatcher = dispatcher();
         let done = plan::dispatch(
@@ -430,7 +438,7 @@ pub fn from_plan<T: Transport + Rest>(
             &target,
             args.batch.into(),
             args.bot.as_deref(),
-            args.collaborators_only,
+            collaborators,
         )?;
         for note in &done.notes {
             eprintln!("Not batched: {note}");
@@ -494,8 +502,8 @@ pub fn from_plan<T: Transport + Rest>(
     }
     let batch = if base.is_some() { 0 } else { args.batch.into() };
     let chosen = batch::select(&client, &issue, &plan, &writers, batch)?;
-    if args.collaborators_only {
-        plan::check_inputs(&client, &issue, &dest, &chosen.extras)?;
+    if let Some(rule) = collaborators {
+        plan::check_inputs(&client, &issue, &dest, &chosen.extras, rule)?;
     }
     for note in &chosen.notes {
         eprintln!("Not batched: {note}");
@@ -1255,6 +1263,7 @@ mod tests {
             batch: 0,
             bot: None,
             collaborators_only: false,
+            status_app_id: None,
         };
         let issue = "https://github.com/cgwalters-forge/tracker/issues/540";
         let tracker = "cgwalters-forge/tracker";
