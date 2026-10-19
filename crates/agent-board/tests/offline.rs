@@ -226,6 +226,50 @@ fn epic_apply_cli_is_opt_in_and_requires_trusted_config() {
     assert!(text.contains("--apply"));
 }
 
+/// Refused before any request to GitHub.
+#[test]
+fn apps_create_cli_refusals() {
+    let base = ["apps", "create", "--org", "example", "--role"];
+    for (args, message) in [
+        (vec!["nope"], "not in the roles config"),
+        (
+            vec!["status", "--config", "missing.json"],
+            "read missing.json",
+        ),
+        (vec!["status", "--json", "x"], "only its own options"),
+        (
+            vec!["status", "--key-stdout", "--hostname", "ghe.example.com"],
+            "supports only github.com",
+        ),
+        (vec!["status"], "--key-file FILE or --key-stdout"),
+        (
+            vec!["status", "--key-stored", "--key-stdout"],
+            "cannot be used with",
+        ),
+        (
+            vec!["status", "--key-file", "k", "--key-stdout"],
+            "cannot be used with",
+        ),
+    ] {
+        let output = command()
+            .args(base)
+            .args(&args)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    let output = command()
+        .args(["apps", "create", "--org", "bad.org", "--role", "status"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not an organization login"));
+}
+
 #[test]
 fn status_update_cli_refusals() {
     for (args, reason) in [

@@ -1,0 +1,44 @@
+{
+  "roles": {
+    "status": {
+      "name": "cgwalters-forge-status",
+      "description": "Posts and edits run-status comments for cgwalters-forge automation.",
+      "permissions": {"issues": "write", "pull_requests": "write"},
+      "events": []
+    },
+    "review": {
+      "name": "cgwalters-forge-review",
+      "description": "Submits pull request reviews and the review commit status for cgwalters-forge automation.",
+      "permissions": {"pull_requests": "write", "statuses": "write"},
+      "events": []
+    },
+    "implement": {
+      "name": "cgwalters-forge-implement",
+      "description": "Pushes implement and fix branches and opens their pull requests for cgwalters-forge automation.",
+      "public": true,
+      "permissions": {
+        "administration": "write",
+        "contents": "write",
+        "issues": "write",
+        "pull_requests": "write",
+        "workflows": "write"
+      },
+      "events": []
+    },
+    "executor": {
+      "name": "cgwalters-forge-executor",
+      "description": "Runs the cgwalters-forge supervisor executor and pull request poll.",
+      "permissions": {
+        "actions": "write",
+        "checks": "read",
+        "contents": "write",
+        "issues": "write",
+        "organization_projects": "write",
+        "pull_requests": "write",
+        "statuses": "read",
+        "workflows": "write"
+      },
+      "events": []
+    }
+  }
+}
