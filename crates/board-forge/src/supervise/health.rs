@@ -8,7 +8,7 @@ use crate::plan::DISPATCH_MARKER;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Each check, in report order, with what to do when it fails.
 pub const CHECKS: &[(&str, &str)] = &[
@@ -69,6 +69,10 @@ pub const CHECKS: &[(&str, &str)] = &[
         "unclosed",
         "Inspect issues left open after their implement pull request merged.",
     ),
+    (
+        "scheduled",
+        "Read the failing job of the scheduled workflow that keeps failing.",
+    ),
 ];
 
 /// The label the poll stops a pull request with.
@@ -88,6 +92,12 @@ const RUNNING: &[&str] = &["in_progress", "queued", "waiting", "pending"];
 const MAX_EPICS: usize = 50;
 const REST_PAGES: usize = 20;
 const COMMENT_PAGES: usize = 20;
+/// A scheduled workflow fails the check once this many of its runs in the
+/// lookback ended and every one failed: one failure may be a flake.
+const SCHEDULED_FAILURES: u64 = 2;
+/// Conclusions that count as a failed run; cancelled and skipped runs
+/// neither pass nor fail.
+const FAILED: &[&str] = &["failure", "timed_out", "startup_failure"];
 
 /// Each check's items, or `None` where they could not be read whole.
 pub type Observations = BTreeMap<String, Option<Vec<Value>>>;
@@ -167,11 +177,9 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                         .take(limits.poll_failures)
                         .collect();
                     let all = failures.len() == limits.poll_failures
-                        && failures.iter().all(|r| {
-                            ["failure", "timed_out", "startup_failure"]
-                                .iter()
-                                .any(|c| r["conclusion"] == *c)
-                        });
+                        && failures
+                            .iter()
+                            .all(|r| FAILED.iter().any(|c| r["conclusion"] == *c));
                     if all { failures } else { vec![] }
                 }
                 "runs" => items
@@ -286,6 +294,13 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                     .filter(|p| {
                         p["issueState"] == "open"
                             && older(&p["mergedAt"], limits.unclosed_wait_hours)
+                    })
+                    .collect(),
+                "scheduled" => items
+                    .iter()
+                    .filter(|w| {
+                        w["runs"].as_u64().is_some_and(|n| n >= SCHEDULED_FAILURES)
+                            && w["failed"] == w["runs"]
                     })
                     .collect(),
                 _ => vec![],
@@ -1370,6 +1385,82 @@ impl Collector<'_> {
         }
         Ok(result)
     }
+
+    /// Each workflow's runs started by `schedule` within the lookback, in the
+    /// followed repositories and the dispatch repository, read in pages of at
+    /// most maxPages a repository. GitHub runs a schedule only on the default
+    /// branch, so the event alone selects it. The report's links are built
+    /// from the configured repository, the run's numeric id and a checked
+    /// workflow file name, never from a run's title.
+    fn scheduled(&self) -> Result<Vec<Value>> {
+        let since = encode(&format!(">={}", iso(self.lookback())));
+        let repos: BTreeSet<&String> = self
+            .s
+            .follow
+            .iter()
+            .chain([&self.s.dispatch_repo])
+            .collect();
+        let mut result = vec![];
+        for repo in repos {
+            // By workflow id: runs ended, runs failed, newest failed run, file.
+            let mut workflows: BTreeMap<u64, (u64, u64, Option<u64>, Option<String>)> =
+                BTreeMap::new();
+            for page in 1.. {
+                ensure!(page <= self.s.limits.max_pages, "scheduled runs truncated");
+                let runs = self.list(
+                    &format!(
+                        "/repos/{repo}/actions/runs?event=schedule&created={since}&page={page}"
+                    ),
+                    true,
+                )?;
+                let full = runs.len() as u64 >= self.s.limits.page_size;
+                for run in &runs {
+                    let (Some(workflow), Some(id)) =
+                        (run["workflow_id"].as_u64(), run["id"].as_u64())
+                    else {
+                        continue;
+                    };
+                    let entry = workflows.entry(workflow).or_default();
+                    if entry.3.is_none() {
+                        entry.3 = run["path"]
+                            .as_str()
+                            .and_then(|p| p.strip_prefix(".github/workflows/"))
+                            .filter(|f| {
+                                !f.is_empty()
+                                    && f.bytes()
+                                        .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
+                            })
+                            .map(str::to_owned);
+                    }
+                    if run["status"] != "completed"
+                        || run["conclusion"] == "cancelled"
+                        || run["conclusion"] == "skipped"
+                    {
+                        continue;
+                    }
+                    entry.0 += 1;
+                    if FAILED.iter().any(|c| run["conclusion"] == *c) {
+                        entry.1 += 1;
+                        entry.2 = entry.2.max(Some(id));
+                    }
+                }
+                if !full {
+                    break;
+                }
+            }
+            for (ended, failed, newest, file) in workflows.into_values() {
+                let page = match file {
+                    Some(file) => format!("https://github.com/{repo}/actions/workflows/{file}"),
+                    None => format!("https://github.com/{repo}/actions"),
+                };
+                let run = newest.map(|id| format!("https://github.com/{repo}/actions/runs/{id}"));
+                result.push(
+                    json!({"runs": ended, "failed": failed, "html_url": page, "run_url": run}),
+                );
+            }
+        }
+        Ok(result)
+    }
 }
 
 /// Reads every observation. A read that fails, or that would be incomplete,
@@ -1460,6 +1551,7 @@ pub fn collect(
     capture("held", &|_| c.held());
     capture("unqueued", &|o| c.unqueued(got(o, "approved").as_ref()));
     capture("unclosed", &|_| c.unclosed());
+    capture("scheduled", &|_| c.scheduled());
     snapshot
 }
 
