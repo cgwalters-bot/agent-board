@@ -21,11 +21,23 @@ use std::collections::BTreeMap;
 const WRITERS: &[&str] = &["admin", "maintain", "write"];
 /// Distinct accounts whose permission one check reads: each is a request.
 pub const INPUT_LOGIN_LIMIT: usize = 30;
-/// Appended by `supervise execute` to each comment it posts for the
-/// supervisor agent. That text is the agent's, which may be injected, though
+/// Appended by `supervise execute` to each comment and issue body it posts
+/// for the supervisor agent. That text is the agent's, which may be injected, though
 /// it is posted by the write-capable bot; a conversation holding it is not
-/// collaborator input.
-pub const SUPERVISOR_NOTE: &str = "<!-- agent-board-supervisor-note -->";
+/// collaborator input. It is visible, as load-bearing markers are, and the
+/// agent cannot write it itself: its text may hold no fence.
+pub const SUPERVISOR_NOTE: &str =
+    "```agent-board-supervisor-note\n{\"author\":\"supervisor-agent\"}\n```";
+/// The opening of the note, which is what readers match.
+const SUPERVISOR_NOTE_FENCE: &str = "```agent-board-supervisor-note";
+/// The hidden note written before the visible one. Still read, so that
+/// comments posted with it keep refusing their conversation; never written.
+pub(crate) const LEGACY_SUPERVISOR_NOTE: &str = "<!-- agent-board-supervisor-note -->";
+
+/// Whether `body` holds the supervisor agent's note, in either form.
+pub fn is_supervisor_note(body: &str) -> bool {
+    body.contains(SUPERVISOR_NOTE_FENCE) || body.contains(LEGACY_SUPERVISOR_NOTE)
+}
 
 /// One page of each connection; `hasNextPage` anywhere refuses the item. The
 /// fields are the same on issues and pull requests, but a union's members
@@ -35,12 +47,12 @@ const INPUT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
     issueOrPullRequest(number: $number) {
       __typename
       ... on Issue {
-        locked author { ...Actor }
+        locked body author { ...Actor }
         userContentEdits(first: 100) { nodes { editor { ...Actor } } pageInfo { hasNextPage } }
         comments(first: 100) { nodes { url databaseId body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
       }
       ... on PullRequest {
-        locked author { ...Actor }
+        locked body author { ...Actor }
         userContentEdits(first: 100) { nodes { editor { ...Actor } } pageInfo { hasNextPage } }
         comments(first: 100) { nodes { url databaseId body lastEditedAt author { ...Actor } editor { ...Actor } } pageInfo { hasNextPage } }
         reviews(first: 100) {
@@ -112,6 +124,11 @@ fn inspect<T: Transport + Rest>(
         !locked || node["locked"] == true,
         "{at}: the conversation is not locked, so anyone may add to it; lock it first"
     );
+    // An issue the supervisor filed has the agent's text as its body.
+    ensure!(
+        !node["body"].as_str().is_some_and(is_supervisor_note),
+        "the body of {at} is the supervisor agent's text, not a collaborator's"
+    );
     let mut authors = Authors::default();
     authors.add(&node["author"], None, || format!("the body of {at}"))?;
     for edit in nodes(node, "userContentEdits", &at)? {
@@ -138,9 +155,7 @@ fn inspect<T: Transport + Rest>(
     for (comment, id) in written {
         let url = comment["url"].as_str().unwrap_or("a comment").to_owned();
         ensure!(
-            !comment["body"]
-                .as_str()
-                .is_some_and(|b| b.contains(SUPERVISOR_NOTE)),
+            !comment["body"].as_str().is_some_and(is_supervisor_note),
             "{url} is the supervisor agent's text, not a collaborator's"
         );
         authors.add(&comment["author"], id, || url.clone())?;
@@ -486,6 +501,26 @@ mod tests {
                 Err(
                     "https://github.com/example/intake/issues/7#issuecomment-1 is the supervisor agent's text",
                 ),
+            ),
+            // Comments posted before the note became visible still hold it.
+            (
+                set("/comments/nodes/0", {
+                    let mut note = comment(1, login("cgwalters-bot"), Value::Null);
+                    note["body"] = json!(format!("Do this instead.\n\n{LEGACY_SUPERVISOR_NOTE}"));
+                    note
+                }),
+                Err(
+                    "https://github.com/example/intake/issues/7#issuecomment-1 is the supervisor agent's text",
+                ),
+            ),
+            // An issue the supervisor filed.
+            (
+                {
+                    let mut filed = pull();
+                    filed["body"] = json!(format!("Runs time out.\n\n{SUPERVISOR_NOTE}"));
+                    filed
+                },
+                Err("the body of example/intake#7 is the supervisor agent's text"),
             ),
             (
                 set("/comments/nodes/0/author", Value::Null),

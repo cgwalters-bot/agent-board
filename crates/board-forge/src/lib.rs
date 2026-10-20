@@ -21,6 +21,10 @@ pub mod status;
 pub mod supervise;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 
+/// The attribution every bot-posted text ends with, the poll's and the
+/// supervisor executor's alike.
+pub const FOOTER: &str = "Generated-by: https://github.com/cgwalters/#llms";
+
 pub trait Forge {
     fn snapshot(&self) -> Result<Snapshot>;
     fn capabilities(&self) -> Result<Vec<Capability>>;

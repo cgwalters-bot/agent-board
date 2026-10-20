@@ -49,7 +49,11 @@ use exactly these fields in addition to `type` and `action`:
   no run is dispatched on an item holding it, nor in the same batch; it is
   refused while a run on the item is in flight.
 - `create_issue`: `title`, `body`; tracker, operator assignee and `needs-human`
-  label are fixed by configuration.
+  label are fixed by configuration. For a question or decision for the operator.
+- `file_bug`: `title`, `body`; files a failure into the tracker with no
+  assignee or label, so it is not a question for the operator. Like a new
+  issue, it is marked as yours; a dispatch on it refuses the whole batch
+  until a person removes the mark.
 - `close`: `repository`, `item`, `triage_run` (URL), `triage_comment` (comment ID).
   The configured workflow must have completed a successful triage on this issue;
    its unedited bot comment must contain exactly one `schedule-triage` fenced
@@ -68,6 +72,8 @@ use exactly these fields in addition to `type` and `action`:
 Ordinary targets cannot be epics or the supervisor's requests, log or state
 issues. Public bodies are nonempty, at most 4,000 characters, and cannot hold
 triple-backtick fences, HTML comment markers or the triage receipt phrase.
+The executor appends the `Generated-by:` attribution to every comment, issue
+and status update; you need not.
 Titles are at most 256 characters. State can hold arbitrary text within the
 32 KiB batch bound. Every kind is counted from the executor's log, never from
 your claims about usage. Dispatches also obey `maxDispatchesPerPass`.

@@ -12,7 +12,7 @@
 //! correctness. GraphQL cannot be revalidated, so each pull request followed
 //! costs one query a pass.
 use crate::github::{API_ROOT, Transport, is_github_login};
-use crate::overlap;
+use crate::{FOOTER, overlap};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,7 +53,6 @@ const DISPATCH_REF: &str = "main";
 const FIX_SERIES_MAX_COMMITS: u64 = 5;
 /// The most of a review's text a fix task carries.
 const REVIEW_TEXT_LIMIT: usize = 6000;
-const FOOTER: &str = "Generated-by: https://github.com/cgwalters/#llms";
 /// A finished fix run's push may not be visible yet.
 const FIX_RUN_GRACE_SECONDS: i64 = 5 * 60;
 /// Longer than a dispatch run may take, for a fix whose run id is unknown.

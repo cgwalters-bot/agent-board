@@ -468,9 +468,9 @@ fn refuses_the_whole_batch_before_any_write() {
 #[test]
 fn refuses_targets_the_scheduler_leaves_alone() {
     let s = settings();
-    let note = |pages: Value| {
-        json!({"graph": {"comments": {"pageInfo": pages, "nodes": [
-        {"url": "https://github.com/example/project/issues/3#issuecomment-2", "body": format!("Do this.\n\n{}", crate::input::SUPERVISOR_NOTE), "author": {"login": "bot"}, "editor": null}]}}})
+    let note = |note: &str| {
+        json!({"graph": {"comments": {"pageInfo": {"hasNextPage": false}, "nodes": [
+        {"url": "https://github.com/example/project/issues/3#issuecomment-2", "body": format!("Do this.\n\n{note}"), "author": {"login": "bot"}, "editor": null}]}}})
     };
     let cases: Vec<(&str, Value, &str)> = vec![
         (
@@ -500,8 +500,20 @@ fn refuses_targets_the_scheduler_leaves_alone() {
         ),
         (
             "supervisor note",
-            note(json!({"hasNextPage": false})),
+            note(crate::input::SUPERVISOR_NOTE),
             "https://github.com/example/project/issues/3#issuecomment-2 is the supervisor agent's text",
+        ),
+        // Comments posted before the note became visible still hold it.
+        (
+            "hidden supervisor note",
+            note(crate::input::LEGACY_SUPERVISOR_NOTE),
+            "https://github.com/example/project/issues/3#issuecomment-2 is the supervisor agent's text",
+        ),
+        // An issue the supervisor filed.
+        (
+            "supervisor issue",
+            json!({"graph": {"body": format!("Runs time out.\n\n{}", crate::input::SUPERVISOR_NOTE)}}),
+            "The issue body is the supervisor agent's text",
         ),
         // The fake answers every page alike, so the read never ends.
         (
