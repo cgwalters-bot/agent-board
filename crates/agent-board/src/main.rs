@@ -51,6 +51,9 @@ struct Cli {
     /// Live project number, not its node ID.
     #[arg(long, global = true, conflicts_with = "snapshot")]
     project: Option<u64>,
+    /// Trusted default-branch agent-board.json whose `board` names the forge (GitHub by default).
+    #[arg(long, global = true, value_name = "FILE", conflicts_with = "snapshot")]
+    board_config: Option<PathBuf>,
     #[arg(long, global = true, hide = true)]
     template: Option<String>,
     #[command(subcommand)]
@@ -187,7 +190,7 @@ struct List {
     /// Filter by exact board status (for example "In Progress").
     #[arg(long)]
     status: Option<String>,
-    /// Filter by priority: P0, P1 or P2.
+    /// Filter by priority: P0 to P3.
     #[arg(long)]
     priority: Option<String>,
     /// Filter by whose turn it is (for example Coordinator).
@@ -328,10 +331,50 @@ fn github(cli: &Cli) -> Result<board_forge::github::GitHub<board_forge::github::
     })
 }
 
+/// The board `--board-config` selects. Only the read commands accept a
+/// Forgejo one: it has no write path, and writes elsewhere assume GitHub.
+fn board(cli: &Cli) -> Result<board_forge::forgejo::Board> {
+    let Some(path) = &cli.board_config else {
+        return Ok(board_forge::forgejo::Board::Github {});
+    };
+    let value: Value = serde_json::from_slice(
+        &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("decode {}", path.display()))?;
+    let board = board_forge::forgejo::Board::from_config(&value)?;
+    ensure!(
+        matches!(board, board_forge::forgejo::Board::Github {})
+            || matches!(
+                cli.command,
+                Command::Snapshot { .. }
+                    | Command::Project {
+                        command: Project::View
+                    }
+                    | Command::Item {
+                        command: Item::List(_) | Item::View { .. }
+                    }
+                    | Command::Reconcile { .. }
+            ),
+        "unsupported_capability: a Forgejo board is only read by snapshot create, project view, item list, item view and reconcile plan"
+    );
+    Ok(board)
+}
+
 fn load(cli: &Cli) -> Result<Snapshot> {
     let policy = agent_policy(cli)?;
-    if cli.snapshot.is_none() {
-        let snapshot = github(cli)?.snapshot_with_policy(&policy)?;
+    let live = if let board_forge::forgejo::Board::Forgejo(config) = board(cli)? {
+        ensure!(
+            cli.owner.is_none() && cli.project.is_none(),
+            "a Forgejo board is chosen by its config, not --owner or --project"
+        );
+        let transport = board_forge::forgejo::Client::from_env(&config)?;
+        Some(board_forge::forgejo::Forgejo { transport, config }.snapshot_with_policy(&policy)?)
+    } else if cli.snapshot.is_none() {
+        Some(github(cli)?.snapshot_with_policy(&policy)?)
+    } else {
+        None
+    };
+    if let Some(snapshot) = live {
         if !snapshot.coverage.complete {
             eprintln!("Warning: snapshot coverage is incomplete; reconciliation is blocked.");
         }
@@ -355,6 +398,7 @@ fn execute(cli: Cli) -> Result<()> {
         cli.template.is_none(),
         "unsupported_capability: --template is not implemented"
     );
+    board(&cli)?;
     match &cli.command {
         Command::Action {
             command: Action::Check(args),

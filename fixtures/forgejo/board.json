@@ -1,0 +1,133 @@
+{
+  "schema": "board-snapshot/v1",
+  "project": "https://forge.example/",
+  "clock": "2026-10-20T00:00:00Z",
+  "coverage": {
+    "complete": true,
+    "observed_at": "2026-10-20T00:00:00Z"
+  },
+  "items": [
+    {
+      "identity": {
+        "host": "forge.example",
+        "repository": "sample/board",
+        "number": 1
+      },
+      "assignment": null,
+      "title": "Read the board from labels",
+      "state": "open",
+      "state_reason": null,
+      "status": null,
+      "priority": "P1",
+      "turn": "Coordinator",
+      "fields_complete": true,
+      "evidence": [
+        {
+          "url": "https://forge.example/sample/board/issues/1",
+          "observed_at": "2026-10-20T00:00:00Z",
+          "provenance": "Forgejo API"
+        }
+      ],
+      "content_kind": "issue",
+      "labels": [
+        "agent-board",
+        "priority/P1",
+        "turn/coordinator"
+      ],
+      "assignees": [
+        "operator"
+      ],
+      "timestamps": {
+        "closedAt": null,
+        "createdAt": "2026-10-01T09:00:00Z",
+        "updatedAt": "2026-10-02T10:00:00Z"
+      },
+      "fields": {
+        "Result": "https://forge.example/sample/board/pulls/9",
+        "Run": "https://forge.example/sample/runner/actions/runs/41"
+      }
+    },
+    {
+      "identity": {
+        "host": "forge.example",
+        "repository": "sample/board",
+        "number": 2
+      },
+      "assignment": null,
+      "title": "Two priorities set by hand",
+      "state": "open",
+      "state_reason": null,
+      "status": null,
+      "priority": null,
+      "turn": "Operator",
+      "fields_complete": false,
+      "field_errors": [
+        "2 priority/ labels"
+      ],
+      "evidence": [
+        {
+          "url": "https://forge.example/sample/board/issues/2",
+          "observed_at": "2026-10-20T00:00:00Z",
+          "provenance": "Forgejo API"
+        }
+      ],
+      "content_kind": "issue",
+      "labels": [
+        "agent-board",
+        "priority/P2",
+        "priority/P3",
+        "turn/operator",
+        "blocked/upstream"
+      ],
+      "assignees": [],
+      "timestamps": {
+        "closedAt": null,
+        "createdAt": "2026-10-03T09:00:00Z",
+        "updatedAt": "2026-10-03T09:00:00Z"
+      },
+      "fields": {
+        "Blocked": [
+          "upstream"
+        ]
+      }
+    },
+    {
+      "identity": {
+        "host": "forge.example",
+        "repository": "sample/board",
+        "number": 3
+      },
+      "assignment": null,
+      "title": "Closed without a priority",
+      "state": "closed",
+      "state_reason": null,
+      "status": null,
+      "priority": null,
+      "turn": "Worker",
+      "fields_complete": false,
+      "field_errors": [
+        "no priority/ label"
+      ],
+      "evidence": [
+        {
+          "url": "https://forge.example/sample/board/issues/3",
+          "observed_at": "2026-10-20T00:00:00Z",
+          "provenance": "Forgejo API"
+        }
+      ],
+      "content_kind": "issue",
+      "labels": [
+        "agent-board",
+        "turn/rust-worker"
+      ],
+      "assignees": [],
+      "timestamps": {
+        "closedAt": "2026-10-05T09:00:00Z",
+        "createdAt": "2026-10-04T09:00:00Z",
+        "updatedAt": "2026-10-05T09:00:00Z"
+      },
+      "fields": {}
+    }
+  ],
+  "fields": []
+}

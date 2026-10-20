@@ -18,7 +18,7 @@ Each item has one canonical issue and one project membership, keyed by native id
 | Item | Issue title/body and native identity; project membership | Acceptance criteria live in the body. Membership defines managed work; enrollment repairs omissions. |
 | Epic and children | Issue with an existing epic label; native sub-issue relation | Decomposition is not a dependency or permission. Unclassified work need not have a parent. |
 | Status | Project single-select: Triage, Backlog, Todo, In Progress, Draft, In Review, Blocked, Needs human, Done, Cancelled | Triage replaces null. Draft means a result awaits operator review, not a GitHub draft item. Needs human marks an open ask and the items it blocks. Terminal status requires evidence. |
-| Priority | Project single-select: P0, P1, P2 | P0 blocks current work; P1 active focus; P2 parked. No mirrored priority labels. |
+| Priority | Project single-select: P0, P1, P2 | P0 blocks current work; P1 active focus; P2 parked. No mirrored priority labels. A read-only Forgejo label board (README) reads `priority/P1`..`priority/P3`; the snapshot also admits P3, so a GitHub P3 option now reads as a value rather than as incomplete. |
 | Whose turn | Project single-select Turn: Coordinator, Worker, Operator, External, None | Canonical coordination signal. Native assignees remain human ownership, not a second turn field. |
 | Operator ask | One issue per decision, with question, lettered alternatives and blocked URLs; Ask text field links it | Operator answers on the issue. Existing PR review threads can be linked instead of creating duplicate asks. |
 | Results and blockers | Project text fields Result, Blocked by, Next, News | URL lists are parsed as typed references. Next is explanation, never executable input. |

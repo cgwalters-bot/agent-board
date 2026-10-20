@@ -1,0 +1,48 @@
+[
+  {
+    "id": 101, "url": "https://forge.example/api/v1/repos/sample/board/issues/1",
+    "html_url": "https://forge.example/sample/board/issues/1", "number": 1,
+    "user": {"id": 2, "login": "operator"}, "original_author": "", "original_author_id": 0,
+    "title": "Read the board from labels", "body": "Snapshot from issues.", "ref": "", "assets": [],
+    "labels": [
+      {"id": 1, "name": "agent-board", "exclusive": false, "is_archived": false, "color": "0075ca", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/1"},
+      {"id": 2, "name": "priority/P1", "exclusive": true, "is_archived": false, "color": "b60205", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/2"},
+      {"id": 5, "name": "turn/coordinator", "exclusive": true, "is_archived": false, "color": "5319e7", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/5"}
+    ],
+    "milestone": null, "assignee": {"id": 2, "login": "operator"}, "assignees": [{"id": 2, "login": "operator"}],
+    "state": "open", "is_locked": false, "comments": 4,
+    "created_at": "2026-10-01T09:00:00Z", "updated_at": "2026-10-02T10:00:00Z", "closed_at": null, "due_date": null,
+    "pull_request": null, "repository": {"id": 7, "name": "board", "owner": "sample", "full_name": "sample/board"}, "pin_order": 0
+  },
+  {
+    "id": 102, "url": "https://forge.example/api/v1/repos/sample/board/issues/2",
+    "html_url": "https://forge.example/sample/board/issues/2", "number": 2,
+    "user": {"id": 2, "login": "operator"}, "original_author": "", "original_author_id": 0,
+    "title": "Two priorities set by hand", "body": "", "ref": "", "assets": [],
+    "labels": [
+      {"id": 1, "name": "agent-board", "exclusive": false, "is_archived": false, "color": "0075ca", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/1"},
+      {"id": 3, "name": "priority/P2", "exclusive": false, "is_archived": false, "color": "d93f0b", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/3"},
+      {"id": 4, "name": "priority/P3", "exclusive": false, "is_archived": false, "color": "fbca04", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/4"},
+      {"id": 6, "name": "turn/operator", "exclusive": true, "is_archived": false, "color": "5319e7", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/6"},
+      {"id": 8, "name": "blocked/upstream", "exclusive": false, "is_archived": false, "color": "000000", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/8"}
+    ],
+    "milestone": null, "assignee": null, "assignees": null,
+    "state": "open", "is_locked": false, "comments": 0,
+    "created_at": "2026-10-03T09:00:00Z", "updated_at": "2026-10-03T09:00:00Z", "closed_at": null, "due_date": null,
+    "pull_request": null, "repository": {"id": 7, "name": "board", "owner": "sample", "full_name": "sample/board"}, "pin_order": 0
+  },
+  {
+    "id": 103, "url": "https://forge.example/api/v1/repos/sample/board/issues/3",
+    "html_url": "https://forge.example/sample/board/issues/3", "number": 3,
+    "user": {"id": 2, "login": "operator"}, "original_author": "", "original_author_id": 0,
+    "title": "Closed without a priority", "body": "", "ref": "", "assets": [],
+    "labels": [
+      {"id": 1, "name": "agent-board", "exclusive": false, "is_archived": false, "color": "0075ca", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/1"},
+      {"id": 7, "name": "turn/rust-worker", "exclusive": true, "is_archived": false, "color": "5319e7", "description": "", "url": "https://forge.example/api/v1/repos/sample/board/labels/7"}
+    ],
+    "milestone": null, "assignee": null, "assignees": [],
+    "state": "closed", "is_locked": false, "comments": 0,
+    "created_at": "2026-10-04T09:00:00Z", "updated_at": "2026-10-05T09:00:00Z", "closed_at": "2026-10-05T09:00:00Z", "due_date": null,
+    "pull_request": null, "repository": {"id": 7, "name": "board", "owner": "sample", "full_name": "sample/board"}, "pin_order": 0
+  }
+]

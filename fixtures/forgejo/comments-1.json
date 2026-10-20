@@ -1,0 +1,30 @@
+[
+  {
+    "id": 501, "html_url": "https://forge.example/sample/board/issues/1#issuecomment-501", "pull_request_url": "",
+    "issue_url": "https://forge.example/sample/board/issues/1",
+    "user": {"id": 9, "login": "board-bot"}, "original_author": "", "original_author_id": 0,
+    "body": "<!-- agent-board-run: https://forge.example/sample/runner/actions/runs/40 -->\nStarted run 40.",
+    "assets": [], "created_at": "2026-10-02T08:00:00Z", "updated_at": "2026-10-02T08:00:00Z"
+  },
+  {
+    "id": 502, "html_url": "https://forge.example/sample/board/issues/1#issuecomment-502", "pull_request_url": "",
+    "issue_url": "https://forge.example/sample/board/issues/1",
+    "user": {"id": 11, "login": "visitor"}, "original_author": "", "original_author_id": 0,
+    "body": "<!-- agent-board-run: https://forge.example/visitor/elsewhere/actions/runs/1 -->\nThis copies the marker but does not count.",
+    "assets": [], "created_at": "2026-10-02T09:00:00Z", "updated_at": "2026-10-02T09:00:00Z"
+  },
+  {
+    "id": 503, "html_url": "https://forge.example/sample/board/issues/1#issuecomment-503", "pull_request_url": "",
+    "issue_url": "https://forge.example/sample/board/issues/1",
+    "user": {"id": 9, "login": "board-bot"}, "original_author": "", "original_author_id": 0,
+    "body": "<!-- agent-board-run: https://forge.example/sample/runner/actions/runs/41 -->\nRetried as run 41.",
+    "assets": [], "created_at": "2026-10-02T09:30:00Z", "updated_at": "2026-10-02T09:30:00Z"
+  },
+  {
+    "id": 504, "html_url": "https://forge.example/sample/board/issues/1#issuecomment-504", "pull_request_url": "",
+    "issue_url": "https://forge.example/sample/board/issues/1",
+    "user": {"id": 9, "login": "board-bot"}, "original_author": "", "original_author_id": 0,
+    "body": "<!-- agent-board-result: https://forge.example/sample/board/pulls/9 -->\nRun 41 opened sample/board#9.",
+    "assets": [], "created_at": "2026-10-02T10:00:00Z", "updated_at": "2026-10-02T10:00:00Z"
+  }
+]

@@ -9,6 +9,7 @@ pub mod action;
 pub mod batch;
 pub mod epic;
 pub mod epic_apply;
+pub mod forgejo;
 pub mod github;
 pub mod input;
 pub mod overlap;
