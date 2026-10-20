@@ -6,6 +6,7 @@ use serde::Deserialize;
 pub const ACTIONS: &[&str] = &[
     "comment",
     "create_issue",
+    "file_bug",
     "close",
     "remove_needs_human",
     "replace_state",
@@ -21,6 +22,14 @@ pub enum Write {
         body: String,
     },
     CreateIssue {
+        title: String,
+        body: String,
+    },
+    /// An issue in the tracker like `create_issue`, but neither assigned nor
+    /// held: a failure for a run to pick up, not a question for the operator.
+    /// A separate action rather than a kind of `create_issue`, so that its
+    /// own cap bounds it and leaves it off where the caller has not set one.
+    FileBug {
         title: String,
         body: String,
     },
@@ -127,7 +136,7 @@ pub(super) fn has_label(issue: &Value, label: &str) -> bool {
 
 fn text(body: &str, max: usize, protocols: bool) -> Result<()> {
     ensure!(
-        !body.trim().is_empty() && body.chars().count() <= max,
+        !unsigned(body).is_empty() && body.chars().count() <= max,
         "Empty or oversized supervisor text"
     );
     if protocols {
@@ -141,6 +150,22 @@ fn text(body: &str, max: usize, protocols: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `body` without the attribution the agent may have added, trimmed.
+fn unsigned(body: &str) -> &str {
+    let body = body.trim();
+    body.strip_suffix(crate::FOOTER).unwrap_or(body).trim()
+}
+
+/// `body` signed with the attribution the agent may have left out, once and
+/// last, after `note`.
+fn signed(body: &str, note: Option<&str>) -> String {
+    let body = unsigned(body);
+    match note {
+        Some(note) => format!("{body}\n\n{note}\n\n{}", crate::FOOTER),
+        None => format!("{body}\n\n{}", crate::FOOTER),
+    }
 }
 
 fn target(policy: &Policy, repo: &str, item: u64) -> Result<()> {
@@ -173,6 +198,7 @@ impl Checked {
             Self::Write(w) => match w {
                 Write::Comment { .. } => "comment",
                 Write::CreateIssue { .. } => "create_issue",
+                Write::FileBug { .. } => "file_bug",
                 Write::Close { .. } => "close",
                 Write::RemoveNeedsHuman { .. } => "remove_needs_human",
                 Write::ReplaceState { .. } => "replace_state",
@@ -204,7 +230,7 @@ impl Checked {
         if let Self::Write(w) = self {
             match w {
                 Write::Comment { body, .. } => text(body, 4000, true)?,
-                Write::CreateIssue { title, body } => {
+                Write::CreateIssue { title, body } | Write::FileBug { title, body } => {
                     let repo = p
                         .agent
                         .tracker
@@ -269,7 +295,7 @@ impl Checked {
     /// a created issue is only addressable through the number it reports.
     pub fn link(&self, p: &Policy, receipt: Option<&Value>) -> String {
         let target = self.issue().or_else(|| match self {
-            Self::Write(Write::CreateIssue { .. }) => p
+            Self::Write(Write::CreateIssue { .. } | Write::FileBug { .. }) => p
                 .agent
                 .tracker
                 .as_deref()
@@ -364,7 +390,7 @@ impl Checked {
                     format!("/repos/{repository}/issues/{item}/comments"),
                     // The bot posts it, so mark it as the agent's: dispatch
                     // admission refuses a conversation holding this note.
-                    json!({"body": format!("{body}\n\n{}", crate::input::SUPERVISOR_NOTE)}),
+                    json!({"body": signed(body, Some(crate::input::SUPERVISOR_NOTE))}),
                 ),
                 Write::CreateIssue { title, body } => (
                     "POST",
@@ -372,7 +398,17 @@ impl Checked {
                         "/repos/{}/issues",
                         p.agent.tracker.as_deref().context("No tracker")?
                     ),
-                    json!({"title": title, "body": body, "assignees": [p.settings.operator], "labels": ["needs-human"]}),
+                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE)), "assignees": [p.settings.operator], "labels": ["needs-human"]}),
+                ),
+                // Unheld, so the note alone keeps the supervisor from making
+                // the agent's words a later run's brief until a person removes it.
+                Write::FileBug { title, body } => (
+                    "POST",
+                    format!(
+                        "/repos/{}/issues",
+                        p.agent.tracker.as_deref().context("No tracker")?
+                    ),
+                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE))}),
                 ),
                 Write::Close {
                     repository, item, ..
@@ -404,7 +440,7 @@ impl Checked {
                     "/graphql".into(),
                     json!({
                         "query": "mutation($project:ID!,$status:ProjectV2StatusUpdateStatus!,$body:String!){createProjectV2StatusUpdate(input:{projectId:$project,status:$status,body:$body}){statusUpdate{id}}}",
-                        "variables": {"project": p.agent.project, "status": status.replace('-', "_").to_ascii_uppercase(), "body": body}
+                        "variables": {"project": p.agent.project, "status": status.replace('-', "_").to_ascii_uppercase(), "body": signed(body, None)}
                     }),
                 ),
             },

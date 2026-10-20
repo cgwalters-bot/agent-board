@@ -3,7 +3,7 @@ use super::*;
 fn configured() -> Settings {
     let mut cfg = supervisor();
     cfg["agent"]["dailyCaps"] = json!({"comment": 2, "create_issue": 1, "close": 1,
-        "remove_needs_human": 1, "replace_state": 1, "status_update": 1});
+        "remove_needs_human": 1, "replace_state": 1, "status_update": 1, "file_bug": 1});
     cfg["agent"]["tracker"] = json!("example/control");
     cfg["agent"]["state"] = json!({"repository": "example/control", "issue": 8});
     cfg["agent"]["project"] = json!("PVT_project");
@@ -45,6 +45,11 @@ fn actions() -> Vec<Value> {
         action(
             "status_update",
             json!({"status": "on-track", "body": "Work is progressing."}),
+        ),
+        // Already signed: the executor signs it once.
+        action(
+            "file_bug",
+            json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{}", crate::FOOTER)}),
         ),
     ]
 }
@@ -150,18 +155,46 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
         match r["action"].as_str().unwrap() {
             "comment" => {
                 assert_eq!(path, "/repos/example/project/issues/3/comments");
+                // The visible note, then the attribution, last.
                 assert_eq!(
                     body["body"],
                     format!(
-                        "Investigated; see the report.\n\n{}",
-                        crate::input::SUPERVISOR_NOTE
+                        "Investigated; see the report.\n\n{}\n\n{}",
+                        crate::input::SUPERVISOR_NOTE,
+                        crate::FOOTER
                     )
                 );
+                assert!(crate::input::is_supervisor_note(
+                    body["body"].as_str().unwrap()
+                ));
+                assert!(!body["body"].as_str().unwrap().contains("<!--"));
             }
             "create_issue" => {
                 assert_eq!(path, "/repos/example/control/issues");
                 assert_eq!(body["assignees"], json!(["owner"]));
                 assert_eq!(body["labels"], json!(["needs-human"]));
+                assert_eq!(
+                    body["body"],
+                    format!(
+                        "Please decide.\n\n{}\n\n{}",
+                        crate::input::SUPERVISOR_NOTE,
+                        crate::FOOTER
+                    )
+                );
+                assert!(
+                    out.lines[0].contains(": done, https://github.com/example/control/issues/738"),
+                    "{out:?}"
+                );
+            }
+            "file_bug" => {
+                // Neither the operator's nor held: only title and body, whose
+                // note keeps it from a dispatch until a person rewrites it.
+                assert_eq!(path, "/repos/example/control/issues");
+                assert_eq!(
+                    body,
+                    &json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{}\n\n{}",
+                        crate::input::SUPERVISOR_NOTE, crate::FOOTER)})
+                );
                 assert!(
                     out.lines[0].contains(": done, https://github.com/example/control/issues/738"),
                     "{out:?}"
@@ -189,6 +222,10 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
             "status_update" => {
                 assert_eq!(path, "/graphql");
                 assert_eq!(body["variables"]["project"], "PVT_project");
+                assert_eq!(
+                    body["variables"]["body"],
+                    format!("Work is progressing.\n\n{}", crate::FOOTER)
+                );
                 assert_eq!(out.lines[0], "- `status_update` configured target: done, ");
             }
             _ => unreachable!(),
@@ -325,6 +362,8 @@ fn forbidden_actions_injected_targets_and_protocol_comments_never_write() {
         "```agent-board-job-plan\n{}\n```",
         "<!-- tracker-poll {} -->",
         "Triage found this issue done: https://github.com/example/control/actions/runs/22",
+        // Only the attribution: no text once the executor signs it.
+        &format!(" {}\n", crate::FOOTER),
     ] {
         refuses(
             &s,

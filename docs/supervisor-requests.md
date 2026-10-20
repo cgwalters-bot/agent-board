@@ -15,6 +15,7 @@ contain:
   "dailyCaps": {
     "comment": 4,
     "create_issue": 2,
+    "file_bug": 2,
     "close": 2,
     "remove_needs_human": 1,
     "replace_state": 4,
@@ -45,6 +46,7 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"dispatch","repository":"OWNER/repo","item":1,"kind":"triage","pool":"small","reason":"no-plan"}
 {"type":"supervisor_action","action":"comment","repository":"OWNER/repo","item":1,"body":"Investigation and links."}
 {"type":"supervisor_action","action":"create_issue","title":"Decision needed","body":"Question and evidence."}
+{"type":"supervisor_action","action":"file_bug","title":"Failure class","body":"Failure and evidence."}
 {"type":"supervisor_action","action":"close","repository":"OWNER/repo","item":1,"triage_run":"https://github.com/OWNER/tracker/actions/runs/456","triage_comment":789}
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
 {"type":"supervisor_action","action":"replace_state","body":"Arbitrary memory, including structured state."}
@@ -62,7 +64,13 @@ approval does not suffice. The `epic` label remains the operator's approval;
 this executor cannot add it or create parentage.
 
 Comments target issues or pull requests in `follow`. New issues go only to
-`tracker`, assigned to the configured operator and labeled `needs-human`.
+`tracker`. `create_issue` is a question for the operator: assigned to the
+configured operator and labeled `needs-human`. `file_bug` files a failure with
+neither, so it is not an operator question; its own cap keeps it off unless
+configured. Both bodies carry the supervisor note below, so the supervisor
+never dispatches either until a person removes it.
+The executor ends every comment, new issue and status update with the
+`Generated-by:` attribution poll uses, rather than trusting the agent to.
 Titles are nonempty and at most 256 characters; public bodies are nonempty and
 at most 4,000 characters. They cannot contain triple-backtick fences, HTML
 comment markers or the triage-done receipt phrase below: an injected request
@@ -72,10 +80,13 @@ and the batch byte limit. Its action replaces only the configured issue body.
 Status accepts `on-track`, `at-risk` or `off-track` and publishes the supplied
 body using the same Projects v2 mutation as `project status-update`.
 
-A comment is the agent's text posted as the bot, so the executor appends the
-fixed hidden note `<!-- agent-board-supervisor-note -->`. Both the supervisor's
+A comment or new issue is the agent's text posted as the bot, so the executor appends the
+fixed visible note, an `agent-board-supervisor-note` fenced JSON block (the
+agent's text cannot hold a fence, so it cannot write one). Readers still
+recognise the hidden `<!-- agent-board-supervisor-note -->` earlier comments
+hold; the executor no longer writes it. Both the supervisor's
 dispatch preflight and the scheduler's optional collaborator-only input check
-refuse a conversation holding it, so one agent pass cannot brief the next run
+refuse a conversation holding it in its body or a comment, so one agent pass cannot brief the next run
 in its own words around the closed brief. A batch cannot comment on and dispatch the same item,
 and a comment is refused while a dispatch run on its target is in flight.
 

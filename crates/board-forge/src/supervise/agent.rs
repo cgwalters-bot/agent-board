@@ -434,7 +434,7 @@ pub struct Outcome {
 
 const CONVERSATION: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
-    locked author { ...Actor } editor { ...Actor }
+    locked body author { ...Actor } editor { ...Actor }
     userContentEdits(first: 100) { totalCount nodes { editor { ...Actor } } }
     comments(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { url body lastEditedAt author { ...Actor } editor { ...Actor } } }
   } }
@@ -448,8 +448,8 @@ fragment Actor on Actor { __typename login }"#;
 /// free text out of the runs it dispatches, as it may be injected; a note it
 /// had the bot post on the target would carry that text in anyway, and the
 /// run's answer would be read by the next pass, so one agent run would steer
-/// the next in a loop. An issue it created is held `needs-human` for the
-/// operator, so it is not dispatched until a person takes it on.
+/// the next in a loop. An issue it created carries the note in its body, so
+/// it is not dispatched here until a person removes it.
 ///
 /// `writers` adds agent-board#111's check, for a closure: a triage verdict
 /// closes the issue with no review after it, so the run must have read only
@@ -488,6 +488,12 @@ fn conversation(api: &dyn Api, repo: &str, number: u64, writers: bool) -> Result
         )?;
         let issue = &data["repository"]["issue"];
         ensure!(issue.is_object(), "The issue could not be read");
+        ensure!(
+            !issue["body"]
+                .as_str()
+                .is_some_and(crate::input::is_supervisor_note),
+            "The issue body is the supervisor agent's text"
+        );
         if writers && page == 0 {
             ensure!(
                 issue["locked"] == true,
@@ -514,7 +520,7 @@ fn conversation(api: &dyn Api, repo: &str, number: u64, writers: bool) -> Result
             ensure!(
                 !comment["body"]
                     .as_str()
-                    .is_some_and(|b| b.contains(crate::input::SUPERVISOR_NOTE)),
+                    .is_some_and(crate::input::is_supervisor_note),
                 "{place} is the supervisor agent's text"
             );
             if writers {
