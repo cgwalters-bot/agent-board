@@ -814,6 +814,147 @@ fn scheduled_runs_are_judged_by_workflow_in_each_repository_with_links_only() {
 }
 
 #[test]
+fn a_due_release_the_train_has_not_run_for_fails() {
+    let (_, now) = recorded();
+    let hours = |h: f64| iso(now - (h * HOUR_MS as f64) as i64);
+    let release = "https://github.com/example/agentic-job/releases/tag/v0.4.0";
+    let runs_page = "https://github.com/example/control/actions/workflows/release-train.yml";
+    // (case, train configured, release age, merged ago, train run since due, status, evidence)
+    type Case<'a> = (
+        &'a str,
+        bool,
+        f64,
+        Option<f64>,
+        bool,
+        &'a str,
+        &'a [&'a str],
+    );
+    let cases: &[Case] = &[
+        (
+            "due and not run",
+            true,
+            30.0,
+            Some(20.0),
+            false,
+            "fail",
+            &[release, runs_page],
+        ),
+        ("due and run", true, 30.0, Some(20.0), true, "ok", &[]),
+        // Due by its interval 0.5 hours ago: not overdue yet.
+        (
+            "due within the threshold",
+            true,
+            24.5,
+            Some(20.0),
+            false,
+            "ok",
+            &[],
+        ),
+        // Due by its merge 0.5 hours ago, though the interval passed long since.
+        (
+            "merged within the threshold",
+            true,
+            48.0,
+            Some(0.5),
+            false,
+            "ok",
+            &[],
+        ),
+        (
+            "not due: recent release",
+            true,
+            2.0,
+            Some(1.5),
+            false,
+            "ok",
+            &[],
+        ),
+        (
+            "not due: nothing merged",
+            true,
+            30.0,
+            None,
+            false,
+            "ok",
+            &[],
+        ),
+        ("key absent", false, 30.0, Some(20.0), false, "ok", &[]),
+    ];
+    for &(case, configured, age, merged, ran, expected, evidence) in cases {
+        let mut s = project_settings();
+        s.release_train_workflow = configured.then(|| "release-train.yml".to_owned());
+        let published = hours(age);
+        let fake = Fake::new(|_: &str, path: &str, _: &Value| -> Result<Value> {
+            if path.contains("/releases/latest") {
+                return Ok(
+                    json!({"tag_name": "v0.4.0", "html_url": release, "published_at": published}),
+                );
+            }
+            if path.contains("/contents/") {
+                return Ok(wrapper("example/agentic-job", "v0.4.0"));
+            }
+            if path.starts_with("/repos/example/agentic-job/pulls?state=closed") {
+                let pull = |at: f64| json!({"merged_at": hours(at), "updated_at": hours(at)});
+                let mut pulls = vec![json!({"merged_at": null, "updated_at": hours(0.1)})];
+                pulls.extend(merged.map(pull));
+                pulls.push(pull(age + 1.0));
+                return Ok(json!(pulls));
+            }
+            let train = "/repos/example/control/actions/workflows/release-train.yml/runs?created=";
+            if let Some(rest) = path.strip_prefix(train) {
+                // Due at the later of the interval's end and the first merge.
+                let due = hours(merged.unwrap_or_default().min(age - 24.0));
+                let since = encode(&format!(">={due}"));
+                assert_eq!(rest, format!("{since}&per_page=100"), "{case}");
+                let found = vec![json!({"id": 1}); usize::from(ran)];
+                return Ok(json!({"workflow_runs": found}));
+            }
+            bail!("not this check")
+        });
+        let snapshot = collect(&fake, &s, "main", now, None);
+        let result = check(&snapshot, "release", now);
+        assert_eq!(result["status"], expected, "{case}");
+        assert_eq!(result["evidence"], json!(evidence), "{case}");
+        // Only a configured train is asked about, and its runs only while due.
+        let calls = fake.calls.borrow();
+        let asked = |part: &str| calls.iter().any(|c| c.contains(part));
+        assert_eq!(
+            asked("pulls?state=closed"),
+            configured && age >= 24.0,
+            "{case}"
+        );
+        assert_eq!(
+            asked("release-train.yml/runs"),
+            configured && age >= 24.0 && merged.is_some(),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn the_release_train_check_refuses_a_crowded_page() {
+    let (_, now) = recorded();
+    let mut s = project_settings();
+    s.release_train_workflow = Some("release-train.yml".into());
+    let published = iso(now - 30 * HOUR_MS);
+    let fake = Fake::new(|_: &str, path: &str, _: &Value| -> Result<Value> {
+        if path.contains("/releases/latest") {
+            return Ok(json!({"tag_name": "v0.4.0", "published_at": published}));
+        }
+        if path.contains("/contents/") {
+            return Ok(wrapper("example/agentic-job", "v0.4.0"));
+        }
+        if path.contains("/pulls?state=closed") {
+            let closed = json!({"merged_at": null, "updated_at": iso(now)});
+            return Ok(json!(vec![closed; 100]));
+        }
+        bail!("not this check")
+    });
+    let snapshot = collect(&fake, &s, "main", now, None);
+    assert!(snapshot.observations["release"].is_none());
+}
+
+#[test]
 fn the_overall_deadline_leaves_observations_unavailable_without_further_requests() {
     let (_, now) = recorded();
     let s = settings();

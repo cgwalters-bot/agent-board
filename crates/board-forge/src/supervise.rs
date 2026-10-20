@@ -138,6 +138,11 @@ pub struct Limits {
     pub unclosed_wait_hours: f64,
     pub pace_margin_percent: f64,
     pub usage_stale_minutes: f64,
+    /// The release train's interval: a release older than this, with pull
+    /// requests merged since, is due.
+    pub release_interval_hours: f64,
+    /// How long a due release may wait for the train to run.
+    pub release_overdue_hours: f64,
 }
 
 impl Default for Limits {
@@ -165,6 +170,8 @@ impl Default for Limits {
             unclosed_wait_hours: 1.0,
             pace_margin_percent: 25.0,
             usage_stale_minutes: 45.0,
+            release_interval_hours: 24.0,
+            release_overdue_hours: 1.0,
         }
     }
 }
@@ -216,6 +223,8 @@ impl Limits {
             unclosed_wait_hours: number("unclosedWaitHours", d.unclosed_wait_hours)?,
             pace_margin_percent: number("paceMarginPercent", d.pace_margin_percent)?,
             usage_stale_minutes: number("usageStaleMinutes", d.usage_stale_minutes)?,
+            release_interval_hours: number("releaseIntervalHours", d.release_interval_hours)?,
+            release_overdue_hours: number("releaseOverdueHours", d.release_overdue_hours)?,
         })
     }
 }
@@ -301,6 +310,9 @@ pub struct Settings {
     pub release_repository: String,
     pub wrapper_repository: String,
     pub wrapper_path: String,
+    /// The dispatch repository's release-train workflow file; absent, the
+    /// release check does not ask whether a due release has waited for it.
+    pub release_train_workflow: Option<String>,
     pub usage: Option<Usage>,
     pub agent: Option<AgentSettings>,
 }
@@ -394,6 +406,16 @@ impl Settings {
             validate_repository(&names[key])?;
         }
         validate_path(&names["wrapperPath"])?;
+        let release_train_workflow = supervisor
+            .get("releaseTrainWorkflow")
+            .map(|v| -> Result<String> {
+                let name = v
+                    .as_str()
+                    .context("supervisor config releaseTrainWorkflow")?;
+                validate_workflow(name)?;
+                Ok(name.to_owned())
+            })
+            .transpose()?;
         // Compared with branch names and sent, encoded, as a query value.
         let prefix = &names["implementBranchPrefix"];
         ensure!(
@@ -434,6 +456,7 @@ impl Settings {
             release_repository: names["releaseRepository"].clone(),
             wrapper_repository: names["wrapperRepository"].clone(),
             wrapper_path: names["wrapperPath"].clone(),
+            release_train_workflow,
             usage,
             agent: agent_settings(supervisor.get("agent"))?,
         })
@@ -665,6 +688,9 @@ mod tests {
             ("wrapperRepository", json!("a/b/c")),
             ("wrapperPath", json!("../secrets")),
             ("wrapperPath", json!("a?ref=x")),
+            ("releaseTrainWorkflow", json!("../train.yml")),
+            ("releaseTrainWorkflow", json!(1)),
+            ("releaseOverdueHours", json!(-1)),
             ("pollWorkflow", json!("poll")),
             ("implementBranchPrefix", json!("a b")),
             ("pageSize", json!(500)),

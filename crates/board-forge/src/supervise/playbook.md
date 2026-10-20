@@ -111,7 +111,9 @@ binds the answer to this issue, without a scheduler question's `request` ID.
 - **decisions**: questions waiting on the operator. Do not answer them.
   Mention one only when it blocks other work.
 - **release**: the wrapper's agentic-job pin lags the latest release.
-  Report it. The pin moves by a reviewed pull request.
+  Report it. The pin moves by a reviewed pull request. With the release
+  train's runs page as evidence, a due release has waited over the threshold
+  with no train run since: report that the train did not start.
 - **idle**: the scheduler's last passes each ended `idle: N slot(s) free
   and nothing started`. The line's tally says what it skipped. When most of
   the skips share one cause that another check also reports (**stuck**,
