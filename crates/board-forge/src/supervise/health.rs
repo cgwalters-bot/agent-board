@@ -239,7 +239,19 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                     .iter()
                     .filter(|i| older(&i["created_at"], limits.decision_wait_hours))
                     .collect(),
-                "release" => items.iter().filter(|i| i["latest"] != i["pin"]).collect(),
+                // The pin lags the latest release, or a due release has
+                // waited past the threshold with no train run since.
+                "release" => items
+                    .iter()
+                    .filter(|i| {
+                        if i.get("due_since").is_some() {
+                            !truthy(&i["ran"])
+                                && older(&i["due_since"], limits.release_overdue_hours)
+                        } else {
+                            i["latest"] != i["pin"]
+                        }
+                    })
+                    .collect(),
                 // The newest scheduler passes, each idle or not: all of them idle.
                 "idle" => {
                     let newest: Vec<&Value> = items.iter().take(limits.idle_passes).collect();
@@ -1060,9 +1072,70 @@ impl Collector<'_> {
             pins.len() == 3 && pins.iter().all(|p| *p == pins[0]),
             "unrecognized wrapper pin"
         );
-        Ok(vec![
+        let mut items = vec![
             json!({"pin": pins[0], "latest": latest["tag_name"], "html_url": latest["html_url"]}),
-        ])
+        ];
+        if let Some(workflow) = &s.release_train_workflow {
+            items.extend(self.release_train(&latest, workflow)?);
+        }
+        Ok(items)
+    }
+
+    /// Whether the release train has run since a release became due: the
+    /// latest release is older than the interval and pull requests merged
+    /// since it. A train whose cron is starved leaves a due release waiting
+    /// unseen; nothing else notices. One item while due, none otherwise.
+    fn release_train(&self, latest: &Value, workflow: &str) -> Result<Option<Value>> {
+        let s = self.s;
+        let published = millis(&latest["published_at"]).context("release published_at")?;
+        let interval = published + (s.limits.release_interval_hours * HOUR_MS as f64) as i64;
+        if interval > self.now {
+            return Ok(None);
+        }
+        // Closed pull requests, most recently updated first: one merged
+        // after the release was updated after it too, so it is on this page
+        // unless a hundred newer updates crowd it out, which is incomplete.
+        let pulls = self.list(
+            &format!(
+                "/repos/{}/pulls?state=closed&sort=updated&direction=desc",
+                s.release_repository
+            ),
+            true,
+        )?;
+        let merged: Vec<i64> = pulls
+            .iter()
+            .filter_map(|p| millis(&p["merged_at"]))
+            .filter(|at| *at > published)
+            .collect();
+        let crowded = pulls.len() as u64 >= s.limits.page_size
+            && pulls
+                .last()
+                .and_then(|p| millis(&p["updated_at"]))
+                .is_some_and(|at| at > published);
+        ensure!(!crowded, "merged pull requests truncated");
+        let Some(first) = merged.iter().min() else {
+            return Ok(None);
+        };
+        // Due once both hold.
+        let due = interval.max(*first);
+        let runs = self.list(
+            &format!(
+                "{}/actions/workflows/{workflow}/runs?created={}",
+                self.root,
+                encode(&format!(">={}", iso(due)))
+            ),
+            true,
+        )?;
+        let runs_page = format!(
+            "https://github.com/{}/actions/workflows/{workflow}",
+            s.dispatch_repo
+        );
+        Ok(Some(json!({
+            "due_since": iso(due),
+            "ran": !runs.is_empty(),
+            "html_url": latest["html_url"],
+            "run_url": runs_page,
+        })))
     }
 
     /// A recorded plan's run, as the scheduler finds it: the run the bot's
