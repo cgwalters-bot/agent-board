@@ -124,6 +124,8 @@ pub enum Priority {
     P0,
     P1,
     P2,
+    /// Used by label boards (`priority/P3`); GitHub boards provision P0 to P2.
+    P3,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -159,6 +161,10 @@ pub struct Item {
     #[serde(deserialize_with = "required_nullable")]
     pub turn: Option<Turn>,
     pub fields_complete: bool,
+    /// Why `fields_complete` is false, where the reader can say (for example
+    /// two labels of one exclusive scope); reconcile repeats it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<Evidence>,
     #[serde(default)]
@@ -245,6 +251,10 @@ impl Snapshot {
             ensure!(
                 ["open", "closed"].contains(&item.state.as_str()),
                 "invalid issue state"
+            );
+            ensure!(
+                item.field_errors.is_empty() || !item.fields_complete,
+                "field errors on an item with complete fields"
             );
         }
         Ok(())
@@ -373,10 +383,11 @@ fn reconcile_inner(
             continue;
         }
         if !item.fields_complete {
-            plan.diagnostics.insert(
-                item.identity.display(),
-                "missing_data: incomplete fields".into(),
-            );
+            let mut diagnostic = String::from("missing_data: incomplete fields");
+            if !item.field_errors.is_empty() {
+                diagnostic = format!("{diagnostic}: {}", item.field_errors.join("; "));
+            }
+            plan.diagnostics.insert(item.identity.display(), diagnostic);
             continue;
         }
         if !policy.repositories.contains(&item.identity.repository) {
@@ -842,6 +853,12 @@ mod tests {
             serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
         snapshot.project = Url::parse("http://forge.example/board").unwrap();
         assert!(snapshot.validate().is_err());
+        let mut snapshot: Snapshot =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        snapshot.items[0].field_errors = vec!["no priority/ label".into()];
+        assert!(snapshot.validate().is_err());
+        snapshot.items[0].fields_complete = false;
+        snapshot.validate().unwrap();
     }
 
     #[test]

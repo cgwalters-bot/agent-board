@@ -37,6 +37,39 @@ All read commands work live (`--owner ORG --project N`, `GH_TOKEN` with project 
 
 `output check`/`output apply` are unsupported; sweeping is disabled.
 
+### Forgejo board (read only)
+
+Forgejo's API has no projects, so `--board-config agent-board.json` (trusted,
+default branch) can make the board the issues of some Forgejo repositories
+instead. It is read by `snapshot create`, `project view`, `item list`,
+`item view` and `reconcile plan`; nothing writes to Forgejo.
+
+```json
+{
+  "board": {
+    "forge": "forgejo",
+    "url": "https://forge.example/",
+    "tokenEnv": "FORGEJO_TOKEN",
+    "repositories": ["example/intake"],
+    "membership": {"label": "agent-board"},
+    "recorders": [1234]
+  }
+}
+```
+
+`membership` is `{"label": NAME}` (open and closed issues with that label) or
+`"open"` (every open issue). Priority comes from one `priority/P1`..`priority/P3`
+label and Turn from one `turn/coordinator`, `turn/operator`, `turn/worker`,
+`turn/external`, `turn/none` or `turn/<policy identity>` (read as Worker) label;
+zero, two or an unknown value leaves the item's fields incomplete and
+`reconcile plan` says why. `blocked/<reason>` labels fill a Blocked list. Run and
+Result come from the newest comment by a `recorders` user id (not login, which
+can be renamed and re-registered) whose first line is
+`<!-- agent-board-run: URL -->` or `<!-- agent-board-result: URL -->`; with no
+recorders, comments are not read. Coverage is complete only when the issues read
+match the listing's `X-Total-Count`. Status and close reasons do not exist there,
+so they are null. Without `board`, or with `"forge": "github"`, nothing changes.
+
 ## Install
 
 Rust supporting edition 2024; no prebuilt releases, and not installable with `gh extension install`.

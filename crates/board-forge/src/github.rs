@@ -472,19 +472,24 @@ impl Client {
     fn with_token(token: String) -> Self {
         Self {
             token,
-            agent: ureq::Agent::config_builder()
-                .tls_config(
-                    ureq::tls::TlsConfig::builder()
-                        // Honor locally installed CAs, including sandbox egress proxies.
-                        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                        .build(),
-                )
-                .http_status_as_error(false)
-                .timeout_global(Some(std::time::Duration::from_secs(30)))
-                .build()
-                .into(),
+            agent: http_agent(),
         }
     }
+}
+
+/// The HTTPS agent every live forge client uses.
+pub(crate) fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                // Honor locally installed CAs, including sandbox egress proxies.
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into()
 }
 
 fn select_token(gh: Option<String>, github: Option<String>) -> Result<String> {
@@ -1487,6 +1492,7 @@ impl<T: Transport> GitHub<T> {
                 priority,
                 turn,
                 fields_complete: typed_complete,
+                field_errors: vec![],
                 evidence: vec![Evidence {
                     url,
                     observed_at: clock.clone(),

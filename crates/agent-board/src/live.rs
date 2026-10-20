@@ -26,7 +26,11 @@ pub struct Options {
 }
 
 pub fn error_exit_code(error: &anyhow::Error) -> i32 {
-    if error.downcast_ref::<AuthenticationRequired>().is_some() {
+    if error.downcast_ref::<AuthenticationRequired>().is_some()
+        || error
+            .downcast_ref::<board_forge::forgejo::AuthenticationRequired>()
+            .is_some()
+    {
         4
     } else if error
         .downcast_ref::<board_forge::epic_apply::PlanChanged>()

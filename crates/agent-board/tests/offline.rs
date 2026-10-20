@@ -573,6 +573,174 @@ fn offline_table() {
     }
 }
 
+/// The snapshot board-forge's Forgejo reader makes of the issue listing and
+/// comment fixtures (its unit test keeps the two in step).
+#[test]
+fn forgejo_snapshot_table() {
+    let fixture = format!(
+        "{}/../../fixtures/forgejo/board.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    for (args, expected) in [
+        (
+            vec!["item", "list"],
+            "ITEM\tSTATUS\tPRIORITY\tTURN\tTITLE\n\
+             sample/board#1\t-\tP1\tCoordinator\tRead the board from labels\n\
+             sample/board#2\t-\t-\tOperator\tTwo priorities set by hand\n\
+             sample/board#3\t-\t-\tWorker\tClosed without a priority\n",
+        ),
+        (
+            vec![
+                "item",
+                "list",
+                "--priority",
+                "P1",
+                "--json",
+                "number",
+                "--jq",
+                ".[].number",
+            ],
+            "1\n",
+        ),
+        (
+            vec![
+                "item", "list", "--state", "closed", "--json", "url", "--jq", ".[].url",
+            ],
+            "https://forge.example/sample/board/issues/3\n",
+        ),
+        (
+            vec![
+                "item",
+                "view",
+                "sample/board#1",
+                "--hostname",
+                "forge.example",
+                "--json",
+                "fields",
+                "--jq",
+                ".fields.Run",
+            ],
+            "https://forge.example/sample/runner/actions/runs/41\n",
+        ),
+        (
+            vec![
+                "reconcile",
+                "plan",
+                "--json",
+                "actions",
+                "--jq",
+                ".actions | length",
+            ],
+            "0\n",
+        ),
+        (
+            vec![
+                "reconcile",
+                "plan",
+                "--json",
+                "diagnostics",
+                "--jq",
+                ".diagnostics | to_entries[] | \"\\(.key) \\(.value)\"",
+            ],
+            "sample/board#1 schema_drift: Status has no unambiguous single-select option \"Triage\"; no repair proposed\n\
+             sample/board#2 missing_data: incomplete fields: 2 priority/ labels\n\
+             sample/board#3 missing_data: incomplete fields: no priority/ label\n",
+        ),
+    ] {
+        let output = command()
+            .args(&args)
+            .args(["--snapshot", &fixture])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(String::from_utf8(output).unwrap(), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn board_config_cli_table() {
+    let dir = std::env::temp_dir().join(format!("agent-board-board-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let forgejo = dir.join("forgejo.json");
+    std::fs::write(
+        &forgejo,
+        r#"{"board":{"forge":"forgejo","url":"https://forge.example/","tokenEnv":"AGENT_BOARD_TEST_FORGEJO_TOKEN","repositories":["sample/board"],"membership":"open"}}"#,
+    )
+    .unwrap();
+    let invalid = dir.join("invalid.json");
+    std::fs::write(
+        &invalid,
+        r#"{"board":{"forge":"forgejo","url":"http://forge.example/","repositories":["sample/board"],"membership":"open"}}"#,
+    )
+    .unwrap();
+    let github = dir.join("github.json");
+    std::fs::write(&github, r#"{"board":{"forge":"github"}}"#).unwrap();
+    let (forgejo, invalid, github) = (
+        forgejo.to_str().unwrap(),
+        invalid.to_str().unwrap(),
+        github.to_str().unwrap(),
+    );
+    for (args, code, message) in [
+        // No token in the configured variable: gh's authentication exit code.
+        (
+            vec!["snapshot", "create", "--board-config", forgejo],
+            4,
+            "AGENT_BOARD_TEST_FORGEJO_TOKEN",
+        ),
+        (
+            vec!["reconcile", "plan", "--board-config", forgejo],
+            4,
+            "AGENT_BOARD_TEST_FORGEJO_TOKEN",
+        ),
+        (
+            vec!["item", "list", "--board-config", forgejo, "--owner", "x"],
+            1,
+            "not --owner or --project",
+        ),
+        (
+            vec!["item", "add", "sample/board#1", "--board-config", forgejo],
+            1,
+            "only read by",
+        ),
+        (
+            vec!["item", "list", "--board-config", invalid],
+            1,
+            "canonical HTTPS URL",
+        ),
+        // GitHub stays the default: the board config adds nothing to it.
+        (
+            vec![
+                "item",
+                "list",
+                "--board-config",
+                github,
+                "--owner",
+                "example",
+                "--project",
+                "1",
+            ],
+            4,
+            "GH_TOKEN",
+        ),
+    ] {
+        let output = command()
+            .env_remove("AGENT_BOARD_TEST_FORGEJO_TOKEN")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .args(&args)
+            .assert()
+            .code(code)
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(output).unwrap();
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn emitted_proposal() {
     let output = command()
