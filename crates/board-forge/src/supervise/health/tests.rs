@@ -50,14 +50,17 @@ fn recorded_reduced_snapshots_healthy_and_unavailable_observations() {
                 i
             })
             .collect();
-        let result = check(&with(id, Some(items)), id, now);
-        let expected = if id == "infrastructure" {
+        let result = check(&with(id, Some(items.clone())), id, now);
+        let expected = if id == "infrastructure" || id == "unset" {
             "warn"
         } else {
             "fail"
         };
         assert_eq!(result["status"], expected, "{id}");
-        assert_eq!(result["evidence"], json!([evidence]), "{id}");
+        // An unset option's evidence is its name.
+        let mut want = vec![json!(evidence)];
+        want.extend(items.iter().filter_map(|i| i.get("option").cloned()));
+        assert_eq!(result["evidence"], json!(want), "{id}");
         assert_eq!(check(&with(id, None), id, now)["status"], "warn", "{id}");
         let healthy = if id == "broker" {
             vec![json!({"conclusion": "success", "updated_at": snapshots["now"]})]
@@ -248,6 +251,22 @@ fn newer_checks_and_their_boundaries() {
         .collect();
     let evidence = check(&with("failures", Some(many)), "failures", now)["evidence"].clone();
     assert_eq!(evidence.as_array().unwrap().len(), limits.max_evidence);
+}
+
+#[test]
+fn unset_options_warn_by_name_and_none_is_ok() {
+    let (_, now) = recorded();
+    let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> { bail!("HTTP 403") });
+    let mut s = settings();
+    let snapshot = collect(&fake, &s, "main", now, None);
+    let result = check(&snapshot, "unset", now);
+    assert_eq!(result["status"], "warn");
+    assert_eq!(result["evidence"][0], "toilFixPool");
+    s.unset.clear();
+    let snapshot = collect(&fake, &s, "main", now, None);
+    let result = check(&snapshot, "unset", now);
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["evidence"], json!([]));
 }
 
 #[test]
@@ -843,7 +862,13 @@ fn the_collector_has_a_bounded_request_budget_and_writes_nothing() {
     let bounded = Bounded::new(&fake, &s.limits, &clock);
     let snapshot = collect(&bounded, &s, "main", now, None);
     assert_eq!(fake.calls.borrow().len(), 2);
-    assert!(snapshot.observations.values().all(Option::is_none));
+    // Only `unset` is read from the settings, not the API.
+    assert!(
+        snapshot
+            .observations
+            .iter()
+            .all(|(id, o)| o.is_none() == (id != "unset"))
+    );
     assert!(
         evaluate(&snapshot, now, &s.limits)
             .iter()

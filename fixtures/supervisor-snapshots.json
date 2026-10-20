@@ -18,5 +18,6 @@
   "held": [{"labeledAt":"2026-10-14T00:00:00Z"}],
   "unqueued": [{"approvedAt":"2026-10-15T10:00:00Z","clean":true,"queued":false}],
   "unclosed": [{"mergedAt":"2026-10-15T10:00:00Z","issueState":"open"}],
-  "scheduled": [{"runs":2,"failed":2}]
+  "scheduled": [{"runs":2,"failed":2}],
+  "unset": [{"option":"rebaseRounds"}]
 }

@@ -271,6 +271,40 @@ pub struct Config {
     pub policy: PollPolicy,
 }
 
+/// The optional poll settings of agent-board.json, which [`PollPolicy`] and
+/// the CLI read through [`option`]: one that is not here cannot be read, so
+/// the supervisor's `unset` check, which lists those a caller leaves out,
+/// covers every one. A feature that ships off is switched on by naming it.
+pub const POLL_OPTIONS: &[&str] = &[
+    "mergeAuthors",
+    "toilFixPool",
+    "conflictFixPool",
+    "kindPools",
+    "mergeQueue",
+    "continuation",
+    "diagnosticPool",
+    "operatorComments",
+    "brokerOutage",
+    "operatorAnswers",
+    "rebaseRounds",
+    "pace",
+    "lockCollaboratorItems",
+    "fixPools",
+    "reviewWorkflow",
+    "dispatchWorkflow",
+];
+
+/// `key` of a config object, refused unless `table` lists it.
+pub fn known<'a>(table: &[&str], value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
+    ensure!(table.contains(&key), "option {key} is not in its table");
+    Ok(value.get(key))
+}
+
+/// An optional poll setting: one of [`POLL_OPTIONS`].
+pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
+    known(POLL_OPTIONS, value, key)
+}
+
 /// Optional settings from the caller's repository-owned agent-board.json.
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
@@ -516,8 +550,9 @@ impl Continuation {
 
 impl PollPolicy {
     pub fn from_json(value: &Value) -> Result<Self> {
-        let continuation = Continuation::from_json(value.get("continuation"))?;
-        let merge_queue = match value.get("mergeQueue") {
+        let get = |key: &str| option(value, key);
+        let continuation = Continuation::from_json(get("continuation")?)?;
+        let merge_queue = match get("mergeQueue")? {
             None => None,
             Some(queue) => {
                 let queue = queue.as_object().context("mergeQueue is not an object")?;
@@ -541,31 +576,27 @@ impl PollPolicy {
             merge_queue,
             continuation,
             merge_authors: serde_json::from_value(
-                value.get("mergeAuthors").cloned().unwrap_or(json!([])),
+                get("mergeAuthors")?.cloned().unwrap_or(json!([])),
             )?,
             toil_fix_pool: serde_json::from_value(
-                value.get("toilFixPool").cloned().unwrap_or(json!("")),
+                get("toilFixPool")?.cloned().unwrap_or(json!("")),
             )?,
             conflict_fix_pool: serde_json::from_value(
-                value.get("conflictFixPool").cloned().unwrap_or(json!("")),
+                get("conflictFixPool")?.cloned().unwrap_or(json!("")),
             )
             .context("conflictFixPool is not a string")?,
-            kind_pools: serde_json::from_value(
-                value.get("kindPools").cloned().unwrap_or(json!({})),
-            )?,
+            kind_pools: serde_json::from_value(get("kindPools")?.cloned().unwrap_or(json!({})))?,
             diagnostic_pool: serde_json::from_value(
-                value.get("diagnosticPool").cloned().unwrap_or(json!("")),
+                get("diagnosticPool")?.cloned().unwrap_or(json!("")),
             )
             .context("diagnosticPool is not a string")?,
-            operator_comments: comments::scopes(value.get("operatorComments"))?,
-            broker_outage: BrokerOutage::from_json(value.get("brokerOutage"))?,
-            operator_answers: value
-                .get("operatorAnswers")
+            operator_comments: comments::scopes(get("operatorComments")?)?,
+            broker_outage: BrokerOutage::from_json(get("brokerOutage")?)?,
+            operator_answers: get("operatorAnswers")?
                 .map(|a| a.as_bool().context("operatorAnswers is not a boolean"))
                 .transpose()?
                 .unwrap_or(false),
-            rebase_rounds: value
-                .get("rebaseRounds")
+            rebase_rounds: get("rebaseRounds")?
                 .map(|r| {
                     r.as_u64()
                         .filter(|r| *r <= REBASE_ROUNDS_LIMIT)
@@ -573,9 +604,8 @@ impl PollPolicy {
                 })
                 .transpose()?
                 .unwrap_or(0),
-            pace: pace::Pace::from_json(value.get("pace"))?,
-            lock_items: value
-                .get("lockCollaboratorItems")
+            pace: pace::Pace::from_json(get("pace")?)?,
+            lock_items: get("lockCollaboratorItems")?
                 .map(|n| {
                     n.as_u64()
                         .filter(|n| (1..=lock::LOCK_ITEMS_LIMIT as u64).contains(n))

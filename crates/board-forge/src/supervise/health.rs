@@ -73,6 +73,10 @@ pub const CHECKS: &[(&str, &str)] = &[
         "scheduled",
         "Read the failing job of the scheduled workflow that keeps failing.",
     ),
+    (
+        "unset",
+        "Set each listed option in the caller's config, or confirm it is meant to stay off.",
+    ),
 ];
 
 /// The label the poll stops a pull request with.
@@ -303,12 +307,15 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                             && w["failed"] == w["runs"]
                     })
                     .collect(),
+                // A feature merged off stays off until its option is named
+                // (tracker#733): each one left unset is shown, and only warns.
+                "unset" => items.iter().collect(),
                 _ => vec![],
             };
             // Bounded, so the agent's task stays inside the wrapper's limit.
             let mut evidence: Vec<&str> = vec![];
             for item in &bad {
-                for key in ["html_url", "reason_url", "issue_url", "run_url"] {
+                for key in ["html_url", "reason_url", "issue_url", "run_url", "option"] {
                     if let Some(url) = item[key].as_str().filter(|u| !u.is_empty())
                         && !evidence.contains(&url)
                     {
@@ -319,7 +326,9 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             evidence.truncate(limits.max_evidence);
             let status = if bad.is_empty() {
                 "ok"
-            } else if id == "infrastructure" || bad.iter().all(|i| truthy(&i["missing"])) {
+            } else if ["infrastructure", "unset"].contains(&id)
+                || bad.iter().all(|i| truthy(&i["missing"]))
+            {
                 "warn"
             } else {
                 "fail"
@@ -1552,6 +1561,10 @@ pub fn collect(
     capture("unqueued", &|o| c.unqueued(got(o, "approved").as_ref()));
     capture("unclosed", &|_| c.unclosed());
     capture("scheduled", &|_| c.scheduled());
+    // From the settings already read: no request.
+    capture("unset", &|_| {
+        Ok(s.unset.iter().map(|o| json!({"option": o})).collect())
+    });
     snapshot
 }
 

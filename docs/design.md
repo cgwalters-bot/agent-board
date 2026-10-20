@@ -545,8 +545,12 @@ failure cleanup without credentials.
 probe, dispatch and scheduler runs, the followed repositories' pull requests,
 the epics, the decisions, the wrapper's agentic-job pin and the usage snapshot
 with a read-only token, within a request count and a deadline. It writes a
-report of eighteen checks. Each check is `ok`, `warn` or `fail`, and the report
-holds only links. An observation it cannot read whole is `warn`, and becomes
+report of nineteen checks. Each check is `ok`, `warn` or `fail`, and the report
+holds only links, but for `unset`, which warns with the names, never the values,
+of the poll and supervisor options agent-board knows that the caller's files
+leave out (the loaders' `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` and
+`AGENT_OPTIONS` tables), so a feature merged off shows until it is switched on
+or confirmed off (agent-board#141). An observation it cannot read whole is `warn`, and becomes
 `fail` once `--previous` shows it has been unavailable for an hour. The
 previous report now comes from a file the workflow downloads, not from an
 artifact the binary unzips. The epics check reads each live epic's checkpoint
