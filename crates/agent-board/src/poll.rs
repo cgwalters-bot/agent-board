@@ -75,11 +75,11 @@ fn configured(args: &Poll, value: Option<&serde_json::Value>) -> Result<(Poll, p
         }
         effective.follow =
             serde_json::from_value(value["follow"].clone()).context("config follow")?;
-        if let Some(pools) = value.get("fixPools") {
+        if let Some(pools) = poll::option(value, "fixPools")? {
             effective.fix_pool =
                 serde_json::from_value(pools.clone()).context("config fixPools")?;
         }
-        if let Some(workflow) = value.get("reviewWorkflow") {
+        if let Some(workflow) = poll::option(value, "reviewWorkflow")? {
             effective.review_workflow = Some(
                 workflow
                     .as_str()
@@ -87,7 +87,7 @@ fn configured(args: &Poll, value: Option<&serde_json::Value>) -> Result<(Poll, p
                     .to_owned(),
             );
         }
-        if let Some(workflow) = value.get("dispatchWorkflow") {
+        if let Some(workflow) = poll::option(value, "dispatchWorkflow")? {
             effective.dispatch_workflow = Some(
                 workflow
                     .as_str()

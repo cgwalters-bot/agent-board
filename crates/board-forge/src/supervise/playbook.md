@@ -149,6 +149,9 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   empty secret is a decision for the operator: report which secret and
   workflow. Anything else is a bug: report it for an issue in that
   repository, or name the issue that owns it.
+- **unset**: options agent-board knows that the caller's poll or supervisor
+  config leaves out; the evidence is their names. It only warns. When another
+  check points at a feature that is off, report which option turns it on.
 - **Unavailable**: a check whose `suggested_action` starts `Observation
   unavailable` fails once `unavailable_since` is an hour old. Find which
   read it lacks (a private repository, a token scope, a truncated listing, a

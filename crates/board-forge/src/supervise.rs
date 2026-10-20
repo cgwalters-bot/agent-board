@@ -5,7 +5,7 @@
 //! ([`agent::execute`]). Its settings are the poll's agent-board.json plus
 //! the supervisor's own file, both from the caller's default branch.
 use crate::github::{API_ROOT, Client, Transport};
-use crate::poll::{Rest, validate_repository, validate_workflow};
+use crate::poll::{POLL_OPTIONS, Rest, known, option, validate_repository, validate_workflow};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::cell::Cell;
@@ -284,6 +284,43 @@ pub struct AgentSettings {
     pub project: Option<String>,
 }
 
+/// The supervisor file's optional settings that switch something on, read
+/// through [`known`] as [`POLL_OPTIONS`] are: `agent`, and within it these.
+/// The [`Limits`] are left out: each has a working default and only tunes a
+/// check, so one left unset is not a feature left off.
+pub const SUPERVISOR_OPTIONS: &[&str] = &["agent"];
+pub const AGENT_OPTIONS: &[&str] = &[
+    "kinds",
+    "maxDispatchesPerPass",
+    "maxDispatchesPerDay",
+    "dailyCaps",
+    "state",
+    "tracker",
+    "project",
+];
+
+/// The options of [`POLL_OPTIONS`], [`SUPERVISOR_OPTIONS`] and, with an
+/// agent, [`AGENT_OPTIONS`] (as `agent.NAME`) that the files leave out or
+/// null: names only, never values, for the `unset` check.
+fn unset(board: &Value, supervisor: &Value) -> Vec<String> {
+    let absent = |value: &Value, key: &str| value.get(key).is_none_or(Value::is_null);
+    let mut names: Vec<String> = POLL_OPTIONS
+        .iter()
+        .filter(|k| absent(board, k))
+        .chain(SUPERVISOR_OPTIONS.iter().filter(|k| absent(supervisor, k)))
+        .map(|k| (*k).to_owned())
+        .collect();
+    if let Some(agent) = supervisor.get("agent").filter(|a| !a.is_null()) {
+        names.extend(
+            AGENT_OPTIONS
+                .iter()
+                .filter(|k| absent(agent, k))
+                .map(|k| format!("agent.{k}")),
+        );
+    }
+    names
+}
+
 /// Everything the supervisor is configured with. None of it may come from a
 /// workflow input: account and repository names are the caller's files.
 #[derive(Clone, Debug)]
@@ -315,6 +352,8 @@ pub struct Settings {
     pub release_train_workflow: Option<String>,
     pub usage: Option<Usage>,
     pub agent: Option<AgentSettings>,
+    /// The known options the files leave unset ([`unset`]).
+    pub unset: Vec<String>,
 }
 
 fn string(value: &Value, key: &str, what: &str) -> Result<String> {
@@ -379,8 +418,7 @@ impl Settings {
             .context("agent-board config missing epics.repository")?
             .to_owned();
         validate_repository(&epics_repository)?;
-        let kind_pools = board
-            .get("kindPools")
+        let kind_pools = option(board, "kindPools")?
             .map(|v| serde_json::from_value(v.clone()).context("config kindPools"))
             .transpose()?
             .unwrap_or_default();
@@ -440,7 +478,7 @@ impl Settings {
                 board.pointer("/schedule/repositories"),
                 "config schedule.repositories",
             )?,
-            merge_authors: strings(board.get("mergeAuthors"), "config mergeAuthors")?,
+            merge_authors: strings(option(board, "mergeAuthors")?, "config mergeAuthors")?,
             operator,
             bot,
             dispatch_repo,
@@ -458,7 +496,8 @@ impl Settings {
             wrapper_path: names["wrapperPath"].clone(),
             release_train_workflow,
             usage,
-            agent: agent_settings(supervisor.get("agent"))?,
+            agent: agent_settings(known(SUPERVISOR_OPTIONS, supervisor, "agent")?)?,
+            unset: unset(board, supervisor),
         })
     }
 }
@@ -473,15 +512,14 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
     ) else {
         return Ok(None);
     };
+    let get = |key: &str| known(AGENT_OPTIONS, agent, key);
     let cap = |key: &str| -> Result<u64> {
-        agent
-            .get(key)
+        get(key)?
             .map(|v| v.as_u64().filter(|n| *n <= 100))
             .unwrap_or(Some(0))
             .with_context(|| format!("supervisor agent.{key}: 0 to 100"))
     };
-    let daily_caps: BTreeMap<String, u64> = agent
-        .get("dailyCaps")
+    let daily_caps: BTreeMap<String, u64> = get("dailyCaps")?
         .map(|v| serde_json::from_value(v.clone()).context("supervisor agent.dailyCaps"))
         .transpose()?
         .unwrap_or_default();
@@ -495,16 +533,14 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
             "status updates are capped at one per day"
         );
     }
-    let tracker = agent
-        .get("tracker")
+    let tracker = get("tracker")?
         .map(|v| -> Result<String> {
             let repo = v.as_str().context("supervisor agent.tracker")?;
             validate_repository(repo)?;
             Ok(repo.to_owned())
         })
         .transpose()?;
-    let project = agent
-        .get("project")
+    let project = get("project")?
         .map(|v| -> Result<String> {
             let id = v.as_str().context("supervisor agent.project")?;
             ensure!(
@@ -518,7 +554,7 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
             Ok(id.to_owned())
         })
         .transpose()?;
-    let state = IssueRef::from_json(agent.get("state"), "supervisor agent.state")?;
+    let state = IssueRef::from_json(get("state")?, "supervisor agent.state")?;
     if let Some(state) = &state {
         ensure!(
             [&requests, &log]
@@ -536,7 +572,7 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
             .context("supervisor agent.cooldownHours: a positive number")?,
         requests,
         log,
-        kinds: strings(agent.get("kinds"), "supervisor agent.kinds")?,
+        kinds: strings(get("kinds")?, "supervisor agent.kinds")?,
         max_dispatches_per_pass: cap("maxDispatchesPerPass")?,
         max_dispatches_per_day: cap("maxDispatchesPerDay")?,
         daily_caps,
@@ -679,6 +715,35 @@ mod tests {
             .agent
             .unwrap();
         assert_eq!(agent.max_dispatches_per_day, 0);
+    }
+
+    #[test]
+    fn unset_lists_the_known_options_the_files_leave_out_by_name() {
+        let s = settings();
+        let mut expected: Vec<String> = POLL_OPTIONS
+            .iter()
+            .filter(|k| !["mergeAuthors", "kindPools", "dispatchWorkflow"].contains(k))
+            .map(|k| (*k).to_owned())
+            .collect();
+        expected.extend(["dailyCaps", "state", "tracker", "project"].map(|k| format!("agent.{k}")));
+        assert_eq!(s.unset, expected);
+        // A named option is set; null is unset.
+        let mut board = board();
+        board["rebaseRounds"] = json!(2);
+        board["operatorAnswers"] = Value::Null;
+        let mut cfg = supervisor();
+        cfg["agent"]["state"] = Value::Null;
+        let s = Settings::from_json(&board, &cfg, None).unwrap();
+        assert!(!s.unset.contains(&"rebaseRounds".to_owned()));
+        assert!(s.unset.contains(&"operatorAnswers".to_owned()));
+        assert!(s.unset.contains(&"agent.state".to_owned()));
+        cfg.as_object_mut().unwrap().remove("agent");
+        let s = Settings::from_json(&board, &cfg, None).unwrap();
+        assert!(s.unset.contains(&"agent".to_owned()));
+        assert!(!s.unset.iter().any(|n| n.starts_with("agent.")));
+        // A loader cannot read an option its table leaves out.
+        assert!(known(POLL_OPTIONS, &json!({"x": 1}), "x").is_err());
+        assert!(known(AGENT_OPTIONS, &json!({}), "pool").is_err());
     }
 
     #[test]

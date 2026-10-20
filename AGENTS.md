@@ -108,6 +108,12 @@ Do not edit workflow/security configuration unless the task explicitly needs it.
 
 ## Hand-back
 
+A feature that ships off (a new option in `POLL_OPTIONS`, `SUPERVISOR_OPTIONS`
+or `AGENT_OPTIONS`) does nothing until the caller's config names it. Its PR, and
+the issue's closing comment, name the caller setting that turns it on, and the
+run opens the caller-side change in tracker or files an issue there for it;
+the supervisor's `unset` check lists the option until then.
+
 One task becomes one pull request with one commit. Recent history uses imperative
 subjects, sometimes with a path prefix (for example `README:`); explain the reason
 for the change in the commit body rather than restating the diff.
