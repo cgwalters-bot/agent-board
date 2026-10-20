@@ -135,6 +135,12 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   merge queue for over an hour. Report why the poll did not merge it.
 - **unclosed**: the bot's implement pull request merged and its issue, named
   by the run, is still open. Ask for a triage run with `merged-open`.
+- **scheduled**: every scheduled run of a workflow on a default branch
+  failed within the lookback, two at least. The evidence is the workflow's
+  runs page and its latest failed run. Read the failing job. A missing or
+  empty secret is a decision for the operator: report which secret and
+  workflow. Anything else is a bug: report it for an issue in that
+  repository, or name the issue that owns it.
 - **Unavailable**: a check whose `suggested_action` starts `Observation
   unavailable` fails once `unavailable_since` is an hour old. Find which
   read it lacks (a private repository, a token scope, a truncated listing, a
