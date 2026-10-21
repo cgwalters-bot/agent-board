@@ -21,6 +21,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub mod comments;
 pub mod lock;
+pub mod notify;
 pub mod pace;
 
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
@@ -284,6 +285,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "continuation",
     "diagnosticPool",
     "operatorComments",
+    "notifications",
     "brokerOutage",
     "operatorAnswers",
     "rebaseRounds",
@@ -334,6 +336,10 @@ pub struct PollPolicy {
     /// runs ([`comments`]), as `OWNER/*` or `OWNER/REPO`. Empty (the default)
     /// reads none.
     pub operator_comments: Vec<String>,
+    /// `notifications`: the bot's unread notifications with these reasons
+    /// are routed to the operator's handling, a peer's research run or a
+    /// line for a person ([`notify`]); none (the default) reads none.
+    pub notifications: Option<notify::Notifications>,
     /// `brokerOutage`: where the inference broker's outages are recorded, so
     /// that a run they failed is not charged; none (the default) charges it.
     pub broker_outage: Option<BrokerOutage>,
@@ -607,6 +613,7 @@ impl PollPolicy {
             )
             .context("diagnosticPool is not a string")?,
             operator_comments: comments::scopes(get("operatorComments")?)?,
+            notifications: notify::Notifications::from_json(get("notifications")?)?,
             broker_outage: BrokerOutage::from_json(get("brokerOutage")?)?,
             operator_answers: get("operatorAnswers")?
                 .map(|a| a.as_bool().context("operatorAnswers is not a boolean"))
@@ -791,6 +798,13 @@ pub struct State {
     /// Only an applying pass moves it, and a pass without the option drops
     /// it. Losing it only starts the round of the repositories again.
     pub follow_cursor: Option<String>,
+    /// `notifications` ([`notify`]): the time the next listing starts at,
+    /// and where the last one had pages left, the time it goes on before,
+    /// for up to [`notify::NOTIFY_PAGES`]. Losing them costs requests: the
+    /// claims, and threads marked read, keep a thread from being acted on
+    /// twice.
+    pub notify_since: Option<String>,
+    pub notify_before: Option<String>,
 }
 
 impl State {
@@ -809,7 +823,9 @@ impl State {
                     "operator_cursor",
                     "operator_page",
                     "lock_refused",
-                    "follow_cursor"
+                    "follow_cursor",
+                    "notify_since",
+                    "notify_before"
                 ]
                 .contains(&key.as_str()),
                 "unknown poll state field {key}"
@@ -879,6 +895,19 @@ impl State {
                     .context("poll state follow_cursor is not a repository")
             })
             .transpose()?;
+        let time = |key: &str| {
+            object
+                .get(key)
+                .map(|c| {
+                    c.as_str()
+                        .filter(|c| OffsetDateTime::parse(c, &Rfc3339).is_ok())
+                        .map(str::to_owned)
+                        .with_context(|| format!("poll state {key} is not a time"))
+                })
+                .transpose()
+        };
+        let notify_since = time("notify_since")?;
+        let notify_before = time("notify_before")?;
         Ok(Self {
             interval_seconds,
             responses,
@@ -886,6 +915,8 @@ impl State {
             operator_page,
             lock_refused,
             follow_cursor,
+            notify_since,
+            notify_before,
         })
     }
 
@@ -906,6 +937,12 @@ impl State {
         }
         if let Some(cursor) = &self.follow_cursor {
             state["follow_cursor"] = cursor.as_str().into();
+        }
+        if let Some(since) = &self.notify_since {
+            state["notify_since"] = since.as_str().into();
+        }
+        if let Some(before) = &self.notify_before {
+            state["notify_before"] = before.as_str().into();
         }
         state
     }
@@ -4627,9 +4664,23 @@ pub fn run<R: Rest, G: Transport>(
     }
     let repositories: BTreeSet<&String> = watch.iter().chain(follow).collect();
     ensure!(
-        !repositories.is_empty() || !config.policy.operator_comments.is_empty(),
+        !repositories.is_empty()
+            || !config.policy.operator_comments.is_empty()
+            || config.policy.notifications.is_some(),
         "poll needs at least one repository"
     );
+    if let Some(settings) = &config.policy.notifications {
+        // The operator's words already have their own handling, and the
+        // bot's own comments are its claims and markers, not questions.
+        for peer in &settings.peers {
+            ensure!(
+                !peer.login.eq_ignore_ascii_case(&config.operator)
+                    && !peer.login.eq_ignore_ascii_case(&config.bot),
+                "notifications peer {} is the operator or the bot",
+                peer.login
+            );
+        }
+    }
     ensure!(
         repositories.len() <= POLL_REPOSITORY_LIMIT,
         "poll repository limit exceeded ({POLL_REPOSITORY_LIMIT})"
@@ -4745,6 +4796,28 @@ pub fn run<R: Rest, G: Transport>(
             }
         }
     }
+    // After the search, so that a comment it claimed is seen claimed here.
+    // As there, a preview keeps the cursor; without the option it is dropped.
+    let (mut notify_since, mut notify_before) = match &config.policy.notifications {
+        Some(_) => (state.notify_since, state.notify_before),
+        None => (None, None),
+    };
+    if let Some(settings) = &config.policy.notifications {
+        let at = (notify_since.as_deref(), notify_before.as_deref());
+        match pass.notifications(settings, &follow, at, &mut outcome) {
+            Ok((since, before)) if pass.apply.is_some() => {
+                notify_since = Some(since);
+                notify_before = before;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                outcome.errors += 1;
+                outcome
+                    .lines
+                    .push(format!("notifications error: {error:#}"));
+            }
+        }
+    }
     if let Some(line) = pass.pace_line() {
         outcome.lines.push(line);
     }
@@ -4768,6 +4841,8 @@ pub fn run<R: Rest, G: Transport>(
         operator_page,
         lock_refused,
         follow_cursor,
+        notify_since,
+        notify_before,
     };
     Ok(outcome)
 }
@@ -7375,10 +7450,27 @@ mod tests {
         let state = State::from_json(&with_cursor).unwrap();
         assert_eq!(state.follow_cursor.as_deref(), Some("o/r"));
         assert_eq!(state.to_json(), with_cursor);
+        let mut with_notify = good.clone();
+        with_notify["notify_since"] = json!("2026-10-16T11:50:00Z");
+        with_notify["notify_before"] = json!("2026-10-16T08:00:00Z");
+        let state = State::from_json(&with_notify).unwrap();
+        assert_eq!(
+            (
+                state.notify_since.as_deref(),
+                state.notify_before.as_deref()
+            ),
+            (Some("2026-10-16T11:50:00Z"), Some("2026-10-16T08:00:00Z"))
+        );
+        assert_eq!(state.to_json(), with_notify);
         for (field, value) in [
             ("schema", json!("agent-board/poll-state/v0")),
             ("follow_cursor", json!("not a repository")),
             ("follow_cursor", json!(1)),
+            ("notify_since", json!("yesterday")),
+            ("notify_since", json!(1)),
+            ("notify_before", json!(true)),
+            ("notify_before", json!("yesterday")),
+            ("notify_more", json!(true)),
             ("interval_seconds", json!(60)),
             ("interval_seconds", json!(MAX_INTERVAL_SECONDS + 1)),
             ("responses", json!({"https://evil.example/": {"body": []}})),

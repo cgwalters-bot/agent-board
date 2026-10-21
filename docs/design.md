@@ -301,7 +301,7 @@ required one does. It has been exercised against recorded responses only.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -500,6 +500,55 @@ superseded by a marker restating the state. The runs count against the three a p
 steps above. Each thread acted on gets a decision line; a preview does not
 advance the cursor. The tracker's configuration and the review site's
 status listing are not part of this repository.
+
+`notifications` (absent by default, which reads none) reads the bot's GitHub
+notifications, which reach no automation otherwise (agent-board#227):
+`{"reasons": [...], "peers": [{"login": L, "repositories": ["OWNER/REPO"], "kind": "research"}]}`.
+`reasons` is 1 or more of `assign`, `author`, `comment`, `manual`, `mention`,
+`review_requested`, `state_change`, `subscribed`, `team_mention`; `peers` is
+at most 10, each with 1 to 10 repositories, and neither the operator nor the
+bot. After `operatorComments`, each pass lists the bot's unread threads
+(`GET /notifications`, 20 a page) updated since a cursor in the state file,
+reaching back at most the same two days: one page, or where the last pass left
+pages, three more before the oldest it listed, so that threads left unread
+cannot keep older ones out of reach. Where all of those were updated in one
+second, the listing's only position within it is its pages, so the pass reads
+on to that second's end (at most ten pages) before moving past it, and else
+reads it again next time. A page unchanged since the last pass is revalidated with its
+`Last-Modified`, which costs no rate budget; `X-Poll-Interval` (60 s) is under
+the poll's five-minute floor and is not read. A thread on an issue or pull
+request with a named reason, outside the followed repositories, is routed.
+The operator's new comments go to the `operatorComments` handling above, with
+its claims, so a comment both find starts one run; outside that setting's
+scope only where one of them has a `/bot` or `@BOT` line, as anyone can notify
+the bot on a thread the operator commented on, and only in a public
+repository, as the brief is copied to the dispatch repository. A peer's new comments (and
+opening post) on an open issue in that peer's public repositories start one
+`research` run on it, claimed as a triage is, whose brief asks for one
+answering comment of facts, links and documentation, no action, no secret or
+deployment detail, and quotes the peer as data (with `<` escaped); after
+three runs on a thread (counting each claim not refused, as one written before
+its dispatch may have started a run) a peer's next question there is left to a person, so
+two bots cannot answer each other without end. Anything else (a peer
+elsewhere, on a pull request or a closed issue, anyone else, a review request
+with no comment) starts nothing and is a
+`notification (REASON) from LOGIN: left to a person, URL` line in the pass's
+output. That line, not a board item, is the record: the notifications of
+anyone who can mention the bot would otherwise become writes on the board.
+A thread that is gone is left with a line. Threads are marked read after the
+last page is read (marking one read moves the later ones up a page), only
+once done (its run started, its line printed, or left to the rest of the
+poll, so that those do not fill every later page) and only where the thread
+was not updated since it was listed. One whose claim or dispatch failed stays
+unread, and the cursor stays before it, as it does before one that could not
+be marked read (from the budget or an error); so does any other subject (an alert,
+an invitation, a release), for a person reading the bot's inbox. The
+three-run cap is per thread: a peer opening many issues is bounded only by
+the three runs a pass.
+The token is the poll's `GH_TOKEN`: listing notifications needs the bot's
+classic token with the `notifications` (or `repo`) scope, as fine-grained
+tokens and App tokens cannot read them. A preview neither marks a thread read
+nor advances the cursor.
 
 `lockCollaboratorItems` (1 to 100; absent by default, which locks nothing)
 is an opt-in left from when `supervise execute` took only a locked item
