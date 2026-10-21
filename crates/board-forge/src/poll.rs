@@ -1597,10 +1597,13 @@ fn parse_marker(tag: &str, body: &str) -> Option<Value> {
     serde_json::from_str(&line[..=end]).ok()
 }
 
-/// The poll's newest marker comment by creation id, not last update time.
+/// The poll's newest round/stop marker by creation id, not update time,
+/// with any newer queue-only state overlaid without changing its identity.
 /// Anyone else's is ignored, so a visitor cannot reset the round count.
 pub fn find_marker(comments: &[Value], login: &str) -> Marker {
     let mut latest = Marker::default();
+    let mut queue = None;
+    let mut queue_reset_from = None;
     for comment in comments {
         if text(comment, "/user/login") != login {
             continue;
@@ -1612,6 +1615,23 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
         let Some(rounds) = state["rounds"].as_u64().filter(|r| *r < 1 << 53) else {
             continue;
         };
+        // Queue-only writes do not advance the round's identity: a claim
+        // already won from it must still fence later contenders, even before
+        // its PATCH records the dispatched round. Read queue state separately
+        // so a concurrent write cannot hide that round (or roll back a stop).
+        if state["queue_only"].as_bool() == Some(true) {
+            if let Some(id) = comment["id"].as_u64() {
+                // A later queue retry need not repeat the reset: retain its
+                // acknowledgment independently of the newest queue snapshot.
+                if let Some(from) = state["queue_reset_from"].as_u64().filter(|from| *from < id) {
+                    queue_reset_from = queue_reset_from.max(Some(from));
+                }
+                if queue.as_ref().is_none_or(|(previous, _)| id > *previous) {
+                    queue = Some((id, QueueState::from_json(&state["queue"])));
+                }
+            }
+            continue;
+        }
         let marker = Marker {
             id: comment["id"].as_u64(),
             rounds,
@@ -1643,6 +1663,22 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
         };
         if latest.id.is_none() || marker.id > latest.id {
             latest = marker;
+        }
+    }
+    if let Some((id, state)) = queue
+        && Some(id) > latest.id
+    {
+        // Enqueueing after a human reset starts fresh, but keeps the stop's
+        // identity so a concurrent reset claim still fences other passes.
+        // A stale queue writer cannot clear a different, newer stop.
+        if latest.stopped && queue_reset_from.is_some() && queue_reset_from == latest.id {
+            latest = Marker {
+                id: latest.id,
+                ..Marker::default()
+            };
+        }
+        if !latest.stopped {
+            latest.queue = state;
         }
     }
     latest
@@ -2942,7 +2978,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// Markers are added, never rewritten by another write: the newest by id
     /// is the state, every claim names the one it was decided from, and a new
     /// stop is a new comment, so each stop is a fresh generation for its reset
-    /// to be claimed from. The PATCHes are [`Self::record_run`], and the undoing
+    /// to be claimed from. A round's marker is written over its claim instead
+    /// ([`Self::mark_claim`]). The PATCHes are [`Self::record_run`], and the undoing
     /// of a refused round ([`comments`]), of a round's own comment by the pass
     /// that wrote it.
     fn post_marker(
@@ -2951,13 +2988,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         number: u64,
         marker: &mut Marker,
         text: &str,
+        queue_from: Option<&Marker>,
     ) -> Result<()> {
         let rest = self.rest;
+        let mut state = marker.state();
+        if let Some(from) = queue_from {
+            state["queue_only"] = true.into();
+            if from.stopped {
+                state["queue_reset_from"] = from.id.into();
+            }
+        }
         let (_, comment) = self.send(
             rest,
             "POST",
             &format!("repos/{repo}/issues/{number}/comments"),
-            json!({"body": self.marker_body(&marker.state(), text)}),
+            json!({"body": self.marker_body(&state, text)}),
             0,
         )?;
         marker.id = Some(
@@ -2968,7 +3013,31 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(())
     }
 
-    /// The run id, into the round's marker that this pass posted. Late, it
+    /// A round's marker, written over the claim `claim` this pass won, so
+    /// that the round is one comment on the pull request, not a claim and a
+    /// marker (agent-board#223). Its id is the claim's, newer than every
+    /// marker when the claim won ([`Self::claim`]). The claim's line is not
+    /// kept: once the comment is a marker, it is the newest round, so every later
+    /// claim is from it, and a pass that read the claim before this write
+    /// lost to it then. A pass that dies before this write leaves the claim
+    /// alone, which is read as a claim never recorded, as before.
+    ///
+    /// A stop another pass posts between the claim's read-back and this
+    /// write is newer and stays the state, where a marker posted after it
+    /// used to roll it back. Queue-only writes are read independently and
+    /// cannot hide this round, even when posted before this PATCH.
+    fn mark_claim(
+        &mut self,
+        repo: &str,
+        claim: u64,
+        marker: &mut Marker,
+        text: &str,
+    ) -> Result<()> {
+        marker.id = Some(claim);
+        self.record_run(repo, marker, text)
+    }
+
+    /// The run id, into the round's marker that this pass wrote. Late, it
     /// changes only that comment: a newer round or stop has a newer one.
     fn record_run(&mut self, repo: &str, marker: &Marker, text: &str) -> Result<()> {
         let id = marker.id.context("the round has no marker")?;
@@ -3037,7 +3106,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 excerpt.replace('`', "'").replace("<!--", "<!- -")
             ));
         }
-        self.post_marker(repo, number, &mut stop, &text)
+        self.post_marker(repo, number, &mut stop, &text, None)
     }
 
     /// A claim on starting fix round `round` from a marker comment: this
@@ -3050,8 +3119,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// then reads the comments again, and only the earliest claim on that comment
     /// goes on. A pass that read the marker before another's claim posts after
     /// it and finds it; one that read it after reads the winner's newer marker,
-    /// or the claim if the winner has not written it yet. Claims are kept: one
-    /// taken away could let a slower contender win. The comments are read
+    /// or the claim if the winner has not written it yet. A winning claim is
+    /// kept, as the round's marker ([`Self::mark_claim`]): one taken away could
+    /// let a slower contender win. Lost claims are kept too: the read-back
+    /// pages by number, so a comment deleted while another pass is between
+    /// pages shifts the next page past a comment it must see, such as the
+    /// winning claim, and that pass could win the same round. The comments are read
     /// again without the cache: a 304 whose pages were cached before the
     /// claims were posted could hide the earlier one. A claim already among
     /// the comments `read` is lost without posting another, so a claim whose
@@ -3275,10 +3348,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             )
         };
         let state = json!({"from": claim_from(marker), "round": round, "sha": head});
-        if let Err((id, at)) = self.claim(repo, number, marker, read, (state, &of))? {
+        let claim = match self.claim(repo, number, marker, read, (state, &of))? {
+            Ok(claim) => claim,
             // A claim that won and was never followed by the marker's write:
             // its pass died, and the round may have started a run or not.
-            if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
+            Err((id, at)) if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) => {
                 self.needs_human(
                     repo,
                     number,
@@ -3289,10 +3363,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 )?;
                 return Ok(format!("labelled {LABEL}"));
             }
-            return Ok(format!(
-                "not started: another pass went first with {name}, in comment {id}"
-            ));
-        }
+            Err((id, _)) => {
+                return Ok(format!(
+                    "not started: another pass went first with {name}, in comment {id}"
+                ));
+            }
+        };
         // Counted once the round is this pass's to start, whatever follows.
         self.dispatched += 1;
         let mut marker = Marker {
@@ -3318,7 +3394,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             rebased: if rebasing { round } else { carried.rebased },
             rebasing,
         };
-        self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
+        self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let task = match &checkpoint {
             Some(at) => continue_task(repo, pull, at, round, rounds),
             None if rebasing => rebase_task(repo, pull, round, self.config.policy.rebase_rounds),
@@ -3421,6 +3497,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                             number,
                             &mut next,
                             &format!("Merge queue: {}.", decision.reason),
+                            Some(marker),
                         )?;
                     }
                     self.mutate(ENQUEUE, json!({"id": id, "head": head}))?;
@@ -3453,8 +3530,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     Ok(Some("merged".into()))
                 }
             }
-            // A new marker, as every round's is: the next round is claimed
-            // from it, not from the one whose claim the refunded round used.
+            // A newer marker, written over its claim as every round's is: the
+            // next round is claimed from it, not from the one whose claim the
+            // refunded round used.
             // The refund is claimed from the marker it gives back, as a round
             // is: two passes that read the same failed run would each post
             // one, and the later, after a round started from the first, would
@@ -3463,9 +3541,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let round = marker.round_name();
                 let of = format!("Refund of {round} for `{}`", short(head));
                 let state = json!({"from": claim_from(marker), "refund": round, "sha": head});
-                if let Err((id, at)) = self.claim(repo, number, marker, read, (state, &of))? {
+                let claim = match self.claim(repo, number, marker, read, (state, &of))? {
+                    Ok(claim) => claim,
                     // As for a round: the winner died before its marker.
-                    if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
+                    Err((id, at))
+                        if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) =>
+                    {
                         self.needs_human(
                             repo,
                             number,
@@ -3476,14 +3557,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         )?;
                         return Ok(Some(format!("labelled {LABEL}")));
                     }
-                    return Ok(Some(format!(
-                        "not given back: another pass went first, in comment {id}"
-                    )));
-                }
+                    Err((id, _)) => {
+                        return Ok(Some(format!(
+                            "not given back: another pass went first, in comment {id}"
+                        )));
+                    }
+                };
                 let mut refunded = marker.refunded();
-                self.post_marker(
+                self.mark_claim(
                     repo,
-                    number,
+                    claim,
                     &mut refunded,
                     &format!("Round given back: {}.", decision.reason),
                 )?;
@@ -8863,7 +8946,7 @@ mod tests {
                 vec![],
                 vec![(200, json!({"workflow_run_id": 1234}))],
                 "continue: continuing (round 1): its checkpoint says budget -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
-                vec![comment.clone(), comment.clone(), patch(99)],
+                vec![comment.clone(), patch(99), patch(99)],
                 1,
             ),
             (
@@ -8883,7 +8966,7 @@ mod tests {
                 vec![],
                 vec![(200, json!({"workflow_run_id": 1234}))],
                 "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
-                vec![comment.clone(), comment.clone(), patch(99)],
+                vec![comment.clone(), patch(99), patch(99)],
                 1,
             ),
             (
@@ -8893,7 +8976,7 @@ mod tests {
                 vec![],
                 vec![(422, json!({})), (204, Value::Null)],
                 "fix: review requested changes -> run started",
-                vec![comment.clone(), comment.clone()],
+                vec![comment.clone(), patch(99)],
                 2,
             ),
             (
@@ -8905,7 +8988,7 @@ mod tests {
                 "error: POST repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches: GitHub HTTP status 500: boom",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    patch(99),
                     label[0].clone(),
                     label[1].clone(),
                     comment.clone(),
@@ -9775,7 +9858,7 @@ mod tests {
         b.rest.get_mut(&comments).unwrap().3 = json!([starting]);
         b.answers.borrow_mut().insert(
             format!("{API_ROOT}repos/{REPO}/issues/470/comments"),
-            vec![(201, json!({"id": 100})), (201, json!({"id": 101}))],
+            vec![(201, json!({"id": 100}))],
         );
         let dispatcher = Fake::default();
         dispatcher.answers.borrow_mut().insert(
@@ -9784,9 +9867,10 @@ mod tests {
         );
         applied(&b, &dispatcher);
         let writes = b.writes.borrow();
-        assert!(writes[1].0.ends_with("issues/470/comments"));
-        assert!(writes[2].0.ends_with("issues/comments/101"));
-        let current = comment(101, &writes[2].1["body"], "2026-10-12T02:01:00Z");
+        // B's marker is its claim, written over twice.
+        assert!(writes[1].0.ends_with("issues/comments/100"));
+        assert!(writes[2].0.ends_with("issues/comments/100"));
+        let current = comment(100, &writes[2].1["body"], "2026-10-12T02:01:00Z");
 
         // A's late PATCH only changes comment 99. Even a later update time or
         // reversed list order cannot hide B's marker or its actual run id.
@@ -10217,13 +10301,13 @@ mod tests {
                 "{name}: {line}"
             );
             assert_eq!(outcome.in_flight, 1, "{name}");
-            // Claimed from the stop, then the round's marker and its run, and
-            // the label last.
+            // Claimed from the stop, then the round's marker over the claim
+            // and its run, and the label last.
             assert_eq!(
                 written(&fake.writes),
                 [
                     format!("POST repos/{REPO}/issues/470/comments"),
-                    format!("POST repos/{REPO}/issues/470/comments"),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("DELETE repos/{REPO}/issues/470/labels/{LABEL}"),
                 ],
@@ -10328,7 +10412,7 @@ mod tests {
             writes,
             [
                 format!("POST repos/{REPO}/issues/470/comments"),
-                format!("POST repos/{REPO}/issues/470/comments"),
+                format!("PATCH repos/{REPO}/issues/comments/99"),
                 format!("PATCH repos/{REPO}/issues/comments/99"),
                 format!("POST repos/{REPO}/issues/470/comments"),
             ]
@@ -10606,8 +10690,84 @@ mod tests {
             parse_marker(CLAIM, &body).unwrap(),
             json!({"from": "5", "round": 2, "sha": HEAD})
         );
+        // The winner's marker is written over its claim, not posted beside it:
+        // the round is one comment, read as the newest marker.
+        let (patched, marked) = first.writes.borrow()[1].clone();
+        assert_eq!(
+            patched,
+            format!("PATCH {API_ROOT}repos/{REPO}/issues/comments/99")
+        );
         let claim = |login: &str, body: &str, at: &str| json!({"id": 99, "user": {"login": login}, "created_at": at, "body": body});
+        let recorded = claim(
+            BOT,
+            marked["body"].as_str().unwrap(),
+            "2026-10-12T01:59:00Z",
+        );
+        let newest = find_marker(&[read.clone(), recorded.clone()], BOT);
+        assert_eq!((newest.id, newest.rounds), (Some(99), 2));
+        // B enqueues using its old round-1 snapshot after A's winning
+        // read-back, but before A PATCHes claim 99. Its queue comment must
+        // neither change the claim's identity nor hide A's dispatched round.
+        let queued = json!({"id": 101, "user": {"login": BOT}, "body": marker_body(
+            &json!({"rounds": 1, "sha": "older", "queue_only": true,
+                "queue": {"head": HEAD, "seen": "removal", "tries": 1}}), "Merge queue.")});
+        let before_patch = find_marker(&[read.clone(), queued.clone()], BOT);
+        assert_eq!(claim_from(&before_patch), "5");
+        let after_patch = find_marker(&[queued.clone(), recorded.clone(), read.clone()], BOT);
+        assert_eq!((after_patch.id, after_patch.rounds), (Some(99), 2));
+        assert_eq!(after_patch.sha.as_deref(), Some(HEAD));
+        assert_eq!(after_patch.queue.as_ref().unwrap().tries, 1);
+        let next = contender(vec![recorded.clone(), queued.clone()], vec![], 102);
+        let next_dispatcher = Fake::default();
+        let next_outcome = applied(&next, &next_dispatcher);
+        assert_eq!(next_outcome.errors, 0, "{:?}", next_outcome.lines);
+        assert_eq!(next_outcome.in_flight, 1, "{:?}", next_outcome.lines);
+        assert!(next_dispatcher.writes.borrow().is_empty());
+        // A later run-id PATCH remains visible too, and a newer stop still
+        // wins rather than being undone by either queue state or that PATCH.
+        let mut running = recorded.clone();
+        let mut state = parse_marker(MARKER, text(&running, "/body")).unwrap();
+        state["run"] = 7.into();
+        running["body"] = marker_body(&state, "Run started.").into();
+        assert_eq!(
+            find_marker(&[queued.clone(), running.clone()], BOT).run,
+            Some(7)
+        );
+        let mut stop = json!({"id": 100, "user": {"login": BOT}, "body": marker_body(
+            &json!({"rounds": 1, "stopped": true}), "Stopped.")});
+        assert!(find_marker(&[running.clone(), stop.clone(), queued.clone()], BOT).stopped);
+        // A queue write can acknowledge a human reset without outranking
+        // the reset round's older claim comment, or clearing another stop.
+        let mut reset_queue = queued.clone();
+        let mut state = parse_marker(MARKER, text(&reset_queue, "/body")).unwrap();
+        state["queue_reset_from"] = 100.into();
+        reset_queue["body"] = marker_body(&state, "Merge queue after reset.").into();
+        let reset = find_marker(&[stop.clone(), reset_queue.clone()], BOT);
+        assert_eq!(
+            (reset.id, reset.rounds, reset.stopped),
+            (Some(100), 0, false)
+        );
+        let mut retry_queue = queued.clone();
+        retry_queue["id"] = 102.into();
+        let retry = find_marker(&[retry_queue, stop.clone(), reset_queue.clone()], BOT);
+        assert_eq!(
+            (retry.id, retry.rounds, retry.stopped),
+            (Some(100), 0, false)
+        );
+        assert_eq!(retry.queue.as_ref().unwrap().tries, 1);
+        let mut reset_run = running;
+        reset_run["id"] = 102.into();
+        reset_queue["id"] = 103.into();
+        let reset = find_marker(&[stop.clone(), reset_run, reset_queue.clone()], BOT);
+        assert_eq!((reset.id, reset.rounds, reset.run), (Some(102), 2, Some(7)));
+        stop["id"] = 104.into();
+        reset_queue["id"] = 105.into();
+        assert!(find_marker(&[stop, reset_queue], BOT).stopped);
+        assert!(parse_marker(CLAIM, marked["body"].as_str().unwrap()).is_none());
         let comment = format!("POST repos/{REPO}/issues/470/comments");
+        // A claim that lost is kept, never deleted ([`Pass::claim`]): the
+        // losing cases write only their claim.
+        let patch = format!("PATCH repos/{REPO}/issues/comments/100");
         let started = "fix: review requested changes -> run started";
         // Name, the claims a second pass reads with the marker, those posted
         // while it posts its own, its line, the bot's writes and the fix runs
@@ -10619,6 +10779,14 @@ mod tests {
                 "a second pass that read the same marker finds the first claim and stops",
                 vec![],
                 vec![claim(BOT, &body, "2026-10-12T01:59:00Z")],
+                "-> not started: another pass went first with fix round 2, in comment 99",
+                vec![comment.clone()],
+                0,
+            ),
+            (
+                "a second pass that finds the first claim already written as its marker stops",
+                vec![],
+                vec![recorded.clone()],
                 "-> not started: another pass went first with fix round 2, in comment 99",
                 vec![comment.clone()],
                 0,
@@ -10656,7 +10824,7 @@ mod tests {
                 vec![claim(BOT, &body.replace("\"from\":\"5\"", "\"from\":\"4\""), "2026-10-11T00:00:00Z")],
                 vec![],
                 started,
-                vec![comment.clone(), comment.clone()],
+                vec![comment.clone(), patch.clone()],
                 1,
             ),
             (
@@ -10664,7 +10832,7 @@ mod tests {
                 vec![claim("visitor", &body, "2026-10-12T01:59:00Z")],
                 vec![],
                 started,
-                vec![comment.clone(), comment.clone()],
+                vec![comment.clone(), patch.clone()],
                 1,
             ),
         ];
@@ -11270,11 +11438,16 @@ mod tests {
                     "{name}"
                 );
             }
+            // A claim that lost is kept, as it was posted.
             if contended && line.contains("not given back") {
                 assert_eq!(writes, std::slice::from_ref(&post), "{name}");
-            }
-            if line.ends_with("round given back") {
-                assert_eq!(writes, [post.clone(), post], "{name}");
+            } else if line.ends_with("round given back") {
+                // The refund's marker is written over its claim.
+                assert_eq!(
+                    writes,
+                    [post, format!("PATCH repos/{REPO}/issues/comments/99")],
+                    "{name}"
+                );
                 let body = &fake.writes.borrow()[1].1["body"];
                 let refunded = find_marker(
                     &[json!({"id": 99, "user": {"login": BOT}, "body": body})],
@@ -11492,7 +11665,7 @@ mod tests {
                 "fix: check merge queue job rust failed at step Run cargo test failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R2", "failed": "merge queue job rust failed at step Run cargo test", "group": "77", "since": "2026-10-12T01:30:00Z"}),
@@ -11523,7 +11696,7 @@ mod tests {
                 "fix: check merge queue job e2e-check-run failed at step Set up secure host failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R2", "failed": "merge queue job e2e-check-run failed at step Set up secure host", "group": "77"}),
@@ -11543,7 +11716,7 @@ mod tests {
                 "fix: check merge queue job e2e-people failed at step Set up secure host failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R2", "failed": "merge queue job e2e-people failed at step Set up secure host"}),
@@ -11562,7 +11735,7 @@ mod tests {
                 "fix: check merge queue job rust failed at step Run cargo test failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R2", "failed": "merge queue job rust failed at step Run cargo test", "group": "77"}),
@@ -11709,7 +11882,7 @@ mod tests {
                 "fix: check ci failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R2", "tries": 0}),
@@ -11775,7 +11948,7 @@ mod tests {
                 "fix: conflicts with main -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
                 vec![
                     comment.clone(),
-                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
                     format!("PATCH repos/{REPO}/issues/comments/99"),
                 ],
                 json!({"seen": "R1", "tries": 0}),

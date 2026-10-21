@@ -765,19 +765,22 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             read,
             (state, &of, ANSWER_ROUND_REQUESTS - 2),
         )?;
-        if let Err((id, at)) = claim {
+        let claim = match claim {
+            Ok(claim) => claim,
             // An unconfirmed claim must not invalidate a concurrent winner.
             // Leave it exclusive until timeout, then preserve the answer in
             // a fresh stop so it can be retried without another human reply.
-            if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
+            Err((id, at)) if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) => {
                 self.send(self.rest, "POST", &format!("repos/{repo}/issues/{number}/comments"),
                     json!({"body": self.marker_body(&refused, &format!("{of}: claim {id} timed out before its round was recorded."))}), 0)?;
                 return Ok(format!("labelled {LABEL}"));
             }
-            return Ok(format!(
-                "not started: another pass went first, in comment {id}"
-            ));
-        }
+            Err((id, _)) => {
+                return Ok(format!(
+                    "not started: another pass went first, in comment {id}"
+                ));
+            }
+        };
         self.dispatched += 1;
         // Fresh counts, as after a reset; of the queue, the removal the stop saw.
         let mut marker = Marker {
@@ -792,7 +795,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // The answer is pending until its run may have started, as for any
         // round on the operator's comments ([`handled`]).
-        self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
+        self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let url = format!("https://github.com/{repo}/pull/{number}");
         let mut inputs = json!({
             "task": answer_brief(repo, number, &head, &url, said, &operator),
@@ -1106,11 +1109,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         );
         let state =
             json!({"from": claim_from(&marker), "round": round, "sha": head, "comments": keys});
-        if let Err((id, at)) = self.claim(repo, number, &marker, read, (state, &of))? {
+        let claim = match self.claim(repo, number, &marker, read, (state, &of))? {
+            Ok(claim) => claim,
             // A claim that won and was never followed by the marker's write:
             // its pass died before the marker, so before its run. A marker
             // restating the state ends it, as the next claim is from that.
-            if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
+            Err((id, at)) if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) => {
                 let mut restated = Marker {
                     id: None,
                     queue: marker.queue.clone(),
@@ -1121,17 +1125,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     number,
                     &mut restated,
                     &format!("{of}: claimed in comment {id} and never started."),
+                    None,
                 )?;
                 return Ok((
                     false,
                     format!("not started: comment {id} claimed it and never started it"),
                 ));
             }
-            return Ok((
-                false,
-                format!("not started: another pass went first, in comment {id}"),
-            ));
-        }
+            Err((id, _)) => {
+                return Ok((
+                    false,
+                    format!("not started: another pass went first, in comment {id}"),
+                ));
+            }
+        };
         self.dispatched += 1;
         let mut marker = Marker {
             rounds: round,
@@ -1147,7 +1154,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // The round is counted before its dispatch, so that no failure after
         // it can start more rounds than the bound; the comments are pending.
-        self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
+        self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let url = format!("https://github.com/{repo}/pull/{number}");
         let mut inputs = json!({
             "task": fix_brief(repo, number, &head, round, &url, said, &operator),
@@ -1941,16 +1948,20 @@ mod tests {
         assert!(task.contains("the operator asks for action"));
         assert!(task.contains("<comment>\nIs this still broken?\n@worker\n</comment>"));
         // The round is counted in the bot's marker, which names the comments.
-        let marker = find_marker(
-            &fake.rest.borrow()
-                [&format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100")]
-                .as_array()
-                .unwrap()
-                .clone(),
-            BOT,
-        );
+        let thread = fake.rest.borrow()
+            [&format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100")]
+            .as_array()
+            .unwrap()
+            .clone();
+        let marker = find_marker(&thread, BOT);
         assert_eq!((marker.rounds, marker.run), (1, Some(1234)));
         assert_eq!(marker.comments, ["issuecomment-100", "discussion_r200"]);
+        // On someone else's pull request, the round is one comment of the
+        // bot's: its claim, written over as its marker (agent-board#223).
+        assert_eq!(
+            thread.iter().filter(|c| c["user"]["login"] == BOT).count(),
+            1
+        );
 
         // Read again, with the cursor lost: the claims and the marker keep
         // every comment from a second run.
