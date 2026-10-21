@@ -48,6 +48,11 @@ fn decisions_cli_configuration_table() {
     for (contents, message, code) in [
         (r#"{}"#, "decisions are not configured", 1),
         (
+            r#"{"decision":{"repository":"sample/coordination","issue":3}}"#,
+            "unknown agent-board config key decision",
+            1,
+        ),
+        (
             r#"{"decisions":{"repository":"sample/coordination","issue":3,"extra":true}}"#,
             "unknown field",
             1,

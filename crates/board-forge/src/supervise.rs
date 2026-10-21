@@ -301,6 +301,11 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "tracker",
     "project",
 ];
+/// The agent object's other keys, without which it stays off or is refused.
+const AGENT_REQUIRED: &[&str] = &["pool", "cooldownHours", "requests", "log"];
+/// The agent object's keys that the caller's own scripts read and agent-board
+/// ignores.
+const AGENT_CALLER_KEYS: &[&str] = &["profile", "skipUnchangedFailures"];
 
 /// The options of [`POLL_OPTIONS`], [`SUPERVISOR_OPTIONS`] and, with an
 /// agent, [`AGENT_OPTIONS`] (as `agent.NAME`) that the files leave out or
@@ -428,6 +433,7 @@ impl Settings {
     /// `board` is the poll's agent-board.json, `supervisor` the supervisor's
     /// own file and `usage` the usage snapshot's settings, if any.
     pub fn from_json(board: &Value, supervisor: &Value, usage: Option<&Value>) -> Result<Self> {
+        crate::poll::check_config(board)?;
         let what = "agent-board config";
         let operator = string(board, "operator", what)?;
         let bot = string(board, "bot", what)?;
@@ -550,6 +556,12 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
     let Some(agent) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
     };
+    // Before the issues: a misspelt `requests` would leave the agent off too.
+    crate::poll::check_keys(
+        &[AGENT_OPTIONS, AGENT_REQUIRED, AGENT_CALLER_KEYS],
+        agent,
+        "supervisor agent",
+    )?;
     let (Some(requests), Some(log)) = (
         IssueRef::from_json(agent.get("requests"), "supervisor agent.requests")?,
         IssueRef::from_json(agent.get("log"), "supervisor agent.log")?,
@@ -575,6 +587,13 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         ensure!(
             kind != "status_update" || *cap <= 1,
             "status updates are capped at one per day"
+        );
+    }
+    let kinds = strings(get("kinds")?, "supervisor agent.kinds")?;
+    for kind in &kinds {
+        ensure!(
+            agent::DISPATCH_KINDS.contains(&kind.as_str()),
+            "supervisor agent.kinds: unknown kind {kind:?}"
         );
     }
     let tracker = get("tracker")?
@@ -616,7 +635,7 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
             .context("supervisor agent.cooldownHours: a positive number")?,
         requests,
         log,
-        kinds: strings(get("kinds")?, "supervisor agent.kinds")?,
+        kinds,
         max_dispatches_per_pass: cap("maxDispatchesPerPass")?,
         max_dispatches_per_day: cap("maxDispatchesPerDay")?,
         daily_caps,
@@ -700,6 +719,7 @@ mod tests {
             "mergeAuthors": ["dependabot[bot]"],
             "kindPools": {"triage": "small"},
             "epics": {"repository": "example/control"},
+            "coordinator": {"enabled": false},
             "schedule": {"repositories": ["example/control", "example/project"]},
         })
     }
@@ -717,6 +737,8 @@ mod tests {
                 "log": {"repository": "example/operator", "issue": 7},
                 "kinds": ["triage", "research"],
                 "maxDispatchesPerPass": 2, "maxDispatchesPerDay": 3,
+                "profile": {"repository": "example/home", "ref": "main"},
+                "skipUnchangedFailures": false,
             },
         })
     }
@@ -867,6 +889,26 @@ mod tests {
         let mut cfg = supervisor();
         cfg["agent"]["maxDispatchesPerPass"] = json!(-1);
         assert!(Settings::from_json(&board(), &cfg, None).is_err());
+        // A misspelt key or kind is refused rather than leaving it off.
+        for (key, value) in [
+            ("maxDispatchPerDay", json!(5)),
+            (
+                "request",
+                json!({"repository": "example/control", "issue": 5}),
+            ),
+            ("kinds", json!(["Triage", "research"])),
+            ("kinds", json!(["fix"])),
+        ] {
+            let mut cfg = supervisor();
+            cfg["agent"][key] = value.clone();
+            assert!(
+                Settings::from_json(&board(), &cfg, None).is_err(),
+                "{key}={value}"
+            );
+        }
+        let mut b = board();
+        b["operatorAnswer"] = json!(true);
+        assert!(Settings::from_json(&b, &supervisor(), None).is_err());
         let mut b = board();
         b["follow"] = json!(["example/project", "../../orgs"]);
         assert!(Settings::from_json(&b, &supervisor(), None).is_err());

@@ -78,6 +78,7 @@ pub fn run(settings: &Settings, operation: Operation<'_>, apply: bool) -> Result
     let config: Value = serde_json::from_slice(
         &std::fs::read(&settings.config).context("read decisions configuration")?,
     )?;
+    board_forge::poll::check_config(&config)?;
     let target: Target = serde_json::from_value(
         config
             .get("decisions")

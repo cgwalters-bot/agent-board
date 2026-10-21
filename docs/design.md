@@ -302,7 +302,15 @@ required one does. It has been exercised against recorded responses only.
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
 optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
-corresponding flags. The workflow must check this file out from its trusted
+corresponding flags. Every reader of the file (poll, supervisor, `ask`,
+`--board-config`, `reconcile plan --config`) refuses a top-level key that is none
+of these and none of the other commands' sections (`board`, `statusReconcile`,
+`epics`, `decisions`, `schedule`) or the caller's scheduler's (`coordinator`,
+`source`, `branch`, which agent-board ignores): every option ships off, so a
+misspelt one would otherwise leave its feature off silently. The supervisor's
+`agent` object likewise refuses unknown keys other than the caller's `profile` and
+`skipUnchangedFailures`, and `agent.kinds` a kind it cannot dispatch. The
+workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
 is built into these settings. `mergeAuthors` defaults to empty; these authors
