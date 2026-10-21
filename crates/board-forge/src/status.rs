@@ -19,6 +19,7 @@ pub struct Config {
 }
 
 pub fn configured(value: &serde_json::Value) -> Result<Config> {
+    crate::poll::check_config(value)?;
     let Some(value) = value.get("statusReconcile") else {
         return Ok(Config::default());
     };
@@ -372,6 +373,7 @@ mod tests {
         ] {
             assert!(configured(&json!({"statusReconcile":value})).is_err());
         }
+        assert!(configured(&json!({"statusReconcil":{"enabled":true}})).is_err());
         for case in [
             "disabled",
             "project",

@@ -304,6 +304,51 @@ pub fn known<'a>(table: &[&str], value: &'a Value, key: &str) -> Result<Option<&
     Ok(value.get(key))
 }
 
+/// agent-board.json's other top-level keys: the settings the poll requires
+/// and the sections other commands read.
+pub const CONFIG_KEYS: &[&str] = &[
+    "operator",
+    "bot",
+    "dispatchRepo",
+    "follow",
+    "board",
+    "statusReconcile",
+    "epics",
+    "decisions",
+    "schedule",
+];
+
+/// agent-board.json's sections that the caller's scheduler owns and
+/// agent-board ignores.
+pub const CALLER_CONFIG_KEYS: &[&str] = &["coordinator", "source", "branch"];
+
+/// Refuses a key of the object `value` that none of `tables` lists. Every option
+/// ships off and is switched on by naming it, so a misspelt name would
+/// otherwise leave its feature off with no error (agent-board#239).
+pub fn check_keys(tables: &[&[&str]], value: &Value, what: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{what} is not an object"))?;
+    for key in object.keys() {
+        ensure!(
+            tables.iter().any(|t| t.contains(&key.as_str())),
+            "unknown {what} key {key}"
+        );
+    }
+    Ok(())
+}
+
+/// Refuses an agent-board.json top-level key that none of [`POLL_OPTIONS`],
+/// [`CONFIG_KEYS`] and [`CALLER_CONFIG_KEYS`] lists; each reader of the file
+/// calls it.
+pub fn check_config(value: &Value) -> Result<()> {
+    check_keys(
+        &[POLL_OPTIONS, CONFIG_KEYS, CALLER_CONFIG_KEYS],
+        value,
+        "agent-board config",
+    )
+}
+
 /// An optional poll setting: one of [`POLL_OPTIONS`].
 pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
     known(POLL_OPTIONS, value, key)
@@ -572,6 +617,7 @@ impl Continuation {
 
 impl PollPolicy {
     pub fn from_json(value: &Value) -> Result<Self> {
+        check_config(value)?;
         let get = |key: &str| option(value, key);
         let continuation = Continuation::from_json(get("continuation")?)?;
         let merge_queue = match get("mergeQueue")? {
@@ -8788,9 +8834,22 @@ mod tests {
             json!({"conflictFixPool": 1}),
             json!({"kindPools": []}),
             json!({"diagnosticPool": ["large"]}),
+            // A misspelt or miscased option is refused, not left off.
+            json!({"operatorAnswer": true}),
+            json!({"rebaseRound": 2}),
+            json!({"statusReconcil": {"enabled": true}}),
+            json!({"MergeQueue": {}}),
+            json!([]),
         ] {
-            assert!(PollPolicy::from_json(&value).is_err());
+            assert!(PollPolicy::from_json(&value).is_err(), "{value}");
         }
+        let every: serde_json::Map<String, Value> = POLL_OPTIONS
+            .iter()
+            .chain(CONFIG_KEYS)
+            .chain(CALLER_CONFIG_KEYS)
+            .map(|k| ((*k).to_owned(), Value::Null))
+            .collect();
+        assert!(check_config(&Value::Object(every)).is_ok());
     }
 
     /// An applying pass that has the state of an earlier one.

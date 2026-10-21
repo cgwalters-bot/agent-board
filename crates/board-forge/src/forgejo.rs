@@ -41,6 +41,7 @@ pub enum Board {
 
 impl Board {
     pub fn from_config(value: &Value) -> Result<Self> {
+        crate::poll::check_config(value)?;
         let Some(board) = value.get("board") else {
             return Ok(Self::Github {});
         };
@@ -1032,6 +1033,7 @@ mod tests {
                 json!({"board": {"forge": "forgejo", "url": "https://forge.example/", "repositories": ["sample/board"], "membership": "open", "extra": 1}}),
                 false,
             ),
+            (json!({"bord": {"forge": "forgejo"}}), false),
         ] {
             assert_eq!(Board::from_config(&value).is_ok(), ok, "{value}");
         }
