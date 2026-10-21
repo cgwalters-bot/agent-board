@@ -104,8 +104,8 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   the broker.
 - **epics**: a coordinator epic failing, stale or looping. Read its
   checkpoint and the runs it names, and report what failed.
-- **dispatch**: a dispatch whose issue is closed, already has an open pull
-  request, or is an umbrella. Report it, with the run.
+- **dispatch**: a dispatch whose issue is closed, has an open pull request
+  opened before the run, or is an umbrella. Report it, with the run.
 - **queue**, **dependabot**: a pull request left the merge queue. Read the
   failing check and report whether it was a flake, an outage or a real
   failure.

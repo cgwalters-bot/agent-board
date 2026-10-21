@@ -1022,3 +1022,50 @@ fn the_collector_has_a_bounded_request_budget_and_writes_nothing() {
     );
     assert!(bounded.graphql("mutation { x }", json!({})).is_err());
 }
+
+#[test]
+fn dispatch_counts_only_pull_requests_that_predate_the_run() {
+    let (_, now) = recorded();
+    let s = settings();
+    let started = now - 20 * 60_000;
+    // (pull request created_at, expected dispatch status)
+    let cases: &[(Option<i64>, &str)] = &[
+        // The run's own pull request, opened while it is still running.
+        (Some(now - 60_000), "ok"),
+        (Some(started), "ok"),
+        // Opened by an earlier attempt, before a re-run's `run_started_at`.
+        (Some(started + 30_000), "ok"),
+        // One that was there before the run: duplicate work.
+        (Some(started - 1), "fail"),
+        // An undated one cannot be told apart and still counts.
+        (None, "fail"),
+    ];
+    let running = "/repos/example/control/actions/workflows/dispatch.yml/runs?status=in_progress";
+    for &(created, expected) in cases {
+        let fake = Fake::new(move |_: &str, path: &str, _: &Value| -> Result<Value> {
+            Ok(if path.starts_with(running) {
+                json!({"workflow_runs": [{"display_title": "implement example/project#6 (claude)",
+                    "created_at": iso(started), "run_started_at": iso(started + 60_000),
+                    "html_url": "https://github.com/example/control/actions/runs/40"}]})
+            } else if path == "/repos/example/project/issues/6" {
+                json!({"state": "open", "labels": []})
+            } else if path.starts_with("/repos/example/project/issues/6/timeline") {
+                let mut pr = json!({"pull_request": {"url": "x"}, "state": "open"});
+                if let Some(at) = created {
+                    pr["created_at"] = json!(iso(at));
+                }
+                json!([{"event": "cross-referenced", "source": {"issue": pr}}])
+            } else {
+                json!([])
+            })
+        });
+        let snapshot = collect(&fake, &s, "main", now, None);
+        let items = snapshot.observations["dispatch"].as_ref().unwrap();
+        assert_eq!(items.len(), 1, "{created:?}");
+        assert_eq!(
+            check(&snapshot, "dispatch", now)["status"],
+            expected,
+            "{created:?}"
+        );
+    }
+}
