@@ -55,6 +55,10 @@ const DISPATCH_TRIES: usize = 3;
 /// the dispatch, which asks again without `return_run_details` where that is
 /// refused, and one for the write.
 const DISPATCH_RECORDED_REQUESTS: usize = 3;
+/// Minimum for a round: claim and read-back, marker, dispatch and record,
+/// two event reads, removal and restoration. Pagination may need more; each
+/// read separately protects the writes still needed to finish or recover.
+const ANSWER_ROUND_REQUESTS: usize = 3 + DISPATCH_RECORDED_REQUESTS + 4;
 
 /// `operatorComments`: absent reads no comments; present, it names at least
 /// one organization (`OWNER/*`) or repository.
@@ -615,16 +619,30 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         comments: &[Value],
         stop: &Marker,
     ) -> Result<(Vec<Said>, Value)> {
-        let since = comments
+        let comment = comments
             .iter()
             .find(|c| c["id"].as_u64() == stop.id)
-            .and_then(|c| OffsetDateTime::parse(text(c, "/created_at"), &Rfc3339).ok())
+            .context("the stop is not among the comments")?;
+        let since = OffsetDateTime::parse(text(comment, "/created_at"), &Rfc3339)
             .context("the stop has no creation time")?;
+        // A fresh stop after a round whose run was refused names the
+        // answer it was started on as `refused`: that answer is older than
+        // the stop, and still counts, until it was refused `DISPATCH_TRIES`
+        // times ([`handled`]).
+        let refused: BTreeSet<String> = parse_marker(MARKER, text(comment, "/body"))
+            .map(|state| {
+                nodes(&state, "/refused")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let (done, _) = handled(comments, &self.config.bot, self.now);
         let said: Vec<Said> = self
-            .said(repo, number, comments, true, since)?
+            .said(repo, number, comments, true, OffsetDateTime::UNIX_EPOCH)?
             .into_iter()
-            .filter(|s| !done.contains(&s.key))
+            .filter(|s| (s.at >= since || refused.contains(&s.key)) && !done.contains(&s.key))
             .collect();
         if said.is_empty() {
             return Ok((said, Value::Null));
@@ -639,9 +657,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 
     /// The newest event that put `needs-human` on a thread, or null.
     fn labelled(&mut self, repo: &str, number: u64, fresh: bool) -> Result<Value> {
-        let events = self.paged(
+        self.labelled_reserved(repo, number, fresh, 0)
+    }
+
+    fn labelled_reserved(
+        &mut self,
+        repo: &str,
+        number: u64,
+        fresh: bool,
+        reserve: usize,
+    ) -> Result<Value> {
+        let events = self.paged_reserved(
             &format!("repos/{repo}/issues/{number}/events?per_page=100"),
             fresh,
+            reserve,
         )?;
         Ok(events
             .into_iter()
@@ -684,6 +713,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             Ok(pool) => pool,
             Err(why) => return Ok(format!("not started: {why}")),
         };
+        // The pull requests followed before this one may have spent most of
+        // the pass's budget: a round that ran out of it part-way would leave
+        // the answer named done, or claimed, with no run and the label on,
+        // which no pass picks up again (agent-board#202). Nothing is written,
+        // and the next pass answers it.
+        if self.remaining < ANSWER_ROUND_REQUESTS {
+            return Ok(format!(
+                "not started: fewer than {ANSWER_ROUND_REQUESTS} requests of the poll's budget are left"
+            ));
+        }
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
@@ -696,19 +735,24 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             short(&head)
         );
         let state = json!({"from": claim_from(stop), "round": 1, "sha": head, "comments": keys});
-        if let Err((id, at)) = self.claim(repo, number, stop, read, (state, &of))? {
-            // As for any round: the winner died before its marker, and a new
-            // stop ends the claim. What it was answering is then older than
-            // that stop, so the operator answers again.
+        // A fresh stop is a recovery receipt, not an edit of the pending
+        // round: conflict-only supervision authenticates unedited stops.
+        let mut refused = stop.clone().state();
+        refused["refused"] = keys.iter().map(|c| plain(c)).collect();
+        let claim = self.claim_reserved(
+            repo,
+            number,
+            stop,
+            read,
+            (state, &of, ANSWER_ROUND_REQUESTS - 2),
+        )?;
+        if let Err((id, at)) = claim {
+            // An unconfirmed claim must not invalidate a concurrent winner.
+            // Leave it exclusive until timeout, then preserve the answer in
+            // a fresh stop so it can be retried without another human reply.
             if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
-                self.needs_human(
-                    repo,
-                    number,
-                    stop,
-                    &head,
-                    &format!("the round on {operator}'s answer was claimed in comment {id} and never recorded; answer again or remove the label"),
-                    None,
-                )?;
+                self.send(self.rest, "POST", &format!("repos/{repo}/issues/{number}/comments"),
+                    json!({"body": marker_body(&refused, &format!("{of}: claim {id} timed out before its round was recorded."))}), 0)?;
                 return Ok(format!("labelled {LABEL}"));
             }
             return Ok(format!(
@@ -723,10 +767,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             at: Some(stamp(self.now)?),
             pool: pool.clone(),
             queue: stop.queue.clone(),
-            comments: keys,
+            pending: keys,
             answering: true,
             ..Marker::default()
         };
+        // The answer is pending until its run may have started, as for any
+        // round on the operator's comments ([`handled`]).
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
         let url = format!("https://github.com/{repo}/pull/{number}");
         let mut inputs = json!({
@@ -738,10 +784,37 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(pool) = pool {
             inputs["pool"] = pool.into();
         }
-        let run = match self.dispatch(dispatcher, &workflow, inputs) {
+        let run = match self.dispatch_recorded(dispatcher, &workflow, inputs) {
             Ok(run) => run,
-            // Back to the person, as for any round that cannot start.
+            // Refused, so nothing started: post an unedited stop to claim
+            // from, naming the answer for the next pass. The label stays on.
+            Err(error) if error.is::<NotStarted>() => {
+                // Retire the pending receipt before the fresh stop names its
+                // refusal, so handled() neither suppresses nor double-counts it.
+                // Keep the answer on the edited stop until the unedited one
+                // is published; a later pass can finish either failed write.
+                let mut recovery = refused.clone();
+                recovery["recover_answer"] = recovery["refused"].take();
+                self.rewrite(
+                    repo,
+                    marker.id.context("the round has no marker")?,
+                    marker_body(&recovery, &format!("{of}: not started.")),
+                )?;
+                self.send(
+                    self.rest,
+                    "POST",
+                    &format!("repos/{repo}/issues/{number}/comments"),
+                    json!({"body": marker_body(&refused, &format!("{of}: not started."))}),
+                    0,
+                )?;
+                return Err(error);
+            }
+            // It may have started: the answer is acted on, and the pull
+            // request goes back to the person, as for any round that cannot
+            // start.
             Err(error) => {
+                marker.comments = std::mem::take(&mut marker.pending);
+                self.record_run(repo, &marker, &format!("{of}: may have started."))?;
                 let why: String = format!("{error:#}").chars().take(200).collect();
                 self.needs_human(
                     repo,
@@ -754,6 +827,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 return Err(error);
             }
         };
+        marker.comments = std::mem::take(&mut marker.pending);
         let run = match run["workflow_run_id"].as_u64() {
             Some(id) => {
                 let run = format!(
@@ -764,9 +838,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 self.record_run(repo, &marker, &format!("{of}: [run]({run})."))?;
                 run
             }
-            None => "run started".into(),
+            None => {
+                self.record_run(repo, &marker, &format!("{of}: started."))?;
+                "run started".into()
+            }
         };
-        let newest = self.labelled(repo, number, true)?;
+        // Keep the label if its history cannot be read in full. Protect the
+        // DELETE, the next read, and a possible restoration independently.
+        let newest = self.labelled_reserved(repo, number, true, 3)?;
         if labelled.is_null() || newest["id"] != *labelled {
             return Ok(format!(
                 "{run}, label kept: {} put it back",
@@ -787,8 +866,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // `labeled` event is then the newest, and the label goes back on:
         // past the round's marker it is their hold, which every later pass
         // skips and only they take off.
-        let newest = self.labelled(repo, number, true)?;
-        if newest["id"] != *labelled {
+        let newest = self.labelled_reserved(repo, number, true, 1);
+        // A failed/partial post-delete read cannot prove that no person put
+        // the label back. Restore it conservatively, using the reserved write.
+        let restore = !newest.as_ref().is_ok_and(|event| event["id"] == *labelled);
+        if restore {
             self.send(
                 rest,
                 "POST",
@@ -796,12 +878,81 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 json!({"labels": [LABEL]}),
                 0,
             )?;
+            let newest = newest?;
             return Ok(format!(
                 "{run}, label put back: {} put it back meanwhile",
                 text(&newest, "/actor/login")
             ));
         }
         Ok(format!("{run}, label removed"))
+    }
+
+    /// Finish either interrupted refusal write before accepting another answer.
+    /// An expired pending receipt is retryable, but a live one is exclusive:
+    /// its dispatch may still be in flight in another pass.
+    pub(super) fn recover_answer_stop(
+        &mut self,
+        repo: &str,
+        number: u64,
+        comments: &[Value],
+        marker: &Marker,
+    ) -> Result<Option<Value>> {
+        let Some(comment) = comments.iter().find(|c| c["id"].as_u64() == marker.id) else {
+            return Ok(None);
+        };
+        let state = parse_marker(MARKER, text(comment, "/body")).unwrap_or_default();
+        let mut stop = if marker.answering
+            && !marker.stopped
+            && marker.run.is_none()
+            && !nodes(&state, "/pending").is_empty()
+            && older_than(
+                self.now,
+                comment["created_at"].as_str(),
+                FIX_RUN_TIMEOUT_SECONDS,
+            ) {
+            let previous: Vec<Value> = comments
+                .iter()
+                .filter(|c| c["id"].as_u64() < marker.id)
+                .cloned()
+                .collect();
+            let previous = find_marker(&previous, &self.config.bot);
+            if !previous.stopped {
+                return Ok(None);
+            }
+            let mut stop = previous.state();
+            stop["refused"] = state["pending"].clone();
+            // Retire pending and record refusal atomically. If this fails the
+            // expired pending receipt still leads back here next pass.
+            let mut recovery = stop.clone();
+            recovery["recover_answer"] = recovery["refused"].take();
+            self.rewrite(
+                repo,
+                marker.id.context("the round has no marker")?,
+                marker_body(&recovery, "The answer's pending dispatch expired."),
+            )?;
+            stop
+        } else if marker.stopped && !nodes(&state, "/recover_answer").is_empty() {
+            let mut stop = state;
+            stop["refused"] = stop["recover_answer"].take();
+            stop
+        } else {
+            return Ok(None);
+        };
+        // Supervision authenticates unedited stops. A failed POST leaves the
+        // edited stop discoverable here, including after the PATCH succeeded.
+        stop["at"] = stamp(self.now)?.into();
+        let body = marker_body(&stop, "The answer's refused dispatch can be retried.");
+        let (_, fresh) = self.send(
+            self.rest,
+            "POST",
+            &format!("repos/{repo}/issues/{number}/comments"),
+            json!({"body": body}),
+            0,
+        )?;
+        Ok(Some(
+            json!({"id": fresh["id"], "user": {"login": self.config.bot},
+            "body": body, "created_at": stamp(self.now)?, "updated_at": stamp(self.now)?}),
+        ))
     }
 
     /// The operator's new comments on one thread, and the run they start;
@@ -1368,6 +1519,11 @@ mod tests {
         unavailable: RefCell<BTreeSet<String>>,
         /// Whether a PATCH that records a dispatch's outcome answers 502.
         broken: RefCell<bool>,
+        broken_stop: RefCell<bool>,
+        links: RefCell<BTreeMap<String, String>>,
+        fallback: bool,
+        concurrent_hold: bool,
+        post_delete_page: bool,
     }
 
     impl Fake {
@@ -1413,7 +1569,7 @@ mod tests {
                 status: 200,
                 etag: None,
                 last_modified: None,
-                link: None,
+                link: self.links.borrow().get(url).cloned(),
                 body,
             })
         }
@@ -1423,16 +1579,40 @@ mod tests {
                 .borrow_mut()
                 .push((format!("{method} {url}"), body.clone()));
             if url.ends_with("/dispatches") {
+                if self.fallback && body.get("return_run_details").is_some() {
+                    return Ok((422, json!({"message": "unsupported"})));
+                }
                 return Ok(match *self.refused.borrow() {
                     Some(status) => (status, json!({"message": "refused"})),
                     None => (200, json!({"workflow_run_id": 1234})),
                 });
+            }
+            if method == "DELETE" && self.concurrent_hold {
+                self.page("repos/upstream/app/issues/7/events?per_page=100", json!([
+                    {"id": 2, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": "human"}}
+                ]));
+            }
+            if method == "DELETE" && self.post_delete_page {
+                let first = format!("{API_ROOT}repos/upstream/app/issues/7/events?per_page=100");
+                let next = format!("{first}&page=2");
+                self.links
+                    .borrow_mut()
+                    .insert(first, format!("<{next}>; rel=\"next\""));
+                self.rest.borrow_mut().insert(next, json!([]));
             }
             let after_dispatch = matches!(
                 self.writes.borrow().iter().rev().nth(1),
                 Some((w, _)) if w.ends_with("/dispatches")
             );
             if method == "PATCH" && *self.broken.borrow() && after_dispatch {
+                return Ok((502, json!({"message": "unavailable"})));
+            }
+            if method == "POST"
+                && url.ends_with("/comments")
+                && *self.broken_stop.borrow()
+                && parse_marker(MARKER, text(body, "/body"))
+                    .is_some_and(|state| state["stopped"] == true)
+            {
                 return Ok((502, json!({"message": "unavailable"})));
             }
             let id = 1000 + self.writes.borrow().len() as u64;
@@ -1455,7 +1635,7 @@ mod tests {
                 comments
                     .as_array_mut()
                     .unwrap()
-                    .push(json!({"id": id, "user": {"login": BOT}, "body": body["body"], "created_at": "2026-10-16T12:00:00Z"}));
+                    .push(json!({"id": id, "user": {"login": BOT}, "body": body["body"], "created_at": "2026-10-16T12:00:00Z", "updated_at": "2026-10-16T12:00:00Z"}));
             }
             if method == "PATCH" {
                 let edited: u64 = url.rsplit('/').next().unwrap().parse().unwrap();
@@ -2295,6 +2475,225 @@ mod tests {
             ]
         );
         assert_eq!(dispatches(&fake).len(), 4);
+    }
+
+    /// An answer reached with too little of the budget left for its round is
+    /// not claimed, marked or named done: the stop stays, for the next pass
+    /// to answer (agent-board#202).
+    #[test]
+    fn an_answer_round_out_of_budget_writes_nothing() {
+        for (remaining, pages, concurrent, refused, outcome) in [
+            (3, 1, false, false, "untouched"),
+            (ANSWER_ROUND_REQUESTS - 1, 1, false, false, "untouched"),
+            (ANSWER_ROUND_REQUESTS, 1, false, false, "removed"),
+            (ANSWER_ROUND_REQUESTS, 7, false, false, "claimed"),
+            (ANSWER_ROUND_REQUESTS, 1, true, false, "restored"),
+            (ANSWER_ROUND_REQUESTS + 6, 7, true, false, "restored"),
+            (ANSWER_ROUND_REQUESTS, 1, false, true, "recovered"),
+            (ANSWER_ROUND_REQUESTS, 1, false, true, "patch failed"),
+            (ANSWER_ROUND_REQUESTS, 1, false, true, "stop failed"),
+            (ANSWER_ROUND_REQUESTS, 1, true, false, "read failed"),
+        ] {
+            let mut fake = github();
+            fake.fallback = concurrent;
+            fake.concurrent_hold = concurrent;
+            fake.post_delete_page = outcome == "read failed";
+            if refused {
+                *fake.refused.borrow_mut() = Some(403);
+            }
+            *fake.broken.borrow_mut() = outcome == "patch failed";
+            *fake.broken_stop.borrow_mut() = outcome == "stop failed";
+            let thread = format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100");
+            for page in 1..pages {
+                let current = if page == 1 {
+                    thread.clone()
+                } else {
+                    format!("{thread}&page={page}")
+                };
+                let next = format!("{thread}&page={}", page + 1);
+                fake.links
+                    .borrow_mut()
+                    .insert(current, format!("<{next}>; rel=\"next\""));
+                fake.rest.borrow_mut().insert(next, json!([]));
+            }
+            let stop = Marker {
+                id: Some(50),
+                rounds: 2,
+                sha: Some("abcdef0123456789".into()),
+                stopped: true,
+                ..Marker::default()
+            };
+            fake.rest
+                .borrow_mut()
+                .get_mut(&thread)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+            "id": 50, "user": {"login": BOT}, "created_at": "2026-10-16T08:00:00Z",
+            "body": marker_body(&stop.state(), "stopped")}));
+            let config = config();
+            let read = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+            let said = [Said {
+                key: "issuecomment-100".into(),
+                at: now(),
+                body: "Please rename.".into(),
+            }];
+            let pull = json!({"number": 7, "headRefOid": "abcdef0123456789"});
+            let apply = Apply {
+                dispatcher: &fake,
+                workflow: "dispatch.yml".into(),
+                pools: vec![],
+            };
+            let mut pass = Pass {
+                rest: &fake,
+                graphql: &fake,
+                config: &config,
+                now: now(),
+                previous: BTreeMap::new(),
+                used: BTreeMap::new(),
+                remaining,
+                apply: Some(apply),
+                dispatched: 0,
+                queues: BTreeMap::new(),
+                outages: None,
+                paces: None,
+                envelope: None,
+            };
+            let events = "repos/upstream/app/issues/7/events?per_page=100";
+            fake.page(
+                events,
+                json!([{"id": 1, "event": "labeled",
+                "label": {"name": LABEL}, "actor": {"login": BOT}}]),
+            );
+            let result =
+                pass.answer_round("upstream/app", &pull, (&stop, &read), (&said, &json!(1)));
+            let comments = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+            let newest = find_marker(&comments, BOT);
+            if matches!(outcome, "patch failed" | "stop failed") {
+                assert!(result.is_err());
+                assert_eq!(dispatches(&fake).len(), 1);
+                pass.remaining = POLL_REQUEST_LIMIT;
+                if outcome == "patch failed" {
+                    assert!(!newest.stopped);
+                    assert!(
+                        pass.recover_answer_stop("upstream/app", 7, &comments, &newest)
+                            .unwrap()
+                            .is_none()
+                    );
+                    pass.now += Duration::seconds(FIX_RUN_TIMEOUT_SECONDS + 1);
+                } else {
+                    assert!(newest.stopped);
+                }
+                *fake.broken.borrow_mut() = false;
+                // Exercise the PATCH/POST window again on a later pass.
+                *fake.broken_stop.borrow_mut() = true;
+                let recovery = pass.recover_answer_stop("upstream/app", 7, &comments, &newest);
+                assert!(recovery.is_err(), "{outcome}: {recovery:?}, {newest:?}");
+                let comments = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+                let newest = find_marker(&comments, BOT);
+                assert!(newest.stopped);
+                *fake.broken_stop.borrow_mut() = false;
+                let recovered = pass
+                    .recover_answer_stop("upstream/app", 7, &comments, &newest)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(recovered["created_at"], recovered["updated_at"]);
+                let comments = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+                assert!(
+                    !handled(&comments, BOT, pass.now)
+                        .0
+                        .contains("issuecomment-100")
+                );
+                assert_eq!(handled(&comments, BOT, pass.now).1["issuecomment-100"], 1);
+                assert_eq!(dispatches(&fake).len(), 1);
+                continue;
+            }
+            if outcome == "claimed" {
+                assert!(result.is_err());
+                assert_eq!(newest.id, stop.id);
+                assert_eq!(fake.writes.borrow().len(), 1);
+                // Another pass may own the claim: an incomplete read must
+                // not create a new generation that can race its dispatch.
+                pass.remaining = ANSWER_ROUND_REQUESTS;
+                let line = pass
+                    .answer_round(
+                        "upstream/app",
+                        &pull,
+                        (&stop, &comments),
+                        (&said, &json!(1)),
+                    )
+                    .unwrap();
+                assert!(line.contains("another pass went first"));
+                assert_eq!(fake.writes.borrow().len(), 1);
+                pass.now += Duration::seconds(FIX_RUN_TIMEOUT_SECONDS + 1);
+                pass.answer_round(
+                    "upstream/app",
+                    &pull,
+                    (&stop, &comments),
+                    (&said, &json!(1)),
+                )
+                .unwrap();
+                let comments = fake.rest.borrow()[&thread].as_array().unwrap().clone();
+                let newest = find_marker(&comments, BOT);
+                assert!(newest.stopped);
+                assert_ne!(newest.id, stop.id);
+                assert!(
+                    !handled(&comments, BOT, pass.now)
+                        .0
+                        .contains("issuecomment-100")
+                );
+                continue;
+            }
+            if outcome == "read failed" {
+                assert!(result.is_err());
+                assert_eq!(newest.run, Some(1234));
+                assert!(fake.writes.borrow().last().unwrap().0.ends_with("/labels"));
+                assert_eq!(pass.remaining, 0);
+                continue;
+            }
+            if outcome == "recovered" {
+                assert!(result.is_err());
+                assert!(newest.stopped);
+                assert_ne!(newest.id, stop.id);
+                let receipt = comments.last().unwrap();
+                assert_eq!(receipt["created_at"], receipt["updated_at"]);
+                assert!(receipt["body"].as_str().unwrap().contains("\"refused\""));
+                assert!(
+                    !handled(&comments, BOT, now())
+                        .0
+                        .contains("issuecomment-100")
+                );
+                continue;
+            }
+            let line = result.unwrap();
+            if outcome != "untouched" {
+                if outcome == "restored" {
+                    assert!(line.contains("label put back"), "{line}");
+                    assert!(fake.writes.borrow().last().unwrap().0.ends_with("/labels"));
+                    assert_eq!(pass.remaining, 0);
+                } else {
+                    assert!(line.ends_with("label removed"), "{line}");
+                }
+                assert_eq!(
+                    (newest.run, newest.comments),
+                    (Some(1234), vec!["issuecomment-100".to_owned()])
+                );
+                continue;
+            }
+            assert!(line.starts_with("not started: fewer than"), "{line}");
+            assert!(
+                fake.writes.borrow().is_empty(),
+                "{:?}",
+                fake.writes.borrow()
+            );
+            assert_eq!(newest.id, Some(50));
+            assert!(
+                !handled(&comments, BOT, now())
+                    .0
+                    .contains("issuecomment-100")
+            );
+        }
     }
 
     #[test]
