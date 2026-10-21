@@ -179,7 +179,7 @@ fn fetch<T: Transport>(transport: &T, target: &Target, recover: bool) -> Result<
         .split_once('/')
         .context("invalid repository")?;
     let value = transport.graphql(
-        "query Decisions($owner:String!,$name:String!,$number:Int!,$limit:Int!){ viewer{login} repository(owner:$owner,name:$name){issue(number:$number){id body updatedAt userContentEdits(last:$limit){nodes{editor{login} previousVersion} pageInfo{hasPreviousPage}}}}}",
+        "query Decisions($owner:String!,$name:String!,$number:Int!,$limit:Int!){ viewer{login} repository(owner:$owner,name:$name){issue(number:$number){id body updatedAt userContentEdits(first:$limit){nodes{editor{login} editedAt diff} pageInfo{hasNextPage}}}}}",
         json!({"owner":owner,"name":name,"number":target.issue,"limit":HISTORY_LIMIT}),
     )?;
     let issue = value
@@ -201,32 +201,40 @@ fn fetch<T: Transport>(transport: &T, target: &Target, recover: bool) -> Result<
         .pointer("/userContentEdits/nodes")
         .and_then(Value::as_array)
         .context("missing edit history")?;
-    // An edit's previousVersion is the body BEFORE that edit. For the newest
-    // bot edit, the next edit's previousVersion is therefore our last write.
+    // GitHub serves edits newest-first for both first: and last:, and an
+    // edit's diff is the whole body as that edit left it. Reading the order
+    // backwards takes an older bot write (or the current body) as the
+    // baseline and silently drops the operator's later edits, so refuse any
+    // history that is not newest-first instead of trusting the order.
+    let mut previous: Option<&str> = None;
+    for edit in edits {
+        let at = edit["editedAt"].as_str().context("missing edit time")?;
+        ensure!(
+            previous.is_none_or(|newer| at <= newer),
+            "edit history is not newest-first"
+        );
+        previous = Some(at);
+    }
+    // The newest bot edit holds our last write; a null (redacted) diff
+    // leaves no baseline, which fails closed below.
     let baseline = edits
         .iter()
-        .rposition(|e| e.pointer("/editor/login").and_then(Value::as_str) == Some(viewer))
-        .and_then(|i| {
-            if i + 1 == edits.len() {
-                Some(body.as_str())
-            } else {
-                edits[i + 1]["previousVersion"].as_str()
-            }
-        })
+        .find(|e| e.pointer("/editor/login").and_then(Value::as_str) == Some(viewer))
+        .and_then(|e| e["diff"].as_str())
         .filter(|s| s.len() <= BODY_LIMIT)
         .map(str::to_owned);
     let mut high_water = entries(&body)?.keys().next_back().copied().unwrap_or(0);
     if recover {
         for edit in edits {
-            if let Some(previous) = edit["previousVersion"].as_str() {
+            if let Some(version) = edit["diff"].as_str() {
                 ensure!(
-                    previous.len() <= BODY_LIMIT,
+                    version.len() <= BODY_LIMIT,
                     "historical decisions body exceeds {BODY_LIMIT} bytes"
                 );
                 // Old revisions may contain an operator's temporarily malformed
                 // document. Conservatively count every valid heading ID rather
                 // than requiring old structure to remain valid forever.
-                for line in previous.lines() {
+                for line in version.lines() {
                     if let Some(rest) = line.strip_prefix("### D")
                         && let Some((id, _)) = rest.split_once(' ')
                         && let Ok(id) = decision_id(&format!("D{id}"))
@@ -247,10 +255,10 @@ fn fetch<T: Transport>(transport: &T, target: &Target, recover: bool) -> Result<
         baseline,
         high_water,
         history_complete: issue
-            .pointer("/userContentEdits/pageInfo/hasPreviousPage")
+            .pointer("/userContentEdits/pageInfo/hasNextPage")
             .and_then(Value::as_bool)
             == Some(false)
-            && edits.iter().all(|e| e["previousVersion"].is_string()),
+            && edits.iter().all(|e| e["diff"].is_string()),
     })
 }
 
@@ -490,7 +498,7 @@ fn execute<T: Transport>(
     let baseline = baseline.or(issue.baseline.as_deref());
     if matches!(operation, Operation::Read) {
         let baseline = baseline.context(
-            "no bot baseline or bot edit in the last 100 edits; cannot attribute changes",
+            "no bot baseline or bot edit in the newest 100 edits; cannot attribute changes",
         )?;
         return Ok(ResultBody {
             output: changes(baseline, &issue.body)?,
@@ -589,8 +597,14 @@ mod tests {
     fn response(body: &str, edits: Value) -> Value {
         json!({"viewer":{"login":"sample-bot"},"repository":{"issue":{
             "id":"ISSUE", "body":body, "updatedAt":"2026-01-01T00:00:00Z",
-            "userContentEdits":{"nodes":edits,"pageInfo":{"hasPreviousPage":false}}
+            "userContentEdits":{"nodes":edits,"pageInfo":{"hasNextPage":false}}
         }}})
+    }
+
+    // GitHub's userContentEdits shape: newest first, each diff the body that
+    // edit left behind.
+    fn edit_node(login: &str, at: &str, diff: Value) -> Value {
+        json!({"editor":{"login":login},"editedAt":format!("2026-01-0{at}T00:00:00Z"),"diff":diff})
     }
 
     struct Offline {
@@ -715,31 +729,31 @@ mod tests {
     #[test]
     fn history_fallback_table() {
         let edited = ORIGINAL.replace("Some context.", "Operator's context.");
-        for (edits, expected) in [
+        let human = edit_node("sample-human", "3", json!(edited));
+        let bot = edit_node("sample-bot", "2", json!(ORIGINAL));
+        let older = edit_node("sample-bot", "1", json!(""));
+        for (name, edits, expected) in [
+            ("operator after bot", json!([human, bot]), true),
+            ("newest bot write wins", json!([human, bot, older]), true),
+            ("oldest-first refused", json!([bot, human]), false),
             (
-                json!([
-                    {"editor":{"login":"sample-bot"},"previousVersion":""},
-                    {"editor":{"login":"sample-human"},"previousVersion":ORIGINAL}
-                ]),
-                true,
-            ),
-            (
-                json!([{"editor":{"login":"sample-human"},"previousVersion":ORIGINAL}]),
+                "redacted bot diff",
+                json!([human, edit_node("sample-bot", "2", Value::Null)]),
                 false,
             ),
-            (json!([]), false),
+            ("no bot edit", json!([human]), false),
+            ("no history", json!([]), false),
         ] {
             let transport = Offline::new(vec![response(&edited, edits)]);
             let result = execute(&transport, &target(), None, 0, Operation::Read, false);
-            assert_eq!(result.is_ok(), expected);
+            assert_eq!(result.is_ok(), expected, "{name}");
             if expected {
-                assert_eq!(result.unwrap().output["changes"][0]["id"], "D12");
+                let changes = &result.unwrap().output["changes"];
+                assert_eq!(changes.as_array().unwrap().len(), 1, "{name}");
+                assert_eq!(changes[0]["id"], "D12", "{name}");
             }
         }
-        let transport = Offline::new(vec![response(
-            ORIGINAL,
-            json!([{"editor":{"login":"sample-bot"},"previousVersion":""}]),
-        )]);
+        let transport = Offline::new(vec![response(ORIGINAL, json!([bot]))]);
         assert!(
             execute(&transport, &target(), None, 0, Operation::Read, false)
                 .unwrap()
@@ -789,8 +803,10 @@ mod tests {
                 true,
             ),
         ] {
-            let history = json!([{"editor":{"login":"sample-human"},"previousVersion":previous},
-                {"editor":{"login":"sample-bot"},"previousVersion":ORIGINAL}]);
+            let history = json!([
+                edit_node("sample-bot", "2", json!(ORIGINAL)),
+                edit_node("sample-human", "1", previous.clone())
+            ]);
             let transport = Offline::new(vec![response(ORIGINAL, history)]);
             let args = add();
             let result = execute(
@@ -888,7 +904,7 @@ mod tests {
         let transport = Offline::new(vec![response("", json!([])), response("", json!([]))]);
         assert!(execute(&transport, &target(), None, 0, Operation::Add(&args), true).is_ok());
         let mut incomplete = response(ORIGINAL, json!([]));
-        incomplete["repository"]["issue"]["userContentEdits"]["pageInfo"]["hasPreviousPage"] =
+        incomplete["repository"]["issue"]["userContentEdits"]["pageInfo"]["hasNextPage"] =
             json!(true);
         let transport = Offline::new(vec![incomplete]);
         assert!(execute(&transport, &target(), None, 0, Operation::Add(&args), true).is_err());
