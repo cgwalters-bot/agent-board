@@ -63,7 +63,11 @@ fn recorded_reduced_snapshots_healthy_and_unavailable_observations() {
         assert_eq!(result["evidence"], json!(want), "{id}");
         assert_eq!(check(&with(id, None), id, now)["status"], "warn", "{id}");
         let healthy = if id == "broker" {
-            vec![json!({"conclusion": "success", "updated_at": snapshots["now"]})]
+            vec![json!({
+                "status": "completed",
+                "conclusion": "success",
+                "updated_at": snapshots["now"],
+            })]
         } else {
             vec![]
         };
@@ -108,22 +112,43 @@ fn threshold_boundaries_and_stale_probe() {
     assert_eq!(
         status(
             "broker",
-            json!([{"conclusion": "success", "updated_at": "2026-10-12T00:00:00Z"}]),
+            json!([{
+                "status": "completed",
+                "conclusion": "success",
+                "updated_at": "2026-10-12T00:00:00Z",
+            }]),
             now
         ),
         "fail"
     );
-    assert_eq!(
-        status(
-            "broker",
-            json!([{"conclusion": "skipped", "updated_at": s["now"]}]),
-            now
-        ),
-        "warn"
-    );
-    let mut skipped = vec![json!({"conclusion": "skipped", "updated_at": s["now"]})];
-    skipped.extend(s["broker"].as_array().unwrap().iter().cloned());
-    assert_eq!(status("broker", json!(skipped), now), "fail");
+    // A probe still running, cancelled waiting on its concurrency group or
+    // skipped has observed nothing: the newest completed probe decides, and
+    // one that hangs is caught by that probe going stale.
+    let success = json!({"status": "completed", "conclusion": "success", "updated_at": s["now"]});
+    let stale = json!({
+        "status": "completed",
+        "conclusion": "success",
+        "updated_at": "2026-10-12T00:00:00Z",
+    });
+    for unfinished in [
+        json!({"status": "in_progress", "conclusion": null, "updated_at": s["now"]}),
+        json!({"status": "queued", "conclusion": null, "updated_at": s["now"]}),
+        json!({"status": "completed", "conclusion": "cancelled", "updated_at": s["now"]}),
+        json!({"status": "completed", "conclusion": "skipped", "updated_at": s["now"]}),
+    ] {
+        let pair = json!([unfinished, success]);
+        assert_eq!(status("broker", pair, now), "ok", "{unfinished}");
+        let pair = json!([unfinished, stale]);
+        assert_eq!(status("broker", pair, now), "fail", "{unfinished}");
+        let mut failed = vec![unfinished.clone()];
+        failed.extend(s["broker"].as_array().unwrap().iter().cloned());
+        assert_eq!(status("broker", json!(failed), now), "fail", "{unfinished}");
+        assert_eq!(
+            status("broker", json!([unfinished]), now),
+            "warn",
+            "{unfinished}"
+        );
+    }
     assert_eq!(
         status(
             "queue",
@@ -308,7 +333,9 @@ fn an_observation_unavailable_for_an_hour_fails() {
     assert_eq!(
         check_since(
             "broker",
-            Some(vec![json!({"conclusion": "skipped"})]),
+            Some(vec![
+                json!({"status": "completed", "conclusion": "skipped"})
+            ]),
             Some(&at(61))
         )["status"],
         "fail"
