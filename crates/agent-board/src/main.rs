@@ -87,7 +87,7 @@ enum Command {
         #[command(subcommand)]
         command: Ask,
     },
-    /// Prepare run field updates (proposals only).
+    /// Propose run field updates, or write them with --apply.
     Run {
         #[command(subcommand)]
         command: Run,

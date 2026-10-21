@@ -11,7 +11,7 @@ use std::io::Write;
 pub struct Plan {
     /// Epic whose newest accepted epic plan to check: URL, OWNER/REPO#N, or N with --repo.
     issue: String,
-    /// Print the mutations instead of making them (required: apply is not implemented).
+    /// Print the mutations instead of making them (required; use epic apply --apply to make them).
     #[arg(long)]
     dry_run: bool,
     /// Login whose plans count: the operator.

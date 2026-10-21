@@ -207,7 +207,9 @@ an inactive webhook, as no role receives events.
    The client secret and webhook secret in the response are discarded.
 4. It prints the app id, slug, settings and install URLs, and the names to store
    them under: variable `ROLE_APP_ID` and secret `ROLE_APP_PRIVATE_KEY` (role
-   uppercased, hyphens as underscores), plus the client id for the device flow.
+   uppercased, hyphens as underscores). A fresh creation also writes the client
+   id for the device flow to stderr; reusing a stored key (`--key-stored`) does
+   not, so read it from the app's settings page then.
 
 Installing the app, and for implement and executor enabling device flow and
 opting out of user-token expiry in the app's settings, remain browser steps; a

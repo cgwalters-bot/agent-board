@@ -968,6 +968,18 @@ fn first_run_help_and_summary() {
             "JSON to stdout",
             "--template",
         ),
+        // run record --apply writes and epic apply --apply exists; help
+        // must not claim otherwise.
+        (
+            vec!["--help"],
+            "or write them with --apply",
+            "proposals only",
+        ),
+        (
+            vec!["epic", "plan", "--help"],
+            "use epic apply --apply to make them",
+            "apply is not implemented",
+        ),
     ] {
         let output = command()
             .args(args)
