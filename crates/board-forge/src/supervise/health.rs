@@ -175,9 +175,17 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             }
             let bad: Vec<&Value> = match id {
                 "poll" => {
+                    // Cancelled and skipped runs are no verdict and are passed
+                    // over: counting a run cancelled while it waited for a slow
+                    // pass as a pass would hide the streak exactly when the
+                    // poll is slow enough to cause such cancellations.
                     let failures: Vec<&Value> = items
                         .iter()
-                        .filter(|r| r["status"] == "completed")
+                        .filter(|r| {
+                            r["status"] == "completed"
+                                && r["conclusion"] != "cancelled"
+                                && r["conclusion"] != "skipped"
+                        })
                         .take(limits.poll_failures)
                         .collect();
                     let all = failures.len() == limits.poll_failures
