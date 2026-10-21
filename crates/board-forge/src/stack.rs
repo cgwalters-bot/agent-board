@@ -83,24 +83,37 @@ pub fn validate_branch(branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a line of a pull request's description closes `number` in `repo`:
-/// `Closes #N`, `Closes OWNER/REPO#N` or `Closes https://github.com/OWNER/REPO/issues/N`.
+/// Whether a pull request's description closes `number` in `repo`, as
+/// GitHub reads it: anywhere in the text, a closing keyword (any case,
+/// optionally followed by a colon) then `#N`, `OWNER/REPO#N` or
+/// `https://github.com/OWNER/REPO/issues/N`. Each keyword closes the one
+/// reference after it, so `Closes #41, closes #42` closes both and
+/// `Closes #41, #42` only #41, as on GitHub.
 fn closes(body: &str, repo: &str, number: u64) -> bool {
-    body.lines().any(|line| {
-        let line = line.trim().trim_end_matches('.');
-        let Some((word, rest)) = line.split_once([' ', ':']) else {
-            return false;
+    let references = [
+        format!("#{number}"),
+        format!("{repo}#{number}"),
+        format!("https://github.com/{repo}/issues/{number}"),
+    ];
+    let mut words = body.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        // A list marker, quote or bracket before the keyword: `- Closes`, `(fixes`.
+        let word = word.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        // `Closes: #41`, `Closes:#41` and `Closes #41` alike.
+        let (keyword, attached) = word.split_once(':').unwrap_or((word, ""));
+        if !CLOSING.contains(&keyword.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let reference = match attached {
+            "" => words.peek().copied().unwrap_or_default(),
+            attached => attached,
         };
-        let rest = rest.trim_start_matches([':', ' ']);
-        CLOSING.contains(&word.to_ascii_lowercase().as_str())
-            && [
-                format!("#{number}"),
-                format!("{repo}#{number}"),
-                format!("https://github.com/{repo}/issues/{number}"),
-            ]
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(rest))
-    })
+        let reference = reference.trim_end_matches([',', '.', ';', ':', ')', ']', '!', '?']);
+        if references.iter().any(|r| r.eq_ignore_ascii_case(reference)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Where the run of a plan on `dest` that stacks on `lower` (an issue in
@@ -294,6 +307,35 @@ mod tests {
         }
         let missing = Forge(json!({"repository": {"issue": null}}));
         assert!(resolve(&missing, &dest, 41, "bot").is_err());
+    }
+
+    #[test]
+    fn closes_table() {
+        for (body, expected) in [
+            ("Closes #41", true),
+            ("closes #41.", true),
+            ("- Closes #41", true),
+            ("* fixes: #41", true),
+            ("Resolved:#41", true),
+            ("This closes #41", true),
+            ("Work.\n\nThis change fixes #41 and more.", true),
+            ("Closes #40, closes #41", true),
+            ("Closes #41, closes #42", true),
+            ("(closes example/widgets#41)", true),
+            ("Closes EXAMPLE/Widgets#41", true),
+            ("Fix https://github.com/example/widgets/issues/41!", true),
+            ("Closes #40, #41", false),
+            ("Closes #410", false),
+            ("Closes #4", false),
+            ("See #41", false),
+            ("Part of #41", false),
+            ("Encloses #41", false),
+            ("Closes other/widgets#41", false),
+            ("closes\n\n", false),
+            ("", false),
+        ] {
+            assert_eq!(closes(body, "example/widgets", 41), expected, "{body:?}");
+        }
     }
 
     #[test]

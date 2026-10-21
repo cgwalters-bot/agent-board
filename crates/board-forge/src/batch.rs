@@ -269,7 +269,9 @@ pub fn select<T: Transport>(
             return Ok(batch);
         }
     };
-    let mut length = brief(plan, &[]).chars().count();
+    // The whole task an extra would join, preamble included: without extras
+    // the bare brief is shorter still.
+    let mut length = batched(plan).chars().count();
     for number in numbers.into_iter().take(BATCH_READS) {
         if batch.extras.len() == limit {
             break;
@@ -331,19 +333,25 @@ fn section(issue: &ItemRef, plan: &JobPlan) -> String {
     format!("\n\n## {}\n\n{}", issue.display(), plan.brief)
 }
 
+/// A batched run's task before the extras' sections: the primary plan's
+/// brief and what a batched run must do.
+fn batched(plan: &JobPlan) -> String {
+    format!(
+        "{}\n\n---\n\nBatched run: this run also does the issues below, each from its own plan.\n\
+         - Make one commit per issue, so review and a revert stay per issue.\n\
+         - Open one pull request. Its body has a `Closes #N` line for each issue you finished, #{} included.\n\
+         - Name in the body each listed issue you did not do, and why; it is left for a later run.",
+        plan.brief, plan.item
+    )
+}
+
 /// The run's task: the primary plan's brief, unchanged without extras, else
 /// followed by what a batched run must do and each extra's brief.
 pub fn brief(plan: &JobPlan, extras: &[&Extra]) -> String {
     if extras.is_empty() {
         return plan.brief.clone();
     }
-    let mut task = format!(
-        "{}\n\n---\n\nBatched run: this run also does the issues below, each from its own plan.\n\
-         - Make one commit per issue, so review and a revert stay per issue.\n\
-         - Open one pull request. Its body has a `Closes #N` line for each issue you finished, #{} included.\n\
-         - Name in the body each listed issue you did not do, and why; it is left for a later run.",
-        plan.brief, plan.item
-    );
+    let mut task = batched(plan);
     for extra in extras {
         task.push_str(&section(&extra.issue, &extra.plan));
     }

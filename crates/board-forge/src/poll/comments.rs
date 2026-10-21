@@ -101,11 +101,16 @@ pub fn scopes(value: Option<&Value>) -> Result<Vec<String>> {
     Ok(scopes)
 }
 
+/// Whether the search's `repo` is in a scope. GitHub's owner and repository
+/// names, and so its `user:`/`repo:` qualifiers, are case-insensitive: a hit
+/// in `Upstream/app` for `upstream/*` is the operator's scope.
 fn in_scope(scopes: &[String], repo: &str) -> bool {
     let owner = repo.split_once('/').map_or("", |(owner, _)| owner);
-    scopes
-        .iter()
-        .any(|s| s == repo || s.strip_suffix("/*") == Some(owner))
+    scopes.iter().any(|s| {
+        s.eq_ignore_ascii_case(repo)
+            || s.strip_suffix("/*")
+                .is_some_and(|o| o.eq_ignore_ascii_case(owner))
+    })
 }
 
 fn stamp(at: OffsetDateTime) -> Result<String> {
@@ -228,9 +233,10 @@ fn run_kind(said: &[Said], bot: &str) -> &'static str {
     if research { "research" } else { "triage" }
 }
 
-/// The lines of a comment that address the bot: `/bot` or `@BOT`.
+/// The lines of a comment that address the bot: `/bot` or `@BOT`. A mention
+/// is GitHub's: an `@` not after a word character, so `foo@worker.org` is an
+/// address rather than a mention, then the login in any case.
 fn addressed<'a>(body: &'a str, bot: &str) -> impl Iterator<Item = &'a str> {
-    let mention = format!("@{bot}");
     body.lines().map(str::trim).filter(move |line| {
         let addressed = |rest: &str| {
             !rest
@@ -239,9 +245,18 @@ fn addressed<'a>(body: &'a str, bot: &str) -> impl Iterator<Item = &'a str> {
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
         };
         line.strip_prefix("/bot").is_some_and(addressed)
-            || line
-                .match_indices(&mention)
-                .any(|(at, _)| addressed(&line[at + mention.len()..]))
+            || line.match_indices('@').any(|(at, _)| {
+                let after_word = line[..at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let login = &line[at + 1..];
+                !after_word
+                    && login
+                        .get(..bot.len())
+                        .is_some_and(|name| name.eq_ignore_ascii_case(bot))
+                    && addressed(&login[bot.len()..])
+            })
     })
 }
 
@@ -399,10 +414,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let cursor = saved
             .map_or(floor, |c| c.clamp(floor, self.now))
             .replace_nanosecond(0)?;
-        // A page is one of the search of the cursor it was saved with.
+        // A page is one of the search of the cursor it was saved with: a
+        // cursor clamped to the lookback or now is another search, read from
+        // its start, else its first pages would be skipped for a pass.
         let start = match saved {
-            Some(_) => page.clamp(1, OPERATOR_PAGE_LIMIT),
-            None => 1,
+            Some(saved) if (floor..=self.now).contains(&saved) => {
+                page.clamp(1, OPERATOR_PAGE_LIMIT)
+            }
+            _ => 1,
         };
         let scopes = &self.config.policy.operator_comments;
         let mut query = format!(
@@ -2346,6 +2365,19 @@ mod tests {
             ),
             (Some("2026-10-16T11:00:00Z"), Some(2))
         );
+
+        // A saved page is one of its own cursor's search: a cursor clamped
+        // to the lookback or to now starts its search at page 1.
+        for (cursor, page) in [
+            ("2026-10-16T11:00:00Z", "&page=2"),
+            ("2026-10-01T00:00:00Z", "&page=1"),
+            ("2026-10-17T00:00:00Z", "&page=1"),
+        ] {
+            let fake = github();
+            pass_from(&fake, (Some(cursor), Some(2)), false);
+            let searched = fake.searched.borrow();
+            assert!(searched[0].ends_with(page), "{cursor}: {searched:?}");
+        }
     }
 
     #[test]
@@ -2764,6 +2796,11 @@ mod tests {
         assert!(in_scope(&["upstream/*".into()], "upstream/app"));
         assert!(!in_scope(&["upstream/*".into()], "upstreamx/app"));
         assert!(!in_scope(&["upstream/app".into()], "upstream/other"));
+        // GitHub's names are case-insensitive, as its search is.
+        assert!(in_scope(&["upstream/*".into()], "Upstream/app"));
+        assert!(in_scope(&["Upstream/*".into()], "upstream/App"));
+        assert!(in_scope(&["upstream/app".into()], "UPSTREAM/App"));
+        assert!(!in_scope(&["Upstream/*".into()], "upstreamx/app"));
     }
 
     #[test]
@@ -2773,8 +2810,16 @@ mod tests {
             ("  /bot", true),
             ("thanks @worker", true),
             ("@worker: look", true),
+            ("@Worker please", true),
+            ("(@WORKER)", true),
+            ("ping foo@bar @worker", true),
             ("/botany", false),
             ("cc @worker-two", false),
+            ("mail foo@worker.org", false),
+            ("x_@worker", false),
+            ("@@worker", true),
+            ("@work", false),
+            ("é@worker", false),
             ("talking about /bot here", false),
             ("nothing", false),
         ] {
