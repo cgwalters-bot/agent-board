@@ -39,6 +39,7 @@ const SUB_ISSUES_QUERY: &str = r#"query($owner: String!, $name: String!, $number
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       id
+      state
       labels(first: 100) { nodes { name } }
       subIssues(first: 100) {
         nodes { number state repository { nameWithOwner } }
@@ -171,6 +172,10 @@ pub struct Epic {
     /// Positive evidence of the operator's epic designation. Missing/redacted
     /// labels are not authority to apply a decomposition.
     pub designated: bool,
+    /// Whether the epic itself is open. Closing it is the operator's decision
+    /// that the decomposition is finished or dropped, so a plan written before
+    /// may not change its sub-issues.
+    pub open: bool,
     /// Its open sub-issues, the only ones a plan may change.
     pub sub_issues: Vec<IssueRef>,
     /// Its closed sub-issues: closed by the operator or by finished work, so
@@ -247,6 +252,12 @@ impl EpicPlan {
             named.same(&epic.issue),
             "epic plan is for {named}, but was found on {}",
             epic.issue
+        );
+        // Here rather than in each caller, so the dry run, the preview and
+        // apply (before and after its claim) refuse alike.
+        ensure!(
+            epic.open,
+            "epic is closed; a plan may not change a closed epic's sub-issues"
         );
         let actions = object
             .get("actions")
@@ -714,6 +725,11 @@ pub fn read_epic<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Epic> {
         designated: node["labels"]["nodes"]
             .as_array()
             .is_some_and(|labels| labels.iter().any(|l| l["name"] == EPIC_LABEL)),
+        open: match node["state"].as_str() {
+            Some("OPEN") => true,
+            Some("CLOSED") => false,
+            _ => bail!("{} has no state", issue.display()),
+        },
         sub_issues: Vec::new(),
         closed: Vec::new(),
     };
@@ -775,6 +791,7 @@ mod tests {
             issue: IssueRef::parse(EPIC).unwrap(),
             id: "I_epic".into(),
             designated: true,
+            open: true,
             sub_issues: vec![
                 IssueRef::parse("cgwalters-forge/agent-board#63").unwrap(),
                 IssueRef::parse("cgwalters-forge/tracker#573").unwrap(),
@@ -1359,7 +1376,7 @@ mod tests {
                 "lastEditedAt": editor.map(|_| at), "author": {"login": author},
                 "editor": editor.map(|login| json!({"login": login}))})
         };
-        let subs = json!({"id": "I_epic", "subIssues": {"nodes": [
+        let subs = json!({"id": "I_epic", "state": "OPEN", "subIssues": {"nodes": [
             {"number": 63, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/agent-board"}},
             {"number": 573, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/tracker"}}],
             "pageInfo": {"hasNextPage": false}}});
@@ -1444,8 +1461,27 @@ mod tests {
             // Sub-issues are read as they are now.
             (
                 vec![first()],
-                json!({"id": "I_epic", "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": false}}}),
+                json!({"id": "I_epic", "state": "OPEN", "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": false}}}),
                 Err("cgwalters-forge/tracker#573 is neither new nor a current sub-issue"),
+            ),
+            // A closed epic refuses every plan, and an unknown state is not open.
+            (
+                vec![first()],
+                {
+                    let mut closed = subs.clone();
+                    closed["state"] = json!("CLOSED");
+                    closed
+                },
+                Err("epic is closed; a plan may not change a closed epic's sub-issues"),
+            ),
+            (
+                vec![first()],
+                {
+                    let mut unknown = subs.clone();
+                    unknown.as_object_mut().unwrap().remove("state");
+                    unknown
+                },
+                Err("cgwalters-forge/tracker#572 has no state"),
             ),
             (vec![first()], full, Err("more than 100 sub-issues")),
             // A closed one the plan rescopes is refused; one it closes is

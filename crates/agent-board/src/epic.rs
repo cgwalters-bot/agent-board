@@ -171,7 +171,7 @@ mod tests {
                 self.0.set(self.0.get() + 1);
                 if query.contains("subIssues") {
                     return Ok(
-                        json!({"repository": {"issue": {"id": "I_epic", "subIssues": {
+                        json!({"repository": {"issue": {"id": "I_epic", "state": "OPEN", "subIssues": {
                         "nodes": [{"number": 63, "state": "OPEN", "repository": {"nameWithOwner": "cgwalters-forge/agent-board"}}],
                         "pageInfo": {"hasNextPage": false}}}}}),
                     );

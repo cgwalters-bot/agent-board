@@ -546,6 +546,8 @@ mod tests {
         edit_on_read: Option<usize>,
         labelled: bool,
         remove_label_on_recheck: bool,
+        /// The epic is closed from this epic read on.
+        epic_closed_from: Option<usize>,
         epic_reads: Cell<usize>,
         reads: Cell<usize>,
         login: &'static str,
@@ -569,6 +571,7 @@ mod tests {
                 edit_on_read: None,
                 labelled: true,
                 remove_label_on_recheck: false,
+                epic_closed_from: None,
                 epic_reads: Cell::new(0),
                 reads: Cell::new(0),
                 login: "planner",
@@ -634,8 +637,11 @@ mod tests {
                 if self.created.get() {
                     nodes.push(json!({"number": 10, "state": "OPEN", "repository": {"nameWithOwner": "example/work"}}));
                 }
+                let reads = self.epic_reads.get();
+                let closed = self.epic_closed_from.is_some_and(|from| reads >= from);
+                let state = if closed { "CLOSED" } else { "OPEN" };
                 return Ok(
-                    json!({"repository": {"issue": {"id": "E", "labels": {"nodes": if labelled { vec![json!({"name": "epic"})] } else { vec![] }}, "subIssues": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}}),
+                    json!({"repository": {"issue": {"id": "E", "state": state, "labels": {"nodes": if labelled { vec![json!({"name": "epic"})] } else { vec![] }}, "subIssues": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}}),
                 );
             }
             if query.starts_with("query") {
@@ -1109,6 +1115,34 @@ mod tests {
             if before {
                 assert!(forge.requests.borrow().is_empty());
                 assert!(preview(&forge, &issue(), &config()).is_err());
+            }
+        }
+    }
+
+    /// Closing the epic ends its decomposition: a plan written while it was
+    /// open makes no write, whether it closed before apply or after the claim.
+    #[test]
+    fn a_closed_epic_is_not_decomposed() {
+        for before in [true, false] {
+            let mut forge = Forge::full();
+            forge.epic_closed_from = Some(if before { 1 } else { 2 });
+            let error = format!(
+                "{:#}",
+                apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap_err()
+            );
+            assert!(error.contains("epic is closed"), "{error}");
+            assert!(!forge.created.get());
+            let writes = forge.requests.borrow();
+            assert!(
+                writes
+                    .iter()
+                    .all(|(_, path, _)| path.starts_with("repos/example/epics/")),
+                "{writes:?}"
+            );
+            if before {
+                assert!(writes.is_empty());
+                let refused = preview(&forge, &issue(), &config()).unwrap_err();
+                assert!(format!("{refused:#}").contains("epic is closed"));
             }
         }
     }

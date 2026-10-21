@@ -11,6 +11,9 @@ configured bot's token. Ordering is expressed only by sub-issue Priority.
 Apply and its preview require positive evidence of the parent's `epic` label,
 which the operator supplies; apply checks it again after claiming. This prevents
 the planner from starting decompositions on ordinary issues or its own new children.
+A closed epic refuses every plan, in the dry run, the preview and apply (again
+after claiming): closing it is the operator's decision that the decomposition
+is finished or dropped, so a plan written before may not add to or change it.
 
 ## Format
 
