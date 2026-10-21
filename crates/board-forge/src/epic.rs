@@ -758,9 +758,15 @@ pub fn read_epic<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Epic> {
             number: issue.number,
         },
         id: id.into(),
-        designated: node["labels"]["nodes"]
-            .as_array()
-            .is_some_and(|labels| labels.iter().any(|l| l["name"] == EPIC_LABEL)),
+        // GitHub label names are case-insensitive, as health, judgment and
+        // the validator's own label refusal compare them.
+        designated: node["labels"]["nodes"].as_array().is_some_and(|labels| {
+            labels.iter().any(|l| {
+                l["name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(EPIC_LABEL))
+            })
+        }),
         open: match node["state"].as_str() {
             Some("OPEN") => true,
             Some("CLOSED") => false,
@@ -1648,5 +1654,32 @@ mod tests {
         };
         assert!(newest_epic_plan(&forge, &issue, &["cgwalters"], &bad).is_err());
         assert_eq!(forge.reads.get(), 0);
+    }
+
+    #[test]
+    fn epic_label_is_compared_case_insensitively() {
+        const URL: &str = "https://github.com/cgwalters-forge/tracker/issues/572";
+        let issue = crate::github::parse_github_issue(URL, None, "github.com").unwrap();
+        for (labels, designated) in [
+            (json!([{"name": "epic"}]), true),
+            (json!([{"name": "Epic"}]), true),
+            (json!([{"name": "bug"}, {"name": "EPIC"}]), true),
+            (json!([{"name": "epics"}]), false),
+            (json!([{"name": null}]), false),
+            (json!([]), false),
+            (Value::Null, false),
+        ] {
+            let forge = Forge {
+                comments: json!([]),
+                sub_issues: json!({"id": "I_epic", "state": "OPEN", "labels": {"nodes": labels},
+                    "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": false}}}),
+                reads: Default::default(),
+            };
+            assert_eq!(
+                read_epic(&forge, &issue).unwrap().designated,
+                designated,
+                "{labels}"
+            );
+        }
     }
 }

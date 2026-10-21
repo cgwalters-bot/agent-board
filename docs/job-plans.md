@@ -60,9 +60,10 @@ that plan is malformed, or was last edited by someone other than a writer
 (anyone with write access can edit others' comments) or by an account GitHub
 no longer names, dispatch stops instead of falling back to the plan it
 replaced. A writer's comment edited by someone else counts as such a plan even
-if the edit removed its fence. A plan quoted in a reply (`> `) is not a
-plan. An issue with more than 1,000 comments is refused, since its newest plan
-could be unread.
+if the edit removed its fence. A plan quoted in a reply (`> `), or shown
+inside another fenced block or an HTML comment, is not a plan. An issue
+with more than 1,000 comments is refused, since its newest plan could be
+unread.
 
 The planner login is trusted as a whole: any run that comments as it could
 write a plan. The caller's bounds still check every dispatched run, so a plan
@@ -206,9 +207,11 @@ implement plan with `stacks_on: N` (an issue of its own `repo`, usually set by
 an [epic plan](epic-plans.md)) is dispatched only with `--bot`, and then:
 
 - with one open pull request of the bot from a `dispatch/` branch of `repo`
-  itself whose description closes #N (`Closes #N`, `OWNER/REPO#N` or the
-  issue's URL), among the repository's newest 50 open ones, the request
-  carries that branch as the `base` input, the run's task says what it stacks
+  itself whose description closes #N as GitHub reads it (a closing keyword
+  anywhere in the text, such as `Closes`, `fixes:` or `resolved`, then `#N`,
+  `OWNER/REPO#N` or the issue's URL), among the repository's newest 50
+  open ones, the request carries that branch as the `base` input, the
+  run's task says what it stacks
   on and asks the pull request description to begin with `Stacks on #P.`, and
   the record says `Stacked on URL (branch)`. The run is neither checked for
   overlap, as it shares the files of the stack below it by design, nor batched;

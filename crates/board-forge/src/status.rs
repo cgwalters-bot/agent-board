@@ -123,7 +123,12 @@ pub fn plan<R: Rest>(
                     .as_array()
                     .context("missing requested reviewers")?
                     .iter()
-                    .any(|reviewer| reviewer["login"].as_str() == Some(operator));
+                    // Logins are case-insensitive on GitHub.
+                    .any(|reviewer| {
+                        reviewer["login"]
+                            .as_str()
+                            .is_some_and(|login| login.eq_ignore_ascii_case(operator))
+                    });
             }
             // The snapshot reader marks truncated/redacted nested field values
             // incomplete. Never infer completion from an empty set of links.
@@ -247,6 +252,7 @@ mod tests {
             ("label", Some(Status::NeedsHuman)),
             ("question", Some(Status::NeedsHuman)),
             ("review_requested", Some(Status::NeedsHuman)),
+            ("review_requested_cased", Some(Status::NeedsHuman)),
             ("other_reviewer", None),
             ("active_run", Some(Status::InProgress)),
             ("finished_run", Some(Status::Todo)),
@@ -276,10 +282,15 @@ mod tests {
                         item.labels.push("needs-human".into());
                     }
                 }
-                "draft_pr" | "review_requested" | "other_reviewer" => {
+                "draft_pr" | "review_requested" | "review_requested_cased" | "other_reviewer" => {
                     item.content_kind = "pull_request".into();
                     offline.pull["draft"] = json!(case == "draft_pr");
-                    offline.pull["requested_reviewers"] = json!([{"login":if case == "review_requested" { "operator" } else { "someone" }}]);
+                    let login = match case {
+                        "review_requested" => "operator",
+                        "review_requested_cased" => "Operator",
+                        _ => "someone",
+                    };
+                    offline.pull["requested_reviewers"] = json!([{ "login": login }]);
                 }
                 "label" | "question" | "ask_wins" => {
                     item.labels.push(

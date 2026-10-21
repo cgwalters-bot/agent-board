@@ -306,33 +306,82 @@ pub(crate) fn newest_fenced<'a>(
 }
 
 fn has_fence(body: &str, fence: &str) -> bool {
+    !fence_blocks(body, fence).is_empty()
+}
+
+/// The `fence` blocks of a comment body, in order: each one's text, or
+/// `None` for one left open. Only top-level fences count: one that opens at
+/// the start of a line, so a block quoted in a reply (`> `) or indented is
+/// not one, and outside another fenced block or an HTML comment, so a plan
+/// shown as an example (in a ````markdown block) or hidden in `<!-- -->`
+/// is not one either.
+fn fence_blocks(body: &str, fence: &str) -> Vec<Option<String>> {
     let open = format!("```{fence}");
-    body.lines().any(|line| line.trim_end() == open)
+    let mut blocks = Vec::new();
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() == open {
+            let mut text = String::new();
+            let mut closed = false;
+            for line in lines.by_ref() {
+                if line.trim_end() == "```" {
+                    closed = true;
+                    break;
+                }
+                text.push_str(line);
+                text.push('\n');
+            }
+            blocks.push(closed.then_some(text));
+        } else if let Some((mark, length)) = code_fence(line) {
+            // CommonMark: it closes on a fence of the same character, at
+            // least as long, with nothing after it; unclosed, it runs to
+            // the end of the body.
+            for line in lines.by_ref() {
+                if code_fence(line).is_some_and(|(m, l)| m == mark && l >= length)
+                    && line.trim().trim_start_matches(mark).is_empty()
+                {
+                    break;
+                }
+            }
+        } else if line
+            .trim_start_matches(' ')
+            .strip_prefix("<!--")
+            .is_some_and(|rest| line.len() - line.trim_start().len() <= 3 && !rest.contains("-->"))
+        {
+            // An HTML comment block, which opens a line, runs to its `-->`;
+            // a `<!--` later in a line is inline and ends with its paragraph,
+            // which a fence interrupts, so it hides no plan.
+            for line in lines.by_ref() {
+                if line.contains("-->") {
+                    break;
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// A line that opens or closes a fenced code block: its character and how
+/// many, after at most three spaces of indentation. A backtick fence's info
+/// string has no backticks, so a line of inline code is not one.
+fn code_fence(line: &str) -> Option<(char, usize)> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let mark = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let length = rest.chars().take_while(|c| *c == mark).count();
+    let info = &rest[length..];
+    (length >= 3 && !(mark == '`' && info.contains('`'))).then_some((mark, length))
 }
 
 /// The JSON of the one `fence` block in a comment body: `None` without one.
-/// The fence must open at the start of a line, so a block quoted in a reply
-/// (`> `) or indented is not one.
+/// Which blocks count is [`fence_blocks`]'s rule.
 pub(crate) fn fenced_json(body: &str, fence: &str) -> Result<Option<Value>> {
-    let open = format!("```{fence}");
-    let mut lines = body.lines();
     let mut found = None;
-    while let Some(line) = lines.next() {
-        if line.trim_end() != open {
-            continue;
-        }
+    for block in fence_blocks(body, fence) {
         ensure!(found.is_none(), "comment holds more than one plan");
-        let mut json = String::new();
-        let mut closed = false;
-        for line in lines.by_ref() {
-            if line.trim_end() == "```" {
-                closed = true;
-                break;
-            }
-            json.push_str(line);
-            json.push('\n');
-        }
-        ensure!(closed, "plan fence is not closed");
+        let json = block.context("plan fence is not closed")?;
         found = Some(serde_json::from_str(&json).context("plan is not valid JSON")?);
     }
     Ok(found)
@@ -1009,6 +1058,33 @@ mod tests {
             (format!("> {open}\n> {plan_text}\n> ```"), Ok(false)),
             (format!("    {open}\n{plan_text}\n```"), Ok(false)),
             (format!("```json\n{plan_text}\n```"), Ok(false)),
+            // So is one nested in another fenced block or an HTML comment...
+            (format!("````markdown\n{}````", body(&plan())), Ok(false)),
+            (format!("~~~\n{}~~~~\n", body(&plan())), Ok(false)),
+            (format!("  ```\n{}", body(&plan())), Ok(false)),
+            (format!("<!--\n{}-->", body(&plan())), Ok(false)),
+            (format!("   <!-- {}  -->", body(&plan())), Ok(false)),
+            // ...but one after the outer block or comment is closed is a plan,
+            // and a shorter fence, a one-line comment or a `<!--` within a
+            // line hides nothing.
+            (
+                format!("Never write `<!--`.\n\n{}", body(&plan())),
+                Ok(true),
+            ),
+            (format!("Example: <!--\n{}", body(&plan())), Ok(true)),
+            (format!("    <!--\n{}", body(&plan())), Ok(true)),
+            (
+                format!("````markdown\n```\n````\n{}", body(&plan())),
+                Ok(true),
+            ),
+            (format!("<!-- marker -->\n{}", body(&plan())), Ok(true)),
+            (format!("<!--\n-->\n{}", body(&plan())), Ok(true)),
+            (format!("```x```\n{}", body(&plan())), Ok(true)),
+            (format!("````\n{}", body(&plan())), Ok(false)),
+            (
+                format!("````markdown\n{}````\n{}", body(&plan()), body(&plan())),
+                Ok(true),
+            ),
             (format!("{open}\n{plan_text}\n"), Err("not closed")),
             (
                 format!("{}\n{}", body(&plan()), body(&plan())),
@@ -1733,14 +1809,15 @@ mod tests {
     #[test]
     fn batched_dispatch_records_each_issue_and_frees_unfinished_ones() {
         let tracker = "https://github.com/cgwalters-forge/tracker/issues";
-        let planned = |n: u64, kind: &str| {
+        let briefed = |n: u64, kind: &str, brief: String| {
             let mut p = plan();
             p["repo"] = json!("cgwalters-forge/tracker");
             p["item"] = json!(n);
             p["kind"] = json!(kind);
-            p["brief"] = json!(format!("Do #{n}."));
+            p["brief"] = json!(brief);
             body(&p)
         };
+        let planned = |n: u64, kind: &str| briefed(n, kind, format!("Do #{n}."));
         let comment = |n: u64, id: u64, body: String| {
             json!({"url": format!("{tracker}/{n}#issuecomment-{id}"), "body": body,
                 "createdAt": "2026-10-13T10:00:00Z", "lastEditedAt": null,
@@ -1810,11 +1887,28 @@ mod tests {
             // Another pass taking the primary first starts nothing.
             ("primary race", 2, "race", &["small"],
                 Err("issues/540#issuecomment-101 recorded this plan first")),
+            // #541 and #545 fit the limit on their own briefs, but not with
+            // the batched preamble: #545 is left out and the short #546 joins.
+            ("long briefs", 2, "long", &["small"], Ok(&[541, 546])),
         ];
         for (name, batch, twist, labels, expected) in cases {
+            let mut others = siblings();
+            if *twist == "long" {
+                // Each section is "\n\n## cgwalters-forge/tracker#N\n\n" and
+                // its brief; the primary's brief is "Do #540.".
+                let sections = 2 * "\n\n## cgwalters-forge/tracker#541\n\n".len();
+                let room = crate::batch::BATCH_BRIEF_LIMIT - "Do #540.".len() - sections;
+                for (n, length) in [(541, PLAN_BRIEF_LIMIT), (545, room - PLAN_BRIEF_LIMIT)] {
+                    others.get_mut(&n).unwrap()[0] = comment(
+                        n,
+                        1000 * n,
+                        briefed(n, "implement", format!("Do #{n}.").repeat(length / 8)),
+                    );
+                }
+            }
             let forge = Forge {
                 twist,
-                others: RefCell::new(siblings()),
+                others: RefCell::new(others),
                 family: if *batch == 0 {
                     Value::Null
                 } else if *twist == "epic fails" {
@@ -1856,6 +1950,17 @@ mod tests {
                     let task = &dispatcher.dispatches.borrow()[0]["inputs"]["task"];
                     let task = task.as_str().unwrap();
                     assert!(task.starts_with("Do #540."), "{name}: {task}");
+                    assert!(
+                        task.chars().count() <= crate::batch::BATCH_BRIEF_LIMIT,
+                        "{name}"
+                    );
+                    if *name == "long briefs" {
+                        let notes = done.notes.join("\n");
+                        assert!(
+                            notes.contains("#545: brief would pass 32000 characters"),
+                            "{name}: {notes}"
+                        );
+                    }
                     assert_eq!(
                         task.contains("one commit per issue"),
                         !extras.is_empty(),
