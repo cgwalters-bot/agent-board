@@ -338,6 +338,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// did not read: by the time of that thread where this pass read the
     /// search from its start, and by the page it is on, so that no number of
     /// threads updated within the lag, or at the same time, holds it in place.
+    /// A resumed search read to its end may be read once more from its start,
+    /// where threads updated meanwhile can have moved one not yet read before
+    /// the page it resumed at.
     pub(super) fn operator_comments(
         &mut self,
         follow: &BTreeSet<&String>,
@@ -425,8 +428,22 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let open = match read.iter().position(|(_, done)| !done) {
             Some(open) => open,
             None if !end => read.len(),
-            // Done to the end: from now, less the lag.
-            None => return Ok((stamp(self.now)?, 1)),
+            // Done to the end: from now, less the lag. On a resumed search,
+            // more threads than the page backed off may have been updated
+            // since the last pass, moving one it had not read, so updated at
+            // or after the cursor, onto a page before `start`. Only where the
+            // first thread read now is older than the cursor can none be
+            // there; else the search is read once more from its start, where
+            // it goes on by the time of the threads it reads.
+            None if start == 1
+                || read
+                    .first()
+                    .and_then(|(at, _)| *at)
+                    .is_some_and(|at| at < cursor) =>
+            {
+                return Ok((stamp(self.now)?, 1));
+            }
+            None => return Ok((stamp(cursor)?, 1)),
         };
         let anchor = read
             .get(open)
@@ -1244,10 +1261,15 @@ mod tests {
             assert!(validator.is_none() || !url.contains("/issues/"));
             let body = if url.starts_with(&format!("{API_ROOT}search/issues?")) {
                 self.searched.borrow_mut().push(url.into());
-                // The recorded results, a page of them as the URL asks.
+                // The recorded results updated since the query's time, a page
+                // of them as the URL asks.
                 let mut found = self.rest.borrow()[&format!("{API_ROOT}search")].clone();
                 let page: usize = url.rsplit_once("&page=").unwrap().1.parse().unwrap();
-                let items = found["items"].as_array().unwrap().clone();
+                let (_, since) = url.split_once("updated%3A%3E%3D").unwrap();
+                let (since, _) = since.split_once('+').unwrap();
+                let since = since.replace("%3A", ":");
+                let mut items = found["items"].as_array().unwrap().clone();
+                items.retain(|hit| text(hit, "/updated_at") >= since.as_str());
                 found["total_count"] = items.len().into();
                 found["items"] = items
                     .into_iter()
@@ -1960,6 +1982,58 @@ mod tests {
             ),
             (Some("2026-10-16T11:00:00Z"), Some(2))
         );
+    }
+
+    #[test]
+    fn a_thread_not_yet_read_survives_more_than_a_page_of_threads_moving() {
+        let fake = github();
+        // More threads than a pass reads, within the lag of each other, the
+        // operator's request after them.
+        let mut items = Vec::new();
+        for n in 0..70u64 {
+            let at = format!("2026-10-16T11:{:02}:{:02}Z", n / 60, n % 60);
+            items.push(hit(&format!("upstream/quiet#{n}"), "someone", false, &at));
+            fake.page(
+                &format!("repos/upstream/quiet/issues/{n}/comments?per_page=100"),
+                json!([]),
+            );
+        }
+        items.push(hit(ISSUE, "someone", false, "2026-10-16T11:01:10Z"));
+        let search = format!("{API_ROOT}search");
+        fake.rest.borrow_mut().get_mut(&search).unwrap()["items"] = items.clone().into();
+        let first = pass(&fake, None, true);
+        assert_eq!(first.state.operator_page, Some(3), "{:?}", first.lines);
+
+        // Then more than a page of those read is updated, moving the request
+        // from the fourth page to the second.
+        let moved: Vec<Value> = items
+            .drain(..35)
+            .map(|mut hit| {
+                hit["updated_at"] = "2026-10-16T11:55:00Z".into();
+                hit
+            })
+            .collect();
+        items.extend(moved);
+        fake.rest.borrow_mut().get_mut(&search).unwrap()["items"] = items.into();
+        let again = resume(&fake, &first);
+        let last = resume(&fake, &again);
+        assert_eq!(
+            dispatches(&fake).len(),
+            1,
+            "the operator's comment on {ISSUE} was never acted on: {:?} then {:?}",
+            again.lines,
+            last.lines
+        );
+        // Read once more, not again and again: the search goes on to now.
+        let done = resume(&fake, &resume(&fake, &last));
+        assert_eq!(
+            (
+                done.state.operator_cursor.as_deref(),
+                done.state.operator_page
+            ),
+            (Some("2026-10-16T12:00:00Z"), None)
+        );
+        assert_eq!(dispatches(&fake).len(), 1);
     }
 
     #[test]

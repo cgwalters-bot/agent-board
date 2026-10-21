@@ -433,7 +433,9 @@ operator's comments outside the followed repositories (agent-board#104):
 organization or a repository. Each pass makes one search
 (`commenter:OPERATOR updated:>=CURSOR` in those scopes, oldest update first,
 three pages of 20 threads), resuming from a cursor and page in the state file
-at the first thread not done with, and reads the
+at the first thread not done with (a resumed search read to its end is read
+once more from its start where threads updated meanwhile may have moved one
+not yet read before where it resumed), and reads the
 comments, reviews and review comments of each thread found. The operator's
 comments from the last two days that no round's marker or triage claim of
 the bot's names start one run a thread: on an open pull request the bot opened
