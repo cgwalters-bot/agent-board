@@ -642,10 +642,13 @@ poll hold removal, state replacement and a daily project update) have separate
 trusted-config daily caps, all off by default. See the
 [request protocol and evidence requirements](supervisor-requests.md). It never
 merges, enqueues, changes variables or reads secrets. Its
-settings are the poll's agent-board.json (`--config`), the supervisor's file
-(`--supervisor-config`, tracker's `.github/supervisor/config.json` with
-`agent.maxDispatchesPerPass`, `agent.maxDispatchesPerDay` and `agent.kinds`)
-and, optionally, the usage snapshot's location (`--usage-config`). The checks
+settings are the poll's agent-board.json (`--config`, which for the supervisor
+must also name `epics.repository`), the supervisor's file
+(`--supervisor-config`, tracker's `.github/supervisor/config.json`) and,
+optionally, the usage snapshot's location (`--usage-config`); every key is in
+the [supervisor configuration](supervisor-requests.md#configuration). The
+release train and scheduler-log settings are optional, so an organization
+without them leaves those checks not configured, and `unset` names them. The checks
 have been exercised against recorded responses only.
 
 `test project --sweep` fails before authentication or network access. Editable

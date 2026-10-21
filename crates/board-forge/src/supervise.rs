@@ -285,10 +285,13 @@ pub struct AgentSettings {
 }
 
 /// The supervisor file's optional settings that switch something on, read
-/// through [`known`] as [`POLL_OPTIONS`] are: `agent`, and within it these.
+/// as [`POLL_OPTIONS`] are: `agent`, and within it these.
 /// The [`Limits`] are left out: each has a working default and only tunes a
-/// check, so one left unset is not a feature left off.
-pub const SUPERVISOR_OPTIONS: &[&str] = &["agent"];
+/// check, so one left unset is not a feature left off. `schedulerJob` and
+/// `releaseRepository` (standing for its group) were once required: listed,
+/// one dropped or misspelled shows in `unset` rather than leaving its checks
+/// "not configured" unseen.
+pub const SUPERVISOR_OPTIONS: &[&str] = &["agent", "schedulerJob", "releaseRepository"];
 pub const AGENT_OPTIONS: &[&str] = &[
     "kinds",
     "maxDispatchesPerPass",
@@ -345,11 +348,13 @@ pub struct Settings {
     pub poll_workflow: String,
     pub probe_workflow: String,
     pub supervisor_workflow: String,
-    pub scheduler_job: String,
+    /// The poll workflow's scheduler job, whose log the idle and stuck checks
+    /// read; absent, those checks are not configured.
+    pub scheduler_job: Option<String>,
     pub implement_branch_prefix: String,
-    pub release_repository: String,
-    pub wrapper_repository: String,
-    pub wrapper_path: String,
+    /// The release whose pin the wrapper carries; absent, the release check
+    /// is not configured.
+    pub release: Option<Release>,
     /// The dispatch repository's release-train workflow file; absent, the
     /// release check does not ask whether a due release has waited for it.
     pub release_train_workflow: Option<String>,
@@ -357,6 +362,23 @@ pub struct Settings {
     pub agent: Option<AgentSettings>,
     /// The known options the files leave unset ([`unset`]).
     pub unset: Vec<String>,
+}
+
+/// A repository's releases and the wrapper workflow that pins them: the
+/// release check compares the wrapper's pin with the latest release.
+#[derive(Clone, Debug)]
+pub struct Release {
+    pub repository: String,
+    pub wrapper_repository: String,
+    pub wrapper_path: String,
+}
+
+/// An optional name: absent or null is `None`, anything else a nonempty string.
+fn optional_string(value: &Value, key: &str, what: &str) -> Result<Option<String>> {
+    if value.get(key).is_none_or(Value::is_null) {
+        return Ok(None);
+    }
+    string(value, key, what).map(Some)
 }
 
 fn string(value: &Value, key: &str, what: &str) -> Result<String> {
@@ -432,31 +454,45 @@ impl Settings {
             "pollWorkflow",
             "probeWorkflow",
             "supervisorWorkflow",
-            "schedulerJob",
             "implementBranchPrefix",
-            "releaseRepository",
-            "wrapperRepository",
-            "wrapperPath",
         ] {
             names.insert(key, string(supervisor, key, what)?);
         }
         for key in ["pollWorkflow", "probeWorkflow", "supervisorWorkflow"] {
             validate_workflow(&names[key])?;
         }
-        for key in ["releaseRepository", "wrapperRepository"] {
-            validate_repository(&names[key])?;
+        // Only a job name, matched against the poll run's jobs.
+        let scheduler_job = optional_string(supervisor, "schedulerJob", what)?;
+        // The release check needs all three; some without the others is a
+        // mistake to report, not a check to switch off quietly.
+        let release = match (
+            optional_string(supervisor, "releaseRepository", what)?,
+            optional_string(supervisor, "wrapperRepository", what)?,
+            optional_string(supervisor, "wrapperPath", what)?,
+        ) {
+            (None, None, None) => None,
+            (Some(repository), Some(wrapper_repository), Some(wrapper_path)) => {
+                validate_repository(&repository)?;
+                validate_repository(&wrapper_repository)?;
+                validate_path(&wrapper_path)?;
+                Some(Release {
+                    repository,
+                    wrapper_repository,
+                    wrapper_path,
+                })
+            }
+            _ => bail!(
+                "{what}: releaseRepository, wrapperRepository and wrapperPath are set together or not at all"
+            ),
+        };
+        let release_train_workflow = optional_string(supervisor, "releaseTrainWorkflow", what)?;
+        if let Some(name) = &release_train_workflow {
+            validate_workflow(name)?;
         }
-        validate_path(&names["wrapperPath"])?;
-        let release_train_workflow = supervisor
-            .get("releaseTrainWorkflow")
-            .map(|v| -> Result<String> {
-                let name = v
-                    .as_str()
-                    .context("supervisor config releaseTrainWorkflow")?;
-                validate_workflow(name)?;
-                Ok(name.to_owned())
-            })
-            .transpose()?;
+        ensure!(
+            release.is_some() || release_train_workflow.is_none(),
+            "{what}: releaseTrainWorkflow needs releaseRepository"
+        );
         // Compared with branch names and sent, encoded, as a query value.
         let prefix = &names["implementBranchPrefix"];
         ensure!(
@@ -493,11 +529,9 @@ impl Settings {
             poll_workflow: names["pollWorkflow"].clone(),
             probe_workflow: names["probeWorkflow"].clone(),
             supervisor_workflow: names["supervisorWorkflow"].clone(),
-            scheduler_job: names["schedulerJob"].clone(),
+            scheduler_job,
             implement_branch_prefix: names["implementBranchPrefix"].clone(),
-            release_repository: names["releaseRepository"].clone(),
-            wrapper_repository: names["wrapperRepository"].clone(),
-            wrapper_path: names["wrapperPath"].clone(),
+            release,
             release_train_workflow,
             usage,
             agent: agent_settings(known(SUPERVISOR_OPTIONS, supervisor, "agent")?)?,
@@ -719,6 +753,53 @@ mod tests {
             .agent
             .unwrap();
         assert_eq!(agent.max_dispatches_per_day, 0);
+    }
+
+    #[test]
+    fn the_release_and_scheduler_settings_are_optional_but_not_partial() {
+        let s = settings();
+        assert_eq!(s.scheduler_job.as_deref(), Some("board"));
+        assert_eq!(
+            s.release.unwrap().wrapper_path,
+            ".github/workflows/wrapper.yml"
+        );
+        let optional = [
+            "schedulerJob",
+            "releaseRepository",
+            "wrapperRepository",
+            "wrapperPath",
+        ];
+        let mut cfg = supervisor();
+        for key in optional {
+            cfg.as_object_mut().unwrap().remove(key);
+        }
+        let s = Settings::from_json(&board(), &cfg, None).unwrap();
+        assert!(s.scheduler_job.is_none() && s.release.is_none());
+        // Left out, they are named by the unset check, so a dropped or
+        // misspelled key is seen.
+        for key in ["schedulerJob", "releaseRepository"] {
+            assert!(s.unset.contains(&key.to_owned()), "{key}");
+        }
+        assert!(!settings().unset.contains(&"schedulerJob".to_owned()));
+        // Null reads as absent; an empty name is a mistake.
+        for key in optional.into_iter().chain(["releaseTrainWorkflow"]) {
+            cfg[key] = Value::Null;
+        }
+        assert!(Settings::from_json(&board(), &cfg, None).is_ok());
+        let mut empty = cfg.clone();
+        empty["schedulerJob"] = json!("");
+        assert!(Settings::from_json(&board(), &empty, None).is_err());
+        // The release check's three names come together, and the train
+        // check needs them.
+        for key in ["releaseRepository", "wrapperRepository", "wrapperPath"] {
+            let mut cfg = supervisor();
+            cfg.as_object_mut().unwrap().remove(key);
+            let err = Settings::from_json(&board(), &cfg, None).unwrap_err();
+            assert!(err.to_string().contains("together"), "{key}: {err}");
+        }
+        cfg["releaseTrainWorkflow"] = json!("release-train.yml");
+        let err = Settings::from_json(&board(), &cfg, None).unwrap_err();
+        assert!(err.to_string().contains("needs releaseRepository"), "{err}");
     }
 
     #[test]

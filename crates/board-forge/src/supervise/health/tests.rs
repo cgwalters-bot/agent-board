@@ -303,6 +303,45 @@ fn unset_options_warn_by_name_and_none_is_ok() {
 }
 
 #[test]
+fn checks_left_unconfigured_are_ok_and_read_nothing() {
+    let (_, now) = recorded();
+    let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> { bail!("HTTP 403") });
+    let mut s = settings();
+    let ids = ["release", "idle", "stuck"];
+    // Configured, a read that fails is a blind spot.
+    let snapshot = collect(&fake, &s, "main", now, None);
+    for id in ids {
+        assert_eq!(check(&snapshot, id, now)["status"], "warn", "{id}");
+    }
+    s.release = None;
+    s.release_train_workflow = None;
+    s.scheduler_job = None;
+    let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> { bail!("HTTP 403") });
+    let snapshot = collect(&fake, &s, "main", now, None);
+    for id in ids {
+        let result = check(&snapshot, id, now);
+        assert_eq!(result["status"], "ok", "{id}");
+        assert_eq!(result["suggested_action"], "Not configured.", "{id}");
+        assert_eq!(result["evidence"], json!([]), "{id}");
+    }
+    assert!(
+        !fake
+            .calls
+            .borrow()
+            .iter()
+            .any(|c| c.contains("/releases/") || c.contains("/contents/") || c.contains("/jobs")),
+        "{:?}",
+        fake.calls.borrow()
+    );
+    // Other checks are unaffected.
+    assert_eq!(check(&snapshot, "poll", now)["status"], "warn");
+    // Nor can an item's own data switch a check off: an epic's checkpoint
+    // is the bot's comment.
+    let epic = json!([{"configured": false, "missing": false, "failures": 3}]);
+    assert_eq!(status("epics", epic, now), "fail");
+}
+
+#[test]
 fn an_observation_unavailable_for_an_hour_fails() {
     let (_, now) = recorded();
     let at = |minutes: i64| iso(now - minutes * 60_000);

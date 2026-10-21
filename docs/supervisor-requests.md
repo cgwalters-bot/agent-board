@@ -9,25 +9,98 @@ Unknown actions, unknown fields and incomplete evidence refuse the whole batch
 before any write, including its reservation in the log. No request can select an
 API endpoint, configuration file, credential, assignee or arbitrary label.
 
-The existing trusted supervisor configuration's `agent` object may additionally
-contain:
+## Configuration
+
+Every `supervise` command reads two files: the poll's agent-board.json
+(`--config`) and the supervisor's own file (`--supervisor-config`). `health`,
+`trigger` and `execute` may also take `--usage-config`, the usage snapshot's
+`{"repo", "issue", "bot"}` (`repository` may stand for `repo`); without it the `pace` check is unavailable.
+
+From agent-board.json the supervisor requires `operator`, `bot`,
+`dispatchRepo`, `dispatchWorkflow` and `epics.repository`: the repository whose
+open `epic`-labeled issues are the plans, which the poll does not read. It
+also reads `follow`, `schedule.repositories` (whose implement runs the dispatch
+check reads), `mergeAuthors`, `kindPools` and `generatedBy` when they are set.
+
+A complete supervisor file:
 
 ```json
 {
-  "dailyCaps": {
-    "comment": 4,
-    "create_issue": 2,
-    "file_bug": 2,
-    "close": 2,
-    "remove_needs_human": 1,
-    "replace_state": 4,
-    "status_update": 1
-  },
-  "tracker": "OWNER/tracker",
-  "state": {"repository": "OWNER/tracker", "issue": 123},
-  "project": "PVT_CONFIGURED_NODE_ID"
+  "pollWorkflow": "poll.yml",
+  "probeWorkflow": "broker-probe.yml",
+  "supervisorWorkflow": "supervisor.yml",
+  "implementBranchPrefix": "dispatch/implement/agent-run-",
+  "schedulerJob": "board",
+  "releaseRepository": "OWNER/agentic-job",
+  "wrapperRepository": "OWNER/actions",
+  "wrapperPath": ".github/workflows/wrapper.yml",
+  "releaseTrainWorkflow": "release-train.yml",
+  "maxRequests": 500,
+  "agent": {
+    "pool": "large",
+    "cooldownHours": 1,
+    "requests": {"repository": "OWNER/tracker", "issue": 5},
+    "log": {"repository": "OWNER/operator", "issue": 7},
+    "kinds": ["triage", "research"],
+    "maxDispatchesPerPass": 2,
+    "maxDispatchesPerDay": 3,
+    "dailyCaps": {
+      "comment": 4,
+      "create_issue": 2,
+      "file_bug": 2,
+      "close": 2,
+      "remove_needs_human": 1,
+      "replace_state": 4,
+      "status_update": 1
+    },
+    "tracker": "OWNER/tracker",
+    "state": {"repository": "OWNER/tracker", "issue": 123},
+    "project": "PVT_CONFIGURED_NODE_ID"
+  }
 }
 ```
+
+Required:
+
+- `pollWorkflow`, `probeWorkflow`: the workflow files, in `dispatchRepo`, of
+  the poll and the broker probe, whose default-branch runs the `poll` and
+  `broker` checks read.
+- `supervisorWorkflow`: the supervisor's own workflow file, whose recent
+  agent runs the cooldown counts.
+- `implementBranchPrefix`: the head-branch prefix of agentic-job's implement
+  pull requests, which the `stuck` and `unclosed` checks match.
+
+Optional, each switching off only the checks that need it. Such a check
+reports `ok` with "Not configured." and makes no request, and the `unset`
+check names `schedulerJob` or `releaseRepository` while it is left out, so a
+dropped or misspelled key is seen:
+
+- `schedulerJob`: the poll workflow's scheduler job, whose log the `idle` and
+  `stuck` checks read.
+- `releaseRepository`, `wrapperRepository` and `wrapperPath`, all three or
+  none: the repository whose latest release the `release` check compares with
+  the pin in the wrapper workflow at that path.
+- `releaseTrainWorkflow`: the release train's workflow file in `dispatchRepo`;
+  with it, the `release` check also fails a due release the train has not run
+  for. It needs `releaseRepository`.
+- The check thresholds and request bounds (`pageSize`, `maxRequests`,
+  `collectionTimeoutSeconds`, `pollFailures`, `runTimeoutMinutes`,
+  `probeStaleMinutes`, `epicStaleHours`, `epicFailures`, `approvedWaitHours`,
+  `decisionWaitHours`, `eventLookbackHours`, `maxPages`, `maxItems`,
+  `maxEvidence`, `maxDownloadBytes`, `unavailableFailHours`, `idlePasses`,
+  `holdWaitHours`, `unqueuedWaitHours`, `unclosedWaitHours`,
+  `paceMarginPercent`, `usageStaleMinutes`, `releaseIntervalHours`,
+  `releaseOverdueHours`), each with a working default (`Limits::default` in
+  `crates/board-forge/src/supervise.rs`).
+- `agent`: the agent and the executor. It is off unless both `agent.requests`
+  (the issue the agent posts its one comment of requests on) and `agent.log`
+  (the operator's log, where the executor records every pass) are set. With
+  either one missing it is off without an error, and `trigger` says "the
+  requests and log issues are not configured". When it is on, `agent.pool`
+  (the pools file's pool the agent's run uses) and `agent.cooldownHours` (how
+  long after an agent run a failing check may start another, a positive number) are
+  required. The cooldown applies outside the daily pass. `kinds`, `maxDispatchesPerPass`, `maxDispatchesPerDay`,
+  `dailyCaps`, `tracker`, `state` and `project` are described below.
 
 All new daily caps default to zero (disabled), accept integers from zero to 100,
 and `status_update` accepts at most one. Dispatches of all admitted kinds share
