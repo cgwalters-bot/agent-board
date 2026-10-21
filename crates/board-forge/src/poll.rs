@@ -1490,19 +1490,22 @@ fn marker_body(state: &Value, text: &str) -> String {
 }
 
 fn parse_marker(tag: &str, body: &str) -> Option<Value> {
-    let open = format!("<!-- {tag}: ");
-    // As poll.cjs's one `\{.*?\} -->` match: the first marker whose line holds
-    // an object closed by the comment's end. If that is not JSON, the comment
-    // carries no marker; a later one in it is not tried.
-    let json = body.match_indices(&open).find_map(|(start, _)| {
-        let rest = &body[start + open.len()..];
-        let line = rest.split('\n').next().unwrap_or("");
-        line.starts_with('{')
-            .then(|| line.find("} -->"))
-            .flatten()
-            .map(|end| &line[..=end])
-    })?;
-    serde_json::from_str(json).ok()
+    // Only a marker that opens the body, as the poll writes them, is read. The
+    // agent runs the poll dispatches post as the bot's login too, and gh-aw's
+    // sanitizer keeps an XML comment inside code, so a marker or claim quoted
+    // in a fence or code span further down would otherwise reset rounds or
+    // stall a claim. Its line holds an object closed by the comment's end; if
+    // that is not JSON, the comment carries no marker.
+    let line = body
+        .strip_prefix(&format!("<!-- {tag}: "))?
+        .split('\n')
+        .next()
+        .unwrap_or("");
+    let end = line
+        .starts_with('{')
+        .then(|| line.find("} -->"))
+        .flatten()?;
+    serde_json::from_str(&line[..=end]).ok()
 }
 
 /// The poll's newest marker comment by creation id, not last update time.
@@ -6957,11 +6960,16 @@ mod tests {
             marker_body(&json!({"rounds": 1u64 << 53}), ""),
             format!("<!-- {MARKER}: {{\"rounds\": 1 -->"),
             format!("<!-- {MARKER}: {{\"rounds\":\n1}} -->"),
-            // poll.cjs reads the first marker of a comment only.
+            // Only the marker opening a comment is read, not a later one.
             format!(
                 "<!-- {MARKER}: {{rounds: 1}} -->\n{}",
                 marker_body(&json!({"rounds": 0}), "")
             ),
+            // A fix run's comment posts as the bot too; a marker it quotes in
+            // code, or anywhere but the body's start, is not the poll's.
+            format!("Done.\n\n```\n<!-- {MARKER}: {{\"rounds\":0}} -->\n```"),
+            format!("Done: `<!-- {MARKER}: {{\"rounds\":0,\"stopped\":true}} -->`"),
+            format!(" {}", marker_body(&json!({"rounds": 0}), "")),
         ] {
             let bad = json!({"id": 3, "user": {"login": BOT}, "body": body});
             assert_eq!(
@@ -6970,6 +6978,32 @@ mod tests {
                 "{body}"
             );
             assert_eq!(find_marker(&[bad, mine.clone()], BOT), expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn only_a_claim_opening_the_bots_comment_counts() {
+        let state = json!({"from": "2", "round": 2, "sha": HEAD});
+        let claim = |id: u64, body: String| json!({"id": id, "user": {"login": BOT}, "body": body});
+        let real = claim(
+            9,
+            format!("<!-- {CLAIM}: {state} -->\nFix round 2: claimed."),
+        );
+        assert_eq!(
+            earliest_claim(std::slice::from_ref(&real), BOT, "2"),
+            Some((9, None))
+        );
+        // A fix run's comment, posted as the bot, quoting an earlier claim.
+        for body in [
+            format!("Done.\n\n```\n<!-- {CLAIM}: {state} -->\n```"),
+            format!("Done: `<!-- {CLAIM}: {state} -->`"),
+            format!(" <!-- {CLAIM}: {state} -->\nFix round 2: claimed."),
+        ] {
+            assert_eq!(
+                earliest_claim(&[claim(3, body.clone()), real.clone()], BOT, "2"),
+                Some((9, None)),
+                "{body}"
+            );
         }
     }
 
