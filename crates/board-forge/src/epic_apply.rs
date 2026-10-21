@@ -59,6 +59,8 @@ impl Preconditions {
 #[derive(Debug)]
 pub struct Config {
     pub operator: String,
+    /// Plan writer besides the operator; the bot when not configured.
+    pub planner: String,
     pub bot: String,
     pub bounds: Bounds,
     pub project: String,
@@ -79,6 +81,7 @@ impl Config {
             ensure!(
                 [
                     "operator",
+                    "planner",
                     "bot",
                     "repositories",
                     "project",
@@ -102,8 +105,14 @@ impl Config {
         };
         let operator = text("operator")?;
         let bot = text("bot")?;
+        let planner = match object.get("planner") {
+            None => bot.clone(),
+            Some(_) => text("planner")?,
+        };
         ensure!(
-            is_github_login(&operator) && is_github_login(&bot),
+            [&operator, &planner, &bot]
+                .iter()
+                .all(|l| is_github_login(l)),
             "invalid configured login"
         );
         let repositories = object
@@ -154,6 +163,7 @@ impl Config {
         );
         Ok(Self {
             operator,
+            planner,
             bot,
             bounds,
             project: text("project")?,
@@ -165,7 +175,15 @@ impl Config {
         })
     }
 
+    /// Whose plans count, as for `epic plan --operator --planner`. With a
+    /// separate planner the bot's own comments (claims, status, poll markers)
+    /// are not plans.
     pub fn writers(&self) -> [&str; 2] {
+        [&self.operator, &self.planner]
+    }
+
+    /// Whose claims count: only the operator and the bot that applies.
+    fn claimers(&self) -> [&str; 2] {
         [&self.operator, &self.bot]
     }
 }
@@ -199,7 +217,7 @@ fn records(comments: &[Comment], config: &Config, id: &str) -> Vec<u64> {
         .filter(|c| {
             c.author
                 .as_deref()
-                .is_some_and(|a| config.writers().iter().any(|w| w.eq_ignore_ascii_case(a)))
+                .is_some_and(|a| config.claimers().iter().any(|w| w.eq_ignore_ascii_case(a)))
                 && c.body.lines().next().map(str::trim_end) == Some(marker.as_str())
         })
         .map(|c| {
@@ -567,9 +585,13 @@ mod tests {
     }
 
     fn comment(id: u64, body: String, editor: Option<&str>) -> Value {
+        authored(id, body, editor, "planner")
+    }
+
+    fn authored(id: u64, body: String, editor: Option<&str>, author: &str) -> Value {
         json!({"url": format!("https://github.com/example/epics/issues/1#issuecomment-{id}"), "body": body,
             "createdAt": "2026-10-14T10:00:00Z", "lastEditedAt": editor.map(|_| "2026-10-14T11:00:00Z"),
-            "author": {"login": "planner"}, "editor": editor.map(|login| json!({"login": login}))})
+            "author": {"login": author}, "editor": editor.map(|login| json!({"login": login}))})
     }
 
     /// A labelings timeline, oldest first: (actor type, login, label).
@@ -758,10 +780,11 @@ mod tests {
             }
             if method == "POST" && path == "repos/example/epics/issues/1/comments" {
                 let id = self.comments.borrow().len() as u64 + 1;
-                self.comments.borrow_mut().push(comment(
+                self.comments.borrow_mut().push(authored(
                     id,
                     body["body"].as_str().unwrap().into(),
                     None,
+                    self.login,
                 ));
                 return Ok((201, json!({"id": id})));
             }
@@ -1116,6 +1139,77 @@ mod tests {
         assert_eq!(fingerprint(&epic).unwrap(), first);
         epic.closed.push(epic.sub_issues.pop().unwrap());
         assert_ne!(fingerprint(&epic).unwrap(), first);
+    }
+
+    #[test]
+    fn a_separate_planner_writes_plans_and_the_bot_claims() {
+        let separate = |planner: Value| {
+            let mut value = json!({"operator": "operator", "bot": "applier", "repositories": ["example/work"],
+                "project": "P_config", "priority_field": "Order", "priority_field_id": "F_config",
+                "priorities": {"High": "O_high", "Normal": "O_normal"}, "default_priority": "Normal"});
+            value["planner"] = planner;
+            Config::from_json(&value)
+        };
+        for bad in [json!(""), json!("not a login!"), json!(null), json!(7)] {
+            assert!(separate(bad).is_err());
+        }
+        // Without a planner the bot writes plans, as before.
+        assert_eq!(config().writers()[1], config().bot);
+        let config = separate(json!("planner")).unwrap();
+        assert_eq!(config.writers(), ["operator", "planner"]);
+
+        let mut forge = Forge::new(json!([
+            {"type": "set_priority", "issue": "example/work#2", "value": "High"}
+        ]));
+        forge.login = "applier";
+        // A newer fenced comment from the bot is not a plan once a planner is named.
+        let decoy = json!({"schema": EPIC_PLAN_SCHEMA, "epic": "example/epics#1", "actions": [
+            {"type": "close_sub_issue", "issue": "example/work#3", "reason": "decoy"}]});
+        forge.comments.borrow_mut().push(authored(
+            2,
+            format!("```{EPIC_PLAN_FENCE}\n{decoy}\n```"),
+            None,
+            "applier",
+        ));
+        let mutations = preview(&forge, &issue(), &config).unwrap();
+        assert!(
+            mutations
+                .iter()
+                .all(|m| !m.to_string().contains("issues/3"))
+        );
+        assert!(mutations.iter().any(|m| m["value"] == "High"));
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let fresh = forge.comments.borrow().clone();
+        apply(&forge, &issue(), &config, now).unwrap();
+        assert!(!forge.closed.get());
+        // A claim the planner posts does not stop the bot's apply.
+        let claim = forge.comments.borrow()[2]["body"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut planted = Forge::new(json!([
+            {"type": "set_priority", "issue": "example/work#2", "value": "High"}
+        ]));
+        planted.login = "applier";
+        *planted.comments.borrow_mut() = fresh;
+        planted
+            .comments
+            .borrow_mut()
+            .push(authored(3, claim, None, "planner"));
+        assert_ne!(
+            apply(&planted, &issue(), &config, now).unwrap(),
+            ["Already claimed; nothing changed."]
+        );
+        // The bot's claim, not the planner's, stops the replay.
+        let writes = forge.requests.borrow().len();
+        assert_eq!(
+            apply(&forge, &issue(), &config, now).unwrap(),
+            ["Already claimed; nothing changed."]
+        );
+        assert_eq!(forge.requests.borrow().len(), writes);
+        // The planner's token may not apply.
+        forge.login = "planner";
+        assert!(apply(&forge, &issue(), &config, now).is_err());
     }
 
     #[test]
