@@ -12,7 +12,7 @@
 //! correctness. GraphQL cannot be revalidated, so each pull request followed
 //! costs one query a pass.
 use crate::github::{API_ROOT, Transport, is_github_login};
-use crate::{FOOTER, overlap};
+use crate::{Footer, overlap};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::admission;
 use serde_json::{Value, json};
@@ -293,6 +293,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "fixPools",
     "reviewWorkflow",
     "dispatchWorkflow",
+    "generatedBy",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -360,6 +361,9 @@ pub struct PollPolicy {
     /// repository, as before. Activity, the operator's comments and the lock
     /// step keep their own bounds and are not part of it.
     pub repositories_per_pass: Option<usize>,
+    /// `generatedBy`: the attribution the poll's comments end with; none
+    /// (the default) keeps [`crate::FOOTER`].
+    pub footer: Footer,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -636,6 +640,7 @@ impl PollPolicy {
                         })
                 })
                 .transpose()?,
+            footer: Footer::from_json(get("generatedBy")?)?,
         })
     }
 }
@@ -1531,8 +1536,8 @@ impl Marker {
     }
 }
 
-fn marker_body(state: &Value, text: &str) -> String {
-    format!("<!-- {MARKER}: {state} -->\n{text}\n\n{FOOTER}")
+fn marker_body(state: &Value, text: &str, footer: &Footer) -> String {
+    format!("<!-- {MARKER}: {state} -->\n{text}\n\n{footer}")
 }
 
 fn parse_marker(tag: &str, body: &str) -> Option<Value> {
@@ -2853,6 +2858,11 @@ struct FailedJob {
 }
 
 impl<R: Rest, G: Transport> Pass<'_, R, G> {
+    /// A marker comment's body, signed with the configured attribution.
+    fn marker_body(&self, state: &Value, text: &str) -> String {
+        marker_body(state, text, &self.config.policy.footer)
+    }
+
     fn spend(&mut self) -> Result<()> {
         ensure!(
             self.remaining > 0,
@@ -2909,7 +2919,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             rest,
             "POST",
             &format!("repos/{repo}/issues/{number}/comments"),
-            json!({"body": marker_body(&marker.state(), text)}),
+            json!({"body": self.marker_body(&marker.state(), text)}),
             0,
         )?;
         marker.id = Some(
@@ -2929,7 +2939,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             rest,
             "PATCH",
             &format!("repos/{repo}/issues/comments/{id}"),
-            json!({"body": marker_body(&marker.state(), text)}),
+            json!({"body": self.marker_body(&marker.state(), text)}),
             0,
         )?;
         Ok(())
@@ -3045,7 +3055,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "POST",
             &comments,
             json!({"body": format!(
-                "<!-- {CLAIM}: {state} -->\n{of}: claimed.\n\n{FOOTER}"
+                "<!-- {CLAIM}: {state} -->\n{of}: claimed.\n\n{}",
+                self.config.policy.footer
             )}),
             0,
         )?;
@@ -4644,6 +4655,11 @@ pub fn run<R: Rest, G: Transport>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    /// A marker as a pass with the default attribution posts it.
+    pub(super) fn marker_body(state: &Value, text: &str) -> String {
+        super::marker_body(state, text, &Footer::default())
+    }
 
     const BOT: &str = "cgwalters-bot";
     const HEAD: &str = "488f45ebacd03a8bc88dceb3d703a5322850ce77";

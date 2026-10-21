@@ -1,6 +1,7 @@
 //! Typed writes, never agent-selected API paths. Free comments must not become
 //! bot-authored plans, poll markers or execution receipts on the next pass.
 use super::*;
+use crate::Footer;
 use serde::Deserialize;
 
 pub const ACTIONS: &[&str] = &[
@@ -134,9 +135,9 @@ pub(super) fn has_label(issue: &Value, label: &str) -> bool {
     })
 }
 
-fn text(body: &str, max: usize, protocols: bool) -> Result<()> {
+fn text(body: &str, max: usize, protocols: bool, footer: &Footer) -> Result<()> {
     ensure!(
-        !unsigned(body).is_empty() && body.chars().count() <= max,
+        !unsigned(body, footer).is_empty() && body.chars().count() <= max,
         "Empty or oversized supervisor text"
     );
     if protocols {
@@ -152,19 +153,24 @@ fn text(body: &str, max: usize, protocols: bool) -> Result<()> {
     Ok(())
 }
 
-/// `body` without the attribution the agent may have added, trimmed.
-fn unsigned(body: &str) -> &str {
+/// `body` without the attribution the agent may have added, trimmed. Only a
+/// line of its own: a configured `generatedBy` may be a word that ends a
+/// sentence too.
+fn unsigned<'a>(body: &'a str, footer: &Footer) -> &'a str {
     let body = body.trim();
-    body.strip_suffix(crate::FOOTER).unwrap_or(body).trim()
+    match body.strip_suffix(footer.as_str()) {
+        Some(rest) if rest.is_empty() || rest.ends_with('\n') => rest.trim(),
+        _ => body,
+    }
 }
 
 /// `body` signed with the attribution the agent may have left out, once and
 /// last, after `note`.
-fn signed(body: &str, note: Option<&str>) -> String {
-    let body = unsigned(body);
+pub(super) fn signed(body: &str, note: Option<&str>, footer: &Footer) -> String {
+    let body = unsigned(body, footer);
     match note {
-        Some(note) => format!("{body}\n\n{note}\n\n{}", crate::FOOTER),
-        None => format!("{body}\n\n{}", crate::FOOTER),
+        Some(note) => format!("{body}\n\n{note}\n\n{footer}"),
+        None => format!("{body}\n\n{footer}"),
     }
 }
 
@@ -229,7 +235,7 @@ impl Checked {
         }
         if let Self::Write(w) = self {
             match w {
-                Write::Comment { body, .. } => text(body, 4000, true)?,
+                Write::Comment { body, .. } => text(body, 4000, true, &p.settings.footer)?,
                 Write::CreateIssue { title, body } | Write::FileBug { title, body } => {
                     let repo = p
                         .agent
@@ -240,8 +246,8 @@ impl Checked {
                         p.settings.follow.iter().any(|r| r == repo),
                         "Tracker outside supervisor repositories"
                     );
-                    text(title, 256, true)?;
-                    text(body, 4000, true)?;
+                    text(title, 256, true, &p.settings.footer)?;
+                    text(body, 4000, true, &p.settings.footer)?;
                 }
                 Write::ReplaceState { body } => {
                     let state = p
@@ -262,7 +268,7 @@ impl Checked {
                         ["on-track", "at-risk", "off-track"].contains(&status.as_str()),
                         "Unknown project status"
                     );
-                    text(body, 4000, true)?;
+                    text(body, 4000, true, &p.settings.footer)?;
                 }
                 Write::Close {
                     triage_run,
@@ -397,7 +403,7 @@ impl Checked {
                     format!("/repos/{repository}/issues/{item}/comments"),
                     // The bot posts it, so mark it as the agent's: dispatch
                     // admission refuses a conversation holding this note.
-                    json!({"body": signed(body, Some(crate::input::SUPERVISOR_NOTE))}),
+                    json!({"body": signed(body, Some(crate::input::SUPERVISOR_NOTE), &p.settings.footer)}),
                 ),
                 Write::CreateIssue { title, body } => (
                     "POST",
@@ -405,7 +411,7 @@ impl Checked {
                         "/repos/{}/issues",
                         p.agent.tracker.as_deref().context("No tracker")?
                     ),
-                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE)), "assignees": [p.settings.operator], "labels": ["needs-human"]}),
+                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE), &p.settings.footer), "assignees": [p.settings.operator], "labels": ["needs-human"]}),
                 ),
                 // Unheld, so the note alone keeps the supervisor from making
                 // the agent's words a later run's brief until a person removes it.
@@ -415,7 +421,7 @@ impl Checked {
                         "/repos/{}/issues",
                         p.agent.tracker.as_deref().context("No tracker")?
                     ),
-                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE))}),
+                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE), &p.settings.footer)}),
                 ),
                 Write::Close {
                     repository, item, ..
@@ -447,7 +453,7 @@ impl Checked {
                     "/graphql".into(),
                     json!({
                         "query": "mutation($project:ID!,$status:ProjectV2StatusUpdateStatus!,$body:String!){createProjectV2StatusUpdate(input:{projectId:$project,status:$status,body:$body}){statusUpdate{id}}}",
-                        "variables": {"project": p.agent.project, "status": status.replace('-', "_").to_ascii_uppercase(), "body": signed(body, None)}
+                        "variables": {"project": p.agent.project, "status": status.replace('-', "_").to_ascii_uppercase(), "body": signed(body, None, &p.settings.footer)}
                     }),
                 ),
             },

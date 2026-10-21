@@ -22,8 +22,13 @@ use std::collections::BTreeSet;
 
 pub(super) mod judgment;
 
-/// The instructions the agent's task opens with.
+/// The instructions the agent's task opens with, [`OPERATOR`] replaced by
+/// the configured operator.
 pub const PLAYBOOK: &str = include_str!("playbook.md");
+/// Where the playbook names the one login whose text is instructions: the
+/// caller's `operator`, so another deployment's operator is not data to its
+/// own supervisor (agent-board#226).
+const OPERATOR: &str = "{{operator}}";
 /// Implementation additionally requires native parentage under a live,
 /// epic-labeled plan in the configured epics repository.
 pub const DISPATCH_KINDS: &[&str] = &["triage", "research", "implement"];
@@ -206,6 +211,7 @@ pub fn recent_agent(
 /// The agent's task: the playbook, the policy it is held to and the report.
 pub fn compose(checks: &[Value], policy: &Policy, reason: &str) -> Result<String> {
     let shown = json!({
+        "operator": policy.settings.operator,
         "repositories": policy.settings.follow,
         "kinds": policy.kinds(),
         "pools": policy.pools,
@@ -218,8 +224,11 @@ pub fn compose(checks: &[Value], policy: &Policy, reason: &str) -> Result<String
         "tracker": policy.agent.tracker,
         "project": policy.agent.project,
     });
+    // The operator is a checked login ([`Settings::from_json`]), so it
+    // cannot add text of its own to the playbook.
+    let playbook = PLAYBOOK.replace(OPERATOR, &policy.settings.operator);
     let task = format!(
-        "{PLAYBOOK}\n## This pass\n\nWhy you run: {reason}.\n\nPolicy:\n\n```json\n{}\n```\n\nHealth report:\n\n```json\n{}\n```\n",
+        "{playbook}\n## This pass\n\nWhy you run: {reason}.\n\nPolicy:\n\n```json\n{}\n```\n\nHealth report:\n\n```json\n{}\n```\n",
         serde_json::to_string_pretty(&shown)?,
         serde_json::to_string_pretty(checks)?
     );

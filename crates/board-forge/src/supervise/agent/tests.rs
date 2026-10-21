@@ -833,7 +833,8 @@ fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
     let s = settings();
     let p = policy(&s);
     let task = compose(&checks("fail"), &p, "release failing").unwrap();
-    assert!(task.starts_with(PLAYBOOK));
+    let (head, _) = PLAYBOOK.split_once(OPERATOR).unwrap();
+    assert!(task.starts_with(head));
     assert!(task.contains("Why you run: release failing."));
     assert!(task.contains("\"maxDispatchesPerPass\": 2"));
     assert!(task.contains("\"no-plan\""));
@@ -844,6 +845,23 @@ fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
         .map(|i| json!({"id": i, "evidence": ["https://github.com/o/r/issues/1"]}))
         .collect();
     assert!(compose(&big, &p, "r").is_err());
+}
+
+#[test]
+fn the_task_names_the_configured_operator_and_no_other_login() {
+    for operator in ["owner", "someone-else"] {
+        let mut board = board();
+        board["operator"] = json!(operator);
+        let s = Settings::from_json(&board, &supervisor(), None).unwrap();
+        let task = compose(&checks("fail"), &policy(&s), "r").unwrap();
+        assert!(
+            task.contains(&format!("anyone but\n{operator}, the policy's `operator`")),
+            "{operator}"
+        );
+        assert!(task.contains(&format!("\"operator\": \"{operator}\"")));
+        assert!(!task.contains(OPERATOR), "{operator}");
+        assert!(!task.contains("cgwalters"), "{operator}");
+    }
 }
 
 #[test]
