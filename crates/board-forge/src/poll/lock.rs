@@ -489,6 +489,7 @@ mod tests {
             queues: BTreeMap::new(),
             outages: None,
             paces: None,
+            envelope: None,
         };
         let mut outcome = Outcome {
             lines: Vec::new(),
