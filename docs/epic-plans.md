@@ -91,7 +91,8 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
 - a `stacks_on` without an implement plan, or naming anything but an earlier
   new slice with one or an open sub-issue, of the same repository;
 - two actions of one type on one issue, or any other action on an issue the
-  plan closes;
+  plan closes, a new slice that stacks on it included: its run would start
+  unstacked once the pull request it was written to build on is abandoned;
 - a `reason` holding an `` ```agent-board `` fence or a `<!--` marker: it is
   posted as a comment by the applier, a plan writer, where it would count as a
   plan or a dispatch record;

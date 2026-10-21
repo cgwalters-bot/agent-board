@@ -410,13 +410,17 @@ impl EpicPlan {
     }
 }
 
+/// The action type after which nothing else may touch its issue.
+const CLOSE: &str = "close_sub_issue";
+
 /// Checks one action at a time against the bounds and the actions before it.
 struct Checker<'a> {
     bounds: &'a Bounds,
     epic: &'a Epic,
     /// The actions so far; `None` for a refused one.
     done: Vec<Option<Action>>,
-    /// Each (type, issue) acted on, and the action that did.
+    /// Each (type, issue) acted on, and the action that did; a slice stacked
+    /// on a current sub-issue counts under the pseudo-type `stacks_on`.
     seen: BTreeMap<(String, String), usize>,
 }
 
@@ -525,7 +529,6 @@ impl Checker<'_> {
     /// One action of a type on any one issue, and nothing else on an issue the
     /// plan closes: either would repeat or contradict.
     fn once(&mut self, kind: &str, key: String) -> Result<()> {
-        const CLOSE: &str = "close_sub_issue";
         let clash = self
             .seen
             .iter()
@@ -534,6 +537,28 @@ impl Checker<'_> {
             bail!("{key} is already the subject of action {earlier}");
         }
         self.seen.insert((kind.into(), key), self.done.len() + 1);
+        Ok(())
+    }
+
+    /// A new slice stacks on the open sub-issue `key`: counted as an action on
+    /// it, so a close of it in the same plan clashes in either order (`once`
+    /// refuses anything on an issue the plan closes). Otherwise apply would
+    /// abandon the pull request the slice's brief builds on, and dispatch
+    /// would find the lower issue closed and start the run unstacked
+    /// (agent-board#207). A rescope or priority of the lower slice, or another
+    /// slice stacking on it, stays allowed: none of those contradicts.
+    fn stacks_on(&mut self, key: String) -> Result<()> {
+        const KIND: &str = "stacks_on";
+        let closed = self
+            .seen
+            .iter()
+            .find(|((k, issue), _)| *issue == key && k == CLOSE);
+        if let Some((_, earlier)) = closed {
+            bail!("{key} is already the subject of action {earlier}");
+        }
+        self.seen
+            .entry((KIND.into(), key))
+            .or_insert(self.done.len() + 1);
         Ok(())
     }
 
@@ -594,14 +619,25 @@ impl Checker<'_> {
                         Some(self.lower(lower, repo)?)
                     }
                 };
-                Action::Create {
+                let action = Action::Create {
                     repo: repo.into(),
                     title: bounded(object, "title", TITLE_LIMIT)?.into(),
                     body: bounded(object, "body", BODY_LIMIT)?.into(),
                     labels,
                     plan,
                     stacks_on,
+                };
+                // Last, so that only an action that passes counts. A new lower
+                // slice cannot be closed by this plan, so only a current one
+                // is recorded.
+                if let Action::Create {
+                    stacks_on: Some(lower @ Target::Issue(_)),
+                    ..
+                } = &action
+                {
+                    self.stacks_on(target_key(lower))?;
                 }
+                action
             }
             "close_sub_issue" | "rescope_sub_issue" => {
                 let named = text(object, "issue")?;
@@ -981,6 +1017,57 @@ mod tests {
         assert_eq!(mutations.len(), 10, "{mutations:?}");
     }
 
+    /// A slice stacks on a sub-issue the same plan closes, in either order:
+    /// apply would abandon the pull request the slice builds on and dispatch
+    /// would run it unstacked (agent-board#207). The lower slice's rescope,
+    /// priority and other slices stacking on it stay allowed.
+    #[test]
+    fn stacking_on_a_sub_issue_the_plan_closes_is_refused() {
+        let lower = "cgwalters-forge/agent-board#63";
+        let close = json!({"type": "close_sub_issue", "issue": lower, "reason": "Dropped."});
+        let mut stacked = create();
+        stacked["stacks_on"] = json!(lower);
+        for (actions, error) in [
+            (
+                vec![close.clone(), stacked.clone()],
+                "action 2 (create_sub_issue): cgwalters-forge/agent-board#63 is already the subject of action 1",
+            ),
+            (
+                vec![stacked.clone(), close.clone()],
+                "action 2 (close_sub_issue): cgwalters-forge/agent-board#63 is already the subject of action 1",
+            ),
+            // The earliest of two slices stacked on the closed one is named.
+            (
+                vec![stacked.clone(), stacked.clone(), close.clone()],
+                "action 3 (close_sub_issue): cgwalters-forge/agent-board#63 is already the subject of action 1",
+            ),
+        ] {
+            let message = format!(
+                "{:#}",
+                EpicPlan::validate(&plan(actions), &bounds(), &epic()).unwrap_err()
+            );
+            assert!(message.contains(error), "{error}: {message}");
+        }
+        // A refused slice does not count against the issue it would stack on.
+        let mut refused = stacked.clone();
+        refused["title"] = json!(" ");
+        let message = format!(
+            "{:#}",
+            EpicPlan::validate(&plan(vec![refused, close.clone()]), &bounds(), &epic())
+                .unwrap_err()
+        );
+        assert!(message.contains("title is empty"), "{message}");
+        assert!(!message.contains("already the subject"), "{message}");
+        // Rescoped, reprioritised and stacked on twice: all coherent with each
+        // other, and a stack on a new slice is not an action on any issue.
+        let mut on_new = create();
+        on_new["stacks_on"] = json!(1);
+        let mut actions = valid();
+        actions.extend([stacked.clone(), stacked, on_new]);
+        let checked = EpicPlan::validate(&plan(actions), &bounds(), &epic()).unwrap();
+        assert_eq!(checked.actions.len(), 8);
+    }
+
     /// Each refusal: the actions after the valid ones, and the error for the
     /// first refused one (its position counts from 7).
     #[test]
@@ -1014,6 +1101,8 @@ mod tests {
         research["plan"]["kind"] = json!("research");
         let mut tracker_slice = create();
         tracker_slice["repo"] = json!("cgwalters-forge/tracker");
+        let mut tracker_stacked = tracker_slice.clone();
+        tracker_stacked["stacks_on"] = json!("cgwalters-forge/tracker#573");
         for (extra, error) in [
             // A slice stacks on another of the epic's in its own repository,
             // named by the action, and only for an implement run.
@@ -1168,10 +1257,15 @@ mod tests {
                 vec![json!({"type": "move_to_ready", "new": 1})],
                 "unknown action type \"move_to_ready\"",
             ),
-            // Nothing else on an issue the plan closes (action 4).
+            // Nothing else on an issue the plan closes (action 3), a new
+            // slice stacked on it included.
             (
                 vec![priority("cgwalters-forge/tracker#573")],
                 "action 6 (set_priority): cgwalters-forge/tracker#573 is already the subject of action 3",
+            ),
+            (
+                vec![tracker_stacked],
+                "action 6 (create_sub_issue): cgwalters-forge/tracker#573 is already the subject of action 3",
             ),
             // A reason may not pose as a plan or a record when posted.
             (
