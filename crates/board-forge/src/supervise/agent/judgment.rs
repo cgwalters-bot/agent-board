@@ -340,6 +340,13 @@ impl Checked {
                             && issue.get("pull_request").is_none_or(Value::is_null),
                         "Not an open issue"
                     );
+                    // The labels are read now, so a hold the operator added
+                    // after the triage receipt still stops the close, as it
+                    // stops a dispatch.
+                    ensure!(
+                        !super::HELD_LABELS.iter().any(|h| has_label(&issue, h)),
+                        "The issue is the operator's or held"
+                    );
                     triage_done(api, p, repo, item, triage_run, *triage_comment)?;
                 }
                 Self::Write(Write::RemoveNeedsHuman { .. }) => {

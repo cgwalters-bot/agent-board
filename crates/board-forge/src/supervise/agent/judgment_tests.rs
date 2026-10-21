@@ -470,6 +470,14 @@ fn closure_needs_a_successful_targeted_triage_and_its_unedited_done_finding() {
     refuses(&s, actions()[2].clone(), |f| {
         f.issues.get_mut(&3).unwrap()["lastEditedAt"] = json!(later);
     });
+    // An operator's hold, whenever added, outranks the finding.
+    for label in ["needs-human", "Question"] {
+        refuses(&s, actions()[2].clone(), |f| {
+            f.objects
+                .get_mut("/repos/example/project/issues/3")
+                .unwrap()["labels"] = json!([{"name": label}]);
+        });
+    }
 }
 
 #[test]
