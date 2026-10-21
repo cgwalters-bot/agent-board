@@ -142,19 +142,32 @@ impl Role {
     }
 }
 
-fn load(text: &str, role: &str) -> Result<Role> {
+/// Stands for `--org` in a role's name and description. App names are global
+/// on GitHub, so a fixed name in the default config would send a second
+/// organization into another organization's app (a name collision, or a
+/// public app refused as owned by someone else).
+const ORG_PLACEHOLDER: &str = "{org}";
+
+fn load(text: &str, role: &str, org: &str) -> Result<Role> {
     let mut roles: Roles = serde_json::from_str(text).context("decode roles config")?;
-    for (key, value) in &roles.roles {
+    for key in roles.roles.keys() {
         ensure!(
             is_slug(key),
             "role name {key:?} must be lowercase letters, digits and hyphens"
         );
-        value.validate(key)?;
     }
-    roles
+    let mut value = roles
         .roles
         .remove(role)
-        .with_context(|| format!("role {role} is not in the roles config"))
+        .with_context(|| format!("role {role} is not in the roles config"))?;
+    // Substituted before validation, so the name's length limit applies to
+    // the name sent to GitHub, before any key file is created. Only this role
+    // is validated: a long login may fit `{org}-status` but not another
+    // role's longer name.
+    value.name = value.name.replace(ORG_PLACEHOLDER, org);
+    value.description = value.description.replace(ORG_PLACEHOLDER, org);
+    value.validate(role)?;
+    Ok(value)
 }
 
 /// The manifest GitHub's form takes
@@ -449,7 +462,7 @@ pub fn create(args: &Create) -> Result<()> {
         }
         None => DEFAULT_ROLES.to_owned(),
     };
-    let role = load(&text, &args.role)?;
+    let role = load(&text, &args.role, &args.org)?;
     ensure!(
         args.key_stored || args.key_file.is_some() || args.key_stdout,
         "GitHub returns a new app's private key only once: pass --key-file FILE or --key-stdout"
@@ -581,14 +594,30 @@ mod tests {
     #[test]
     fn default_roles_build_manifests() {
         for role in ["status", "review", "implement", "executor"] {
-            load(DEFAULT_ROLES, role).unwrap();
+            let ours = load(DEFAULT_ROLES, role, "cgwalters-forge").unwrap();
+            assert_eq!(ours.slug(), format!("cgwalters-forge-{role}"));
+            let theirs = load(DEFAULT_ROLES, role, "example").unwrap();
+            assert_eq!(theirs.slug(), format!("example-{role}"));
+            assert!(!theirs.description.contains("cgwalters-forge"));
+            assert!(!theirs.description.contains(ORG_PLACEHOLDER));
         }
-        let role = load(DEFAULT_ROLES, "review").unwrap();
-        assert_eq!(role.slug(), "cgwalters-forge-review");
+        // An organization whose login makes the role's name over GitHub's
+        // limit is refused at load, before a key file exists; another role's
+        // longer name does not refuse it.
+        load(DEFAULT_ROLES, "status", &"a".repeat(25)).unwrap();
+        let error = load(DEFAULT_ROLES, "implement", &"a".repeat(25))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("characters"), "{error}");
+        let role = load(DEFAULT_ROLES, "review", "example").unwrap();
+        assert_eq!(
+            role.description,
+            "Submits pull request reviews and the review commit status for example automation."
+        );
         assert_eq!(
             manifest("example", &role, "http://127.0.0.1:9/callback"),
             json!({
-                "name": "cgwalters-forge-review",
+                "name": "example-review",
                 "url": "https://github.com/example",
                 "description": role.description,
                 "public": false,
@@ -609,7 +638,7 @@ mod tests {
     fn roles_config_refusals() {
         let base = json!({"roles":{"status":{"name":"Example Status","permissions":{"issues":"write"},"events":["issues"]}}});
         assert_eq!(
-            load(&base.to_string(), "status").unwrap().slug(),
+            load(&base.to_string(), "status", "other").unwrap().slug(),
             "example-status"
         );
         for (pointer, value, message) in [
@@ -646,10 +675,15 @@ mod tests {
                     object[key] = value;
                 }
             }
-            let error = format!("{:#}", load(&config.to_string(), "status").err().unwrap());
+            let error = format!(
+                "{:#}",
+                load(&config.to_string(), "status", "example")
+                    .err()
+                    .unwrap()
+            );
             assert!(error.contains(message), "{pointer}: {error}");
         }
-        let error = load(&base.to_string(), "review").err().unwrap();
+        let error = load(&base.to_string(), "review", "example").err().unwrap();
         assert!(error.to_string().contains("not in the roles config"));
     }
 
@@ -749,7 +783,7 @@ mod tests {
 
     #[test]
     fn callback_checks_state() {
-        let role = load(DEFAULT_ROLES, "status").unwrap();
+        let role = load(DEFAULT_ROLES, "status", "example").unwrap();
         let manifest = manifest("example", &role, "http://127.0.0.1:9/callback");
         let page = page("example", &manifest, "s1");
         assert!(page.contains(

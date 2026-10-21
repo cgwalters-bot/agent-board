@@ -184,8 +184,13 @@ It reads the role from the roles config (`--config FILE`, JSON, unknown fields
 refused; default [`policy/apps.json`](../policy/apps.json)): each role's app
 `name`, optional `slug` (when GitHub's differs from the name lowercased with
 hyphens), `description`, `url` (default `https://github.com/ORG`) and `public`
-(default false), its `permissions` and its `events`. The manifest it builds has
-an inactive webhook, as no role receives events.
+(default false), its `permissions` and its `events`. `{org}` in a `name` or
+`description` stands for `--org`, so the default config names another
+organization's apps after it (`example-org-status` for `--org example-org`):
+app names are global on GitHub. The chosen role's name over 34 characters
+after substitution is refused before anything is created (the default
+`{org}-implement` fits a login of up to 24); pass a `--config` with shorter names.
+The manifest it builds has an inactive webhook, as no role receives events.
 
 1. It looks the app up with `GET /apps/SLUG`, using `GH_TOKEN` if set (a private
    app is visible only to a member's token). An app owned by another account is
