@@ -1045,9 +1045,18 @@ impl Collector<'_> {
                 l.iter()
                     .any(|l| l["name"] == "epic" || l["name"] == "question")
             });
+            // The run's own pull request names this issue and opens before
+            // the run completes, so only one that predates the run is
+            // duplicate work. An undated one still counts. `created_at`, not
+            // `run_started_at`, which a re-run moves past its own pull request.
+            let started = millis(&run["created_at"]);
             let has_pr = timeline.iter().any(|e| {
-                truthy(&e["source"]["issue"]["pull_request"])
-                    && e["source"]["issue"]["state"] == "open"
+                let pr = &e["source"]["issue"];
+                truthy(&pr["pull_request"])
+                    && pr["state"] == "open"
+                    && millis(&pr["created_at"])
+                        .zip(started)
+                        .is_none_or(|(created, started)| created < started)
             });
             result.push(json!({
                 "state": issue["state"],
