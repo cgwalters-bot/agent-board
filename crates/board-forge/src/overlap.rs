@@ -79,8 +79,8 @@ pub(crate) fn shown(paths: &[String]) -> String {
 
 /// The paths a text names: tokens of path characters whose last part has a
 /// file extension or is a dotfile (`.gitignore`), or that end in `/` (a
-/// directory). URLs, repository names (`OWNER/REPO`) and `host.name/...` are
-/// left out, since they name no file.
+/// directory). URLs, repository names (`OWNER/REPO`), `host.name/...` and
+/// abbreviations (`e.g`) are left out, since they name no file.
 pub fn paths(text: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     for token in text.split(|c: char| !pathlike(c)) {
@@ -105,11 +105,18 @@ pub fn paths(text: &str) -> BTreeSet<String> {
                 && ext.bytes().all(|c| c.is_ascii_alphanumeric())
                 && ext.bytes().any(|c| c.is_ascii_alphabetic())
         });
+        // `e.g`, `i.e` and `a.k.a` pass the extension rule, but a bare token of
+        // dotted single letters is an abbreviation, not a file: two issues that
+        // both say "e.g." share no file, and one run waiting on the other for it
+        // lasts until that run ends (#204). `a.rs` (a longer extension) and
+        // `lib/e.g` (a directory) are still paths; a file like `a.c` is named
+        // with its directory.
+        let abbreviation = !token.contains('/') && token.split('.').all(|part| part.len() == 1);
         let dotfile = last.strip_prefix('.').is_some_and(|name| {
             !name.contains('.') && name.bytes().any(|c| c.is_ascii_alphabetic())
         });
         let host = token.contains('/') && first.trim_start_matches('.').contains('.');
-        if (file || dotfile || dir)
+        if ((file && !abbreviation) || dotfile || dir)
             && !host
             && token.len() <= 200
             && !token.starts_with(['/', '-'])
@@ -338,7 +345,9 @@ mod tests {
             https://github.com/cgwalters-forge/agent-board/blob/main/README.md), and the \
             safe-outputs/ code in ./src/lib.rs, .github/workflows/ci.yml, ././.gitignore and \
             .config/ too. Not cgwalters-forge/agent-board#86, \
-            github.com/x/y.md, e.g. 1.5, and/or ../etc/passwd or -rf.sh.";
+            github.com/x/y.md, e.g. 1.5, i.e. the backoff (a.k.a. jitter), and/or \
+            ../etc/passwd or -rf.sh. Keep a.rs and lib/e.g, not a.c. A bare host \
+            name, github.com, still passes.";
         let found: Vec<String> = paths(text).into_iter().collect();
         assert_eq!(
             found,
@@ -346,14 +355,17 @@ mod tests {
                 ".config",
                 ".github/workflows/ci.yml",
                 ".gitignore",
+                "a.rs",
                 "crates/board-forge/src/batch.rs",
                 "docs/job-plans.md",
-                "e.g",
+                "github.com",
+                "lib/e.g",
                 "safe-outputs",
                 "src/lib.rs",
             ]
         );
         assert!(paths("Fix the flaky test.").is_empty());
+        assert!(paths("E.g. i.e. a.k.a. P.S. U.S.").is_empty());
         let many: String = (0..2 * PATH_LIMIT).map(|n| format!("f{n}.rs ")).collect();
         assert_eq!(paths(&many).len(), PATH_LIMIT);
     }
@@ -562,6 +574,14 @@ mod tests {
                 json!([]),
                 independent(none),
             ),
+            // Two briefs that both say "e.g." name no file (#204).
+            (
+                "shared abbreviation",
+                "Make the retry bounded, e.g. five attempts, in src/retry.rs.",
+                vec!["implement example/work#17"],
+                json!([]),
+                independent(none),
+            ),
             // A bare dotfile still overlaps a path with a directory...
             (
                 "dotfile in flight",
@@ -586,6 +606,10 @@ mod tests {
                 ("example/work#14", "Touches docs/y.md."),
                 ("example/work#15", "Hand back a `.patch` (*.patch)."),
                 ("example/work#16", "Touches sub/.gitignore."),
+                (
+                    "example/work#17",
+                    "Document the pools, e.g. claude, in docs/pools.md.",
+                ),
                 ("example/tracker#11", "Touches a.rs."),
             ]
             .into()
