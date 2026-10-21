@@ -306,10 +306,14 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                         truthy(&s["ended"]) && (s["pull"] == "merged" || s["pull"] == "none")
                     })
                     .collect(),
-                // Used share of the window against the share of it elapsed, in points.
+                // Used share of the window against the share of it elapsed, in
+                // points. A pool under a pace override is shown, and only warns.
                 "pace" => items
                     .iter()
                     .filter(|p| {
+                        if truthy(&p["override"]) {
+                            return true;
+                        }
                         let window = p["window_minutes"].as_f64().unwrap_or(f64::NAN) * 60_000.0;
                         let left = millis(&p["resets_at"]).map_or(f64::NAN, |at| (at - now) as f64);
                         let elapsed = 100.0 * (1.0 - left / window).clamp(0.0, 1.0);
@@ -357,7 +361,14 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             // Bounded, so the agent's task stays inside the wrapper's limit.
             let mut evidence: Vec<&str> = vec![];
             for item in &bad {
-                for key in ["html_url", "reason_url", "issue_url", "run_url", "option"] {
+                for key in [
+                    "html_url",
+                    "reason_url",
+                    "issue_url",
+                    "run_url",
+                    "option",
+                    "override",
+                ] {
                     if let Some(url) = item[key].as_str().filter(|u| !u.is_empty())
                         && !evidence.contains(&url)
                     {
@@ -369,7 +380,9 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             let status = if bad.is_empty() {
                 "ok"
             } else if ["infrastructure", "unset"].contains(&id)
-                || bad.iter().all(|i| truthy(&i["missing"]))
+                || bad
+                    .iter()
+                    .all(|i| truthy(&i["missing"]) || truthy(&i["override"]))
             {
                 "warn"
             } else {
@@ -1279,13 +1292,25 @@ impl Collector<'_> {
             bail!("no fresh usage snapshot");
         };
         let url = comment.map_or(Value::Null, |c| c["html_url"].clone());
+        // An override in force says why a pool runs off its pace.
+        let overridden = |pool: &str| {
+            self.s
+                .pace_overrides
+                .iter()
+                .find(|o| {
+                    o.pool == pool && (o.until.unix_timestamp_nanos() / 1_000_000) as i64 > self.now
+                })
+                .map_or(Value::Null, |o| {
+                    format!("pace override: {}", o.describe()).into()
+                })
+        };
         Ok(snap["pools"]
             .as_object()
             .map(|pools| {
                 pools
-                    .values()
-                    .filter(|p| truthy(p))
-                    .map(|p| json!({"used_percent": p["used_percent"], "window_minutes": p["window_minutes"], "resets_at": p["resets_at"], "html_url": url}))
+                    .iter()
+                    .filter(|(_, p)| truthy(p))
+                    .map(|(pool, p)| json!({"used_percent": p["used_percent"], "window_minutes": p["window_minutes"], "resets_at": p["resets_at"], "html_url": url, "override": overridden(pool)}))
                     .collect()
             })
             .unwrap_or_default())

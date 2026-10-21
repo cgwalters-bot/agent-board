@@ -65,6 +65,7 @@ fn configured(
     args: &Poll,
     value: Option<&serde_json::Value>,
     pools: Option<&serde_json::Value>,
+    now: time::OffsetDateTime,
 ) -> Result<(Poll, poll::PollPolicy)> {
     let mut effective = args.clone();
     let mut policy = poll::PollPolicy::default();
@@ -106,6 +107,9 @@ fn configured(
     policy
         .read_tiers(pools, &effective.fix_pool)
         .context("decode pool tiers")?;
+    policy
+        .check_overrides(now, &effective.fix_pool)
+        .context("decode pace overrides")?;
     Ok((effective, policy))
 }
 
@@ -123,7 +127,8 @@ pub fn run(
     };
     let value = args.config.as_ref().map(read).transpose()?;
     let pools = args.pools.as_ref().map(read).transpose()?;
-    let (effective, policy) = configured(args, value.as_ref(), pools.as_ref())?;
+    let now = time::OffsetDateTime::now_utc();
+    let (effective, policy) = configured(args, value.as_ref(), pools.as_ref(), now)?;
     let args = &effective;
     ensure!(
         !args.apply || args.dispatch_workflow.is_some(),
@@ -175,7 +180,6 @@ pub fn run(
         workflow: args.dispatch_workflow.clone().unwrap_or_default(),
         pools: args.fix_pool.clone(),
     });
-    let now = time::OffsetDateTime::now_utc();
     let outcome = poll::run(
         &client,
         &client,
@@ -395,8 +399,13 @@ mod tests {
             "other.yml",
         ])
         .poll;
+        let now = time::OffsetDateTime::parse(
+            "2026-10-21T12:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
         let base = json!({"operator": "owner", "bot": "worker", "dispatchRepo": "o/tracker", "follow": ["o/repo"]});
-        let (cfg, policy) = configured(&args, Some(&base), None).unwrap();
+        let (cfg, policy) = configured(&args, Some(&base), None, now).unwrap();
         assert_eq!(cfg.operator, "owner");
         assert_eq!(cfg.bot, "worker");
         assert_eq!(cfg.dispatch_repo, "o/tracker");
@@ -412,12 +421,16 @@ mod tests {
         full["fixPools"] = json!(["configured"]);
         full["reviewWorkflow"] = json!("review.yml");
         full["dispatchWorkflow"] = json!("dispatch.yml");
-        let (cfg, _) = configured(&args, Some(&full), None).unwrap();
+        let (cfg, _) = configured(&args, Some(&full), None, now).unwrap();
         assert_eq!(cfg.fix_pool, ["configured"]);
         assert_eq!(cfg.review_workflow.as_deref(), Some("review.yml"));
         assert_eq!(cfg.dispatch_workflow.as_deref(), Some("dispatch.yml"));
 
         // A tier is read from the pools file, and only where a setting names one.
+        let paced = |pool: &str, until: &str| {
+            json!({"repository": "o/ops", "issue": 1, "bot": "worker",
+                "overrides": [{"pool": pool, "until": until, "mode": "spend"}]})
+        };
         let pools = json!({"claude": {"tier": 1}, "openai": {"tier": 1}, "mistral": {"tier": 2},
             "fable": {"tier": 1, "auto": false}, "hand": {"tier": 3, "auto": false}});
         for (case, settings, file, expected) in [
@@ -511,13 +524,33 @@ mod tests {
                 Some(&pools),
                 Err("continuation pools names tier-1, but only fixPools and kindPools take a tier"),
             ),
+            (
+                "an override may name a pool of a configured tier",
+                json!({"fixPools": ["tier-1"], "pace": paced("openai", "2026-10-22T04:00:00Z")}),
+                Some(&pools),
+                Ok(json!({"tier-1": ["claude", "openai"], "tier-2": ["mistral"], "tier-3": []})),
+            ),
+            (
+                "an override of a pool no setting names",
+                json!({"fixPools": ["tier-1"], "pace": paced("fable", "2026-10-22T04:00:00Z")}),
+                Some(&pools),
+                Err("pace override names fable, which is not a configured pool"),
+            ),
+            (
+                "an override more than a week ahead",
+                json!({"fixPools": ["claude"], "pace": paced("claude", "2026-10-28T12:01:00Z")}),
+                None,
+                Err(
+                    "pace override for claude runs until 2026-10-28T12:01Z, more than 7 days ahead",
+                ),
+            ),
         ] {
             let mut value = json!({"operator": "owner", "bot": "worker", "dispatchRepo": "o/tracker", "follow": ["o/repo"]});
             value
                 .as_object_mut()
                 .unwrap()
                 .extend(settings.as_object().unwrap().clone());
-            let got = configured(&args, Some(&value), file)
+            let got = configured(&args, Some(&value), file, now)
                 .map(|(_, policy)| json!(policy.tiers))
                 .map_err(|e| format!("{:#}", e.root_cause()));
             assert_eq!(got, expected.map_err(str::to_owned), "{case}");
