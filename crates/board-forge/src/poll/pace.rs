@@ -3,7 +3,8 @@
 //! used more of its window than has passed takes no new run
 //! (agent-board#135). Without it, fix rounds alternated `fixPools` blind: on
 //! 17 Oct the openai pool had used 26% of a fresh 7-day window, against a 4%
-//! pace, and the poll kept starting rounds there.
+//! pace, and the poll kept starting rounds there. The snapshot's own `hold`
+//! decides where it gives one (agent-board#233).
 //!
 //! Off by default. It only chooses among, or holds back, the pools the
 //! configuration already names for a run; it never adds a pool, a run or a
@@ -76,10 +77,12 @@ impl Pace {
 /// A pool's mode by the snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
-    /// Within its pace: the shares of its window used and passed, in percent.
-    Normal { used: f64, elapsed: f64 },
-    /// Over its pace by more than the margin, until the window catches up.
-    Held { until: OffsetDateTime },
+    /// Not held: the share of its window used and the most it may use now,
+    /// in percent; the pool with the most room between them is preferred.
+    Normal { used: f64, ceiling: f64 },
+    /// Held by the snapshot, or over its pace by more than the margin, until
+    /// the time given, where there is one.
+    Held { until: Option<OffsetDateTime> },
     /// No window to pace by, as for mistral's monthly dollar allowance until
     /// the snapshot reports it: usable, but never preferred to a paced pool.
     Unpaced,
@@ -88,9 +91,38 @@ pub enum Mode {
 /// The pools of a fresh snapshot by name, or why there is none.
 pub type Paces = std::result::Result<BTreeMap<String, Mode>, String>;
 
-/// A pool's mode from its snapshot entry, by the share of its window used
-/// against the share passed, as the supervisor's pace check compares them.
+/// A pool's mode from its snapshot entry. The snapshot's own `hold` decides
+/// (agent-board#233): it knows each pool's `burst` and holds for reasons
+/// beyond pace, such as a window or session limit, so recomputing the hold
+/// here with one margin for every pool held claude while its burst left it
+/// room. Only an entry without `hold`, from an older snapshot, is paced
+/// here, by the share of its window used against the share passed.
 pub fn mode(entry: &Value, now: OffsetDateTime, margin: f64) -> Mode {
+    match entry.get("hold") {
+        None => paced(entry, now, margin),
+        Some(Value::Bool(false)) => {
+            let used = entry["used_percent"].as_f64().unwrap_or(f64::NAN);
+            let allowed = entry["allowed_percent"].as_f64().unwrap_or(f64::NAN);
+            let ceiling = allowed + entry["burst"].as_f64().unwrap_or(0.0);
+            if used.is_finite() && ceiling.is_finite() {
+                Mode::Normal { used, ceiling }
+            } else {
+                Mode::Unpaced
+            }
+        }
+        // `true`, or a hold this does not understand: missing usage holds
+        // rather than reading as room.
+        Some(_) => Mode::Held {
+            until: entry["next_dispatch_at"]
+                .as_str()
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok()),
+        },
+    }
+}
+
+/// An older snapshot's pool, held while it has used more of its window than
+/// has passed, plus `margin`.
+fn paced(entry: &Value, now: OffsetDateTime, margin: f64) -> Mode {
     let window = entry["window_minutes"].as_f64().unwrap_or(f64::NAN) * 60_000.0;
     let used = entry["used_percent"].as_f64().unwrap_or(f64::NAN);
     let Some(resets) = millis(&entry["resets_at"]) else {
@@ -108,7 +140,10 @@ pub fn mode(entry: &Value, now: OffsetDateTime, margin: f64) -> Mode {
     }
     let elapsed = 100.0 * (1.0 - left / window).clamp(0.0, 1.0);
     if used - elapsed <= margin {
-        return Mode::Normal { used, elapsed };
+        return Mode::Normal {
+            used,
+            ceiling: elapsed,
+        };
     }
     // Held until the share passed is within the margin of the share used,
     // or the window resets, whichever comes first.
@@ -116,7 +151,7 @@ pub fn mode(entry: &Value, now: OffsetDateTime, margin: f64) -> Mode {
     let at = resets as f64 - window * (1.0 - caught_up / 100.0);
     let until = OffsetDateTime::from_unix_timestamp_nanos(at as i128 * 1_000_000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    Mode::Held { until }
+    Mode::Held { until: Some(until) }
 }
 
 /// The modes of the snapshot's pools, if it is fresh. A pool whose entry is
@@ -137,8 +172,8 @@ pub fn paces(snapshot: Option<&Value>, now: OffsetDateTime, margin: f64) -> Pace
         .collect())
 }
 
-/// Of `candidates`, the pool furthest under its pace; an unpaced one only
-/// where no paced one is within its pace. A tie goes to `turn`, the pool
+/// Of `candidates`, the pool with the most room under its ceiling; an
+/// unpaced one only where no other is unheld. A tie goes to `turn`, the pool
 /// the round would take without pace, so that pools the snapshot does not
 /// tell apart still take turns; else to the configured order. Held pools
 /// are skipped, and the reason the run waits is the error.
@@ -154,10 +189,10 @@ pub fn choose(
     let mut held = Vec::new();
     for pool in candidates {
         let room = match paces.get(pool).unwrap_or(&Mode::Unpaced) {
-            Mode::Normal { used, elapsed } => elapsed - used,
+            Mode::Normal { used, ceiling } => ceiling - used,
             Mode::Unpaced => f64::NEG_INFINITY,
             Mode::Held { until } => {
-                held.push(format!("{pool} until {}", minute(*until)));
+                held.push(format!("{pool}{}", until_minute(*until)));
                 continue;
             }
         };
@@ -180,8 +215,8 @@ pub fn line(paces: &Paces, configured: &BTreeSet<String>) -> String {
     let modes: Vec<String> = names
         .into_iter()
         .map(|pool| match paces.get(pool).unwrap_or(&Mode::Unpaced) {
-            Mode::Normal { used, elapsed } => format!("{pool} normal {used:.0}%/{elapsed:.0}%"),
-            Mode::Held { until } => format!("{pool} held until {}", minute(*until)),
+            Mode::Normal { used, ceiling } => format!("{pool} normal {used:.0}%/{ceiling:.0}%"),
+            Mode::Held { until } => format!("{pool} held{}", until_minute(*until)),
             Mode::Unpaced => format!("{pool} unpaced"),
         })
         .collect();
@@ -264,6 +299,13 @@ pub fn expand(tiers: &Tiers, names: &[String]) -> Vec<String> {
                 .unwrap_or_else(|| vec![name.clone()])
         })
         .collect()
+}
+
+/// ` until 2026-10-19T03:24Z`, or nothing for a hold the snapshot gives no end.
+fn until_minute(until: Option<OffsetDateTime>) -> String {
+    until
+        .map(|at| format!(" until {}", minute(at)))
+        .unwrap_or_default()
 }
 
 /// `2026-10-19T03:24Z`.
@@ -400,7 +442,7 @@ mod tests {
         let now = at(NOW);
         // 17 Oct: 26% used against a 4% pace, held until 26% of the week has passed.
         let openai = mode(&pool(26.0, 7), now, 0.0);
-        let Mode::Held { until } = openai else {
+        let Mode::Held { until: Some(until) } = openai else {
             panic!("{openai:?}")
         };
         assert_eq!(minute(until), "2026-10-18T16:04Z");
@@ -414,7 +456,7 @@ mod tests {
             Mode::Normal { .. }
         ));
         // Used past the window: held until it resets.
-        let Mode::Held { until } = mode(&pool(120.0, 160), now, 0.0) else {
+        let Mode::Held { until: Some(until) } = mode(&pool(120.0, 160), now, 0.0) else {
             panic!()
         };
         assert_eq!(minute(until), "2026-10-17T11:24Z");
@@ -510,6 +552,137 @@ mod tests {
                 Err(format!("{why}, so new runs wait"))
             );
         }
+    }
+
+    /// A pool the snapshot paces itself: `hold`, and `burst` where given.
+    fn led(used: f64, allowed: f64, burst: Option<f64>, hold: Value) -> Value {
+        let mut entry = pool(used, 84);
+        entry["allowed_percent"] = json!(allowed);
+        entry["hold"] = hold;
+        if let Some(burst) = burst {
+            entry["burst"] = json!(burst);
+        }
+        entry
+    }
+
+    #[test]
+    fn the_snapshots_hold_decides_and_room_counts_its_burst() {
+        let now = at(NOW);
+        let until = Some(at("2026-10-22T00:33:00Z"));
+        let held = |mut entry: Value| {
+            entry["next_dispatch_at"] = json!("2026-10-22T00:33:00Z");
+            entry
+        };
+        // The margin is 5, as the poll's on 21 Oct, so only the fallback uses it.
+        for (case, entry, expected) in [
+            (
+                "21 Oct claude: over its pace, under its burst",
+                led(70.0, 26.0, Some(95.0), json!(false)),
+                Mode::Normal {
+                    used: 70.0,
+                    ceiling: 121.0,
+                },
+            ),
+            (
+                "not held without a burst, even over its pace",
+                led(30.0, 20.0, None, json!(false)),
+                Mode::Normal {
+                    used: 30.0,
+                    ceiling: 20.0,
+                },
+            ),
+            (
+                "21 Oct openai: held until the snapshot's next dispatch",
+                held(led(26.0, 18.0, Some(3.0), json!(true))),
+                Mode::Held { until },
+            ),
+            (
+                "held under its pace, for a window or session reason",
+                held(led(1.0, 50.0, None, json!(true))),
+                Mode::Held { until },
+            ),
+            (
+                "held with no next dispatch",
+                led(1.0, 50.0, Some(95.0), json!(true)),
+                Mode::Held { until: None },
+            ),
+            (
+                "a hold that is not a boolean holds",
+                led(1.0, 50.0, None, json!("no")),
+                Mode::Held { until: None },
+            ),
+            (
+                "a null hold holds, unlike a missing one",
+                led(1.0, 50.0, None, Value::Null),
+                Mode::Held { until: None },
+            ),
+            (
+                "a numeric hold holds",
+                led(1.0, 50.0, None, json!(0)),
+                Mode::Held { until: None },
+            ),
+            (
+                "not held, with nothing to rank by",
+                json!({"hold": false, "spent_usd": 12}),
+                Mode::Unpaced,
+            ),
+        ] {
+            assert_eq!(mode(&entry, now, 5.0), expected, "{case}");
+        }
+        // Without `hold`, as from an older snapshot, the margin paces the
+        // pool and its burst is ignored: 26% used, held until 21% has passed.
+        let mut older = pool(26.0, 1);
+        older["burst"] = json!(95);
+        let Mode::Held { until: Some(until) } = mode(&older, now, 5.0) else {
+            panic!("{older}")
+        };
+        assert_eq!(minute(until), "2026-10-18T13:40Z");
+
+        let read = |pools: Value| paces(Some(&snapshot(pools)), now, 5.0);
+        let october = json!({
+            "claude": led(70.0, 26.0, Some(95.0), json!(false)),
+            "openai": held(led(26.0, 18.0, Some(3.0), json!(true))),
+        });
+        for (case, pools, turn, expected) in [
+            (
+                "21 Oct: claude, on openai's turn",
+                october.clone(),
+                "openai",
+                Ok("claude"),
+            ),
+            (
+                "the bigger burst's room, whoever's turn",
+                json!({"claude": led(70.0, 26.0, Some(95.0), json!(false)),
+                    "openai": led(10.0, 18.0, Some(3.0), json!(false))}),
+                "openai",
+                Ok("claude"),
+            ),
+            (
+                "an older entry ranks by its pace beside a snapshot-led one",
+                json!({"claude": led(70.0, 26.0, Some(95.0), json!(false)),
+                    "openai": pool(10.0, 120)}),
+                "claude",
+                Ok("openai"),
+            ),
+            (
+                "every pool held by the snapshot",
+                json!({"claude": led(1.0, 50.0, None, json!(true)),
+                    "openai": held(led(26.0, 18.0, Some(3.0), json!(true)))}),
+                "claude",
+                Err("every pool is held (claude, openai until 2026-10-22T00:33Z)"),
+            ),
+        ] {
+            let got = choose(&read(pools), &names(&["claude", "openai"]), Some(turn));
+            assert_eq!(
+                got.as_deref(),
+                expected.map_err(str::to_owned).as_deref(),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            line(&read(october), &BTreeSet::new()),
+            "pools: claude normal 70%/121%, openai held until 2026-10-22T00:33Z"
+        );
     }
 
     #[test]

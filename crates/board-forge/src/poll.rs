@@ -8452,6 +8452,17 @@ mod tests {
                 (Ok("claude"), "openai held until"),
             ),
             (
+                // 21 Oct: claude over its pace but within its burst.
+                "the snapshot's hold decides, not the margin",
+                named,
+                usage(json!({
+                    "claude": {"used_percent": 70, "allowed_percent": 26, "burst": 95, "hold": false},
+                    "openai": {"used_percent": 26, "allowed_percent": 18, "burst": 3, "hold": true,
+                        "next_dispatch_at": "2026-10-22T00:33:00Z"},
+                })),
+                (Ok("claude"), "openai held until"),
+            ),
+            (
                 "every pool held",
                 named,
                 usage(json!({"claude": pool(90.0, 84), "openai": pool(26.0, 7)})),
