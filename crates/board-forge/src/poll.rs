@@ -204,7 +204,7 @@ const PULL_QUERY: &str = concat!(
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
       files(first: 100) { nodes { path } pageInfo { hasNextPage } }
-      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason } } }
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason beforeCommit { oid } } } }
       baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
@@ -3663,7 +3663,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> Result<(Removal, QueueState, Option<Log>)> {
         let head = text(pull, "/headRefOid");
         let mut state = marker.queue.clone().unwrap_or_default();
-        if state.head != head || marker.stopped {
+        let new_head = state.head != head;
+        if new_head || marker.stopped {
             state = QueueState {
                 head: head.to_owned(),
                 seen: state.seen,
@@ -3677,6 +3678,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         state.seen = id;
         let removed_at = text(latest, "/createdAt");
+        // Attribute the removal to GitHub's recorded head, not a commit's
+        // committer-controlled date. Missing attribution must retain the stop:
+        // the current head may have been queued and dequeued between polls.
+        let removed_head = text(latest, "/beforeCommit/oid");
+        if new_head && !removed_head.is_empty() && removed_head != head {
+            return Ok((Removal::None, state, None));
+        }
         let since = state.since.replace(plain(removed_at));
         let removal = match text(latest, "/reason") {
             "merged" => Removal::None,
@@ -11460,6 +11468,90 @@ mod tests {
                 "needs-human: removed from the merge queue 4 times at 488f45ebacd0 (a; b; c; the queue rebuilt around it) -> labelled needs-human",
                 vec![label[0].clone(), label[1].clone(), comment.clone()],
                 json!({"seen": "R4", "tries": 0}),
+            ),
+            (
+                // A person dequeues the old head to push this one: their
+                // removal is the old head's, and this head is queued.
+                "an old head's removal before a pre-created commit was pushed is not charged to it",
+                Some(3),
+                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": "a".repeat(40)}}]}, "committedDate": "2026-10-12T01:00:00Z"}),
+                {
+                    let mut s = state("R1", 1, &[], none.clone());
+                    s["queue"]["head"] = "a".repeat(40).into();
+                    s
+                },
+                None,
+                json!([]),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec!["enqueuePullRequest".into()],
+                none.clone(),
+            ),
+            (
+                "an unattributed removal still stops a future-dated current head",
+                Some(3),
+                json!({"timelineItems": removed("R2", "dequeued"), "committedDate": "2027-10-12T01:20:00Z"}),
+                {
+                    let mut s = state("R1", 1, &[], none.clone());
+                    s["queue"]["head"] = "a".repeat(40).into();
+                    s
+                },
+                None,
+                json!([]),
+                "needs-human: removed from the merge queue (dequeued), which the poll does not retry -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                json!({"seen": "R2"}),
+            ),
+            (
+                "a future-dated current head queued and dequeued between polls still stops",
+                Some(3),
+                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": HEAD}}]}, "committedDate": "2027-10-12T01:20:00Z"}),
+                {
+                    let mut s = state("R1", 1, &[], none.clone());
+                    s["queue"]["head"] = "a".repeat(40).into();
+                    s
+                },
+                None,
+                json!([]),
+                "needs-human: removed from the merge queue (dequeued), which the poll does not retry -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                json!({"seen": "R2"}),
+            ),
+            (
+                "nor does it hold a new head's fix round",
+                Some(3),
+                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": "a".repeat(40)}}]}, "contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                {
+                    let mut s = state("R1", 1, &[], none.clone());
+                    s["queue"]["head"] = "a".repeat(40).into();
+                    s
+                },
+                None,
+                json!([]),
+                "fix: check ci failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![
+                    comment.clone(),
+                    comment.clone(),
+                    format!("PATCH repos/{REPO}/issues/comments/99"),
+                ],
+                json!({"seen": "R2", "tries": 0}),
+            ),
+            (
+                "nor spend one of a new head's re-queues",
+                Some(3),
+                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "stack_invalidated", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": "a".repeat(40)}}]}}),
+                {
+                    let mut s = state("R1", 1, &[], none.clone());
+                    s["rounds"] = 1.into();
+                    s["sha"] = "a".repeat(40).into();
+                    s["run"] = 7.into();
+                    s["queue"]["head"] = "a".repeat(40).into();
+                    s
+                },
+                None,
+                json!([]),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec!["enqueuePullRequest".into()],
+                none.clone(),
             ),
             (
                 "a reason the poll does not know goes to a human",
