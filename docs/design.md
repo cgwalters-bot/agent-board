@@ -18,7 +18,7 @@ Each item has one canonical issue and one project membership, keyed by native id
 | Item | Issue title/body and native identity; project membership | Acceptance criteria live in the body. Membership defines managed work; enrollment repairs omissions. |
 | Epic and children | Issue with an existing epic label; native sub-issue relation | Decomposition is not a dependency or permission. Unclassified work need not have a parent. |
 | Status | Project single-select: Triage, Backlog, Todo, In Progress, Draft, In Review, Blocked, Needs human, Done, Cancelled | Triage replaces null. Draft means a result awaits operator review, not a GitHub draft item. Needs human marks an open ask and the items it blocks. Terminal status requires evidence. |
-| Priority | Project single-select: P0, P1, P2 | P0 blocks current work; P1 active focus; P2 parked. No mirrored priority labels. A read-only Forgejo label board (README) reads `priority/P1`..`priority/P3`; the snapshot also admits P3, so a GitHub P3 option now reads as a value rather than as incomplete. |
+| Priority | Project single-select: P0, P1, P2 | P0 blocks current work; P1 active focus; P2 parked. No mirrored priority labels. A read-only Forgejo label board (README) reads `priority/P0`..`priority/P3`; the snapshot also admits P3, so a GitHub P3 option now reads as a value rather than as incomplete. |
 | Whose turn | Project single-select Turn: Coordinator, Worker, Operator, External, None | Canonical coordination signal. Native assignees remain human ownership, not a second turn field. |
 | Operator ask | One issue per decision, with question, lettered alternatives and blocked URLs; Ask text field links it | Operator answers on the issue. Existing PR review threads can be linked instead of creating duplicate asks. |
 | Results and blockers | Project text fields Result, Blocked by, Next, News | URL lists are parsed as typed references. Next is explanation, never executable input. |
@@ -661,7 +661,8 @@ failure cleanup without credentials.
 probe, dispatch and scheduler runs, the followed repositories' pull requests,
 the epics, the decisions, the wrapper's agentic-job pin and the usage snapshot
 with a read-only token, within a request count and a deadline. It writes a
-report of nineteen checks. Each check is `ok`, `warn` or `fail`, and the report
+report of the checks in the `CHECKS` table of
+`crates/board-forge/src/supervise/health.rs`. Each check is `ok`, `warn` or `fail`, and the report
 holds only links, but for `unset`, which warns with the names, never the values,
 of the poll and supervisor options agent-board knows that the caller's files
 leave out (the loaders' `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` and
@@ -750,8 +751,10 @@ This sequence makes agentic-job integration a visible dependency without turning
 ### Dispatch preview integration seam
 
 `request dispatch` and `run record` implement an operator-driven preview join to
-agentic-job's `examples/dispatch/dispatch.yml`. Both support offline snapshots;
-neither mutates the forge. Routing comes from explicit operator flags, not item
+agentic-job's `examples/dispatch/dispatch.yml`. Both support offline snapshots.
+`request dispatch` never mutates the forge; `run record` only proposes unless
+`--apply` writes the validated Run/Result update with the operator's GH_TOKEN.
+Routing comes from explicit operator flags, not item
 prose. Eligibility rejects incomplete or non-issue inputs to avoid launching work
 from unknown state. URL grammar excludes unrelated result targets, but is not
 evidence of authorship or success. The operator must verify run/item correlation
@@ -767,8 +770,11 @@ Independently bounded `update_project` application must be configured
 for the exact project, issue, fields and values. Only that separate apply job may
 receive organization Projects write permission; GITHUB_TOKEN does not grant it.
 
-No scheduled admission, automatic Run/Result recording, run listing, refusal-to-Blocked
-conversion or stuck-run recovery is implemented yet. Do not retry an ambiguous
+When no Run is recorded, `run record --caller` searches one page of at most 100
+of the caller's `dispatch.yml` runs for the single one titled `KIND OWNER/REPO#N`
+and needs `--yes` to use it; there is no `run list`. No scheduled admission,
+automatic Run/Result recording, refusal-to-Blocked conversion or stuck-run
+recovery is implemented yet. Do not retry an ambiguous
 dispatch automatically. `project init` creates missing Turn/Run/Result
 fields with the operator's own token and never edits existing fields or options. No workflow permissions, token
 placement or action pins are changed in this patch.

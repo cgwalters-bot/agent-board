@@ -58,7 +58,7 @@ instead. It is read by `snapshot create`, `project view`, `item list`,
 ```
 
 `membership` is `{"label": NAME}` (open and closed issues with that label) or
-`"open"` (every open issue). Priority comes from one `priority/P1`..`priority/P3`
+`"open"` (every open issue). Priority comes from one `priority/P0`..`priority/P3`
 label and Turn from one `turn/coordinator`, `turn/operator`, `turn/worker`,
 `turn/external`, `turn/none` or `turn/<policy identity>` (read as Worker) label;
 zero, two or an unknown value leaves the item's fields incomplete and

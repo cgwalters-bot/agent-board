@@ -123,9 +123,10 @@ position, preceded by a `{"request":"..."}` metadata object when supplied
 (even for an empty plan). Apply's preview uses the same metadata object;
 successful apply and already-claimed output print `Request: ...` when supplied.
 The dry run names the plan's comment on stderr. It needs a token that can
-read the epic. The bounds come from the caller's own configuration (for
-tracker, `schedule.repositories` in its `agent-board.json`), never from a plan
-or a dispatcher's inputs.
+read the epic. The caller passes `--allow-repo` and `--priority-option` from its own trusted
+epic configuration (the `repositories` and `priorities` names of the
+[Apply](#apply) `--config` file; tracker's `agent-board.json` is not one), never
+from a plan or a dispatcher's inputs.
 
 ## Apply
 
