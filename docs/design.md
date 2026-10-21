@@ -247,11 +247,21 @@ enabled as a fallback. Label `needs-human` with the marker comment, and start a 
 through the caller's `--dispatch-workflow` with `DISPATCH_TOKEN`, at most three
 a pass as the dispatcher above is bounded. A pass claims each fix round with a
 comment naming the marker comment it decided from, and only the earliest claim on
-that comment, while that marker is still the newest, starts a run. Markers are only added: each round and each
+that comment, while that marker is still the newest, starts a run. The winner
+writes the round's marker over its claim, so a round is one comment. A claim
+that lost is kept: the read-back pages by number, so a deletion while another
+pass reads would shift a page past the claim it must see. Markers are otherwise only added: each
 `needs-human` stop is a new comment, and the one later write is a round's run
-id, into its own comment. Readers use the newest marker by creation id, so a
+id, into its own comment. A round's comment is a person's to keep: deleting it
+leaves the marker it was claimed from as the newest, and the round is counted
+again. Readers use the newest round or stop marker by creation id, so a
 late result cannot roll back a newer round or stop, and each removal of the
-label is claimed from a stop of its own. A stop is added after its label, and
+label is claimed from a stop of its own. Queue-only markers carry `queue_only`:
+their newer queue state is read separately, without replacing the round's
+identity or accounting, including while its winning claim is being patched.
+A queue write after a reset records `queue_reset_from`, clearing only that
+stop's state without changing the identity a concurrent reset claim names.
+A stop is added after its label, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
 repositories only, besides the runs `operatorComments` starts (below); the board widens what is read, not what is changed. The
