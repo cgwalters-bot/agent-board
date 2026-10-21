@@ -8,6 +8,9 @@ pub struct Poll {
     /// never a dispatched pull request or workflow input. File settings win.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
+    /// Repository-owned pools file (each pool's `tier`), from the same trusted checkout, needed only where fixPools or kindPools names a tier such as tier-1.
+    #[arg(long, value_name = "FILE")]
+    pub pools: Option<PathBuf>,
     /// Print the step a pass would take for each pull request and take none.
     #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
@@ -58,7 +61,11 @@ pub struct Poll {
     pub fix_pool: Vec<String>,
 }
 
-fn configured(args: &Poll, value: Option<&serde_json::Value>) -> Result<(Poll, poll::PollPolicy)> {
+fn configured(
+    args: &Poll,
+    value: Option<&serde_json::Value>,
+    pools: Option<&serde_json::Value>,
+) -> Result<(Poll, poll::PollPolicy)> {
     let mut effective = args.clone();
     let mut policy = poll::PollPolicy::default();
     if let Some(value) = value {
@@ -96,6 +103,9 @@ fn configured(args: &Poll, value: Option<&serde_json::Value>) -> Result<(Poll, p
             );
         }
     }
+    policy
+        .read_tiers(pools, &effective.fix_pool)
+        .context("decode pool tiers")?;
     Ok((effective, policy))
 }
 
@@ -105,17 +115,15 @@ pub fn run(
     args: &Poll,
     board: impl FnOnce() -> Result<Option<board_core::Snapshot>>,
 ) -> Result<()> {
-    let value = args
-        .config
-        .as_ref()
-        .map(|path| -> Result<serde_json::Value> {
-            serde_json::from_slice(
-                &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-            )
-            .with_context(|| format!("decode {}", path.display()))
-        })
-        .transpose()?;
-    let (effective, policy) = configured(args, value.as_ref())?;
+    let read = |path: &PathBuf| -> Result<serde_json::Value> {
+        serde_json::from_slice(
+            &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("decode {}", path.display()))
+    };
+    let value = args.config.as_ref().map(read).transpose()?;
+    let pools = args.pools.as_ref().map(read).transpose()?;
+    let (effective, policy) = configured(args, value.as_ref(), pools.as_ref())?;
     let args = &effective;
     ensure!(
         !args.apply || args.dispatch_workflow.is_some(),
@@ -388,7 +396,7 @@ mod tests {
         ])
         .poll;
         let base = json!({"operator": "owner", "bot": "worker", "dispatchRepo": "o/tracker", "follow": ["o/repo"]});
-        let (cfg, policy) = configured(&args, Some(&base)).unwrap();
+        let (cfg, policy) = configured(&args, Some(&base), None).unwrap();
         assert_eq!(cfg.operator, "owner");
         assert_eq!(cfg.bot, "worker");
         assert_eq!(cfg.dispatch_repo, "o/tracker");
@@ -404,9 +412,115 @@ mod tests {
         full["fixPools"] = json!(["configured"]);
         full["reviewWorkflow"] = json!("review.yml");
         full["dispatchWorkflow"] = json!("dispatch.yml");
-        let (cfg, _) = configured(&args, Some(&full)).unwrap();
+        let (cfg, _) = configured(&args, Some(&full), None).unwrap();
         assert_eq!(cfg.fix_pool, ["configured"]);
         assert_eq!(cfg.review_workflow.as_deref(), Some("review.yml"));
         assert_eq!(cfg.dispatch_workflow.as_deref(), Some("dispatch.yml"));
+
+        // A tier is read from the pools file, and only where a setting names one.
+        let pools = json!({"claude": {"tier": 1}, "openai": {"tier": 1}, "mistral": {"tier": 2},
+            "fable": {"tier": 1, "auto": false}, "hand": {"tier": 3, "auto": false}});
+        for (case, settings, file, expected) in [
+            (
+                "a pool name needs no file",
+                json!({"fixPools": ["claude"]}),
+                None,
+                Ok(json!({})),
+            ),
+            (
+                "fixPools and kindPools take a tier's automatic pools",
+                json!({"fixPools": ["tier-1"], "kindPools": {"triage": "tier-2"}}),
+                Some(&pools),
+                Ok(json!({"tier-1": ["claude", "openai"], "tier-2": ["mistral"], "tier-3": []})),
+            ),
+            (
+                "an unknown tier",
+                json!({"kindPools": {"research": "tier-4"}}),
+                Some(&pools),
+                Err("kindPools names tier-4, which is not a tier of the pools file"),
+            ),
+            (
+                "a tier of hand-dispatch pools only",
+                json!({"fixPools": ["tier-3"]}),
+                Some(&pools),
+                Err("fixPools names tier-3, which has no automatic pool in the pools file"),
+            ),
+            (
+                "a tier without the pools file",
+                json!({"fixPools": ["tier-1"]}),
+                None,
+                Err("fixPools names tier-1, but no pools file gives the tiers"),
+            ),
+            (
+                "a pool without its tier",
+                json!({"fixPools": ["tier-1"]}),
+                Some(&json!({"claude": {"tier": 1}, "openai": {}})),
+                Err("pools file: openai tier is not 1 to 9"),
+            ),
+            (
+                "a tier past the limit",
+                json!({"fixPools": ["tier-1"]}),
+                Some(&json!({"claude": {"tier": 10}})),
+                Err("pools file: claude tier is not 1 to 9"),
+            ),
+            (
+                "a tier of 0",
+                json!({"fixPools": ["tier-1"]}),
+                Some(&json!({"claude": {"tier": 0}})),
+                Err("pools file: claude tier is not 1 to 9"),
+            ),
+            (
+                "an auto that is not a boolean",
+                json!({"fixPools": ["tier-1"]}),
+                Some(&json!({"claude": {"tier": 1, "auto": "no"}})),
+                Err("pools file: claude auto is not a boolean"),
+            ),
+            (
+                "a pool named as a tier",
+                json!({"fixPools": ["tier-1"]}),
+                Some(&json!({"tier-1": {"tier": 1}})),
+                Err("pools file: pool \"tier-1\" is named as a tier"),
+            ),
+            (
+                "a pools file that is not an object",
+                json!({"fixPools": ["tier-1"]}),
+                Some(&json!(["claude"])),
+                Err("pools file is not an object"),
+            ),
+            (
+                "a tier where the round takes one pool",
+                json!({"toilFixPool": "tier-1"}),
+                Some(&pools),
+                Err("toilFixPool names tier-1, but only fixPools and kindPools take a tier"),
+            ),
+            (
+                "a tier for a conflict round",
+                json!({"conflictFixPool": "tier-1"}),
+                Some(&pools),
+                Err("conflictFixPool names tier-1, but only fixPools and kindPools take a tier"),
+            ),
+            (
+                "a tier for a diagnostic round",
+                json!({"diagnosticPool": "tier-1"}),
+                Some(&pools),
+                Err("diagnosticPool names tier-1, but only fixPools and kindPools take a tier"),
+            ),
+            (
+                "a tier for a continuation",
+                json!({"continuation": {"pools": {"cap": "tier-1"}}}),
+                Some(&pools),
+                Err("continuation pools names tier-1, but only fixPools and kindPools take a tier"),
+            ),
+        ] {
+            let mut value = json!({"operator": "owner", "bot": "worker", "dispatchRepo": "o/tracker", "follow": ["o/repo"]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(settings.as_object().unwrap().clone());
+            let got = configured(&args, Some(&value), file)
+                .map(|(_, policy)| json!(policy.tiers))
+                .map_err(|e| format!("{:#}", e.root_cause()));
+            assert_eq!(got, expected.map_err(str::to_owned), "{case}");
+        }
     }
 }

@@ -64,6 +64,30 @@ fn accepts_only_a_triage_or_research_dispatch_inside_the_policy() {
 }
 
 #[test]
+fn a_kinds_tier_takes_any_of_its_automatic_pools() {
+    let mut s = settings();
+    s.kind_pools.insert("triage".into(), "tier-1".into());
+    let tiered = json!({"large": {"tier": 1}, "small": {"tier": 1}, "hand": {"tier": 1, "auto": false},
+        "other": {"tier": 2}});
+    let p = Policy::new(&s, &tiered).unwrap().unwrap();
+    for (pool, accepted) in [
+        ("large", true),
+        ("small", true),
+        ("hand", false),
+        ("other", false),
+    ] {
+        let r = request(json!({"kind": "triage", "pool": pool, "item": 4}));
+        assert_eq!(validate_batch(&lines(&[r]), &p).is_ok(), accepted, "{pool}");
+    }
+    // A tier the pools file does not give is refused before any request.
+    s.kind_pools.insert("triage".into(), "tier-3".into());
+    assert!(Policy::new(&s, &tiered).is_err());
+    // Without a tier named, the pools file needs none.
+    s.kind_pools.insert("triage".into(), "small".into());
+    assert!(Policy::new(&s, &pools()).is_ok());
+}
+
+#[test]
 fn rejects_every_other_action_and_any_field_outside_the_policy() {
     let s = settings();
     let p = policy(&s);

@@ -1245,14 +1245,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ));
         }
         let (dispatcher, workflow) = (apply.dispatcher, apply.workflow.clone());
-        let kind_pool: Vec<String> = self
-            .config
-            .policy
-            .kind_pools
-            .get(kind)
-            .cloned()
-            .into_iter()
-            .collect();
+        let kind_pool = self.config.policy.kind_pool_choices(kind);
         let pool = match self.paced(kind_pool.first().cloned(), &kind_pool) {
             Ok(pool) => pool,
             Err(why) => return Ok((false, format!("not started: {why}"))),

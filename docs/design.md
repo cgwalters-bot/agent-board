@@ -328,6 +328,25 @@ chosen over a paced pool with room, and ties go to the round's usual turn. Each 
 with a `pools:` line naming every pool's mode. The tracker scheduler's own fill
 mode is outside this repository.
 
+Pools have tiers (agent-board#228): `fixPools` and each `kindPools` entry may
+name a tier, `tier-1` or `tier-2`, instead of a pool, so that tier-1 work
+spreads over claude and openai rather than going to one hardcoded pool. `poll
+--pools PATH` reads the caller's repository-owned pools file (tracker's
+`pools.json`, from the same trusted checkout), where each pool has its `tier`
+(1 to 9) and `"auto": false` keeps a hand-dispatch pool out of its tier. A
+tier stands for its automatic pools in name order: with `pace`, the run takes
+the one furthest under its pace, skipping held ones and waiting with the usual
+message when all are held; without it, fix rounds take the tier's pools in
+turn as listed `fixPools` do, and a `kindPools` run takes the tier's first pool. The dispatched run's `pool` input and its marker name the pool
+chosen, never the tier. A tier the file does not give, a tier with no automatic
+pool, a tier named without `--pools`, or a tier in `toilFixPool`,
+`conflictFixPool`, `diagnosticPool` or `continuation.pools` (which name the
+one pool a round must take) refuses the configuration. A configuration that
+names no tier needs no pools file and behaves as before. The supervisor's
+executor reads its kind's tier from the pools file it already takes, and admits
+a request for any automatic pool of it. `coordinator.planPool` and the
+`schedule` pools are the tracker scheduler's, outside this repository.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`

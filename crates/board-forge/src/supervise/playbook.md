@@ -34,7 +34,8 @@ Each request is exactly:
 - `kind` is one of the policy's `kinds` (triage, research, or explicitly enabled
   implement). Implement also requires native membership under an open,
   epic-labeled plan in the configured epics repository. `pool` is one of its `pools`, and
-  it must be the kind's pool where `kindPools` names one.
+  it must be the kind's pool where `kindPools` names one, or one of that
+  tier's pools in `tiers` where it names a tier such as `tier-1`.
 - `reason` is one of the policy's `reasons`. The executor writes the run's
   brief from it. You cannot add text to the brief.
 

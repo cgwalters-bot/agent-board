@@ -16,6 +16,7 @@
 //! Judgment writes share that log and fail closed without configured caps.
 use super::{AgentSettings, Api, HOUR_MS, IssueRef, Settings, encode, iso, millis, run_title};
 use crate::plan::Target;
+use crate::poll::pace::{Tiers, expand, tiers};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -89,6 +90,9 @@ pub struct Policy<'a> {
     pub settings: &'a Settings,
     pub agent: &'a AgentSettings,
     pub pools: Vec<String>,
+    /// The tiers `kindPools` names, whose automatic pools a run of that kind
+    /// may take; none where it names only pools.
+    pub tiers: Tiers,
 }
 
 impl<'a> Policy<'a> {
@@ -98,6 +102,12 @@ impl<'a> Policy<'a> {
         let Some(agent) = &settings.agent else {
             return Ok(None);
         };
+        let named: Vec<(&str, &str)> = settings
+            .kind_pools
+            .values()
+            .map(|p| ("kindPools", p.as_str()))
+            .collect();
+        let tiers = tiers(Some(pools), &named)?;
         let pools = pools.as_object().context("pools file is not an object")?;
         ensure!(
             pools.contains_key(&agent.pool),
@@ -108,6 +118,7 @@ impl<'a> Policy<'a> {
             settings,
             agent,
             pools: pools.keys().cloned().collect(),
+            tiers,
         }))
     }
 
@@ -216,6 +227,7 @@ pub fn compose(checks: &[Value], policy: &Policy, reason: &str) -> Result<String
         "kinds": policy.kinds(),
         "pools": policy.pools,
         "kindPools": policy.settings.kind_pools,
+        "tiers": policy.tiers,
         "reasons": REASONS.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
         "maxDispatchesPerPass": policy.agent.max_dispatches_per_pass,
         "maxDispatchesPerDay": policy.agent.max_dispatches_per_day,
@@ -343,11 +355,17 @@ pub fn validate_batch(source: &str, policy: &Policy) -> Result<Vec<Request>> {
             ensure!(!own, "The supervisor's own issues are not targets");
             let kind = request["kind"].as_str().unwrap_or_default();
             let pool = request["pool"].as_str().unwrap_or_default();
-            let fixed = policy.settings.kind_pools.get(kind);
+            // A kind's tier lets the agent pick among its automatic pools;
+            // a hand-dispatch pool of that tier stays outside it.
+            let fixed = policy
+                .settings
+                .kind_pools
+                .get(kind)
+                .map(|p| expand(&policy.tiers, std::slice::from_ref(p)));
             ensure!(
                 policy.kinds().contains(&kind)
                     && policy.pools.iter().any(|p| p == pool)
-                    && fixed.is_none_or(|p| p == pool),
+                    && fixed.is_none_or(|p| p.iter().any(|p| p == pool)),
                 "Kind or pool outside supervisor policy"
             );
             let reason = request["reason"].as_str().unwrap_or_default();
