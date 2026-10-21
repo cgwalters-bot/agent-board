@@ -3019,6 +3019,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         read: &[Value],
         (state, of): (Value, &str),
     ) -> Result<std::result::Result<u64, (u64, Option<String>)>> {
+        self.claim_reserved(repo, number, marker, read, (state, of, 0))
+    }
+
+    fn claim_reserved(
+        &mut self,
+        repo: &str,
+        number: u64,
+        marker: &Marker,
+        read: &[Value],
+        (state, of, reserve): (Value, &str, usize),
+    ) -> Result<std::result::Result<u64, (u64, Option<String>)>> {
         let from = state["from"]
             .as_str()
             .context("a claim names what it claims")?
@@ -3039,7 +3050,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             0,
         )?;
         let mine = posted["id"].as_u64().context("the new comment has no id")?;
-        let again = self.paged(&format!("{comments}?per_page=100"), true)?;
+        let again = self.paged_reserved(&format!("{comments}?per_page=100"), true, reserve)?;
         // A marker newer than the one read was not claimed from it: a stop is
         // posted without a claim, and a reset of it may be under way.
         let newest = find_marker(&again, &self.config.bot).id;
@@ -3526,9 +3537,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// Every page of a list, following `Link` within the API only; read
     /// without the cache where `fresh`.
     fn paged(&mut self, path: &str, fresh: bool) -> Result<Vec<Value>> {
+        self.paged_reserved(path, fresh, 0)
+    }
+
+    /// A paginated read must not spend writes reserved for recovery. A partial
+    /// list is never returned, including when the next page would use the reserve.
+    fn paged_reserved(&mut self, path: &str, fresh: bool, reserve: usize) -> Result<Vec<Value>> {
         let mut url = Some(format!("{API_ROOT}{path}"));
         let mut all = Vec::new();
         while let Some(page) = url {
+            ensure!(
+                reserve == 0 || self.remaining > reserve,
+                "pagination reached the poll's reserved requests"
+            );
             ensure!(
                 page.starts_with(API_ROOT),
                 "pagination left the API: {page}"
@@ -4125,7 +4146,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // stop, so a stop read here was labelled before the query below, and
         // no label there means a person took it off, not that another pass
         // is between its two writes.
-        let comments = if merge_only {
+        let mut comments = if merge_only {
             Vec::new()
         } else {
             self.paged(
@@ -4239,6 +4260,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Only where the label is the poll's own stop, the newest marker: a
         // label a person put on is theirs, and a stop already reset is not
         // waiting for anyone.
+        if self.config.policy.operator_answers
+            && !merge_only
+            && self.apply.is_some()
+            && labelled(&pull)
+            && is_harness(&pull, &self.config.bot)
+            && let Some(stop) = self.recover_answer_stop(repo, number, &comments, &marker)?
+        {
+            comments.push(stop);
+            marker = find_marker(&comments, &self.config.bot);
+        }
         let (answer, labelled_by) = if self.config.policy.operator_answers
             && !merge_only
             && marker.stopped
@@ -9788,7 +9819,8 @@ mod tests {
     /// label comes off and round 1 starts on it, quoting it. Anyone else's,
     /// the operator's from before the stop, an empty review, a label without
     /// the poll's stop or put back by a person, or the setting off, leave the
-    /// label to a person. A run that cannot start leaves it on, with a new stop.
+    /// label to a person. A run that is refused leaves it on, with the stop
+    /// again, which takes the answer up again.
     #[test]
     fn the_operators_answer_to_needs_human_starts_a_round() {
         let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
@@ -10112,8 +10144,8 @@ mod tests {
             "{line}"
         );
         assert!(fake.writes.borrow().is_empty());
-        // A run GitHub refuses leaves the label on, with a new stop after
-        // the answer, which a person answers again.
+        // A run GitHub refuses leaves the label on and posts a fresh stop,
+        // naming the answer as refused (agent-board#202).
         let fake = answered();
         let dispatcher = Fake::default();
         dispatcher.answers.borrow_mut().insert(
@@ -10137,12 +10169,58 @@ mod tests {
             !writes.iter().any(|w| w.starts_with("DELETE")),
             "{writes:?}"
         );
+        assert_eq!(
+            writes,
+            [
+                format!("POST repos/{REPO}/issues/470/comments"),
+                format!("POST repos/{REPO}/issues/470/comments"),
+                format!("PATCH repos/{REPO}/issues/comments/99"),
+                format!("POST repos/{REPO}/issues/470/comments"),
+            ]
+        );
         let body = fake.writes.borrow().last().unwrap().1["body"].clone();
-        let restop = find_marker(
-            &[json!({"id": 100, "user": {"login": BOT}, "body": body})],
+        let rewritten = json!({"id": 99, "user": {"login": BOT}, "created_at": "2026-10-11T09:00:00Z", "body": body});
+        let restop = find_marker(std::slice::from_ref(&rewritten), BOT);
+        assert_eq!((restop.stopped, restop.rounds), (true, 2), "{body}");
+        assert_eq!(
+            parse_marker(MARKER, body.as_str().unwrap()).unwrap()["refused"],
+            json!(["issuecomment-6"])
+        );
+        // The next pass answers it from that stop, though the answer is
+        // older than it.
+        let fake = github_with(
+            vec![
+                stop.clone(),
+                said(6, "cgwalters", "2026-10-11T08:00:00Z", answer),
+                rewritten,
+            ],
+            vec![],
+            vec![],
             BOT,
         );
-        assert_eq!((restop.stopped, restop.rounds), (true, 1), "{body}");
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            DISPATCHES.into(),
+            vec![(200, json!({"workflow_run_id": 1234}))],
+        );
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        let line = outcome.lines.last().unwrap();
+        assert!(line.contains("(issuecomment-6)"), "{line}");
+        assert!(line.ends_with("runs/1234, label removed"), "{line}");
+        assert_eq!(
+            parse_marker(CLAIM, fake.writes.borrow()[0].1["body"].as_str().unwrap()).unwrap()["from"],
+            "99"
+        );
         // A person puts the label back while the round starts: the round
         // goes on, but their hold stays.
         let mut fake = answered();
