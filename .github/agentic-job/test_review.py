@@ -33,7 +33,10 @@ class ReviewContracts(unittest.TestCase):
         # zizmor's unpinned-uses does not. agentic-job is referenced by release
         # tag; other cgwalters-forge references follow main
         # (cgwalters-forge/tracker#544), except the review wrapper, which holds
-        # review.yml's write grants and so is pinned by commit.
+        # review.yml's write grants, and secure-host, which runs as root before
+        # the job is hardened and which `agentic-job workflows check` admits
+        # only at a commit (agentic-job docs/workflows-check.md): both are
+        # pinned by commit.
         workflows = sorted((ROOT / ".github/workflows").glob("*.yml")) + sorted((ROOT / "live").glob("*.yml"))
         self.assertTrue(workflows)
         for path in workflows:
@@ -44,7 +47,10 @@ class ReviewContracts(unittest.TestCase):
                     target, _, pin = ref.partition("@")
                     if re.match(r"cgwalters-forge/agentic-job(/|\Z)", target):
                         self.assertRegex(pin, r"\Av\d+\.\d+\.\d+\Z")
-                    elif target == "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml":
+                    elif target in (
+                        "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml",
+                        "cgwalters-forge/actions/secure-host",
+                    ):
                         self.assertRegex(pin, r"\A[0-9a-f]{40}\Z")
                     elif target.startswith("cgwalters-forge/"):
                         self.assertEqual(pin, "main")
@@ -118,6 +124,44 @@ class ReviewContracts(unittest.TestCase):
         justfile = (ROOT / "Justfile").read_text()
         self.assertIn('forge_actions := env("FORGE_ACTIONS", "../actions")', justfile)
         self.assertIn('--justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check', justfile)
+
+    def test_site_is_built_hardened_and_deployed_by_a_deploy_only_job(self):
+        # The shape `agentic-job workflows check` admits for GitHub Pages
+        # (agentic-job docs/workflows-check.md, "Deploy-only Pages jobs"),
+        # which this repository does not yet run: the job holding the Pages
+        # grant and the OIDC request token runs nothing of the repository,
+        # only the one admitted upstream commit of deploy-pages, and takes
+        # the artifact the hardened check job uploaded on a push to main.
+        site = (ROOT / ".github/workflows/site.yml").read_text()
+        self.assertIn("\npermissions:\n  contents: read\n\nconcurrency:\n", site)
+        check, deploy = site.split("\n  check:\n", 1)[1].split("\n  deploy:\n", 1)
+        # Every checkout drops its token, and nothing runs between the
+        # checkout and secure-host: the tree is anyone's until hardened.
+        self.assertEqual(check.count("checkout@"), check.count("persist-credentials: false"))
+        self.assertGreater(check.count("checkout@"), 0)
+        before, hardened = check.split("uses: cgwalters-forge/actions/secure-host@", 1)
+        self.assertNotIn("- run:", before)
+        self.assertNotIn("- uses:", before.split("persist-credentials: false", 1)[1])
+        self.assertIn("- run: just site-test\n", hardened)
+        self.assertIn("- run: just site-build\n", hardened)
+        main_only = "if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n        "
+        self.assertIn(main_only + "run: just site-build-pages\n", hardened)
+        self.assertIn(main_only + "uses: actions/upload-pages-artifact@", hardened)
+        for forbidden in ("id-token", "secrets.", "env:", "GH_TOKEN", "token:"):
+            with self.subTest(job="check", forbidden=forbidden):
+                self.assertNotIn(forbidden, check)
+        self.assertIn("if: github.event_name == 'push' && github.ref == 'refs/heads/main'\n    needs: check\n", deploy)
+        self.assertIn("permissions:\n      pages: write\n      id-token: write\n    environment: github-pages\n", deploy)
+        self.assertEqual(
+            deploy.split("steps:\n", 1)[1].strip(),
+            "- uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5",
+        )
+        for forbidden in ("checkout", "run:", "env:", "with:", "secrets.", "container:", "services:"):
+            with self.subTest(job="deploy", forbidden=forbidden):
+                self.assertNotIn(forbidden, deploy)
+        justfile = (ROOT / "Justfile").read_text()
+        self.assertIn("cd site && npm ci --ignore-scripts --no-audit --no-fund\n", justfile)
+        self.assertIn("node --test site/links.test.mjs\n", justfile)
 
 
 if __name__ == "__main__":

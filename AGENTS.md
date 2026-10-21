@@ -19,6 +19,7 @@ that a feature or security boundary has been implemented.
 - `.github/workflows/`: unprivileged PR/push CI.
 - `live/`: protected staging workflow template, run from the staging repository.
 - `docs/`: design, security contracts and implementation limits; distinguish plans from current code.
+- `site/`: the Starlight documentation site, rendering the README and `docs/` in place (no copies); `just site-test` and `just site-build`, as agentic-job's.
 
 ## Build, lint and test
 
@@ -39,6 +40,12 @@ A separate CI job, `lint`, runs `just lint`: the shared workflow check over
 `.github/` (not `live/`) from a checkout of cgwalters-forge/actions (see the
 [Justfile](Justfile)). It needs just, cargo and docker or `CONTAINER=podman`,
 and pulls the linter images.
+
+The `site` workflow runs `just site-test`, `just site-build` (Node 22, `npm ci`
+from the lock, no install scripts; 8 s measured) and `just site-check` (lychee;
+the workflow uses its action); on main it then rebuilds with `just site-build-pages`
+for the Pages address and uploads that. Remove `site/node_modules`, `site/dist`
+and `site/.astro` before `just lint`, or zizmor reads the dependencies' workflows.
 
 Measured on a fresh Linux devspace with dependency downloads (2026-10-08):
 format 0.07 s, clippy 15.50 s, tests 20.97 s, CLI commands 7.91/0.07/0.07 s.

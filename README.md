@@ -248,6 +248,7 @@ than treating this checklist as evidence of a successful end-to-end run.
 - `ci.yml`: fmt, clippy, tests and fixture CLI runs on PRs, merge queue and pushes to main (`contents: read`), and `just lint`: the forge's [shared workflow check](https://github.com/cgwalters-forge/actions/blob/main/lint/README.md) (actionlint, zizmor, no `ubuntu-latest`) from a checkout of cgwalters-forge/actions at main. Locally, with that repository at `../actions` or `FORGE_ACTIONS`, run `just lint`.
 - `reconcile.yml`: every ten minutes on main, reads cgwalters-forge-stage project 2 with a read-only environment token and uploads `reconcile plan --emit` proposals as an artifact; nothing is applied. Until `STAGING_PROJECT_READ_TOKEN` is provisioned in that environment, each run logs a notice and skips successfully instead of failing.
 - `review.yml`: cgwalters-forge/actions' [cgwalters-review](https://github.com/cgwalters-forge/actions/blob/main/.github/workflows/cgwalters-review.yml) wrapper of agentic-job's review, pinned by commit, on pull requests and `/review` comments.
+- `site.yml`: builds and link-checks the [documentation site](https://cgwalters-forge.github.io/agent-board/) in `site/`, a Starlight rendering of this README and `docs/` like [agentic-job's](https://cgwalters-forge.github.io/agentic-job/), after secure-host with `contents: read`; on main it uploads the Pages artifact and a separate deploy-only job publishes it. Locally, `just site-test` and `just site-build`.
 
 ### Provisioning the reconcile preview
 
