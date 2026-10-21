@@ -327,6 +327,9 @@ fn unset(board: &Value, supervisor: &Value) -> Vec<String> {
 pub struct Settings {
     pub operator: String,
     pub bot: String,
+    /// agent-board.json's `generatedBy`, which the executor signs with as
+    /// the poll does ([`crate::Footer`]).
+    pub footer: crate::Footer,
     pub dispatch_repo: String,
     pub dispatch_workflow: String,
     /// Repositories whose pull requests the poll follows; an agent may ask
@@ -481,6 +484,7 @@ impl Settings {
             merge_authors: strings(option(board, "mergeAuthors")?, "config mergeAuthors")?,
             operator,
             bot,
+            footer: crate::Footer::from_json(option(board, "generatedBy")?)?,
             dispatch_repo,
             dispatch_workflow,
             epics_repository,

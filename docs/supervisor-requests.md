@@ -72,7 +72,8 @@ neither, so it is not an operator question; its own cap keeps it off unless
 configured. Both bodies carry the supervisor note below, so the supervisor
 never dispatches either until a person removes it.
 The executor ends every comment, new issue and status update with the
-`Generated-by:` attribution poll uses, rather than trusting the agent to.
+attribution poll uses (agent-board.json's `generatedBy`), rather than trusting
+the agent to.
 Titles are nonempty and at most 256 characters; public bodies are nonempty and
 at most 4,000 characters. They cannot contain triple-backtick fences, HTML
 comment markers or the triage-done receipt phrase below: an injected request

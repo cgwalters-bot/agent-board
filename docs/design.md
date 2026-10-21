@@ -291,7 +291,7 @@ required one does. It has been exercised against recorded responses only.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -501,6 +501,12 @@ step failed included, and a pass without the option drops it. The envelope
 bounds the per-repository pull request steps only: activity reads,
 `operatorComments` and `lockCollaboratorItems` keep their own bounds.
 
+`generatedBy` (one trimmed line of at most 200 characters; absent by default,
+which keeps `Generated-by: https://github.com/cgwalters/#llms`) is the
+attribution the poll's comments and the supervisor executor's writes end
+with, and the one the executor strips from the agent's text before signing
+it once (agent-board#226).
+
 `operatorAnswers` (`true`; absent or `false` by default, which leaves a
 `needs-human` pull request to a person taking the label off) takes the
 operator's comment as the answer the label waits for (agent-board#113). On
@@ -584,6 +590,7 @@ artifact the binary unzips. The epics check reads each live epic's checkpoint
 without the census's board read. `supervise trigger` decides whether the agent
 runs: on a failing check, outside a cooldown, or on the daily pass. It prints
 the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
+naming the configured `operator` as the one login whose text is instructions,
 the policy and the report. `supervise execute` holds the bot's token. It takes
 the agent's one unedited comment on the requests issue and accepts bounded
 requests: a triage or research run on an open issue in a `follow`

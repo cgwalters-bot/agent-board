@@ -22,8 +22,55 @@ pub mod supervise;
 pub use github::{github_item_url, is_github_login, parse_github_item, validate_github_project};
 
 /// The attribution every bot-posted text ends with, the poll's and the
-/// supervisor executor's alike.
+/// supervisor executor's alike, unless agent-board.json's `generatedBy`
+/// names another ([`Footer`]).
 pub const FOOTER: &str = "Generated-by: https://github.com/cgwalters/#llms";
+/// The longest `generatedBy`, in characters.
+pub const FOOTER_LIMIT: usize = 200;
+
+/// The attribution the poll and the supervisor executor append, and the
+/// executor strips from the agent's text before appending it once: both read
+/// it from the same `generatedBy`, defaulting to [`FOOTER`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Footer(String);
+
+impl Default for Footer {
+    fn default() -> Self {
+        Self(FOOTER.into())
+    }
+}
+
+impl std::fmt::Display for Footer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Footer {
+    /// `generatedBy`: absent or null keeps [`FOOTER`]. One trimmed line of
+    /// at most [`FOOTER_LIMIT`] characters: the executor strips it as the
+    /// last line of the agent's trimmed text, which a footer with a line
+    /// break or surrounding space would never match, so the agent's own copy
+    /// would be posted above the executor's.
+    pub fn from_json(value: Option<&Value>) -> Result<Self> {
+        let Some(value) = value.filter(|v| !v.is_null()) else {
+            return Ok(Self::default());
+        };
+        let text = value.as_str().unwrap_or_default();
+        ensure!(
+            !text.is_empty()
+                && text.trim() == text
+                && text.chars().count() <= FOOTER_LIMIT
+                && !text.chars().any(char::is_control),
+            "generatedBy is not one trimmed line of 1 to {FOOTER_LIMIT} characters"
+        );
+        Ok(Self(text.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 pub trait Forge {
     fn snapshot(&self) -> Result<Snapshot>;
@@ -69,6 +116,30 @@ mod tests {
     use super::*;
     use board_core::{Policy, reconcile};
     use url::Url;
+
+    #[test]
+    fn generated_by_is_one_trimmed_bounded_line() {
+        let long = "x".repeat(FOOTER_LIMIT + 1);
+        let cases: &[(Option<Value>, Option<&str>)] = &[
+            (None, Some(FOOTER)),
+            (Some(Value::Null), Some(FOOTER)),
+            (Some(json!("Made by a tool")), Some("Made by a tool")),
+            (Some(json!("x".repeat(FOOTER_LIMIT))), Some(&long[1..])),
+            (Some(json!(long)), None),
+            (Some(json!("")), None),
+            (Some(json!(" padded")), None),
+            (Some(json!("padded ")), None),
+            (Some(json!("two\nlines")), None),
+            (Some(json!("carriage\rreturn")), None),
+            (Some(json!("tab\there")), None),
+            (Some(json!(1)), None),
+            (Some(json!(["Made by"])), None),
+        ];
+        for (value, expected) in cases {
+            let got = Footer::from_json(value.as_ref()).ok();
+            assert_eq!(got.as_ref().map(Footer::as_str), *expected, "{value:?}");
+        }
+    }
 
     #[test]
     fn github_identity_table() {

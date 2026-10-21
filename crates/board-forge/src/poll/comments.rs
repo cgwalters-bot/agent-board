@@ -752,7 +752,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             // a fresh stop so it can be retried without another human reply.
             if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) {
                 self.send(self.rest, "POST", &format!("repos/{repo}/issues/{number}/comments"),
-                    json!({"body": marker_body(&refused, &format!("{of}: claim {id} timed out before its round was recorded."))}), 0)?;
+                    json!({"body": self.marker_body(&refused, &format!("{of}: claim {id} timed out before its round was recorded."))}), 0)?;
                 return Ok(format!("labelled {LABEL}"));
             }
             return Ok(format!(
@@ -798,13 +798,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 self.rewrite(
                     repo,
                     marker.id.context("the round has no marker")?,
-                    marker_body(&recovery, &format!("{of}: not started.")),
+                    self.marker_body(&recovery, &format!("{of}: not started.")),
                 )?;
                 self.send(
                     self.rest,
                     "POST",
                     &format!("repos/{repo}/issues/{number}/comments"),
-                    json!({"body": marker_body(&refused, &format!("{of}: not started."))}),
+                    json!({"body": self.marker_body(&refused, &format!("{of}: not started."))}),
                     0,
                 )?;
                 return Err(error);
@@ -928,7 +928,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             self.rewrite(
                 repo,
                 marker.id.context("the round has no marker")?,
-                marker_body(&recovery, "The answer's pending dispatch expired."),
+                self.marker_body(&recovery, "The answer's pending dispatch expired."),
             )?;
             stop
         } else if marker.stopped && !nodes(&state, "/recover_answer").is_empty() {
@@ -941,7 +941,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Supervision authenticates unedited stops. A failed POST leaves the
         // edited stop discoverable here, including after the PATCH succeeded.
         stop["at"] = stamp(self.now)?.into();
-        let body = marker_body(&stop, "The answer's refused dispatch can be retried.");
+        let body = self.marker_body(&stop, "The answer's refused dispatch can be retried.");
         let (_, fresh) = self.send(
             self.rest,
             "POST",
@@ -1156,7 +1156,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 self.rewrite(
                     repo,
                     id,
-                    marker_body(&state, &format!("{of}: not started.")),
+                    self.marker_body(&state, &format!("{of}: not started.")),
                 )?;
                 return Err(error);
             }
@@ -1267,8 +1267,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         self.dispatched += 1;
         let mut state = state;
+        let footer = self.config.policy.footer.clone();
         let claim_body = |state: &Value, text: &str| {
-            format!("<!-- {CLAIM}: {state} -->\n{of}: {text}\n\n{FOOTER}")
+            format!("<!-- {CLAIM}: {state} -->\n{of}: {text}\n\n{footer}")
         };
         // Someone else's pull request: the run's item is its tracking issue,
         // recorded on the claim, which is also the link to it from here. It
@@ -1417,7 +1418,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     .collect();
                 if !new.is_empty() {
                     let rest = self.rest;
-                    let more = format!("More from {url}:\n{}\n\n{FOOTER}", quoted(&new));
+                    let more = format!(
+                        "More from {url}:\n{}\n\n{}",
+                        quoted(&new),
+                        self.config.policy.footer
+                    );
                     self.send(
                         rest,
                         "POST",
@@ -1430,8 +1435,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         }
         let body = format!(
-            "The operator commented on {url}, a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it.\n{}\n\n{FOOTER}",
-            quoted(said)
+            "The operator commented on {url}, a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it.\n{}\n\n{}",
+            quoted(said),
+            self.config.policy.footer
         );
         let rest = self.rest;
         let (_, created) = self.send(
@@ -1481,6 +1487,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::poll::tests::marker_body;
     use std::cell::RefCell;
 
     const OPERATOR: &str = "op";
@@ -1784,10 +1791,20 @@ mod tests {
         apply: bool,
         at: OffsetDateTime,
     ) -> Outcome {
+        pass_configured(fake, &config(), (cursor, page), apply, at)
+    }
+
+    fn pass_configured(
+        fake: &Fake,
+        config: &Config,
+        (cursor, page): (Option<&str>, Option<u64>),
+        apply: bool,
+        at: OffsetDateTime,
+    ) -> Outcome {
         run(
             fake,
             fake,
-            &config(),
+            config,
             State {
                 operator_cursor: cursor.map(str::to_owned),
                 operator_page: page,
@@ -1812,6 +1829,42 @@ mod tests {
             .filter(|(w, _)| w.ends_with("/dispatches"))
             .map(|(_, body)| body["inputs"].clone())
             .collect()
+    }
+
+    #[test]
+    fn every_text_the_pass_writes_ends_with_the_configured_attribution() {
+        let custom = "Generated-by: https://example.org/llms";
+        for (name, fake) in [("bot's", github()), ("someone's", someones_pull())] {
+            for generated_by in [None, Some(custom)] {
+                let fake = Fake {
+                    rest: RefCell::new(fake.rest.borrow().clone()),
+                    links: RefCell::new(fake.links.borrow().clone()),
+                    ..Fake::default()
+                };
+                let mut config = config();
+                config.policy.footer = PollPolicy::from_json(&json!({"generatedBy": generated_by}))
+                    .unwrap()
+                    .footer;
+                let out = pass_configured(&fake, &config, (None, None), true, now());
+                assert_eq!(out.errors, 0, "{name}: {:?}", out.lines);
+                let writes = fake.writes.borrow();
+                let bodies: Vec<&str> = writes
+                    .iter()
+                    .filter_map(|(_, w)| w["body"].as_str())
+                    .collect();
+                // Claims, the round's marker and, for someone else's pull
+                // request, its tracking issue.
+                assert!(bodies.len() >= 3, "{name}: {bodies:?}");
+                let footer = generated_by.unwrap_or(crate::FOOTER);
+                for body in bodies {
+                    assert!(body.ends_with(&format!("\n\n{footer}")), "{name}: {body}");
+                    if generated_by.is_some() {
+                        assert!(!body.contains(crate::FOOTER), "{name}: {body}");
+                    }
+                }
+            }
+        }
+        assert!(PollPolicy::from_json(&json!({"generatedBy": "two\nlines"})).is_err());
     }
 
     #[test]

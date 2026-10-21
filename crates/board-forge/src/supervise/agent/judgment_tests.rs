@@ -1,6 +1,16 @@
 use super::*;
+use crate::Footer;
 
 fn configured() -> Settings {
+    configured_with(None)
+}
+
+/// With `generatedBy`, the attribution another deployment signs with.
+fn configured_with(generated_by: Option<&str>) -> Settings {
+    let mut board = board();
+    if let Some(footer) = generated_by {
+        board["generatedBy"] = json!(footer);
+    }
     let mut cfg = supervisor();
     cfg["agent"]["dailyCaps"] = json!({"comment": 2, "create_issue": 1, "close": 1,
         "remove_needs_human": 1, "replace_state": 1, "status_update": 1, "file_bug": 1});
@@ -8,7 +18,7 @@ fn configured() -> Settings {
     cfg["agent"]["state"] = json!({"repository": "example/control", "issue": 8});
     cfg["agent"]["project"] = json!("PVT_project");
     cfg["agent"]["kinds"] = json!(["triage", "research", "implement"]);
-    Settings::from_json(&board(), &cfg, None).unwrap()
+    Settings::from_json(&board, &cfg, None).unwrap()
 }
 
 fn action(name: &str, fields: Value) -> Value {
@@ -20,6 +30,10 @@ fn action(name: &str, fields: Value) -> Value {
 }
 
 fn actions() -> Vec<Value> {
+    actions_signed(&Footer::default())
+}
+
+fn actions_signed(footer: &Footer) -> Vec<Value> {
     vec![
         action(
             "comment",
@@ -49,7 +63,7 @@ fn actions() -> Vec<Value> {
         // Already signed: the executor signs it once.
         action(
             "file_bug",
-            json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{}", crate::FOOTER)}),
+            json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{footer}")}),
         ),
     ]
 }
@@ -140,8 +154,17 @@ fn evidence(fake: &mut Fake) {
 
 #[test]
 fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
-    let s = configured();
-    for r in actions() {
+    // Each deployment signs with, and strips, its own `generatedBy`.
+    for generated_by in [None, Some("Generated-by: https://example.org/llms")] {
+        signs_with(generated_by);
+    }
+}
+
+fn signs_with(generated_by: Option<&str>) {
+    let s = configured_with(generated_by);
+    let footer = &s.footer;
+    assert_eq!(footer.as_str(), generated_by.unwrap_or(crate::FOOTER));
+    for r in actions_signed(footer) {
         let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
         evidence(&mut fake);
         let out = run(&fake, &s, RESULT_URL, 1);
@@ -159,9 +182,8 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
                 assert_eq!(
                     body["body"],
                     format!(
-                        "Investigated; see the report.\n\n{}\n\n{}",
+                        "Investigated; see the report.\n\n{}\n\n{footer}",
                         crate::input::SUPERVISOR_NOTE,
-                        crate::FOOTER
                     )
                 );
                 assert!(crate::input::is_supervisor_note(
@@ -176,9 +198,8 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
                 assert_eq!(
                     body["body"],
                     format!(
-                        "Please decide.\n\n{}\n\n{}",
+                        "Please decide.\n\n{}\n\n{footer}",
                         crate::input::SUPERVISOR_NOTE,
-                        crate::FOOTER
                     )
                 );
                 assert!(
@@ -192,8 +213,8 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
                 assert_eq!(path, "/repos/example/control/issues");
                 assert_eq!(
                     body,
-                    &json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{}\n\n{}",
-                        crate::input::SUPERVISOR_NOTE, crate::FOOTER)})
+                    &json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{}\n\n{footer}",
+                        crate::input::SUPERVISOR_NOTE)})
                 );
                 assert!(
                     out.lines[0].contains(": done, https://github.com/example/control/issues/738"),
@@ -224,7 +245,7 @@ fn judgment_writes_use_only_configured_targets_and_fixed_labels_and_assignee() {
                 assert_eq!(body["variables"]["project"], "PVT_project");
                 assert_eq!(
                     body["variables"]["body"],
-                    format!("Work is progressing.\n\n{}", crate::FOOTER)
+                    format!("Work is progressing.\n\n{footer}")
                 );
                 assert_eq!(out.lines[0], "- `status_update` configured target: done, ");
             }
@@ -373,6 +394,27 @@ fn forbidden_actions_injected_targets_and_protocol_comments_never_write() {
             ),
             |_| {},
         );
+    }
+    // Nor only another deployment's configured attribution.
+    let other = configured_with(Some("Made by a tool"));
+    refuses(
+        &other,
+        action(
+            "comment",
+            json!({"repository": "example/project", "item": 3, "body": " Made by a tool\n"}),
+        ),
+        |_| {},
+    );
+    // The attribution is stripped only as a line of its own, never from the
+    // end of the agent's sentence.
+    let footer = &configured_with(Some("bot")).footer;
+    for (body, posted) in [
+        ("Ask the bot", "Ask the bot\n\nbot"),
+        ("Ask the robot", "Ask the robot\n\nbot"),
+        ("Ask the owner.\nbot", "Ask the owner.\n\nbot"),
+        ("Ask the owner.\n\nbot\n", "Ask the owner.\n\nbot"),
+    ] {
+        assert_eq!(judgment::signed(body, None, footer), posted, "{body:?}");
     }
     let mut close = actions()[2].clone();
     close.as_object_mut().unwrap().remove("triage_run");
