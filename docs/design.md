@@ -676,8 +676,12 @@ the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
 naming the configured `operator` as the one login whose text is instructions,
 the policy and the report. `supervise execute` holds the bot's token. It takes
 the agent's one unedited comment on the requests issue and accepts bounded
-requests: a triage or research run on an open issue in a `follow`
-repository, with a pool from the pools file and one of a fixed set of reasons.
+requests: dispatches (triage, research and, under an open epic, implement) and
+the judgment writes below, all off by default: dispatches need their
+`agent.kinds` entry and nonzero dispatch caps, every other write its
+`agent.dailyCaps` entry.
+A dispatch is a run on an open issue in a `follow` repository, with a pool from
+the pools file and one of a fixed set of reasons.
 The executor writes the brief itself. A batch is refused whole if any request
 is invalid, if an issue holds a supervisor note, if an issue has a dispatch
 run in flight, or if the batch would pass
@@ -691,7 +695,7 @@ names. That count holds only if the caller runs one executor at a time, as
 tracker's execute job does with its own concurrency group. Both caps default
 to zero, which admits nothing. Explicitly enabled implement dispatches additionally
 require native membership under an open, epic-labeled plan. Judgment writes
-(comments, operator-assigned tracker issues, triage-proven closure, conflict-only
+(comments, operator-assigned tracker issues, tracker bug issues, triage-proven closure, conflict-only
 poll hold removal, state replacement and a daily project update) have separate
 trusted-config daily caps, all off by default. See the
 [request protocol and evidence requirements](supervisor-requests.md). It never
