@@ -37,7 +37,7 @@ start of a line, holding one JSON object:
 | `item` | yes | Positive issue number in `repo` |
 | `kind` | yes | `implement`, `triage` or `research`: the profile the run gets |
 | `runner` | yes | `hosted`, the only runner the caller has |
-| `pool` | no | Inference pool named in the caller's `pools.json`; absent leaves it to the caller's variables |
+| `pool` | no | Inference pool named in the caller's `pools.json`: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 32 bytes (`gpt5`, `claude-opus`), and not a `tier-` name; absent leaves it to the caller's variables |
 | `brief` | yes | The task, at most 16,000 characters; the run gets it after the kind's profile |
 | `stacks_on` | no | Another issue number in `repo` whose pull request this implement run builds on ([stacking](#stacking)) |
 
