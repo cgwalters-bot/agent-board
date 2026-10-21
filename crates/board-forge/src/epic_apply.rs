@@ -1,5 +1,5 @@
 //! Opt-in epic mutations, with a dispatch-style claim preventing blind replay.
-use crate::epic::{Bounds, EPIC_PLAN_FENCE, Epic, EpicPlan, IssueRef, read_epic};
+use crate::epic::{Bounds, EPIC_PLAN_FENCE, Epic, EpicPlan, IssueRef, epic_labelled_by, read_epic};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::plan::{Comment, fenced_json, issue_comments, newest_fenced, plan_id, send, viewer};
 use crate::poll::Rest;
@@ -66,6 +66,10 @@ pub struct Config {
     pub priority_field_id: String,
     pub priorities: BTreeMap<String, String>,
     pub default_priority: String,
+    /// Require the newest `epic` labeling to be the operator's, so that
+    /// someone with only triage access (or the bot) cannot start a
+    /// decomposition the bot then carries out. Off by default.
+    pub label_by_operator: bool,
 }
 
 impl Config {
@@ -81,7 +85,8 @@ impl Config {
                     "priority_field",
                     "priority_field_id",
                     "priorities",
-                    "default_priority"
+                    "default_priority",
+                    "label_by_operator"
                 ]
                 .contains(&key.as_str()),
                 "unknown epic config field {key:?}"
@@ -137,6 +142,16 @@ impl Config {
             priorities.contains_key(&default_priority),
             "default_priority is not a configured option"
         );
+        let label_by_operator = object
+            .get("label_by_operator")
+            .map(|v| v.as_bool().context("label_by_operator is not a boolean"))
+            .transpose()?
+            .unwrap_or(false);
+        // Else the bot's own labeling would pass as the operator's.
+        ensure!(
+            !label_by_operator || !operator.eq_ignore_ascii_case(&bot),
+            "label_by_operator needs an operator other than the bot"
+        );
         Ok(Self {
             operator,
             bot,
@@ -146,6 +161,7 @@ impl Config {
             priority_field_id: text("priority_field_id")?,
             priorities,
             default_priority,
+            label_by_operator,
         })
     }
 
@@ -201,6 +217,35 @@ fn accepted(comments: &[Comment], config: &Config) -> Result<(Value, Comment)> {
     Ok((value, from.clone()))
 }
 
+/// The parent is an epic: labelled, and by the operator where configured.
+/// `still` words the re-check after claiming.
+fn designated<T: Transport>(
+    client: &T,
+    issue: &ItemRef,
+    epic: &Epic,
+    config: &Config,
+    still: bool,
+) -> Result<()> {
+    let has = if still {
+        "no longer has"
+    } else {
+        "does not have"
+    };
+    ensure!(epic.designated, "parent {has} the epic label");
+    if config.label_by_operator {
+        let by = epic_labelled_by(client, issue)?;
+        ensure!(
+            by.as_deref()
+                .is_some_and(|login| login.eq_ignore_ascii_case(&config.operator)),
+            "parent's epic label was added by {}, not the operator",
+            by.map_or("an app or a deleted account".into(), |login| format!(
+                "{login:?}"
+            ))
+        );
+    }
+    Ok(())
+}
+
 /// Read-only preview. Apply checks for an existing claim before validating
 /// current sub-issues: a prior rescope's target may have closed since, which
 /// makes its own plan invalid. A prior close is satisfied, so only the claim
@@ -220,10 +265,7 @@ pub fn preview_checked<T: Transport>(
     expected.check(&value, &from)?;
     let epic = read_epic(client, issue)?;
     let plan = EpicPlan::validate(&value, &config.bounds, &epic)?;
-    ensure!(
-        epic.designated,
-        "parent does not have the operator's epic label"
-    );
+    designated(client, issue, &epic, config, false)?;
     let mut out = Vec::new();
     for mut mutation in plan.preview(&epic) {
         if mutation["graphql"] == "updateProjectV2ItemFieldValue" {
@@ -278,10 +320,7 @@ pub fn apply_checked<C: Transport + Rest>(
             .collect());
     }
     let epic = read_epic(client, issue)?;
-    ensure!(
-        epic.designated,
-        "parent does not have the operator's epic label"
-    );
+    designated(client, issue, &epic, config, false)?;
     EpicPlan::validate(&value, &config.bounds, &epic)?;
     let path = format!(
         "{API_ROOT}repos/{}/issues/{}/comments",
@@ -321,10 +360,7 @@ pub fn apply_checked<C: Transport + Rest>(
         );
         // Recheck membership and all refusals after claiming, before any write.
         let epic = read_epic(client, issue)?;
-        ensure!(
-            epic.designated,
-            "parent no longer has the operator's epic label"
-        );
+        designated(client, issue, &epic, config, true)?;
         let checked = EpicPlan::validate(&current, &config.bounds, &epic)?;
         execute(client, &checked, &epic, config, &mut done)
     })();
@@ -536,6 +572,14 @@ mod tests {
             "author": {"login": "planner"}, "editor": editor.map(|login| json!({"login": login}))})
     }
 
+    /// A labelings timeline, oldest first: (actor type, login, label).
+    fn labellings(events: &[(&str, &str, &str)], earlier: bool) -> Value {
+        let nodes: Vec<_> = (events.iter())
+            .map(|(kind, login, label)| json!({"actor": {"__typename": kind, "login": login}, "label": {"name": label}}))
+            .collect();
+        json!({"nodes": nodes, "pageInfo": {"hasPreviousPage": earlier}})
+    }
+
     struct Forge {
         comments: RefCell<Vec<Value>>,
         requests: RefCell<Vec<(String, String, Value)>>,
@@ -546,6 +590,10 @@ mod tests {
         edit_on_read: Option<usize>,
         labelled: bool,
         remove_label_on_recheck: bool,
+        /// The epic's labelings timeline, and the one from the second read on.
+        labellings: Value,
+        relabelled: Option<Value>,
+        timeline_reads: Cell<usize>,
         /// The epic is closed from this epic read on.
         epic_closed_from: Option<usize>,
         epic_reads: Cell<usize>,
@@ -571,6 +619,9 @@ mod tests {
                 edit_on_read: None,
                 labelled: true,
                 remove_label_on_recheck: false,
+                labellings: labellings(&[("User", "operator", "epic")], false),
+                relabelled: None,
+                timeline_reads: Cell::new(0),
                 epic_closed_from: None,
                 epic_reads: Cell::new(0),
                 reads: Cell::new(0),
@@ -601,6 +652,14 @@ mod tests {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
             if query.contains("viewer") {
                 return Ok(json!({"viewer": {"login": self.login}}));
+            }
+            if query.contains("timelineItems(itemTypes: [LABELED_EVENT]") {
+                self.timeline_reads.set(self.timeline_reads.get() + 1);
+                let timeline = match &self.relabelled {
+                    Some(later) if self.timeline_reads.get() >= 2 => later,
+                    _ => &self.labellings,
+                };
+                return Ok(json!({"repository": {"issue": {"timelineItems": timeline}}}));
             }
             if query.contains("comments(first") {
                 self.reads.set(self.reads.get() + 1);
@@ -1101,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn only_operator_designated_epics_may_be_decomposed() {
+    fn only_designated_epics_may_be_decomposed() {
         for before in [true, false] {
             let mut forge = Forge::full();
             forge.labelled = !before;
@@ -1110,13 +1169,157 @@ mod tests {
                 "{:#}",
                 apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap_err()
             );
-            assert!(error.contains("operator's epic label"), "{error}");
+            assert!(error.contains("the epic label"), "{error}");
             assert!(!forge.created.get());
             if before {
                 assert!(forge.requests.borrow().is_empty());
                 assert!(preview(&forge, &issue(), &config()).is_err());
             }
         }
+    }
+
+    /// With `label_by_operator`, the newest epic labeling must be a user's
+    /// whose login is the operator's, before apply and after its claim. Off,
+    /// the timeline is never read.
+    #[test]
+    fn label_by_operator_requires_the_operators_newest_labeling() {
+        let operator = ("User", "Operator", "epic");
+        let intruder = ("User", "intruder", "epic");
+        let other = ("User", "operator", "bug");
+        // Configured, the timeline, a later one, and the error (None: applies).
+        for (on, timeline, later, expected) in [
+            (false, labellings(&[intruder], false), None, None),
+            (true, labellings(&[operator], false), None, None),
+            (
+                true,
+                labellings(&[intruder, operator, other], true),
+                None,
+                None,
+            ),
+            (
+                true,
+                labellings(&[("User", "operator", "Epic")], false),
+                None,
+                None,
+            ),
+            (
+                true,
+                labellings(&[intruder], false),
+                None,
+                Some("added by \"intruder\""),
+            ),
+            (
+                true,
+                labellings(&[operator, intruder], false),
+                None,
+                Some("added by \"intruder\""),
+            ),
+            (
+                true,
+                labellings(&[("Bot", "operator", "epic")], false),
+                None,
+                Some("an app or a deleted account"),
+            ),
+            (
+                true,
+                labellings(&[other], true),
+                None,
+                Some("more labelings than one page holds"),
+            ),
+            (
+                true,
+                labellings(&[other], false),
+                None,
+                Some("no \"epic\" labeling"),
+            ),
+            (
+                true,
+                json!({"nodes": null}),
+                None,
+                Some("timeline has no nodes"),
+            ),
+            (
+                true,
+                json!({"nodes": [{"actor": null, "label": {"name": "epic"}}], "pageInfo": {"hasPreviousPage": false}}),
+                None,
+                Some("an app or a deleted account"),
+            ),
+            (
+                true,
+                labellings(&[("Mannequin", "operator", "epic")], false),
+                None,
+                Some("an app or a deleted account"),
+            ),
+            // A labeling whose label was since deleted is not an epic one.
+            (
+                true,
+                json!({"nodes": [{"actor": {"__typename": "User", "login": "operator"}, "label": null}], "pageInfo": {"hasPreviousPage": false}}),
+                None,
+                Some("no \"epic\" labeling"),
+            ),
+            (
+                true,
+                json!({"nodes": []}),
+                None,
+                Some("or GitHub did not say"),
+            ),
+            (
+                true,
+                labellings(&[operator], false),
+                Some(labellings(&[operator, intruder], false)),
+                Some("added by \"intruder\""),
+            ),
+        ] {
+            let mut forge = Forge::full();
+            forge.labellings = timeline;
+            let after_claim = later.is_some();
+            forge.relabelled = later;
+            let mut config = config();
+            config.label_by_operator = on;
+            let result = apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH);
+            if !on {
+                assert_eq!(forge.timeline_reads.get(), 0);
+            }
+            match expected {
+                None => {
+                    result.unwrap();
+                    assert!(forge.created.get());
+                }
+                Some(expected) => {
+                    let error = format!("{:#}", result.unwrap_err());
+                    assert!(error.contains(expected), "{error}");
+                    assert!(!forge.created.get() && !forge.closed.get());
+                    let writes = forge.requests.borrow();
+                    if after_claim {
+                        assert!(
+                            (writes.iter())
+                                .all(|(_, path, _)| path.starts_with("repos/example/epics/")),
+                            "{writes:?}"
+                        );
+                    } else {
+                        assert!(writes.is_empty(), "{writes:?}");
+                        drop(writes);
+                        let refused = preview(&forge, &issue(), &config).unwrap_err();
+                        assert!(format!("{refused:#}").contains(expected));
+                    }
+                }
+            }
+        }
+        let on = |value: Value, bot: &str| {
+            let mut object = json!({"operator": "operator", "bot": bot, "repositories": [],
+                "project": "P", "priority_field": "Order", "priority_field_id": "F",
+                "priorities": {"Normal": "O"}, "default_priority": "Normal"});
+            if !value.is_null() {
+                object["label_by_operator"] = value;
+            }
+            Config::from_json(&object).map(|c| c.label_by_operator).ok()
+        };
+        assert_eq!(on(Value::Null, "planner"), Some(false));
+        assert_eq!(on(json!(true), "planner"), Some(true));
+        assert_eq!(on(json!(false), "planner"), Some(false));
+        assert_eq!(on(json!("true"), "planner"), None);
+        assert_eq!(on(json!(true), "Operator"), None);
+        assert_eq!(on(json!(false), "Operator"), Some(false));
     }
 
     /// Closing the epic ends its decomposition: a plan written while it was

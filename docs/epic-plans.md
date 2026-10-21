@@ -10,9 +10,12 @@ from the caller's configuration, and only those bounds limit what it may change.
 `epic plan --dry-run` prints the GitHub mutations a plan would make.
 `epic apply ISSUE --config FILE` previews by default; `--apply` acts with the
 configured bot's token. Ordering is expressed only by sub-issue Priority.
-Apply and its preview require positive evidence of the parent's `epic` label,
-which the operator supplies; apply checks it again after claiming. This prevents
-the planner from starting decompositions on ordinary issues or its own new children.
+Apply and its preview require positive evidence of the parent's `epic` label;
+apply checks it again after claiming. This prevents the planner from starting
+decompositions on ordinary issues or its own new children. Anyone with triage
+access to the repository can add the label, and so can the bot; the plan's
+bounds are the limit. With `label_by_operator` in the [configuration](#apply),
+the newest `epic` labeling must also be the configured operator's.
 A closed epic refuses every plan, in the dry run, the preview and apply (again
 after claiming): closing it is the operator's decision that the decomposition
 is finished or dropped, so a plan written before may not add to or change it.
@@ -163,9 +166,22 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
   "priority_field": "Priority",
   "priority_field_id": "FIELD_NODE_ID",
   "priorities": {"P0": "OPTION_ID_0", "P1": "OPTION_ID_1"},
-  "default_priority": "P1"
+  "default_priority": "P1",
+  "label_by_operator": true
 }
 ```
+
+`label_by_operator` is optional and off by default. On, the preview and apply
+(before and after claiming) read the epic's last 100 labelings and refuse
+unless the newest `epic` one was added by a user whose login is `operator`. An
+app's labeling never counts, and a newest `epic` labeling older than the last
+100 labelings refuses rather than falling back to an older one. This stops
+someone with only triage access, or the bot, from starting a decomposition
+that the bot then carries out; `operator` and `bot` must then differ. GitHub
+names a labeling's label as it is called now, so renaming a label the operator
+once added to `epic` (which takes write access) would also pass. It covers
+`epic apply` only, not the supervisor's implement gate
+([supervisor requests](supervisor-requests.md)).
 
 IDs and names are configuration, not planner-controlled values. Creating an
 issue sets the default Priority; a later `set_priority` can override it. The
