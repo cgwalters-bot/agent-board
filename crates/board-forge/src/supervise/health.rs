@@ -124,12 +124,21 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
-/// A probe that is switched off leaves skipped runs: no observation, which
+/// Probe runs that observed the broker: completed and neither skipped nor
+/// cancelled. A run still in progress, or cancelled waiting on its
+/// concurrency group, has not observed anything, so the newest completed
+/// probe decides; one that hangs, or is cancelled at its timeout, is caught
+/// by the newest completed probe going stale (`probe_stale_minutes`). A
+/// probe that is switched off leaves skipped runs: no observation, which
 /// fails once it has lasted, like any other.
 fn probes(items: &[Value]) -> Vec<&Value> {
     items
         .iter()
-        .filter(|r| r["conclusion"] != "skipped")
+        .filter(|r| {
+            r["status"] == "completed"
+                && r["conclusion"] != "skipped"
+                && r["conclusion"] != "cancelled"
+        })
         .collect()
 }
 
