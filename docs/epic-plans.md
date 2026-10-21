@@ -99,8 +99,8 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
   plan closes, a new slice that stacks on it included: its run would start
   unstacked once the pull request it was written to build on is abandoned;
 - a `reason` holding an `` ```agent-board `` fence or a `<!--` marker: it is
-  posted as a comment by the applier, a plan writer, where it would count as a
-  plan or a dispatch record;
+  posted as a comment by the applier, which may also be a plan writer, where it
+  would count as a plan or a dispatch record;
 - more than 20 actions, titles over 256 characters, bodies over 60,000 and
   reasons over 4,000, and empty text.
 
@@ -110,6 +110,11 @@ As for job plans: only the operator's (`--operator`) and the planner's
 (`--planner`) comments count, the newest written or edited wins, and a newest
 plan that is invalid or last edited by anyone else stops the check rather than
 falling back to an older one. See [job plans](job-plans.md#who-may-write-one).
+For apply, the planner is the configuration's `planner`; without one it is the
+`bot`, so every comment the bot writes is then a trusted plan writer's. Name a
+separate planner when it has its own login. The bot still posts the job plans
+of the sub-issues it creates, so dispatching those needs the bot as their
+`--planner`.
 
 ## Dry run
 
@@ -161,6 +166,7 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
 ```json
 {
   "operator": "OPERATOR_LOGIN",
+  "planner": "PLANNER_LOGIN",
   "bot": "BOT_LOGIN",
   "repositories": ["OWNER/REPO"],
   "project": "PROJECT_NODE_ID",
@@ -184,16 +190,18 @@ once added to `epic` (which takes write access) would also pass. It covers
 `epic apply` only, not the supervisor's implement gate
 ([supervisor requests](supervisor-requests.md)).
 
-IDs and names are configuration, not planner-controlled values. Creating an
-issue sets the default Priority; a later `set_priority` can override it. The
+`planner` is optional and defaults to `bot`. IDs and names are configuration,
+not planner-controlled values. Creating an issue sets the default Priority; a
+later `set_priority` can override it. The
 configured field must be a single-select field. The bot needs issue write and
 project write access. Neither command dispatches a job or changes Status.
 
 To prevent duplicate creation after a partial or ambiguous write, apply posts
 an `<!-- agent-board-epic-apply: COMMENT-ID@CHANGE-TIME -->` claim before any
 mutation and reads it back, as job dispatch does. The oldest claim wins; only
-operator/bot-authored claims count. Callers must serialize apply passes, since
-GitHub comment reads are not a transactional lock. A claimed plan is a no-op
+operator/bot-authored claims count, not a separate planner's. Callers must
+serialize apply passes, since GitHub comment reads are not a transactional
+lock. A claimed plan is a no-op
 on re-run. The claim, not validation, is what stops a replay: a close the plan
 made is satisfied when it is checked again. A foreign edit to the
 plan still refuses it; accepted edits identify a new plan.
