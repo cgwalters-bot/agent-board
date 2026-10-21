@@ -188,6 +188,84 @@ pub fn line(paces: &Paces, configured: &BTreeSet<String>) -> String {
     format!("pools: {}", modes.join(", "))
 }
 
+/// What a pool setting names to take a tier's pools instead of one pool:
+/// `tier-1` is the pools file's pools with `"tier": 1` (agent-board#228).
+pub const TIER_PREFIX: &str = "tier-";
+/// The highest tier a pool may have in the pools file.
+pub const TIER_LIMIT: u64 = 9;
+
+/// The automatic pools of each tier, by tier name, in name order.
+pub type Tiers = BTreeMap<String, Vec<String>>;
+
+/// Whether a pool setting names a tier rather than a pool.
+pub fn is_tier(name: &str) -> bool {
+    name.starts_with(TIER_PREFIX)
+}
+
+/// The tiers of the caller's pools file (tracker's pools.json, from its
+/// default branch), read only where a setting in `named` names one, so that
+/// a configuration naming none needs no file and is as before. Each pool
+/// then needs its `tier`; `"auto": false` keeps a pool dispatched only by
+/// hand, whose allowance is apart, out of its tier's choice. A tier the file
+/// does not give, or gives no automatic pool, is refused: without that, a
+/// mistyped tier would go to the dispatch as a pool's name, and a tier of
+/// hand-dispatch pools would spend the allowance they keep apart.
+pub fn tiers(pools: Option<&Value>, named: &[(&str, &str)]) -> Result<Tiers> {
+    let named: Vec<_> = named.iter().filter(|(_, n)| is_tier(n)).collect();
+    let Some((setting, tier)) = named.first() else {
+        return Ok(Tiers::new());
+    };
+    let pools = pools
+        .with_context(|| format!("{setting} names {tier}, but no pools file gives the tiers"))?
+        .as_object()
+        .context("pools file is not an object")?;
+    let mut tiers = Tiers::new();
+    for (pool, entry) in pools {
+        ensure!(
+            !is_tier(pool),
+            "pools file: pool {pool:?} is named as a tier"
+        );
+        let tier = entry["tier"]
+            .as_u64()
+            .filter(|t| (1..=TIER_LIMIT).contains(t))
+            .with_context(|| format!("pools file: {pool} tier is not 1 to {TIER_LIMIT}"))?;
+        let auto = match entry.get("auto") {
+            None => true,
+            Some(auto) => auto
+                .as_bool()
+                .with_context(|| format!("pools file: {pool} auto is not a boolean"))?,
+        };
+        let pools = tiers.entry(format!("{TIER_PREFIX}{tier}")).or_default();
+        if auto {
+            pools.push(pool.clone());
+        }
+    }
+    for (setting, tier) in named {
+        match tiers.get(*tier) {
+            None => bail!("{setting} names {tier}, which is not a tier of the pools file"),
+            Some(pools) => ensure!(
+                !pools.is_empty(),
+                "{setting} names {tier}, which has no automatic pool in the pools file"
+            ),
+        }
+    }
+    Ok(tiers)
+}
+
+/// `names` with each tier in place of its pools, which pace then chooses
+/// among as among any configured pools.
+pub fn expand(tiers: &Tiers, names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .flat_map(|name| {
+            tiers
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| vec![name.clone()])
+        })
+        .collect()
+}
+
 /// `2026-10-19T03:24Z`.
 fn minute(at: OffsetDateTime) -> String {
     let at = at.to_offset(time::UtcOffset::UTC);
@@ -251,7 +329,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     pub(super) fn pace_line(&mut self) -> Option<String> {
         let paces = self.paces()?;
         let policy = &self.config.policy;
-        let mut configured: BTreeSet<String> = policy.kind_pools.values().cloned().collect();
+        let kinds: Vec<String> = policy.kind_pools.values().cloned().collect();
+        let mut configured: BTreeSet<String> = expand(&policy.tiers, &kinds).into_iter().collect();
         configured.extend(policy.continuation.pools.values().cloned());
         configured.extend(
             [
@@ -264,7 +343,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .cloned(),
         );
         if let Some(apply) = &self.apply {
-            configured.extend(apply.pools.iter().cloned());
+            configured.extend(expand(&policy.tiers, &apply.pools));
         }
         Some(line(&paces, &configured))
     }

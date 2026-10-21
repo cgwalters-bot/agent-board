@@ -364,6 +364,10 @@ pub struct PollPolicy {
     /// `generatedBy`: the attribution the poll's comments end with; none
     /// (the default) keeps [`crate::FOOTER`].
     pub footer: Footer,
+    /// The tiers `fixPools` and `kindPools` may name for a run's pool, read
+    /// from the caller's pools file by [`PollPolicy::read_tiers`] ([`pace::tiers`]);
+    /// none (the default) where they name only pools.
+    pub tiers: pace::Tiers,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -641,7 +645,46 @@ impl PollPolicy {
                 })
                 .transpose()?,
             footer: Footer::from_json(get("generatedBy")?)?,
+            tiers: pace::Tiers::new(),
         })
+    }
+
+    /// Reads the tiers that `fix_pools` (the rounds' `fixPools`) and
+    /// `kindPools` name from the caller's pools file. The other pool settings
+    /// name the one pool a round must take, so a tier there is refused rather
+    /// than dispatched as a pool's name.
+    pub fn read_tiers(&mut self, pools: Option<&Value>, fix_pools: &[String]) -> Result<()> {
+        let single = [
+            ("toilFixPool", &self.toil_fix_pool),
+            ("conflictFixPool", &self.conflict_fix_pool),
+            ("diagnosticPool", &self.diagnostic_pool),
+        ]
+        .into_iter()
+        .chain(
+            self.continuation
+                .pools
+                .values()
+                .map(|p| ("continuation pools", p)),
+        );
+        for (setting, pool) in single {
+            ensure!(
+                !pace::is_tier(pool),
+                "{setting} names {pool}, but only fixPools and kindPools take a tier"
+            );
+        }
+        let named: Vec<(&str, &str)> = fix_pools
+            .iter()
+            .map(|p| ("fixPools", p.as_str()))
+            .chain(self.kind_pools.values().map(|p| ("kindPools", p.as_str())))
+            .collect();
+        self.tiers = pace::tiers(pools, &named)?;
+        Ok(())
+    }
+
+    /// The pools a run of `kind` may take: its `kindPools` pool, or its tier's.
+    fn kind_pool_choices(&self, kind: &str) -> Vec<String> {
+        let pool: Vec<String> = self.kind_pools.get(kind).cloned().into_iter().collect();
+        pace::expand(&self.tiers, &pool)
     }
 }
 
@@ -672,17 +715,12 @@ pub struct Apply<'a, R> {
     pub pools: Vec<String>,
 }
 
-/// The pools a fix round takes in turn: `fixPools`, else `kindPools.fix`.
+/// The pools a fix round takes in turn: `fixPools`, else `kindPools.fix`,
+/// each tier as its pools.
 fn fix_pools(pools: &[String], config: &Config) -> Vec<String> {
     match pools.is_empty() {
-        true => config
-            .policy
-            .kind_pools
-            .get("fix")
-            .cloned()
-            .into_iter()
-            .collect(),
-        false => pools.to_vec(),
+        true => config.policy.kind_pool_choices("fix"),
+        false => pace::expand(&config.policy.tiers, pools),
     }
 }
 
@@ -8317,24 +8355,51 @@ mod tests {
             let snapshot = json!({"schema": "bot-usage/v1", "updated_at": updated, "pools": pools});
             json!([{"user": {"login": BOT}, "body": format!("<!-- bot-usage v1 -->\n```json\n{snapshot}\n```\n")}])
         };
-        for (case, comments, expected) in [
+        let both_held = "not started: every pool is held (claude until 2026-10-14T21:12Z, openai until 2026-10-13T14:40Z)";
+        // `fixPools` naming the pools, or their tier (agent-board#228).
+        let (named, tier) = (&["claude", "openai"][..], &["tier-1"][..]);
+        let pools_file = json!({"claude": {"tier": 1}, "openai": {"tier": 1},
+            "mistral": {"tier": 2}, "fable": {"tier": 1, "auto": false}});
+        for (case, fix_pools, comments, (expected, shown)) in [
             (
                 // Round 2 would be openai's turn.
                 "an openai hold sends the round to claude",
+                named,
                 usage(json!({"claude": pool(40.0, 84), "openai": pool(26.0, 7)})),
-                Ok("claude"),
+                (Ok("claude"), "openai held until"),
             ),
             (
                 "every pool held",
+                named,
                 usage(json!({"claude": pool(90.0, 84), "openai": pool(26.0, 7)})),
-                Err(
-                    "not started: every pool is held (claude until 2026-10-14T21:12Z, openai until 2026-10-13T14:40Z)",
-                ),
+                (Err(both_held), ""),
             ),
             (
                 "missing usage",
+                named,
                 json!([]),
-                Err("not started: there is no usage snapshot, so new runs wait"),
+                (
+                    Err("not started: there is no usage snapshot, so new runs wait"),
+                    "",
+                ),
+            ),
+            (
+                "a tier's pool furthest under its pace, whoever's turn",
+                tier,
+                usage(json!({"claude": pool(10.0, 84), "openai": pool(40.0, 84)})),
+                (Ok("claude"), "openai normal 40%/50%"),
+            ),
+            (
+                "a tier's held pool sends the round to the other",
+                tier,
+                usage(json!({"claude": pool(90.0, 84), "openai": pool(10.0, 84)})),
+                (Ok("openai"), "claude held until"),
+            ),
+            (
+                "a tier with every pool held waits",
+                tier,
+                usage(json!({"claude": pool(90.0, 84), "openai": pool(26.0, 7)})),
+                (Err(both_held), ""),
             ),
         ] {
             let mut fake = github();
@@ -8357,7 +8422,13 @@ mod tests {
                 &json!({"repository": "o/ops", "issue": 1, "bot": BOT}),
             ))
             .unwrap();
+            let fix_pools: Vec<String> = fix_pools.iter().map(|p| (*p).to_owned()).collect();
+            cfg.policy
+                .read_tiers(Some(&pools_file), &fix_pools)
+                .unwrap();
             let dispatcher = Fake::default();
+            let mut apply = applying(&dispatcher).unwrap();
+            apply.pools = fix_pools;
             let outcome = run(
                 &fake,
                 &fake,
@@ -8365,13 +8436,15 @@ mod tests {
                 State::default(),
                 &[],
                 &[REPO.into()],
-                applying(&dispatcher),
+                Some(apply),
                 now(),
             )
             .unwrap();
             assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
             let line = outcome.lines.last().unwrap();
             assert!(line.starts_with("pools: "), "{case}: {line}");
+            // The line names the tier's pools, never the tier or a hand-dispatch pool.
+            assert!(!line.contains("tier-") && !line.contains("fable"), "{line}");
             match expected {
                 Ok(expected) => {
                     assert_eq!(
@@ -8379,7 +8452,13 @@ mod tests {
                         expected,
                         "{case}"
                     );
-                    assert!(line.contains("openai held until"), "{line}");
+                    // The marker records the pool the run went to.
+                    assert!(fake.writes.borrow().iter().any(|(_, body)| {
+                        body["body"]
+                            .as_str()
+                            .is_some_and(|s| s.contains(&format!("\"pool\":\"{expected}\"")))
+                    }));
+                    assert!(line.contains(shown), "{case}: {line}");
                 }
                 Err(why) => {
                     // Nothing is claimed, so the next pass tries again.
@@ -8397,14 +8476,20 @@ mod tests {
 
     #[test]
     fn fix_kind_pool_is_only_a_fallback_for_an_empty_round_list() {
-        for (pools, expected) in [(vec![], "fallback"), (vec!["normal".into()], "normal")] {
+        // Without pace, a tier's first pool in name order takes round 1.
+        let tiers = json!({"small": {"tier": 2}, "large": {"tier": 2}, "fallback": {"tier": 1}});
+        for (kind_pool, pools, expected) in [
+            ("fallback", vec![], "fallback"),
+            ("fallback", vec!["normal".into()], "normal"),
+            ("tier-2", vec![], "large"),
+            ("tier-2", vec!["tier-1".into()], "fallback"),
+        ] {
             let mut fake = github();
             fake.pulls
                 .insert(470, pull("pull-470", json!({"mergeable": "CONFLICTING"})));
             let mut cfg = config();
-            cfg.policy
-                .kind_pools
-                .insert("fix".into(), "fallback".into());
+            cfg.policy.kind_pools.insert("fix".into(), kind_pool.into());
+            cfg.policy.read_tiers(Some(&tiers), &pools).unwrap();
             let dispatcher = Fake::default();
             let mut apply = applying(&dispatcher).unwrap();
             apply.pools = pools;
