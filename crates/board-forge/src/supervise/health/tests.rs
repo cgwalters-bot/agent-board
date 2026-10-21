@@ -88,6 +88,14 @@ fn threshold_boundaries_and_stale_probe() {
     let mut newer = vec![json!({"status": "completed", "conclusion": "success"})];
     newer.extend(poll.iter().cloned());
     assert_eq!(status("poll", json!(newer), now), "ok");
+    // A cancelled or skipped run between failures is passed over, not a pass.
+    for between in ["cancelled", "skipped", "success"] {
+        let mut runs = poll.clone();
+        runs.insert(1, json!({"status": "completed", "conclusion": between}));
+        let want = if between == "success" { "ok" } else { "fail" };
+        assert_eq!(status("poll", json!(runs), now), want, "{between}");
+        assert_eq!(status("poll", json!(runs[..3]), now), "ok", "{between}");
+    }
     let at = iso(now - (limits.run_timeout_minutes * 60_000.0) as i64);
     assert_eq!(
         status(
