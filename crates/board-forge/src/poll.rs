@@ -196,7 +196,7 @@ const PULL_QUERY: &str = concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number url title body isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
+      id number url title body state isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
       baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
       author { login }
       headRepositoryOwner { login }
@@ -4144,6 +4144,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter(|p| p.is_object())
             .context("pull request not found")?
             .clone();
+        // The open list was read at the start of the repository's walk, which
+        // can be minutes ago: a pull request merged or closed since then gets
+        // no round, label or merge (#208). Anything but OPEN, a missing state
+        // included, is skipped. This narrows the window to the reads between
+        // here and the write; it does not close it.
+        if pull["state"] != "OPEN" {
+            return Ok((
+                format!("{repo}#{number} skip: closed since the list was read"),
+                false,
+            ));
+        }
         if !(text(&pull, "/author/login") == self.config.bot
             || self
                 .config
@@ -4708,6 +4719,8 @@ mod tests {
         p["baseRepository"] = json!({"nameWithOwner": REPO, "isPrivate": false,
             "defaultBranchRef": {"name": "main"}});
         p["baseRefName"] = "main".into();
+        // And `state`: they were recorded open.
+        p["state"] = "OPEN".into();
         let mut change = change.as_object().cloned().unwrap_or_default();
         let contexts = change.remove("contexts");
         let truncated = change.remove("truncated");
@@ -9065,6 +9078,39 @@ mod tests {
         .unwrap();
         let line = outcome.lines.last().unwrap().clone();
         (line, fake, dispatcher)
+    }
+
+    /// A pull request merged or closed after the open list was read, or one
+    /// whose state is not read, gets no round, label or merge (#208).
+    #[test]
+    fn a_pull_request_closed_since_the_list_was_read_is_skipped() {
+        let failing = json!({"ci": {"conclusion": "FAILURE"}});
+        for (contexts, marker, open) in [
+            (json!({}), json!({}), "merge:"),
+            (failing.clone(), json!({"sha": "older"}), "fix:"),
+            (
+                failing,
+                json!({"rounds": 2, "sha": "older"}),
+                "needs-human:",
+            ),
+        ] {
+            for state in [json!("OPEN"), json!("MERGED"), json!("CLOSED"), Value::Null] {
+                let change = json!({"state": state, "contexts": contexts});
+                let (line, fake, dispatcher) = applied_with(json!({}), change, marker.clone());
+                if state == "OPEN" {
+                    assert!(line.contains(open), "{line}");
+                    assert!(!fake.writes.borrow().is_empty(), "{line}");
+                    continue;
+                }
+                assert_eq!(
+                    line,
+                    format!("{REPO}#470 skip: closed since the list was read"),
+                    "{state}"
+                );
+                assert!(fake.writes.borrow().is_empty(), "{state} {line}");
+                assert!(dispatcher.writes.borrow().is_empty(), "{state} {line}");
+            }
+        }
     }
 
     /// After its fix rounds, a pull request that still fails gets one round
