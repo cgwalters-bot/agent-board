@@ -60,8 +60,9 @@ including rewordings and deletions. It reports document-only edits as
 `other_edits` when there are no changed entries. These are text deltas, not
 authenticated attribution or authority to execute the selected option.
 
-When state is absent, the last 100 `userContentEdits` provide a fallback: the
-newest edit by the authenticated bot identifies its last written version. Use
+When state is absent, the newest 100 `userContentEdits` provide a fallback: the
+`diff` of the newest edit by the authenticated bot is its last written version.
+GitHub serves edits newest-first; history in any other order is refused. Use
 the same dedicated bot account between runs; another writer with that identity
 is indistinguishable. A missing/redacted baseline fails closed rather than
 guessing. An empty issue can be initialized. Writes without local state require
