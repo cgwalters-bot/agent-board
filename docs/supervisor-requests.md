@@ -113,6 +113,9 @@ The comment must have been created within that run's start/end timestamps.
 The finding must still describe the issue: no reopen or rename event, body
 edit, or comment may follow the receipt, except the bot's own comments before
 the triage run ended.
+Like a dispatch, a close refuses an issue that carries `epic`, `question` or
+`needs-human` when the request runs, however long after the receipt the hold
+was added.
 Nothing reviews a closure, so unlike a dispatch it keeps agent-board#111's
 input check: the issue must have been locked since before the triage run
 started, and every author and editor of its body and comments, the bot
