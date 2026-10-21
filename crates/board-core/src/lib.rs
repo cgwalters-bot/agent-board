@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use url::Url;
 
+pub mod admission;
 mod agents;
 pub use agents::{AgentIdentity, AgentPolicy, DEFAULT_AGENT_POLICY, check_proposals};
 

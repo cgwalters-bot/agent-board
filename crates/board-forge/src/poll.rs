@@ -14,6 +14,7 @@
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::{FOOTER, overlap};
 use anyhow::{Context, Result, bail, ensure};
+use board_core::admission;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -288,6 +289,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "rebaseRounds",
     "pace",
     "lockCollaboratorItems",
+    "repositoriesPerPass",
     "fixPools",
     "reviewWorkflow",
     "dispatchWorkflow",
@@ -351,6 +353,13 @@ pub struct PollPolicy {
     /// repositories one pass checks, locking those with input only from
     /// collaborators ([`lock`]); none (the default) locks nothing.
     pub lock_items: Option<usize>,
+    /// `repositoriesPerPass`: the followed repositories one pass takes its
+    /// pull request steps in, at most, as a deterministic envelope
+    /// ([`board_core::admission`]) that the next pass continues from
+    /// (agent-board#182); none (the default) takes them in every followed
+    /// repository, as before. Activity, the operator's comments and the lock
+    /// step keep their own bounds and are not part of it.
+    pub repositories_per_pass: Option<usize>,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -617,6 +626,16 @@ impl PollPolicy {
                         })
                 })
                 .transpose()?,
+            repositories_per_pass: get("repositoriesPerPass")?
+                .map(|n| {
+                    n.as_u64()
+                        .filter(|n| (1..=POLL_REPOSITORY_LIMIT as u64).contains(n))
+                        .map(|n| n as usize)
+                        .with_context(|| {
+                            format!("repositoriesPerPass is not 1 to {POLL_REPOSITORY_LIMIT}")
+                        })
+                })
+                .transpose()?,
         })
     }
 }
@@ -724,6 +743,11 @@ pub struct State {
     /// input check refused them, `OWNER/REPO#N` to the `updated_at` it read,
     /// which go to the back of the next pass's queue until they change.
     pub lock_refused: BTreeMap<String, String>,
+    /// `repositoriesPerPass`: the followed repository the next pass's
+    /// envelope starts from ([`board_core::admission`]); none starts over.
+    /// Only an applying pass moves it, and a pass without the option drops
+    /// it. Losing it only starts the round of the repositories again.
+    pub follow_cursor: Option<String>,
 }
 
 impl State {
@@ -741,7 +765,8 @@ impl State {
                     "responses",
                     "operator_cursor",
                     "operator_page",
-                    "lock_refused"
+                    "lock_refused",
+                    "follow_cursor"
                 ]
                 .contains(&key.as_str()),
                 "unknown poll state field {key}"
@@ -802,12 +827,22 @@ impl State {
                 })
                 .collect::<Result<_>>()?,
         };
+        let follow_cursor = object
+            .get("follow_cursor")
+            .map(|c| {
+                c.as_str()
+                    .filter(|c| validate_repository(c).is_ok())
+                    .map(str::to_owned)
+                    .context("poll state follow_cursor is not a repository")
+            })
+            .transpose()?;
         Ok(Self {
             interval_seconds,
             responses,
             operator_cursor,
             operator_page,
             lock_refused,
+            follow_cursor,
         })
     }
 
@@ -825,6 +860,9 @@ impl State {
         }
         if !self.lock_refused.is_empty() {
             state["lock_refused"] = json!(self.lock_refused);
+        }
+        if let Some(cursor) = &self.follow_cursor {
+            state["follow_cursor"] = cursor.as_str().into();
         }
         state
     }
@@ -2716,6 +2754,9 @@ struct Pass<'a, R, G> {
     outages: Option<Outages>,
     /// The pools' modes, read once a pass where `pace` is set.
     paces: Option<pace::Paces>,
+    /// The followed repositories this pass takes steps in, where
+    /// `repositoriesPerPass` is set; none admits every followed repository.
+    envelope: Option<admission::Envelope>,
 }
 
 /// A merge queue entry: its number and the files it changes, if all were read.
@@ -4311,6 +4352,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     }
 
     fn follow(&mut self, repo: &str, outcome: &mut Outcome) -> Result<()> {
+        // The envelope is the bound, not the loop that walks it: a step in a
+        // repository outside it is refused here, before anything is read.
+        ensure!(
+            self.envelope.as_ref().is_none_or(|e| e.admits(repo)),
+            "{repo} is outside this pass's envelope"
+        );
         let open = self.paged(
             &format!("repos/{repo}/pulls?state=open&per_page=100"),
             false,
@@ -4408,6 +4455,7 @@ pub fn run<R: Rest, G: Transport>(
         queues: BTreeMap::new(),
         outages: None,
         paces: None,
+        envelope: None,
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -4444,7 +4492,39 @@ pub fn run<R: Rest, G: Transport>(
         }
     }
     let follow: BTreeSet<&String> = follow.iter().collect();
+    // With `repositoriesPerPass`, the steps of this pass stay inside an
+    // envelope computed from the followed set, the cap and the cursor the
+    // last pass left, and recorded as a line before them so two passes'
+    // envelopes can be compared. As with the operator comments' cursor, a
+    // preview keeps the cursor, so that a dry run on the state file hides no
+    // repository from the next pass that applies; an applying pass moves it
+    // past the admitted repositories, one whose step failed included, which
+    // gets its next turn with the rest. Without the option there is no round
+    // to keep a place in, so the cursor is dropped.
+    let mut follow_cursor = None;
+    if let Some(cap) = config.policy.repositories_per_pass {
+        let envelope = admission::admit(
+            follow.iter().map(|r| r.as_str()),
+            cap,
+            state.follow_cursor.as_deref(),
+        )?;
+        outcome.lines.push(envelope.line());
+        follow_cursor = if pass.apply.is_some() {
+            envelope.next.clone()
+        } else {
+            state.follow_cursor
+        };
+        pass.envelope = Some(envelope);
+    }
     for repo in &follow {
+        if let Some(envelope) = &pass.envelope
+            && !envelope.admits(repo)
+        {
+            outcome
+                .lines
+                .push(format!("{repo} skip: outside this pass's envelope"));
+            continue;
+        }
         if let Err(error) = pass.follow(repo, &mut outcome) {
             outcome.errors += 1;
             outcome.lines.push(format!("{repo} error: {error:#}"));
@@ -4492,6 +4572,7 @@ pub fn run<R: Rest, G: Transport>(
         operator_cursor,
         operator_page,
         lock_refused,
+        follow_cursor,
     };
     Ok(outcome)
 }
@@ -7055,8 +7136,16 @@ mod tests {
             "responses": {"https://api.github.com/repos/o/r/events?per_page=100": {"etag": "\"a\"", "body": []}}});
         let state = State::from_json(&good).unwrap();
         assert_eq!(state.to_json(), good);
+        assert_eq!(state.follow_cursor, None);
+        let mut with_cursor = good.clone();
+        with_cursor["follow_cursor"] = json!("o/r");
+        let state = State::from_json(&with_cursor).unwrap();
+        assert_eq!(state.follow_cursor.as_deref(), Some("o/r"));
+        assert_eq!(state.to_json(), with_cursor);
         for (field, value) in [
             ("schema", json!("agent-board/poll-state/v0")),
+            ("follow_cursor", json!("not a repository")),
+            ("follow_cursor", json!(1)),
             ("interval_seconds", json!(60)),
             ("interval_seconds", json!(MAX_INTERVAL_SECONDS + 1)),
             ("responses", json!({"https://evil.example/": {"body": []}})),
@@ -10476,6 +10565,218 @@ mod tests {
         ] {
             let got = PollPolicy::from_json(&value).ok().map(|p| p.rebase_rounds);
             assert_eq!(got, want, "{value}");
+        }
+    }
+
+    #[test]
+    fn repositories_per_pass_policy_table() {
+        for (value, want) in [
+            (json!({}), Some(None)),
+            (json!({"repositoriesPerPass": 1}), Some(Some(1))),
+            (
+                json!({"repositoriesPerPass": POLL_REPOSITORY_LIMIT}),
+                Some(Some(POLL_REPOSITORY_LIMIT)),
+            ),
+            (json!({"repositoriesPerPass": 0}), None),
+            (
+                json!({"repositoriesPerPass": POLL_REPOSITORY_LIMIT + 1}),
+                None,
+            ),
+            (json!({"repositoriesPerPass": -1}), None),
+            (json!({"repositoriesPerPass": "1"}), None),
+            (json!({"repositoriesPerPass": null}), None),
+        ] {
+            let got = PollPolicy::from_json(&value)
+                .ok()
+                .map(|p| p.repositories_per_pass);
+            assert_eq!(got, want, "{value}");
+        }
+    }
+
+    /// With `repositoriesPerPass`, a pass records its envelope, takes steps
+    /// only inside it, and leaves the next pass the cursor to go on from;
+    /// the same inputs give the same envelope.
+    #[test]
+    fn an_envelope_bounds_each_pass_and_the_cursor_walks_the_followed_repositories() {
+        const OTHER: &str = "cgwalters-forge/zzz";
+        let mut fake = github();
+        fake.page(
+            &format!("repos/{OTHER}/events?per_page=100"),
+            None,
+            None,
+            json!([]),
+        );
+        fake.page(
+            &format!("repos/{OTHER}/pulls?state=open&per_page=100"),
+            None,
+            None,
+            json!([]),
+        );
+        let per_pass = |n: u64| {
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(&json!({"repositoriesPerPass": n})).unwrap();
+            cfg
+        };
+        let follow = [REPO.to_owned(), OTHER.to_owned()];
+        let pass = |cfg: &Config, state: State, apply: bool| {
+            fake.sent.borrow_mut().clear();
+            let dispatcher = Fake::default();
+            run(
+                &fake,
+                &fake,
+                cfg,
+                state,
+                &[],
+                &follow,
+                apply.then(|| applying(&dispatcher)).flatten(),
+                now(),
+            )
+            .unwrap()
+        };
+        let pulls = |repo: &str| format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100");
+        let read = |repo: &str| {
+            fake.sent
+                .borrow()
+                .iter()
+                .any(|(url, _)| *url == pulls(repo))
+        };
+        let line = |outcome: &Outcome, prefix: &str| {
+            outcome
+                .lines
+                .iter()
+                .find(|l| l.starts_with(prefix))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {prefix:?} in {:?}", outcome.lines))
+        };
+
+        // Pass 1: no cursor, so the first repository in order, and only it.
+        let one = per_pass(1);
+        let first = pass(&one, State::default(), true);
+        let envelope = line(&first, "envelope: ");
+        assert!(
+            envelope.ends_with(&format!(" count=2 cap=1 admitted={REPO} next={OTHER}")),
+            "{envelope}"
+        );
+        assert!(line(&first, &format!("{REPO}#470 ")).contains("merge: "));
+        assert_eq!(
+            line(&first, OTHER),
+            format!("{OTHER} skip: outside this pass's envelope")
+        );
+        assert!(read(REPO) && !read(OTHER));
+        assert_eq!(first.state.follow_cursor.as_deref(), Some(OTHER));
+        assert_eq!(first.errors, 0, "{:?}", first.lines);
+        // The same inputs give the same envelope in a preview, which leaves
+        // the cursor where it was.
+        let preview = pass(&one, State::default(), false);
+        assert_eq!(line(&preview, "envelope: "), envelope);
+        assert_eq!(line(&preview, OTHER), line(&first, OTHER));
+        assert!(read(REPO) && !read(OTHER));
+        assert_eq!(preview.state.follow_cursor, None);
+
+        // Pass 2, from the saved state: the next repository, and the first
+        // one's pull requests are not read, let alone stepped.
+        let saved = || State::from_json(&first.state.to_json()).unwrap();
+        assert_eq!(saved().follow_cursor.as_deref(), Some(OTHER));
+        let previewed = pass(&one, saved(), false);
+        assert_eq!(previewed.state.follow_cursor.as_deref(), Some(OTHER));
+        let second = pass(&one, saved(), true);
+        assert_eq!(line(&second, "envelope: "), line(&previewed, "envelope: "));
+        assert!(
+            line(&second, "envelope: ")
+                .ends_with(&format!(" count=2 cap=1 admitted={OTHER} next=start")),
+            "{:?}",
+            second.lines
+        );
+        assert_eq!(
+            line(&second, REPO),
+            format!("{REPO} skip: outside this pass's envelope")
+        );
+        assert!(!second.lines.iter().any(|l| l.contains("#470 ")));
+        assert!(read(OTHER) && !read(REPO));
+        assert_eq!(second.state.follow_cursor, None);
+        assert_eq!(second.errors, 0, "{:?}", second.lines);
+
+        // Pass 3 starts over; the envelope is the first pass's again.
+        let third = pass(
+            &one,
+            State::from_json(&second.state.to_json()).unwrap(),
+            false,
+        );
+        assert_eq!(line(&third, "envelope: "), envelope);
+        assert!(read(REPO) && !read(OTHER));
+
+        // A cap at or over the followed set admits all of it, as no option does.
+        let whole = pass(&per_pass(2), State::default(), false);
+        assert!(line(&whole, "envelope: ").ends_with(&format!(
+            " count=2 cap=2 admitted={REPO},{OTHER} next=start"
+        )));
+        assert!(read(REPO) && read(OTHER));
+        let outside = |outcome: &Outcome| {
+            outcome
+                .lines
+                .iter()
+                .any(|l| l.contains("outside this pass's envelope"))
+        };
+        assert!(!outside(&whole), "{:?}", whole.lines);
+        // Without the option nothing is bounded or recorded, and a cursor an
+        // earlier configuration left is dropped.
+        for apply in [false, true] {
+            let left = State {
+                follow_cursor: Some(OTHER.to_owned()),
+                ..State::default()
+            };
+            let unbounded = pass(&config(), left, apply);
+            assert!(!unbounded.lines.iter().any(|l| l.starts_with("envelope: ")));
+            assert!(!outside(&unbounded), "{:?}", unbounded.lines);
+            assert!(read(REPO) && read(OTHER));
+            assert_eq!(unbounded.state.follow_cursor, None);
+        }
+    }
+
+    /// The envelope is checked where a step starts, not only by the loop
+    /// that walks it: a followed repository outside it is refused unread.
+    #[test]
+    fn a_step_outside_the_envelope_is_refused_before_anything_is_read() {
+        let fake = github();
+        let cfg = config();
+        let mut pass = Pass {
+            rest: &fake,
+            graphql: &fake,
+            config: &cfg,
+            now: now(),
+            previous: BTreeMap::new(),
+            used: BTreeMap::new(),
+            remaining: POLL_REQUEST_LIMIT,
+            apply: None,
+            dispatched: 0,
+            queues: BTreeMap::new(),
+            outages: None,
+            paces: None,
+            envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),
+        };
+        let mut outcome = Outcome {
+            lines: Vec::new(),
+            errors: 0,
+            activity: 0,
+            in_flight: 0,
+            state: State::default(),
+        };
+        let error = pass.follow(REPO, &mut outcome).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            format!("{REPO} is outside this pass's envelope")
+        );
+        assert!(fake.sent.borrow().is_empty() && outcome.lines.is_empty());
+        // Inside it, or with no envelope, the repository is followed.
+        for envelope in [Some(admission::admit([REPO], 1, None).unwrap()), None] {
+            pass.envelope = envelope;
+            pass.follow(REPO, &mut outcome).unwrap();
+            assert!(
+                fake.sent
+                    .borrow()
+                    .iter()
+                    .any(|(url, _)| url.contains("/pulls?"))
+            );
         }
     }
 

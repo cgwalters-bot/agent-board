@@ -291,7 +291,7 @@ required one does. It has been exercised against recorded responses only.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`. File settings override the
+optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`. File settings override the
 corresponding flags. The workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository
@@ -475,6 +475,23 @@ followed repositories with the input check `dispatch` makes, and with
 saying why, and waits behind the others until it changes. A line counts the
 items locked, left unlocked and not checked. Pull requests are excluded: the supervisor
 does not dispatch them, and locking them can prevent job tokens from reviewing.
+
+`repositoriesPerPass` (1 to 50; absent by default, which takes steps in every
+followed repository) bounds one pass's pull request steps to a deterministic
+admission envelope over the followed repositories (agent-board#182, after
+gh-cao's control precompute): the followed set sorted and deduplicated, a
+`sha256:` digest of it as its version, the first that many repositories from
+the cursor the last pass left in the state file, and the repository after
+them as the next cursor (none at the end, so the next pass starts over). The
+pass prints the envelope before its steps, as
+`envelope: inventory=sha256:… count=N cap=C admitted=A,B next=R|start`, so two
+passes' envelopes can be compared; a followed repository outside it gets a
+`skip: outside this pass's envelope` line, its pull requests are not read, and
+a step in it is refused. As with `operatorComments`, a preview keeps the
+cursor; an applying pass moves it past the admitted repositories, one whose
+step failed included, and a pass without the option drops it. The envelope
+bounds the per-repository pull request steps only: activity reads,
+`operatorComments` and `lockCollaboratorItems` keep their own bounds.
 
 `operatorAnswers` (`true`; absent or `false` by default, which leaves a
 `needs-human` pull request to a person taking the label off) takes the
