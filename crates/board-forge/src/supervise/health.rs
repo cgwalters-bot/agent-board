@@ -3,7 +3,7 @@
 //! in particular, never `poll --apply` to gather facts. Only links reach the
 //! report, never remote titles or text, since the report becomes an agent's
 //! task and a public job summary.
-use super::{Api, HOUR_MS, Limits, Settings, encode, iso, millis, run_title, word_repo};
+use super::{Api, HOUR_MS, Limits, Release, Settings, encode, iso, millis, run_title, word_repo};
 use crate::plan::DISPATCH_MARKER;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
@@ -79,6 +79,8 @@ pub const CHECKS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The checks whose settings may be left out, reported "Not configured.".
+const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck"];
 /// The label the poll stops a pull request with.
 const HOLD: &str = "needs-human";
 /// Coordinator checkpoints on an epic: `<!-- coordinator/v1: {...} -->`.
@@ -179,6 +181,17 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             let Some(Some(items)) = snapshot.observations.get(id) else {
                 return unavailable(id, action, snapshot.previous.as_deref(), now, limits);
             };
+            // Only checks with optional settings honour the marker: others'
+            // items carry remote data, such as an epic's checkpoint JSON,
+            // that must not switch a check off.
+            if OPTIONAL_CHECKS.contains(&id) && items.iter().any(|i| i["configured"] == false) {
+                return json!({
+                    "id": id,
+                    "status": "ok",
+                    "evidence": [],
+                    "suggested_action": "Not configured.",
+                });
+            }
             if id == "broker" && probes(items).is_empty() {
                 return unavailable(id, action, snapshot.previous.as_deref(), now, limits);
             }
@@ -827,6 +840,11 @@ impl Collector<'_> {
     /// for the previous pass ran no scheduler and is passed over.
     fn passes(&self, poll: Option<&Vec<Value>>) -> Result<Vec<Value>> {
         let poll = poll.context("poll runs unavailable")?;
+        let scheduler_job = self
+            .s
+            .scheduler_job
+            .as_deref()
+            .context("no scheduler job configured")?;
         let value = self.once("passes", || {
             let mut result = vec![];
             let limits = &self.s.limits;
@@ -842,7 +860,7 @@ impl Collector<'_> {
                 ))?;
                 let Some(job) = jobs["jobs"].as_array().and_then(|jobs| {
                     jobs.iter().find(|j| {
-                        j["name"] == self.s.scheduler_job.as_str()
+                        j["name"] == scheduler_job
                             && j["status"] == "completed"
                             && (j["conclusion"] == "success" || j["conclusion"] == "failure")
                     })
@@ -1092,17 +1110,17 @@ impl Collector<'_> {
         Ok(unanswered)
     }
 
-    fn release(&self) -> Result<Vec<Value>> {
+    fn release(&self, release: &Release) -> Result<Vec<Value>> {
         let s = self.s;
         let latest = self
             .api
-            .get(&format!("/repos/{}/releases/latest", s.release_repository))?;
+            .get(&format!("/repos/{}/releases/latest", release.repository))?;
         let file = self.api.get(&format!(
             "/repos/{}/contents/{}",
-            s.wrapper_repository, s.wrapper_path
+            release.wrapper_repository, release.wrapper_path
         ))?;
         let text = base64_decode(file["content"].as_str().context("wrapper content")?)?;
-        let pins = wrapper_pins(&String::from_utf8_lossy(&text), &s.release_repository);
+        let pins = wrapper_pins(&String::from_utf8_lossy(&text), &release.repository);
         ensure!(
             pins.len() == 3 && pins.iter().all(|p| *p == pins[0]),
             "unrecognized wrapper pin"
@@ -1111,7 +1129,7 @@ impl Collector<'_> {
             json!({"pin": pins[0], "latest": latest["tag_name"], "html_url": latest["html_url"]}),
         ];
         if let Some(workflow) = &s.release_train_workflow {
-            items.extend(self.release_train(&latest, workflow)?);
+            items.extend(self.release_train(release, &latest, workflow)?);
         }
         Ok(items)
     }
@@ -1120,7 +1138,12 @@ impl Collector<'_> {
     /// latest release is older than the interval and pull requests merged
     /// since it. A train whose cron is starved leaves a due release waiting
     /// unseen; nothing else notices. One item while due, none otherwise.
-    fn release_train(&self, latest: &Value, workflow: &str) -> Result<Option<Value>> {
+    fn release_train(
+        &self,
+        release: &Release,
+        latest: &Value,
+        workflow: &str,
+    ) -> Result<Option<Value>> {
         let s = self.s;
         let published = millis(&latest["published_at"]).context("release published_at")?;
         let interval = published + (s.limits.release_interval_hours * HOUR_MS as f64) as i64;
@@ -1133,7 +1156,7 @@ impl Collector<'_> {
         let pulls = self.list(
             &format!(
                 "/repos/{}/pulls?state=closed&sort=updated&direction=desc",
-                s.release_repository
+                release.repository
             ),
             true,
         )?;
@@ -1641,8 +1664,18 @@ pub fn collect(
     });
     capture("dispatch", &|_| c.dispatch());
     capture("decisions", &|_| c.decisions());
-    capture("release", &|_| c.release());
+    // A check whose optional settings are left out (an organization without
+    // tracker's release train or scheduler job) reads nothing and reports ok,
+    // saying it is not configured, rather than a blind spot that comes to fail.
+    let unconfigured = || Ok(vec![json!({"configured": false})]);
+    capture("release", &|_| match &s.release {
+        Some(release) => c.release(release),
+        None => unconfigured(),
+    });
     capture("idle", &|o| {
+        if s.scheduler_job.is_none() {
+            return unconfigured();
+        }
         Ok(c.passes(got(o, "poll").as_ref())?
             .iter()
             .map(|p| {
@@ -1653,7 +1686,10 @@ pub fn collect(
             })
             .collect())
     });
-    capture("stuck", &|o| c.stuck(got(o, "poll").as_ref()));
+    capture("stuck", &|o| match &s.scheduler_job {
+        Some(_) => c.stuck(got(o, "poll").as_ref()),
+        None => unconfigured(),
+    });
     capture("pace", &|_| c.pace());
     capture("failures", &|_| c.failures());
     capture("held", &|_| c.held());
