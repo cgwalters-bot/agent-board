@@ -344,6 +344,9 @@ pub struct Settings {
     pub merge_authors: Vec<String>,
     /// A kind with a configured pool runs only there (agent-board.json's kindPools).
     pub kind_pools: BTreeMap<String, String>,
+    /// agent-board.json's `pace.overrides`, which the pace check shows
+    /// beside the pool they pace ([`crate::poll::pace::overrides`]).
+    pub pace_overrides: Vec<crate::poll::pace::Override>,
     pub limits: Limits,
     pub poll_workflow: String,
     pub probe_workflow: String,
@@ -525,6 +528,9 @@ impl Settings {
             dispatch_workflow,
             epics_repository,
             kind_pools,
+            pace_overrides: crate::poll::pace::overrides(
+                option(board, "pace")?.and_then(|p| p.get("overrides")),
+            )?,
             limits: Limits::from_json(supervisor)?,
             poll_workflow: names["pollWorkflow"].clone(),
             probe_workflow: names["probeWorkflow"].clone(),

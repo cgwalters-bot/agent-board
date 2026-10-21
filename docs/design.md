@@ -343,6 +343,25 @@ chosen over a paced pool with room, and ties go to the round's usual turn. Each 
 with a `pools:` line naming every pool's mode. The tracker scheduler's own fill
 mode is outside this repository.
 
+`pace.overrides` (absent by default) changes one pool's pacing for a while
+from the committed file rather than by editing the margin and pool lists and
+remembering to revert (agent-board#235). Each entry has a `pool`, a required
+`until` (RFC 3339, at most 7 days ahead), a `mode` and an optional one-line
+`reason`. In force, `spend` means the pool is not held by the poll's own pacing
+and is chosen over any pool without an override; a used-up window still holds
+it (indefinitely where its reset is absent or unreadable), and so does missing
+usage, since an override lifts pacing, not caps. `hold` holds the pool
+until `until` whatever its pace. An entry past its `until` is ignored and named
+in the `pools:` line (`override for claude expired at …`), so a forgotten one
+shows rather than pins behavior. A missing or past-the-bound `until`, an unknown
+`mode` or field, a pool named twice, or a pool no setting names (each tier as
+its pools) refuses the poll's configuration. The `pools:` line names each
+override in force with its reason, and the supervisor's pace check shows it
+as evidence, warning rather than failing for that pool. The snapshot's own
+`hold` (agent-board#233) does not say why it holds, and a pool over its pace
+may be out of its session too, so any `hold` but `false` still holds a spend
+pool until the snapshot reports pace and cap reasons apart. The tracker scheduler (`schedule.cjs` `paceMode`) does not read overrides.
+
 Pools have tiers (agent-board#228): `fixPools` and each `kindPools` entry may
 name a tier, `tier-1` or `tier-2`, instead of a pool, so that tier-1 work
 spreads over claude and openai rather than going to one hardcoded pool. `poll

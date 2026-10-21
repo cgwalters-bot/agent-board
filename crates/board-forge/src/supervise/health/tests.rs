@@ -211,6 +211,21 @@ fn newer_checks_and_their_boundaries() {
     assert_eq!(status("pace", week(50), now), "ok");
     assert_eq!(status("pace", week(54), now), "fail");
     assert_eq!(status("pace", week(0), now), "fail");
+    // A pool under a pace override shows, on or off its pace, and only warns
+    // unless another pool is off its pace.
+    let spend = json!("pace override: large override spend until 2026-10-18T00:00Z");
+    for used in [0, 50] {
+        let mut items = week(used);
+        items[0]["override"] = spend.clone();
+        assert_eq!(status("pace", items, now), "warn", "{used}");
+    }
+    let mut items = week(54);
+    items[0]["override"] = spend.clone();
+    items
+        .as_array_mut()
+        .unwrap()
+        .extend(week(0).as_array().unwrap().clone());
+    assert_eq!(status("pace", items, now), "fail");
     assert_eq!(
         status(
             "pace",
@@ -814,6 +829,30 @@ fn successful_snapshot_skips_old_pull_request_detail_and_keeps_commented_approva
         "idle",
     ] {
         assert!(snapshot.observations[id].is_some(), "{id}");
+    }
+    drop(calls);
+    // An override in force for a pool shows in the pace check's evidence;
+    // an expired one does not.
+    for (until, expected) in [(now + 3_600_000, "warn"), (now - 60_000, "ok")] {
+        let mut overridden = s.clone();
+        overridden.pace_overrides = crate::poll::pace::overrides(Some(&json!([
+            {"pool": "large", "until": iso(until), "mode": "spend", "reason": "reset tonight"},
+        ])))
+        .unwrap();
+        let checks = evaluate(
+            &collect(&fake, &overridden, "main", now, None),
+            now,
+            &s.limits,
+        );
+        let pace = checks.iter().find(|c| c["id"] == "pace").unwrap();
+        assert_eq!(pace["status"], expected);
+        let evidence = pace["evidence"].to_string();
+        assert_eq!(
+            evidence.contains("pace override: large override spend until")
+                && evidence.contains("(reset tonight)"),
+            expected == "warn",
+            "{evidence}"
+        );
     }
 }
 
