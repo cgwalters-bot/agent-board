@@ -62,8 +62,9 @@ authors and lock are not checked: the run reads the issue as data in its
 sandbox, writes only through bounded safe outputs, and its pull request needs
 review before merge (agent-board#155). Implement requires those checks **and** native parentage under an
 open `epic`-labeled issue in the configured epics repository. A body link claiming
-approval does not suffice. The `epic` label remains the operator's approval;
-this executor cannot add it or create parentage.
+approval does not suffice. The `epic` label is the approval; this executor
+cannot add it or create parentage, but anyone with triage access can add it
+(who did is not checked here; see [epic plans](epic-plans.md)).
 
 Comments target issues or pull requests in `follow`. New issues go only to
 `tracker`. `create_issue` is a question for the operator: assigned to the

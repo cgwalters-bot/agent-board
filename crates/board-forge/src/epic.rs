@@ -18,8 +18,9 @@ use std::fmt;
 pub const EPIC_PLAN_SCHEMA: &str = "agent-board/epic-plan/v1";
 /// The info string of the fence that holds an epic plan.
 pub const EPIC_PLAN_FENCE: &str = "agent-board-epic-plan";
-/// The label that makes an issue an epic. Only the operator applies it: a
-/// plan that could would let the planner start epics of its own.
+/// The label that makes an issue an epic. A plan may not apply it, which would
+/// let the planner start epics of its own. Anyone with triage access can,
+/// unless the caller requires the operator's ([`epic_labelled_by`]).
 pub const EPIC_LABEL: &str = "epic";
 pub const PRIORITY_FIELD: &str = "Priority";
 /// Actions in one plan, so a runaway planner cannot file issues by the dozen.
@@ -44,6 +45,18 @@ const SUB_ISSUES_QUERY: &str = r#"query($owner: String!, $name: String!, $number
       subIssues(first: 100) {
         nodes { number state repository { nameWithOwner } }
         pageInfo { hasNextPage }
+      }
+    }
+  }
+}"#;
+
+/// Labelings of the issue, newest last; label removals are other events.
+const LABELED_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      timelineItems(itemTypes: [LABELED_EVENT], last: 100) {
+        nodes { ... on LabeledEvent { actor { __typename login } label { name } } }
+        pageInfo { hasPreviousPage }
       }
     }
   }
@@ -169,7 +182,7 @@ pub struct Epic {
     pub issue: IssueRef,
     /// Its node ID, which addSubIssue takes.
     pub id: String,
-    /// Positive evidence of the operator's epic designation. Missing/redacted
+    /// Positive evidence of the epic label, whoever added it. Missing/redacted
     /// labels are not authority to apply a decomposition.
     pub designated: bool,
     /// Whether the epic itself is open. Closing it is the operator's decision
@@ -797,6 +810,51 @@ pub fn read_epic<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Epic> {
         }
     }
     Ok(epic)
+}
+
+/// The user who last added the epic label to `issue`, or `None` where an app
+/// or a deleted account did. GitHub lets anyone with triage access label an
+/// issue, so the label's presence alone does not say the operator chose it.
+/// The newest labeling is the one that put the current label on: a removal
+/// and a later labeling leave a newer event. Refuses when that event is not
+/// among the last page of labelings, rather than trusting an older one.
+pub fn epic_labelled_by<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Option<String>> {
+    ensure!(
+        issue.host == DEFAULT_HOST,
+        "epic plans are read only from github.com"
+    );
+    validate_repository(&issue.repository)?;
+    let (owner, name) = issue
+        .repository
+        .split_once('/')
+        .context("issue repository")?;
+    let data = transport.graphql(
+        LABELED_QUERY,
+        json!({"owner": owner, "name": name, "number": issue.number}),
+    )?;
+    let timeline = data
+        .pointer("/repository/issue/timelineItems")
+        .with_context(|| format!("{} has no timeline", issue.display()))?;
+    let nodes = timeline["nodes"]
+        .as_array()
+        .context("the epic's timeline has no nodes")?;
+    let newest = nodes.iter().rev().find(|event| {
+        event["label"]["name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(EPIC_LABEL))
+    });
+    let Some(event) = newest else {
+        ensure!(
+            timeline["pageInfo"]["hasPreviousPage"] == false,
+            "{} has more labelings than one page holds, or GitHub did not say; who added its {EPIC_LABEL:?} label is unknown",
+            issue.display()
+        );
+        bail!("{} has no {EPIC_LABEL:?} labeling", issue.display());
+    };
+    // An app named like the operator is not the operator.
+    Ok((event["actor"]["__typename"] == "User")
+        .then(|| event["actor"]["login"].as_str().map(str::to_owned))
+        .flatten())
 }
 
 /// The newest accepted epic plan on `issue`, checked, with the comment it
