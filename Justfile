@@ -28,8 +28,10 @@ site-build:
 site-build-pages:
     SITE_URL="https://$GITHUB_REPOSITORY_OWNER.github.io" SITE_BASE="/${GITHUB_REPOSITORY#*/}/" SITE_SOURCE_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/" {{ just_executable() }} site-build
 
-site-test:
+# dist.test.mjs checks the pages site-build renders, so it builds first.
+site-test: site-build
     node --test site/links.test.mjs
+    node --test site/dist.test.mjs
 
 # Links and fragments of a build served at /, as site-build makes it by
 # default; links to repository files then name the checkout's files.
