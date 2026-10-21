@@ -329,11 +329,16 @@ the fix-round list is empty; other kinds are not dispatched by poll.
 `pace` (absent by default, which leaves pool selection as above) names the
 usage snapshot the supervisor's pace check reads (`repository`, `issue`, `bot`)
 and an optional `marginPercent` (0 to 100, default 0). With it, a fix round
-takes the `fixPools` pool furthest under its pace instead of the next in turn,
-and a round, triage or continuation whose single configured pool is over its
-pace by more than the margin waits; so does every run with a configured pool
-while the snapshot is missing or older than 45 minutes. A pool the snapshot
-gives no current window for, or does not name, is unpaced: usable, but never
+takes the `fixPools` pool with the most room under its ceiling instead of the
+next in turn, and a round, triage or continuation whose single configured pool
+is held waits; so does every run with a configured pool while the snapshot is
+missing or older than 45 minutes. A pool is held when its snapshot entry says
+`hold: true` (shown until its `next_dispatch_at`), whatever the reason, or gives
+a `hold` that is not a boolean; its room is `allowed_percent + burst -
+used_percent`. Only an entry without `hold`, from an older snapshot, is held
+here when its share used exceeds the share of its window passed by more than
+the margin, with room the share passed less the share used. A pool the
+snapshot gives no current window for, or does not name, is unpaced: usable, but never
 chosen over a paced pool with room, and ties go to the round's usual turn. Each pass ends
 with a `pools:` line naming every pool's mode. The tracker scheduler's own fill
 mode is outside this repository.
