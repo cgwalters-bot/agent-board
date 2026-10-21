@@ -8,6 +8,7 @@
 use crate::batch::{BATCH_LIMIT, batch_line, held};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::overlap::Decision;
+use crate::poll::pace::is_tier;
 use crate::poll::{Rest, validate_repository, validate_workflow};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
@@ -45,6 +46,14 @@ const FIELDS: &[&str] = &[
     "brief",
     "stacks_on",
 ];
+
+/// A plan's pool: lowercase letters, digits, `-` and `_`, led by a letter or digit.
+fn valid_pool(pool: &str) -> bool {
+    let name = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    pool.len() <= POOL_LIMIT
+        && pool.bytes().next().is_some_and(name)
+        && pool.bytes().all(|c| name(c) || c == b'-' || c == b'_')
+}
 
 const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -115,13 +124,26 @@ impl JobPlan {
         );
         let pool = match object.get("pool") {
             None => "",
-            Some(_) => text("pool")?,
+            Some(_) => {
+                let pool = text("pool")?;
+                // The caller checks the name against its pools.json; this
+                // keeps it a plain name: no path, option or whitespace,
+                // `[a-z0-9][a-z0-9_-]{0,31}`. Empty is refused, since absence
+                // is the default.
+                ensure!(
+                    valid_pool(pool),
+                    "plan pool must be a name of lowercase letters, digits, '-' and '_', \
+                     starting with a letter or digit, at most {POOL_LIMIT} bytes"
+                );
+                // A tier is resolved by the poll, never by the dispatch, which
+                // would take it as a pool's name.
+                ensure!(
+                    !is_tier(pool),
+                    "plan pool {pool:?} names a tier, not a pool"
+                );
+                pool
+            }
         };
-        // The caller checks the name against its pools.json; this keeps it a name.
-        ensure!(
-            pool.len() <= POOL_LIMIT && pool.bytes().all(|c| c.is_ascii_lowercase()),
-            "plan pool must be a lowercase name"
-        );
         let brief = text("brief")?;
         ensure!(!brief.trim().is_empty(), "plan brief is empty");
         ensure!(
@@ -985,6 +1007,19 @@ mod tests {
         let mut no_pool = plan();
         no_pool.as_object_mut().unwrap().remove("pool");
         assert_eq!(JobPlan::from_json(&no_pool).unwrap().pool, "");
+        // Pool names another organization's pools.json may use.
+        for pool in [
+            "gpt5",
+            "claude-opus",
+            "glm_5",
+            "5",
+            "tier1",
+            &"a".repeat(32),
+        ] {
+            let mut named = plan();
+            named["pool"] = json!(pool);
+            assert_eq!(JobPlan::from_json(&named).unwrap().pool, pool);
+        }
         // Each edit of a valid plan, and the error it must give.
         let long = "x".repeat(PLAN_BRIEF_LIMIT + 1);
         for (key, value, error) in [
@@ -1009,7 +1044,16 @@ mod tests {
                 "runner is not a string",
             ),
             ("pool", Value::Null, "pool is not a string"),
-            ("pool", json!("../claude"), "lowercase name"),
+            ("pool", json!("../claude"), "plan pool must be a name"),
+            ("pool", json!(""), "plan pool must be a name"),
+            ("pool", json!("-claude"), "plan pool must be a name"),
+            ("pool", json!("_claude"), "plan pool must be a name"),
+            ("pool", json!("Claude"), "plan pool must be a name"),
+            ("pool", json!("claude opus"), "plan pool must be a name"),
+            ("pool", json!("claude.opus"), "plan pool must be a name"),
+            ("pool", json!("a/b"), "plan pool must be a name"),
+            ("pool", json!("tier-1"), "names a tier"),
+            ("pool", json!("a".repeat(33)), "plan pool must be a name"),
             ("brief", json!("  \n"), "brief is empty"),
             ("brief", json!(long), "exceeds"),
             // Fields the caller has no input for are refused, not dropped.
