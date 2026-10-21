@@ -457,7 +457,12 @@ Each is claimed on its
 thread first, as a fix round is, so a comment is acted on once whether or not
 the cursor survives. A run GitHub refuses (a 4xx) is recorded on its claim or
 marker, without using the round, and tried again on later passes, three times
-at most; a fix round's claim that no marker followed within the run timeout is
+at most. The claim or marker names the comments as pending until a write after
+the dispatch records its outcome. One still pending after the run timeout
+counts as a refusal, so a refusal whose record could not be written, or a
+started run whose record could not, is tried again too, within those tries
+and the fix rounds (agent-board#185). A
+fix round's claim that no marker followed within the run timeout is
 superseded by a marker restating the state. The runs count against the three a pass and go through
 `--dispatch-workflow` and its bounds. Followed repositories are left to the
 steps above. Each thread acted on gets a decision line; a preview does not

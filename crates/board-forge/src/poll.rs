@@ -1345,6 +1345,11 @@ pub struct Marker {
     /// The operator's comments a round was started on ([`comments`]), which
     /// no later pass starts one on again.
     pub comments: Vec<String>,
+    /// The operator's comments a round is being dispatched on, which become
+    /// `comments` once it may have started ([`comments`]). Written, never
+    /// read back: only the comment that carries it counts it, so a later
+    /// marker built from this one does not count it again.
+    pub pending: Vec<String>,
     /// An operator answer must finish successfully and publish a new head
     /// before the unchanged head's approvals can authorize a merge.
     pub answering: bool,
@@ -1473,6 +1478,9 @@ impl Marker {
         if !self.comments.is_empty() {
             state["comments"] = self.comments.iter().map(|c| plain(c)).collect();
         }
+        if !self.pending.is_empty() {
+            state["pending"] = self.pending.iter().map(|c| plain(c)).collect();
+        }
         if self.rebased > 0 {
             state["rebased"] = self.rebased.into();
         }
@@ -1588,6 +1596,7 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
                 .filter_map(Value::as_str)
                 .map(plain)
                 .collect(),
+            pending: Vec::new(),
         };
         if latest.id.is_none() || marker.id > latest.id {
             latest = marker;
@@ -3244,6 +3253,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             raised,
             raising,
             comments: Vec::new(),
+            pending: Vec::new(),
             answering: false,
             rebased: if rebasing { round } else { carried.rebased },
             rebasing,

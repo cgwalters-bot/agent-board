@@ -51,6 +51,10 @@ const TRIAGE_FROM: &str = "comment:";
 /// given up on: each try posts a claim, and a marker for a fix round, on a
 /// thread of someone else's.
 const DISPATCH_TRIES: usize = 3;
+/// The requests a dispatch and the write recording its run may take: two for
+/// the dispatch, which asks again without `return_run_details` where that is
+/// refused, and one for the write.
+const DISPATCH_RECORDED_REQUESTS: usize = 3;
 
 /// `operatorComments`: absent reads no comments; present, it names at least
 /// one organization (`OWNER/*`) or repository.
@@ -117,7 +121,24 @@ pub(super) struct Said {
 /// claim, names: acted on, so never again. A marker or claim whose run GitHub
 /// refused names them as `refused` instead, and they are tried again, up to
 /// `DISPATCH_TRIES` times; with how often each was refused.
-fn handled(comments: &[Value], bot: &str) -> (BTreeSet<String>, BTreeMap<String, usize>) {
+///
+/// A marker or claim is posted before its dispatch with the comments as
+/// `pending`, and only the write after a dispatch that started a run, or may
+/// have, names them as `comments`. So a refusal needs no write of its own: a
+/// pending record, whose dispatch was refused or whose pass failed before
+/// recording it, counts as one refusal once it is older than the run
+/// timeout; until then it may be another pass's dispatch under way, and is
+/// done for now, or two overlapping passes would each start a run on it.
+/// Read the other way, a write that failed after a refusal (a 5xx, or the
+/// request budget spent) would leave them acted on with no run started
+/// (agent-board#185). The cost is that a run that started but could not be
+/// recorded is tried again, within `DISPATCH_TRIES` and, for a fix round,
+/// the rounds its marker counted.
+fn handled(
+    comments: &[Value],
+    bot: &str,
+    now: OffsetDateTime,
+) -> (BTreeSet<String>, BTreeMap<String, usize>) {
     let names = |state: &Value, field: &str| -> Vec<String> {
         nodes(state, field)
             .iter()
@@ -125,15 +146,22 @@ fn handled(comments: &[Value], bot: &str) -> (BTreeSet<String>, BTreeMap<String,
             .map(str::to_owned)
             .collect()
     };
+    let settled =
+        |comment: &Value| older_than(now, comment["created_at"].as_str(), FIX_RUN_TIMEOUT_SECONDS);
     let mut done = BTreeSet::new();
     let mut refused: BTreeMap<String, usize> = BTreeMap::new();
     // The earliest claim from each comment wins, as the claim protocol says.
-    let mut claims: BTreeMap<String, (u64, Value)> = BTreeMap::new();
+    let mut claims: BTreeMap<String, (u64, Value, bool)> = BTreeMap::new();
     for comment in comments.iter().filter(|c| text(c, "/user/login") == bot) {
         let body = text(comment, "/body");
         if let Some(state) = parse_marker(MARKER, body) {
             done.extend(names(&state, "/comments"));
-            for key in names(&state, "/refused") {
+            let mut keys = names(&state, "/refused");
+            match settled(comment) {
+                true => keys.extend(names(&state, "/pending")),
+                false => done.extend(names(&state, "/pending")),
+            }
+            for key in keys {
                 *refused.entry(key).or_default() += 1;
             }
         }
@@ -143,12 +171,16 @@ fn handled(comments: &[Value], bot: &str) -> (BTreeSet<String>, BTreeMap<String,
         let (Some(from), Some(id)) = (state["from"].as_str(), comment["id"].as_u64()) else {
             continue;
         };
-        if from.starts_with(TRIAGE_FROM) && claims.get(from).is_none_or(|(first, _)| id < *first) {
-            claims.insert(from.to_owned(), (id, state));
+        if from.starts_with(TRIAGE_FROM) && claims.get(from).is_none_or(|(first, ..)| id < *first) {
+            claims.insert(from.to_owned(), (id, state, settled(comment)));
         }
     }
-    for (_, state) in claims.into_values() {
-        let keys = names(&state, "/refused");
+    for (_, state, settled) in claims.into_values() {
+        let mut keys = names(&state, "/refused");
+        match settled {
+            true => keys.extend(names(&state, "/pending")),
+            false => done.extend(names(&state, "/pending")),
+        }
         if keys.is_empty() {
             done.extend(names(&state, "/comments"));
         }
@@ -163,6 +195,16 @@ fn handled(comments: &[Value], bot: &str) -> (BTreeSet<String>, BTreeMap<String,
             .map(|(key, _)| key.clone()),
     );
     (done, refused)
+}
+
+/// A claim's pending comments, named with its dispatch's outcome: `comments`
+/// where its run started, or may have; `refused` where GitHub refused it.
+fn settle(state: &mut Value, outcome: &str) {
+    if let Some(state) = state.as_object_mut()
+        && let Some(keys) = state.remove("pending")
+    {
+        state.insert(outcome.into(), keys);
+    }
 }
 
 /// Whether a line of the operator's asks the bot for action explicitly.
@@ -578,7 +620,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .find(|c| c["id"].as_u64() == stop.id)
             .and_then(|c| OffsetDateTime::parse(text(c, "/created_at"), &Rfc3339).ok())
             .context("the stop has no creation time")?;
-        let (done, _) = handled(comments, &self.config.bot);
+        let (done, _) = handled(comments, &self.config.bot, self.now);
         let said: Vec<Said> = self
             .said(repo, number, comments, true, since)?
             .into_iter()
@@ -774,13 +816,32 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
             self.apply.is_some(),
         )?;
-        let (done, refused) = handled(&comments, &self.config.bot);
+        let (done, refused) = handled(&comments, &self.config.bot, self.now);
         let said: Vec<Said> = self
             .said(repo, number, &comments, pull, floor)?
             .into_iter()
             .filter(|s| !done.contains(&s.key))
             .collect();
         if said.is_empty() {
+            // A fresh pending record suppresses dispatch, but is not finished:
+            // keep its thread in the search until it settles or times out.
+            // Otherwise advancing the cursor loses the retry when no further
+            // comments update the thread before the timeout.
+            let pending = comments.iter().any(|comment| {
+                text(comment, "/user/login") == self.config.bot
+                    && [MARKER, CLAIM].iter().any(|kind| {
+                        parse_marker(kind, text(comment, "/body"))
+                            .is_some_and(|state| !nodes(&state, "/pending").is_empty())
+                    })
+                    && !older_than(
+                        self.now,
+                        comment["created_at"].as_str(),
+                        FIX_RUN_TIMEOUT_SECONDS,
+                    )
+            });
+            if pending {
+                return Ok(Some((false, "operator comments: dispatch pending".into())));
+            }
             return Ok(None);
         }
         let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
@@ -911,9 +972,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             continued: carried.continued,
             raised: carried.raised,
             rebased: carried.rebased,
-            comments: keys,
+            pending: keys,
             ..Marker::default()
         };
+        // The round is counted before its dispatch, so that no failure after
+        // it can start more rounds than the bound; the comments are pending.
         self.post_marker(repo, number, &mut marker, &format!("{of}: starting."))?;
         let url = format!("https://github.com/{repo}/pull/{number}");
         let mut inputs = json!({
@@ -925,10 +988,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(pool) = pool {
             inputs["pool"] = pool.into();
         }
-        let run = match self.dispatch(dispatcher, &workflow, inputs) {
+        let run = match self.dispatch_recorded(dispatcher, &workflow, inputs) {
             Ok(run) => run,
             // Refused: the marker is put back as it was, without the round,
-            // and names the comments as refused, for the next pass to try.
+            // and names the comments as refused. Where that write fails, the
+            // round stays used, but the comments are still pending.
             Err(error) if error.is::<NotStarted>() => {
                 let mut state = Marker {
                     id: None,
@@ -936,7 +1000,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     ..carried
                 }
                 .state();
-                state["refused"] = marker.comments.iter().map(|c| plain(c)).collect();
+                state["refused"] = marker.pending.iter().map(|c| plain(c)).collect();
                 let id = marker.id.context("the round has no marker")?;
                 self.rewrite(
                     repo,
@@ -945,11 +1009,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 )?;
                 return Err(error);
             }
-            // Anything else leaves the round used, as a pass that died after
-            // its marker would: the bot may not label a pull request upstream.
-            Err(error) => return Err(error),
+            // Anything else leaves the round used and the comments acted on,
+            // as the run may have started: the bot may not label a pull
+            // request upstream.
+            Err(error) => {
+                marker.comments = std::mem::take(&mut marker.pending);
+                self.record_run(repo, &marker, &format!("{of}: may have started."))?;
+                return Err(error);
+            }
         };
+        marker.comments = std::mem::take(&mut marker.pending);
         let Some(id) = run["workflow_run_id"].as_u64() else {
+            self.record_run(repo, &marker, &format!("{of}: started."))?;
             return Ok((true, format!("fix round {round} -> run started")));
         };
         let run = format!(
@@ -1032,7 +1103,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             0 => format!("{TRIAGE_FROM}{}", keys[0]),
             tries => format!("{TRIAGE_FROM}{}/{tries}", keys[0]),
         };
-        let state = json!({"from": from, "comments": keys});
+        let state = json!({"from": from, "pending": keys});
         let marker = find_marker(read, &self.config.bot);
         let claim = match self.claim(repo, number, &marker, read, (state.clone(), &of))? {
             Ok(claim) => claim,
@@ -1050,20 +1121,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // Someone else's pull request: the run's item is its tracking issue,
         // recorded on the claim, which is also the link to it from here. It
-        // is recorded with the dispatch's outcome, not before: a claim that
-        // names the comments without refusing them reads as done, so a write
-        // that failed between the claim and the dispatch would drop them.
+        // is recorded with the dispatch's outcome. A failure before the
+        // dispatch leaves the claim pending, and the comments are tried again.
         let (item_repo, item, tracking) = if pull {
-            let tracked = self.tracking_issue(repo, number, &url, read, said);
-            let issue = match tracked {
-                Ok(issue) => issue,
-                // Nothing was started: tried again, as a refused run is.
-                Err(error) => {
-                    state["refused"] = state["comments"].clone();
-                    self.rewrite(repo, claim, claim_body(&state, "not started."))?;
-                    return Err(error);
-                }
-            };
+            let issue = self.tracking_issue(repo, number, &url, read, said)?;
             let tracker = self.config.dispatch_repo.clone();
             let link = format!("https://github.com/{tracker}/issues/{issue}");
             state["issue"] = issue.into();
@@ -1081,31 +1142,35 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(pool) = pool {
             inputs["pool"] = pool.into();
         }
-        let run = match self.dispatch(dispatcher, &workflow, inputs) {
+        let run = match self.dispatch_recorded(dispatcher, &workflow, inputs) {
             Ok(run) => run,
             // Refused: the claim names the comments as refused, for the next
-            // pass to try. Anything else may have started the run.
+            // pass to try. Where that write fails, it stays pending, and is
+            // tried once it is older than the run timeout ([`handled`]).
             Err(error) if error.is::<NotStarted>() => {
-                state["refused"] = state["comments"].clone();
+                settle(&mut state, "refused");
                 self.rewrite(repo, claim, claim_body(&state, "not started."))?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
-        };
-        let on = match &tracking {
-            Some(link) => {
-                // The run started: a failure here only loses the mapping, and
-                // the next request opens a new issue.
-                self.rewrite(
-                    repo,
-                    claim,
-                    claim_body(&state, &format!("claimed; tracked in {link}.")),
-                )
-                .context("the run started, but its claim does not record its issue")?;
-                format!(" on {item_repo}#{item}")
+            // Anything else may have started the run: its comments are done.
+            Err(error) => {
+                settle(&mut state, "comments");
+                self.rewrite(repo, claim, claim_body(&state, "may have started."))?;
+                return Err(error);
             }
-            None => String::new(),
         };
+        // The run started. Where this write fails, the claim stays pending
+        // and the comments are tried again after the run timeout ([`handled`]).
+        settle(&mut state, "comments");
+        let (on, text) = match &tracking {
+            Some(link) => (
+                format!(" on {item_repo}#{item}"),
+                format!("claimed; tracked in {link}."),
+            ),
+            None => (String::new(), "claimed; started.".to_owned()),
+        };
+        self.rewrite(repo, claim, claim_body(&state, &text))
+            .context("the run started, but its claim does not record it")?;
         Ok((
             true,
             match run["workflow_run_id"].as_u64() {
@@ -1189,6 +1254,24 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         created["number"]
             .as_u64()
             .context("the new issue has no number")
+    }
+
+    /// [`Pass::dispatch`], not started unless the request budget leaves the
+    /// write that records its run: a run whose record could not be paid for
+    /// would be read as pending, and started again ([`handled`]).
+    fn dispatch_recorded(
+        &mut self,
+        dispatcher: &R,
+        workflow: &str,
+        inputs: Value,
+    ) -> Result<Value> {
+        if self.remaining < DISPATCH_RECORDED_REQUESTS {
+            return Err(NotStarted(format!(
+                "fewer than {DISPATCH_RECORDED_REQUESTS} requests of the poll's budget are left"
+            ))
+            .into());
+        }
+        self.dispatch(dispatcher, workflow, inputs)
     }
 
     /// A new body for a comment of this pass's.
@@ -1455,7 +1538,29 @@ mod tests {
         )
     }
 
-    fn pass_from(fake: &Fake, (cursor, page): (Option<&str>, Option<u64>), apply: bool) -> Outcome {
+    fn pass_from(fake: &Fake, search: (Option<&str>, Option<u64>), apply: bool) -> Outcome {
+        pass_when(fake, search, apply, now())
+    }
+
+    /// An applying pass that resumes where `last` left the search, past the
+    /// run timeout, which a pending claim or marker of the bot's waits out.
+    fn resume_later(fake: &Fake, last: &Outcome) -> Outcome {
+        let state = &last.state;
+        let later = now() + Duration::seconds(FIX_RUN_TIMEOUT_SECONDS + 30 * 60);
+        pass_when(
+            fake,
+            (state.operator_cursor.as_deref(), state.operator_page),
+            true,
+            later,
+        )
+    }
+
+    fn pass_when(
+        fake: &Fake,
+        (cursor, page): (Option<&str>, Option<u64>),
+        apply: bool,
+        at: OffsetDateTime,
+    ) -> Outcome {
         run(
             fake,
             fake,
@@ -1472,7 +1577,7 @@ mod tests {
                 workflow: "dispatch.yml".into(),
                 pools: vec![],
             }),
-            now(),
+            at,
         )
         .unwrap()
     }
@@ -1891,14 +1996,16 @@ mod tests {
             assert!(fake.writes.borrow().is_empty(), "{case}");
         }
 
-        // The claim records the issue once the run started: where that write
-        // fails, the run is not started again.
+        // The claim records the run and its issue once the run started: where
+        // that write fails, the claim is still pending. Until the run timeout
+        // that is a run under way, which no other pass starts again; past it,
+        // the run is tried again, as one refused would be; then not again.
         let fake = someones_pull();
         *fake.broken.borrow_mut() = true;
         let first = pass(&fake, None, true);
         assert_eq!(first.errors, 1, "{:?}", first.lines);
         assert!(
-            first.lines[0].contains("the run started, but its claim does not record its issue"),
+            first.lines[0].contains("the run started, but its claim does not record it"),
             "{:?}",
             first.lines
         );
@@ -1907,6 +2014,11 @@ mod tests {
         let again = resume(&fake, &first);
         assert_eq!(again.errors, 0, "{:?}", again.lines);
         assert_eq!(dispatches(&fake).len(), 1);
+        let later = resume_later(&fake, &again);
+        assert_eq!(later.errors, 0, "{:?}", later.lines);
+        assert_eq!(dispatches(&fake).len(), 2);
+        resume_later(&fake, &later);
+        assert_eq!(dispatches(&fake).len(), 2);
     }
 
     #[test]
@@ -2072,6 +2184,45 @@ mod tests {
             ]
         );
         assert_eq!((marker(&fake).rounds, marker(&fake).run), (1, Some(1234)));
+    }
+
+    #[test]
+    fn a_refusal_that_could_not_be_recorded_is_still_tried_again() {
+        // Refused, and the write that would record the refusal fails.
+        let fake = github();
+        *fake.refused.borrow_mut() = Some(404);
+        *fake.broken.borrow_mut() = true;
+        let first = pass(&fake, None, true);
+        assert_eq!(first.errors, 2, "{:?}", first.lines);
+        assert_eq!(dispatches(&fake).len(), 2);
+        *fake.refused.borrow_mut() = None;
+        *fake.broken.borrow_mut() = false;
+        // Pending, the claim and the marker may be another pass's dispatch
+        // under way: nothing is started on them within the run timeout.
+        let again = resume(&fake, &first);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert_eq!(again.lines.len(), 3, "{:?}", again.lines);
+        assert_eq!(dispatches(&fake).len(), 2);
+        let thread = format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100");
+        let read =
+            |fake: &Fake, at| handled(fake.rest.borrow()[&thread].as_array().unwrap(), BOT, at);
+        assert!(read(&fake, now()).0.contains("issuecomment-100"));
+        // Past it, each counts as one refusal and is tried again. The fix
+        // round's marker, not put back, keeps the round it counted.
+        let later = now() + Duration::seconds(FIX_RUN_TIMEOUT_SECONDS + 30 * 60);
+        let (done, tries) = read(&fake, later);
+        assert!(!done.contains("issuecomment-100"), "{done:?}");
+        assert_eq!(tries.get("issuecomment-100"), Some(&1));
+        let last = resume_later(&fake, &again);
+        assert_eq!(last.errors, 0, "{:?}", last.lines);
+        assert_eq!(
+            last.lines[..2],
+            [
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 2 -> https://github.com/example/tracker/actions/runs/1234",
+                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/example/tracker/actions/runs/1234",
+            ]
+        );
+        assert_eq!(dispatches(&fake).len(), 4);
     }
 
     #[test]
