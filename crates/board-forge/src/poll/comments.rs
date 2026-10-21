@@ -109,7 +109,7 @@ fn stamp(at: OffsetDateTime) -> Result<String> {
 }
 
 /// One comment, review or review comment of the operator's.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Said {
     /// Its anchor on the thread, which names it in claims and markers.
     pub(super) key: String,
@@ -1121,13 +1121,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // Someone else's pull request: the run's item is its tracking issue,
         // recorded on the claim, which is also the link to it from here. It
-        // is recorded with the dispatch's outcome. A failure before the
-        // dispatch leaves the claim pending, and the comments are tried again.
+        // is recorded before the dispatch, still pending: where the write of
+        // the dispatch's outcome then fails, the retry after the run timeout
+        // finds the issue rather than opening a second one for the same
+        // comments (agent-board#206). A failure before the dispatch leaves
+        // the claim pending, and the comments are tried again.
         let (item_repo, item, tracking) = if pull {
             let issue = self.tracking_issue(repo, number, &url, read, said)?;
             let tracker = self.config.dispatch_repo.clone();
             let link = format!("https://github.com/{tracker}/issues/{issue}");
             state["issue"] = issue.into();
+            self.rewrite(
+                repo,
+                claim,
+                claim_body(&state, &format!("starting; tracked in {link}.")),
+            )?;
             (tracker, issue, Some(link))
         } else {
             (repo.to_owned(), number, None)
@@ -1199,18 +1207,25 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let title = format!("{repo}#{number}: operator request");
         // Quoted for people to read, not run: nothing in it can carry a
         // marker or claim of the bot's.
-        let quoted = quote(said, url, &self.config.operator)
-            .join("\n")
-            .replace("<!--", "<!- -");
-        let mapped = read
+        let operator = self.config.operator.clone();
+        let quoted = |said: &[Said]| {
+            quote(said, url, &operator)
+                .join("\n")
+                .replace("<!--", "<!- -")
+        };
+        let claims: Vec<(u64, Value)> = read
             .iter()
             .filter(|c| text(c, "/user/login") == bot)
             .filter_map(|c| {
-                let issue = parse_marker(CLAIM, text(c, "/body"))?["issue"].as_u64()?;
-                Some((c["id"].as_u64()?, issue))
+                let state = parse_marker(CLAIM, text(c, "/body"))?;
+                Some((c["id"].as_u64()?, state))
             })
-            .max()
-            .map(|(_, issue)| issue);
+            .filter(|(_, state)| state["issue"].is_u64())
+            .collect();
+        let mapped = claims
+            .iter()
+            .max_by_key(|(id, _)| *id)
+            .and_then(|(_, state)| state["issue"].as_u64());
         if let Some(issue) = mapped {
             let found = match self.get(&format!("repos/{tracker}/issues/{issue}")) {
                 Ok(found) => found,
@@ -1230,25 +1245,49 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 && found["state"] == "open"
                 && found.get("pull_request").is_none_or(Value::is_null)
             {
-                let rest = self.rest;
-                self.send(
-                    rest,
-                    "POST",
-                    &format!("repos/{tracker}/issues/{issue}/comments"),
-                    json!({"body": format!("More from {url}:\n{quoted}\n\n{FOOTER}")}),
-                    0,
-                )?;
+                // Every claim naming the issue names the comments it quotes,
+                // as it is recorded before its dispatch: a retry after a
+                // refusal, or after a run whose claim was not recorded,
+                // quotes none of them again (agent-board#206).
+                let named: BTreeSet<&str> = claims
+                    .iter()
+                    .filter(|(_, state)| state["issue"] == issue)
+                    .flat_map(|(_, state)| {
+                        ["/pending", "/refused", "/comments"]
+                            .into_iter()
+                            .flat_map(|field| nodes(state, field))
+                    })
+                    .filter_map(Value::as_str)
+                    .collect();
+                let new: Vec<Said> = said
+                    .iter()
+                    .filter(|s| !named.contains(s.key.as_str()))
+                    .cloned()
+                    .collect();
+                if !new.is_empty() {
+                    let rest = self.rest;
+                    let more = format!("More from {url}:\n{}\n\n{FOOTER}", quoted(&new));
+                    self.send(
+                        rest,
+                        "POST",
+                        &format!("repos/{tracker}/issues/{issue}/comments"),
+                        json!({"body": more}),
+                        0,
+                    )?;
+                }
                 return Ok(issue);
             }
         }
+        let body = format!(
+            "The operator commented on {url}, a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it.\n{}\n\n{FOOTER}",
+            quoted(said)
+        );
         let rest = self.rest;
         let (_, created) = self.send(
             rest,
             "POST",
             &format!("repos/{tracker}/issues"),
-            json!({"title": title, "body": format!(
-                "The operator commented on {url}, a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it.\n{quoted}\n\n{FOOTER}"
-            )}),
+            json!({"title": title, "body": body}),
             0,
         )?;
         created["number"]
@@ -1327,7 +1366,7 @@ mod tests {
         refused: RefCell<Option<u16>>,
         /// URLs whose GET fails as a server error would.
         unavailable: RefCell<BTreeSet<String>>,
-        /// Whether a PATCH answers 502.
+        /// Whether a PATCH that records a dispatch's outcome answers 502.
         broken: RefCell<bool>,
     }
 
@@ -1389,7 +1428,11 @@ mod tests {
                     None => (200, json!({"workflow_run_id": 1234})),
                 });
             }
-            if method == "PATCH" && *self.broken.borrow() {
+            let after_dispatch = matches!(
+                self.writes.borrow().iter().rev().nth(1),
+                Some((w, _)) if w.ends_with("/dispatches")
+            );
+            if method == "PATCH" && *self.broken.borrow() && after_dispatch {
                 return Ok((502, json!({"message": "unavailable"})));
             }
             let id = 1000 + self.writes.borrow().len() as u64;
@@ -2019,6 +2062,35 @@ mod tests {
         assert_eq!(dispatches(&fake).len(), 2);
         resume_later(&fake, &later);
         assert_eq!(dispatches(&fake).len(), 2);
+        // The claim named the issue before the dispatch, so the retry goes
+        // to the same one, and quotes nothing on it again (agent-board#206).
+        let issues = |fake: &Fake| -> Vec<String> {
+            fake.writes
+                .borrow()
+                .iter()
+                .filter(|(w, b)| {
+                    w == &format!("POST {API_ROOT}repos/{DISPATCH}/issues")
+                        || (w.starts_with(&format!("POST {API_ROOT}repos/{DISPATCH}/issues/"))
+                            && text(b, "/body").starts_with("More from"))
+                })
+                .map(|(w, _)| w.clone())
+                .collect()
+        };
+        assert_eq!(issues(&fake).len(), 1, "{:?}", issues(&fake));
+        let item = &dispatches(&fake)[0]["item"];
+        assert!(dispatches(&fake).iter().all(|i| &i["item"] == item));
+
+        // Refused, the run is tried again on the same issue, which quotes
+        // the comments once.
+        let fake = someones_pull();
+        *fake.refused.borrow_mut() = Some(404);
+        let first = pass(&fake, None, true);
+        assert_eq!(first.errors, 1, "{:?}", first.lines);
+        *fake.refused.borrow_mut() = None;
+        let again = resume(&fake, &first);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert_eq!(issues(&fake).len(), 1, "{:?}", issues(&fake));
+        assert_eq!(dispatches(&fake)[0]["item"], dispatches(&fake)[1]["item"]);
     }
 
     #[test]
