@@ -10,8 +10,9 @@
 # check` admits it (agentic-job docs/workflows-check.md, "Deploy-only Pages
 # jobs"): no checkout, no run step, no env, nothing from the repository
 # beside those credentials; it publishes the artifact the hardened check
-# job uploaded. What is published is therefore only as good as main's
-# site/ code and the locked dependencies that build it.
+# job uploaded. deploy-pages is pinned at v5.0.1 (node24, same inputs as
+# v4); the check admits it once its allowlist names that commit. What is
+# published is therefore only as good as main's site/ code and the locked dependencies that build it.
 name: site
 
 on:
@@ -79,4 +80,4 @@ jobs:
       group: pages
       cancel-in-progress: false
     steps:
-      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
