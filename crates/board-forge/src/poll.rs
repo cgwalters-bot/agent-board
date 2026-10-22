@@ -199,7 +199,7 @@ const PULL_QUERY: &str = concat!(
     pullRequest(number: $number) {
       id number url title body state isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
       baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
-      author { login }
+      author { __typename login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
@@ -1009,6 +1009,17 @@ pub fn next_interval(previous: i64, active: bool) -> i64 {
 
 fn text<'a>(value: &'a Value, pointer: &str) -> &'a str {
     value.pointer(pointer).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A GraphQL author's login as REST names it: REST names an app `name[bot]`,
+/// GraphQL `name`, so the author needs its `__typename` queried.
+pub(crate) fn author_login(author: &Value) -> String {
+    let name = author["login"].as_str().unwrap_or_default();
+    if author["__typename"] == "Bot" {
+        format!("{name}[bot]")
+    } else {
+        name.to_owned()
+    }
 }
 
 fn nodes<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
@@ -4388,6 +4399,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter(|p| p.is_object())
             .context("pull request not found")?
             .clone();
+        // From here on the author is named as the REST list and `mergeAuthors`
+        // name it, so a listed app such as `dependabot[bot]` is still followed
+        // here; read raw, GraphQL's `dependabot` was never one of them. Only a
+        // Bot gets the suffix, which GitHub's user logins cannot carry, so a
+        // user cannot pass as a listed app, nor an app as the bot.
+        if pull["author"].is_object() {
+            pull["author"]["login"] = author_login(&pull["author"]).into();
+        }
         // The open list was read at the start of the repository's walk, which
         // can be minutes ago: a pull request merged or closed since then gets
         // no round, label or merge (#208). Anything but OPEN, a missing state
@@ -8277,10 +8296,19 @@ mod tests {
 
     #[test]
     fn unfollowed_authors_are_skips_and_bad_repositories_do_not_block_others() {
-        for (listed_author, queried_author) in [
-            ("stranger", "stranger"),
-            (BOT, "stranger"),
-            ("updater[bot]", "stranger"),
+        // The list names an app `name[bot]`, GraphQL `name` with its type.
+        let user = |login: &str| json!({"__typename": "User", "login": login});
+        for (listed_author, queried_author, followed) in [
+            ("stranger", user("stranger"), false),
+            (BOT, user("stranger"), false),
+            (BOT, json!({"__typename": "Bot", "login": BOT}), false),
+            ("updater[bot]", user("stranger"), false),
+            ("updater[bot]", user("updater"), false),
+            (
+                "updater[bot]",
+                json!({"__typename": "Bot", "login": "updater"}),
+                true,
+            ),
         ] {
             for bad_repository in [false, true] {
                 let mut fake = github();
@@ -8294,7 +8322,9 @@ mod tests {
                     ]),
                 );
                 let mut p = pull("pull-470", json!({}));
-                p["author"]["login"] = queried_author.into();
+                p["author"] = queried_author.clone();
+                p["reviews"]["nodes"] =
+                    json!([review("APPROVED", user("cgwalters"), HEAD, "approved")]);
                 fake.pulls.insert(469, p);
                 fake.page(
                     &format!("repos/{REPO}/issues/469/comments?per_page=100"),
@@ -8328,21 +8358,33 @@ mod tests {
                     "{:?}",
                     outcome.lines
                 );
-                assert!(
+                assert_eq!(
                     outcome
                         .lines
                         .iter()
                         .any(|l| l
-                            == &format!("{REPO}#469 skip: pull request author is not followed"))
+                            == &format!("{REPO}#469 skip: pull request author is not followed")),
+                    !followed,
+                    "{queried_author}: {:?}",
+                    outcome.lines
                 );
+                for number in [469, 470].into_iter().filter(|&n| followed || n == 470) {
+                    assert!(
+                        outcome
+                            .lines
+                            .iter()
+                            .any(|l| l.contains(&format!("#{number} ")) && l.contains("merge:")),
+                        "{queried_author}: {:?}",
+                        outcome.lines
+                    );
+                }
+                assert_eq!(fake.writes.borrow().len(), 1 + usize::from(followed));
                 assert!(
-                    outcome
-                        .lines
+                    fake.writes
+                        .borrow()
                         .iter()
-                        .any(|l| l.contains("#470") && l.contains("merge:"))
+                        .all(|(q, _)| q.contains("mergePullRequest"))
                 );
-                assert_eq!(fake.writes.borrow().len(), 1);
-                assert!(fake.writes.borrow()[0].0.contains("mergePullRequest"));
                 assert!(dispatcher.writes.borrow().is_empty());
             }
         }
@@ -8385,7 +8427,8 @@ mod tests {
         ] {
             let mut fake = github();
             let mut p = pull("pull-470", change);
-            p["author"]["login"] = "updater[bot]".into();
+            // As GraphQL names the app the list calls `updater[bot]`.
+            p["author"] = json!({"__typename": "Bot", "login": "updater"});
             p["reviews"]["nodes"] = json!([review(
                 approval,
                 json!({"__typename": "User", "login": "cgwalters"}),
