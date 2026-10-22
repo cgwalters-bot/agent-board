@@ -19,6 +19,8 @@ the newest `epic` labeling must also be the configured operator's.
 A closed epic refuses every plan, in the dry run, the preview and apply (again
 after claiming): closing it is the operator's decision that the decomposition
 is finished or dropped, so a plan written before may not add to or change it.
+Only where the configuration allows it may a plan close the epic itself
+([`close_epic`](#format)).
 
 ## Format
 
@@ -58,6 +60,16 @@ structural format; runtime checks also enforce the bounds and relationships belo
 | `close_sub_issue` | `issue`, `reason` | Comment the reason, close as not planned |
 | `rescope_sub_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason |
 | `set_priority` | `issue` or `new`, `value` | Set the board's Priority |
+| `close_epic` | `reason`; optional `moved_to` | Comment the reason (and where the work moved) on the epic, close it as completed |
+
+`close_epic` lets a plan end an epic with nothing left to do, which would
+otherwise be replanned empty on every pass. It must be the plan's last
+action, the plan may not create a sub-issue, and every sub-issue must be
+closed, before or by an earlier `close_sub_issue` in the plan, unless
+`moved_to` (`OWNER/REPO#N`, in a configured repository, neither the epic nor
+one of its sub-issues) names the issue now tracking what is left open. Apply
+and its preview refuse it unless the configuration sets
+[`close_epic`](#apply); the dry run, which has no configuration, shows it.
 
 `issue` is `OWNER/REPO#N`; `new` is the 1-based position of an earlier
 `create_sub_issue` in `actions`. A job plan in `plan` has every field of a job
@@ -98,6 +110,9 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
 - two actions of one type on one issue, or any other action on an issue the
   plan closes, a new slice that stacks on it included: its run would start
   unstacked once the pull request it was written to build on is abandoned;
+- a `close_epic` that is not the last action, follows a `create_sub_issue`,
+  or, without `moved_to`, leaves a sub-issue open or closes an epic that
+  never had one;
 - a `reason` holding an `` ```agent-board `` fence or a `<!--` marker: it is
   posted as a comment by the applier, which may also be a plan writer, where it
   would count as a plan or a dispatch record;
@@ -174,9 +189,15 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
   "priority_field_id": "FIELD_NODE_ID",
   "priorities": {"P0": "OPTION_ID_0", "P1": "OPTION_ID_1"},
   "default_priority": "P1",
-  "label_by_operator": true
+  "label_by_operator": true,
+  "close_epic": true
 }
 ```
+
+`close_epic` is optional and off by default. Off, a plan with a `close_epic`
+action is refused and closing an epic stays the operator's alone; on, a plan
+writer may close one whose sub-issues are all closed, or whose remaining
+work it says has moved (`moved_to` is its word, not checked further).
 
 `label_by_operator` is optional and off by default. On, the preview and apply
 (before and after claiming) read the epic's last 100 labelings and refuse

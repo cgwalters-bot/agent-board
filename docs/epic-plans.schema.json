@@ -46,6 +46,10 @@
         {"required": ["value"], "oneOf": [{"required": ["issue"]}, {"required": ["new"]}], "properties": {
           "type": {"const": "set_priority"}, "issue": {"$ref": "#/$defs/issue"},
           "new": {"type": "integer", "minimum": 1, "maximum": 20}, "value": {"type": "string"}
+        }},
+        {"required": ["reason"], "properties": {
+          "type": {"const": "close_epic"}, "reason": {"$ref": "#/$defs/reason"},
+          "moved_to": {"$ref": "#/$defs/issue"}
         }}
       ]
     }

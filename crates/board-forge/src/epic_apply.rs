@@ -72,6 +72,11 @@ pub struct Config {
     /// someone with only triage access (or the bot) cannot start a
     /// decomposition the bot then carries out. Off by default.
     pub label_by_operator: bool,
+    /// Let a plan's `close_epic` close the epic. Off by default, closing an
+    /// epic is the operator's call alone: off, a plan writer cannot end a
+    /// decomposition the operator still wants worked, which `moved_to` (the
+    /// planner's own word that work moved) would otherwise let it do.
+    pub close_epic: bool,
 }
 
 impl Config {
@@ -89,7 +94,8 @@ impl Config {
                     "priority_field_id",
                     "priorities",
                     "default_priority",
-                    "label_by_operator"
+                    "label_by_operator",
+                    "close_epic"
                 ]
                 .contains(&key.as_str()),
                 "unknown epic config field {key:?}"
@@ -151,11 +157,17 @@ impl Config {
             priorities.contains_key(&default_priority),
             "default_priority is not a configured option"
         );
-        let label_by_operator = object
-            .get("label_by_operator")
-            .map(|v| v.as_bool().context("label_by_operator is not a boolean"))
-            .transpose()?
-            .unwrap_or(false);
+        let flag = |key: &str| -> Result<bool> {
+            Ok(object
+                .get(key)
+                .map(|v| {
+                    v.as_bool()
+                        .with_context(|| format!("{key} is not a boolean"))
+                })
+                .transpose()?
+                .unwrap_or(false))
+        };
+        let label_by_operator = flag("label_by_operator")?;
         // Else the bot's own labeling would pass as the operator's.
         ensure!(
             !label_by_operator || !operator.eq_ignore_ascii_case(&bot),
@@ -172,7 +184,18 @@ impl Config {
             priorities,
             default_priority,
             label_by_operator,
+            close_epic: flag("close_epic")?,
         })
+    }
+
+    /// The plan, checked against the bounds and the caller's opt-ins.
+    fn validate(&self, value: &Value, epic: &Epic) -> Result<EpicPlan> {
+        let plan = EpicPlan::validate(value, &self.bounds, epic)?;
+        ensure!(
+            self.close_epic || !plan.closes_epic(),
+            "the plan closes the epic, which the configuration does not allow (close_epic)"
+        );
+        Ok(plan)
     }
 
     /// Whose plans count, as for `epic plan --operator --planner`. With a
@@ -282,7 +305,7 @@ pub fn preview_checked<T: Transport>(
     let (value, from) = accepted(&comments, config)?;
     expected.check(&value, &from)?;
     let epic = read_epic(client, issue)?;
-    let plan = EpicPlan::validate(&value, &config.bounds, &epic)?;
+    let plan = config.validate(&value, &epic)?;
     designated(client, issue, &epic, config, false)?;
     let mut out = Vec::new();
     for mut mutation in plan.preview(&epic) {
@@ -339,7 +362,7 @@ pub fn apply_checked<C: Transport + Rest>(
     }
     let epic = read_epic(client, issue)?;
     designated(client, issue, &epic, config, false)?;
-    EpicPlan::validate(&value, &config.bounds, &epic)?;
+    config.validate(&value, &epic)?;
     let path = format!(
         "{API_ROOT}repos/{}/issues/{}/comments",
         issue.repository, issue.number
@@ -379,7 +402,7 @@ pub fn apply_checked<C: Transport + Rest>(
         // Recheck membership and all refusals after claiming, before any write.
         let epic = read_epic(client, issue)?;
         designated(client, issue, &epic, config, true)?;
-        let checked = EpicPlan::validate(&current, &config.bounds, &epic)?;
+        let checked = config.validate(&current, &epic)?;
         execute(client, &checked, &epic, config, &mut done)
     })();
     let dated = now.format(&Rfc3339)?;
@@ -618,6 +641,8 @@ mod tests {
         timeline_reads: Cell<usize>,
         /// The epic is closed from this epic read on.
         epic_closed_from: Option<usize>,
+        /// Closed by a plan's close_epic.
+        epic_closed: Cell<bool>,
         epic_reads: Cell<usize>,
         reads: Cell<usize>,
         login: &'static str,
@@ -645,6 +670,7 @@ mod tests {
                 relabelled: None,
                 timeline_reads: Cell::new(0),
                 epic_closed_from: None,
+                epic_closed: Cell::new(false),
                 epic_reads: Cell::new(0),
                 reads: Cell::new(0),
                 login: "planner",
@@ -719,7 +745,8 @@ mod tests {
                     nodes.push(json!({"number": 10, "state": "OPEN", "repository": {"nameWithOwner": "example/work"}}));
                 }
                 let reads = self.epic_reads.get();
-                let closed = self.epic_closed_from.is_some_and(|from| reads >= from);
+                let closed = self.epic_closed.get()
+                    || self.epic_closed_from.is_some_and(|from| reads >= from);
                 let state = if closed { "CLOSED" } else { "OPEN" };
                 return Ok(
                     json!({"repository": {"issue": {"id": "E", "state": state, "labels": {"nodes": if labelled { vec![json!({"name": "epic"})] } else { vec![] }}, "subIssues": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}}),
@@ -793,6 +820,9 @@ mod tests {
             }
             if path == "repos/example/work/issues/3" {
                 self.closed.set(true);
+            }
+            if path == "repos/example/epics/issues/1" {
+                self.epic_closed.set(true);
             }
             Ok((200, json!({})))
         }
@@ -1442,6 +1472,72 @@ mod tests {
                 assert!(format!("{refused:#}").contains("epic is closed"));
             }
         }
+    }
+
+    /// agent-board#200: a plan closes its epic after its last sub-issues, and
+    /// only where the configuration allows it; off, nothing is written.
+    #[test]
+    fn close_epic_applies_only_when_configured() {
+        let actions = json!([
+            {"type": "close_sub_issue", "issue": "example/work#2", "reason": "done"},
+            {"type": "close_sub_issue", "issue": "example/work#3", "reason": "done"},
+            {"type": "close_epic", "reason": "Nothing is left."}
+        ]);
+        let forge = Forge::new(actions.clone());
+        let error = format!("{:#}", preview(&forge, &issue(), &config()).unwrap_err());
+        assert!(error.contains("does not allow (close_epic)"), "{error}");
+        let error = apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap_err();
+        assert!(format!("{error:#}").contains("does not allow (close_epic)"));
+        assert!(forge.requests.borrow().is_empty());
+        assert!(!forge.epic_closed.get());
+
+        let mut config = config();
+        config.close_epic = true;
+        let preview = preview(&forge, &issue(), &config).unwrap();
+        assert_eq!(preview.len(), 6, "{preview:?}");
+        apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH).unwrap();
+        let requests = forge.requests.borrow().clone();
+        let targets: Vec<_> = (requests.iter())
+            .map(|(method, target, _)| format!("{method} {target}"))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "POST repos/example/epics/issues/1/comments",
+                "POST repos/example/work/issues/2/comments",
+                "PATCH repos/example/work/issues/2",
+                "POST repos/example/work/issues/3/comments",
+                "PATCH repos/example/work/issues/3",
+                "POST repos/example/epics/issues/1/comments",
+                "PATCH repos/example/epics/issues/1",
+                "PATCH repos/example/epics/issues/comments/2",
+                "POST repos/example/epics/issues/1/comments"
+            ]
+        );
+        assert_eq!(requests[5].2, json!({"body": "Nothing is left."}));
+        assert_eq!(
+            requests[6].2,
+            json!({"state": "closed", "state_reason": "completed"})
+        );
+        assert!(forge.epic_closed.get());
+        // The claim, not the closed epic's refusal, ends a replay.
+        assert_eq!(
+            apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH).unwrap(),
+            ["Already claimed; nothing changed."]
+        );
+        let on = |value: Value| {
+            let mut object = json!({"operator": "operator", "bot": "planner", "repositories": [],
+                "project": "P", "priority_field": "Order", "priority_field_id": "F",
+                "priorities": {"Normal": "O"}, "default_priority": "Normal"});
+            if !value.is_null() {
+                object["close_epic"] = value;
+            }
+            Config::from_json(&object).map(|c| c.close_epic).ok()
+        };
+        assert_eq!(on(Value::Null), Some(false));
+        assert_eq!(on(json!(true)), Some(true));
+        assert_eq!(on(json!(false)), Some(false));
+        assert_eq!(on(json!("true")), None);
     }
 
     #[test]
