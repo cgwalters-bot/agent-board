@@ -1,0 +1,1 @@
+{"base":{"repo":{"full_name":"ostreedev/ostree"}},"head":{"sha":"a0207f11818b46729249315399c87fe99d5e3f21"},"html_url":"https://github.com/ostreedev/ostree/pull/3649","number":3649,"state":"open","title":"fix: don't wedge deployment finalization on SELinux policy refresh","url":"https://api.github.com/repos/ostreedev/ostree/pulls/3649"}

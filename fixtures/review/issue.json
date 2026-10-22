@@ -1,0 +1,20 @@
+{
+  "url": "https://github.com/example/tracker/issues/900",
+  "body": "Review draft for ostreedev/ostree#3649; the draft follows in a comment.\n\n- [x] Send the newest draft as example-bot\n",
+  "createdAt": "2026-10-21T09:00:00Z",
+  "lastEditedAt": "2026-10-21T11:00:00Z",
+  "author": {
+    "login": "example-bot"
+  },
+  "editor": {
+    "login": "operator"
+  },
+  "state": "OPEN",
+  "labels": {
+    "nodes": [
+      {
+        "name": "review-draft"
+      }
+    ]
+  }
+}

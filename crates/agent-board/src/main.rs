@@ -8,6 +8,7 @@ mod item;
 mod live;
 mod org_status;
 mod poll;
+mod review;
 mod supervise;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -105,6 +106,11 @@ enum Command {
         #[command(subcommand)]
         command: Epic,
     },
+    /// Send an operator-approved review draft as the bot.
+    Review {
+        #[command(subcommand)]
+        command: Review,
+    },
     /// Save a normalized board snapshot for offline use.
     Snapshot {
         #[command(subcommand)]
@@ -144,6 +150,12 @@ enum Epic {
     Plan(epic::Plan),
     /// Apply the newest accepted epic plan once (dry run unless --apply).
     Apply(epic::Apply),
+}
+
+#[derive(Subcommand)]
+enum Review {
+    /// Post the newest review draft on an issue once the operator approves it (dry run unless --apply).
+    Send(review::Send),
 }
 
 #[derive(Subcommand)]
@@ -488,6 +500,21 @@ fn execute(cli: Cli) -> Result<()> {
                 "epic apply does not support --json or --snapshot"
             );
             epic::apply(
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Review {
+            command: Review::Send(args),
+        } => {
+            ensure!(
+                cli.json.is_none() && cli.snapshot.is_none(),
+                "review send does not support --json or --snapshot"
+            );
+            review::send(
                 args,
                 cli.repo.as_deref(),
                 &cli.hostname,

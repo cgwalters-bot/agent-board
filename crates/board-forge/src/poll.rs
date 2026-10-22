@@ -316,6 +316,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "epics",
     "decisions",
     "schedule",
+    "review",
 ];
 
 /// agent-board.json's sections that the caller's scheduler owns and
