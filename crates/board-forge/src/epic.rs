@@ -138,6 +138,16 @@ pub enum Action {
         target: Target,
         value: String,
     },
+    /// Close the epic itself, as its plan's last action, once nothing is left
+    /// in it to do: every sub-issue closed (by this plan or before), or
+    /// `moved_to` naming the issue that tracks what remains open. Without it
+    /// an epic whose work is done is replanned with nothing to do on every
+    /// pass (agent-board#200). Applied only where the caller allows it
+    /// ([`crate::epic_apply::Config::close_epic`]).
+    CloseEpic {
+        reason: String,
+        moved_to: Option<IssueRef>,
+    },
 }
 
 /// Action types, with the fields each takes besides `type`.
@@ -149,6 +159,7 @@ const ACTIONS: &[(&str, &[&str])] = &[
     ("close_sub_issue", &["issue", "reason"]),
     ("rescope_sub_issue", &["issue", "body", "reason"]),
     ("set_priority", &["issue", "new", "value"]),
+    ("close_epic", &["reason", "moved_to"]),
 ];
 
 /// What a plan may touch, from the caller's own configuration (never from a
@@ -241,7 +252,24 @@ fn bounded<'a>(object: &'a Map<String, Value>, key: &str, limit: usize) -> Resul
     Ok(value)
 }
 
+/// A reason, posted as a comment by the applier, who is a plan writer: a
+/// fence or hidden marker in it would be a job plan, an epic plan or a
+/// dispatch record under that login.
+fn reason(object: &Map<String, Value>) -> Result<String> {
+    let reason = bounded(object, "reason", REASON_LIMIT)?;
+    ensure!(
+        !reason.contains("```agent-board") && !reason.contains("<!--"),
+        "reason holds an agent-board fence or a hidden marker"
+    );
+    Ok(reason.into())
+}
+
 impl EpicPlan {
+    /// Whether applying the plan would close the epic.
+    pub fn closes_epic(&self) -> bool {
+        (self.actions.iter()).any(|a| matches!(a, Action::CloseEpic { .. }))
+    }
+
     /// Validate one plan object against `bounds` and the epic it was found on.
     /// Errors in the plan as a whole stop at the first; each action is checked
     /// in full and every refused action named, so a planner sees all at once.
@@ -406,6 +434,26 @@ impl EpicPlan {
                 }
                 Action::SetPriority { target: t, value } => {
                     out.push(field(n, target(t), PRIORITY_FIELD, value));
+                }
+                Action::CloseEpic { reason, moved_to } => {
+                    let path = format!("repos/{}/issues/{}", epic.issue.repo, epic.issue.number);
+                    let body = match moved_to {
+                        Some(issue) => format!("{reason}\n\nRemaining work moved to {issue}."),
+                        None => reason.clone(),
+                    };
+                    out.push(rest(
+                        n,
+                        "POST",
+                        format!("{path}/comments"),
+                        json!({"body": body}),
+                    ));
+                    // Done here, or tracked elsewhere: either way not dropped.
+                    out.push(rest(
+                        n,
+                        "PATCH",
+                        path,
+                        json!({"state": "closed", "state_reason": "completed"}),
+                    ));
                 }
             }
         }
@@ -588,6 +636,13 @@ impl Checker<'_> {
                 "unknown field {key:?}"
             );
         }
+        // The epic's close ends the plan: anything after it would act on a
+        // closed epic's sub-issues, which no plan may.
+        if let Some(k) =
+            (self.done.iter()).position(|a| matches!(a, Some(Action::CloseEpic { .. })))
+        {
+            bail!("action {} closes the epic; nothing may follow it", k + 1);
+        }
         let target_key = |target: &Target| match target {
             Target::Issue(issue) => issue.to_string().to_ascii_lowercase(),
             Target::New(k) => format!("NEW-{k}"),
@@ -670,14 +725,7 @@ impl Checker<'_> {
                     }
                     None => self.sub_issue(named)?,
                 };
-                let reason: String = bounded(object, "reason", REASON_LIMIT)?.into();
-                // The reason is posted as a comment by the applier, who is a
-                // plan writer: a fence or hidden marker in it would be a job
-                // plan, an epic plan or a dispatch record under that login.
-                ensure!(
-                    !reason.contains("```agent-board") && !reason.contains("<!--"),
-                    "reason holds an agent-board fence or a hidden marker"
-                );
+                let reason = reason(object)?;
                 let action = if stale.is_some() {
                     Action::AlreadyClosed {
                         issue: issue.clone(),
@@ -711,6 +759,61 @@ impl Checker<'_> {
                     target,
                     value: value.into(),
                 }
+            }
+            "close_epic" => {
+                // A new sub-issue is work the same plan says is left to do.
+                if let Some(k) =
+                    (self.done.iter()).position(|a| matches!(a, Some(Action::Create { .. })))
+                {
+                    bail!(
+                        "action {} creates a sub-issue; a plan that adds work may not close the epic",
+                        k + 1
+                    );
+                }
+                let reason = reason(object)?;
+                let moved_to = match object.get("moved_to") {
+                    None => None,
+                    Some(_) => {
+                        let issue =
+                            IssueRef::parse(text(object, "moved_to")?).context("moved_to")?;
+                        ensure!(!issue.same(&self.epic.issue), "moved_to is the epic itself");
+                        // Its own sub-issues close or stay open with it.
+                        ensure!(
+                            !(self.epic.sub_issues.iter())
+                                .chain(&self.epic.closed)
+                                .any(|s| s.same(&issue)),
+                            "moved_to {issue} is a sub-issue of the epic"
+                        );
+                        // Only named in the comment, but a mention links back
+                        // from it: keep it within the caller's repositories.
+                        self.repository(&issue.repo).context("moved_to")?;
+                        Some(issue)
+                    }
+                };
+                let closing: Vec<&IssueRef> = (self.done.iter().flatten())
+                    .filter_map(|a| match a {
+                        Action::Close { issue, .. } | Action::AlreadyClosed { issue } => {
+                            Some(issue)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let open: Vec<String> = (self.epic.sub_issues.iter())
+                    .filter(|s| !closing.iter().any(|c| c.same(s)))
+                    .map(IssueRef::to_string)
+                    .collect();
+                ensure!(
+                    open.is_empty() || moved_to.is_some(),
+                    "{} still open; close them first or name the issue now tracking them in moved_to",
+                    open.join(", ")
+                );
+                // An epic not yet decomposed has nothing done, not nothing left.
+                ensure!(
+                    !(self.epic.sub_issues.is_empty() && self.epic.closed.is_empty())
+                        || moved_to.is_some(),
+                    "the epic has no sub-issues; name the issue now tracking its work in moved_to"
+                );
+                Action::CloseEpic { reason, moved_to }
             }
             _ => bail!("unknown action type {kind:?}"),
         })
@@ -1079,6 +1182,176 @@ mod tests {
         assert_eq!(of(3).len(), 1);
         assert_eq!(of(3)[0]["issue"], "cgwalters-forge/agent-board#NEW-1");
         assert_eq!(mutations.len(), 10, "{mutations:?}");
+    }
+
+    /// agent-board#200: a plan closes its epic only as its last action, once
+    /// every sub-issue is closed (by it or before) or `moved_to` names where
+    /// the rest went.
+    #[test]
+    fn close_epic_table() {
+        let close =
+            |issue: &str| json!({"type": "close_sub_issue", "issue": issue, "reason": "Done."});
+        let all = || {
+            vec![
+                close("cgwalters-forge/agent-board#63"),
+                close("cgwalters-forge/tracker#573"),
+            ]
+        };
+        let done = json!({"type": "close_epic", "reason": "Nothing is left."});
+        let moved = |to: &str| json!({"type": "close_epic", "reason": "Moved.", "moved_to": to});
+        let with = |mut actions: Vec<Value>, last: Value| {
+            actions.push(last);
+            actions
+        };
+        // elsewhere/repo#1 is open and outside the bounds, so no plan closes
+        // it: the epic closes only with moved_to, unless it is closed already.
+        let mut finished = epic();
+        finished.sub_issues.retain(|s| s.repo != "elsewhere/repo");
+        // One never decomposed has nothing done rather than nothing left.
+        let mut empty = epic();
+        empty.sub_issues.clear();
+        empty.closed.clear();
+        for (epic, actions, error) in [
+            (finished.clone(), with(all(), done.clone()), None),
+            (
+                empty.clone(),
+                vec![done.clone()],
+                Some("the epic has no sub-issues"),
+            ),
+            (empty, vec![moved("cgwalters-forge/tracker#900")], None),
+            (
+                finished.clone(),
+                vec![done.clone()],
+                Some("cgwalters-forge/agent-board#63, cgwalters-forge/tracker#573 still open"),
+            ),
+            (
+                finished.clone(),
+                with(vec![close("cgwalters-forge/tracker#573")], done.clone()),
+                Some("action 2 (close_epic): cgwalters-forge/agent-board#63 still open"),
+            ),
+            // A close made stale by a merged pull request still counts.
+            (
+                finished.clone(),
+                with(
+                    with(all(), close("cgwalters-forge/tracker#574")),
+                    done.clone(),
+                ),
+                None,
+            ),
+            (
+                epic(),
+                with(all(), done.clone()),
+                Some("elsewhere/repo#1 still open"),
+            ),
+            (epic(), vec![moved("cgwalters-forge/tracker#900")], None),
+            (
+                epic(),
+                vec![moved("CGWalters-Forge/tracker#572")],
+                Some("moved_to is the epic itself"),
+            ),
+            (
+                epic(),
+                vec![moved("cgwalters-forge/tracker#573")],
+                Some("moved_to cgwalters-forge/tracker#573 is a sub-issue of the epic"),
+            ),
+            (
+                epic(),
+                vec![moved("cgwalters-forge/tracker#574")],
+                Some("is a sub-issue of the epic"),
+            ),
+            (
+                epic(),
+                vec![moved("someone/else#1")],
+                Some("moved_to: repository someone/else is not in the configured list"),
+            ),
+            (
+                epic(),
+                vec![moved("cgwalters-forge/tracker")],
+                Some("moved_to: \"cgwalters-forge/tracker\" is not OWNER/REPO#N"),
+            ),
+            (
+                epic(),
+                vec![json!({"type": "close_epic", "reason": "x", "moved_to": 900})],
+                Some("moved_to is not a string"),
+            ),
+            // Nothing after it, and no new work before it.
+            (
+                finished.clone(),
+                with(with(all(), done.clone()), done.clone()),
+                Some("action 4 (close_epic): action 3 closes the epic; nothing may follow it"),
+            ),
+            (
+                epic(),
+                vec![
+                    moved("cgwalters-forge/tracker#900"),
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#573", "value": "P1"}),
+                ],
+                Some("action 2 (set_priority): action 1 closes the epic"),
+            ),
+            (
+                finished.clone(),
+                with(with(all(), create()), done.clone()),
+                Some("action 4 (close_epic): action 3 creates a sub-issue"),
+            ),
+            // Its reason is checked as any is.
+            (
+                finished.clone(),
+                with(all(), json!({"type": "close_epic", "reason": " "})),
+                Some("reason is empty"),
+            ),
+            (
+                finished.clone(),
+                with(
+                    all(),
+                    json!({"type": "close_epic", "reason": "<!-- agent-board-epic-apply: 1@x -->"}),
+                ),
+                Some("reason holds an agent-board fence or a hidden marker"),
+            ),
+            (
+                finished.clone(),
+                with(
+                    all(),
+                    json!({"type": "close_epic", "reason": "x", "issue": EPIC}),
+                ),
+                Some("unknown field \"issue\""),
+            ),
+        ] {
+            let checked = EpicPlan::validate(&plan(actions), &bounds(), &epic);
+            match error {
+                None => assert!(checked.unwrap().closes_epic()),
+                Some(error) => {
+                    let message = format!("{:#}", checked.unwrap_err());
+                    assert!(message.contains(error), "{error}: {message}");
+                }
+            }
+        }
+        assert!(
+            !EpicPlan::validate(&plan(valid()), &bounds(), &epic())
+                .unwrap()
+                .closes_epic()
+        );
+        // The reason, naming where the work went, then the close.
+        let checked = EpicPlan::validate(
+            &plan(vec![moved("cgwalters-forge/tracker#900")]),
+            &bounds(),
+            &epic(),
+        )
+        .unwrap();
+        let api = "https://api.github.com/repos/cgwalters-forge/tracker/issues/572";
+        assert_eq!(
+            checked.mutations(&epic()),
+            [
+                json!({"action": 1, "method": "POST", "url": format!("{api}/comments"),
+                    "body": {"body": "Moved.\n\nRemaining work moved to cgwalters-forge/tracker#900."}}),
+                json!({"action": 1, "method": "PATCH", "url": api,
+                    "body": {"state": "closed", "state_reason": "completed"}}),
+            ]
+        );
+        let checked = EpicPlan::validate(&plan(with(all(), done)), &bounds(), &finished).unwrap();
+        assert_eq!(
+            checked.mutations(&finished)[4]["body"],
+            json!({"body": "Nothing is left."})
+        );
     }
 
     /// A slice stacks on a sub-issue the same plan closes, in either order:
