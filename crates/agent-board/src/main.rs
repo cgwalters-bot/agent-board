@@ -6,6 +6,7 @@ mod dispatch;
 mod epic;
 mod item;
 mod live;
+mod org_status;
 mod poll;
 mod supervise;
 
@@ -123,6 +124,8 @@ enum Command {
     Poll(poll::Poll),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
+    /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
+    Status(org_status::Status),
     /// Create the per-role GitHub Apps (docs/apps.md).
     Apps {
         #[command(subcommand)]
@@ -825,6 +828,48 @@ fn execute(cli: Cli) -> Result<()> {
             );
             supervise::run(args)
         }
+        Command::Status(args) => {
+            ensure!(
+                cli.repo.is_none() && cli.snapshot.is_none(),
+                "status reads live: --owner, --config and optionally --project"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            let owner = cli.owner.as_deref().context("status requires --owner")?;
+            let settings = org_status::settings(args, owner)?;
+            for field in cli.json.iter().flat_map(|f| f.split(',')) {
+                ensure!(
+                    board_forge::org_status::FIELDS.contains(&field),
+                    "unknown JSON field: {field}; available fields: {}",
+                    board_forge::org_status::FIELDS.join(",")
+                );
+                ensure!(
+                    field != "board" || cli.project.is_some(),
+                    "--json board needs --project"
+                );
+                ensure!(
+                    field != "pools" || settings.pace.is_some(),
+                    "--json pools needs the config's pace"
+                );
+            }
+            // Refused before any read, as every other section needs the token too.
+            let client = board_forge::github::Client::from_env()?;
+            let board = cli.project.map(|_| load(&cli));
+            let report = org_status::report(&client, &settings, board);
+            let complete = board_forge::org_status::complete(&report);
+            if cli.json.is_some() {
+                render(report, &cli)?;
+            } else {
+                io::stdout()
+                    .lock()
+                    .write_all(board_forge::org_status::text(&report).as_bytes())?;
+            }
+            // The report is printed whole; a section that could not be read fails the command.
+            ensure!(complete, "status: not every section could be read");
+            Ok(())
+        }
         Command::Apps {
             command: Apps::Create(args),
         } => {
@@ -1034,40 +1079,41 @@ fn select(value: &Value, fields: &[&str]) -> Result<Value> {
 
 fn render(mut value: Value, cli: &Cli) -> Result<()> {
     if let Some(fields) = &cli.json {
-        let available: &[&str] =
-            if matches!(cli.command, Command::Item { .. } | Command::Ask { .. }) {
-                &[
-                    "identity",
-                    "title",
-                    "state",
-                    "state_reason",
-                    "status",
-                    "priority",
-                    "turn",
-                    "fields_complete",
-                    "evidence",
-                    "number",
-                    "repository",
-                    "url",
-                    "content_kind",
-                    "assignment",
-                    "labels",
-                    "assignees",
-                    "timestamps",
-                    "fields",
-                ]
-            } else {
-                &[
-                    "schema",
-                    "project",
-                    "actions",
-                    "diagnostics",
-                    "clock",
-                    "coverage",
-                    "items",
-                    "fields",
-                ]
-            };
+        let available: &[&str] = if matches!(cli.command, Command::Status(_)) {
+            board_forge::org_status::FIELDS
+        } else if matches!(cli.command, Command::Item { .. } | Command::Ask { .. }) {
+            &[
+                "identity",
+                "title",
+                "state",
+                "state_reason",
+                "status",
+                "priority",
+                "turn",
+                "fields_complete",
+                "evidence",
+                "number",
+                "repository",
+                "url",
+                "content_kind",
+                "assignment",
+                "labels",
+                "assignees",
+                "timestamps",
+                "fields",
+            ]
+        } else {
+            &[
+                "schema",
+                "project",
+                "actions",
+                "diagnostics",
+                "clock",
+                "coverage",
+                "items",
+                "fields",
+            ]
+        };
         for field in fields.split(',') {
             ensure!(
                 available.contains(&field),

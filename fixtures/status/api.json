@@ -1,0 +1,71 @@
+{
+  "/orgs/example/repos?type=all&sort=full_name&per_page=100&page=1": [
+    {"full_name": "example/code", "archived": false, "disabled": false},
+    {"full_name": "example/control", "archived": false, "disabled": false},
+    {"full_name": "example/old", "archived": true, "disabled": false}
+  ],
+  "/repos/example/code/actions/runs?status=queued&per_page=100&page=1": {"total_count": 1, "workflow_runs": [
+    {"id": 11, "path": ".github/workflows/ci.yml", "display_title": "ci", "status": "queued"}
+  ]},
+  "/repos/example/code/actions/runs?status=in_progress&per_page=100&page=1": {"total_count": 1, "workflow_runs": [
+    {"id": 12, "path": ".github/workflows/ci.yml", "display_title": "ci", "status": "in_progress"}
+  ]},
+  "/repos/example/control/actions/runs?status=queued&per_page=100&page=1": {"total_count": 2, "workflow_runs": [
+    {"id": 21, "path": ".github/workflows/dispatch.yml", "display_title": "triage example/code#5 (claude)", "status": "queued"},
+    {"id": 22, "path": ".github/workflows/dispatch.yml", "display_title": "triage example/code#6 (claude)", "status": "queued"}
+  ]},
+  "/repos/example/control/actions/runs?status=in_progress&per_page=100&page=1": {"total_count": 2, "workflow_runs": [
+    {"id": 23, "path": ".github/workflows/dispatch.yml", "display_title": "implement example/code#3 (openai)", "status": "in_progress"},
+    {"id": 24, "path": ".github/workflows/poll.yml", "display_title": "poll", "status": "in_progress"}
+  ]},
+  "/repos/example/code/actions/runs/11/jobs?per_page=100&page=1": {"total_count": 1, "jobs": [
+    {"status": "queued", "labels": ["ubuntu-26.04"], "created_at": "2026-10-22T11:57:00Z", "html_url": "https://github.com/example/code/actions/runs/11/job/111"}
+  ]},
+  "/repos/example/code/actions/runs/12/jobs?per_page=100&page=1": {"total_count": 2, "jobs": [
+    {"status": "in_progress", "labels": ["ubuntu-26.04"], "created_at": "2026-10-22T11:40:00Z", "html_url": "https://github.com/example/code/actions/runs/12/job/121"},
+    {"status": "completed", "labels": ["ubuntu-26.04"], "created_at": "2026-10-22T11:30:00Z", "html_url": "https://github.com/example/code/actions/runs/12/job/122"}
+  ]},
+  "/repos/example/control/actions/runs/21/jobs?per_page=100&page=1": {"total_count": 1, "jobs": [
+    {"status": "queued", "labels": ["ubuntu-26.04"], "created_at": "2026-10-22T11:46:00Z", "html_url": "https://github.com/example/control/actions/runs/21/job/211"}
+  ]},
+  "/repos/example/control/actions/runs/22/jobs?per_page=100&page=1": {"total_count": 1, "jobs": [
+    {"status": "queued", "labels": ["ubuntu-26.04"], "created_at": "2026-10-22T11:50:00Z", "html_url": "https://github.com/example/control/actions/runs/22/job/221"}
+  ]},
+  "/repos/example/control/actions/runs/23/jobs?per_page=100&page=1": {"total_count": 1, "jobs": [
+    {"status": "in_progress", "labels": ["ubuntu-26.04"], "created_at": "2026-10-22T11:20:00Z", "html_url": "https://github.com/example/control/actions/runs/23/job/231"}
+  ]},
+  "/repos/example/control/actions/runs/24/jobs?per_page=100&page=1": {"total_count": 1, "jobs": [
+    {"status": "in_progress", "labels": ["self-hosted", "linux"], "created_at": "2026-10-22T11:55:00Z", "html_url": "https://github.com/example/control/actions/runs/24/job/241"}
+  ]},
+  "/repos/example/control/actions/workflows/dispatch.yml/runs?status=queued&per_page=100&page=1": {"total_count": 2, "workflow_runs": [
+    {"id": 21, "display_title": "triage example/code#5 (claude)", "status": "queued"},
+    {"id": 22, "display_title": "triage example/code#6 (claude)", "status": "queued"}
+  ]},
+  "/repos/example/control/actions/workflows/dispatch.yml/runs?status=in_progress&per_page=100&page=1": {"total_count": 1, "workflow_runs": [
+    {"id": 23, "display_title": "implement example/code#3 (openai)", "status": "in_progress"}
+  ]},
+  "/repos/example/control/actions/workflows/dispatch.yml/runs?status=completed&created=%3E%3D2026-10-22T06%3A00%3A00.000Z&per_page=100&page=1": {"total_count": 4, "workflow_runs": [
+    {"id": 31, "display_title": "fix example/code#9", "conclusion": "success", "updated_at": "2026-10-22T11:30:00Z", "html_url": "https://github.com/example/control/actions/runs/31"},
+    {"id": 32, "display_title": "implement example/code#4 (claude)", "conclusion": "failure", "updated_at": "2026-10-22T11:10:00Z", "html_url": "https://github.com/example/control/actions/runs/32"},
+    {"id": 33, "display_title": "review example/code#8", "conclusion": "cancelled", "updated_at": "2026-10-22T11:50:00Z", "html_url": "https://github.com/example/control/actions/runs/33"},
+    {"id": 34, "display_title": "research example/code#2", "conclusion": "failure", "updated_at": "2026-10-22T10:00:00Z", "html_url": "https://github.com/example/control/actions/runs/34"}
+  ]},
+  "/repos/example/ops/issues/7/comments?per_page=100&page=1": [
+    {"user": {"login": "mallory"}, "body": "<!-- bot-usage v1 -->\n\n```json\n{\"schema\": \"bot-usage/v1\", \"updated_at\": \"2026-10-22T11:59:00Z\", \"pools\": {\"claude\": {\"used_percent\": 1, \"allowed_percent\": 99, \"burst\": 0, \"hold\": false}}}\n```\n"},
+    {"user": {"login": "usage-bot"}, "body": "<!-- bot-usage v1 -->\n\n```json\n{\"schema\": \"bot-usage/v1\", \"updated_at\": \"2026-10-22T11:50:00Z\", \"pools\": {\"claude\": {\"used_percent\": 26, \"allowed_percent\": 30, \"burst\": 0, \"hold\": false}, \"openai\": {\"used_percent\": 80, \"allowed_percent\": 40, \"burst\": 0, \"hold\": true, \"next_dispatch_at\": \"2026-10-23T00:00:00Z\"}}}\n```\n"}
+  ],
+  "graphql example/code": {"repository": {
+    "mergeQueue": {"entries": {"totalCount": 2, "nodes": [
+      {"position": 1, "state": "MERGEABLE", "pullRequest": {"number": 40, "url": "https://github.com/example/code/pull/40"}},
+      {"position": 2, "state": "AWAITING_CHECKS", "pullRequest": {"number": 41, "url": "https://github.com/example/code/pull/41"}}
+    ]}},
+    "pullRequests": {"totalCount": 6, "nodes": [
+      {"number": 40, "url": "https://github.com/example/code/pull/40", "isDraft": false, "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "isInMergeQueue": true, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}},
+      {"number": 42, "url": "https://github.com/example/code/pull/42", "isDraft": false, "reviewDecision": "APPROVED", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "isInMergeQueue": false, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}},
+      {"number": 43, "url": "https://github.com/example/code/pull/43", "isDraft": false, "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED", "isInMergeQueue": false, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "FAILURE"}}}]}},
+      {"number": 44, "url": "https://github.com/example/code/pull/44", "isDraft": false, "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "mergeStateStatus": "BEHIND", "isInMergeQueue": false, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}},
+      {"number": 45, "url": "https://github.com/example/code/pull/45", "isDraft": true, "reviewDecision": "APPROVED", "mergeable": "MERGEABLE", "mergeStateStatus": "DRAFT", "isInMergeQueue": false, "commits": {"nodes": []}},
+      {"number": 46, "url": "https://github.com/example/code/pull/46", "isDraft": false, "reviewDecision": "REVIEW_REQUIRED", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED", "isInMergeQueue": false, "commits": {"nodes": []}}
+    ]}
+  }}
+}

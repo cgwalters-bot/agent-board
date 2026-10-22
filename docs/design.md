@@ -683,6 +683,23 @@ an intermediate Triage proposal. No live reads or live terminal repair have
 been verified against GitHub. Recorded responses exercise the lifecycle and its
 failure cleanup without credentials.
 
+`agent-board status --owner ORG --config agent-board.json [--job-limit N]`
+reports how loaded the organization is (agent-board#262), read-only through the
+supervisor's bounded API (at most `REQUEST_LIMIT` requests and
+`TIMEOUT_SECONDS`, no write). Runner load is the queued and running jobs of
+every unarchived repository's queued and in-progress runs, by runner label
+(self-hosted as one), with the configured `dispatchRepo`'s `dispatchWorkflow`
+runs counted as agent runs apart from other CI, against `--job-limit`.
+Agent runs are counted by the kind and pool their titles name, with the last
+hour's outcomes; pools, where the config has `pace`, are the poll's pace line
+from the same usage snapshot; queues are each `follow` repository's merge queue
+and its approved pull requests not in it, among the newest hundred (marked
+partial past that); `--project` adds the board's Status counts and open P0
+items with no Run, Result or linked pull request, read by the board's own
+bounded snapshot. A section that cannot be read is shown as unavailable and the
+command exits 1. The requests grow with the load (one per active run), and are
+made one at a time.
+
 `agent-board supervise` is the controller's supervisor, moved from tracker's
 `.github/supervisor` (agent-board#112). `supervise health` reads the poll,
 probe, dispatch and scheduler runs, the followed repositories' pull requests,
