@@ -1,0 +1,22 @@
+[
+  {
+    "url": "https://github.com/example/tracker/issues/900#issuecomment-9001",
+    "body": "```review-draft\npr = \"ostreedev/ostree#3649\"\nhead = \"a0207f11818b46729249315399c87fe99d5e3f21\"\nevent = \"REQUEST_CHANGES\"   # COMMENT, REQUEST_CHANGES or APPROVE\n```\n\n## Review\n\nThe policy refresh can still block finalization when `semodule` hangs.\n\n## Comments\n\n### `src/libostree/ostree-sysroot-deploy.c:3415`\n\n*Important*: this waits without a timeout.\n\n```c\nwaitpid (pid, &status, 0);\n```\n\n### `src/libostree/ostree-repo-finder-mount.c:342`\n\n(low) Unrelated reformatting.\n\nGenerated-by: https://github.com/cgwalters/#llms\n",
+    "createdAt": "2026-10-21T10:00:00Z",
+    "lastEditedAt": null,
+    "author": {
+      "login": "example-bot"
+    },
+    "editor": null
+  },
+  {
+    "url": "https://github.com/example/tracker/issues/900#issuecomment-9002",
+    "body": "/send\n",
+    "createdAt": "2026-10-21T10:30:00Z",
+    "lastEditedAt": null,
+    "author": {
+      "login": "operator"
+    },
+    "editor": null
+  }
+]

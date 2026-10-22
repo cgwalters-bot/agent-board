@@ -104,7 +104,7 @@ pub fn scopes(value: Option<&Value>) -> Result<Vec<String>> {
 /// Whether the search's `repo` is in a scope. GitHub's owner and repository
 /// names, and so its `user:`/`repo:` qualifiers, are case-insensitive: a hit
 /// in `Upstream/app` for `upstream/*` is the operator's scope.
-pub(super) fn in_scope(scopes: &[String], repo: &str) -> bool {
+pub(crate) fn in_scope(scopes: &[String], repo: &str) -> bool {
     let owner = repo.split_once('/').map_or("", |(owner, _)| owner);
     scopes.iter().any(|s| {
         s.eq_ignore_ascii_case(repo)

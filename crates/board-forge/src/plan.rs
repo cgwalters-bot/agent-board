@@ -327,7 +327,7 @@ pub(crate) fn newest_fenced<'a>(
     Ok(newest)
 }
 
-fn has_fence(body: &str, fence: &str) -> bool {
+pub(crate) fn has_fence(body: &str, fence: &str) -> bool {
     !fence_blocks(body, fence).is_empty()
 }
 
@@ -338,27 +338,39 @@ fn has_fence(body: &str, fence: &str) -> bool {
 /// shown as an example (in a ````markdown block) or hidden in `<!-- -->`
 /// is not one either.
 fn fence_blocks(body: &str, fence: &str) -> Vec<Option<String>> {
+    fence_spans(body, fence)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// [`fence_blocks`], each with the index of the line after it, where the
+/// text that follows a block (a review draft's sections) starts.
+pub(crate) fn fence_spans(body: &str, fence: &str) -> Vec<(Option<String>, usize)> {
     let open = format!("```{fence}");
     let mut blocks = Vec::new();
-    let mut lines = body.lines();
-    while let Some(line) = lines.next() {
+    let mut lines = body.lines().enumerate();
+    while let Some((_, line)) = lines.next() {
         if line.trim_end() == open {
             let mut text = String::new();
-            let mut closed = false;
-            for line in lines.by_ref() {
+            let mut closed = None;
+            for (i, line) in lines.by_ref() {
                 if line.trim_end() == "```" {
-                    closed = true;
+                    closed = Some(i + 1);
                     break;
                 }
                 text.push_str(line);
                 text.push('\n');
             }
-            blocks.push(closed.then_some(text));
+            blocks.push(match closed {
+                Some(end) => (Some(text), end),
+                None => (None, body.lines().count()),
+            });
         } else if let Some((mark, length)) = code_fence(line) {
             // CommonMark: it closes on a fence of the same character, at
             // least as long, with nothing after it; unclosed, it runs to
             // the end of the body.
-            for line in lines.by_ref() {
+            for (_, line) in lines.by_ref() {
                 if code_fence(line).is_some_and(|(m, l)| m == mark && l >= length)
                     && line.trim().trim_start_matches(mark).is_empty()
                 {
@@ -373,7 +385,7 @@ fn fence_blocks(body: &str, fence: &str) -> Vec<Option<String>> {
             // An HTML comment block, which opens a line, runs to its `-->`;
             // a `<!--` later in a line is inline and ends with its paragraph,
             // which a fence interrupts, so it hides no plan.
-            for line in lines.by_ref() {
+            for (_, line) in lines.by_ref() {
                 if line.contains("-->") {
                     break;
                 }
@@ -386,7 +398,7 @@ fn fence_blocks(body: &str, fence: &str) -> Vec<Option<String>> {
 /// A line that opens or closes a fenced code block: its character and how
 /// many, after at most three spaces of indentation. A backtick fence's info
 /// string has no backticks, so a line of inline code is not one.
-fn code_fence(line: &str) -> Option<(char, usize)> {
+pub(crate) fn code_fence(line: &str) -> Option<(char, usize)> {
     let rest = line.trim_start_matches(' ');
     if line.len() - rest.len() > 3 {
         return None;
@@ -413,7 +425,8 @@ fn login(node: &Value, key: &str) -> Option<String> {
     node[key]["login"].as_str().map(str::to_owned)
 }
 
-fn comment(node: &Value) -> Result<Comment> {
+/// An issue comment node, or an issue's own node: both have these fields.
+pub(crate) fn comment(node: &Value) -> Result<Comment> {
     let field = |key: &str| {
         node[key]
             .as_str()
@@ -487,7 +500,7 @@ pub fn plan_id(comment: &Comment) -> Result<String> {
     Ok(format!("{id}@{}", comment.changed.format(&Rfc3339)?))
 }
 
-fn comment_id(url: &str) -> Option<u64> {
+pub(crate) fn comment_id(url: &str) -> Option<u64> {
     url.rsplit_once("#issuecomment-")?.1.parse().ok()
 }
 

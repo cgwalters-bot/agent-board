@@ -16,6 +16,7 @@ pub mod org_status;
 pub mod overlap;
 pub mod plan;
 pub mod poll;
+pub mod review;
 pub mod runs;
 pub mod stack;
 pub mod status;
