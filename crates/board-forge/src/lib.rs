@@ -96,7 +96,12 @@ impl OutputBackend for GitHubSafeOutputs {
                 ensure!(item.host == "github.com", "item host mismatch");
                 item.validate()?;
                 ensure!(item.repository.split('/').count() == 2, "invalid GitHub repository");
-                Ok(json!({"type":"close_issue", "target_repo":item.repository, "issue_number":item.number}))
+                // agentic-job's close_issue (docs/safe-outputs.md, "Closing issues")
+                // takes `repo`, not update_project's `target_repo`, and requires a
+                // body so watchers learn why. No state_reason: plans carry none, and
+                // the handler defaults to completed.
+                let body = format!("Closed by agent-board's reconcile rule `{}`.", action.reason);
+                Ok(json!({"type":"close_issue", "repo":item.repository, "issue_number":item.number, "body":body}))
             }
             Intent::SetStatus { item, value } => {
                 ensure!(item.host == "github.com", "item host mismatch");
@@ -217,6 +222,32 @@ mod tests {
             vec![
                 json!({"type":"update_project","project":snapshot.project,"content_type":"issue","content_number":1,"target_repo":"example/intake","fields":{"Status":"Triage"}})
             ]
+        );
+    }
+
+    #[test]
+    fn close_issue_matches_agentic_job() {
+        let snapshot: Snapshot =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        let item = snapshot.items[0].identity.clone();
+        let plan = Plan {
+            schema: board_core::PLAN_SCHEMA.into(),
+            project: snapshot.project.clone(),
+            actions: vec![board_core::Action {
+                key: "k".into(),
+                reason: "accepted_completion".into(),
+                intent: Intent::CloseIssue { item },
+                prerequisites: vec![],
+                evidence: vec![],
+            }],
+            diagnostics: Default::default(),
+        };
+        assert_eq!(
+            GitHubSafeOutputs.lower(&plan).unwrap(),
+            vec![json!({
+                "type":"close_issue", "repo":"example/intake", "issue_number":1,
+                "body":"Closed by agent-board's reconcile rule `accepted_completion`."
+            })]
         );
     }
 

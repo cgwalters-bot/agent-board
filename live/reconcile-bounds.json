@@ -1,6 +1,0 @@
-{
-  "project": "https://github.com/orgs/cgwalters-forge-stage/projects/2",
-  "repositories": ["cgwalters-forge-stage/board-test"],
-  "max_outputs": 5,
-  "outputs": {"update_project": 3, "close_issue": 2}
-}

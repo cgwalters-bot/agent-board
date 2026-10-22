@@ -31,7 +31,8 @@ class ReviewContracts(unittest.TestCase):
     def test_third_party_uses_are_hash_pinned(self):
         # Covers step-level and job-level (reusable workflow) uses:, which
         # zizmor's unpinned-uses does not. agentic-job is referenced by release
-        # tag; other cgwalters-forge references follow main
+        # tag, except reconcile.yml's call, which receives SAFE_OUTPUTS_PAT and
+        # is pinned by commit; other cgwalters-forge references follow main
         # (cgwalters-forge/tracker#544), except the review wrapper, which holds
         # review.yml's write grants, and secure-host, which runs as root before
         # the job is hardened and which `agentic-job workflows check` admits
@@ -45,7 +46,9 @@ class ReviewContracts(unittest.TestCase):
                     if ref.startswith("./"):
                         continue
                     target, _, pin = ref.partition("@")
-                    if re.match(r"cgwalters-forge/agentic-job(/|\Z)", target):
+                    if path.name == "reconcile.yml" and target == "cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml":
+                        self.assertRegex(pin, r"\A[0-9a-f]{40}\Z")
+                    elif re.match(r"cgwalters-forge/agentic-job(/|\Z)", target):
                         self.assertRegex(pin, r"\Av\d+\.\d+\.\d+\Z")
                     elif target in (
                         "cgwalters-forge/actions/.github/workflows/cgwalters-review.yml",

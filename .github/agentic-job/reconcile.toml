@@ -1,0 +1,21 @@
+# Bounds for reconcile.yml's apply job: agent-board's deterministic repairs
+# (`reconcile plan --emit`) on the staging board, checked and applied by
+# agentic-job (docs/safe-outputs.md). Never name cgwalters-forge's own board.
+hosts = ["github.com"]
+repos = ["cgwalters-forge-stage/board-test"]
+bases = ["main"]
+# Below agent-board's own lowering cap of 10, so a burst of drift is refused
+# whole rather than applied: someone should look first.
+max_outputs = 5
+# No patch output is allowed; these only satisfy the format.
+max_patch_bytes = 1024
+max_patch_files = 1
+
+[outputs]
+close_issue = { max = 2 }
+
+[outputs.update_project]
+max = 3
+projects = ["https://github.com/orgs/cgwalters-forge-stage/projects/2"]
+# The rules only ever set Status.
+fields = ["Status"]
