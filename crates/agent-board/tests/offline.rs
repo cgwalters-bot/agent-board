@@ -1322,6 +1322,88 @@ fn live_reads_require_authentication() {
 }
 
 #[test]
+fn status_cli_refusals() {
+    let dir = std::env::temp_dir().join(format!("agent-board-status-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("agent-board.json");
+    let partial = dir.join("partial.json");
+    std::fs::write(
+        &config,
+        r#"{"operator": "owner", "bot": "worker", "dispatchRepo": "example/control",
+            "dispatchWorkflow": "dispatch.yml", "follow": ["example/code"]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &partial,
+        r#"{"operator": "owner", "bot": "worker", "dispatchRepo": "example/control", "follow": []}"#,
+    )
+    .unwrap();
+    let (config, partial) = (config.to_str().unwrap(), partial.to_str().unwrap());
+    for (args, code, message) in [
+        (vec!["--config", config], 1, "status requires --owner"),
+        (
+            vec!["--config", config, "--snapshot", &fixture()],
+            1,
+            "status reads live",
+        ),
+        (
+            vec!["--owner", "example", "--config", partial],
+            1,
+            "status needs dispatchWorkflow",
+        ),
+        (
+            vec!["--owner", "example", "--config", config, "--job-limit", "0"],
+            1,
+            "--job-limit is not 1 to",
+        ),
+        (
+            vec![
+                "--owner",
+                "example",
+                "--config",
+                config,
+                "--json",
+                "runners,items",
+            ],
+            1,
+            "unknown JSON field: items",
+        ),
+        (
+            vec!["--owner", "example", "--config", config, "--json", "board"],
+            1,
+            "--json board needs --project",
+        ),
+        (
+            vec!["--owner", "example", "--config", config, "--json", "pools"],
+            1,
+            "--json pools needs the config's pace",
+        ),
+        // Every check above precedes the token; without one nothing is read.
+        (
+            vec![
+                "--owner", "example", "--config", config, "--json", "runners",
+            ],
+            4,
+            "",
+        ),
+    ] {
+        let output = command()
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .arg("status")
+            .args(&args)
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(message), "{args:?}: {stderr}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn terminal_drift_preview_and_emit() {
     let fixture = format!(
         "{}/../../fixtures/terminal-drift.json",

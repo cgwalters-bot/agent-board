@@ -12,6 +12,7 @@ pub mod epic_apply;
 pub mod forgejo;
 pub mod github;
 pub mod input;
+pub mod org_status;
 pub mod overlap;
 pub mod plan;
 pub mod poll;
