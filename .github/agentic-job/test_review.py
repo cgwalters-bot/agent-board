@@ -133,8 +133,10 @@ class ReviewContracts(unittest.TestCase):
         # (agentic-job docs/workflows-check.md, "Deploy-only Pages jobs"),
         # which this repository does not yet run: the job holding the Pages
         # grant and the OIDC request token runs nothing of the repository,
-        # only the one admitted upstream commit of deploy-pages, and takes
-        # the artifact the hardened check job uploaded on a push to main.
+        # only one pinned upstream commit of deploy-pages, and takes the
+        # artifact the hardened check job uploaded on a push to main. The
+        # pin is v5.0.1; agentic-job's check must admit that commit (its
+        # DEPLOY_PAGES_COMMITS) before this repository can adopt the check.
         site = (ROOT / ".github/workflows/site.yml").read_text()
         self.assertIn("\npermissions:\n  contents: read\n\nconcurrency:\n", site)
         check, deploy = site.split("\n  check:\n", 1)[1].split("\n  deploy:\n", 1)
@@ -157,7 +159,7 @@ class ReviewContracts(unittest.TestCase):
         self.assertIn("permissions:\n      pages: write\n      id-token: write\n    environment: github-pages\n", deploy)
         self.assertEqual(
             deploy.split("steps:\n", 1)[1].strip(),
-            "- uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5",
+            "- uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1",
         )
         for forbidden in ("checkout", "run:", "env:", "with:", "secrets.", "container:", "services:"):
             with self.subTest(job="deploy", forbidden=forbidden):
