@@ -5,6 +5,7 @@
 //! task and a public job summary.
 use super::{Api, HOUR_MS, Limits, Release, Settings, encode, iso, millis, run_title, word_repo};
 use crate::plan::DISPATCH_MARKER;
+use crate::poll::author_login as login;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -423,16 +424,6 @@ const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: 
     }
   } }
 }"#;
-
-/// REST names an app `name[bot]`, GraphQL `name`.
-fn login(author: &Value) -> String {
-    let name = author["login"].as_str().unwrap_or_default();
-    if author["__typename"] == "Bot" {
-        format!("{name}[bot]")
-    } else {
-        name.to_owned()
-    }
-}
 
 /// The comments that are `who`'s, by agent-board's rule for plans: written
 /// by them and, if edited at all, last edited by them, as GitHub lets anyone
