@@ -1,13 +1,11 @@
-name: staging reconciliation preview
+name: staging reconciliation
 on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
-# No write permission or OIDC: this stops at the agentic-job integration seam.
-permissions:
-  contents: read
+permissions: {}
 concurrency:
-  group: staging-project-2-reconcile
+  group: staging-reconcile
   cancel-in-progress: false
 jobs:
   propose:
@@ -15,22 +13,31 @@ jobs:
     # Configure this environment to allow only the main branch (no tags).
     # Its read-only secret must not also exist as a repository/organization secret.
     environment: staging-project-read
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      proposals: ${{ steps.plan.outputs.proposals }}
     steps:
-      # Until the environment secret is provisioned, skip with a notice rather
-      # than failing every scheduled run; the failure list then shows real failures.
+      # Until the environment secret and the repository variables naming the
+      # board are provisioned, skip with a notice rather than failing every
+      # scheduled run; the failure list then shows real failures. The
+      # variables only select: the bounds file decides what apply may touch.
       - name: Check for the staging read token
         id: read-token
         run: |
-          if [ -n "$STAGING_PROJECT_READ_TOKEN" ]; then
+          if [ -n "$STAGING_PROJECT_READ_TOKEN" ] && [ -n "$OWNER" ] && [ -n "$PROJECT" ] && [ -n "$REPO" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::STAGING_PROJECT_READ_TOKEN is not set; skipping this staging reconciliation preview run."
+            echo "::notice::STAGING_PROJECT_READ_TOKEN or a RECONCILE_* variable is not set; skipping this staging reconciliation run."
           fi
         env:
           STAGING_PROJECT_READ_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}
+          OWNER: ${{ vars.RECONCILE_OWNER }}
+          PROJECT: ${{ vars.RECONCILE_PROJECT }}
+          REPO: ${{ vars.RECONCILE_REPO }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.read-token.outputs.present == 'true'
         with:
@@ -40,20 +47,66 @@ jobs:
         if: steps.read-token.outputs.present == 'true'
       - name: Read staging project
         if: steps.read-token.outputs.present == 'true'
-        run: ./target/release/agent-board snapshot create --owner cgwalters-forge-stage --project 2 > snapshot.json
+        run: ./target/release/agent-board snapshot create --owner "$OWNER" --project "$PROJECT" > snapshot.json
         env:
           GH_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}
+          OWNER: ${{ vars.RECONCILE_OWNER }}
+          PROJECT: ${{ vars.RECONCILE_PROJECT }}
+      # agentic-job reads outputs.jsonl, and nothing else, from the artifact.
+      # A board without drift, or an incomplete snapshot, yields no
+      # proposals; apply is then skipped rather than run on nothing.
       - name: Propose without a token
+        id: plan
         if: steps.read-token.outputs.present == 'true'
-        run: ./target/release/agent-board reconcile plan --snapshot snapshot.json --emit > proposals.jsonl
-      # Preview only. Never give this job the staging write token.
+        run: |
+          mkdir proposals
+          ./target/release/agent-board reconcile plan --snapshot snapshot.json --emit > proposals/outputs.jsonl
+          cat proposals/outputs.jsonl
+          if [ -s proposals/outputs.jsonl ]; then
+            echo "proposals=true" >> "$GITHUB_OUTPUT"
+          fi
+      # Never give this job the staging write token.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.read-token.outputs.present == 'true'
         with:
           name: staging-reconcile-proposals
-          path: |
-            snapshot.json
-            proposals.jsonl
-            live/reconcile-bounds.json
+          path: proposals/outputs.jsonl
           if-no-files-found: error
           retention-days: 7
+      # The facts each applied repair came from, kept beside it for audit.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.read-token.outputs.present == 'true'
+        with:
+          name: staging-reconcile-snapshot
+          path: snapshot.json
+          if-no-files-found: error
+          retention-days: 7
+  # agentic-job's check refuses the hand-back whole unless every proposal fits
+  # .github/agentic-job/reconcile.toml; only its apply job, in the
+  # staging-project-apply environment, receives SAFE_OUTPUTS_PAT. Limit that
+  # environment to main, and keep the PAT (organization Projects read and
+  # write, Issues write on the bounds' repository) there only: a repository or
+  # organization secret of the same name would otherwise be used.
+  apply:
+    needs: propose
+    if: needs.propose.outputs.proposals == 'true'
+    uses: cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml@db6f8e67b0855ba342c3f32a7083b4243a8ae995 # v0.6.3
+    # docs/workflow.md "Proposals from a non-agent job": GitHub validates the
+    # skipped agent and register jobs' grants too, so these reads and
+    # id-token stay although no agent runs and no OIDC token is requested.
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: read
+      id-token: write
+    secrets:
+      SAFE_OUTPUTS_PAT: ${{ secrets.SAFE_OUTPUTS_PAT }}
+    with:
+      id: reconcile
+      repo: ${{ vars.RECONCILE_REPO }}
+      allow: .github/agentic-job/reconcile.toml
+      outputs: update_project,close_issue
+      max-outputs: '5'
+      proposals-artifact: staging-reconcile-proposals
+      apply-environment: staging-project-apply
