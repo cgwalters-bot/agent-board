@@ -673,7 +673,7 @@ fn dispatches_since(api: &dyn Api, policy: &Policy, since: i64, action: &str) ->
             let body = c["body"].as_str().unwrap_or_default();
             // since= filters on updated_at; a dispatch counts from when it was recorded.
             if c["user"]["login"] != policy.settings.bot.as_str()
-                || !millis(&c["created_at"]).is_some_and(|at| at >= since)
+                || millis(&c["created_at"]).is_none_or(|at| at < since)
                 || !body.starts_with(LOG_START)
             {
                 continue;

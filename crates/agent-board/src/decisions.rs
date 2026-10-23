@@ -13,7 +13,7 @@ const HISTORY_LIMIT: usize = 100;
 #[derive(Args)]
 pub struct Settings {
     /// Caller-owned agent-board.json from a trusted default-branch checkout.
-    #[arg(long, default_value = "agent-board.json")]
+    #[arg(long, value_name = "FILE", default_value = "agent-board.json")]
     pub config: PathBuf,
 }
 

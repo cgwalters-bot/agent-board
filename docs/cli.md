@@ -63,7 +63,7 @@ Commands:
 Print the newest accepted proposal's typed mutations without writing
 
 ```text
-agent-board action check [OPTIONS] --config <CONFIG> <ISSUE>
+agent-board action check [OPTIONS] --config <FILE> <ISSUE>
 ```
 
 Arguments:
@@ -72,7 +72,7 @@ Arguments:
 
 Options:
 
-- `--config <CONFIG>`: Repository-owned configuration from a protected default-branch checkout
+- `--config <FILE>`: Repository-owned configuration from a protected default-branch checkout
 
 ## agent-board check
 
@@ -97,7 +97,7 @@ agent-board check proposals [OPTIONS] --as <IDENTITY>
 Options:
 
 - `--as <IDENTITY>`: Identity from the policy whose bounds the proposals must stay within
-- `--proposals <PROPOSALS>`: JSONL proposals file; reads stdin when omitted
+- `--proposals <FILE>`: JSONL proposals file; reads stdin when omitted
 
 ## agent-board project
 
@@ -139,8 +139,8 @@ agent-board project status-update [OPTIONS] --status <STATUS>
 
 Options:
 
-- `--status <STATUS>`: Overall project health: on-track, at-risk or off-track (possible values: `on-track`, `at-risk`, `off-track`)
-- `--body <BODY>`: Read the update body from a UTF-8 file; otherwise summarize since the last update
+- `--status <STATUS>`: Overall project health (possible values: `on-track`, `at-risk`, `off-track`)
+- `--body <FILE>`: Read the update body from a UTF-8 file; otherwise summarize since the last update
 
 ## agent-board item
 
@@ -170,7 +170,7 @@ Options:
 - `--status <STATUS>`: Filter by exact board status (for example "In Progress")
 - `--priority <PRIORITY>`: Filter by priority: P0 to P3
 - `--turn <TURN>`: Filter by whose turn it is (for example Coordinator)
-- `--state <STATE>`: Filter issue state: open, closed or all (default: `all`)
+- `--state <STATE>`: Filter by issue state (possible values: `open`, `closed`, `all`) (default: `all`)
 - `-L, --limit <LIMIT>`: Maximum number of items to display (default: `30`)
 
 ## agent-board item view
@@ -250,7 +250,7 @@ Arguments:
 
 Options:
 
-- `--config <CONFIG>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
+- `--config <FILE>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
 - `--context <CONTEXT>`: Background paragraph, without headings or fences
 - `--option <OPTIONS>`: Alternative answer (repeat 2 to 10 times)
 - `--recommend <RECOMMEND>`: Reason to recommend the first option (A)
@@ -268,7 +268,7 @@ agent-board ask read [OPTIONS]
 
 Options:
 
-- `--config <CONFIG>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
+- `--config <FILE>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
 
 ## agent-board ask create
 
@@ -319,7 +319,7 @@ Arguments:
 
 Options:
 
-- `--config <CONFIG>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
+- `--config <FILE>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
 - `--apply`: Comment, close and write to the live board with your token; without it, only print proposals
 
 ## agent-board run
@@ -402,7 +402,7 @@ Options:
 - `--planner <LOGIN>`: Login the planning run comments as, whose plans also count
 - `--batch <N>`: Add up to N small, ready sub-issues of the issue's epic, each with its own implement plan, to one run; 0 runs the issue alone. From the caller's configuration (default: `0`)
 - `--bot <LOGIN>`: Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration
-- `--collaborators-only`: Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository (#111). Off without it; from the caller's configuration
+- `--collaborators-only`: Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository. Off without it; from the caller's configuration
 - `--status-app-id <ID>`: With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration
 
 ## agent-board epic
@@ -416,14 +416,14 @@ agent-board epic [OPTIONS] <COMMAND>
 Commands:
 
 - [`plan`](#agent-board-epic-plan): Print the mutations the newest accepted epic plan on an epic would make (--dry-run only)
-- [`apply`](#agent-board-epic-apply): Apply the newest accepted epic plan once (dry run unless --apply)
+- [`apply`](#agent-board-epic-apply): Apply the newest accepted epic plan once (dry run is the default; --apply writes)
 
 ## agent-board epic plan
 
 Print the mutations the newest accepted epic plan on an epic would make (--dry-run only)
 
 ```text
-agent-board epic plan [OPTIONS] --operator <LOGIN> <ISSUE>
+agent-board epic plan [OPTIONS] --dry-run --operator <LOGIN> <ISSUE>
 ```
 
 Arguments:
@@ -440,10 +440,10 @@ Options:
 
 ## agent-board epic apply
 
-Apply the newest accepted epic plan once (dry run unless --apply)
+Apply the newest accepted epic plan once (dry run is the default; --apply writes)
 
 ```text
-agent-board epic apply [OPTIONS] --config <CONFIG> <ISSUE>
+agent-board epic apply [OPTIONS] --config <FILE> <ISSUE>
 ```
 
 Arguments:
@@ -452,12 +452,11 @@ Arguments:
 
 Options:
 
-- `--config <CONFIG>`: Trusted configuration file from a protected default-branch checkout
-- `--dry-run`: Print requests without writing (the default)
+- `--config <FILE>`: Trusted configuration file from a protected default-branch checkout
 - `--apply`: Write with the configured bot's token
-- `--expect-request <EXPECT_REQUEST>`: Refuse unless the newest trusted plan has this request identifier
-- `--expect-comment <EXPECT_COMMENT>`: Refuse unless the newest trusted plan is this comment
-- `--expect-updated-at <EXPECT_UPDATED_AT>`: Refuse unless the plan's last edit (or creation) is this RFC 3339 instant
+- `--expect-request <ID>`: Refuse unless the newest trusted plan has this request identifier
+- `--expect-comment <ID>`: Refuse unless the newest trusted plan is this comment
+- `--expect-updated-at <RFC3339>`: Refuse unless the plan's last edit (or creation) is this RFC 3339 instant
 
 ## agent-board review
 
@@ -476,7 +475,7 @@ Commands:
 Post the newest review draft on an issue once the operator approves it (dry run unless --apply)
 
 ```text
-agent-board review send [OPTIONS] --config <CONFIG> <ISSUE>
+agent-board review send [OPTIONS] --config <FILE> <ISSUE>
 ```
 
 Arguments:
@@ -485,7 +484,7 @@ Arguments:
 
 Options:
 
-- `--config <CONFIG>`: Trusted agent-board.json from a protected default-branch checkout: operator, bot and review
+- `--config <FILE>`: Trusted agent-board.json from a protected default-branch checkout: operator, bot and review
 - `--dry-run`: Print the requests without writing (the default)
 - `--apply`: Send with the configured bot's token
 - `--approved-by-edit <EVENT>`: The operator's approval is their ticking the body's checkbox, not a /send comment: the `issues: edited` event payload of that edit, such as $GITHUB_EVENT_PATH, which binds the send to the body it left
@@ -533,7 +532,7 @@ agent-board reconcile plan [OPTIONS]
 Options:
 
 - `--emit`: Write safe-output proposals as JSONL, not authorized mutations
-- `--config <CONFIG>`: Trusted default-branch agent-board.json; statusReconcile is off by default
+- `--config <FILE>`: Trusted default-branch agent-board.json; statusReconcile is off by default
 
 ## agent-board poll
 
@@ -552,9 +551,9 @@ Options:
 - `--state <FILE>`: Poll state file (cached responses, the events pages last read, the idle interval); created if missing. Keep it where only the poll writes it: its bodies are trusted
 - `--follow <OWNER/REPO>`: Repository whose open pull requests by --bot get a step; its activity is read too. Repeatable
 - `--watch <OWNER/REPO>`: Repository whose activity is read, besides those on the board given by --owner/--project or --snapshot. Repeatable
-- `--operator <LOGIN>`: Login whose activity is direction and whose review of a head counts (default: `""`)
-- `--bot <LOGIN>`: Login whose pull requests are followed and whose activity is state (default: `""`)
-- `--dispatch-repo <OWNER/REPO>`: Repository whose dispatch runs the fix markers name (default: `""`)
+- `--operator <LOGIN>`: Login whose activity is direction and whose review of a head counts
+- `--bot <LOGIN>`: Login whose pull requests are followed and whose activity is state
+- `--dispatch-repo <OWNER/REPO>`: Repository whose dispatch runs the fix markers name
 - `--dispatch-workflow <FILE>`: Workflow file in --dispatch-repo that --apply starts fix runs with
 - `--review-workflow <FILE>`: Workflow file of the review job in each --follow repository. Its reviews of a head count as the verdict only with this, and only from a run of it on pull_request_target for that head of a --bot dispatch pull request from its fork into a public repository; without it only --operator's count
 - `--fix-pool <POOL>`: The workflow's `pool` input for each fix round in turn. Repeatable; none leaves its default
@@ -651,7 +650,7 @@ agent-board status [OPTIONS] --config <FILE>
 Options:
 
 - `--config <FILE>`: Repository-owned agent-board.json from a trusted default-branch checkout: the dispatch repository and workflow whose runs are agent runs, the followed repositories whose queues are shown, and `pace`, where the usage snapshot is
-- `--job-limit <N>`: The plan's concurrent hosted-job limit that running jobs are shown against (60 standard Linux jobs on Team)
+- `--job-limit <N>`: Concurrent hosted-job limit to compare running jobs against
 
 ## agent-board release-train
 

@@ -12,7 +12,7 @@ pub struct Check {
     /// Issue holding the proposal: URL, OWNER/REPO#N, or N with --repo.
     issue: String,
     /// Repository-owned configuration from a protected default-branch checkout.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     config: PathBuf,
 }
 

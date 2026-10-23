@@ -10,7 +10,7 @@ pub struct Status {
     /// Repository-owned agent-board.json from a trusted default-branch checkout: the dispatch repository and workflow whose runs are agent runs, the followed repositories whose queues are shown, and `pace`, where the usage snapshot is.
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
-    /// The plan's concurrent hosted-job limit that running jobs are shown against (60 standard Linux jobs on Team).
+    /// Concurrent hosted-job limit to compare running jobs against.
     #[arg(long, value_name = "N")]
     job_limit: Option<u64>,
 }

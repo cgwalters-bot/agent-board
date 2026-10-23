@@ -27,29 +27,14 @@ pub struct Poll {
     #[arg(long, value_name = "OWNER/REPO")]
     pub watch: Vec<String>,
     /// Login whose activity is direction and whose review of a head counts.
-    #[arg(
-        long,
-        value_name = "LOGIN",
-        required_unless_present = "config",
-        default_value = ""
-    )]
-    pub operator: String,
+    #[arg(long, value_name = "LOGIN", required_unless_present = "config")]
+    pub operator: Option<String>,
     /// Login whose pull requests are followed and whose activity is state.
-    #[arg(
-        long,
-        value_name = "LOGIN",
-        required_unless_present = "config",
-        default_value = ""
-    )]
-    pub bot: String,
+    #[arg(long, value_name = "LOGIN", required_unless_present = "config")]
+    pub bot: Option<String>,
     /// Repository whose dispatch runs the fix markers name.
-    #[arg(
-        long,
-        value_name = "OWNER/REPO",
-        required_unless_present = "config",
-        default_value = ""
-    )]
-    pub dispatch_repo: String,
+    #[arg(long, value_name = "OWNER/REPO", required_unless_present = "config")]
+    pub dispatch_repo: Option<String>,
     /// Workflow file in --dispatch-repo that --apply starts fix runs with.
     #[arg(long, value_name = "FILE")]
     pub dispatch_workflow: Option<String>,
@@ -76,10 +61,12 @@ fn configured(
             ("bot", &mut effective.bot),
             ("dispatchRepo", &mut effective.dispatch_repo),
         ] {
-            *target = value[key]
-                .as_str()
-                .with_context(|| format!("config missing {key}"))?
-                .to_owned();
+            *target = Some(
+                value[key]
+                    .as_str()
+                    .with_context(|| format!("config missing {key}"))?
+                    .to_owned(),
+            );
         }
         effective.follow =
             serde_json::from_value(value["follow"].clone()).context("config follow")?;
@@ -148,9 +135,15 @@ pub fn run(
         _ => State::default(),
     };
     let config = poll::Config {
-        operator: args.operator.clone(),
-        bot: args.bot.clone(),
-        dispatch_repo: args.dispatch_repo.clone(),
+        operator: args
+            .operator
+            .clone()
+            .context("missing --operator or config operator")?,
+        bot: args.bot.clone().context("missing --bot or config bot")?,
+        dispatch_repo: args
+            .dispatch_repo
+            .clone()
+            .context("missing --dispatch-repo or config dispatchRepo")?,
         review_workflow: args.review_workflow.clone(),
         policy,
     };
@@ -171,7 +164,7 @@ pub fn run(
         &client,
         snapshot.as_ref(),
         value.as_ref(),
-        &args.operator,
+        &config.operator,
         &mut std::io::stderr().lock(),
     );
     let dispatcher = board_forge::github::Client::from_var("DISPATCH_TOKEN");
@@ -408,9 +401,9 @@ mod tests {
         .unwrap();
         let base = json!({"operator": "owner", "bot": "worker", "dispatchRepo": "o/tracker", "follow": ["o/repo"]});
         let (cfg, policy) = configured(&args, Some(&base), None, now).unwrap();
-        assert_eq!(cfg.operator, "owner");
-        assert_eq!(cfg.bot, "worker");
-        assert_eq!(cfg.dispatch_repo, "o/tracker");
+        assert_eq!(cfg.operator.as_deref(), Some("owner"));
+        assert_eq!(cfg.bot.as_deref(), Some("worker"));
+        assert_eq!(cfg.dispatch_repo.as_deref(), Some("o/tracker"));
         assert_eq!(cfg.follow, ["o/repo"]);
         // Optional legacy flags remain usable when the file has no setting.
         assert_eq!(cfg.fix_pool, ["large"]);

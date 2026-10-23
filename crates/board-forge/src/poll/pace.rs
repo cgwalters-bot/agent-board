@@ -339,7 +339,7 @@ pub fn paces(
 ) -> Paces {
     let snapshot = snapshot.ok_or("there is no usage snapshot")?;
     let fresh = (now.unix_timestamp_nanos() / 1_000_000) as i64 - USAGE_STALE_SECONDS * 1000;
-    if !millis(&snapshot["updated_at"]).is_some_and(|at| at >= fresh) {
+    if millis(&snapshot["updated_at"]).is_none_or(|at| at < fresh) {
         return Err("the usage snapshot is not fresh".into());
     }
     let pools = snapshot["pools"]

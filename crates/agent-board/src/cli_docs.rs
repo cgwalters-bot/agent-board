@@ -165,3 +165,86 @@ fn signature(arg: &Arg) -> String {
 fn anchor(heading: &str) -> String {
     heading.to_lowercase().replace(' ', "-")
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn tidy_option_contracts() {
+        let reference = super::markdown(crate::Cli::command());
+        for signature in [
+            "--expect-request <ID>",
+            "--expect-comment <ID>",
+            "--expect-updated-at <RFC3339>",
+            "--proposals <FILE>",
+            "--body <FILE>",
+        ] {
+            assert!(reference.contains(signature), "{signature}");
+        }
+        assert!(!reference.contains("default: `\"\"`"));
+        assert!(!reference.contains("--config <CONFIG>"));
+        for state in ["open", "closed", "all", "typo"] {
+            assert_eq!(
+                crate::Cli::try_parse_from(["agent-board", "item", "list", "--state", state])
+                    .is_ok(),
+                state != "typo"
+            );
+        }
+        assert!(
+            crate::Cli::try_parse_from([
+                "agent-board",
+                "epic",
+                "plan",
+                "o/r#1",
+                "--operator",
+                "owner"
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "agent-board",
+                "epic",
+                "plan",
+                "o/r#1",
+                "--operator",
+                "owner",
+                "--dry-run"
+            ])
+            .is_ok()
+        );
+        let cli =
+            crate::Cli::try_parse_from(["agent-board", "poll", "--config", "unused"]).unwrap();
+        let crate::Command::Poll(args) = cli.command else {
+            panic!("expected poll")
+        };
+        assert!(args.operator.is_none());
+        assert!(args.bot.is_none());
+        assert!(args.dispatch_repo.is_none());
+        assert!(crate::Cli::try_parse_from(["agent-board", "poll"]).is_err());
+        assert!(
+            crate::Cli::try_parse_from([
+                "agent-board",
+                "epic",
+                "apply",
+                "o/r#1",
+                "--config",
+                "unused"
+            ])
+            .is_ok()
+        );
+        assert!(
+            crate::Cli::try_parse_from([
+                "agent-board",
+                "epic",
+                "apply",
+                "o/r#1",
+                "--config",
+                "unused",
+                "--dry-run"
+            ])
+            .is_err()
+        );
+    }
+}

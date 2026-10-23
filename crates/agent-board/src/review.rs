@@ -12,7 +12,7 @@ pub struct Send {
     /// Draft issue URL, OWNER/REPO#N, or N with --repo.
     issue: String,
     /// Trusted agent-board.json from a protected default-branch checkout: operator, bot and review.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     config: std::path::PathBuf,
     /// Print the requests without writing (the default).
     #[arg(long, conflicts_with = "apply")]
