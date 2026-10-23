@@ -459,24 +459,19 @@ mod tests {
                     "fields",
                     json!([{"id":"F_created","name":"Fixture nonce","dataType":"TEXT"},{"id":"F_status","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"todo","name":"Todo"},{"id":"done","name":"Done"}]}]),
                 )
-            } else if query.contains("items(first") {
+            } else {
+                assert!(query.contains("items(first"), "unexpected read: {query}");
+                // A snapshot page holds each item's values, labels and assignees.
+                let values = if kept {
+                    json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}])
+                } else {
+                    json!([{"__typename":"ProjectV2ItemFieldTextValue","text":"nonce","field":{"name":"Fixture nonce"}}])
+                };
+                let last = |nodes: Value| json!({"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}});
                 (
                     "items",
-                    json!([{"id":"M_created","content":{"__typename":"Issue","id":"I_created","number":1,"title":"nonce","state":"OPEN","createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"repository":{"nameWithOwner":"cgwalters-forge-stage/board-test"}}}]),
+                    json!([{"id":"M_created","fieldValues":last(values),"content":{"__typename":"Issue","id":"I_created","number":1,"title":"nonce","state":"OPEN","createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"repository":{"nameWithOwner":"cgwalters-forge-stage/board-test"},"labels":last(json!([])),"assignees":last(json!([]))}}]),
                 )
-            } else if query.contains("fieldValues(first") {
-                (
-                    "fieldValues",
-                    if kept {
-                        json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}])
-                    } else {
-                        json!([{"__typename":"ProjectV2ItemFieldTextValue","text":"nonce","field":{"name":"Fixture nonce"}}])
-                    },
-                )
-            } else if query.contains("labels(first") {
-                ("labels", json!([]))
-            } else {
-                ("assignees", json!([]))
             };
             Ok(
                 json!({"node":{key:{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
@@ -499,9 +494,9 @@ mod tests {
                     "nonce",
                     kept,
                 );
-                // Kept: project read, scope, issue, schema (2), lookup, add, set, snapshot (6),
+                // Kept: project read, scope, issue, schema (2), lookup, add, set, snapshot (3),
                 // remove, close. Throwaway: scope, project, issue, field, then as kept, delete.
-                let (total, add) = if kept.is_some() { (16, 7) } else { (18, 8) };
+                let (total, add) = if kept.is_some() { (13, 7) } else { (15, 8) };
                 assert_eq!(
                     result.is_ok(),
                     fail == 0 || fail > total,

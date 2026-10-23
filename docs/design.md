@@ -165,10 +165,14 @@ repository's `reconcile.yml` hands `reconcile plan --emit` to agentic-job's
 independent check and apply for a staging board.
 It does not complete step 1's scheduled sweeper.
 
+The reader reads each page of 100 board items with their field values, labels and
+assignees inline, so a board costs a request per page; only an item with more than
+a page holds is read again by itself.
 Label, user, linked-PR and reviewer field values are not GraphQL nodes. The reader
-fetches their nested connections inline (at most 100 entries each); additional
-pages or redacted/missing connection data mark the item and snapshot incomplete,
-blocking reconciliation rather than treating a partial list as complete.
+fetches their nested connections inline (10 entries in a page, and at most 100 in
+an item's own read); additional pages or redacted/missing connection data mark the
+item and snapshot incomplete, blocking reconciliation rather than treating a
+partial list as complete.
 
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done

@@ -1315,9 +1315,14 @@ fn live_reads_require_authentication() {
             .assert()
             .code(4)
             .get_output()
-            .stderr
             .clone();
-        assert!(String::from_utf8(output).unwrap().contains("read:project"));
+        // A failed read prints no partial listing, only the error.
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("read:project")
+        );
     }
 }
 

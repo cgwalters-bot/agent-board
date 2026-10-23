@@ -229,6 +229,13 @@ fn operation(query: &str) -> (&str, &str, bool) {
             "organization Projects write",
             false,
         ),
+        // Before fieldValues: a snapshot page reads both, and is a membership read.
+        (
+            "items(first",
+            "reading membership in project",
+            "organization Projects read",
+            false,
+        ),
         (
             "fieldValues(first",
             "reading item field values in project",
@@ -238,12 +245,6 @@ fn operation(query: &str) -> (&str, &str, bool) {
         (
             "fields(first",
             "reading field schema in project",
-            "organization Projects read",
-            false,
-        ),
-        (
-            "items(first",
-            "reading membership in project",
             "organization Projects read",
             false,
         ),
@@ -370,6 +371,76 @@ impl<T: Transport> Transport for DiagnosticTransport<'_, T> {
 // Shared across every connection and per-item read in one snapshot. Exhaustion
 // returns an error, never a partial snapshot that could yield proposals.
 const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
+
+// A snapshot page reads each item's field values, labels and assignees inline,
+// so a board costs a request per page rather than three per item (#276).
+// GitHub refuses a query that could return more than 500,000 nodes, counting
+// every nested `first`: with 100 values nested in each field value, a page
+// of 100 items asks for 509,100. Nesting 10 asks for 59,100 (a cost of 53
+// points per page, measured on a 28-field board), and the rare item that
+// has more is read again by itself, below, with the full page sizes.
+const ITEM_PAGE: usize = 100;
+/// Values per item read inline: a value per field set, so more than a board's
+/// usual field count (GitHub's default fields included).
+const VALUE_PAGE: usize = 50;
+/// Users, labels, pull requests or reviewers in a field value, read inline.
+const NESTED_VALUE_PAGE: usize = 10;
+/// The content's labels and assignees, read inline.
+const FACT_PAGE: usize = 20;
+// GitHub's count for a page, as measured: the items, their labels and
+// assignees, their values, and the entries nested in each value.
+const _: () =
+    assert!(ITEM_PAGE * (1 + 2 * FACT_PAGE + VALUE_PAGE * (1 + NESTED_VALUE_PAGE)) < 500_000);
+/// The page size of every per-item follow-up read.
+const FOLLOW_UP_PAGE: usize = 100;
+/// Field values that hold a connection, which have no node ID of their own.
+const NESTED_VALUES: [(&str, &str); 4] = [
+    ("ProjectV2ItemFieldLabelValue", "labels"),
+    ("ProjectV2ItemFieldUserValue", "users"),
+    ("ProjectV2ItemFieldPullRequestValue", "pullRequests"),
+    ("ProjectV2ItemFieldReviewerValue", "reviewers"),
+];
+/// The content's connections, with the field each node is read for.
+const CONTENT_FACTS: [(&str, &str); 2] = [("labels", "name"), ("assignees", "login")];
+
+/// The selection of an item's field values, nesting `nested` values in each.
+fn field_values_selection(page: usize, nested: usize, after: &str) -> String {
+    format!(
+        "fieldValues(first:{page}{after}){{nodes{{__typename ... on ProjectV2ItemFieldSingleSelectValue{{name optionId field{{... on ProjectV2SingleSelectField{{name}}}}}} ... on ProjectV2ItemFieldTextValue{{text field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldNumberValue{{number field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldDateValue{{date field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldIterationValue{{title iterationId field{{... on ProjectV2IterationField{{name}}}}}} ... on ProjectV2ItemFieldRepositoryValue{{repository{{id nameWithOwner}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldMilestoneValue{{milestone{{id title state dueOn}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldLabelValue{{labels(first:{nested}){{nodes{{id name}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldUserValue{{users(first:{nested}){{nodes{{id login}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldPullRequestValue{{pullRequests(first:{nested}){{nodes{{id number url title state}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldReviewerValue{{reviewers(first:{nested}){{nodes{{__typename ... on User{{id login}} ... on Team{{id name}}}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}}}} pageInfo{{hasNextPage endCursor}}}}"
+    )
+}
+
+/// The selection of one of the content's [`CONTENT_FACTS`].
+fn content_fact_selection(field: &str, selection: &str, page: usize, after: &str) -> String {
+    format!(
+        "{field}(first:{page}{after}){{nodes{{{selection}}} pageInfo{{hasNextPage endCursor}}}}"
+    )
+}
+
+/// One page of the board's items with everything the snapshot reads of each.
+fn snapshot_items_query() -> String {
+    let facts = CONTENT_FACTS
+        .map(|(field, selection)| content_fact_selection(field, selection, FACT_PAGE, ""))
+        .join(" ");
+    let values = field_values_selection(VALUE_PAGE, NESTED_VALUE_PAGE, "");
+    format!(
+        "query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2{{items(first:{ITEM_PAGE},after:$cursor){{nodes{{id content{{__typename ... on Issue{{id number title state stateReason createdAt updatedAt closedAt repository{{nameWithOwner}} {facts}}} ... on PullRequest{{id number title state createdAt updatedAt closedAt mergedAt repository{{nameWithOwner}} {facts}}}}} {values}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
+    )
+}
+
+/// All of one item's field values, for an item the page did not hold whole.
+fn item_field_values_query() -> String {
+    let values = field_values_selection(FOLLOW_UP_PAGE, FOLLOW_UP_PAGE, ",after:$cursor");
+    format!("query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2Item{{{values}}}}}}}")
+}
+
+/// The rest of the content's `field` after the page read inline.
+fn content_fact_query(field: &str, selection: &str) -> String {
+    let connection = content_fact_selection(field, selection, FOLLOW_UP_PAGE, ",after:$cursor");
+    format!(
+        "query($id:ID!,$cursor:String){{node(id:$id){{... on Issue{{{connection}}} ... on PullRequest{{{connection}}}}}}}"
+    )
+}
 
 struct ReadBudget<'a, T> {
     transport: &'a T,
@@ -709,13 +780,27 @@ fn connection(
     variables: Value,
     pointer: &str,
 ) -> Result<(Vec<Value>, bool)> {
-    let mut variables = variables;
+    continue_connection(t, None, query, variables, pointer)
+}
+
+/// Collect a connection from its `first` page, if already read, then read the
+/// rest with `query` from its cursor. Only a page that says it is the last one
+/// is complete.
+fn continue_connection(
+    t: &impl Transport,
+    first: Option<&Value>,
+    query: &str,
+    mut variables: Value,
+    pointer: &str,
+) -> Result<(Vec<Value>, bool)> {
     let mut nodes = Vec::new();
     let mut cursors = BTreeSet::new();
     let mut complete = true;
+    let mut conn = match first {
+        Some(first) => first.clone(),
+        None => read_page(t, query, &variables, pointer)?,
+    };
     loop {
-        let data = t.graphql(query, variables.clone())?;
-        let conn = data.pointer(pointer).context("missing GitHub connection")?;
         let page = conn["nodes"]
             .as_array()
             .context("missing connection nodes")?;
@@ -738,6 +823,43 @@ fn connection(
             }
             None => return Ok((nodes, false)),
         }
+        conn = read_page(t, query, &variables, pointer)?;
+    }
+}
+
+fn read_page(t: &impl Transport, query: &str, variables: &Value, pointer: &str) -> Result<Value> {
+    t.graphql(query, variables.clone())?
+        .pointer_mut(pointer)
+        .map(Value::take)
+        .context("missing GitHub connection")
+}
+
+/// The connection a field value holds, if it is one of [`NESTED_VALUES`].
+fn nested_value_field(value: &Value) -> Option<&'static str> {
+    let kind = value["__typename"].as_str()?;
+    NESTED_VALUES
+        .iter()
+        .find(|(ty, _)| *ty == kind)
+        .map(|(_, field)| *field)
+}
+
+/// An item's field values: the page's, when it held all of them whole, or else
+/// all of them read again by themselves, which nests a full page in each.
+fn item_field_values(t: &impl Transport, member: &Value) -> Result<(Vec<Value>, bool)> {
+    let inline = &member["fieldValues"];
+    let truncated = inline["pageInfo"]["hasNextPage"] == true
+        || inline["nodes"].as_array().is_some_and(|values| {
+            values.iter().any(|value| {
+                nested_value_field(value)
+                    .is_some_and(|field| value[field]["pageInfo"]["hasNextPage"] == true)
+            })
+        });
+    let query = item_field_values_query();
+    let variables = json!({"id":text(member, "id")?});
+    if truncated {
+        connection(t, &query, variables, "/node/fieldValues")
+    } else {
+        continue_connection(t, Some(inline), &query, variables, "/node/fieldValues")
     }
 }
 
@@ -1322,7 +1444,7 @@ impl<T: Transport> GitHub<T> {
             .format(&time::format_description::well_known::Rfc3339)?;
         let (members, members_complete) = connection(
             &transport,
-            "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{id content{__typename ... on Issue{id number title state stateReason createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{id number title state createdAt updatedAt closedAt mergedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
+            &snapshot_items_query(),
             json!({"id":id}),
             "/node/items",
         )?;
@@ -1342,22 +1464,11 @@ impl<T: Transport> GitHub<T> {
                     || (kind == Some("PullRequest") && native_state == "MERGED"),
                 "unknown GitHub content state"
             );
-            let (values, values_complete) = connection(
-                &transport,
-                "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2Item{fieldValues(first:100,after:$cursor){nodes{__typename ... on ProjectV2ItemFieldSingleSelectValue{name optionId field{... on ProjectV2SingleSelectField{name}}} ... on ProjectV2ItemFieldTextValue{text field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldNumberValue{number field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldDateValue{date field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldIterationValue{title iterationId field{... on ProjectV2IterationField{name}}} ... on ProjectV2ItemFieldRepositoryValue{repository{id nameWithOwner} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldMilestoneValue{milestone{id title state dueOn} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldLabelValue{labels(first:100){nodes{id name} pageInfo{hasNextPage}} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldUserValue{users(first:100){nodes{id login} pageInfo{hasNextPage}} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldPullRequestValue{pullRequests(first:100){nodes{id number url title state} pageInfo{hasNextPage}} field{... on ProjectV2Field{name}}} ... on ProjectV2ItemFieldReviewerValue{reviewers(first:100){nodes{__typename ... on User{id login} ... on Team{id name}} pageInfo{hasNextPage}} field{... on ProjectV2Field{name}}}} pageInfo{hasNextPage endCursor}}}}}",
-                json!({"id":text(&member,"id")?}),
-                "/node/fieldValues",
-            )?;
+            let (values, values_complete) = item_field_values(&transport, &member)?;
             let mut item_fields = BTreeMap::new();
             let mut values_supported = true;
             for mut value in values {
-                let nested = match value["__typename"].as_str() {
-                    Some("ProjectV2ItemFieldLabelValue") => Some("labels"),
-                    Some("ProjectV2ItemFieldUserValue") => Some("users"),
-                    Some("ProjectV2ItemFieldPullRequestValue") => Some("pullRequests"),
-                    Some("ProjectV2ItemFieldReviewerValue") => Some("reviewers"),
-                    _ => None,
-                };
+                let nested = nested_value_field(&value);
                 if let Some(field) = nested {
                     // These value types are not nodes: retain the inline page,
                     // but do not treat truncated or redacted facts as complete.
@@ -1410,13 +1521,13 @@ impl<T: Transport> GitHub<T> {
                 && content.get("closedAt").is_some()
                 && (kind != Some("PullRequest") || content.get("mergedAt").is_some());
             let mut facts = BTreeMap::new();
-            for (field, selection) in [("labels", "name"), ("assignees", "login")] {
-                let query = format!(
-                    "query($id:ID!,$cursor:String){{node(id:$id){{... on Issue{{{field}(first:100,after:$cursor){{nodes{{{selection}}} pageInfo{{hasNextPage endCursor}}}}}} ... on PullRequest{{{field}(first:100,after:$cursor){{nodes{{{selection}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
-                );
-                let (nodes, full) = connection(
+            for (field, selection) in CONTENT_FACTS {
+                // The page read the first labels and assignees; follow the
+                // cursor only for an item that has more.
+                let (nodes, full) = continue_connection(
                     &transport,
-                    &query,
+                    Some(&content[field]),
+                    &content_fact_query(field, selection),
                     json!({"id":content_id}),
                     &format!("/node/{field}"),
                 )?;
@@ -1563,15 +1674,14 @@ mod tests {
     impl Transport for Recorded {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
             if query.contains("fieldValues(first") {
-                for (ty, field) in [
-                    ("Label", "labels"),
-                    ("User", "users"),
-                    ("PullRequest", "pullRequests"),
-                    ("Reviewer", "reviewers"),
-                ] {
-                    assert!(query.contains(&format!(
-                        "... on ProjectV2ItemField{ty}Value{{{field}(first:100)"
-                    )));
+                // A page nests a few values; a follow-up read nests a full page.
+                let nested = if query.contains("items(first") {
+                    NESTED_VALUE_PAGE
+                } else {
+                    FOLLOW_UP_PAGE
+                };
+                for (ty, field) in NESTED_VALUES {
+                    assert!(query.contains(&format!("... on {ty}{{{field}(first:{nested})")));
                 }
             }
             self.variables.borrow_mut().push(variables);
@@ -1584,6 +1694,53 @@ mod tests {
 
     fn page(nodes: Value, next: bool, cursor: Value) -> Value {
         json!({"node":{"connection":{"nodes":nodes,"pageInfo":{"hasNextPage":next,"endCursor":cursor}}}})
+    }
+
+    /// A connection page that is the last one.
+    fn last(nodes: Value) -> Value {
+        json!({"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}})
+    }
+
+    /// A response holding the last page of the node's connection `name`.
+    fn conn(name: &str, nodes: Value) -> Value {
+        json!({"node":{name:last(nodes)}})
+    }
+
+    /// The project and its field schema, the first two reads of a snapshot.
+    fn schema(fields: Value) -> [Value; 2] {
+        [
+            json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
+            conn("fields", fields),
+        ]
+    }
+
+    /// A board item as a snapshot page holds it, its connections whole.
+    fn member(
+        id: &str,
+        mut content: Value,
+        values: Value,
+        labels: Value,
+        assignees: Value,
+    ) -> Value {
+        content["labels"] = last(labels);
+        content["assignees"] = last(assignees);
+        json!({"id":id,"content":content,"fieldValues":last(values)})
+    }
+
+    /// An open issue's content, as a snapshot page reads it.
+    fn issue(number: u64) -> Value {
+        json!({"__typename":"Issue","id":format!("I{number}"),"number":number,"title":"recorded","state":"OPEN","stateReason":null,"repository":{"nameWithOwner":"example/intake"},"createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null})
+    }
+
+    fn recorded(responses: impl IntoIterator<Item = Value>) -> GitHub<Recorded> {
+        GitHub {
+            transport: Recorded {
+                responses: RefCell::new(responses.into_iter().collect()),
+                variables: RefCell::new(vec![]),
+            },
+            owner: "example".into(),
+            number: 1,
+        }
     }
 
     #[test]
@@ -1980,21 +2137,22 @@ mod tests {
             ("PullRequest", "OPEN", None, 0),
             ("PullRequest", "MERGED", None, 0),
         ] {
-            let conn = |name: &str, nodes: Value| json!({"node":{name:{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}});
-            let t = Recorded { responses: RefCell::new(vec![
-                json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
-                conn("fields",json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"done","name":"Done"},{"id":"cancelled","name":"Cancelled"}]}])),
-                conn("items",json!([{"id":"M","content":{"__typename":kind,"id":"I","number":7,"title":"recorded","state":state,"stateReason":reason,"repository":{"nameWithOwner":"example/intake"},"createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"mergedAt":null}}])),
-                conn("fieldValues",json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}])),
-                conn("labels",json!([{"name":"bug"}])),conn("assignees",json!([{"login":"human"}])),
-            ].into()),variables:RefCell::new(vec![]) };
-            let snapshot = GitHub {
-                transport: t,
-                owner: "example".into(),
-                number: 1,
-            }
-            .snapshot()
-            .unwrap();
+            let content = json!({"__typename":kind,"id":"I","number":7,"title":"recorded","state":state,"stateReason":reason,"repository":{"nameWithOwner":"example/intake"},"createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null,"mergedAt":null});
+            let values = json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}]);
+            let [project, fields] = schema(
+                json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"done","name":"Done"},{"id":"cancelled","name":"Cancelled"}]}]),
+            );
+            let items = conn(
+                "items",
+                json!([member(
+                    "M",
+                    content,
+                    values,
+                    json!([{"name":"bug"}]),
+                    json!([{"login":"human"}])
+                )]),
+            );
+            let snapshot = recorded([project, fields, items]).snapshot().unwrap();
             assert!(snapshot.coverage.complete);
             let item = &snapshot.items[0];
             assert!(item.fields_complete);
@@ -2029,26 +2187,16 @@ mod tests {
             (Some("custom-worker"), true),
             (Some("unknown"), false),
         ] {
-            let conn = |name: &str, nodes: Value| json!({"node":{name:{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}});
             let values = name.map(|name| vec![json!({"__typename":"ProjectV2ItemFieldSingleSelectValue", "name":name, "optionId":"agent", "field":{"name":"Agent"}})]).unwrap_or_default();
-            let github = GitHub {
-                transport: Recorded {
-                    responses: RefCell::new(vec![
-                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
-                        conn("fields", json!([
-                            {"name":"Status","dataType":"SINGLE_SELECT","options":[]},
-                            {"name":"Agent","dataType":"SINGLE_SELECT","options":[{"id":"agent","name":name.unwrap_or("rust-worker")}]}
-                        ])),
-                        conn("items", json!([{"id":"M","content":{"__typename":"Issue","id":"I","number":7,"title":"recorded","state":"OPEN","repository":{"nameWithOwner":"example/intake"}}}])),
-                        conn("fieldValues", json!(values)),
-                        conn("labels", json!([])),
-                        conn("assignees", json!([])),
-                    ].into()),
-                    variables: RefCell::new(vec![]),
-                },
-                owner: "example".into(),
-                number: 1,
-            };
+            let [project, fields] = schema(json!([
+                {"name":"Status","dataType":"SINGLE_SELECT","options":[]},
+                {"name":"Agent","dataType":"SINGLE_SELECT","options":[{"id":"agent","name":name.unwrap_or("rust-worker")}]}
+            ]));
+            let items = conn(
+                "items",
+                json!([member("M", issue(7), json!(values), json!([]), json!([]))]),
+            );
+            let github = recorded([project, fields, items]);
             let policy = board_core::AgentPolicy::parse(&format!(
                 "{}\n[agents.custom-worker]\nenabled = true\nfields = []\noutputs = []",
                 board_core::DEFAULT_AGENT_POLICY
@@ -2064,61 +2212,173 @@ mod tests {
     }
 
     #[test]
+    fn board_pages_table() {
+        const ITEMS: u64 = 250;
+        // Item 7's connection that is longer than the page holds, and its
+        // follow-up read: the request it makes and the response it gets.
+        let label = |name: &str| json!({"name":name});
+        let more = json!({"hasNextPage":true,"endCursor":"c"});
+        let values = json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}]);
+        let label_value = |next: bool| json!([{"__typename":"ProjectV2ItemFieldLabelValue","field":{"name":"Labels"},"labels":{"nodes":[{"id":"L","name":"bug"}],"pageInfo":{"hasNextPage":next}}}]);
+        // What of item 7 is longer than the page holds, and the follow-up
+        // read that brings the rest: the request it makes and its response.
+        let cases = [
+            ("whole", None, None, true),
+            (
+                "more values",
+                Some(("/fieldValues/pageInfo", more.clone())),
+                Some((json!({"id":"M7"}), conn("fieldValues", values.clone()))),
+                true,
+            ),
+            (
+                "nested values",
+                Some(("/fieldValues/nodes", label_value(true))),
+                Some((json!({"id":"M7"}), conn("fieldValues", label_value(false)))),
+                true,
+            ),
+            (
+                "nested values still truncated",
+                Some(("/fieldValues/nodes", label_value(true))),
+                Some((json!({"id":"M7"}), conn("fieldValues", label_value(true)))),
+                false,
+            ),
+            (
+                "more labels",
+                Some(("/content/labels/pageInfo", more.clone())),
+                Some((
+                    json!({"id":"I7","cursor":"c"}),
+                    conn("labels", json!([label("more")])),
+                )),
+                true,
+            ),
+            (
+                "more assignees",
+                Some(("/content/assignees/pageInfo", more.clone())),
+                Some((
+                    json!({"id":"I7","cursor":"c"}),
+                    conn("assignees", json!([{"login":"other"}])),
+                )),
+                true,
+            ),
+        ];
+        for (case, change, follow_up, complete) in cases {
+            let [project, fields] = schema(
+                json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"done","name":"Done"}]}]),
+            );
+            let mut members: Vec<Value> = (1..=ITEMS)
+                .map(|n| {
+                    member(
+                        &format!("M{n}"),
+                        issue(n),
+                        values.clone(),
+                        json!([label("bug")]),
+                        json!([]),
+                    )
+                })
+                .collect();
+            if let Some((pointer, value)) = change {
+                *members[6].pointer_mut(pointer).unwrap() = value;
+            }
+            let pages = members.chunks(ITEM_PAGE).enumerate().map(|(i, nodes)| {
+                let next = (i + 1) * ITEM_PAGE < members.len();
+                json!({"node":{"items":{"nodes":nodes,"pageInfo":{"hasNextPage":next,"endCursor":format!("page-{i}")}}}})
+            });
+            let mut responses: Vec<Value> = [project, fields].into_iter().chain(pages).collect();
+            let page_requests = responses.len() - 2;
+            assert_eq!(page_requests, 3);
+            responses.extend(follow_up.iter().map(|(_, response)| response.clone()));
+            let github = recorded(responses);
+            let snapshot = github.snapshot().unwrap();
+            let requests = github.transport.variables.borrow().clone();
+            assert_eq!(snapshot.items.len(), ITEMS as usize, "{case}");
+            assert_eq!(snapshot.coverage.complete, complete, "{case}");
+            assert_eq!(
+                requests.len(),
+                2 + page_requests + usize::from(follow_up.is_some()),
+                "{case}"
+            );
+            for (i, request) in requests[2..2 + page_requests].iter().enumerate() {
+                let cursor = i.checked_sub(1).map(|i| format!("page-{i}"));
+                assert_eq!(request["cursor"], json!(cursor), "{case}");
+            }
+            if let Some((request, _)) = &follow_up {
+                assert_eq!(requests.last(), Some(request), "{case}");
+            }
+            let item = &snapshot.items[6];
+            assert_eq!(item.identity.number, 7);
+            assert_eq!(item.fields_complete, complete, "{case}");
+            match case {
+                "more labels" => assert_eq!(item.labels, ["bug", "more"]),
+                "more assignees" => assert_eq!(item.assignees, ["other"]),
+                _ => assert_eq!(item.labels, ["bug"]),
+            }
+        }
+    }
+
+    #[test]
     fn inline_field_connections_table() {
         // API-shaped synthetic responses: these four value types have no id.
         let fixture: Vec<Value> =
             serde_json::from_str(include_str!("../../../fixtures/github-field-values.json"))
                 .unwrap();
-        for field in ["labels", "users", "pullRequests", "reviewers"] {
-            for (case, expected_complete) in [
-                ("complete", true),
-                ("empty", true),
-                ("truncated", false),
-                ("redacted", false),
-                ("malformed_object", false),
-                ("missing_fact", false),
-                ("missing_nodes", false),
-                ("missing_page_info", false),
+        for (_, field) in NESTED_VALUES {
+            // `follow_up`: the values an item truncated in the page is read
+            // again with, nesting a full page; truncated there, it stays so.
+            for (case, follow_up, expected_complete) in [
+                ("complete", None, true),
+                ("empty", None, true),
+                ("truncated", Some("complete"), true),
+                ("truncated", Some("truncated"), false),
+                ("redacted", None, false),
+                ("malformed_object", None, false),
+                ("missing_fact", None, false),
+                ("missing_nodes", None, false),
+                ("missing_page_info", None, false),
             ] {
-                let mut values = fixture.clone();
-                let value = values.iter_mut().find(|v| v.get(field).is_some()).unwrap();
-                match case {
-                    "empty" => value[field]["nodes"] = json!([]),
-                    "truncated" => value[field]["pageInfo"]["hasNextPage"] = json!(true),
-                    "redacted" => value[field]["nodes"] = json!([null]),
-                    "malformed_object" => value[field]["nodes"] = json!([{}]),
-                    "missing_fact" => value[field]["nodes"] = json!([{"id":"N"}]),
-                    "missing_nodes" => {
-                        value[field].as_object_mut().unwrap().remove("nodes");
+                let values = |case: &str| {
+                    let mut values = fixture.clone();
+                    let value = values.iter_mut().find(|v| v.get(field).is_some()).unwrap();
+                    match case {
+                        "empty" => value[field]["nodes"] = json!([]),
+                        "truncated" => value[field]["pageInfo"]["hasNextPage"] = json!(true),
+                        "redacted" => value[field]["nodes"] = json!([null]),
+                        "malformed_object" => value[field]["nodes"] = json!([{}]),
+                        "missing_fact" => value[field]["nodes"] = json!([{"id":"N"}]),
+                        "missing_nodes" => {
+                            value[field].as_object_mut().unwrap().remove("nodes");
+                        }
+                        "missing_page_info" => {
+                            value[field].as_object_mut().unwrap().remove("pageInfo");
+                        }
+                        _ => {}
                     }
-                    "missing_page_info" => {
-                        value[field].as_object_mut().unwrap().remove("pageInfo");
-                    }
-                    _ => {}
-                }
-                let conn = |name: &str, nodes: Value| json!({"node":{name:{"nodes":nodes,"pageInfo":{"hasNextPage":false}}}});
-                let github = GitHub {
-                    transport: Recorded {
-                        responses: RefCell::new(vec![
-                            json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
-                            conn("fields", json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"triage","name":"Triage"}]}])),
-                            conn("items", json!([{"id":"M","content":{"__typename":"Issue","id":"I","number":7,"title":"recorded","state":"OPEN","repository":{"nameWithOwner":"example/intake"},"createdAt":"2026-10-08T00:00:00Z","updatedAt":"2026-10-08T00:00:00Z","closedAt":null}}])),
-                            conn("fieldValues", json!(values)),
-                            conn("labels", json!([])),
-                            conn("assignees", json!([])),
-                        ].into()),
-                        variables: RefCell::new(vec![]),
-                    },
-                    owner: "example".into(),
-                    number: 1,
+                    json!(values)
                 };
-                let snapshot = github.snapshot().unwrap();
-                assert_eq!(
-                    snapshot.coverage.complete, expected_complete,
-                    "{field}/{case}"
+                let [project, fields] = schema(
+                    json!([{"name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"triage","name":"Triage"}]}]),
                 );
+                let items = conn(
+                    "items",
+                    json!([member("M", issue(7), values(case), json!([]), json!([]))]),
+                );
+                let github = recorded(
+                    [project, fields, items]
+                        .into_iter()
+                        .chain(follow_up.map(|case| conn("fieldValues", values(case)))),
+                );
+                let snapshot = github.snapshot().unwrap();
+                let context = format!("{field}/{case}/{follow_up:?}");
+                assert_eq!(snapshot.coverage.complete, expected_complete, "{context}");
                 assert_eq!(snapshot.items[0].fields_complete, expected_complete);
-                assert_eq!(github.transport.variables.borrow().len(), 6);
+                let requests = github.transport.variables.borrow().clone();
+                assert_eq!(
+                    requests.len(),
+                    3 + usize::from(follow_up.is_some()),
+                    "{context}"
+                );
+                if follow_up.is_some() {
+                    assert_eq!(requests[3], json!({"id":"M"}));
+                }
                 let policy = board_core::Policy {
                     project: snapshot.project.clone(),
                     repositories: vec!["example/intake".into()],
