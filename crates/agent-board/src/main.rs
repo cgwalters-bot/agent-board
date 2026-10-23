@@ -8,6 +8,7 @@ mod epic;
 mod item;
 mod live;
 mod org_status;
+mod pass;
 mod poll;
 mod release_train;
 mod review;
@@ -130,6 +131,8 @@ enum Command {
     },
     /// One pass of the pull request poll, previewed or applied; says when the next is due.
     Poll(poll::Poll),
+    /// One scheduled pass: follow up pull requests, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md).
+    Pass(pass::Pass),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
     /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
@@ -879,6 +882,18 @@ fn execute(cli: Cli) -> Result<()> {
                 }
                 Ok(Some(load(&cli)?))
             })
+        }
+        Command::Pass(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "pass reads its settings from --config only"
+            );
+            pass::run(args, &mut io::stdout().lock())
         }
         Command::Supervise(args) => {
             ensure!(

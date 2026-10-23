@@ -14,6 +14,7 @@ pub mod github;
 pub mod input;
 pub mod org_status;
 pub mod overlap;
+pub mod pass;
 pub mod plan;
 pub mod poll;
 pub mod release_train;

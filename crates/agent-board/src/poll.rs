@@ -179,6 +179,7 @@ pub fn run(
         dispatcher: dispatcher.as_ref().unwrap_or(&client),
         workflow: args.dispatch_workflow.clone().unwrap_or_default(),
         pools: args.fix_pool.clone(),
+        git_ref: None,
     });
     let outcome = poll::run(
         &client,
@@ -367,6 +368,7 @@ mod tests {
                     dispatcher: &client,
                     workflow: "dispatch.yml".into(),
                     pools: vec![],
+                    git_ref: None,
                 }),
                 time::OffsetDateTime::UNIX_EPOCH,
             )

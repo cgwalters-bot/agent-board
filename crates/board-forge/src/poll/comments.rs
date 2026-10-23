@@ -1959,6 +1959,7 @@ pub(super) mod tests {
                 dispatcher: fake,
                 workflow: "dispatch.yml".into(),
                 pools: vec![],
+                git_ref: None,
             }),
             at,
         )
@@ -2757,6 +2758,7 @@ pub(super) mod tests {
                 dispatcher: &fake,
                 workflow: "dispatch.yml".into(),
                 pools: vec![],
+                git_ref: None,
             };
             let mut pass = Pass {
                 rest: &fake,

@@ -27,6 +27,7 @@ Commands:
 - [`snapshot`](#agent-board-snapshot): Save a normalized board snapshot for offline use
 - [`reconcile`](#agent-board-reconcile): Preview deterministic board repairs; never apply them
 - [`poll`](#agent-board-poll): One pass of the pull request poll, previewed or applied; says when the next is due
+- [`pass`](#agent-board-pass): One scheduled pass: follow up pull requests, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -557,6 +558,21 @@ Options:
 - `--dispatch-workflow <FILE>`: Workflow file in --dispatch-repo that --apply starts fix runs with
 - `--review-workflow <FILE>`: Workflow file of the review job in each --follow repository. Its reviews of a head count as the verdict only with this, and only from a run of it on pull_request_target for that head of a --bot dispatch pull request from its fork into a public repository; without it only --operator's count
 - `--fix-pool <POOL>`: The workflow's `pool` input for each fix round in turn. Repeatable; none leaves its default
+
+## agent-board pass
+
+One scheduled pass: follow up pull requests, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
+
+```text
+agent-board pass [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN (the bot's) and DISPATCH_TOKEN, never the file
+- `--apply`: Take the steps: follow up pull requests and start the chosen runs as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. Only in a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID): work starts only while no other run of its workflow is in progress
+- `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read
+- `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture
 
 ## agent-board supervise
 

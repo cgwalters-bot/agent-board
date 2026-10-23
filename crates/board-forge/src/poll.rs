@@ -767,6 +767,8 @@ pub struct Apply<'a, R> {
     pub workflow: String,
     /// Its `pool` input for each fix round in turn; none leaves its default.
     pub pools: Vec<String>,
+    /// The ref the runs start from; none is [`DISPATCH_REF`].
+    pub git_ref: Option<String>,
 }
 
 /// The pools a fix round takes in turn: `fixPools`, else `kindPools.fix`,
@@ -2913,11 +2915,14 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
 }
 
 /// The result of one pass.
+#[derive(Default)]
 pub struct Outcome {
     pub lines: Vec<String>,
     pub errors: usize,
     pub activity: usize,
     pub in_flight: usize,
+    /// The runs this pass started, which a caller counts against its capacity.
+    pub dispatched: usize,
     /// The state to keep for the next pass; its interval is the next gap.
     pub state: State,
 }
@@ -3292,8 +3297,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "repos/{}/actions/workflows/{workflow}/dispatches",
             self.config.dispatch_repo
         );
-        let mut request =
-            json!({"ref": DISPATCH_REF, "inputs": inputs, "return_run_details": true});
+        let git_ref = self.apply.as_ref().and_then(|a| a.git_ref.clone());
+        let git_ref = git_ref.as_deref().unwrap_or(DISPATCH_REF);
+        let mut request = json!({"ref": git_ref, "inputs": inputs, "return_run_details": true});
         loop {
             self.spend().map_err(|e| NotStarted(format!("{e:#}")))?;
             let (status, run) = dispatcher.send("POST", &format!("{API_ROOT}{path}"), &request)?;
@@ -4782,13 +4788,7 @@ pub fn run<R: Rest, G: Transport>(
             config.bot
         );
     }
-    let mut outcome = Outcome {
-        lines: Vec::new(),
-        errors: 0,
-        activity: 0,
-        in_flight: 0,
-        state: State::default(),
-    };
+    let mut outcome = Outcome::default();
     for repo in &repositories {
         match pass.activity(repo, &mut outcome.lines) {
             Ok(count) => outcome.activity += count,
@@ -4901,6 +4901,7 @@ pub fn run<R: Rest, G: Transport>(
     } else {
         state.interval_seconds
     };
+    outcome.dispatched = pass.dispatched;
     outcome.state = State {
         interval_seconds: next_interval(previous, active),
         responses: pass.used,
@@ -8143,6 +8144,7 @@ mod tests {
             dispatcher,
             workflow: "dispatch.yml".into(),
             pools: vec!["claude".into(), "openai".into()],
+            git_ref: None,
         })
     }
 
@@ -10027,6 +10029,26 @@ mod tests {
             now(),
         );
         assert_eq!(decided.action, "wait", "{}", decided.reason);
+        // A caller's ref (the pass's `dispatchRef`) starts it there instead.
+        let mut fake = github();
+        fake.pulls.insert(
+            470,
+            pull("pull-470", json!({"contexts": {"review": {"state": "FAILURE"}, "ci": {"conclusion": "FAILURE"}}})),
+        );
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            DISPATCHES.into(),
+            vec![(200, json!({"workflow_run_id": 1234}))],
+        );
+        let mut apply = applying(&dispatcher);
+        if let Some(apply) = apply.as_mut() {
+            apply.git_ref = Some("staging".into());
+        }
+        let follow = [REPO.to_owned()];
+        let state = State::default();
+        let outcome = run(&fake, &fake, &config(), state, &[], &follow, apply, now()).unwrap();
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(dispatcher.writes.borrow()[0].1["ref"], "staging");
     }
 
     #[test]
@@ -11406,13 +11428,7 @@ mod tests {
             paces: None,
             envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),
         };
-        let mut outcome = Outcome {
-            lines: Vec::new(),
-            errors: 0,
-            activity: 0,
-            in_flight: 0,
-            state: State::default(),
-        };
+        let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();
         assert_eq!(
             format!("{error:#}"),
