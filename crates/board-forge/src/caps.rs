@@ -28,11 +28,26 @@ impl Kind {
     }
 }
 
-/// The caps one pass was given; none is uncapped.
+/// Board Status changes one pass makes at most, unless told otherwise: a
+/// first pass over a board that drifted for months should be looked at
+/// before it rewrites it.
+pub const STATUS_CHANGES: usize = 50;
+
+/// The caps one pass was given; none is uncapped, but for `status_changes`,
+/// which is [`STATUS_CHANGES`] by default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     pub dispatch: Option<usize>,
     pub writes: Option<usize>,
+    /// More Status changes than this refuse the Status stage whole.
+    pub status_changes: Option<usize>,
+}
+
+impl Limits {
+    /// The most Status changes the pass makes before it refuses them all.
+    pub fn status_changes(&self) -> usize {
+        self.status_changes.unwrap_or(STATUS_CHANGES)
+    }
 }
 
 /// What one pass spent of its [`Limits`], and how many steps they held.
@@ -61,9 +76,15 @@ impl Caps {
         }
     }
 
-    /// Whether any limit is set: uncapped, a pass only counts its steps.
+    /// Whether `--max-dispatch` or `--max-writes` is set: uncapped, a pass
+    /// only counts its steps.
     pub fn limited(&self) -> bool {
-        self.limits != Limits::default()
+        self.limits.dispatch.is_some() || self.limits.writes.is_some()
+    }
+
+    /// The most Status changes the pass makes ([`Limits::status_changes`]).
+    pub fn status_changes(&self) -> usize {
+        self.limits.status_changes()
     }
 
     /// Whether a step of `kind` would be held now.
@@ -126,6 +147,7 @@ mod tests {
                 Limits {
                     dispatch: Some(1),
                     writes: Some(2),
+                    ..Limits::default()
                 },
                 &[D, W, D, W, W, D],
                 &[false, false, true, false, true, true],
@@ -134,7 +156,7 @@ mod tests {
             (
                 Limits {
                     dispatch: Some(0),
-                    writes: None,
+                    ..Limits::default()
                 },
                 &[D, W],
                 &[true, false],

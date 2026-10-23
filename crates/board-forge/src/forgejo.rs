@@ -482,6 +482,7 @@ fn item(
         .join(&format!("{repository}/issues/{number}"))?;
     Ok(Item {
         identity,
+        project_item: None,
         assignment: None,
         title: text(issue, "title")?.into(),
         state: state.into(),

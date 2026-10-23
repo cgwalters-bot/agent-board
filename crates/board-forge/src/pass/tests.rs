@@ -68,6 +68,15 @@ const STARTED: &[&str] = &[
     "wip: no slot left; 185 more candidate(s) wait",
 ];
 
+/// The last line of scheduling, before the Status stage's.
+fn last_scheduled(report: &Report) -> &str {
+    let lines = report.lines.iter().rev();
+    lines
+        .map(String::as_str)
+        .find(|l| !l.starts_with("status"))
+        .unwrap()
+}
+
 /// The idle board of 23 October: two runs in flight of eight, a usable
 /// pool, so six runs start, in Priority order. Zero would be a regression.
 /// Recorded plans and an overlap behind an open pull request hold.
@@ -81,6 +90,9 @@ fn replay_idle_board_starts_work() {
         "candidates: 194 (0 opened by others, 107 outside a live epic)",
     ];
     expected.extend(STARTED);
+    // The recording's whole-board read is an empty board: the Status stage
+    // has its own recording.
+    expected.push("status: 0 change(s) of 0 item(s) read");
     assert_eq!(report.lines, expected);
     assert_eq!(report.failures, 0);
 }
@@ -196,7 +208,10 @@ fn replay_scenarios() {
             Box::new(|r, _| {
                 answer(r, "status=waiting")["body"]["total_count"] = 101.into();
             }),
-            vec!["schedule error: more waiting runs than one page lists; capacity is unknown"],
+            vec![
+                "schedule error: more waiting runs than one page lists; capacity is unknown",
+                "status: the runs in flight could not be listed, so none goes back to Todo",
+            ],
             0,
             1,
         ),
@@ -589,7 +604,7 @@ impl Rest for Forge {
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         self.failing(&format!("graphql {query}"))?;
-        if query.contains("viewer") {
+        if query.contains("viewer {") {
             return Ok(json!({"viewer": {"login": self.login}}));
         }
         if query.contains("projectItems") {
@@ -644,7 +659,7 @@ fn apply_starts_nothing_while_another_pass_is_in_progress() {
     let report = apply(&forge, &config);
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     assert_eq!(
-        report.lines.last().unwrap(),
+        last_scheduled(&report),
         "hold wip: another pass is in progress, https://github.com/cgwalters-forge/tracker/actions/runs/4243; it takes the free slots"
     );
     assert!(forge.writes.borrow().is_empty());
@@ -675,10 +690,17 @@ fn apply_stops_at_its_time_bound() {
     )
     .unwrap();
     assert_eq!(
-        report.lines.last().unwrap(),
+        last_scheduled(&report),
         "schedule error: the pass's time bound (900 seconds) is spent"
     );
-    assert_eq!(report.failures, 1);
+    // Nor does the Status stage read the board.
+    let last = report.lines.last().unwrap();
+    assert!(
+        last.starts_with("status error: reading the whole board: ")
+            && last.ends_with("the pass's time bound (900 seconds) is spent"),
+        "{last}"
+    );
+    assert_eq!(report.failures, 2);
     assert!(forge.writes.borrow().is_empty());
 }
 
@@ -744,7 +766,7 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
         second.lines
     );
     assert_eq!(
-        second.lines.last().unwrap(),
+        last_scheduled(&second),
         "idle: 6 slot(s) free and nothing started"
     );
 }
@@ -761,7 +783,11 @@ fn caps_hold_starts_past_max_dispatch() {
         .copied()
         .collect();
     let config = config(json!({}));
-    let limits = |dispatch, writes| Limits { dispatch, writes };
+    let limits = |dispatch, writes| Limits {
+        dispatch,
+        writes,
+        ..Limits::default()
+    };
     for (limits, started, summary) in [
         (
             limits(None, None),
@@ -1383,6 +1409,36 @@ fn facts(repo: &str, number: u64, created: &str) -> Facts {
         priority: None,
         status: None,
     }
+}
+
+/// A closing reference GitHub answers as null is unread, so the issue's
+/// pull requests are incomplete, never "none open".
+#[test]
+fn null_closing_references_are_unread() {
+    let open = json!({"number": 2, "state": "OPEN", "repository": {"nameWithOwner": "o/r"},
+        "author": {"login": "cgwalters"}});
+    let closed = json!({"number": 3, "state": "CLOSED", "repository": {"nameWithOwner": "o/r"},
+        "author": null});
+    for (nodes, total, read, open_count) in [
+        (json!([open, closed]), 2, 2, 1),
+        (json!([null, closed]), 2, 1, 0),
+        (json!([null]), 1, 0, 0),
+    ] {
+        let refs = json!({"nodes": nodes, "totalCount": total});
+        let (pulls, n, of) = pulls(&refs).unwrap();
+        assert_eq!((pulls.len(), n, of), (open_count, read, total), "{refs}");
+    }
+    let mut node = json!({
+        "number": 1, "state": "OPEN", "createdAt": "2026-10-01T00:00:00Z",
+        "repository": {"nameWithOwner": "o/r"}, "author": {"login": "cgwalters"},
+        "labels": {"nodes": [], "totalCount": 0},
+        "issueDependenciesSummary": {"blockedBy": 0},
+        "closedByPullRequestsReferences": {"nodes": [null], "totalCount": 1},
+        "parent": null,
+    });
+    assert!(!Facts::from_node(&node).unwrap().pulls_complete);
+    node["closedByPullRequestsReferences"] = json!({"nodes": [], "totalCount": 0});
+    assert!(Facts::from_node(&node).unwrap().pulls_complete);
 }
 
 #[test]

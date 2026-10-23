@@ -25,8 +25,8 @@ decisions both follow. Where an older page disagrees, this one wins.
 `agent-board pass` is the heartbeat: a cron runs it, it finishes once, and the
 same facts give the same decisions. One pass follows pull requests (the
 standalone `poll` becomes this stage of pass rather than a separate command),
-refreshes usage, plans epics, derives Status and schedules new work (stages 2,
-3 and 5 are not built yet; see [what is built](pass.md#what-is-built)).
+refreshes usage, plans epics, derives Status and schedules new work (stages 2
+and 3 are not built yet; see [what is built](pass.md#what-is-built)).
 
 The supervisor is an agent that answers "is the system working?". It audits
 individual pieces of work from time to time and is who the operator talks to.
@@ -45,7 +45,7 @@ compete with it for the same decisions.
 ## Writes
 
 `agent-board pass --apply` makes its own writes directly; agentic-job's
-independent check and apply is for what an agent produces (stages 2, 3 and 5
+independent check and apply is for what an agent produces (stages 2 and 3
 are not built yet; see [what is built](pass.md#what-is-built)). Guards and
 caps are in [order and effects](pass.md#order-and-effects).
 
@@ -56,7 +56,17 @@ checker would re-derive the same answer at the cost of another moving part.
 
 Status is derived and written each pass from live facts: Done, Needs human
 and In Progress are never set by hand; Todo, Backlog and Priority are a
-person's choice. The rules are pass's [stage 5](pass.md#order-and-effects).
+person's choice, and Blocked and Backlog are holds that only Done replaces.
+The rules are pass's [stage 5](pass.md#order-and-effects). Any open pull
+request for an item makes it In Progress, draft or not, in any repository
+and by any author, so an upstream issue with a fork's pull request is In
+Progress; an issue a person marked Done that is still open goes back to
+Todo, since open means not done.
+
+The live Status set is Todo, Backlog, Blocked, In Progress, Needs human and
+Done; the others (Triage, Draft, In Review, Cancelled) are legacy, which the
+derived rules override, to be removed from the board once the pass has run
+for a while, not now.
 
 Why: a status someone has to remember to change goes stale, and a stale board
 misleads both the operator and the scheduler.
@@ -112,16 +122,15 @@ These are not decided; the pass spec leaves them as they are today or open.
 * **Backlog as a hold?** If Todo and Backlog are a person's ready/not-ready
   choice, should the pass refuse to start Backlog items? Today it holds on
   board Blocked instead.
-* **When a derived status stops holding.** Does an item the pass marked In
-  Progress or Needs human go back to Todo, or to what a person set before?
-* **The other Status options.** Triage, Draft, In Review, Blocked and
-  Cancelled are not among the derived values or the human choices. Does the
-  pass leave them alone, replace them, or does the board drop them?
+* **When a derived status stops holding.** Today an item whose Needs human,
+  In Progress or Done no longer holds goes back to Todo, not to what a
+  person set before.
 * **What counts as an infrastructure failure.** The rerun needs a fixed
   rule for telling the runner, broker or forge failing apart from the agent's
   own work failing, from the facts a run leaves.
 * **Cap numbers.** A pass takes `--max-dispatch` and `--max-writes`, unset
-  by default; what the scheduled pass should pass is not set yet.
+  by default; what the scheduled pass should pass is not set yet. The Status
+  stage's first-run guard, `--max-status-changes`, is 50 by default.
 * **First-party bookkeeping for PR follow-up.** What poll's hidden fix-claim
   and round markers become in first-party repositories, where state should
   be a readable line with machine detail alongside.

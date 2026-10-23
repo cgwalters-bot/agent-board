@@ -464,7 +464,9 @@ every poll:
 Supply the board with `--owner`/`--project` or `--snapshot`; it must match the
 configured project. Each poll prints a `status-preview=` plan to stderr, even
 with `poll --apply`; the poll never writes Status. The pass's Status stage
-([pass](pass.md#order-and-effects)) replaces this preview and its rules.
+([pass](pass.md#order-and-effects)) replaces this preview; the two share the
+rules' precedence, while the pass reads its own facts (no `question` label,
+review request or linked-field rule) and also releases Done.
 `reconcile plan --config agent-board.json` uses the same rules; `--emit` lowers
 proposals, retaining issue versus PR identity. There are at most 500 additional
 read requests per pass; exceeding the bound fails without publishing a partial

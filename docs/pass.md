@@ -10,8 +10,8 @@ authority for their operations. The differences below are intentional.
 
 ## What is built
 
-The first slice implements the configuration below, stage 1 and stage 4.
-Stages 2, 3 and 5 are not built; the pass prints a line for 2 and 3:
+The first slice implements the configuration below and stages 1, 4 and 5.
+Stages 2 and 3 are not built; the pass prints a line for each:
 
 * **Usage** is not refreshed. Pacing reads the `bot-usage/v1` snapshot that
   another job publishes to `usage.repository#usage.issue`, so `usage.url` is
@@ -19,13 +19,37 @@ Stages 2, 3 and 5 are not built; the pass prints a line for 2 and 3:
 * **Epics** are not planned or applied, and applies are not recovered. A
   configured `epics.repository` only decides which children qualify, through a
   live epic.
-* **Status** is not derived or written (stage 5), and there is no
-  infrastructure rerun. Stage 1 still writes poll's claim and marker comments
-  in every followed repository, external ones included.
+* There is no infrastructure rerun. Stage 1 still writes poll's claim and
+  marker comments in every followed repository, external ones included.
+
+Stage 5 reads the whole board (closed issues and pull requests included, in
+about one request per hundred items) besides the runs and open issues that
+scheduling reads, and reuses those where scheduling read them. Its first
+line counts the changes, such as
+`status: 39 change(s) of 46 item(s) read; 2 kept, their own facts not read whole`
+(draft issues and redacted items, which the whole-board read cannot see,
+are not counted and keep their Status),
+then one line per change, `status OWNER/REPO#N: OLD -> NEW (why)`, for
+example `status example/work#12: Todo -> In Progress (pull request
+example/work#14 is open)`. Each change is one write step; one that
+`--max-writes` holds starts `held by --max-writes: `. An applying pass
+reads the item's Status again just before writing it, and leaves one a
+person changed since (`changed to X since the board was read`); that read
+and the write are two of the pass's 500 requests, so once the budget or the
+time bound is spent the rest wait for the next pass, on one line. The stage
+is not serialized by the hold that keeps two passes from starting work: two
+overlapping passes derive the same values, and the read before each write
+leaves what the other wrote. More changes than `--max-status-changes` (50
+unless given) refuse the stage whole: it writes none, prints each as
+`refused: status …`, and fails the pass, a preview too, so that a first
+pass over a board that drifted is looked at first and then let through
+once with a higher number.
 
 The replay gate below is partly met: there is one recorded board, from 23
-October, with a synthetic usage snapshot. Scenario tests edit that recording.
-No staging run has happened.
+October, with a synthetic usage snapshot and an empty whole-board read.
+Scenario tests edit that recording. Stage 5 has its own recording of the
+same day's board, trimmed to items that show each rule
+(`fixtures/pass/status-2026-10-23.json`). No staging run has happened.
 
 Try a pass without credentials, against the recorded board:
 
@@ -35,7 +59,8 @@ agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board
 
 Each decision is one line: `start triage|implement OWNER/REPO#N … pool=P`,
 `hold OWNER/REPO#N: why`, `hold wip|pools: why`,
-`held by --max-dispatch: start …`, `fail …` or `… error: …`; a pull request's
+`held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
+`… error: …`; a pull request's
 step that a cap held ends `-> held by --max-dispatch` or
 `-> held by --max-writes`. With `--apply`, a started line also names its
 dispatch record and run. The last line is a summary such as
@@ -78,10 +103,11 @@ two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
 starts, stage 1's fix, rebase, continuation and answer rounds and stage 4's
 starts together, and `--max-writes N` bounds its other write steps, forge
 writes such as comments, labels and merges (stage 1's comments, labels,
-retitles, retargets, enqueues and merges). The unit is a step, not a request:
-a fix round's claim, marker and dispatch are one dispatch, and a stop's label
-and marker one write. A step is checked before its first write and taken whole
-or held whole; a held step is reported on its line and left to the next pass.
+retitles, retargets, enqueues and merges, and stage 5's Status changes).
+The unit is a step, not a request: a fix round's claim, marker and dispatch
+are one dispatch, and a stop's label and marker one write. A step is checked
+before its first write and taken whole or held whole; a held step is
+reported on its line and left to the next pass.
 A held start takes the slot it would have had, so a capped pass reads no
 further than an uncapped one. The numbers for the scheduled pass are an
 [open question](architecture.md#open-questions).
@@ -125,15 +151,25 @@ A pass captures one clock and performs these stages in order:
 5. Derive Status for every board item, closed issues and merged pull
    requests included (this stage reads those, which earlier stages skip),
    from this pass's facts and its own starts, and write each one that differs:
-   * closed issue, or merged pull request: **Done**;
+   * closed issue, or merged or closed pull request: **Done**;
    * otherwise, the `needs-human` label on the item: **Needs human**;
-   * otherwise, a run in flight or an open pull request for it: **In Progress**;
-   * otherwise a person's **Todo** or **Backlog** stays. What a derived value
-     that no longer holds becomes is an
-     [open question](architecture.md#open-questions).
+   * otherwise, a run in flight for it, or an open pull request for it (the
+     item itself, or one that says it closes the issue, in any repository and
+     by any author; draft or not): **In Progress**;
+   * otherwise, a derived value that no longer holds (Needs human, In
+     Progress, or Done on an issue open again) goes back to **Todo**;
+   * otherwise the Status stays. **Blocked** and **Backlog** are a person's
+     holds: only Done replaces them, so neither the label, a run nor a pull
+     request moves them (the label still holds scheduling). The legacy
+     columns (Triage, Draft, In Review, Cancelled) give way to any rule
+     above; a person's **Todo** stays.
 
+   The rules' precedence is shared with poll's `statusReconcile` preview.
    No person or agent sets the derived values; an edit to one is overwritten
-   on the next pass. An item whose facts were not read whole keeps its Status.
+   on the next pass. An item whose facts were not read whole keeps its Status:
+   its own fields, labels or state incomplete, or, for the fall back to Todo,
+   runs that could not all be listed or an open issue's closing pull requests
+   that could not all be read.
 
 The result names actions, holds, incomplete reads and failures, with a nonzero
 exit for an operational failure. Independent PRs may still be followed when an

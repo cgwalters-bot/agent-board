@@ -1593,6 +1593,7 @@ impl<T: Transport> GitHub<T> {
             .parse()?;
             items.push(Item {
                 identity,
+                project_item: Some(text(&member, "id")?.to_owned()),
                 assignment: None,
                 title: text(content, "title")?.into(),
                 state: if native_state == "OPEN" {

@@ -148,6 +148,10 @@ pub struct Coverage {
 #[serde(deny_unknown_fields)]
 pub struct Item {
     pub identity: ItemRef,
+    /// The forge's id of the board item (on GitHub, `PVTI_…`), where the
+    /// reader kept it: what a write to this item's fields names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_item: Option<String>,
     /// Observed Agent single-select value, not proof of run identity.
     #[serde(default)]
     pub assignment: Option<String>,
@@ -333,6 +337,62 @@ pub struct StatusFacts {
     pub active_run: Option<bool>,
 }
 
+/// What the Status rules read of one item, however its caller gathered it:
+/// `poll`'s `statusReconcile` preview and the pass's stage 5 map their own
+/// facts onto these and share [`derive_status`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatusSignals {
+    /// The work is over: closed or merged content.
+    pub terminal: bool,
+    /// An open ask for the operator.
+    pub human_ask: bool,
+    /// Work under way: seen (`Some(true)`), seen to be absent
+    /// (`Some(false)`), or unknown, which is never taken for absent.
+    pub active: Option<bool>,
+}
+
+/// Which current values the Status rules may change, beyond the derived ones.
+#[derive(Clone, Copy, Debug)]
+pub struct StatusRules<'a> {
+    /// Derived values that go back to Todo once no signal holds them.
+    pub released: &'a [Status],
+    /// Values a person set that only a terminal signal replaces.
+    pub kept: &'a [Status],
+}
+
+/// The `statusReconcile` preview: a finished run releases In Progress and
+/// Needs human; nothing is kept from a signal.
+pub const POLL_STATUS_RULES: StatusRules<'static> = StatusRules {
+    released: &[Status::InProgress, Status::NeedsHuman],
+    kept: &[],
+};
+
+/// The Status an item's signals derive, with its rule, or `None` to leave it:
+/// terminal facts win, then an ask for a person, then active work. A
+/// derived value that no longer holds goes back to Todo, but only when
+/// absence of work is known.
+pub fn derive_status(
+    current: Option<&Status>,
+    signals: &StatusSignals,
+    rules: &StatusRules,
+) -> Option<(&'static str, Status)> {
+    if signals.terminal {
+        return Some(("terminal_content", Status::Done));
+    }
+    if current.is_some_and(|c| rules.kept.contains(c)) {
+        return None;
+    }
+    if signals.human_ask {
+        Some(("open_human_ask", Status::NeedsHuman))
+    } else if signals.active == Some(true) {
+        Some(("active_work", Status::InProgress))
+    } else if signals.active == Some(false) && current.is_some_and(|c| rules.released.contains(c)) {
+        Some(("inactive_work", Status::Todo))
+    } else {
+        None
+    }
+}
+
 pub fn reconcile_status(
     snapshot: &Snapshot,
     policy: &Policy,
@@ -401,24 +461,20 @@ fn reconcile_inner(
         let derived = status_facts
             .and_then(|facts| facts.get(&item.identity))
             .and_then(|facts| {
-                if item.state == "closed" || facts.linked_prs_all_merged {
-                    Some(("terminal_content", Status::Done))
-                } else if facts.review_requested
-                    || item
-                        .labels
-                        .iter()
-                        .any(|label| label == "needs-human" || label == "question")
-                {
-                    Some(("open_human_ask", Status::NeedsHuman))
-                } else if facts.draft || facts.active_run == Some(true) {
-                    Some(("active_work", Status::InProgress))
-                } else if facts.active_run == Some(false)
-                    && matches!(item.status, Some(Status::InProgress | Status::NeedsHuman))
-                {
-                    Some(("inactive_work", Status::Todo))
-                } else {
-                    None
-                }
+                let signals = StatusSignals {
+                    terminal: item.state == "closed" || facts.linked_prs_all_merged,
+                    human_ask: facts.review_requested
+                        || item
+                            .labels
+                            .iter()
+                            .any(|label| label == "needs-human" || label == "question"),
+                    active: if facts.draft {
+                        Some(true)
+                    } else {
+                        facts.active_run
+                    },
+                };
+                derive_status(item.status.as_ref(), &signals, &POLL_STATUS_RULES)
             });
         let (reason, intent) = if let Some((reason, value)) = derived {
             if item.status.as_ref() == Some(&value) {

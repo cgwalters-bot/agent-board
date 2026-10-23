@@ -3,11 +3,12 @@
 //! and starts it with the existing plan dispatch ([`crate::plan`]). It
 //! previews unless asked to apply, printing one line per decision.
 //!
-//! Built so far: the configuration, stage 1 (pull request follow-up) and
-//! stage 4 (scheduling). Stage 2 (refreshing usage from the broker) and
-//! stage 3 (epic planning and apply recovery) are not: the pass reads the
-//! usage snapshot another job publishes, and says so on a line, and epics
-//! only decide which children qualify.
+//! Built so far: the configuration, stage 1 (pull request follow-up),
+//! stage 4 (scheduling) and stage 5 (board Status, in [`status`]). Stage 2
+//! (refreshing usage from the broker) and stage 3 (epic planning and apply
+//! recovery) are not: the pass reads the usage snapshot another job
+//! publishes, and says so on a line, and epics only decide which children
+//! qualify.
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -71,8 +72,10 @@ const DEFAULT_TARGET: f64 = 0.95;
 const BURST_LIMIT: f64 = 100.0;
 const REBASE_ROUNDS_LIMIT: u64 = 3;
 const QUEUE_TRIES_LIMIT: u64 = 5;
+/// The one marker that the operator must act (docs/architecture.md).
+const NEEDS_HUMAN: &str = "needs-human";
 /// Labels a person puts on an issue to keep runs off it.
-const HOLD_LABELS: &[&str] = &["needs-human", "needs-design"];
+const HOLD_LABELS: &[&str] = &[NEEDS_HUMAN, "needs-design"];
 /// Issues that are not work: epics, and questions to the operator.
 const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
 /// The board Status that holds an item.
@@ -633,7 +636,8 @@ fn issue_ref(node: &Value) -> Result<ItemRef> {
 }
 
 /// The open pull requests of a page of closing references, how many
-/// references the page read and how many there are.
+/// references the page read and how many there are. A reference GitHub
+/// answers as null (one the token may not see) is not read: it could be open.
 type Pulls = (Vec<(u64, String, Option<String>)>, u64, u64);
 
 fn pulls(refs: &Value) -> Result<Pulls> {
@@ -653,7 +657,8 @@ fn pulls(refs: &Value) -> Result<Pulls> {
     let total = refs["totalCount"]
         .as_u64()
         .context("references have no total")?;
-    Ok((open, nodes.len() as u64, total))
+    let read = nodes.iter().filter(|p| !p.is_null()).count();
+    Ok((open, read as u64, total))
 }
 
 impl Facts {
@@ -843,7 +848,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
 
 impl<C: Transport> Transport for Budget<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        self.spend(false)?;
+        self.spend(query.trim_start().starts_with("mutation"))?;
         self.inner.graphql(query, variables)
     }
 }
@@ -1022,10 +1027,17 @@ fn stages<C: Rest + Transport>(
         caps,
         report: &mut report,
         epics: BTreeMap::new(),
+        busy: None,
+        board: None,
     };
     if let Err(error) = scheduler.schedule(earlier, &git_ref) {
-        report.failures += 1;
-        report.lines.push(format!("schedule error: {error:#}"));
+        scheduler.report.failures += 1;
+        scheduler.line(format!("schedule error: {error:#}"));
+    }
+    // Stage 5: board Status from the facts read, this pass's starts included.
+    if let Err(error) = scheduler.status(&git_ref) {
+        scheduler.report.failures += 1;
+        scheduler.line(format!("status error: {error:#}"));
     }
     report
 }
@@ -1096,6 +1108,12 @@ struct Scheduler<'a, C> {
     report: &'a mut Report,
     /// Whether each parent read is a live epic, or why that is unknown.
     epics: BTreeMap<String, std::result::Result<bool, String>>,
+    /// For the Status stage, what scheduling read: the issues with a run in
+    /// flight, by key, with what it started; `Some(None)` where the listing
+    /// failed, and `None` where scheduling did not get that far.
+    busy: Option<Option<BTreeMap<String, String>>>,
+    /// The open board issues, likewise.
+    board: Option<Option<BoardRead>>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -1135,9 +1153,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let target = config.target(git_ref);
         target.validate()?;
-        let (runs, busy) = self.runs(&target)?;
+        let listed = self.runs(&target);
+        self.busy = Some(listed.as_ref().ok().map(|(_, busy)| busy.clone()));
+        let (runs, busy) = listed?;
         let wip = config.wip as usize;
-        let mut slots = Slots {
+        let slots = Slots {
             wip,
             earlier,
             mine: Vec::new(),
@@ -1162,9 +1182,28 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.line(format!("hold pools: {why}; new runs wait"));
             return Ok(());
         }
-        let board = self.board()?;
-        let candidates = self.candidates(&board);
-        let mut free = wip - active;
+        let board = self.board();
+        let Ok(board) = board else {
+            self.board = Some(None);
+            return board.map(|_| ());
+        };
+        let (free, taken) = self.start(&board, slots, (wip - active, &target, snapshot.as_ref()));
+        self.board = Some(Some(board));
+        if taken == 0 && free > 0 {
+            self.line(format!("idle: {free} slot(s) free and nothing started"));
+        }
+        Ok(())
+    }
+
+    /// Starts the board's candidates in order while `free` slots last: how
+    /// many slots are left free, and how many runs it took.
+    fn start(
+        &mut self,
+        board: &BoardRead,
+        mut slots: Slots,
+        (mut free, target, snapshot): (usize, &Target, Option<&Value>),
+    ) -> (usize, usize) {
+        let candidates = self.candidates(board);
         let mut taken = 0;
         for (n, facts) in candidates.iter().enumerate() {
             if free == 0 {
@@ -1181,7 +1220,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             let issue = facts.issue.display();
-            let step = self.consider(facts, &board, &slots, snapshot.as_ref(), &target);
+            let step = self.consider(facts, board, &slots, snapshot, target);
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.finishing.set(false);
             let step = match step {
@@ -1218,7 +1257,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.report.failures += 1;
             }
             for held in holds {
-                slots.busy.insert(key(&held), "started in this pass".into());
+                let started = || "started in this pass".to_owned();
+                slots.busy.insert(key(&held), started());
+                if let Some(Some(busy)) = &mut self.busy {
+                    busy.insert(key(&held), started());
+                }
             }
             if self.apply {
                 slots.mine.push(run_id(&line));
@@ -1227,10 +1270,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             free -= 1;
             taken += 1;
         }
-        if taken == 0 && free > 0 {
-            self.line(format!("idle: {free} slot(s) free and nothing started"));
-        }
-        Ok(())
+        (free, taken)
     }
 
     /// Another run of `own`'s workflow in progress, by its URL ([`PassRun`]).
@@ -2063,6 +2103,8 @@ impl Transport for Replay {
         }
     }
 }
+
+mod status;
 
 #[cfg(test)]
 mod tests;

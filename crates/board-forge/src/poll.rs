@@ -11226,7 +11226,11 @@ mod tests {
         let green = json!({});
         let fix = "fix: review requested changes";
         let merge = "merge: review approved and checks green";
-        let limits = |dispatch, writes| caps::Limits { dispatch, writes };
+        let limits = |dispatch, writes| caps::Limits {
+            dispatch,
+            writes,
+            ..caps::Limits::default()
+        };
         // Name, each pull request's change, the caps, the step, how many are
         // taken, and the dispatches and writes sent applying.
         type Case<'a> = (
@@ -11369,7 +11373,11 @@ mod tests {
     #[test]
     fn caps_refuse_the_polls_other_writers() {
         let refusal = "caps cover pull request steps only";
-        let limits = |dispatch, writes| caps::Limits { dispatch, writes };
+        let limits = |dispatch, writes| caps::Limits {
+            dispatch,
+            writes,
+            ..caps::Limits::default()
+        };
         let writers = [
             json!({"operatorComments": {"repositories": [REPO]}}),
             json!({"notifications": {"reasons": ["comment"]}}),
@@ -11520,8 +11528,8 @@ mod tests {
             cfg.policy = PollPolicy::from_json(&setup(&mut fake)).unwrap();
             let dispatcher = Fake::default();
             let caps = caps::Caps::new(caps::Limits {
-                dispatch: None,
                 writes: Some(0),
+                ..caps::Limits::default()
             });
             let outcome = run_capped(
                 &fake,
