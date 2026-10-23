@@ -11,6 +11,7 @@
 //! state file the caller keeps between passes; losing it costs requests, not
 //! correctness. GraphQL cannot be revalidated, so each pull request followed
 //! costs one query a pass.
+use crate::caps::{self, Kind};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::{Footer, overlap};
 use anyhow::{Context, Result, bail, ensure};
@@ -2396,6 +2397,19 @@ pub struct Decision {
     pub queue: Option<QueueState>,
 }
 
+/// What taking a decision's step spends of a capped pass ([`caps`]), or
+/// none for a step that writes nothing (skip, wait). Any other step is a
+/// write, an action added later included, so that a cap fails safe: it is
+/// checked against `--max-writes` before its first write, never left out.
+fn step_kind(action: &str) -> Option<Kind> {
+    match action {
+        "skip" | "wait" => None,
+        "fix" | "continue" | "rebase" | "answer" => Some(Kind::Dispatch),
+        // merge, refund, needs-human and retitle.
+        _ => Some(Kind::Write),
+    }
+}
+
 fn step(action: &'static str, reason: impl Into<String>) -> Decision {
     Decision {
         action,
@@ -2949,6 +2963,10 @@ struct Pass<'a, R, G> {
     /// The followed repositories this pass takes steps in, where
     /// `repositoriesPerPass` is set; none admits every followed repository.
     envelope: Option<admission::Envelope>,
+    /// The pass's caps on its steps ([`caps`]); none is uncapped.
+    caps: Option<&'a caps::Caps>,
+    /// Writes sent, or tried, so far: whether a step wrote anything.
+    writes: usize,
 }
 
 /// A merge queue entry: its number and the files it changes, if all were read.
@@ -3057,6 +3075,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         allowed: u16,
     ) -> Result<(u16, Value)> {
         self.spend()?;
+        self.writes += 1;
         let (status, response) = client.send(method, &format!("{API_ROOT}{path}"), &body)?;
         ensure!(
             (200..300).contains(&status) || status == allowed,
@@ -3070,6 +3089,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 
     fn mutate(&mut self, mutation: &str, variables: Value) -> Result<()> {
         self.spend()?;
+        self.writes += 1;
         self.graphql.graphql(mutation, variables)?;
         Ok(())
     }
@@ -3302,6 +3322,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut request = json!({"ref": git_ref, "inputs": inputs, "return_run_details": true});
         loop {
             self.spend().map_err(|e| NotStarted(format!("{e:#}")))?;
+            self.writes += 1;
             let (status, run) = dispatcher.send("POST", &format!("{API_ROOT}{path}"), &request)?;
             if (200..300).contains(&status) {
                 return Ok(run);
@@ -4611,13 +4632,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 Some(format!("Its failing job could not be read ({error})."))
             });
         }
+        // A capped pass checks the step before its first write, and counts
+        // it once it wrote, or once a preview plans it.
+        let kind = match (answer.is_empty(), &retarget) {
+            (false, _) => Some(Kind::Dispatch),
+            (true, Some(_)) => Some(Kind::Write),
+            (true, None) => step_kind(decision.action),
+        };
+        let caps = self.caps.zip(kind);
+        let held = caps.and_then(|(caps, kind)| caps.check(kind));
+        let (capped, before) = (held.is_some(), self.writes);
         let done = match (&self.apply, &retarget) {
-            (Some(_), _) if !answer.is_empty() => Some(self.answer_round(
-                repo,
-                &pull,
-                (&marker, &comments),
-                (&answer, &labelled_by),
-            )?),
+            _ if capped => Ok(held),
+            (Some(_), _) if !answer.is_empty() => self
+                .answer_round(repo, &pull, (&marker, &comments), (&answer, &labelled_by))
+                .map(Some),
             // The bot's own pull request, so its token may edit it. The head is
             // unchanged, so its approval stands, and the next pass reads how it
             // fares against the new base.
@@ -4629,8 +4658,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     &format!("repos/{repo}/pulls/{number}"),
                     json!({"base": onto}),
                     0,
-                )?;
-                Some(format!("retargeted to {onto}"))
+                )
+                .map(|_| Some(format!("retargeted to {onto}")))
             }
             (Some(_), None) => self.take(
                 repo,
@@ -4639,9 +4668,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 (&marker, &comments),
                 &decision,
                 review_run.as_ref(),
-            )?,
-            (None, _) => None,
+            ),
+            (None, _) => Ok(None),
         };
+        if let Some((caps, kind)) = caps
+            && !capped
+            && (self.apply.is_none() || self.writes > before)
+        {
+            caps.count(kind);
+        }
+        let done = done?;
         let line = format!(
             "{repo}#{number} {} {}: {}{}",
             short(head),
@@ -4725,6 +4761,41 @@ pub fn run<R: Rest, G: Transport>(
     apply: Option<Apply<'_, R>>,
     now: OffsetDateTime,
 ) -> Result<Outcome> {
+    run_capped(
+        rest,
+        graphql,
+        config,
+        state,
+        (watch, follow),
+        apply,
+        None,
+        now,
+    )
+}
+
+/// [`run`] within `caps`, which the pull request steps check and count. Only
+/// those steps are capped, so where a limit is set the poll's other writers
+/// must be off: the operator's comments, notifications, answers and locking.
+#[allow(clippy::too_many_arguments)]
+pub fn run_capped<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
+    state: State,
+    (watch, follow): (&[String], &[String]),
+    apply: Option<Apply<'_, R>>,
+    caps: Option<&caps::Caps>,
+    now: OffsetDateTime,
+) -> Result<Outcome> {
+    let policy = &config.policy;
+    ensure!(
+        !caps.is_some_and(caps::Caps::limited)
+            || (policy.operator_comments.is_empty()
+                && policy.notifications.is_none()
+                && !policy.operator_answers
+                && policy.lock_items.is_none()),
+        "caps cover pull request steps only; operator comments, notifications, answers and locking would write uncapped"
+    );
     for login in [&config.operator, &config.bot] {
         ensure!(is_github_login(login), "invalid login {login:?}");
     }
@@ -4775,6 +4846,8 @@ pub fn run<R: Rest, G: Transport>(
         outages: None,
         paces: None,
         envelope: None,
+        caps,
+        writes: 0,
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -11142,6 +11215,363 @@ mod tests {
         );
     }
 
+    /// A capped pass takes steps up to its caps and holds the rest whole,
+    /// writing nothing of them; a preview plans as many as an apply takes.
+    /// A fix round is a dispatch, a merge a write, each one step however
+    /// many requests it makes.
+    #[test]
+    fn caps_hold_whole_steps_past_their_limit() {
+        let numbers = [470, 471, 472];
+        let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
+        let green = json!({});
+        let fix = "fix: review requested changes";
+        let merge = "merge: review approved and checks green";
+        let limits = |dispatch, writes| caps::Limits { dispatch, writes };
+        // Name, each pull request's change, the caps, the step, how many are
+        // taken, and the dispatches and writes sent applying.
+        type Case<'a> = (
+            &'a str,
+            &'a Value,
+            caps::Limits,
+            &'a str,
+            usize,
+            usize,
+            usize,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "uncapped fix rounds",
+                &changes,
+                limits(None, None),
+                fix,
+                3,
+                3,
+                6,
+            ),
+            (
+                "one fix round",
+                &changes,
+                limits(Some(1), Some(0)),
+                fix,
+                1,
+                1,
+                2,
+            ),
+            (
+                "no fix round",
+                &changes,
+                limits(Some(0), None),
+                fix,
+                0,
+                0,
+                0,
+            ),
+            (
+                "a write cap leaves fix rounds",
+                &changes,
+                limits(None, Some(0)),
+                fix,
+                3,
+                3,
+                6,
+            ),
+            (
+                "one merge",
+                &green,
+                limits(Some(0), Some(1)),
+                merge,
+                1,
+                0,
+                1,
+            ),
+            ("two merges", &green, limits(None, Some(2)), merge, 2, 0, 2),
+        ];
+        for (name, change, limits, step, taken, dispatches, writes) in cases {
+            let mut fake = github();
+            fake.page(
+                &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                Some("\"p2\""),
+                None,
+                numbers
+                    .iter()
+                    .map(|n| json!({"number": n, "user": {"login": BOT}}))
+                    .collect(),
+            );
+            for n in numbers {
+                fake.page(
+                    &format!("repos/{REPO}/issues/{n}/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([]),
+                );
+                let mut change = change.clone();
+                change["number"] = n.into();
+                fake.pulls.insert(n, pull("pull-470", change));
+            }
+            let follow = [REPO.to_owned()];
+            for apply in [false, true] {
+                let dispatcher = Fake::default();
+                let applying = applying(&dispatcher).filter(|_| apply);
+                let caps = caps::Caps::new(limits);
+                let outcome = run_capped(
+                    &fake,
+                    &fake,
+                    &config(),
+                    State::default(),
+                    (&[], &follow),
+                    applying,
+                    Some(&caps),
+                    now(),
+                )
+                .unwrap();
+                let lines: Vec<&String> =
+                    outcome.lines.iter().filter(|l| l.contains(step)).collect();
+                assert_eq!(lines.len(), numbers.len(), "{name}: {:?}", outcome.lines);
+                let held: Vec<&&String> = lines
+                    .iter()
+                    .filter(|l| {
+                        l.ends_with(" -> held by --max-dispatch")
+                            || l.ends_with(" -> held by --max-writes")
+                    })
+                    .collect();
+                // The first steps are taken, the rest held.
+                assert_eq!(
+                    held.len(),
+                    numbers.len() - taken,
+                    "{name} {apply}: {lines:?}"
+                );
+                assert!(lines[taken..].iter().all(|l| held.contains(&l)), "{name}");
+                assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+                let summary = caps.summary();
+                let (dispatched, written) = match step == fix {
+                    true => (taken, 0),
+                    false => (0, taken),
+                };
+                assert!(
+                    summary.starts_with(&format!("summary: dispatched {dispatched}"))
+                        && summary.contains(&format!("writes {written}"))
+                        && summary.ends_with(&format!("held {}", numbers.len() - taken)),
+                    "{name}: {summary}"
+                );
+                let sent = (dispatcher.writes.borrow().len(), fake.writes.borrow().len());
+                match apply {
+                    true => assert_eq!(sent, (dispatches, writes), "{name}"),
+                    false => assert_eq!(sent, (0, 0), "{name}: a preview wrote"),
+                }
+                fake.writes.borrow_mut().clear();
+            }
+        }
+    }
+
+    /// Only the pull request steps are capped, so a pass with a limit set
+    /// refuses the poll's other writers rather than let them write uncapped.
+    /// An uncapped pass, as in Actions without flags, still has them.
+    #[test]
+    fn caps_refuse_the_polls_other_writers() {
+        let refusal = "caps cover pull request steps only";
+        let limits = |dispatch, writes| caps::Limits { dispatch, writes };
+        let writers = [
+            json!({"operatorComments": {"repositories": [REPO]}}),
+            json!({"notifications": {"reasons": ["comment"]}}),
+            json!({"operatorAnswers": true}),
+            json!({"lockCollaboratorItems": 1}),
+        ];
+        let follow = [REPO.to_owned()];
+        for policy in &writers {
+            for (limits, refused) in [
+                (limits(None, None), false),
+                (limits(Some(1), None), true),
+                (limits(None, Some(3)), true),
+                (limits(Some(0), Some(0)), true),
+            ] {
+                let fake = github();
+                let mut cfg = config();
+                cfg.policy = PollPolicy::from_json(policy).unwrap();
+                let caps = caps::Caps::new(limits);
+                let error = run_capped(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    (&[], &follow),
+                    None,
+                    Some(&caps),
+                    now(),
+                )
+                .err()
+                .map(|e| format!("{e:#}"));
+                match refused {
+                    true => assert!(
+                        error.as_deref().is_some_and(|e| e.starts_with(refusal)),
+                        "{policy} {limits:?}: {error:?}"
+                    ),
+                    false => assert_eq!(error, None, "{policy} {limits:?}"),
+                }
+            }
+        }
+    }
+
+    /// Every write step that is not a run is held by `--max-writes` before
+    /// its first write: a stop, a refund, a retitle and a retarget write
+    /// nothing once the cap is spent.
+    #[test]
+    fn write_steps_are_held_by_max_writes() {
+        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let marked = |fake: &mut Fake, state: Value| {
+            fake.rest.get_mut(&comments).unwrap().3 = json!([
+                {"id": 5, "user": {"login": BOT}, "body": marker_body(&state, "Fix round.")}
+            ]);
+        };
+        // Name, the step, and how the fake and the policy are set up for it.
+        type Setup<'a> = Box<dyn Fn(&mut Fake) -> Value + 'a>;
+        let cases: Vec<(&str, &str, Setup)> = vec![
+            (
+                "a draft with no checkpoint is a stop",
+                "needs-human: a draft with no checkpoint",
+                Box::new(|fake: &mut Fake| {
+                    fake.pulls.insert(
+                        470,
+                        pull(
+                            "pull-470",
+                            json!({"isDraft": true, "contexts": {"review": null}}),
+                        ),
+                    );
+                    json!({})
+                }),
+            ),
+            (
+                "a round a broker outage failed is refunded",
+                "refund: fix round 1's run",
+                Box::new(|fake: &mut Fake| {
+                    fake.pulls.insert(
+                        470,
+                        pull(
+                            "pull-470",
+                            json!({"contexts": {"review": {"state": "FAILURE"}}}),
+                        ),
+                    );
+                    marked(fake, json!({"rounds": 1, "sha": HEAD, "run": 7}));
+                    fake.page(
+                        "repos/cgwalters-forge/tracker/actions/runs/7",
+                        None,
+                        None,
+                        json!({"status": "completed", "conclusion": "failure", "updated_at": "2026-10-12T01:55:00Z"}),
+                    );
+                    let issues = format!(
+                        "{API_ROOT}repos/cgwalters-forge/tracker/issues?labels=outage&per_page=30"
+                    );
+                    fake.rest.insert(
+                        format!("{issues}&state=open"),
+                        (None, None, None, json!([])),
+                    );
+                    fake.rest.insert(
+                        format!("{issues}&state=closed&since=2026-10-10T02:00:00Z"),
+                        (None, None, None, json!([{"number": 9, "state": "closed",
+                            "created_at": "2026-10-12T01:50:00Z", "closed_at": "2026-10-12T01:59:50Z",
+                            "user": {"login": BOT}, "body": format!("{OUTAGE_MARKER}\nBroker unreachable.")}])),
+                    );
+                    json!({"brokerOutage": {"repository": "cgwalters-forge/tracker", "author": BOT, "leadSeconds": 600}})
+                }),
+            ),
+            (
+                "a completed round is retitled",
+                "retitle:",
+                Box::new(|fake: &mut Fake| {
+                    let mut change = json!({"title": "[partial: stopped at a limit] Agent run 7", "body": "**Partial work.** Stopped."});
+                    change["commits"] = pull("pull-470", json!({}))["commits"].clone();
+                    change["commits"]["nodes"][0]["commit"]["message"] =
+                        "docs: Explain it\n\nSay why.\n".into();
+                    fake.pulls.insert(470, pull("pull-470", change));
+                    marked(
+                        fake,
+                        json!({"rounds": 0, "continued": 1, "continuing": true, "sha": "older"}),
+                    );
+                    json!({"continuation": {"retitle": true}})
+                }),
+            ),
+            (
+                "a stack whose lower pull request merged is retargeted",
+                "retarget: stacked on dispatch/469",
+                Box::new(|fake: &mut Fake| {
+                    fake.pulls.insert(
+                        470,
+                        pull("pull-470", json!({"baseRefName": "dispatch/469"})),
+                    );
+                    fake.lower = vec![
+                        json!({"number": 469, "state": "MERGED", "baseRefName": "main",
+                        "author": {"login": BOT}, "isCrossRepository": false}),
+                    ];
+                    for path in ["rules/branches", "branches"] {
+                        let main =
+                            fake.rest[&format!("{API_ROOT}repos/{REPO}/{path}/main")].clone();
+                        fake.rest.insert(
+                            format!("{API_ROOT}repos/{REPO}/{path}/dispatch%2F469"),
+                            main,
+                        );
+                    }
+                    json!({})
+                }),
+            ),
+        ];
+        let follow = [REPO.to_owned()];
+        for (name, step, setup) in cases {
+            let mut fake = github();
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(&setup(&mut fake)).unwrap();
+            let dispatcher = Fake::default();
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: None,
+                writes: Some(0),
+            });
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &follow),
+                applying(&dispatcher),
+                Some(&caps),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            let line = outcome.lines.last().unwrap();
+            assert!(
+                line.contains(step) && line.ends_with(" -> held by --max-writes"),
+                "{name}: {line}"
+            );
+            assert_eq!(written(&fake.writes), Vec::<String>::new(), "{name}");
+            assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            assert_eq!(
+                caps.summary(),
+                "summary: dispatched 0, writes 0/0, held 1",
+                "{name}"
+            );
+        }
+    }
+
+    /// The steps that write nothing are not capped; runs are dispatches,
+    /// and every other step is a write, an action added later included.
+    #[test]
+    fn step_kind_table() {
+        use caps::Kind::{Dispatch, Write};
+        for (action, kind) in [
+            ("skip", None),
+            ("wait", None),
+            ("fix", Some(Dispatch)),
+            ("continue", Some(Dispatch)),
+            ("rebase", Some(Dispatch)),
+            ("answer", Some(Dispatch)),
+            ("merge", Some(Write)),
+            ("refund", Some(Write)),
+            ("needs-human", Some(Write)),
+            ("retitle", Some(Write)),
+            ("some-new-step", Some(Write)),
+        ] {
+            assert_eq!(step_kind(action), kind, "{action}");
+        }
+    }
+
     #[test]
     fn fix_task_table() {
         let changes = json!({"review": {"state": "FAILURE"}});
@@ -11427,6 +11857,8 @@ mod tests {
             outages: None,
             paces: None,
             envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),
+            caps: None,
+            writes: 0,
         };
         let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();

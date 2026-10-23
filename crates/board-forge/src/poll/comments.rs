@@ -2774,6 +2774,8 @@ pub(super) mod tests {
                 outages: None,
                 paces: None,
                 envelope: None,
+                caps: None,
+                writes: 0,
             };
             let events = "repos/upstream/app/issues/7/events?per_page=100";
             fake.page(

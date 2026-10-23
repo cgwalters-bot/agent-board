@@ -36,7 +36,7 @@ output and the forge.
 After a deployment moves its pinned agent-board revision, the supervisor's
 next audit reads what changed between the pins, exercises it with a
 `pass --record` preview against the previous recording (and, for new writes,
-one capped apply; the cap flags are planned, not built), and reports what it
+one apply with `--max-dispatch 1` and a small `--max-writes`), and reports what it
 saw to the operator, recommending a rollback of the pin if it misbehaves.
 
 Why: a scheduler should be boring and replayable, and judgment should not
@@ -120,8 +120,8 @@ These are not decided; the pass spec leaves them as they are today or open.
 * **What counts as an infrastructure failure.** The rerun needs a fixed
   rule for telling the runner, broker or forge failing apart from the agent's
   own work failing, from the facts a run leaves.
-* **Cap numbers.** Each kind of write has a per-pass cap, but no numbers are
-  set yet.
+* **Cap numbers.** A pass takes `--max-dispatch` and `--max-writes`, unset
+  by default; what the scheduled pass should pass is not set yet.
 * **First-party bookkeeping for PR follow-up.** What poll's hidden fix-claim
   and round markers become in first-party repositories, where state should
   be a readable line with machine detail alongside.

@@ -24,7 +24,15 @@ fn config(edit: Value) -> Config {
 }
 
 fn preview(config: &Config, replay: &Replay) -> Report {
-    run(replay, replay, config, State::default(), None, replay.now).unwrap()
+    run(
+        replay,
+        replay,
+        config,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        replay.now,
+    )
+    .unwrap()
 }
 
 /// The recorded answer to the request whose JSON contains `needle`.
@@ -618,7 +626,7 @@ fn apply(forge: &Forge, config: &Config) -> Report {
         forge,
         config,
         State::default(),
-        Some(&own()),
+        (Mode::Actions(&own()), Limits::default()),
         forge.replay.now,
     )
     .unwrap()
@@ -657,7 +665,12 @@ fn apply_stops_at_its_time_bound() {
         &forge,
         &forge,
         &config,
-        (State::default(), Some(&own()), forge.replay.now),
+        (
+            State::default(),
+            Mode::Actions(&own()),
+            Limits::default(),
+            forge.replay.now,
+        ),
         &Bounds::new(PASS_REQUEST_LIMIT, past),
     )
     .unwrap();
@@ -734,6 +747,85 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
         second.lines.last().unwrap(),
         "idle: 6 slot(s) free and nothing started"
     );
+}
+
+/// `--max-dispatch` starts the first runs the pass would and holds the rest,
+/// a line each, writing nothing for them; a preview of the recorded board
+/// plans what a local apply over it starts. A start is a dispatch, not a
+/// write, so `--max-writes` leaves it.
+#[test]
+fn caps_hold_starts_past_max_dispatch() {
+    let starts: Vec<&str> = STARTED
+        .iter()
+        .filter(|l| l.starts_with("start "))
+        .copied()
+        .collect();
+    let config = config(json!({}));
+    let limits = |dispatch, writes| Limits { dispatch, writes };
+    for (limits, started, summary) in [
+        (
+            limits(None, None),
+            6,
+            "summary: dispatched 6, writes 0, held 0",
+        ),
+        (
+            limits(Some(1), Some(0)),
+            1,
+            "summary: dispatched 1/1, writes 0/0, held 5",
+        ),
+        (
+            limits(Some(0), Some(3)),
+            0,
+            "summary: dispatched 0/0, writes 0/3, held 6",
+        ),
+        (
+            limits(None, Some(0)),
+            6,
+            "summary: dispatched 6, writes 0/0, held 0",
+        ),
+    ] {
+        let replay = replay();
+        let preview = (Mode::Preview, limits);
+        let preview = run(
+            &replay,
+            &replay,
+            &config,
+            State::default(),
+            preview,
+            replay.now,
+        );
+        let forge = Forge::new(None, false);
+        let local = (Mode::Local, limits);
+        let applied = run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            local,
+            forge.replay.now,
+        );
+        for report in [preview.unwrap(), applied.unwrap()] {
+            let held: Vec<&str> = report
+                .lines
+                .iter()
+                .filter_map(|l| l.strip_prefix("held by --max-dispatch: "))
+                .collect();
+            assert_eq!(held, starts[started..], "{limits:?}: {:#?}", report.lines);
+            let begun = report.lines.iter().filter(|l| l.starts_with("start "));
+            assert_eq!(begun.count(), started, "{limits:?}");
+            assert_eq!(report.summary, summary);
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        }
+        let issue = |line: &str| line.split(' ').nth(2).unwrap().to_owned();
+        let expected: Vec<String> = starts[..started].iter().map(|l| issue(l)).collect();
+        assert_eq!(forge.dispatches(), expected, "{limits:?}");
+        for held in &starts[started..] {
+            let held = issue(held);
+            let (repo, number) = held.split_once('#').unwrap();
+            let comments = forge.comments_on(repo, number.parse().unwrap());
+            assert!(comments.is_empty(), "{held} was written: {comments:#?}");
+        }
+    }
 }
 
 /// A pass interrupted at each write boundary: the failure shows, the slot
@@ -929,7 +1021,12 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
             &forge,
             &forge,
             &config,
-            (State::default(), Some(&own()), forge.replay.now),
+            (
+                State::default(),
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.replay.now,
+            ),
             &Bounds::new(limit, admit_by),
         )
         .unwrap();

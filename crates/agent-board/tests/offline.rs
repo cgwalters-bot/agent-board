@@ -2127,6 +2127,10 @@ fn pass_replay_previews_without_credentials() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.starts_with("pass: preview\n"), "{text}");
     assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
+    assert!(
+        text.ends_with("\nsummary: dispatched 6, writes 0, held 0\n"),
+        "{text}"
+    );
     for refused in [
         vec!["--apply"],
         vec!["--owner", "example"],
@@ -2144,4 +2148,57 @@ fn pass_replay_previews_without_credentials() {
     let output = command().args(unknown).current_dir(root).assert().code(1);
     let error = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
+}
+
+/// Outside GitHub Actions, `pass --apply` needs both caps, and is refused
+/// before any token is read without them; with them, it warns that it is
+/// not serialized. Inside Actions it still needs its run.
+#[test]
+fn pass_local_apply_needs_both_caps() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let apply = ["pass", "--config", "fixtures/pass/config.json", "--apply"];
+    let local = "--apply outside GitHub Actions needs both --max-dispatch and --max-writes";
+    let warning = "warning: applying outside GitHub Actions, not serialized against the scheduled workflow's passes";
+    // Extra arguments, whether in Actions, the exit code, the error and
+    // stdout's lines. Past the gate, the next refusal is the missing token.
+    type Case<'a> = (&'a [&'a str], bool, i32, &'a str, &'a [&'a str]);
+    let cases: &[Case] = &[
+        (&[], false, 1, local, &[]),
+        (&["--max-dispatch", "1"], false, 1, local, &[]),
+        (&["--max-writes", "3"], false, 1, local, &[]),
+        (
+            &["--max-dispatch", "1", "--max-writes", "3"],
+            false,
+            4,
+            "GH_TOKEN",
+            &["pass: apply", warning],
+        ),
+        (
+            &["--max-dispatch", "1", "--max-writes", "3"],
+            true,
+            1,
+            "--apply runs in a GitHub Actions run, which sets GITHUB_REPOSITORY",
+            &[],
+        ),
+    ];
+    for (args, actions, code, error, stdout) in cases {
+        let mut command = command();
+        command
+            .args(apply)
+            .args(*args)
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GITHUB_REPOSITORY")
+            .env_remove("GITHUB_RUN_ID")
+            .env_remove("GITHUB_ACTIONS");
+        if *actions {
+            command.env("GITHUB_ACTIONS", "true");
+        }
+        let output = command.assert().code(*code).get_output().clone();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(err.contains(error), "{args:?}: {err}");
+        let out = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(out.lines().collect::<Vec<_>>(), *stdout, "{args:?}");
+    }
 }

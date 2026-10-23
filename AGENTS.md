@@ -4,7 +4,8 @@ agent-board is a Rust CLI for a forge-hosted work board; start with the
 [site's landing page](site/index.md) for its purpose and the
 [setup](docs/setup.md) for its quickstart.
 `agent-board pass --apply` makes its own deterministic writes directly, behind
-preview by default and replay tests, with per-operation caps planned; agent
+preview by default, replay tests and the per-pass caps `--max-dispatch` and
+`--max-writes`; agent
 output goes through agentic-job's independent check and apply
 ([architecture](docs/architecture.md#writes)).
 Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)

@@ -491,6 +491,8 @@ mod tests {
             outages: None,
             paces: None,
             envelope: None,
+            caps: None,
+            writes: 0,
         };
         let mut outcome = Outcome::default();
         let repo = REPO.to_owned();

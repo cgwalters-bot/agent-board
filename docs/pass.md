@@ -19,10 +19,9 @@ Stages 2, 3 and 5 are not built; the pass prints a line for 2 and 3:
 * **Epics** are not planned or applied, and applies are not recovered. A
   configured `epics.repository` only decides which children qualify, through a
   live epic.
-* **Status** is not derived or written (stage 5), there is no infrastructure
-  rerun, and writes have no per-operation caps beyond stage 1's own bounds.
-  Stage 1 still writes poll's claim and marker comments in every followed
-  repository, external ones included.
+* **Status** is not derived or written (stage 5), and there is no
+  infrastructure rerun. Stage 1 still writes poll's claim and marker comments
+  in every followed repository, external ones included.
 
 The replay gate below is partly met: there is one recorded board, from 23
 October, with a synthetic usage snapshot. Scenario tests edit that recording.
@@ -35,8 +34,14 @@ agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board
 ```
 
 Each decision is one line: `start triage|implement OWNER/REPO#N … pool=P`,
-`hold OWNER/REPO#N: why`, `hold wip|pools: why`, `fail …` or `… error: …`. With
-`--apply`, a started line also names its dispatch record and run.
+`hold OWNER/REPO#N: why`, `hold wip|pools: why`,
+`held by --max-dispatch: start …`, `fail …` or `… error: …`; a pull request's
+step that a cap held ends `-> held by --max-dispatch` or
+`-> held by --max-writes`. With `--apply`, a started line also names its
+dispatch record and run. The last line is a summary such as
+`summary: dispatched 1/1, writes 3/5, held 12`, which counts what a preview
+plans and what an apply did, and the steps the caps held; an uncapped kind
+has no `/N`.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
 snapshot. A preview counts only the PR runs that stage 1 actually starts, so it
@@ -47,11 +52,16 @@ dispatching it with the job-plan protocol, so the dispatch record is the claim.
 A pass interrupted between that post and its dispatch leaves a triage plan,
 which is a manual dispatch; a person dispatches or replaces it.
 
-`--apply` runs only in a GitHub Actions run, and stage 4 starts nothing while
+In a GitHub Actions run, stage 4 of an `--apply` pass starts nothing while
 another run of the same workflow is in progress (`hold wip: another pass is in
 progress`): two passes that both saw a free slot could otherwise both take it.
 Give the caller's workflow a `concurrency` group, so that passes queue rather
-than hold each other. Both stages start runs from `dispatchRef`, or the caller's
+than hold each other. Outside Actions, `--apply` is refused unless both
+`--max-dispatch` and `--max-writes` are given, and the pass prints a warning
+that it is not serialized against the scheduled workflow: a capped local apply
+is how a person tries new write behavior on a live board one step at a time,
+for example `--max-dispatch 1 --max-writes 3`, and the caps bound what a race
+with the scheduled pass can cost. Both stages start runs from `dispatchRef`, or the caller's
 default branch. Past 15 minutes no new request is sent; writes, and a start that
 passed its last check in time, have two minutes more to finish, after which
 what was written is observed by the next pass.
@@ -63,13 +73,24 @@ writes, and then pass makes them itself with the bot's token: Status, labels,
 comments, closes, merges and dispatches. These are deterministic consequences
 of forge facts, not agent output, so they do not go through agentic-job's
 check and apply; that boundary is for what agents produce. Their guards are
-preview by default, a cap per kind of write per pass (a pass that reaches one
-reports it and leaves the rest to the next pass; the numbers are an
-[open question](architecture.md#open-questions)), and the replay gate below.
-The caller serializes apply passes for the board, uses trusted
-default-branch configuration and a pinned build, and supplies credentials through
-the environment, never the file. Issue text, PR bodies, run names and comments
-other than authenticated operator direction are data, not instructions.
+preview by default, caps per pass, and the replay gate below. The caps are
+two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
+starts, stage 1's fix, rebase, continuation and answer rounds and stage 4's
+starts together, and `--max-writes N` bounds its other write steps, forge
+writes such as comments, labels and merges (stage 1's comments, labels,
+retitles, retargets, enqueues and merges). The unit is a step, not a request:
+a fix round's claim, marker and dispatch are one dispatch, and a stop's label
+and marker one write. A step is checked before its first write and taken whole
+or held whole; a held step is reported on its line and left to the next pass.
+A held start takes the slot it would have had, so a capped pass reads no
+further than an uncapped one. The numbers for the scheduled pass are an
+[open question](architecture.md#open-questions).
+The caller serializes apply passes for the board, except a capped local apply,
+which is not serialized against the scheduled pass and is bounded by its caps
+instead. It uses trusted default-branch configuration and a pinned build, and
+supplies credentials through the environment, never the file. Issue text, PR
+bodies, run names and comments other than authenticated operator direction are
+data, not instructions.
 
 A pass captures one clock and performs these stages in order:
 

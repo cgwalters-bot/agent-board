@@ -9,6 +9,7 @@
 //! usage snapshot another job publishes, and says so on a line, and epics
 //! only decide which children qualify.
 use crate::batch;
+use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
 use crate::github::{API_ROOT, DEFAULT_HOST, Transport, is_github_login};
 use crate::overlap::{self, Decision};
@@ -849,11 +850,13 @@ impl<C: Transport> Transport for Budget<'_, C> {
 
 // ---- One pass ----
 
-/// What a pass did: a line per decision, how many operations failed, and
-/// the poll's state for the next applying pass.
+/// What a pass did: a line per decision, a summary of what it dispatched,
+/// wrote and held by its caps ([`Caps::summary`]), how many operations
+/// failed, and the poll's state for the next applying pass.
 #[derive(Default)]
 pub struct Report {
     pub lines: Vec<String>,
+    pub summary: String,
     pub failures: usize,
     pub state: Option<State>,
 }
@@ -870,20 +873,40 @@ pub struct PassRun {
     pub id: u64,
 }
 
-/// One pass at `now`. `client` reads and writes as the bot; `dispatcher`
-/// starts runs. Without `apply`, the run it is in, nothing is written or
+/// Whether a pass writes, and how it is kept from racing another.
+#[derive(Clone, Copy)]
+pub enum Mode<'a> {
+    /// Nothing is written or dispatched.
+    Preview,
+    /// Applying in a GitHub Actions run, which starts work only while no
+    /// other run of its workflow is in progress ([`PassRun`]).
+    Actions(&'a PassRun),
+    /// Applying outside GitHub Actions, as a person testing a change does:
+    /// not serialized against the scheduled workflow, so the CLI allows it
+    /// only with both caps.
+    Local,
+}
+
+/// One pass at `now` within `limits`. `client` reads and writes as the bot;
+/// `dispatcher` starts runs. In [`Mode::Preview`], nothing is written or
 /// dispatched.
 pub fn run<C: Rest + Transport>(
     client: &C,
     dispatcher: &C,
     config: &Config,
     state: State,
-    apply: Option<&PassRun>,
+    (mode, limits): (Mode, Limits),
     now: OffsetDateTime,
 ) -> Result<Report> {
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
-    run_within(client, dispatcher, config, (state, apply, now), &bounds)
+    run_within(
+        client,
+        dispatcher,
+        config,
+        (state, mode, limits, now),
+        &bounds,
+    )
 }
 
 /// [`run`] within `bounds` rather than [`PASS_REQUEST_LIMIT`] and
@@ -892,10 +915,35 @@ fn run_within<C: Rest + Transport>(
     client: &C,
     dispatcher: &C,
     config: &Config,
-    (state, own, now): (State, Option<&PassRun>, OffsetDateTime),
+    (state, mode, limits, now): (State, Mode, Limits, OffsetDateTime),
     bounds: &Bounds,
 ) -> Result<Report> {
-    let apply = own.is_some();
+    let caps = Caps::new(limits);
+    let mut report = stages(
+        client,
+        dispatcher,
+        config,
+        (state, mode, now),
+        bounds,
+        &caps,
+    );
+    report.summary = caps.summary();
+    Ok(report)
+}
+
+fn stages<C: Rest + Transport>(
+    client: &C,
+    dispatcher: &C,
+    config: &Config,
+    (state, mode, now): (State, Mode, OffsetDateTime),
+    bounds: &Bounds,
+    caps: &Caps,
+) -> Report {
+    let (apply, own) = match mode {
+        Mode::Preview => (false, None),
+        Mode::Actions(own) => (true, Some(own)),
+        Mode::Local => (true, None),
+    };
     let mut report = Report::default();
     let client = Budget {
         inner: client,
@@ -914,7 +962,7 @@ fn run_within<C: Rest + Transport>(
             Err(error) => {
                 report.failures += 1;
                 report.lines.push(format!("dispatch ref error: {error:#}"));
-                return Ok(report);
+                return report;
             }
         },
     };
@@ -930,14 +978,14 @@ fn run_within<C: Rest + Transport>(
             git_ref: Some(git_ref.clone()),
         });
         let follow = &config.follow;
-        match poll::run(
+        match poll::run_capped(
             &client,
             &client,
             &config.poll(),
             state,
-            follow,
-            follow,
+            (follow, follow),
             apply,
+            Some(caps),
             now,
         ) {
             Ok(outcome) => {
@@ -971,6 +1019,7 @@ fn run_within<C: Rest + Transport>(
         now,
         apply,
         own,
+        caps,
         report: &mut report,
         epics: BTreeMap::new(),
     };
@@ -978,7 +1027,7 @@ fn run_within<C: Rest + Transport>(
         report.failures += 1;
         report.lines.push(format!("schedule error: {error:#}"));
     }
-    Ok(report)
+    report
 }
 
 fn default_branch(client: &impl Rest, repo: &str) -> Result<String> {
@@ -1000,6 +1049,10 @@ enum Step {
     /// A run started, or was sent and may have started: its slot is taken.
     Started(String, Vec<ItemRef>),
     Failed(String, Vec<ItemRef>),
+    /// A start `--max-dispatch` held, with nothing written: its line. It
+    /// takes the slot it would have had, so the pass reads no further than
+    /// it would have without the cap.
+    Capped(String),
 }
 
 /// What holds a slot or an issue besides the runs a listing shows.
@@ -1037,7 +1090,9 @@ struct Scheduler<'a, C> {
     config: &'a Config,
     now: OffsetDateTime,
     apply: bool,
+    /// The run it is in, where it applies in GitHub Actions.
     own: Option<&'a PassRun>,
+    caps: &'a Caps,
     report: &'a mut Report,
     /// Whether each parent read is a live epic, or why that is unknown.
     epics: BTreeMap<String, std::result::Result<bool, String>>,
@@ -1058,7 +1113,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.line("schedule: off (wip 0 or no workRepositories)".into());
             return Ok(());
         }
-        if let Some(own) = self.own {
+        if self.apply {
             // Only a writer's plans count: another account's triage plan
             // would be passed over, and posted again on every pass.
             let login = plan::viewer(&self.client)?;
@@ -1068,12 +1123,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     .any(|w| w.eq_ignore_ascii_case(&login)),
                 "{login} is not a plan writer; apply with the operator's or the bot's token"
             );
-            if let Some(other) = self.overlapping(own)? {
-                self.line(format!(
-                    "hold wip: another pass is in progress, {other}; it takes the free slots"
-                ));
-                return Ok(());
-            }
+        }
+        // A local apply is not serialized; the CLI caps it instead.
+        if let Some(own) = self.own
+            && let Some(other) = self.overlapping(own)?
+        {
+            self.line(format!(
+                "hold wip: another pass is in progress, {other}; it takes the free slots"
+            ));
+            return Ok(());
         }
         let target = config.target(git_ref);
         target.validate()?;
@@ -1146,9 +1204,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     free = 0;
                     break;
                 }
+                Step::Capped(line) => {
+                    self.line(line);
+                    free -= 1;
+                    continue;
+                }
                 Step::Started(line, holds) => (line, holds, false),
                 Step::Failed(line, holds) => (line, holds, true),
             };
+            // Sent or planned: a failed start may have dispatched.
+            self.caps.count(Kind::Dispatch);
             if failed {
                 self.report.failures += 1;
             }
@@ -1667,7 +1732,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             issue.display()
         );
         let holds = vec![issue.clone(), dest.clone()];
-        if !self.apply {
+        // A start the cap holds is judged as a preview judges it, so that it
+        // is held by the cap only where it would have started.
+        if !self.apply || self.caps.full(Kind::Dispatch) {
             // What the dispatch would decide, read but not written.
             let bot = Some(config.bot.as_str());
             let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
@@ -1687,7 +1754,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return Ok(Step::Hold(decision.sentence()));
                 }
             }
-            return Ok(Step::Started(line, holds));
+            return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
         }
         if let Some(step) = self.recheck(slots, issue, &dest, target)? {
             return Ok(step);
@@ -1707,6 +1774,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             options,
         );
         Ok(self.dispatched(line, holds, done))
+    }
+
+    /// `line`'s start held by `--max-dispatch`, checked before anything of
+    /// it is written; none where it may go ahead.
+    fn capped(&self, line: &str) -> Option<Step> {
+        let held = self.caps.check(Kind::Dispatch)?;
+        Some(Step::Capped(format!("{held}: {line}")))
     }
 
     /// A run's outcome as a step: no record is a wait, with nothing written.
@@ -1754,6 +1828,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let line = format!("start triage {} pool={pool}", issue.display());
         let holds = vec![issue.clone()];
+        if let Some(step) = self.capped(&line) {
+            return Ok(step);
+        }
         if !self.apply {
             return Ok(Step::Started(line, holds));
         }
