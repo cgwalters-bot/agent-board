@@ -8,6 +8,11 @@ forge_actions := env("FORGE_ACTIONS", "../actions")
 lint:
     {{ just_executable() }} --justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check
 
+# docs/cli.md, the CLI reference, from the binary's own help; a test
+# fails when the committed copy is stale.
+cli-docs:
+    cargo run --locked -q -p agent-board -- help-markdown > docs/cli.md
+
 # NODE_PATH must provide Ajv 8, the review site's JSON Schema validator.
 test-action-schema:
     node tests/operator-actions.cjs

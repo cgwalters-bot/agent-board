@@ -2085,3 +2085,15 @@ fn supervise_offline_table() {
         .code(1);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn cli_reference_is_current() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/cli.md");
+    let output = command().arg("help-markdown").assert().success();
+    let generated = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let committed = std::fs::read_to_string(path).unwrap_or_default();
+    assert!(
+        generated == committed,
+        "docs/cli.md does not match `agent-board help-markdown`; regenerate it with `just cli-docs`"
+    );
+}

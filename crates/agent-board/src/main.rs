@@ -1,6 +1,7 @@
 mod action;
 mod apps;
 mod ask;
+mod cli_docs;
 mod decisions;
 mod dispatch;
 mod epic;
@@ -145,6 +146,9 @@ enum Command {
         #[command(subcommand)]
         command: Test,
     },
+    /// Print this CLI's reference as Markdown (docs/cli.md).
+    #[command(hide = true)]
+    HelpMarkdown,
 }
 
 #[derive(Subcommand)]
@@ -418,6 +422,12 @@ fn execute(cli: Cli) -> Result<()> {
     );
     board(&cli)?;
     match &cli.command {
+        Command::HelpMarkdown => {
+            use clap::CommandFactory;
+            io::stdout()
+                .write_all(cli_docs::markdown(Cli::command()).as_bytes())
+                .context("write CLI reference")
+        }
         Command::Action {
             command: Action::Check(args),
         } => {
