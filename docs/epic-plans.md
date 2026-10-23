@@ -56,7 +56,7 @@ structural format; runtime checks also enforce the bounds and relationships belo
 
 | `type` | Fields | Mutations |
 |---|---|---|
-| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan`, `stacks_on` | Create the issue, link it to the epic, enroll it in the project with configured default Priority, and post `plan` as a job plan |
+| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan`, `stacks_on` | Create the issue, link it to the epic, enroll it in the project with its Priority, and post `plan` as a job plan |
 | `close_sub_issue` | `issue`, `reason` | Comment the reason, close as not planned |
 | `rescope_sub_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason |
 | `set_priority` | `issue` or `new`, `value` | Set the board's Priority |
@@ -212,13 +212,14 @@ once added to `epic` (which takes write access) would also pass. It covers
 ([supervisor](supervisor-requests.md)).
 
 `planner` is optional and defaults to `bot`. IDs and names are configuration,
-not planner-controlled values. Creating an issue sets the default Priority; a
-later `set_priority` can override it. The
+not planner-controlled values. A new sub-issue gets its Priority once, as it is
+created: the plan's `set_priority` of it, else `default_priority`; not the
+default and then a second change. The
 configured field must be a single-select field. The bot needs issue write and
 project write access. Neither command dispatches a job or changes Status.
 
 To prevent duplicate creation after a partial or ambiguous write, apply posts
-an `<!-- agent-board-epic-apply: COMMENT-ID@CHANGE-TIME -->` claim before any
+its receipt, which claims the plan `COMMENT-ID@CHANGE-TIME`, before any
 mutation and reads it back, as job dispatch does. The oldest claim wins; only
 operator/bot-authored claims count, not a separate planner's. Callers must
 serialize apply passes, since GitHub comment reads are not a transactional
@@ -230,12 +231,52 @@ plan still refuses it; accepted edits identify a new plan.
 Apply stops on the first failed request, records each confirmed write (including
 partial actions), and retains the claim. No rollback or automatic retry occurs.
 Inspect a failed or interrupted run and edit/replace the plan to continue.
-Failure to update the claim or post status is also an error, not permission to
-retry. Claim deletion by a repository writer can enable replay, as for dispatch.
+Failure to update the receipt is also an error, not permission to retry.
+Receipt deletion by a repository writer can enable replay, as for dispatch.
 
-A dated status comment lists confirmed changes. Its hidden first line is
-`<!-- agent-board-epic-fingerprint: JSON -->`, where JSON is the sorted list of
-`[lowercase OWNER/REPO#N, OPEN-or-CLOSED]` pairs for all current sub-issues.
-`epic_apply::fingerprint` exposes this canonical representation for a future
-census. It detects membership/state drift, not body or Priority drift; no census
-consumer is implemented in this slice. A failed final read cannot publish status.
+The receipt is one comment on the epic, readable first: what the apply did,
+one line per sub-issue with its final state, then one fenced
+`agent-board-epic-apply` block with the machine detail. It is updated after
+each new sub-issue is created, so an apply cut short still names what it
+made, and once more when the apply ends:
+
+````markdown
+<!-- agent-board-epic-apply: 1@2026-10-23T13:34:49Z -->
+Applied [this epic plan](https://github.com/OWNER/REPO/issues/7#issuecomment-1) at 2026-10-23T13:41:30Z.
+
+- Created [agentic-job#715](https://github.com/OWNER/agentic-job/issues/715) (P0)
+- Closed #611 as not planned
+
+```agent-board-epic-apply
+{
+  "schema": "agent-board/epic-apply/v1",
+  "plan": "1@2026-10-23T13:34:49Z",
+  "outcome": "applied",
+  "actions": [
+    {"action": 1, "type": "create_sub_issue", "issue": "OWNER/agentic-job#715",
+     "priority": "P0", "writes": ["create", "link", "priority", "comment"]},
+    {"action": 2, "type": "set_priority", "issue": "OWNER/agentic-job#715",
+     "priority": "P0", "writes": ["folded"]},
+    {"action": 3, "type": "close_sub_issue", "issue": "OWNER/REPO#611",
+     "writes": ["comment", "patch"]}
+  ],
+  "fingerprint": [["owner/agentic-job#715", "OPEN"], ["owner/repo#611", "CLOSED"]]
+}
+```
+````
+
+`outcome` is `claimed` (under way, or cut short before it could say),
+`applied`, `stopped` (a request failed) or `recovered` (cut short, and every
+action's effect later proved by [`agent-board pass`](pass.md#what-is-built)
+from the identities the receipt confirmed). `fingerprint` is the sorted list
+of `[lowercase OWNER/REPO#N, OPEN-or-CLOSED]` pairs for all sub-issues once the
+apply ended (absent where that read failed): membership and state, not body or
+Priority. `writes` names the requests confirmed; `folded` is a new sub-issue's
+Priority, set by its create's own write. A sub-issue the apply created is
+named only by the identity its create returned, never found by its title.
+The hidden first line is the older receipts' claim, kept so that an earlier
+build sees it too. Older receipts, that line with a separate
+`<!-- agent-board-epic-fingerprint: JSON -->` comment, are still read as
+claims and receipts. A comment by the operator or the bot that looks like a
+receipt but cannot be read, or that anyone else edited, claims every plan:
+apply refuses until a person inspects it.

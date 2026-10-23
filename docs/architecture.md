@@ -25,8 +25,8 @@ decisions both follow. Where an older page disagrees, this one wins.
 `agent-board pass` is the heartbeat: a cron runs it, it finishes once, and the
 same facts give the same decisions. One pass follows pull requests (the
 standalone `poll` becomes this stage of pass rather than a separate command),
-refreshes usage, plans epics, derives Status and schedules new work (stages 2
-and 3 are not built yet; see [what is built](pass.md#what-is-built)).
+refreshes usage, plans epics, derives Status and schedules new work (stage 2
+is not built yet; see [what is built](pass.md#what-is-built)).
 
 The supervisor is an agent that answers "is the system working?". It audits
 individual pieces of work from time to time and is who the operator talks to.
@@ -45,8 +45,8 @@ compete with it for the same decisions.
 ## Writes
 
 `agent-board pass --apply` makes its own writes directly; agentic-job's
-independent check and apply is for what an agent produces (stages 2 and 3
-are not built yet; see [what is built](pass.md#what-is-built)). Guards and
+independent check and apply is for what an agent produces (stage 2 is not
+built yet; see [what is built](pass.md#what-is-built)). Guards and
 caps are in [order and effects](pass.md#order-and-effects).
 
 Why: the pass's writes follow from forge facts by fixed rules, so a second

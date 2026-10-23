@@ -36,7 +36,7 @@ const LABEL_LIMIT: usize = 10;
 /// GitHub allows 100 sub-issues per parent, so they fit in one page.
 pub const SUB_ISSUE_LIMIT: usize = 100;
 
-const SUB_ISSUES_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+pub(crate) const SUB_ISSUES_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       id

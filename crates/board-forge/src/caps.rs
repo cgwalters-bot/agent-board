@@ -96,7 +96,16 @@ impl Caps {
     /// Before a step of `kind`: `None` where it may go ahead, else the
     /// words for its line, `held by --max-…`, and it is counted as held.
     pub fn check(&self, kind: Kind) -> Option<String> {
-        self.full(kind).then(|| {
+        self.check_many(kind, 1)
+    }
+
+    /// [`Caps::check`] for `n` steps of `kind` that are taken together or
+    /// not at all, such as an epic plan's apply: one held step if they do
+    /// not all fit.
+    pub fn check_many(&self, kind: Kind, n: usize) -> Option<String> {
+        let (spent, limit) = self.of(kind);
+        let held = limit.is_some_and(|limit| spent.get().saturating_add(n) > limit);
+        held.then(|| {
             self.held.set(self.held.get() + 1);
             format!("held by {}", kind.flag())
         })
@@ -104,8 +113,13 @@ impl Caps {
 
     /// A step of `kind` that went ahead and wrote, or that a preview plans.
     pub fn count(&self, kind: Kind) {
+        self.count_many(kind, 1);
+    }
+
+    /// `n` steps of `kind` that went ahead together ([`Caps::check_many`]).
+    pub fn count_many(&self, kind: Kind, n: usize) {
         let (spent, _) = self.of(kind);
-        spent.set(spent.get() + 1);
+        spent.set(spent.get() + n);
     }
 
     /// The pass's last line: `summary: dispatched 1/1, writes 3/5, held 12`,

@@ -339,7 +339,12 @@ fn weighed(c: &Comment, writers: &[&str], fence: &str) -> bool {
 /// Whether no comment holds a plan for [`newest_plan`] to weigh, as against
 /// a newest plan that is invalid, which is never read as no plan.
 pub fn no_plan(comments: &[Comment], writers: &[&str]) -> bool {
-    !comments.iter().any(|c| weighed(c, writers, PLAN_FENCE))
+    no_fenced(comments, writers, PLAN_FENCE)
+}
+
+/// [`no_plan`] for any `fence`, such as an epic plan's.
+pub(crate) fn no_fenced(comments: &[Comment], writers: &[&str], fence: &str) -> bool {
+    !comments.iter().any(|c| weighed(c, writers, fence))
 }
 
 pub(crate) fn has_fence(body: &str, fence: &str) -> bool {

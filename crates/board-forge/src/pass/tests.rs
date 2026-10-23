@@ -3,18 +3,35 @@ use super::*;
 const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
 /// The live board read on 23 October 2026 by `pass --record`, with a
 /// synthetic usage snapshot (the live one is private): claude under its
-/// pace, openai held over it.
+/// pace, openai held over it. Stage 3's reads of the live epics tracker#596,
+/// #766 and #890 were recorded that evening, seeded with this recording,
+/// and appended to it ([`epics`]'s tests replay them at that time).
 const BOARD: &str = include_str!("../../../../fixtures/pass/board-2026-10-23.json");
 
 fn at(stamp: &str) -> OffsetDateTime {
     OffsetDateTime::parse(stamp, &Rfc3339).unwrap()
 }
 
-fn replay() -> Replay {
+pub(super) fn replay() -> Replay {
     Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap()
 }
 
-fn config(edit: Value) -> Config {
+/// `replay` with no open epic for stage 3 to read, for tests of the other
+/// stages; the board's children still qualify through their epics.
+pub(super) fn without_epics(mut replay: Replay) -> Replay {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "label": EPIC_LABEL,
+        "field": "Priority", "cursor": null});
+    let request = graphql_key(epics::EPICS_QUERY, &variables);
+    let none = json!({"data": {"repository": {"issues": {"nodes": [],
+        "pageInfo": {"hasNextPage": false, "endCursor": null}}}}});
+    replay.requests.retain(|e| e["request"] != request);
+    replay
+        .requests
+        .push(json!({"request": request, "answer": none}));
+    replay
+}
+
+pub(super) fn config(edit: Value) -> Config {
     let mut value: Value = serde_json::from_str(CONFIG).unwrap();
     value
         .as_object_mut()
@@ -23,7 +40,7 @@ fn config(edit: Value) -> Config {
     Config::parse(&value.to_string()).unwrap()
 }
 
-fn preview(config: &Config, replay: &Replay) -> Report {
+pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
     run(
         replay,
         replay,
@@ -36,7 +53,7 @@ fn preview(config: &Config, replay: &Replay) -> Report {
 }
 
 /// The recorded answer to the request whose JSON contains `needle`.
-fn answer<'a>(replay: &'a mut Replay, needle: &str) -> &'a mut Value {
+pub(super) fn answer<'a>(replay: &'a mut Replay, needle: &str) -> &'a mut Value {
     replay
         .requests
         .iter_mut()
@@ -45,12 +62,12 @@ fn answer<'a>(replay: &'a mut Replay, needle: &str) -> &'a mut Value {
         .unwrap_or_else(|| panic!("no recorded request has {needle}"))
 }
 
-fn usage(replay: &mut Replay) -> Value {
+pub(super) fn usage(replay: &mut Replay) -> Value {
     let body = &answer(replay, "bot-ops/issues/1/comments")["body"][0]["body"];
     usage_snapshot(body.as_str().unwrap()).unwrap()
 }
 
-fn set_usage(replay: &mut Replay, snapshot: &Value) {
+pub(super) fn set_usage(replay: &mut Replay, snapshot: &Value) {
     let body = format!("{USAGE_MARKER}\n\n```json\n{snapshot:#}\n```\n");
     answer(replay, "bot-ops/issues/1/comments")["body"][0]["body"] = body.into();
 }
@@ -77,19 +94,32 @@ fn last_scheduled(report: &Report) -> &str {
         .unwrap()
 }
 
+/// Stage 3 on the recorded board: tracker#596, whose applied plan's
+/// sub-issues have closed since, is planned; #890's changes wait three hours
+/// after its last plan; #766 is held by its label.
+pub(super) const EPIC_LINES: &[&str] = &[
+    "epics: 3 live of 3 open in cgwalters-forge/tracker",
+    "start planning cgwalters-forge/tracker#596 pool=claude: its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 3 more)",
+    "hold epic cgwalters-forge/tracker#890: its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); cgwalters-forge/agent-board#284 edited; cgwalters-forge/agent-board#289's Priority is P0, not P2; planned again from 2026-10-23T16:34:49Z, three hours after its last request",
+    "hold epic cgwalters-forge/tracker#766: labelled needs-human; otherwise due to be planned (its sub-issues changed (cgwalters-forge/actions#83 closed, cgwalters-forge/agent-board#167 closed, cgwalters-forge/agent-board#168 closed and 2 more))",
+];
+
 /// The idle board of 23 October: two runs in flight of eight, a usable
-/// pool, so six runs start, in Priority order. Zero would be a regression.
-/// Recorded plans and an overlap behind an open pull request hold.
+/// pool, so six runs start: an epic's planning run, then five in Priority
+/// order. Zero would be a regression. Recorded plans and an overlap behind
+/// an open pull request hold.
 #[test]
 fn replay_idle_board_starts_work() {
     let report = preview(&config(json!({})), &replay());
     let mut expected = vec![
         "follow: no repositories",
         "usage: not refreshed by this build; pacing reads the published snapshot",
-        "epics: not planned or applied by this build; live epics qualify their children",
-        "candidates: 194 (0 opened by others, 107 outside a live epic)",
     ];
-    expected.extend(STARTED);
+    expected.extend(EPIC_LINES);
+    expected.push("candidates: 194 (0 opened by others, 107 outside a live epic)");
+    // The planning run took the last slot stage 4 had.
+    expected.extend(&STARTED[..STARTED.len() - 2]);
+    expected.push("wip: no slot left; 186 more candidate(s) wait");
     // The recording's whole-board read is an empty board: the Status stage
     // has its own recording.
     expected.push("status: 0 change(s) of 0 item(s) read");
@@ -389,7 +419,7 @@ fn replay_scenarios() {
         ),
     ];
     for (name, edit, lines, starts, failures) in cases {
-        let mut replay = replay();
+        let mut replay = without_epics(replay());
         let mut settings = json!({});
         edit(&mut replay, &mut settings);
         let report = preview(&config(settings), &replay);
@@ -453,7 +483,7 @@ type Late = Box<dyn Fn(&str, &mut Value)>;
 
 impl Forge {
     fn new(fail: Option<&str>, after_record: bool) -> Self {
-        let mut replay = replay();
+        let mut replay = without_epics(replay());
         only(&mut replay, FIRST);
         Self {
             replay,
@@ -607,7 +637,7 @@ impl Transport for Forge {
         if query.contains("viewer {") {
             return Ok(json!({"viewer": {"login": self.login}}));
         }
-        if query.contains("projectItems") {
+        if query.starts_with(FRESH_QUERY) {
             let mut data = self.fresh(&variables)?;
             self.late(&variables.to_string(), &mut data);
             return Ok(data);
@@ -693,6 +723,12 @@ fn apply_stops_at_its_time_bound() {
         last_scheduled(&report),
         "schedule error: the pass's time bound (900 seconds) is spent"
     );
+    // Nor does stage 3 read the epics.
+    assert!(
+        report
+            .lines
+            .contains(&"epics error: the pass's time bound (900 seconds) is spent".to_owned())
+    );
     // Nor does the Status stage read the board.
     let last = report.lines.last().unwrap();
     assert!(
@@ -700,7 +736,7 @@ fn apply_stops_at_its_time_bound() {
             && last.ends_with("the pass's time bound (900 seconds) is spent"),
         "{last}"
     );
-    assert_eq!(report.failures, 2);
+    assert_eq!(report.failures, 3);
     assert!(forge.writes.borrow().is_empty());
 }
 
@@ -810,7 +846,7 @@ fn caps_hold_starts_past_max_dispatch() {
             "summary: dispatched 6, writes 0/0, held 0",
         ),
     ] {
-        let replay = replay();
+        let replay = without_epics(replay());
         let preview = (Mode::Preview, limits);
         let preview = run(
             &replay,

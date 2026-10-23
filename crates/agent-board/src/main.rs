@@ -131,7 +131,7 @@ enum Command {
     },
     /// One pass of the pull request poll, previewed or applied; says when the next is due.
     Poll(poll::Poll),
-    /// One scheduled pass: follow up pull requests, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md).
+    /// One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md).
     Pass(pass::Pass),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),

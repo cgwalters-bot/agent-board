@@ -432,7 +432,9 @@ mod tests {
     }
 
     fn replay() -> Replay {
-        Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap()
+        crate::pass::tests::without_epics(
+            Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap(),
+        )
     }
 
     /// The Status stage's lines of a pass.
@@ -692,9 +694,10 @@ mod tests {
             since: BTreeMap::new(),
             writes: RefCell::new(vec![]),
         };
-        // The recording's 16 reads, then two changes' read and write each.
+        // The recording's 16 reads and stage 3's one, then two changes'
+        // read and write each.
         let bounds = Bounds::new(
-            16 + WRITE_RESERVE + 4,
+            17 + WRITE_RESERVE + 4,
             Instant::now() + Duration::from_secs(60),
         );
         let state = (

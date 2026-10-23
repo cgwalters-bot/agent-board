@@ -27,7 +27,7 @@ Commands:
 - [`snapshot`](#agent-board-snapshot): Save a normalized board snapshot for offline use
 - [`reconcile`](#agent-board-reconcile): Preview deterministic board repairs; never apply them
 - [`poll`](#agent-board-poll): One pass of the pull request poll, previewed or applied; says when the next is due
-- [`pass`](#agent-board-pass): One scheduled pass: follow up pull requests, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
+- [`pass`](#agent-board-pass): One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -561,7 +561,7 @@ Options:
 
 ## agent-board pass
 
-One scheduled pass: follow up pull requests, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
+One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
 
 ```text
 agent-board pass [OPTIONS] --config <FILE>
@@ -570,9 +570,9 @@ agent-board pass [OPTIONS] --config <FILE>
 Options:
 
 - `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN (the bot's) and DISPATCH_TOKEN, never the file
-- `--apply`: Take the steps: follow up pull requests, start the chosen runs and write board Status as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow
-- `--max-dispatch <N>`: Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, and scheduled starts. The rest are held, each line saying so
-- `--max-writes <N>`: Take at most N other write steps in this pass: forge writes such as comments, labels, merges and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, and each item's Status change). A step is taken whole or held whole
+- `--apply`: Take the steps: follow up pull requests, apply epic plans, start the chosen runs and write board Status as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow
+- `--max-dispatch <N>`: Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, an epic's planning run, and scheduled starts. The rest are held, each line saying so
+- `--max-writes <N>`: Take at most N other write steps in this pass: forge writes such as comments, labels, merges, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together
 - `--max-status-changes <N>`: Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through
 - `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read
 - `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture

@@ -10,17 +10,59 @@ authority for their operations. The differences below are intentional.
 
 ## What is built
 
-The first slice implements the configuration below and stages 1, 4 and 5.
-Stages 2 and 3 are not built; the pass prints a line for each:
+The pass implements the configuration below and stages 1, 3, 4 and 5.
+Stage 2 is not built; the pass prints a line for it:
 
 * **Usage** is not refreshed. Pacing reads the `bot-usage/v1` snapshot that
   another job publishes to `usage.repository#usage.issue`, so `usage.url` is
   accepted but not used.
-* **Epics** are not planned or applied, and applies are not recovered. A
-  configured `epics.repository` only decides which children qualify, through a
-  live epic.
 * There is no infrastructure rerun. Stage 1 still writes poll's claim and
   marker comments in every followed repository, external ones included.
+
+Stage 3 reads the open `epic` issues of `epics.repository` with their
+sub-issues (20 epics a request), the board's Priority options, and each live
+epic's comments, and takes the live epics in Priority order. Its first line
+counts them, such as `epics: 7 live of 17 open in example/tracker`, then
+one line an epic:
+
+* `apply epic OWNER/REPO#N plan=ID: Create a sub-issue in example/work (P0);
+  Close example/work#9 as not planned` where the newest accepted plan has no
+  receipt, applied with `epic apply`'s checks, its comment and change time
+  pinned. A new sub-issue gets its final Priority with its create: the plan's
+  `set_priority` of it, else the board's last option. An applying pass ends
+  the line with what the [receipt](epic-plans.md#apply) says and
+  `receipt=URL`. Its receipt and each action that writes are one write step
+  each, held whole by `--max-writes`; one epic is applied a pass.
+* `recover epic …` where the receipt was cut short (`claimed` or `stopped`)
+  and every action's effect is proved by the identities it confirmed and the
+  epic now; an applying pass rewrites the receipt as `recovered`, one write.
+  Writes after a create that the receipt did not confirm are observed: the
+  sub-issue's link, its board Priority and its job plan. One that is not
+  proved is held for a person with the actions it cannot prove, and never
+  replayed; so is an epic with a receipt that cannot be read.
+* `start planning OWNER/REPO#N pool=P: why` for the first due epic: a
+  triage run on the epic, started as stage 4 starts one, from `planPools`,
+  whose brief asks for an epic plan. It takes a slot from stage 4 and counts
+  against `--max-dispatch`; one epic is planned a pass.
+* `epic OWNER/REPO#N: plan ID applied; nothing changed since T`, or
+  `hold epic OWNER/REPO#N: why`: a planning run in flight, a request waiting
+  for its plan or answered by none, an invalid newest plan, or a person's
+  hold (`needs-human`, `needs-design`, board Blocked), which also says what
+  the epic would otherwise come to.
+
+An applied plan is recognised from its receipt, older receipts (the hidden
+claim and fingerprint comment) included, never from titles: a sub-issue
+retitled, closed or reprioritised since is not missing. An epic is due when
+it has no plan or request; on the operator's comment since its last plan
+(for a plan that cannot be applied or recovered, since its last request too,
+so a run that answers nothing is not started again);
+otherwise, once three hours have passed since its last request (its record,
+or for an epic planned before this stage, its plan), when the epic's text was
+edited, a sub-issue was added, removed, closed or reopened against the
+receipt's fingerprint, a sub-issue's text was edited, or a Priority the
+apply set differs now; and a day after its last plan, unless nothing is open.
+Not yet noticed: a Priority change of a sub-issue the apply did not set,
+until that day's replan.
 
 Stage 5 reads the whole board (closed issues and pull requests included, in
 about one request per hundred items) besides the runs and open issues that
@@ -46,8 +88,11 @@ pass over a board that drifted is looked at first and then let through
 once with a higher number.
 
 The replay gate below is partly met: there is one recorded board, from 23
-October, with a synthetic usage snapshot and an empty whole-board read.
-Scenario tests edit that recording. Stage 5 has its own recording of the
+October, with a synthetic usage snapshot and an empty whole-board read, and
+stage 3's reads of the epics tracker#596, #766 and #890 that evening appended
+to it. Scenario tests edit that recording; on it #596, frozen by a title
+match until tracker#851, is planned, and #890's applied plan is not applied
+again. Stage 5 has its own recording of the
 same day's board, trimmed to items that show each rule
 (`fixtures/pass/status-2026-10-23.json`). No staging run has happened.
 
@@ -57,8 +102,9 @@ Try a pass without credentials, against the recorded board:
 agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json
 ```
 
-Each decision is one line: `start triage|implement OWNER/REPO#N … pool=P`,
-`hold OWNER/REPO#N: why`, `hold wip|pools: why`,
+Each decision is one line: `start triage|implement|planning OWNER/REPO#N … pool=P`,
+`apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`,
+`hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
 step that a cap held ends `-> held by --max-dispatch` or
@@ -100,10 +146,12 @@ of forge facts, not agent output, so they do not go through agentic-job's
 check and apply; that boundary is for what agents produce. Their guards are
 preview by default, caps per pass, and the replay gate below. The caps are
 two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
-starts, stage 1's fix, rebase, continuation and answer rounds and stage 4's
-starts together, and `--max-writes N` bounds its other write steps, forge
-writes such as comments, labels and merges (stage 1's comments, labels,
-retitles, retargets, enqueues and merges, and stage 5's Status changes).
+starts, stage 1's fix, rebase, continuation and answer rounds, stage 3's
+planning run and stage 4's starts together, and `--max-writes N` bounds its
+other write steps, forge writes such as comments, labels and merges (stage
+1's comments, labels, retitles, retargets, enqueues and merges, stage 3's
+epic apply, a step for its receipt and each action that writes, taken whole,
+and its recovery, and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
 are one dispatch, and a stop's label and marker one write. A step is checked
 before its first write and taken whole or held whole; a held step is
@@ -275,8 +323,8 @@ An epic's repository is first-party, so its apply receipt follows the
 [bookkeeping rule](architecture.md#bookkeeping): one comment on the epic, the
 claim posted before any write and updated as writes are confirmed, readable
 first. It has one line per sub-issue saying what the apply did to it, for
-example `- example/work#12: created, Priority P2` or
-`- example/work#9: closed as not planned`, then one fenced
+example `- Created agentic-job#715 (P0)` or `- Closed #611 as not
+planned`, then one fenced
 `agent-board-epic-apply` JSON block with the machine detail: the plan comment
 ID and change time it claims, each confirmed action with the identity it
 produced, the outcome, and the post-apply fingerprint. It replaces the hidden
