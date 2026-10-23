@@ -302,16 +302,11 @@ pub(crate) fn newest_fenced<'a>(
     for writer in writers {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
-    let trusted = |login: &Option<String>| {
-        login
-            .as_deref()
-            .is_some_and(|l| writers.iter().any(|w| w.eq_ignore_ascii_case(l)))
-    };
-    // An edit counts as a writer's only when GitHub names a writer as its editor.
-    let foreign_edit = |c: &Comment| (c.edited || c.editor.is_some()) && !trusted(&c.editor);
+    let foreign_edit =
+        |c: &Comment| (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor);
     let newest = comments
         .iter()
-        .filter(|c| trusted(&c.author) && (has_fence(&c.body, fence) || foreign_edit(c)))
+        .filter(|c| weighed(c, writers, fence))
         // max_by_key keeps the last of equals: the later comment wins a tie.
         .max_by_key(|c| c.changed)
         .with_context(|| format!("no plan on this issue from an accepted writer ({fence})"))?;
@@ -325,6 +320,26 @@ pub(crate) fn newest_fenced<'a>(
             .unwrap_or("an unidentified account")
     );
     Ok(newest)
+}
+
+fn trusted(writers: &[&str], login: &Option<String>) -> bool {
+    login
+        .as_deref()
+        .is_some_and(|l| writers.iter().any(|w| w.eq_ignore_ascii_case(l)))
+}
+
+/// Whether [`newest_fenced`] weighs a comment: a writer's with a `fence`
+/// block, or one edited by anyone else. An edit counts as a writer's only
+/// when GitHub names a writer as its editor.
+fn weighed(c: &Comment, writers: &[&str], fence: &str) -> bool {
+    let foreign_edit = (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor);
+    trusted(writers, &c.author) && (has_fence(&c.body, fence) || foreign_edit)
+}
+
+/// Whether no comment holds a plan for [`newest_plan`] to weigh, as against
+/// a newest plan that is invalid, which is never read as no plan.
+pub fn no_plan(comments: &[Comment], writers: &[&str]) -> bool {
+    !comments.iter().any(|c| weighed(c, writers, PLAN_FENCE))
 }
 
 pub(crate) fn has_fence(body: &str, fence: &str) -> bool {
@@ -688,6 +703,38 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     bot: Option<&str>,
     collaborators: Option<crate::input::Rule>,
 ) -> Result<Dispatched> {
+    let standalone = Scheduled::default();
+    let options = (batch, bot, collaborators, standalone);
+    dispatch_with(client, dispatcher, issue, writers, target, options)
+}
+
+/// What `agent-board pass` holds a dispatch to beyond [`dispatch`]: the plan
+/// it chose, read again here, and the pool it checked against pace.
+#[derive(Clone, Copy, Default)]
+pub struct Scheduled<'a> {
+    /// The plan id the pass chose; another newest plan dispatches nothing.
+    pub plan: Option<&'a str>,
+    /// The pool the pass checked: a plan that names none takes it, and one
+    /// that names another dispatches nothing.
+    pub pool: Option<&'a str>,
+    /// Wait when the overlap check cannot read ([`crate::overlap::decide_strict`]).
+    pub strict: bool,
+}
+
+/// [`dispatch`] with its batch, bot, collaborator rule and [`Scheduled`] checks.
+pub fn dispatch_with<C: Transport + Rest, D: Rest>(
+    client: &C,
+    dispatcher: &D,
+    issue: &ItemRef,
+    writers: &[&str],
+    target: &Target,
+    (batch, bot, collaborators, scheduled): (
+        usize,
+        Option<&str>,
+        Option<crate::input::Rule>,
+        Scheduled,
+    ),
+) -> Result<Dispatched> {
     target.validate()?;
     ensure!(
         batch <= BATCH_LIMIT,
@@ -697,8 +744,22 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
         ensure!(is_github_login(bot), "invalid login {bot:?}");
     }
     let comments = issue_comments(client, issue)?;
-    let (plan, from) = newest_plan(&comments, writers)?;
+    let (mut plan, from) = newest_plan(&comments, writers)?;
     let id = plan_id(from)?;
+    if let Some(chosen) = scheduled.plan {
+        ensure!(
+            id == chosen,
+            "the newest plan is {id}, not {chosen} as the pass read it"
+        );
+    }
+    if let Some(pool) = scheduled.pool {
+        ensure!(
+            plan.pool.is_empty() || plan.pool == pool,
+            "the plan asks for pool {}, not {pool} as the pass checked",
+            plan.pool
+        );
+        plan.pool = pool.into();
+    }
     // Records count only from writers, so every dispatching account must be
     // one: two accounts that each read only their own records would both
     // dispatch, as would a new account after a token is rotated.
@@ -735,9 +796,13 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
     };
     // A stacked run shares the files of the stack below it by design: its
     // plan, not a guess from paths, decided how it runs.
+    let decide = match scheduled.strict {
+        true => crate::overlap::decide_strict,
+        false => crate::overlap::decide,
+    };
     let overlap = bot
         .filter(|_| base.is_none())
-        .map(|bot| crate::overlap::decide(client, issue, &dest, &plan.brief, bot, target));
+        .map(|bot| decide(client, issue, &dest, &plan.brief, bot, target));
     if let Some(Decision::Wait(_)) = overlap {
         // Unrecorded, so the next pass decides again on fresh state.
         return Ok(Dispatched {

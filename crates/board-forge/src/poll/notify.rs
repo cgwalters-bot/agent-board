@@ -685,6 +685,7 @@ mod tests {
                 dispatcher: fake,
                 workflow: "dispatch.yml".into(),
                 pools: vec![],
+                git_ref: None,
             }),
             now(),
         )
@@ -1243,6 +1244,7 @@ mod tests {
                     dispatcher: &fake,
                     workflow: "dispatch.yml".into(),
                     pools: vec![],
+                    git_ref: None,
                 }),
                 dispatched: 0,
                 queues: BTreeMap::new(),
@@ -1250,13 +1252,7 @@ mod tests {
                 paces: None,
                 envelope: None,
             };
-            let mut outcome = Outcome {
-                lines: vec![],
-                errors: 0,
-                activity: 0,
-                in_flight: 0,
-                state: State::default(),
-            };
+            let mut outcome = Outcome::default();
             let next = pass
                 .notifications(&settings, &BTreeSet::new(), (None, None), &mut outcome)
                 .unwrap();

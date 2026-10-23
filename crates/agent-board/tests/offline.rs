@@ -2097,3 +2097,46 @@ fn cli_reference_is_current() {
         "docs/cli.md does not match `agent-board help-markdown`; regenerate it with `just cli-docs`"
     );
 }
+
+/// The recorded pass of 23 October previews offline, a line per decision,
+/// and refuses what would leave preview or mix sources.
+#[test]
+fn pass_replay_previews_without_credentials() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let replay = [
+        "pass",
+        "--config",
+        "fixtures/pass/config.json",
+        "--replay",
+        "fixtures/pass/board-2026-10-23.json",
+    ];
+    let output = command()
+        .args(replay)
+        .current_dir(root)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.starts_with("pass: preview\n"), "{text}");
+    assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
+    for refused in [
+        vec!["--apply"],
+        vec!["--owner", "example"],
+        vec!["--json", "lines"],
+    ] {
+        command()
+            .args(replay)
+            .args(refused)
+            .current_dir(root)
+            .assert()
+            .code(1);
+    }
+    let mut unknown = replay.to_vec();
+    unknown[2] = "fixtures/board.json";
+    let output = command().args(unknown).current_dir(root).assert().code(1);
+    let error = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
+}

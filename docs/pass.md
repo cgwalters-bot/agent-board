@@ -1,11 +1,54 @@
 # One pass
 
-This is the proposed contract for `agent-board pass`, not implemented behaviour.
-Approve this contract and its drop list before implementing the command. A pass
+This is the approved contract for `agent-board pass`. A pass
 finishes once; it is not a daemon, a second planner, or a JavaScript compatibility
 layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
+
+## What is built
+
+The first slice implements the configuration below, stage 1 and stage 4. Stages
+2 and 3 are not built yet, and each pass prints a line saying so:
+
+* **Usage** is not refreshed. Pacing reads the `bot-usage/v1` snapshot that
+  another job publishes to `usage.repository#usage.issue`, so `usage.url` is
+  accepted but not used.
+* **Epics** are not planned or applied, and applies are not recovered. A
+  configured `epics.repository` only decides which children qualify, through a
+  live epic.
+
+The replay gate below is partly met: there is one recorded board, from 23
+October, with a synthetic usage snapshot. Scenario tests edit that recording.
+No staging run has happened.
+
+Try a pass without credentials, against the recorded board:
+
+```sh
+agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json
+```
+
+Each decision is one line: `start triage|implement OWNER/REPO#N … pool=P`,
+`hold OWNER/REPO#N: why`, `hold wip|pools: why`, `fail …` or `… error: …`. With
+`--apply`, a started line also names its dispatch record and run.
+`--record FILE` previews live and saves every read as a new fixture. Add
+`--replay SEED` to answer reads the token cannot make, such as a private usage
+snapshot. A preview counts only the PR runs that stage 1 actually starts, so it
+can show more free slots than an applying pass would.
+
+A triage run is started by posting the bot's `triage` job plan on the issue and
+dispatching it with the job-plan protocol, so the dispatch record is the claim.
+A pass interrupted between that post and its dispatch leaves a triage plan,
+which is a manual dispatch; a person dispatches or replaces it.
+
+`--apply` runs only in a GitHub Actions run, and stage 4 starts nothing while
+another run of the same workflow is in progress (`hold wip: another pass is in
+progress`): two passes that both saw a free slot could otherwise both take it.
+Give the caller's workflow a `concurrency` group, so that passes queue rather
+than hold each other. Both stages start runs from `dispatchRef`, or the caller's
+default branch. Past 15 minutes no new request is sent; writes, and a start that
+passed its last check in time, have two minutes more to finish, after which
+what was written is observed by the next pass.
 
 ## Order and effects
 
@@ -101,7 +144,8 @@ triage plans explicitly posted on issues remain manual dispatches.
 Choose among the configured automatic pools by greatest room below pace:
 `target_percent * elapsed_fraction - used_percent`; ties use config order.
 Exclude held, exhausted, reset, missing or stale readings (snapshot older than
-45 minutes or paced observation older than 30 hours). If none qualifies, wait;
+45 minutes or paced observation older than 30 hours), and readings more than five
+minutes in the future. If none qualifies, wait;
 do not fall back to a held/unknown pool. Negative room alone does not exclude a
 pool if its normalized burst-aware hold is false. An explicit plan pool is
 respected, not silently replaced, and must pass the same checks. Pacing applies
@@ -175,7 +219,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
-| `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default |
+| `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |

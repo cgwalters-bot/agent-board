@@ -321,6 +321,7 @@ mod tests {
                 dispatcher: forge,
                 workflow: "dispatch.yml".into(),
                 pools: vec![],
+                git_ref: None,
             }),
             OffsetDateTime::UNIX_EPOCH,
         )
@@ -491,13 +492,7 @@ mod tests {
             paces: None,
             envelope: None,
         };
-        let mut outcome = Outcome {
-            lines: Vec::new(),
-            errors: 0,
-            activity: 0,
-            in_flight: 0,
-            state: State::default(),
-        };
+        let mut outcome = Outcome::default();
         let repo = REPO.to_owned();
         pass.lock(&BTreeSet::from([&repo]), 30, &BTreeMap::new(), &mut outcome);
         assert_eq!(*forge.queried.borrow(), [1]);

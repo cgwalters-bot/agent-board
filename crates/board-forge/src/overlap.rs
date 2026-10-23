@@ -171,6 +171,22 @@ pub fn decide<C: Transport + Rest>(
     }
 }
 
+/// [`decide`] for a scheduler that starts runs on its own (`agent-board
+/// pass`): a check that cannot read waits rather than runs, as nobody chose
+/// this issue by hand to run beside whatever it may overlap.
+pub fn decide_strict<C: Transport + Rest>(
+    client: &C,
+    source: &ItemRef,
+    dest: &ItemRef,
+    brief: &str,
+    bot: &str,
+    target: &Target,
+) -> Decision {
+    check(client, source, dest, brief, bot, target).unwrap_or_else(|error| {
+        Decision::Wait(format!("the overlap check could not read ({error:#})"))
+    })
+}
+
 fn check<C: Transport + Rest>(
     client: &C,
     source: &ItemRef,
