@@ -189,6 +189,21 @@ fn runs(n: u64) -> Vec<Value> {
         .collect()
 }
 
+/// Puts `run` on a second page of the in-progress runs, after the two
+/// recorded; that page links to `next`, where there is one.
+fn second_page(replay: &mut Replay, run: Value, next: Option<&str>) {
+    let first = answer(replay, "status=in_progress");
+    let url = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?status=in_progress&per_page=100&page=2"
+    );
+    first["link"] = format!("<{url}>; rel=\"next\"").into();
+    first["body"]["total_count"] = 3.into();
+    let link = next.map(|n| format!("<{n}>; rel=\"next\""));
+    let body = json!({"total_count": 3, "workflow_runs": [run]});
+    replay.requests.push(json!({"request": {"get": url},
+        "answer": {"status": 200, "link": link, "body": body}}));
+}
+
 /// Gives tracker#446 twelve open closing pull requests, eleven a visitor's
 /// and the last `last`'s: ten on the board's page, all on the page read after.
 fn closing_pulls(replay: &mut Replay, last: &str) {
@@ -249,7 +264,7 @@ fn replay_scenarios() {
                 answer(r, "status=waiting")["body"]["total_count"] = 101.into();
             }),
             vec![
-                "schedule error: more waiting runs than one page lists; capacity is unknown",
+                "schedule error: waiting runs: 0 read of 101; capacity is unknown",
                 "status: the runs in flight could not be listed, so none goes back to Todo",
             ],
             0,
@@ -272,6 +287,32 @@ fn replay_scenarios() {
             ],
             5,
             0,
+        ),
+        (
+            "runs past one page are all read: a run on the second holds its issue",
+            Box::new(|r, _| {
+                let run = json!({"id": 7, "display_title": "triage cgwalters-forge/tracker#446 (claude)",
+                    "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/7"});
+                second_page(r, run, None);
+            }),
+            vec![
+                "hold cgwalters-forge/tracker#446: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
+                "wip: no slot left; 185 more candidate(s) wait",
+            ],
+            5,
+            0,
+        ),
+        (
+            "more runs than GitHub lists for a status are no capacity, without paging",
+            Box::new(|r, _| {
+                second_page(r, json!({"id": 7}), None);
+                answer(r, "status=in_progress")["body"]["total_count"] = 1001.into();
+            }),
+            vec![
+                "schedule error: in_progress runs: 2 read of 1001; capacity is unknown, more than GitHub lists",
+            ],
+            0,
+            1,
         ),
         (
             "missing usage holds every new run, a cold start too",
@@ -1924,4 +1965,41 @@ fn apply_paces_pull_requests_by_this_pass_reading() {
         );
     }
     assert_eq!(report.failures, 0, "{lines:#?}");
+}
+
+/// A run list longer than the request budget is read until the budget is
+/// spent, then fails closed, saying how many runs it read: capacity is
+/// unknown, so nothing starts.
+#[test]
+fn runs_past_the_budget_are_no_capacity() {
+    let mut replay = without_epics(replay());
+    let page = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?status=in_progress&per_page=100&page=2"
+    );
+    // The second page links to itself, so the list goes on past the budget.
+    second_page(&mut replay, json!({"id": 7}), Some(&page));
+    for entry in &mut replay.requests {
+        if entry["request"]["get"]
+            .as_str()
+            .is_some_and(|u| u.contains("status=in_progress"))
+        {
+            entry["answer"]["body"]["total_count"] = RUN_LIST_LIMIT.into();
+        }
+    }
+    let report = preview(&config(json!({})), &replay);
+    let error = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("schedule error: in_progress runs: "))
+        .unwrap_or_else(|| panic!("{:#?}", report.lines));
+    assert!(
+        error
+            == &format!(
+                "schedule error: in_progress runs: 3 read of {RUN_LIST_LIMIT}; capacity is unknown: the pass's request budget ({PASS_REQUEST_LIMIT}) is spent"
+            ),
+        "{error}"
+    );
+    assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
+    // The Status stage finds the budget spent too.
+    assert_eq!(report.failures, 2, "{:#?}", report.lines);
 }

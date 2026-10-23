@@ -80,6 +80,9 @@ const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
 const BLOCKED_STATUS: &str = "Blocked";
 /// The run statuses that hold a slot, as the Actions API names them.
 const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
+/// The most runs GitHub lists for one status filter; a longer list cannot
+/// be read whole.
+const RUN_LIST_LIMIT: u64 = 1000;
 /// The runner a triage plan asks for.
 const TRIAGE_RUNNER: &str = "hosted";
 
@@ -1332,8 +1335,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// Another run of `own`'s workflow in progress, by its URL ([`PassRun`]).
-    /// It may be a preview: a pass waits for it all the same. A list that
-    /// may be cut short is an error.
+    /// It may be a preview: a pass waits for it all the same. A list cut
+    /// short is an error.
     fn overlapping(&self, own: &PassRun) -> Result<Option<String>> {
         let repo = &own.repository;
         let url = format!("{API_ROOT}repos/{repo}/actions/runs/{}", own.id);
@@ -1350,31 +1353,61 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let url = format!(
             "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?status=in_progress&per_page=100"
         );
-        let response = self.client.get(&url, None)?;
-        ensure!(
-            response.status == 200,
-            "listing this pass's workflow's runs: GitHub HTTP status {}",
-            response.status
-        );
-        let runs = response.body["workflow_runs"]
-            .as_array()
-            .context("run list has no workflow_runs")?;
-        ensure!(
-            response.body["total_count"].as_u64() == Some(runs.len() as u64)
-                && response.link.as_deref().and_then(next_link).is_none(),
-            "more runs of this pass's workflow in progress than one page lists"
-        );
-        for run in runs {
+        for run in self.workflow_runs(&url, "this pass's workflow's in_progress runs")? {
             if run["id"].as_u64().context("run has no id")? != own.id {
-                return Ok(Some(text(run, "/html_url").to_owned()));
+                return Ok(Some(text(&run, "/html_url").to_owned()));
             }
         }
         Ok(None)
     }
 
+    /// Every run `url` lists, page by page within the pass's budget. A list
+    /// cut short, by the budget, by [`RUN_LIST_LIMIT`] or by runs that moved
+    /// between its pages, is an error that says how many of `what` were
+    /// read: capacity read from it would be guessed.
+    fn workflow_runs(&self, url: &str, what: &str) -> Result<Vec<Value>> {
+        let mut runs: Vec<Value> = Vec::new();
+        let mut ids = BTreeSet::new();
+        let mut total = None;
+        let mut next = Some(url.to_owned());
+        let unknown = |read: usize, total: Option<u64>| {
+            let of = total.map_or(String::new(), |t| format!(" of {t}"));
+            format!("{what}: {read} read{of}; capacity is unknown")
+        };
+        while let Some(url) = next {
+            let response = self
+                .client
+                .get(&url, None)
+                .with_context(|| unknown(runs.len(), total))?;
+            ensure!(
+                response.status == 200,
+                "listing {what}: GitHub HTTP status {}",
+                response.status
+            );
+            let page = response.body["workflow_runs"]
+                .as_array()
+                .context("run list has no workflow_runs")?;
+            for run in page {
+                // Listed twice as runs moved between pages: one was missed.
+                if ids.insert(run["id"].as_u64().context("run has no id")?) {
+                    runs.push(run.clone());
+                }
+            }
+            total = response.body["total_count"].as_u64();
+            // Not paged past GitHub's limit, which the list would never meet.
+            ensure!(
+                total.is_none_or(|t| t <= RUN_LIST_LIMIT),
+                "{}, more than GitHub lists",
+                unknown(runs.len(), total)
+            );
+            next = response.link.as_deref().and_then(next_link);
+        }
+        ensure!(total == Some(runs.len() as u64), unknown(runs.len(), total));
+        Ok(runs)
+    }
+
     /// The caller workflow's runs that hold a slot, by id, and the issue each
-    /// names, by key. A list that may be cut short is an error: capacity
-    /// read from it would be guessed.
+    /// names, by key. A list cut short is an error ([`Self::workflow_runs`]).
     fn runs(&self, target: &Target) -> Result<(BTreeSet<u64>, BTreeMap<String, String>)> {
         let mut ids = BTreeSet::new();
         let mut busy = BTreeMap::new();
@@ -1383,26 +1416,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page=100",
                 target.caller, target.workflow
             );
-            let response = self.client.get(&url, None)?;
-            ensure!(
-                response.status == 200,
-                "listing {status} runs: GitHub HTTP status {}",
-                response.status
-            );
-            let runs = response.body["workflow_runs"]
-                .as_array()
-                .context("run list has no workflow_runs")?;
-            let total = response.body["total_count"].as_u64();
-            ensure!(
-                total == Some(runs.len() as u64)
-                    && response.link.as_deref().and_then(next_link).is_none(),
-                "more {status} runs than one page lists; capacity is unknown"
-            );
-            for run in runs {
+            for run in self.workflow_runs(&url, &format!("{status} runs"))? {
                 ids.insert(run["id"].as_u64().context("run has no id")?);
                 let title = run["display_title"].as_str().unwrap_or_default();
                 if let Some((_, repo, number)) = run_title(title) {
-                    let url = text(run, "/html_url").to_owned();
+                    let url = text(&run, "/html_url").to_owned();
                     busy.entry(format!("{repo}#{number}").to_ascii_lowercase())
                         .or_insert(url);
                 }
