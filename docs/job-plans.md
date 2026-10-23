@@ -82,7 +82,8 @@ the plan's comment on stderr. It needs a token that can read the issue. The
 caller, workflow and logins come from the caller's own configuration (its
 repository variables), never from a plan or a dispatcher's inputs.
 
-`--apply` sends that request, once per plan. A plan is its comment and the
+`--apply` sends that request, once per plan (the [pass](pass.md#scheduling)'s
+one infrastructure rerun aside). A plan is its comment and the
 time that comment last changed, so a writer's edit, or a reply with a plan, is
 a new plan. Before sending, dispatch posts one comment on the issue whose
 hidden first line names the plan (`<!-- agent-board-dispatch: COMMENT-ID@TIME -->`),

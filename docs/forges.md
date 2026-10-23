@@ -17,7 +17,7 @@ Dispatch itself is a GitHub Actions request today on every forge; making it a
 pluggable backend is [#295](https://github.com/cgwalters-forge/agent-board/issues/295)
 ([dispatch](dispatch.md)). The design's approach to other forges, capability
 negotiation rather than weakened guarantees, is in
-[Rust boundaries](design.md#7-rust-boundaries-and-the-first-six-prs).
+[Rust boundaries](design.md#7-rust-boundaries).
 
 ## GitHub
 

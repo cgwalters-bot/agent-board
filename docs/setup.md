@@ -73,7 +73,9 @@ reproducible. Every command and flag is in the [CLI reference](cli.md).
 5. **Provision and read the board before writes.** Pre-create the Status
    options `Triage`, `Backlog`, `Todo`, `In Progress`, `Draft`, `In Review`,
    `Blocked`, `Needs human`, `Done` and `Cancelled`, and the Priority
-   single-select with `P0`, `P1` and `P2` ([durable model](design.md#1-scope-and-durable-model)).
+   single-select with `P0`, `P1` and `P2`
+   ([durable model](design.md#1-scope-and-durable-model); Status is derived by
+   the pass, see [architecture](architecture.md#status)).
    `project init` creates only missing Turn, Run and Result fields, with the
    operator's token, and never edits existing fields or options;
    `project init --snapshot FILE` instead prints copyable
@@ -125,11 +127,12 @@ unverified, and remove only scratch objects the trial created.
 
 ## Scheduled reconciliation
 
-This repository's [reconcile.yml](../.github/workflows/reconcile.yml) is an
-example of applying `reconcile plan` repairs from CI. Every ten minutes on main
-it reads a staging board with a read-only token, writes `reconcile plan --emit`
-proposals as an artifact, and hands them to agentic-job's independent check and
-apply, bounded by [reconcile.toml](../.github/agentic-job/reconcile.toml) to
+This repository's [reconcile.yml](../.github/workflows/reconcile.yml) is a
+staging example of applying `reconcile plan` repairs from CI; the pass's
+Status stage ([pass](pass.md#order-and-effects)) replaces it at cutover.
+Every ten minutes on main it reads a staging board with a read-only token,
+writes `reconcile plan --emit` proposals as an artifact, and hands them to
+agentic-job's independent check and apply, bounded by [reconcile.toml](../.github/agentic-job/reconcile.toml) to
 Status updates on one project and issue closes in one repository. The board
 comes from the repository variables `RECONCILE_OWNER`, `RECONCILE_PROJECT` and
 `RECONCILE_REPO`; until they and the read token are set, each run skips with a

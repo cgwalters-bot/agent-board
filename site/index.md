@@ -13,9 +13,9 @@ agent planning that keeps its whole record on the forge. People and agents put
 work on an ordinary board and its issues; agent-board reads them, decides what
 job each issue should get, starts that job once with a record on the issue, and
 follows the pull requests that come back. It does not run agents itself, and
-nothing it derives from board text is write authority: repairs are proposals for
-an independent check, and writes happen only where an operator or a trusted
-configuration allows them.
+nothing it derives from board text is write authority. Its own writes follow
+fixed rules from forge facts and preview by default, within a fixed request
+budget; what an agent produces needs an independent check.
 
 It is meant for any forge. Today GitHub works fully; Forgejo boards can be read
 but not written or dispatched from; GitLab is not supported yet. See
@@ -31,13 +31,14 @@ but not written or dispatched from; GitLab is not supported yet. See
         +---- pull requests, comments <---- agent job <---------+
                      |
                      v
-              review, then merge or a fix round (agent-board poll)
+              review, then merge or a fix round (agent-board pass)
 ```
 
 The forge's board and issues hold the work: priority, status, plans and
 operator answers live there, where people already look. agent-board reads them
-and decides what to start; the proposed [pass](../docs/pass.md) is the contract
-for one scheduled decision. A dispatcher runs the agent job:
+and decides what to start; [pass](../docs/pass.md) is that scheduled heartbeat,
+and the [architecture](../docs/architecture.md) is how it and the supervisor
+divide the work. A dispatcher runs the agent job:
 [agentic-job](https://cgwalters-forge.github.io/agentic-job/) on a CI runner is
 one backend, and [dispatch](../docs/dispatch.md) describes the interface others
 would plug into. The job's pull requests and comments come back to the forge,
@@ -54,17 +55,18 @@ runs agent-board; the records stay on the forge.
 
 ## Topics
 
+- [Architecture](../docs/architecture.md): the operator's decisions on writes, Status, bookkeeping and the two loops.
 - [Job plans](../docs/job-plans.md): how a plan on an issue becomes one dispatch, and when it is held back.
 - [Epic plans](../docs/epic-plans.md): breaking an epic into sub-issues from a reviewed plan.
 - [Dispatch](../docs/dispatch.md): what agent-board sends to start a job and how it finds the run.
 - [Pull request follow-up](../docs/poll.md): what the poll does and every option of its configuration.
-- [One pass](../docs/pass.md): the proposed single scheduled pass, not implemented yet.
-- [Supervisor](../docs/supervisor-requests.md): health checks and the executor of an agent's bounded requests.
-- [Operator interaction](../docs/operator.md): asks, the decisions document, operator actions and status updates.
+- [One pass](../docs/pass.md): the single scheduled pass, partly built.
+- [Supervisor](../docs/supervisor-requests.md): the auditing agent's commands as built today.
+- [Operator interaction](../docs/operator.md): the `needs-human` label, operator actions and status updates.
 - [Review drafts](../docs/review-drafts.md): sending an agent-drafted review of another project's pull request once the operator approves it.
 - [Release train](../docs/release-train.md): cutting a release and moving its callers' pins, a step a pass.
 - [Per-role GitHub Apps](../docs/apps.md): one app per automation role; so far only `apps create` exists.
-- [Design](../docs/design.md): the coordinator as intended, with its [current implementation limits](../docs/design.md#current-implementation-limits).
+- [Design](../docs/design.md): the original design and research, with its [current implementation limits](../docs/design.md#current-implementation-limits).
 - [GitHub work queue comparison](../docs/github-workqueue-comparison.md): how this differs from gh-aw's native work queue.
 
 agent-board is licensed Apache-2.0 or MIT, at your option. The source is at

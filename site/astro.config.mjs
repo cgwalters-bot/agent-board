@@ -8,6 +8,8 @@ import { unified } from "@astrojs/markdown-remark";
 import starlight from "@astrojs/starlight";
 import { DOCS, pageId, remarkRepositoryLinks } from "./links.mjs";
 
+// Listed on its own under the overview, as the page the others follow.
+const ARCHITECTURE = "architecture.md";
 const root = fileURLToPath(new URL("..", import.meta.url));
 // Where the site is served (`just site-build-pages` sets these for GitHub
 // Pages) and the prefix of links to repository
@@ -34,12 +36,13 @@ export default defineConfig({
       components: { Banner: "./src/components/Banner.astro" },
       sidebar: [
         { label: "Overview", slug: pageId("site/index.md") },
+        { label: "Architecture", slug: pageId(`${DOCS}${ARCHITECTURE}`) },
         // Starlight's autogenerate reads src/content/docs/, not the
         // repository's docs/, so the group lists that directory itself.
         {
           label: "Documentation",
           items: readdirSync(new URL(`../${DOCS}`, import.meta.url))
-            .filter((name) => name.endsWith(".md"))
+            .filter((name) => name.endsWith(".md") && name !== ARCHITECTURE)
             .sort()
             .map((name) => pageId(`${DOCS}${name}`)),
         },

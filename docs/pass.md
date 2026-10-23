@@ -1,6 +1,8 @@
 # One pass
 
-This is the approved contract for `agent-board pass`. A pass
+This is the proposed contract for `agent-board pass`; the operator reviews it
+on the pull request that changes it, and the [architecture](architecture.md)
+records the decisions it follows. A pass
 finishes once; it is not a daemon, a second planner, or a JavaScript compatibility
 layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
@@ -8,8 +10,8 @@ authority for their operations. The differences below are intentional.
 
 ## What is built
 
-The first slice implements the configuration below, stage 1 and stage 4. Stages
-2 and 3 are not built yet, and each pass prints a line saying so:
+The first slice implements the configuration below, stage 1 and stage 4.
+Stages 2, 3 and 5 are not built; the pass prints a line for 2 and 3:
 
 * **Usage** is not refreshed. Pacing reads the `bot-usage/v1` snapshot that
   another job publishes to `usage.repository#usage.issue`, so `usage.url` is
@@ -17,6 +19,10 @@ The first slice implements the configuration below, stage 1 and stage 4. Stages
 * **Epics** are not planned or applied, and applies are not recovered. A
   configured `epics.repository` only decides which children qualify, through a
   live epic.
+* **Status** is not derived or written (stage 5), there is no infrastructure
+  rerun, and writes have no per-operation caps beyond stage 1's own bounds.
+  Stage 1 still writes poll's claim and marker comments in every followed
+  repository, external ones included.
 
 The replay gate below is partly met: there is one recorded board, from 23
 October, with a synthetic usage snapshot. Scenario tests edit that recording.
@@ -53,7 +59,14 @@ what was written is observed by the next pass.
 ## Order and effects
 
 `agent-board pass --config FILE` previews by default. Only `--apply` permits
-writes. The caller serializes apply passes for the board, uses trusted
+writes, and then pass makes them itself with the bot's token: Status, labels,
+comments, closes, merges and dispatches. These are deterministic consequences
+of forge facts, not agent output, so they do not go through agentic-job's
+check and apply; that boundary is for what agents produce. Their guards are
+preview by default, a cap per kind of write per pass (a pass that reaches one
+reports it and leaves the rest to the next pass; the numbers are an
+[open question](architecture.md#open-questions)), and the replay gate below.
+The caller serializes apply passes for the board, uses trusted
 default-branch configuration and a pinned build, and supplies credentials through
 the environment, never the file. Issue text, PR bodies, run names and comments
 other than authenticated operator direction are data, not instructions.
@@ -63,7 +76,10 @@ A pass captures one clock and performs these stages in order:
 1. Follow up PRs using today's `poll` decisions: read followed repositories,
    PR heads, reviews, checks, comments and runs; dispatch bounded fixes/reviews,
    merge only an approved head with green required checks, or comment/label for
-   a person. Retain its claim and head-recheck rules. Count every dispatch made
+   a person. Retain its claim and head-recheck rules, but follow the
+   [bookkeeping rule](architecture.md#bookkeeping): in an external repository
+   the claims and markers become one hidden comment the bot edits in place, and
+   it posts no claim or status comments there. Count every dispatch made
    here against capacity before starting anything later. Pacing here reads the
    previous trusted usage snapshot; missing/stale readings hold new PR runs,
    including on a cold start. The refresh in stage 2 prepares later stages and
@@ -81,9 +97,22 @@ A pass captures one clock and performs these stages in order:
    set Priority, rescope or close children and post plans/receipts within the
    existing epic bounds; planning itself only dispatches a triage run. Refresh
    affected board/issue facts after an apply before scheduling.
-4. Choose and dispatch work by the rule below. Dispatch writes the existing
+4. Rerun, once, each scheduled run that failed for an infrastructure reason,
+   then choose and dispatch work by the rule below. Dispatch writes the existing
    plan claim and run link, and the existing board Run update where supported;
-   it does not invent Status transitions or close issues from guessed outcomes.
+   it does not close issues from guessed outcomes.
+5. Derive Status for every board item, closed issues and merged pull
+   requests included (this stage reads those, which earlier stages skip),
+   from this pass's facts and its own starts, and write each one that differs:
+   * closed issue, or merged pull request: **Done**;
+   * otherwise, the `needs-human` label on the item: **Needs human**;
+   * otherwise, a run in flight or an open pull request for it: **In Progress**;
+   * otherwise a person's **Todo** or **Backlog** stays. What a derived value
+     that no longer holds becomes is an
+     [open question](architecture.md#open-questions).
+
+   No person or agent sets the derived values; an edit to one is overwritten
+   on the next pass. An item whose facts were not read whole keeps its Status.
 
 The result names actions, holds, incomplete reads and failures, with a nonzero
 exit for an operational failure. Independent PRs may still be followed when an
@@ -104,7 +133,7 @@ does not change the apply cache.
 ## Scheduling
 
 There is one candidate set: open board issues in explicitly configured work
-repositories, excluding epic/question/control issues. An epic child qualifies
+repositories, excluding epics and the usage issue. An epic child qualifies
 only through a live epic whose latest `epic` label event is the operator's.
 An unparented issue qualifies only when opened by the operator or bot; public
 visitors must not be able to spend runs simply by filing issues. Deduplicate by
@@ -136,9 +165,20 @@ available. It proposes an implement plan, or explains a needs-design/human hold;
 it does not close the issue on a `done` verdict. Record the question using the
 existing dispatch claim protocol, not another scheduler marker. A completed run
 without a usable plan remains visible for a person; do not automatically retry.
+
+The one automatic rerun is for infrastructure: a scheduled run that failed
+before the agent's work could succeed or fail on its own (runner lost, setup
+or checkout failed, broker or forge outage; the exact rule is an
+[open question](architecture.md#open-questions)) is dispatched again once,
+with the same plan and pool choice rules, counted against WIP and pacing like
+any start. The rerun is recorded on the same dispatch record, so a second
+infrastructure failure, or any failure of the agent's own work, is left for a
+person.
+
 With an accepted implement plan, dispatch precisely that plan once. An invalid
 newest plan does not mean “no plan”; report it, never fall back. Recorded plans
-do not run again; an operator/planner edit or replacement is needed. Research or
+do not run again, except the infrastructure rerun above; an operator/planner
+edit or replacement is needed. Research or
 triage plans explicitly posted on issues remain manual dispatches.
 
 Choose among the configured automatic pools by greatest room below pace:
@@ -174,11 +214,23 @@ minutes for its answer to arrive; an unconfirmed dispatch gets six hours before
 being reported unresolved. Neither starts an automatic retry. New operator
 direction or a replacement plan is the recovery path.
 
-On every pass, examine the trusted `agent-board-epic-apply: ID@TIME` receipt
-**before** deciding that a plan is still waiting. A claim means “do not replay,”
+An epic's repository is first-party, so its apply receipt follows the
+[bookkeeping rule](architecture.md#bookkeeping): one comment on the epic, the
+claim posted before any write and updated as writes are confirmed, readable
+first. It has one line per sub-issue saying what the apply did to it, for
+example `- example/work#12: created, Priority P2` or
+`- example/work#9: closed as not planned`, then one fenced
+`agent-board-epic-apply` JSON block with the machine detail: the plan comment
+ID and change time it claims, each confirmed action with the identity it
+produced, the outcome, and the post-apply fingerprint. It replaces the hidden
+`agent-board-epic-apply` claim and `agent-board-epic-fingerprint` markers, which
+are still read on older epics.
+
+On every pass, examine the trusted receipt **before** deciding that a plan is
+still waiting. A claim means “do not replay,”
 not “all actions succeeded.” Inspect its confirmed writes and refresh the
 census. A successful dated apply result plus its
-`agent-board-epic-fingerprint` records the post-apply membership/state baseline;
+fingerprint records the post-apply membership/state baseline;
 those writes are not fresh demand for planning. That fingerprint does not cover
 body or Priority: retain/compare those facts separately from the resolved
 request and actual effects.
@@ -230,11 +282,13 @@ rounds and existing default continuation handling. Its runs use the same inline
 pool definitions for pacing: previous usage in stage 1, refreshed usage for
 later starts; no tiers or second pools file.
 No additional poll optional switches are exposed in this initial pass schema;
-standalone `poll` remains available. Credentials and transport-specific provider
-normalization are not per-deployment config keys. The caller enables new work by
-setting `workRepositories`, `wip`, pools and usage; triage additionally needs
-`triage: true`, epic planning `epics.repository`. The cutover PR must supply those
-settings explicitly; merely upgrading the binary enables none of them.
+`poll` becomes this stage rather than a separate command, so the switches
+not listed here go with it at the cutover unless a need adds them.
+Credentials and transport-specific provider normalization are not
+per-deployment config keys. The caller enables new work by setting
+`workRepositories`, `wip`, pools and usage; triage additionally needs
+`triage: true`, epic planning `epics.repository`. The cutover PR must supply
+those settings explicitly; merely upgrading the binary enables none of them.
 
 ## Replay and release gate
 
@@ -242,12 +296,13 @@ Record sanitized, complete live facts with injected clock and expected actions,
 holds, writes and dispatch count; replay the contract, not every JavaScript unit
 test. Include idle/free-slot boards on **22 and 23 October**, frozen epics with
 completed applies but stale pending state, partial/ambiguous applies, overlap
-behind rescue drafts, under-pace fill opportunities and over-pace pools. Also
-exercise full WIP, missing/stale usage, invalid latest plans, incomplete pages,
-lost dispatch responses and reruns after each write boundary. Reruns must never
-duplicate creates or dispatches. Document intentional differences under the
-approved drop list; zero dispatches on an idle board with eligible free slots
-and usable pools is a regression, not success.
+behind rescue drafts, under-pace and over-pace pools, and Status derivation
+on every rule above. Also exercise full WIP, an infrastructure failure rerun
+once and a second one left for a person, missing/stale usage, invalid latest
+plans, incomplete pages, lost dispatch responses and reruns after each write
+boundary. Reruns must never duplicate creates or dispatches. Document
+intentional differences under the drop list; zero dispatches on an idle board
+with eligible free slots and usable pools is a regression, not success.
 
 Before production, run preview then apply in a separate staging organization
 with isolated repositories/project and credentials. Verify actual receipts,
@@ -270,9 +325,12 @@ claims to force a retry.
 the required staging deployment for that caller is `cgwalters-forge-stage`.
 Neither name is a default or an agent-board policy.
 
-## Drop list for approval
+## Drop list
 
-These are deliberate removals from the audited caller, not implied parity.
+These are deliberate removals from the audited caller, not implied parity;
+the operator decided the list on 23 October 2026
+([architecture](architecture.md#reruns-and-the-drop-list)). Everything here is
+dropped except the one infrastructure rerun kept from the retry entry.
 Links are immutable source locations; retained semantics are described above.
 
 * [Fill mode, issue-page/candidate caps and accelerated planning][fill]: used
@@ -285,6 +343,8 @@ Links are immutable source locations; retained semantics are described above.
   retried failed runs, inferred blockers, closed merged outcomes and escalated
   exhaustion; retain receipts, but require a replacement plan/person instead
   of another retry state machine. GitHub closing keywords remain effective.
+  Kept: one rerun of a run that failed for an infrastructure reason
+  ([scheduling](#scheduling)), not of an agent's failure.
 * [Scheduler triage verdicts, short-body heuristic and lost-question retries][triage]:
   guessed done/design from body length and answers, closed issues, retried then
   escalated; triage now only proposes a plan/hold, once per recorded request.
@@ -305,10 +365,12 @@ Links are immutable source locations; retained semantics are described above.
   holds and operator epic designation suffice, with no implicit hold removal.
 * [Broker probe/outage-issue lifecycle and global preview hold][broker]: opened,
   refreshed and closed outage issues, held all actors; fresh usable usage and
-  ordinary dispatch failure reporting suffice for this pass. Outage monitoring
+  ordinary dispatch failure reporting, plus the one infrastructure rerun,
+  suffice for this pass. Outage monitoring
   belongs outside scheduling; no outage-based fix-round refunds are configured.
 * [Encrypted private Decisions baseline][decisions]: read/compared private
-  answers on every poll; separate operator interaction, not a scheduling input.
+  answers on every poll; the decisions document folds into the `needs-human`
+  label, which is already a scheduling hold.
 * [Supervisor starts][starts] and its [due][due], [profile][profile] and
   [repeat-failure][repeat] helpers: woke/paced a separate health actor and packed
   operator tasks; relocate with that actor's own cron, not into pass.
@@ -334,7 +396,7 @@ Links are immutable source locations; retained semantics are described above.
   initial pass also does not expose optional standalone-poll operator-comment
   relays, notification subscriptions, operator-answer label clearing,
   collaborator locking, admission envelopes, diagnostic/continuation overrides
-  or custom attribution. Those commands/features remain independently usable;
+  or custom attribution. With `poll` folded into pass they go at the cutover;
   adding them to pass later requires a demonstrated need, not silent migration.
 
 [fill]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/poll/schedule.cjs#L572-L659

@@ -3,7 +3,10 @@
 agent-board is a Rust CLI for a forge-hosted work board; start with the
 [site's landing page](site/index.md) for its purpose and the
 [setup](docs/setup.md) for its quickstart.
-Reconciliation produces proposals, not authorized mutations.
+`agent-board pass --apply` makes its own deterministic writes directly, behind
+preview by default and replay tests, with per-operation caps planned; agent
+output goes through agentic-job's independent check and apply
+([architecture](docs/architecture.md#writes)).
 Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)
 within its fixed bounds (our repositories, at most 2 fix rounds per pull request,
 auto-merge only on review success and green required checks) need no per-run
@@ -102,10 +105,11 @@ Unknown fields, missing-versus-null facts, incomplete coverage, issue-versus-PR
 identity, host/repository/project scope and authenticated cleanup are boundaries,
 not convenience checks. Preserve their negative tests.
 
-Independent bounds/check/apply is **not implemented here**: the CLI's `output
-check` and `output apply` are unsupported. The policy derived from a snapshot is
-proposal scope, not write authority. Do not bypass this with agent credentials or
-direct mutation; see [the bounds contract](docs/design.md#3-agentic-job-bounds-and-delegated-operations).
+The pass's direct writes are its own deterministic ones; what an agent produces
+is a proposal until agentic-job's independent check and apply accepts it, and
+that check is **not implemented here** (the CLI's `output check` and `output
+apply` are unsupported). Do not give agents credentials or a direct mutation
+path around it; see [the bounds contract](docs/design.md#3-agentic-job-bounds-and-delegated-operations).
 Sweeping is deliberately disabled pending authenticated creation receipts.
 
 Keep changes task-scoped: no generated artifacts, credential material, live board

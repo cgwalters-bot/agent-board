@@ -22,7 +22,7 @@ it exists.
   `dispatchWorkflow` from the caller's `agent-board.json`, at `main`.
 - `supervise execute` starts the triage, research and implement runs the
   [supervisor](supervisor-requests.md) requests, with the same two settings.
-- The proposed [pass](pass.md) would use the same settings plus `dispatchRef`.
+- [Pass](pass.md) uses the same settings plus `dispatchRef`.
 
 Every route, identity and pool allowlist comes from the caller's trusted
 configuration, never from a plan, an issue or a dispatcher's inputs.
@@ -80,8 +80,9 @@ When no Run is recorded, `run record --caller` searches one page of at most 100
 of the caller's `dispatch.yml` runs for the single one titled `KIND OWNER/REPO#N`
 and needs `--yes` (or an explicit `--run`) to use it. No scheduled admission,
 automatic Run/Result recording, refusal-to-Blocked conversion or stuck-run
-recovery is implemented. CI applies board changes only through independent
-check and apply.
+recovery is implemented. Agent output reaches the board only through
+independent check and apply; the pass's own writes are direct
+([architecture](architecture.md#writes)).
 
 A post-run controller would need the caller to expose applied pull request and
 comment URLs and refusal reasons as trusted workflow outputs, with run identity
