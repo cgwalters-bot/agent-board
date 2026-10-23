@@ -86,9 +86,9 @@ const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck"];
 const HOLD: &str = "needs-human";
 /// Coordinator checkpoints on an epic: `<!-- coordinator/v1: {...} -->`.
 const CHECKPOINT_MARKER: &str = "coordinator/v1";
-/// The usage snapshot comment (tracker's usage.yml) and its JSON's schema.
+/// The usage snapshot comment (`pass`'s stage 2, or tracker's usage.yml) and its JSON's schema.
 pub(crate) const USAGE_MARKER: &str = "<!-- bot-usage v1 -->";
-const USAGE_SCHEMA: &str = "bot-usage/v1";
+pub(crate) const USAGE_SCHEMA: &str = "bot-usage/v1";
 /// agentic-job's status comment on a run's target ends with this.
 fn status_end(run: u64) -> String {
     format!("\n\n<!-- agentic-job-run: {run} -->\n\n<!-- agentic-job-status -->")

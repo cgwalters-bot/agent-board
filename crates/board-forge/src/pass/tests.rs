@@ -67,6 +67,16 @@ pub(super) fn usage(replay: &mut Replay) -> Value {
     usage_snapshot(body.as_str().unwrap()).unwrap()
 }
 
+/// The broker answering `answer` ([`usage::tests::broker`]'s, recorded),
+/// under a `usage.url` that names no real one.
+fn with_broker(replay: &mut Replay, settings: &mut Value, answer: Value) {
+    replay
+        .requests
+        .push(json!({"request": broker_key(), "answer": answer}));
+    settings["usage"] = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1,
+        "url": "https://broker.invalid/usage"});
+}
+
 pub(super) fn set_usage(replay: &mut Replay, snapshot: &Value) {
     let body = format!("{USAGE_MARKER}\n\n```json\n{snapshot:#}\n```\n");
     answer(replay, "bot-ops/issues/1/comments")["body"][0]["body"] = body.into();
@@ -113,7 +123,7 @@ fn replay_idle_board_starts_work() {
     let report = preview(&config(json!({})), &replay());
     let mut expected = vec![
         "follow: no repositories",
-        "usage: not refreshed by this build; pacing reads the published snapshot",
+        "usage: no usage.url; pacing reads the published snapshot",
     ];
     expected.extend(EPIC_LINES);
     expected.push("candidates: 194 (0 opened by others, 107 outside a live epic)");
@@ -288,6 +298,48 @@ fn replay_scenarios() {
             "a snapshot older than 45 minutes is stale",
             Box::new(|r, _| r.now += time::Duration::minutes(45)),
             vec!["hold pools: the usage snapshot is stale"],
+            0,
+            0,
+        ),
+        (
+            "a fresh broker reading paces a pass whose published snapshot is stale",
+            Box::new(|r, c| {
+                r.now += time::Duration::minutes(45);
+                with_broker(r, c, json!({"body": usage::tests::broker()}));
+            }),
+            vec![
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%",
+                "usage: publish to cgwalters-forge/bot-ops#1",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "an unreadable broker is one line, and the stale snapshot holds",
+            Box::new(|r, c| {
+                r.now += time::Duration::minutes(45);
+                with_broker(r, c, json!({"error": "GET /usage: HTTP status 502"}));
+            }),
+            vec![
+                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the published snapshot",
+                "hold pools: the usage snapshot is stale",
+            ],
+            0,
+            1,
+        ),
+        (
+            "a broker reading without claude's week holds claude",
+            Box::new(|r, c| {
+                let mut broker = usage::tests::broker();
+                broker["anthropic"]["unified_7d"] = Value::Null;
+                broker["codex"]["primary"]["used_percent"] = 10.into();
+                with_broker(r, c, json!({"body": broker}));
+            }),
+            vec![
+                "usage: claude: no reading (held); openai: 10% used",
+                "hold pools: claude has no reading; openai is held until 2026-10-24T00:22:44.21Z",
+            ],
             0,
             0,
         ),
@@ -606,6 +658,12 @@ impl Forge {
     }
 }
 
+impl Broker for Forge {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.replay.usage(url)
+    }
+}
+
 impl Rest for Forge {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.failing(&format!("GET {url}"))?;
@@ -675,6 +733,94 @@ fn apply(forge: &Forge, config: &Config) -> Report {
         forge.replay.now,
     )
     .unwrap()
+}
+
+/// An applying pass publishes the refreshed snapshot to the bot's comment,
+/// one write that `--max-writes` holds, and only to a private repository.
+#[test]
+fn apply_publishes_the_refreshed_usage() {
+    let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    let edit = format!("PATCH {bot_ops}/issues/comments/1");
+    let add = format!("POST {bot_ops}/issues/1/comments");
+    let publish = "usage: publish to cgwalters-forge/bot-ops#1";
+    let not_private = format!("usage error: {publish}: cgwalters-forge/bot-ops is not private");
+    let not_bot = format!("usage error: {publish}: the token is \"someone\"'s");
+    // The --max-writes cap, whether the repository is private, the account
+    // of a pass that finds no usage comment, and what the pass says and writes.
+    type Case<'a> = (
+        Option<usize>,
+        bool,
+        Option<&'a str>,
+        String,
+        Option<&'a String>,
+    );
+    let cases: Vec<Case> = vec![
+        (Some(1), true, None, "usage: published ".into(), Some(&edit)),
+        (
+            Some(0),
+            true,
+            None,
+            format!("held by --max-writes: {publish}"),
+            None,
+        ),
+        (None, false, None, not_private, None),
+        (
+            None,
+            true,
+            Some("cgwalters-bot"),
+            "usage: published ".into(),
+            Some(&add),
+        ),
+        (None, true, Some("someone"), not_bot, None),
+    ];
+    for (writes, private, account, line, wrote) in cases {
+        let mut forge = Forge::new(None, false);
+        let mut settings = json!({"wip": 2});
+        let broker = json!({"body": usage::tests::broker()});
+        with_broker(&mut forge.replay, &mut settings, broker);
+        let reply = |body| json!({"status": 200, "link": null, "body": body});
+        let mut recorded = vec![(bot_ops.clone(), reply(json!({"private": private})))];
+        if let Some(login) = account {
+            answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"] = json!([]);
+            recorded.push((format!("{API_ROOT}user"), reply(json!({"login": login}))));
+        }
+        for (url, answer) in recorded {
+            let request = json!({"request": {"get": url}, "answer": answer});
+            forge.replay.requests.push(request);
+        }
+        let limits = Limits {
+            writes,
+            ..Limits::default()
+        };
+        let now = forge.replay.now;
+        let mode = (Mode::Actions(&own()), limits);
+        let report = run(
+            &forge,
+            &forge,
+            &config(settings),
+            State::default(),
+            mode,
+            now,
+        )
+        .unwrap();
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(&line)),
+            "{line}: {:#?}",
+            report.lines
+        );
+        let writes = forge.writes.borrow();
+        let usage = writes
+            .iter()
+            .find(|(m, url, _)| url.starts_with(&bot_ops) && m != "GET")
+            .map(|(m, url, body)| (format!("{m} {url}"), body));
+        assert_eq!(usage.as_ref().map(|(w, _)| w), wrote, "{line}");
+        if let Some((_, body)) = usage {
+            let published = usage_snapshot(text(body, "/body")).unwrap();
+            let pools = &config(json!({})).pools;
+            let expected = usage::snapshot(&usage::tests::broker(), pools, now).unwrap();
+            assert_eq!(published, expected);
+        }
+    }
 }
 
 /// Two passes compete for the last slot, each with a different plan: the
@@ -1236,8 +1382,12 @@ fn config_table() {
             "triage needs triagePools or planPools",
         ),
         (
-            json!({"usage": {"repository": "o/ops", "issue": 1, "url": "http://broker"}}),
-            "usage url is not https",
+            json!({"usage": {"repository": "o/ops", "issue": 1, "url": "ftp://broker"}}),
+            "usage url is not an http(s) URL with a host",
+        ),
+        (
+            json!({"usage": {"repository": "o/ops", "issue": 1, "url": "http://"}}),
+            "usage url is not an http(s) URL with a host",
         ),
         (
             json!({"pr": {"rebaseRounds": 4}}),
@@ -1253,6 +1403,11 @@ fn config_table() {
         (
             json!({"follow": ["o/r"], "usage": {"repository": "o/ops", "issue": 1}}),
             "pr fixPools is required to pace",
+        ),
+        (
+            json!({"follow": ["o/r"], "pr": {"fixPools": ["mistral"]},
+                "usage": {"url": "http://broker.example/usage", "repository": "o/ops", "issue": 1}}),
+            "pr pool mistral is not in pools",
         ),
     ] {
         let mut value = minimal.clone();

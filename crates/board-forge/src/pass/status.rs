@@ -522,6 +522,12 @@ mod tests {
         }
     }
 
+    impl Broker for Board {
+        fn usage(&self, url: &str) -> Result<Value> {
+            self.replay.usage(url)
+        }
+    }
+
     impl Rest for Board {
         fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
             self.replay.get(url, validator)

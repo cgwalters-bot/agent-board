@@ -637,6 +637,40 @@ impl Transport for Client {
     }
 }
 
+/// The broker answers in well under a kilobyte; this is a bound, not a size.
+const BROKER_BYTES: u64 = 256 * 1024;
+const BROKER_SECONDS: u64 = 10;
+
+impl crate::pass::Broker for Client {
+    /// Without the token, which is GitHub's alone; the errors name no
+    /// address, which may be private.
+    fn usage(&self, url: &str) -> Result<Value> {
+        let mut response = self
+            .agent
+            .get(url)
+            .header("User-Agent", "agent-board")
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(BROKER_SECONDS)))
+            // The address may be private: not to a proxy from the environment.
+            .proxy(None)
+            .build()
+            .call()
+            .map_err(|error| match error {
+                // It would repeat the address.
+                ureq::Error::BadUri(_) => anyhow::anyhow!("GET /usage: invalid address"),
+                error => anyhow::anyhow!("GET /usage: {error}"),
+            })?;
+        let status = response.status().as_u16();
+        ensure!(status == 200, "GET /usage: HTTP status {status}");
+        response
+            .body_mut()
+            .with_config()
+            .limit(BROKER_BYTES)
+            .read_json()
+            .with_context(|| format!("GET /usage: not JSON, or over {BROKER_BYTES} bytes"))
+    }
+}
+
 impl crate::poll::Rest for Client {
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         ensure!(

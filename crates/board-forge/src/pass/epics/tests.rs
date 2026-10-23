@@ -384,6 +384,12 @@ impl Forge {
     }
 }
 
+impl Broker for Forge {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.replay.usage(url)
+    }
+}
+
 impl Rest for Forge {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.replay.get(url, validator)

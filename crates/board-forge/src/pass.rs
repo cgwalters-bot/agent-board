@@ -5,9 +5,8 @@
 //!
 //! Built so far: the configuration, stage 1 (pull request follow-up),
 //! stage 3 (epic apply, recovery and planning, in [`epics`]), stage 4
-//! (scheduling) and stage 5 (board Status, in [`status`]). Stage 2
-//! (refreshing usage from the broker) is not: the pass reads the usage
-//! snapshot another job publishes, and says so on a line.
+//! (scheduling) and stage 5 (board Status, in [`status`]), with stage 2
+//! (the usage refresh, in [`usage`]) between them.
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -18,7 +17,7 @@ use crate::poll::{
     self, POLL_REPOSITORY_LIMIT, PollPolicy, Rest, RestResponse, State, next_link,
     validate_repository, validate_workflow,
 };
-use crate::supervise::health::{USAGE_MARKER, usage_snapshot};
+use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
@@ -47,10 +46,10 @@ pub const REPLAY_SCHEMA: &str = "agent-board/pass-replay/v1";
 const USAGE_STALE_SECONDS: i64 = 45 * 60;
 /// A pool reading observed longer ago than this is not a reading: the broker
 /// may have carried it over a restart while use elsewhere went on.
-const OBSERVED_STALE_SECONDS: i64 = 30 * 60 * 60;
+pub(super) const OBSERVED_STALE_SECONDS: i64 = 30 * 60 * 60;
 /// How far past the pass's clock a usage time may lie, for clocks that
 /// differ a little: a later one is a mistake, never a fresh reading.
-const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+pub(super) const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 /// Requests a start is left before its first write, enough for every read
 /// and write after it: the triage plan's post, the plan protocol's two reads
 /// of the comments (10 pages each), its account read, the overlap check (at
@@ -247,7 +246,8 @@ impl<'de> Deserialize<'de> for Pools {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
-    /// The broker's usage endpoint, for the refresh this build does not make.
+    /// The broker's usage endpoint, which stage 2 reads; without it, pacing
+    /// reads the snapshot another job publishes.
     pub url: Option<String>,
     pub repository: String,
     pub issue: u64,
@@ -384,8 +384,16 @@ impl Config {
         if let Some(usage) = &self.usage {
             validate_repository(&usage.repository).context("usage repository")?;
             ensure!(usage.issue > 0, "usage issue is not a positive number");
+            // Plain HTTP is for a broker on a private network, such as a
+            // tailnet, which encrypts it; the read carries no credential.
+            // The address is not repeated: it may be private.
             if let Some(url) = &usage.url {
-                ensure!(url.starts_with("https://"), "usage url is not https");
+                let url = url::Url::parse(url).ok();
+                ensure!(
+                    url.is_some_and(|u| matches!(u.scheme(), "http" | "https")
+                        && u.host_str().is_some_and(|h| !h.is_empty())),
+                    "usage url is not an http(s) URL with a host"
+                );
             }
         }
         if let Some(workflow) = &self.pr.review_workflow {
@@ -412,6 +420,13 @@ impl Config {
             .chain(&self.pr.conflict_fix_pool)
         {
             ensure!(valid_pool(pool), "pr pool {pool:?} is not a pool name");
+            // Stage 2 publishes only the configured pools, and PR pacing
+            // reads a pool missing from the snapshot as unpaced room.
+            ensure!(
+                self.usage.as_ref().is_none_or(|u| u.url.is_none())
+                    || self.pools.0.iter().any(|(name, _)| name == pool),
+                "pr pool {pool} is not in pools, which stage 2 publishes usage for"
+            );
         }
         // The poll paces only the pools a fix round names: with none, the
         // caller's default would run unpaced, on a cold start too.
@@ -510,7 +525,7 @@ pub fn room(
         ));
     }
     let entry = &snapshot["pools"][pool];
-    if !entry.is_object() {
+    if !entry.is_object() || entry["reason"] == usage::NO_READING {
         return Err(format!("{pool} has no reading"));
     }
     match at(&entry["observed_at"]).map(|observed| (now - observed).whole_seconds()) {
@@ -538,9 +553,15 @@ pub fn room(
     if resets <= now {
         return Err(format!("{pool}'s window has reset since its reading"));
     }
+    Ok(allowed(settings.target, window, resets, now) - used)
+}
+
+/// The share of its paced window, in percent, a pool may have used by
+/// `now`: `target` of the share of the window passed. The refresh's hold and
+/// [`room`] both pace by it.
+fn allowed(target: f64, window_minutes: f64, resets: OffsetDateTime, now: OffsetDateTime) -> f64 {
     let left = (resets - now).as_seconds_f64() / 60.0;
-    let elapsed = (1.0 - left / window).clamp(0.0, 1.0);
-    Ok(settings.target * 100.0 * elapsed - used)
+    target * 100.0 * (1.0 - left / window_minutes).clamp(0.0, 1.0)
 }
 
 /// Of `names`, in their order, the pool with the most room; a tie goes to
@@ -871,6 +892,13 @@ impl<C: Transport> Transport for Budget<'_, C> {
     }
 }
 
+/// Not a forge request, so not one of the budget's.
+impl<C: Broker> Broker for Budget<'_, C> {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.inner.usage(url)
+    }
+}
+
 // ---- One pass ----
 
 /// What a pass did: a line per decision, a summary of what it dispatched,
@@ -913,7 +941,7 @@ pub enum Mode<'a> {
 /// One pass at `now` within `limits`. `client` reads and writes as the bot;
 /// `dispatcher` starts runs. In [`Mode::Preview`], nothing is written or
 /// dispatched.
-pub fn run<C: Rest + Transport>(
+pub fn run<C: Rest + Transport + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
@@ -934,7 +962,7 @@ pub fn run<C: Rest + Transport>(
 
 /// [`run`] within `bounds` rather than [`PASS_REQUEST_LIMIT`] and
 /// [`PASS_SECONDS_LIMIT`].
-fn run_within<C: Rest + Transport>(
+fn run_within<C: Rest + Transport + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
@@ -954,7 +982,7 @@ fn run_within<C: Rest + Transport>(
     Ok(report)
 }
 
-fn stages<C: Rest + Transport>(
+fn stages<C: Rest + Transport + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
@@ -1023,12 +1051,6 @@ fn stages<C: Rest + Transport>(
             }
         }
     }
-    // Stage 2, not built yet: say so rather than look done.
-    if config.usage.is_some() {
-        report
-            .lines
-            .push("usage: not refreshed by this build; pacing reads the published snapshot".into());
-    }
     let mut scheduler = Scheduler {
         client,
         dispatcher,
@@ -1045,6 +1067,8 @@ fn stages<C: Rest + Transport>(
         other: None,
         epic_starts: Vec::new(),
     };
+    // Stage 2: usage from the broker, for this pass's later starts and the next pass.
+    scheduler.refresh();
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
     // starts take their slots before stage 4's.
     earlier += scheduler.epics(earlier, &git_ref);
@@ -1395,6 +1419,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// The bot's usage snapshot from the configured issue, if `usage` is set.
     fn usage(&self) -> Result<Option<Value>> {
+        let comment = self.usage_comment()?;
+        Ok(comment.and_then(|c| usage_snapshot(text(&c, "/body"))))
+    }
+
+    /// The bot's usage comment on the configured issue, if `usage` is set.
+    fn usage_comment(&self) -> Result<Option<Value>> {
         let Some(usage) = &self.config.usage else {
             return Ok(None);
         };
@@ -1418,7 +1448,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     && text(c, "/body").starts_with(USAGE_MARKER)
             });
             if let Some(comment) = found {
-                return Ok(usage_snapshot(text(comment, "/body")));
+                return Ok(Some(comment.clone()));
             }
             match response.link.as_deref().and_then(next_link) {
                 Some(next) => url = next,
@@ -1999,6 +2029,12 @@ fn graphql_key(query: &str, variables: &Value) -> Value {
     json!({"graphql": fnv(query), "variables": variables})
 }
 
+/// The broker's `/usage` in a recording, by no address: the fixture keeps
+/// none, and replays under any `usage.url`.
+fn broker_key() -> Value {
+    json!({"broker": "/usage"})
+}
+
 /// Reads through `inner`, keeping each request and its answer for a replay
 /// fixture. Reads are made without the poll's validators, so the fixture
 /// replays without its state file. It never writes.
@@ -2050,6 +2086,18 @@ impl<C: Rest> Rest for Recorder<'_, C> {
 
     fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
         bail!("a recorded pass is a preview, and does not {method} {url}")
+    }
+}
+
+impl<C: Broker> Broker for Recorder<'_, C> {
+    fn usage(&self, url: &str) -> Result<Value> {
+        let read = self.inner.usage(url);
+        let answer = match &read {
+            Ok(body) => json!({"body": body}),
+            Err(error) => json!({"error": format!("{error:#}")}),
+        };
+        self.keep(broker_key(), answer);
+        read
     }
 }
 
@@ -2120,6 +2168,15 @@ impl<C: Rest> Rest for Seeded<'_, C> {
     }
 }
 
+impl<C: Broker> Broker for Seeded<'_, C> {
+    fn usage(&self, url: &str) -> Result<Value> {
+        match self.seed.answer(&broker_key()) {
+            Ok(_) => self.seed.usage(url),
+            Err(_) => self.live.usage(url),
+        }
+    }
+}
+
 impl<C: Transport> Transport for Seeded<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         match self.seed.answer(&graphql_key(query, &variables)) {
@@ -2146,6 +2203,16 @@ impl Rest for Replay {
     }
 }
 
+impl Broker for Replay {
+    fn usage(&self, _: &str) -> Result<Value> {
+        let answer = self.answer(&broker_key())?;
+        match answer.get("error") {
+            Some(error) => bail!("{}", error.as_str().unwrap_or("recorded error")),
+            None => Ok(answer["body"].clone()),
+        }
+    }
+}
+
 impl Transport for Replay {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let answer = self.answer(&graphql_key(query, &variables))?;
@@ -2158,6 +2225,9 @@ impl Transport for Replay {
 
 mod epics;
 mod status;
+mod usage;
+
+pub use usage::Broker;
 
 #[cfg(test)]
 mod tests;

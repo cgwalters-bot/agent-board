@@ -10,14 +10,29 @@ authority for their operations. The differences below are intentional.
 
 ## What is built
 
-The pass implements the configuration below and stages 1, 3, 4 and 5.
-Stage 2 is not built; the pass prints a line for it:
+The pass implements the configuration below and stages 1 to 5, except
+that there is no infrastructure rerun, and stage 1 still writes poll's claim
+and marker comments in every followed repository, external ones included.
 
-* **Usage** is not refreshed. Pacing reads the `bot-usage/v1` snapshot that
-  another job publishes to `usage.repository#usage.issue`, so `usage.url` is
-  accepted but not used.
-* There is no infrastructure rerun. Stage 1 still writes poll's claim and
-  marker comments in every followed repository, external ones included.
+Stage 2 reads `usage.url`, the broker's `/usage`, without the forge token or
+an environment proxy (plain HTTP is allowed for a broker on a private network
+that encrypts it, such as a tailnet), and paces each configured pool it reads
+(claude from Anthropic's windows, openai from Codex's) as tracker's
+[`usage.cjs`][meters] does. Its line is
+`usage: claude: 18% used, pace allows 50%, resets T, read T; openai: …`, and
+stages 3 and 4 pace by it. A preview then prints
+`usage: publish to OWNER/REPO#N`; an applying pass edits the bot's comment
+there (or adds one, as the bot), only in a private repository, and prints
+`usage: published URL`. That is one write step, and the pass's first after
+stage 1, so `--max-writes 1` spends it there. A failed read is one line,
+`usage error: reading the broker: …`, counted as a failure, and pacing falls
+back to the published snapshot under the staleness rules below. Without
+`usage.url` the line says pacing reads the published snapshot. Unlike
+`usage.cjs`, a pool the broker has no current week for (after a broker
+restart) is null, so held, not carried from the previous snapshot; and the
+snapshot has no `windows`, `workers` or Mistral allowance (the review app
+reads that from the pools file). A recording keeps the broker's answer under
+no address.
 
 Stage 3 reads the open `epic` issues of `epics.repository` with their
 sub-issues (20 epics a request), the board's Priority options, and each live
@@ -103,7 +118,7 @@ agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board
 ```
 
 Each decision is one line: `start triage|implement|planning OWNER/REPO#N … pool=P`,
-`apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`,
+`apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
@@ -115,7 +130,7 @@ plans and what an apply did, and the steps the caps held; an uncapped kind
 has no `/N`.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
-snapshot. A preview counts only the PR runs that stage 1 actually starts, so it
+snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 1 actually starts, so it
 can show more free slots than an applying pass would.
 
 A triage run is started by posting the bot's `triage` job plan on the issue and
@@ -149,7 +164,8 @@ two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
 starts, stage 1's fix, rebase, continuation and answer rounds, stage 3's
 planning run and stage 4's starts together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
-1's comments, labels, retitles, retargets, enqueues and merges, stage 3's
+1's comments, labels, retitles, retargets, enqueues and merges, stage 2's
+usage comment, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
 and its recovery, and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch

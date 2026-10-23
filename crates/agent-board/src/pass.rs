@@ -12,19 +12,19 @@ pub struct Pass {
     /// The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN (the bot's) and DISPATCH_TOKEN, never the file.
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
-    /// Take the steps: follow up pull requests, apply epic plans, start the chosen runs and write board Status as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow.
+    /// Take the steps: follow up pull requests, publish the usage snapshot, apply epic plans, start the chosen runs and write board Status as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow.
     #[arg(long)]
     pub apply: bool,
     /// Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, an epic's planning run, and scheduled starts. The rest are held, each line saying so.
     #[arg(long, value_name = "N")]
     pub max_dispatch: Option<usize>,
-    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together.
+    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage snapshot, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage comment's edit, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together.
     #[arg(long, value_name = "N")]
     pub max_writes: Option<usize>,
     /// Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through.
     #[arg(long, value_name = "N")]
     pub max_status_changes: Option<usize>,
-    /// Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read.
+    /// Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub replay: Option<PathBuf>,
     /// Preview live, and save every read and its answer to FILE as a replay fixture.
@@ -33,7 +33,7 @@ pub struct Pass {
 }
 
 /// A preview through `live` whose reads are saved to `path` as a replay fixture.
-fn record_pass<C: Rest + Transport>(
+fn record_pass<C: Rest + Transport + pass::Broker>(
     live: &C,
     config: &Config,
     (path, limits): (&PathBuf, Limits),
