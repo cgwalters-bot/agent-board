@@ -1,0 +1,3 @@
+https://github.com/cgwalters-forge/tracker/issues/880 v0.6.4: wrappers
+would: label https://github.com/cgwalters-forge/tracker/issues/880 needs-human
+would: comment on https://github.com/cgwalters-forge/tracker/issues/880: Halted: no single pin of cgwalters-forge/agentic-job with its version. Fix it, then remove the `needs-human` label.

@@ -806,7 +806,8 @@ pub struct RestResponse {
 /// Conditional GETs against the REST API. `validator` is a header name and value.
 pub trait Rest {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse>;
-    /// A write; any status comes back, for the caller to judge.
+    /// A write, or a GET whose 404 is an answer; any status comes back,
+    /// for the caller to judge.
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)>;
 }
 

@@ -641,7 +641,7 @@ fn wrapper_pins(text: &str, release: &str) -> Vec<String> {
         .collect()
 }
 
-fn base64_decode(text: &str) -> Result<Vec<u8>> {
+pub(crate) fn base64_decode(text: &str) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0u32);
     for c in text.bytes().filter(|c| !c.is_ascii_whitespace()) {

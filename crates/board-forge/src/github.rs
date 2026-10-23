@@ -579,13 +579,16 @@ impl crate::poll::Rest for Client {
                 .header("User-Agent", "agent-board")
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28");
-            // A DELETE (of a label) is sent with `null`, which means no body.
+            // A DELETE (of a label) or a GET is sent with `null`, which
+            // means no body.
             match body {
                 Value::Null => request.send_empty(),
                 body => request.send_json(body),
             }
         };
         let mut response = match method {
+            // Unconditional, with its status for the caller to judge.
+            "GET" => request(self.agent.get(url).force_send_body()),
             "POST" => request(self.agent.post(url)),
             "PATCH" => request(self.agent.patch(url)),
             "PUT" => request(self.agent.put(url)),
