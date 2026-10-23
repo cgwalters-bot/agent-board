@@ -209,7 +209,7 @@ that the bot then carries out; `operator` and `bot` must then differ. GitHub
 names a labeling's label as it is called now, so renaming a label the operator
 once added to `epic` (which takes write access) would also pass. It covers
 `epic apply` only, not the supervisor's implement gate
-([supervisor requests](supervisor-requests.md)).
+([supervisor](supervisor-requests.md)).
 
 `planner` is optional and defaults to `bot`. IDs and names are configuration,
 not planner-controlled values. Creating an issue sets the default Priority; a

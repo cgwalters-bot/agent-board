@@ -34,5 +34,5 @@ Three repositories share the work; each holds what the others must not.
 - [Job plans](../docs/job-plans.md): how a plan on an issue becomes one dispatch, and when it is held back.
 - [Epic plans](../docs/epic-plans.md): breaking an epic into sub-issues from a reviewed plan.
 - [Review drafts](../docs/review-drafts.md): sending an agent-drafted review of another project's pull request once the operator approves it.
-- [Operator actions](../docs/operator-actions.md) and [decisions](../docs/decisions.md): how a person answers the board's questions.
+- [Operator interaction](../docs/operator.md): how a person answers the board's questions and acts on it.
 - [Per-role GitHub Apps](../docs/apps.md): one app per automation role; so far only `apps create` exists, and no workflow uses the apps.

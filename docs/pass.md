@@ -3,7 +3,7 @@
 This is the proposed contract for `agent-board pass`, not implemented behaviour.
 Approve this contract and its drop list before implementing the command. A pass
 finishes once; it is not a daemon, a second planner, or a JavaScript compatibility
-layer. Existing [PR follow-up](design.md),
+layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
 

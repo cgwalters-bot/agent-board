@@ -64,7 +64,7 @@ deadlock checks are disabled because this is a safety question, not scheduling.
 
 Here is the code correspondence (see
 [`dispatch.rs`](../crates/agent-board/src/dispatch.rs) and
-[the design's preview seam](../docs/design.md#dispatch-preview-integration-seam)):
+[the run recording join](../docs/dispatch.md#recording-a-run-on-the-board)):
 
 `Prepare` represents `command()` / `request dispatch`: the snapshot has an open
 Todo issue, Coordinator turn and empty Run. Printing argv neither reserves nor

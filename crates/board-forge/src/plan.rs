@@ -660,7 +660,7 @@ struct Record {
 /// post a record and only the one with the earlier goes on. A pass that dies
 /// after its record, or a dispatch that fails, leaves the plan recorded and
 /// not dispatched again, since an ambiguous dispatch must not be retried
-/// blindly (docs/design.md); a writer edits or replaces the plan to try again.
+/// blindly (docs/dispatch.md); a writer edits or replaces the plan to try again.
 ///
 /// With `batch` above zero the run also does up to that many extra issues
 /// ([`crate::batch`]), each recorded and read back the same way before the
