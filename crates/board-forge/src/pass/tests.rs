@@ -122,8 +122,8 @@ pub(super) const EPIC_LINES: &[&str] = &[
 fn replay_idle_board_starts_work() {
     let report = preview(&config(json!({})), &replay());
     let mut expected = vec![
-        "follow: no repositories",
         "usage: no usage.url; pacing reads the published snapshot",
+        "follow: no repositories",
     ];
     expected.extend(EPIC_LINES);
     expected.push("candidates: 194 (0 opened by others, 107 outside a live epic)");
@@ -311,6 +311,21 @@ fn replay_scenarios() {
                 "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%",
                 "usage: publish to cgwalters-forge/bot-ops#1",
                 "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "a preview paces pull requests by its fresh reading, unpublished",
+            Box::new(|r, c| {
+                r.now += time::Duration::minutes(45);
+                with_broker(r, c, json!({"body": usage::tests::broker()}));
+                followed_draft(r, c);
+            }),
+            vec![
+                "usage: publish to cgwalters-forge/bot-ops#1; a preview paces by it unpublished",
+                "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)",
+                "pools: claude normal 18%/145%, openai normal 3%/5%",
             ],
             6,
             0,
@@ -1435,7 +1450,7 @@ fn config_table() {
         .is_ok()
     );
     // The PR stage keeps today's poll defaults but for its own keys.
-    let poll = config(json!({"pr": {"mergeQueue": {}, "rebaseRounds": 2}})).poll();
+    let poll = config(json!({"pr": {"mergeQueue": {}, "rebaseRounds": 2}})).poll(None);
     assert_eq!(poll.policy.merge_queue, Some(poll::QUEUE_TRIES));
     assert_eq!(poll.policy.rebase_rounds, 2);
     assert_eq!(poll.policy.continuation, poll::Continuation::default());
@@ -1820,4 +1835,93 @@ fn replay_refuses_writes_and_unrecorded_reads() {
     );
     assert_eq!(fnv(""), "cbf29ce484222325");
     assert_eq!(fnv("a"), "af63dc4c8601ec8c");
+}
+
+/// Follows `cgwalters-forge/agentic-job`, whose one open pull request, #9,
+/// is the bot's draft that stopped at a checkpoint: stage 2 continues it
+/// where pacing lets it.
+fn followed_draft(replay: &mut Replay, settings: &mut Value) {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    let checkpoint =
+        json!({"reason": "budget", "done": "half", "left": "half", "next": "the rest"});
+    let pull = json!({
+        "id": "PR_9", "number": 9, "url": format!("https://github.com/{REPO}/pull/9"),
+        "title": "Do the thing", "state": "OPEN", "isDraft": true, "mergeable": "MERGEABLE",
+        "body": format!("Closes #8.\n\n```checkpoint\n{checkpoint}\n```\n"),
+        "headRefOid": "abc", "headRefName": "dispatch/implement/agent-run-1",
+        "baseRefName": "main", "isCrossRepository": true,
+        "baseRepository": {"nameWithOwner": REPO, "isPrivate": false, "defaultBranchRef": {"name": "main"}},
+        "author": {"__typename": "User", "login": "cgwalters-bot"},
+        "headRepositoryOwner": {"login": "cgwalters-bot"},
+        "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+        "autoMergeRequest": null, "mergeQueueEntry": null,
+        "files": {"nodes": [{"path": "README.md"}], "pageInfo": {"hasNextPage": false}},
+        "timelineItems": {"nodes": []}, "baseChange": {"nodes": []},
+        "reviews": {"nodes": [], "pageInfo": {"hasPreviousPage": false}},
+        "series": {"nodes": [{"commit": {"oid": "abc", "messageHeadline": "Do half the thing"}}],
+            "pageInfo": {"hasNextPage": false}},
+        "commits": {"nodes": [{"commit": {"oid": "abc", "committedDate": "2026-10-23T12:00:00Z",
+            "message": "Do half the thing", "statusCheckRollup": null}}]},
+    });
+    let variables = json!({"owner": "cgwalters-forge", "name": "agentic-job", "number": 9});
+    replay.requests.push(json!({
+        "request": graphql_key(poll::PULL_QUERY, &variables),
+        "answer": {"data": {"repository": {"pullRequest": pull}}},
+    }));
+    for (path, body) in [
+        ("events?per_page=100", json!([])),
+        (
+            "pulls?state=open&per_page=100",
+            json!([{"number": 9, "user": {"login": "cgwalters-bot"}}]),
+        ),
+        ("issues/9/comments?per_page=100", json!([])),
+        ("rules/branches/main", json!([])),
+        ("branches/main", json!({"name": "main", "protected": false})),
+    ] {
+        replay.requests.push(json!({
+            "request": {"get": format!("{API_ROOT}repos/{REPO}/{path}")},
+            "answer": {"status": 200, "link": null, "body": body},
+        }));
+    }
+    settings["follow"] = json!([REPO]);
+    settings["pr"] = json!({"fixPools": ["claude"]});
+}
+
+/// 23 October, live: a pass whose published snapshot was stale refused
+/// every pull request's continuation, though it read the broker fresh in the
+/// same pass. Stage 2 now paces by stage 1's reading, so the continuation
+/// starts, and takes a slot from scheduling.
+#[test]
+fn apply_paces_pull_requests_by_this_pass_reading() {
+    let mut forge = Forge::new(None, false);
+    let mut settings = json!({"wip": 2});
+    forge.replay.now += time::Duration::minutes(45);
+    let broker = json!({"body": usage::tests::broker()});
+    with_broker(&mut forge.replay, &mut settings, broker);
+    followed_draft(&mut forge.replay, &mut settings);
+    for (url, body) in [
+        (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+        (
+            format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+            json!({"private": true}),
+        ),
+    ] {
+        let answer = json!({"status": 200, "link": null, "body": body});
+        let request = json!({"request": {"get": url}, "answer": answer});
+        forge.replay.requests.push(request);
+    }
+    let report = apply(&forge, &config(settings));
+    let lines = &report.lines;
+    for line in [
+        "usage: published ",
+        "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1): its checkpoint says budget -> https://github.com/",
+        "pools: claude normal 18%/145%, openai normal 3%/5%",
+        "hold wip: 3 of 2 runs active",
+    ] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(line)),
+            "{line}: {lines:#?}"
+        );
+    }
+    assert_eq!(report.failures, 0, "{lines:#?}");
 }

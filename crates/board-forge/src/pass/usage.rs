@@ -1,9 +1,8 @@
-//! Stage 2 (docs/pass.md): the pools' usage, read from the inference
+//! Stage 1 (docs/pass.md): the pools' usage, read from the inference
 //! broker's `/usage` and paced as tracker's `usage.cjs` paced it, so that
-//! the pass's later starts and the next pass's pull request runs pace by a
-//! fresh reading rather than by whatever another job last published. An
-//! applying pass publishes it to the bot's usage comment, where the review
-//! app reads it too.
+//! the pass's runs, pull requests' included, pace by a fresh reading rather
+//! than by whatever another job last published. An applying pass publishes
+//! it to the bot's usage comment, where the review app reads it too.
 use super::*;
 
 /// The broker's answer this reads.
@@ -247,8 +246,9 @@ fn render(snapshot: &Value) -> Result<String> {
 }
 
 impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
-    /// Stage 2: read the broker and pace this pass's later starts by it;
-    /// an applying pass publishes it, one write. A failed read is one line,
+    /// Stage 1: read the broker and pace this pass's runs by it; an
+    /// applying pass publishes it, one write, and a preview paces by it
+    /// unpublished. A failed read is one line,
     /// and pacing falls back to the published snapshot, which holds once
     /// it is stale.
     pub(super) fn refresh(&mut self) {
@@ -281,7 +281,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
         if !self.apply {
             self.caps.count(Kind::Write);
-            self.line(said);
+            self.line(format!("{said}; a preview paces by it unpublished"));
             return;
         }
         let comment = self.usage_comment();

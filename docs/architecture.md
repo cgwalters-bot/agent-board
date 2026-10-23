@@ -8,7 +8,7 @@ decisions both follow. Where an older page disagrees, this one wins.
 
 ```text
   cron --> agent-board pass ---dispatch---> dispatcher ---> agent job
-           (follow PRs, usage, epics,       (agentic-job        |
+           (usage, follow PRs, epics,       (agentic-job        |
             Status, schedule)                or another)        |
                 |          ^                                    |
          writes |          | reads                              |
@@ -23,9 +23,9 @@ decisions both follow. Where an older page disagrees, this one wins.
 ## Two loops
 
 `agent-board pass` is the heartbeat: a cron runs it, it finishes once, and the
-same facts give the same decisions. One pass follows pull requests (the
-standalone `poll` becomes this stage of pass rather than a separate command),
-refreshes usage, plans epics, derives Status and schedules new work (see
+same facts give the same decisions. One pass refreshes usage, follows pull
+requests (the standalone `poll` becomes this stage of pass rather than a
+separate command), plans epics, derives Status and schedules new work (see
 [what is built](pass.md#what-is-built)).
 
 The supervisor is an agent that answers "is the system working?". It audits

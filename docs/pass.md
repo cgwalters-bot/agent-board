@@ -11,20 +11,22 @@ authority for their operations. The differences below are intentional.
 ## What is built
 
 The pass implements the configuration below and stages 1 to 5, except
-that there is no infrastructure rerun, and stage 1 still writes poll's claim
+that there is no infrastructure rerun, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
 
-Stage 2 reads `usage.url`, the broker's `/usage`, without the forge token or
+Stage 1 reads `usage.url`, the broker's `/usage`, without the forge token or
 an environment proxy (plain HTTP is allowed for a broker on a private network
 that encrypts it, such as a tailnet), and paces each configured pool it reads
 (claude from Anthropic's windows, openai from Codex's) as tracker's
 [`usage.cjs`][meters] does. Its line is
 `usage: claude: 18% used, pace allows 50%, resets T, read T; openai: …`, and
-stages 3 and 4 pace by it. A preview then prints
-`usage: publish to OWNER/REPO#N`; an applying pass edits the bot's comment
+stages 2 to 4 pace by it, pull requests' fix and continuation runs included.
+A preview then prints
+`usage: publish to OWNER/REPO#N; a preview paces by it unpublished`; an
+applying pass edits the bot's comment
 there (or adds one, as the bot), only in a private repository, and prints
-`usage: published URL`. That is one write step, and the pass's first after
-stage 1, so `--max-writes 1` spends it there. A failed read is one line,
+`usage: published URL`. That is one write step, and the pass's first,
+so `--max-writes 1` spends it there. A failed read is one line,
 `usage error: reading the broker: …`, counted as a failure, and pacing falls
 back to the published snapshot under the staleness rules below. Without
 `usage.url` the line says pacing reads the published snapshot. Unlike
@@ -130,7 +132,7 @@ plans and what an apply did, and the steps the caps held; an uncapped kind
 has no `/N`.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
-snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 1 actually starts, so it
+snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 2 actually starts, so it
 can show more free slots than an applying pass would.
 
 A triage run is started by posting the bot's `triage` job plan on the issue and
@@ -161,11 +163,11 @@ of forge facts, not agent output, so they do not go through agentic-job's
 check and apply; that boundary is for what agents produce. Their guards are
 preview by default, caps per pass, and the replay gate below. The caps are
 two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
-starts, stage 1's fix, rebase, continuation and answer rounds, stage 3's
+starts, stage 2's fix, rebase, continuation and answer rounds, stage 3's
 planning run and stage 4's starts together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
-1's comments, labels, retitles, retargets, enqueues and merges, stage 2's
-usage comment, stage 3's
+1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues
+and merges, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
 and its recovery, and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
@@ -184,23 +186,23 @@ data, not instructions.
 
 A pass captures one clock and performs these stages in order:
 
-1. Follow up PRs using today's `poll` decisions: read followed repositories,
+1. Refresh usage from the configured broker, retaining the existing normalized
+   paced-window calculation (target, burst, short-window exhaustion and original
+   observation time). Read the previous trusted snapshot and publish the new
+   `bot-usage/v1` snapshot to the configured private issue. Preview computes it
+   without publishing, and paces by it all the same. A failed refresh is
+   visible; it cannot turn missing or stale readings into spare capacity.
+2. Follow up PRs using today's `poll` decisions: read followed repositories,
    PR heads, reviews, checks, comments and runs; dispatch bounded fixes/reviews,
    merge only an approved head with green required checks, or comment/label for
    a person. Retain its claim and head-recheck rules, but follow the
    [bookkeeping rule](architecture.md#bookkeeping): in an external repository
    the claims and markers become one hidden comment the bot edits in place, and
    it posts no claim or status comments there. Count every dispatch made
-   here against capacity before starting anything later. Pacing here reads the
-   previous trusted usage snapshot; missing/stale readings hold new PR runs,
-   including on a cold start. The refresh in stage 2 prepares later stages and
-   the next pass, not retroactive permission for stage 1.
-2. Refresh usage from the configured broker, retaining the existing normalized
-   paced-window calculation (target, burst, short-window exhaustion and original
-   observation time). Read the previous trusted snapshot and publish the new
-   `bot-usage/v1` snapshot to the configured private issue. Preview computes it
-   without publishing. A failed refresh is visible; it cannot turn missing or
-   stale readings into spare capacity.
+   here against capacity before starting anything later. Pacing here reads
+   stage 1's reading, or where the refresh failed or is not configured, the
+   previous trusted snapshot; missing/stale readings hold new PR runs,
+   including on a cold start.
 3. Read the complete board, Priority options, live epics, their children,
    authenticated operator comments, accepted plans, apply receipts and current
    runs. Recover completed epic applies, apply an accepted pending epic plan,
@@ -400,8 +402,8 @@ The pinned executable/build reference belongs in the workflow, not this file.
 
 The PR stage otherwise uses today's default poll policy, including two fix
 rounds and existing default continuation handling. Its runs use the same inline
-pool definitions for pacing: previous usage in stage 1, refreshed usage for
-later starts; no tiers or second pools file.
+pool definitions for pacing, by stage 1's refreshed usage like later
+starts; no tiers or second pools file.
 No additional poll optional switches are exposed in this initial pass schema;
 `poll` becomes this stage rather than a separate command, so the switches
 not listed here go with it at the cutover unless a need adds them.

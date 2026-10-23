@@ -3,10 +3,10 @@
 //! and starts it with the existing plan dispatch ([`crate::plan`]). It
 //! previews unless asked to apply, printing one line per decision.
 //!
-//! Built so far: the configuration, stage 1 (pull request follow-up),
-//! stage 3 (epic apply, recovery and planning, in [`epics`]), stage 4
-//! (scheduling) and stage 5 (board Status, in [`status`]), with stage 2
-//! (the usage refresh, in [`usage`]) between them.
+//! Built so far: the configuration, stage 1 (the usage refresh, in
+//! [`usage`]), stage 2 (pull request follow-up), stage 3 (epic apply,
+//! recovery and planning, in [`epics`]), stage 4 (scheduling) and stage 5
+//! (board Status, in [`status`]).
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -246,7 +246,7 @@ impl<'de> Deserialize<'de> for Pools {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
-    /// The broker's usage endpoint, which stage 2 reads; without it, pacing
+    /// The broker's usage endpoint, which stage 1 reads; without it, pacing
     /// reads the snapshot another job publishes.
     pub url: Option<String>,
     pub repository: String,
@@ -420,12 +420,12 @@ impl Config {
             .chain(&self.pr.conflict_fix_pool)
         {
             ensure!(valid_pool(pool), "pr pool {pool:?} is not a pool name");
-            // Stage 2 publishes only the configured pools, and PR pacing
+            // Stage 1 reads only the configured pools, and PR pacing
             // reads a pool missing from the snapshot as unpaced room.
             ensure!(
                 self.usage.as_ref().is_none_or(|u| u.url.is_none())
                     || self.pools.0.iter().any(|(name, _)| name == pool),
-                "pr pool {pool} is not in pools, which stage 2 publishes usage for"
+                "pr pool {pool} is not in pools, which stage 1 reads usage for"
             );
         }
         // The poll paces only the pools a fix round names: with none, the
@@ -465,8 +465,9 @@ impl Config {
     }
 
     /// The pull request poll's settings: today's defaults but for the `pr`
-    /// keys, paced by the previous usage snapshot where `usage` is set.
-    pub fn poll(&self) -> poll::Config {
+    /// keys, paced where `usage` is set by `snapshot`, this pass's reading,
+    /// or without one by the published snapshot.
+    pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
         let policy = PollPolicy {
             merge_authors: self.pr.merge_authors.clone(),
             toil_fix_pool: self.pr.toil_fix_pool.clone().unwrap_or_default(),
@@ -479,6 +480,7 @@ impl Config {
                 bot: self.bot.clone(),
                 margin_percent: 0.0,
                 overrides: vec![],
+                snapshot: snapshot.cloned(),
             }),
             ..PollPolicy::default()
         };
@@ -1004,7 +1006,7 @@ fn stages<C: Rest + Transport + Broker>(
         inner: dispatcher,
         bounds,
     };
-    // Both stages start runs from the same ref.
+    // Every stage that starts runs starts them from the same ref.
     let git_ref = match &config.dispatch_ref {
         Some(git_ref) => git_ref.clone(),
         None if config.follow.is_empty() && !config.work() => String::new(),
@@ -1017,40 +1019,6 @@ fn stages<C: Rest + Transport + Broker>(
             }
         },
     };
-    // Stage 1: pull request follow-up, today's poll.
-    let mut earlier = 0;
-    if config.follow.is_empty() {
-        report.lines.push("follow: no repositories".into());
-    } else {
-        let apply = apply.then(|| poll::Apply {
-            dispatcher: &dispatcher,
-            workflow: config.dispatch_workflow.clone(),
-            pools: config.pr.fix_pools.clone(),
-            git_ref: Some(git_ref.clone()),
-        });
-        let follow = &config.follow;
-        match poll::run_capped(
-            &client,
-            &client,
-            &config.poll(),
-            state,
-            (follow, follow),
-            apply,
-            Some(caps),
-            now,
-        ) {
-            Ok(outcome) => {
-                report.lines.extend(outcome.lines);
-                report.failures += outcome.errors;
-                earlier = outcome.dispatched;
-                report.state = Some(outcome.state);
-            }
-            Err(error) => {
-                report.failures += 1;
-                report.lines.push(format!("follow error: {error:#}"));
-            }
-        }
-    }
     let mut scheduler = Scheduler {
         client,
         dispatcher,
@@ -1067,8 +1035,11 @@ fn stages<C: Rest + Transport + Broker>(
         other: None,
         epic_starts: Vec::new(),
     };
-    // Stage 2: usage from the broker, for this pass's later starts and the next pass.
+    // Stage 1: usage from the broker, which this pass's runs pace by, pull
+    // requests' included, and the next pass if it cannot read the broker.
     scheduler.refresh();
+    // Stage 2: pull request follow-up, today's poll.
+    let mut earlier = scheduler.follow(state, &git_ref);
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
     // starts take their slots before stage 4's.
     earlier += scheduler.epics(earlier, &git_ref);
@@ -1113,7 +1084,7 @@ enum Step {
 /// What holds a slot or an issue besides the runs a listing shows.
 struct Slots {
     wip: usize,
-    /// Runs stage 1 started.
+    /// Runs stage 2 started.
     earlier: usize,
     /// Runs this stage started, by id where GitHub named it: a listing that
     /// shows them already does not count them twice.
@@ -1173,6 +1144,46 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     fn writers(&self) -> [&'a str; 2] {
         [&self.config.operator, &self.config.bot]
+    }
+
+    /// Stage 2: the followed pull requests, paced by stage 1's reading where
+    /// it has one. How many runs it started.
+    fn follow(&mut self, state: State, git_ref: &str) -> usize {
+        let config = self.config;
+        if config.follow.is_empty() {
+            self.line("follow: no repositories".into());
+            return 0;
+        }
+        let apply = self.apply.then(|| poll::Apply {
+            dispatcher: &self.dispatcher,
+            workflow: config.dispatch_workflow.clone(),
+            pools: config.pr.fix_pools.clone(),
+            git_ref: Some(git_ref.to_owned()),
+        });
+        let fresh = self.snapshot.clone().flatten();
+        let follow = &config.follow;
+        match poll::run_capped(
+            &self.client,
+            &self.client,
+            &config.poll(fresh.as_ref()),
+            state,
+            (follow, follow),
+            apply,
+            Some(self.caps),
+            self.now,
+        ) {
+            Ok(outcome) => {
+                self.report.lines.extend(outcome.lines);
+                self.report.failures += outcome.errors;
+                self.report.state = Some(outcome.state);
+                outcome.dispatched
+            }
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("follow error: {error:#}"));
+                0
+            }
+        }
     }
 
     fn schedule(&mut self, earlier: usize, git_ref: &str) -> Result<()> {

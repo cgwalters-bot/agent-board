@@ -36,6 +36,10 @@ pub struct Pace {
     pub bot: String,
     pub margin_percent: f64,
     pub overrides: Vec<Override>,
+    /// A snapshot already in hand, paced by in place of the comment, which
+    /// is then not read: the pass's own fresh reading, which a preview does
+    /// not publish.
+    pub snapshot: Option<Value>,
 }
 
 /// What an override does to its pool's pacing while it is in force.
@@ -214,6 +218,7 @@ impl Pace {
             bot: bot.to_owned(),
             margin_percent,
             overrides: overrides(object.get("overrides"))?,
+            snapshot: None,
         }))
     }
 }
@@ -544,34 +549,40 @@ fn minute(at: OffsetDateTime) -> String {
 impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// The pools' modes, read once a pass where `pace` is set.
     pub(super) fn paces(&mut self) -> Option<Paces> {
-        let pace = self.config.policy.pace.clone()?;
+        self.config.policy.pace.as_ref()?;
         if let Some(read) = &self.paces {
             return Some(read.clone());
         }
-        let read = self
-            .paged(
-                &format!(
-                    "repos/{}/issues/{}/comments?per_page=100",
-                    pace.repository, pace.issue
-                ),
-                false,
-            )
-            .map_err(|error| format!("the usage snapshot could not be read ({error:#})"))
-            .and_then(|comments| {
-                let snapshot = comments
-                    .iter()
-                    .find(|c| {
-                        text(c, "/user/login") == pace.bot
-                            && text(c, "/body").starts_with(USAGE_MARKER)
-                    })
-                    .and_then(|c| usage_snapshot(text(c, "/body")));
-                paces(
-                    snapshot.as_ref(),
-                    self.now,
-                    pace.margin_percent,
-                    &pace.overrides,
+        let pace = self.config.policy.pace.clone()?;
+        let snapshot = match pace.snapshot {
+            Some(snapshot) => Ok(Some(snapshot)),
+            None => self
+                .paged(
+                    &format!(
+                        "repos/{}/issues/{}/comments?per_page=100",
+                        pace.repository, pace.issue
+                    ),
+                    false,
                 )
-            });
+                .map_err(|error| format!("the usage snapshot could not be read ({error:#})"))
+                .map(|comments| {
+                    comments
+                        .iter()
+                        .find(|c| {
+                            text(c, "/user/login") == pace.bot
+                                && text(c, "/body").starts_with(USAGE_MARKER)
+                        })
+                        .and_then(|c| usage_snapshot(text(c, "/body")))
+                }),
+        };
+        let read = snapshot.and_then(|snapshot| {
+            paces(
+                snapshot.as_ref(),
+                self.now,
+                pace.margin_percent,
+                &pace.overrides,
+            )
+        });
         self.paces = Some(read.clone());
         Some(read)
     }

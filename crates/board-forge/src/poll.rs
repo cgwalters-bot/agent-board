@@ -194,7 +194,7 @@ macro_rules! check_fields {
     };
 }
 
-const PULL_QUERY: &str = concat!(
+pub(crate) const PULL_QUERY: &str = concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
