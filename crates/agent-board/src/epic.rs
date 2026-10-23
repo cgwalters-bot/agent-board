@@ -12,7 +12,7 @@ pub struct Plan {
     /// Epic whose newest accepted epic plan to check: URL, OWNER/REPO#N, or N with --repo.
     issue: String,
     /// Print the mutations instead of making them (required; use epic apply --apply to make them).
-    #[arg(long)]
+    #[arg(long, required = true)]
     dry_run: bool,
     /// Login whose plans count: the operator.
     #[arg(long, value_name = "LOGIN")]
@@ -75,22 +75,19 @@ pub struct Apply {
     /// Epic URL, OWNER/REPO#N, or N with --repo.
     issue: String,
     /// Trusted configuration file from a protected default-branch checkout.
-    #[arg(long)]
+    #[arg(long, value_name = "FILE")]
     config: std::path::PathBuf,
-    /// Print requests without writing (the default).
-    #[arg(long, conflicts_with = "apply")]
-    dry_run: bool,
     /// Write with the configured bot's token.
     #[arg(long)]
     apply: bool,
     /// Refuse unless the newest trusted plan has this request identifier.
-    #[arg(long)]
+    #[arg(long, value_name = "ID")]
     expect_request: Option<String>,
     /// Refuse unless the newest trusted plan is this comment.
-    #[arg(long)]
+    #[arg(long, value_name = "ID")]
     expect_comment: Option<u64>,
     /// Refuse unless the plan's last edit (or creation) is this RFC 3339 instant.
-    #[arg(long)]
+    #[arg(long, value_name = "RFC3339")]
     expect_updated_at: Option<String>,
 }
 

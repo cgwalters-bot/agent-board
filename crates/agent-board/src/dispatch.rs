@@ -59,7 +59,7 @@ pub struct FromPlan {
     /// Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration.
     #[arg(long, value_name = "LOGIN")]
     bot: Option<String>,
-    /// Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository (#111). Off without it; from the caller's configuration.
+    /// Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository. Off without it; from the caller's configuration.
     #[arg(long)]
     collaborators_only: bool,
     /// With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration.

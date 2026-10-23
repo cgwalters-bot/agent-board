@@ -158,7 +158,7 @@ enum Command {
 enum Epic {
     /// Print the mutations the newest accepted epic plan on an epic would make (--dry-run only).
     Plan(epic::Plan),
-    /// Apply the newest accepted epic plan once (dry run unless --apply).
+    /// Apply the newest accepted epic plan once (dry run is the default; --apply writes).
     Apply(epic::Apply),
 }
 
@@ -182,11 +182,11 @@ enum Project {
     Init,
     /// Publish a project status update (writes; requires project write permission).
     StatusUpdate {
-        /// Overall project health: on-track, at-risk or off-track.
+        /// Overall project health.
         #[arg(long, value_parser = ["on-track", "at-risk", "off-track"])]
         status: String,
         /// Read the update body from a UTF-8 file; otherwise summarize since the last update.
-        #[arg(long)]
+        #[arg(long, value_name = "FILE")]
         body: Option<PathBuf>,
     },
 }
@@ -221,8 +221,8 @@ struct List {
     /// Filter by whose turn it is (for example Coordinator).
     #[arg(long)]
     turn: Option<String>,
-    /// Filter issue state: open, closed or all.
-    #[arg(long, default_value = "all")]
+    /// Filter by issue state.
+    #[arg(long, default_value = "all", value_parser = ["open", "closed", "all"])]
     state: String,
     /// Maximum number of items to display.
     #[arg(short = 'L', long, default_value_t = 30)]
@@ -284,7 +284,7 @@ enum Reconcile {
         #[arg(long)]
         emit: bool,
         /// Trusted default-branch agent-board.json; statusReconcile is off by default.
-        #[arg(long)]
+        #[arg(long, value_name = "FILE")]
         config: Option<PathBuf>,
     },
 }
@@ -303,7 +303,7 @@ enum Check {
         #[arg(long = "as")]
         identity: String,
         /// JSONL proposals file; reads stdin when omitted.
-        #[arg(long)]
+        #[arg(long, value_name = "FILE")]
         proposals: Option<PathBuf>,
     },
 }
