@@ -1,7 +1,8 @@
 # Working on agent-board
 
 agent-board is a Rust CLI for a forge-hosted work board; start with the
-[README](README.md) for its purpose, quickstart and current capabilities.
+[site's landing page](site/index.md) for its purpose and the
+[setup](docs/setup.md) for its quickstart.
 Reconciliation produces proposals, not authorized mutations.
 Runs started by the [tracker polling job](https://github.com/cgwalters-forge/tracker#the-pull-request-poll)
 within its fixed bounds (our repositories, at most 2 fix rounds per pull request,
@@ -19,7 +20,7 @@ that a feature or security boundary has been implemented.
 - `.github/workflows/`: unprivileged PR/push CI.
 - `live/`: protected staging workflow template, run from the staging repository.
 - `docs/`: design, security contracts and implementation limits; distinguish plans from current code.
-- `site/`: the Starlight documentation site, rendering the README and `docs/` in place (no copies); `just site-test` and `just site-build`, as agentic-job's.
+- `site/`: the Starlight documentation site, rendering `docs/` in place (no copies) under its own landing page, `site/index.md`; the README only points to it; `just site-test` and `just site-build`, as agentic-job's.
 
 ## Build, lint and test
 
@@ -63,7 +64,7 @@ cargo build --locked --release -p agent-board
 Measured cold release build: 54.30 s. Do not run the live workflow's `test project`
 invocation in a sandbox: it needs GitHub network access and a staging write token,
 and creates/modifies forge objects. No current test requires root. See
-[README commands](README.md#commands) and
+[CLI reference](docs/cli.md) and
 [design implementation limits](docs/design.md#current-implementation-limits).
 
 ## Code conventions

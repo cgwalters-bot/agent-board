@@ -33,7 +33,7 @@ export default defineConfig({
       title: "agent-board",
       components: { Banner: "./src/components/Banner.astro" },
       sidebar: [
-        { label: "Overview", slug: pageId("README.md") },
+        { label: "Overview", slug: pageId("site/index.md") },
         // Starlight's autogenerate reads src/content/docs/, not the
         // repository's docs/, so the group lists that directory itself.
         {

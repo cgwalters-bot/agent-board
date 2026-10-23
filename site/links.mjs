@@ -9,7 +9,6 @@ import path from "node:path";
 // `<base><id>/`. The content collection and this table must agree.
 export const PAGES = {
   "site/index.md": "",
-  "README.md": "overview",
 };
 export const DOCS = "docs/";
 

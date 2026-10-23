@@ -9,8 +9,8 @@ test("rewrite", () => {
     // Between docs pages, with and without a fragment.
     ["job-plans.md", "docs/epic-plans.md", "/agent-board/docs/job-plans/"],
     ["job-plans.md#batching", "docs/design.md", "/agent-board/docs/job-plans/#batching"],
-    // The README and the landing page are pages too.
-    ["../README.md#commands", "docs/job-plans.md", "/agent-board/overview/#commands"],
+    // The landing page is a page too; the README is not, and goes to the forge.
+    ["../README.md#install", "docs/job-plans.md", "https://forge.example/o/r/blob/abc/README.md#install"],
     ["docs/design.md#current-implementation-limits", "README.md", "/agent-board/docs/design/#current-implementation-limits"],
     ["../docs/job-plans.md", "site/index.md", "/agent-board/docs/job-plans/"],
     ["index.md", "site/index.md", "/agent-board/"],
@@ -34,7 +34,7 @@ test("rewrite", () => {
 });
 
 test("pageId", () => {
-  assert.equal(pageId("README.md"), "overview");
+  assert.equal(pageId("README.md"), null);
   assert.equal(pageId("site/index.md"), "");
   assert.equal(pageId("docs/design.md"), "docs/design");
   // Only the pages the collection loads.
@@ -57,14 +57,14 @@ test("remarkRepositoryLinks", () => {
     children: [
       { type: "heading", depth: 1, children: [{ type: "text", value: "The " }, { type: "inlineCode", value: "poll" }, { type: "text", value: " command" }] },
       { type: "paragraph", children: [{ type: "link", url: "job-plans.md#dispatch", children: [] }] },
-      { type: "definition", url: "../README.md" },
+      { type: "definition", url: "../site/index.md" },
     ],
   });
   const tree = page();
   plugin(tree, { path: "/repo/docs/design.md" });
   assert.deepEqual(tree.children[0], { type: "html", value: '<span id="the-poll-command"></span>' });
   assert.equal(tree.children[1].children[0].url, "/agent-board/docs/job-plans/#dispatch");
-  assert.equal(tree.children[2].url, "/agent-board/overview/");
+  assert.equal(tree.children[2].url, "/agent-board/");
   // A file the site does not render as a page is left alone.
   const other = page();
   plugin(other, { path: "/repo/specs/board.md" });
