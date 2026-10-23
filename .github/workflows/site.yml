@@ -45,7 +45,7 @@ jobs:
       # Pinned by commit, as the workflow check requires of a step that
       # runs as root; this is main when written, with secure-host:v0.6.3.
       - uses: cgwalters-forge/actions/secure-host@4642b4f3a2803489a2714f5e1211371b24150fdc # main, with secure-host:v0.6.3
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: just@1.58.0
       - run: just site-test
