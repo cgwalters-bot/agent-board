@@ -253,7 +253,7 @@ fn staging_reader_uses_dedicated_environment() {
     // Regression guard for the job's binding, not proof of GitHub-side protection.
     assert!(WORKFLOW.contains("\n    environment: staging-project-read\n"));
     assert!(WORKFLOW.contains("GH_TOKEN: ${{ secrets.STAGING_PROJECT_READ_TOKEN }}"));
-    let documentation = include_str!("../../../README.md");
+    let documentation = include_str!("../../../docs/setup.md");
     assert!(documentation.contains("only a **branch** rule for `main` and no tag rules"));
     assert!(documentation.contains("Remove any repository or organization secret"));
 }

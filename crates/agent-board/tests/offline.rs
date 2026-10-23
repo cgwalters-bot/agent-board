@@ -10,13 +10,13 @@ fn fixture() -> String {
 }
 
 #[test]
-fn readme_credential_free_rehearsal() {
-    let readme = include_str!("../../../README.md");
-    let section = readme
-        .split_once("### Rehearse without credentials\n")
+fn setup_credential_free_rehearsal() {
+    let setup = include_str!("../../../docs/setup.md");
+    let section = setup
+        .split_once("## Try it offline\n")
         .unwrap()
         .1
-        .split_once("### Connect one lane\n")
+        .split_once("## Connect one lane\n")
         .unwrap()
         .0;
     let commands = section.split_once("```sh\n").unwrap().1;

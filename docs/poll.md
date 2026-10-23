@@ -446,6 +446,52 @@ harness's own words, carries a checkpoint, has no body, or does not fit
 GitHub's bounds (256 and 65536 characters) is not copied, and the pull request
 goes to `needs-human` as before. The edit cannot be pinned to the head.
 
+`statusReconcile` (absent by default) previews whole-board Status drift on
+every poll:
+
+```json
+{
+  "statusReconcile": {
+    "enabled": true,
+    "project": "https://github.com/orgs/example/projects/1",
+    "repositories": ["example/intake", "example/code"],
+    "runRepositories": ["example/runners"]
+  }
+}
+```
+
+Supply the board with `--owner`/`--project` or `--snapshot`; it must match the
+configured project. Each poll prints a `status-preview=` plan to stderr, even
+with `poll --apply`: **board proposals are never applied by the poll**.
+`reconcile plan --config agent-board.json` uses the same rules; `--emit` lowers
+proposals, retaining issue versus PR identity. There are at most 500 additional
+read requests per pass; exceeding the bound fails without publishing a partial
+status plan. Preview errors are reported on stderr and in the final exit status,
+but do not stop the PR poll. Run URLs are only read in `runRepositories`, so
+editable board text cannot send token-bearing reads to arbitrary repositories or
+API paths.
+
+The rules inspect every in-scope issue and PR without Lead, Workflow or
+assignment exemptions: closed/merged content or a nonempty set of all-merged
+linked PRs becomes Done; an open `needs-human`/`question` label or an outstanding
+operator review request becomes Needs human; otherwise a draft PR or active
+recorded Run becomes In Progress. A completed recorded Run releases In Progress
+or Needs human to Todo. Terminal facts win, then human asks, then active work.
+Missing run data is unknown, not proof that no live job exists. Linked PR facts
+come from complete native PR-valued project fields. Coverage and status schema
+checks still block incomplete or ambiguous repairs. This mode maps all closed
+content to Done, including `NOT_PLANNED`; the default rules keep Cancelled.
+Closure with a reason, Draft-item actions, complete live-job absence detection,
+epic classification, Priority defaults and off-board inventory are not
+inferred.
+
+Plan preconditions are not sufficient authority to apply these proposals. An
+independent checker must reread the decisive facts for each reason: content and
+linked PR states for `terminal_content`, open labels/current-head review requests
+for `open_human_ask`, and draft state plus the recorded run's identity/status for
+`active_work` or `inactive_work`. A board Run URL is not proof of run/item
+correlation; completion of that run alone is not proof of no other live job.
+
 ## Organization status
 
 `agent-board status --owner ORG --config agent-board.json [--job-limit N]`
