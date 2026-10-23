@@ -8,6 +8,7 @@ mod item;
 mod live;
 mod org_status;
 mod poll;
+mod release_train;
 mod review;
 mod supervise;
 
@@ -132,6 +133,8 @@ enum Command {
     Supervise(supervise::Supervise),
     /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
     Status(org_status::Status),
+    /// One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply).
+    ReleaseTrain(release_train::ReleaseTrain),
     /// Create the per-role GitHub Apps (docs/apps.md).
     Apps {
         #[command(subcommand)]
@@ -830,6 +833,25 @@ fn execute(cli: Cli) -> Result<()> {
                 eprintln!("Preview only; not applied.");
                 render(serde_json::to_value(plan)?, &cli)
             }
+        }
+        Command::ReleaseTrain(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none(),
+                "release-train prints lines and reads its settings from --config only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "release-train supports only github.com"
+            );
+            release_train::run(
+                args,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
         }
         Command::Poll(args) => {
             ensure!(
