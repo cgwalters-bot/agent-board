@@ -490,7 +490,7 @@ Links are immutable source locations; retained semantics are described above.
   refreshed and closed outage issues, held all actors; fresh usable usage and
   ordinary dispatch failure reporting, plus the one infrastructure rerun,
   suffice for this pass. Outage monitoring
-  belongs outside scheduling; no outage-based fix-round refunds are configured.
+  belongs outside scheduling, in the [broker probe](broker-probe.md); no outage-based fix-round refunds are configured.
 * [Encrypted private Decisions baseline][decisions]: read/compared private
   answers on every poll; the decisions document folds into the `needs-human`
   label, which is already a scheduling hold.

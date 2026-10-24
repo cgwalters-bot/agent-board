@@ -1,0 +1,13 @@
+{
+  "open": [
+    {"number": 8, "user": {"login": "someone"}, "body": "<!-- tracker-broker-outage -->\nBroker unreachable."},
+    {"number": 9, "user": {"login": "example-bot"}, "body": "<!-- tracker-broker-outage -->\nBroker unreachable.", "pull_request": {}},
+    {"number": 10, "user": {"login": "example-bot"}, "body": "Broker unreachable."},
+    {"number": 7, "user": {"login": "Example-Bot"}, "body": "<!-- tracker-broker-outage -->\nBroker unreachable from the probe at 2026-10-24T00:00:00Z."}
+  ],
+  "others": [
+    {"number": 8, "user": {"login": "someone"}, "body": "<!-- tracker-broker-outage -->\nBroker unreachable."},
+    {"number": 9, "user": {"login": "example-bot"}, "body": "<!-- tracker-broker-outage -->\nBroker unreachable.", "pull_request": {}},
+    {"number": 10, "user": {"login": "example-bot"}, "body": "Broker unreachable."}
+  ]
+}

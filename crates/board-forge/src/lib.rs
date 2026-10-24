@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 pub mod action;
 pub mod batch;
+pub mod broker;
 pub mod caps;
 pub mod epic;
 pub mod epic_apply;

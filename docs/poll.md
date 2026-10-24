@@ -228,7 +228,7 @@ required, `N` 0 to 25200 (the run timeout). Only for a fix or continuation run
 the marker names that completed other than `success`, the pass reads one page
 of 30 each of the open and the last two days' closed issues labelled `outage`
 in that repository, and keeps those `author` opened whose body starts with
-`<!-- tracker-broker-outage -->`, as the caller's broker probe writes them. Each is an outage from `N` seconds before it was opened until it
+`<!-- tracker-broker-outage -->`, as the [broker probe](broker-probe.md) writes them. Each is an outage from `N` seconds before it was opened until it
 was closed. A run whose `updated_at` falls in an open one waits; in a closed
 one, the round is given back in a new marker (fix rounds or continuation
 rounds one fewer, no head or run named), so the next pass starts it again
