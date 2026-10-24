@@ -77,6 +77,30 @@ fn with_broker(replay: &mut Replay, settings: &mut Value, answer: Value) {
         "url": "https://broker.invalid/usage"});
 }
 
+/// The broker just after a restart, `with_broker`'s with `probe` set: no
+/// windows, and `requests` sent for each pool since, or no count at all.
+fn restarted(replay: &mut Replay, settings: &mut Value, probe: bool, requests: Option<u64>) {
+    let mut broker = usage::tests::broker();
+    broker["started_at"] = 1792768000.into();
+    let counts = requests.map(|n| json!({"requests": n, "unmetered": 0}));
+    broker["anthropic"] = json!({"counts": counts});
+    broker["codex"] = json!({"counts": counts});
+    with_broker(replay, settings, json!({"body": broker}));
+    settings["usage"]["probe"] = probe.into();
+}
+
+/// The recorded run in flight on claude, its pool unnamed.
+fn unpooled(replay: &mut Replay) {
+    let runs = &mut answer(replay, "status=in_progress")["body"]["workflow_runs"];
+    for run in runs.as_array_mut().unwrap() {
+        let title = run["display_title"]
+            .as_str()
+            .unwrap()
+            .replace(" (claude)", "");
+        run["display_title"] = title.into();
+    }
+}
+
 pub(super) fn set_usage(replay: &mut Replay, snapshot: &Value) {
     let body = format!("{USAGE_MARKER}\n\n```json\n{snapshot:#}\n```\n");
     answer(replay, "bot-ops/issues/1/comments")["body"][0]["body"] = body.into();
@@ -396,6 +420,62 @@ fn replay_scenarios() {
                 "usage: claude: no reading (held); openai: 10% used",
                 "hold pools: claude has no reading; openai is held until 2026-10-24T00:22:44.21Z",
             ],
+            0,
+            0,
+        ),
+        (
+            "after a broker restart, without probe, every pool waits for a reading",
+            Box::new(|r, c| restarted(r, c, false, Some(0))),
+            vec![
+                "usage: claude: no reading (held); openai: no reading (held)",
+                "hold pools: claude has no reading; openai has no reading; new runs wait",
+            ],
+            0,
+            0,
+        ),
+        (
+            "probe: one run on each pool the broker has sent nothing for",
+            Box::new(|r, c| {
+                restarted(r, c, true, Some(0));
+                unpooled(r);
+            }),
+            vec![
+                "probe: claude has no reading; one run to take one",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+                "probe: openai has no reading; one run to take one",
+                "start triage cgwalters-forge/tracker#459 pool=openai",
+                "hold pools: claude has no reading; openai has no reading; 192 more candidate(s) wait",
+            ],
+            2,
+            0,
+        ),
+        (
+            "probe: none on a pool with a run in flight",
+            Box::new(|r, c| restarted(r, c, true, Some(0))),
+            vec![
+                "probe: openai has no reading; one run to take one",
+                "start triage cgwalters-forge/tracker#446 pool=openai",
+            ],
+            1,
+            0,
+        ),
+        (
+            "probe: requests since the restart and still no reading hold",
+            Box::new(|r, c| {
+                restarted(r, c, true, Some(3));
+                unpooled(r);
+            }),
+            vec!["hold pools: claude has no reading; openai has no reading; new runs wait"],
+            0,
+            0,
+        ),
+        (
+            "probe: a broker that counts no requests holds",
+            Box::new(|r, c| {
+                restarted(r, c, true, None);
+                unpooled(r);
+            }),
+            vec!["hold pools: claude has no reading; openai has no reading; new runs wait"],
             0,
             0,
         ),

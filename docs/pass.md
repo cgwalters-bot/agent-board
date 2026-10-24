@@ -36,6 +36,16 @@ snapshot has no `windows`, `workers` or Mistral allowance (the review app
 reads that from the pools file). A recording keeps the broker's answer under
 no address.
 
+The broker learns a pool's windows only from the responses to requests made
+through it, so after a restart a held pool would never get a reading. With
+`usage.probe`, a pool with no reading whose count of requests in the broker's
+answer (`anthropic.counts`, `codex.counts`, as `mistral.counts`) is zero, and
+with no run in flight named for it, takes one run in stage 4, within
+`--max-dispatch`: `probe: claude has no reading; one run to take one` before
+its start. Its requests give the next pass a reading. A pool with requests and
+still no reading, or without a count, stays held, and the published snapshot
+holds it either way (`no-reading`).
+
 Stage 3 reads the open `epic` issues of `epics.repository` with their
 sub-issues (20 epics a request), the board's Priority options, and each live
 epic's comments, and takes the live epics in Priority order. Its first line
@@ -392,6 +402,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
+| `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |

@@ -553,6 +553,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     earlier,
                     mine: Vec::new(),
                     busy,
+                    probes: BTreeSet::new(),
                 },
             )),
             Err(error) => {
