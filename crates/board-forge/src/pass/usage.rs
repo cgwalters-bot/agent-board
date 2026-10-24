@@ -181,6 +181,33 @@ fn mistral(broker: &Value, at: &str) -> Result<Option<Value>> {
     Ok(Some(out))
 }
 
+/// The snapshot's `budget`: `weekly`, and the broker's trailing week of
+/// spend at list prices, in dollars, of every operator
+/// (praxis-credential-broker#36). The broker's split by operator is not
+/// read yet, so interactive use counts too: the budget holds early, never
+/// late. Anything but a week in dollars at list prices is no reading, and so
+/// is a total that leaves requests unpriced, or does not say it prices them
+/// all: a model missing from the broker's price table would spend unbounded
+/// at $0.
+fn spend(broker: &Value, weekly: f64) -> Value {
+    let spend = &broker["spend"];
+    let week = spend["currency"] == "USD"
+        && spend["basis"] == "list"
+        && spend["window_days"].as_u64() == Some(7);
+    let unpriced = spend["unpriced_requests"].as_u64();
+    match number(&spend["total"]).filter(|t| week && unpriced == Some(0) && *t >= 0.0) {
+        Some(total) => json!({"weekly_usd": weekly, "spent_usd": total,
+            "prices": spend["prices"].as_str(), "unpriced_requests": 0}),
+        None => {
+            let mut none = json!({"weekly_usd": weekly, "spent_usd": null, "reason": NO_READING});
+            if let Some(n) = unpriced.filter(|n| week && *n > 0) {
+                none["unpriced_requests"] = n.into();
+            }
+            none
+        }
+    }
+}
+
 /// The `bot-usage/v1` snapshot of the configured pools the broker reads,
 /// from its answer at `now`.
 pub(super) fn snapshot(broker: &Value, pools: &Pools, now: OffsetDateTime) -> Result<Value> {
@@ -251,10 +278,22 @@ fn describe(name: &str, entry: &Value) -> String {
     )
 }
 
-/// Each pool's [`describe`].
+/// Each pool's [`describe`], then the budget's where there is one.
 fn pools(snapshot: &Value) -> Vec<String> {
     let pools = snapshot["pools"].as_object().into_iter().flatten();
-    pools.map(|(name, entry)| describe(name, entry)).collect()
+    let mut lines: Vec<String> = pools.map(|(name, entry)| describe(name, entry)).collect();
+    let budget = &snapshot["budget"];
+    if budget.is_object() {
+        let weekly = budget["weekly_usd"].as_f64().unwrap_or(f64::NAN);
+        lines.push(match budget["spent_usd"].as_f64() {
+            Some(spent) => format!("budget: ${spent:.0} of ${weekly:.0} this week at list prices"),
+            None => match budget["unpriced_requests"].as_u64() {
+                Some(n) => format!("budget: ${weekly:.0} a week, {n} request(s) unpriced (held)"),
+                None => format!("budget: ${weekly:.0} a week, no spend reading (held)"),
+            },
+        });
+    }
+    lines
 }
 
 /// The comment: the marker, a line per pool, then the JSON that pacing and
@@ -284,7 +323,10 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             return;
         };
         let read = self.client.usage(url).and_then(|broker| {
-            let snapshot = snapshot(&broker, &config.pools, self.now)?;
+            let mut snapshot = snapshot(&broker, &config.pools, self.now)?;
+            if let Some(budget) = &config.budget {
+                snapshot["budget"] = spend(&broker, budget.weekly_usd);
+            }
             Ok((unasked(&broker, &snapshot), snapshot))
         });
         let snapshot = match read {
@@ -533,6 +575,59 @@ pub(super) mod tests {
         let pools = ["claude".to_owned(), "openai".to_owned()];
         let why = choose(&paces, &pools, None).unwrap_err();
         assert!(why.contains("claude") && why.contains("openai"), "{why}");
+    }
+
+    /// The snapshot's `budget`, which the review app reads: the broker's
+    /// week at list prices in dollars, or no reading, never $0.
+    #[test]
+    fn spend_of_the_week() {
+        let week = json!({"currency": "USD", "basis": "list", "prices": "2026-10-20",
+            "window_days": 7, "total": 412.37, "by_operator": {}, "unpriced_requests": 0});
+        let read = json!({"weekly_usd": 1000.0, "spent_usd": 412.37,
+            "prices": "2026-10-20", "unpriced_requests": 0});
+        let none = json!({"weekly_usd": 1000.0, "spent_usd": null, "reason": NO_READING});
+        let mut unpriced = none.clone();
+        unpriced["unpriced_requests"] = 2.into();
+        for (edit, expected) in [
+            (None, &read),
+            (Some(("/currency", json!("EUR"))), &none),
+            (Some(("/basis", json!("effective"))), &none),
+            (Some(("/window_days", json!(30))), &none),
+            (Some(("/total", json!(-1))), &none),
+            (Some(("/total", json!("412"))), &none),
+            (Some(("/unpriced_requests", json!(2))), &unpriced),
+            (Some(("/unpriced_requests", Value::Null)), &none),
+            (Some(("/unpriced_requests", json!("0"))), &none),
+            (Some(("/unpriced_requests", json!(-1))), &none),
+            (Some(("/unpriced_requests", json!(0.5))), &none),
+        ] {
+            let mut broker = broker();
+            broker["spend"] = week.clone();
+            if let Some((pointer, value)) = &edit {
+                *broker["spend"].pointer_mut(pointer).unwrap() = value.clone();
+            }
+            assert_eq!(&spend(&broker, 1000.0), expected, "{edit:?}");
+        }
+        let mut broker = broker();
+        broker["spend"] = week.clone();
+        broker["spend"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unpriced_requests");
+        assert_eq!(spend(&broker, 1000.0), none);
+        assert_eq!(spend(&self::broker(), 1000.0), none);
+        let mut snap = snapshot(&broker, &pools(), now()).unwrap();
+        for (budget, line) in [
+            (read, "- budget: $412 of $1000 this week at list prices\n"),
+            (
+                unpriced,
+                "- budget: $1000 a week, 2 request(s) unpriced (held)\n",
+            ),
+        ] {
+            snap["budget"] = budget;
+            let body = render(&snap).unwrap();
+            assert!(body.contains(line), "{body}");
+        }
     }
 
     /// The whole snapshot from the recorded answer: the shape pacing and the

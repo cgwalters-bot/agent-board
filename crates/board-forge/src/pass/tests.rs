@@ -101,6 +101,27 @@ fn unpooled(replay: &mut Replay) {
     }
 }
 
+/// The broker metering `spend` of the week, at list prices in dollars
+/// (praxis-credential-broker#36), against a budget of $1000 a week.
+pub(super) fn with_spend(replay: &mut Replay, settings: &mut Value, spend: Value) {
+    let mut broker = usage::tests::broker();
+    broker["spend"] = spend;
+    with_broker(replay, settings, json!({"body": broker}));
+    settings["budget"] = json!({"weeklyUsd": 1000});
+}
+
+/// The broker [`with_spend`] added, failing as when it is down.
+fn broker_down(replay: &mut Replay) {
+    let down = json!({"error": "GET /usage: HTTP status 502"});
+    *replay.requests.last_mut().unwrap() = json!({"request": broker_key(), "answer": down});
+}
+
+/// A week's spend of `total` dollars as the broker reports it.
+pub(super) fn spend(total: f64) -> Value {
+    json!({"currency": "USD", "basis": "list", "prices": "2026-10-20", "window_days": 7,
+        "total": total, "by_operator": {}, "unpriced_requests": 0})
+}
+
 pub(super) fn set_usage(replay: &mut Replay, snapshot: &Value) {
     let body = format!("{USAGE_MARKER}\n\n```json\n{snapshot:#}\n```\n");
     answer(replay, "bot-ops/issues/1/comments")["body"][0]["body"] = body.into();
@@ -159,6 +180,24 @@ fn replay_idle_board_starts_work() {
     expected.push("status: 0 change(s) of 0 item(s) read");
     assert_eq!(report.lines, expected);
     assert_eq!(report.failures, 0);
+}
+
+/// Spend at the weekly budget holds stage 3's planning run as it holds
+/// stage 4's: a planning run is a new run too.
+#[test]
+fn budget_holds_epic_planning() {
+    let mut replay = replay();
+    let mut settings = json!({});
+    with_spend(&mut replay, &mut settings, spend(1000.0));
+    let report = preview(&config(settings), &replay);
+    let planned = "hold epic cgwalters-forge/tracker#596: due (its sub-issues changed";
+    let line = report.lines.iter().find(|l| l.starts_with(planned));
+    let line = line.unwrap_or_else(|| panic!("{:#?}", report.lines));
+    assert!(
+        line.ends_with("; budget: $1000 of $1000 this week"),
+        "{line}"
+    );
+    assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
 }
 
 /// Keeps only `issues` (`OWNER/REPO#N`) and the epics on every recorded board page,
@@ -476,6 +515,164 @@ fn replay_scenarios() {
                 unpooled(r);
             }),
             vec!["hold pools: claude has no reading; openai has no reading; new runs wait"],
+            0,
+            0,
+        ),
+        (
+            "spend under the weekly budget is shown and starts runs",
+            Box::new(|r, c| with_spend(r, c, spend(412.37))),
+            vec![
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $412 of $1000 this week at list prices",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "spend at the weekly budget holds every new run",
+            Box::new(|r, c| with_spend(r, c, spend(1003.0))),
+            vec!["budget: $1003 of $1000 this week; new runs wait"],
+            0,
+            0,
+        ),
+        (
+            "a broker that does not meter spend holds, never reads as $0",
+            Box::new(|r, c| with_spend(r, c, Value::Null)),
+            vec![
+                "usage: claude: 18% used",
+                "budget: the usage snapshot has no spend reading; new runs wait",
+            ],
+            0,
+            0,
+        ),
+        (
+            "spend in anything but list-price dollars over a week is no reading",
+            Box::new(|r, c| {
+                let mut spend = spend(10.0);
+                spend["window_days"] = 30.into();
+                with_spend(r, c, spend);
+            }),
+            vec!["budget: the usage snapshot has no spend reading; new runs wait"],
+            0,
+            0,
+        ),
+        (
+            "a total that leaves requests unpriced is no reading, never their $0",
+            Box::new(|r, c| {
+                let mut spend = spend(0.0);
+                spend["unpriced_requests"] = 1000.into();
+                with_spend(r, c, spend);
+            }),
+            vec![
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $1000 a week, 1000 request(s) unpriced (held)",
+                "budget: the usage snapshot has no spend reading; new runs wait",
+            ],
+            0,
+            0,
+        ),
+        (
+            "a total that does not say it prices every request is no reading",
+            Box::new(|r, c| {
+                let mut spend = spend(0.0);
+                spend.as_object_mut().unwrap().remove("unpriced_requests");
+                with_spend(r, c, spend);
+            }),
+            vec!["budget: the usage snapshot has no spend reading; new runs wait"],
+            0,
+            0,
+        ),
+        (
+            "with requests unpriced, pull requests' fix rounds wait too",
+            Box::new(|r, c| {
+                let mut spend = spend(0.0);
+                spend["unpriced_requests"] = 1.into();
+                with_spend(r, c, spend);
+                followed_draft(r, c);
+            }),
+            vec![
+                "budget: the usage snapshot has no spend reading; pull requests' fix rounds wait",
+                "pools: claude held, openai held",
+                "budget: the usage snapshot has no spend reading; new runs wait",
+            ],
+            0,
+            0,
+        ),
+        (
+            "with no spend reading, pull requests' fix rounds wait too",
+            Box::new(|r, c| {
+                with_spend(r, c, Value::Null);
+                followed_draft(r, c);
+            }),
+            vec![
+                "budget: the usage snapshot has no spend reading; pull requests' fix rounds wait",
+                "pools: claude held, openai held",
+            ],
+            0,
+            0,
+        ),
+        (
+            "an unreadable broker leaves the published snapshot, with no spend, to hold",
+            Box::new(|r, c| {
+                with_spend(r, c, spend(10.0));
+                broker_down(r);
+            }),
+            vec![
+                "usage error: reading the broker",
+                "budget: the usage snapshot has no spend reading; new runs wait",
+            ],
+            0,
+            1,
+        ),
+        (
+            "a published snapshot's spend under the budget starts runs",
+            Box::new(|r, c| {
+                with_spend(r, c, spend(10.0));
+                broker_down(r);
+                let mut snapshot = usage(r);
+                snapshot["budget"] = json!({"weekly_usd": 1000, "spent_usd": 10.0});
+                set_usage(r, &snapshot);
+            }),
+            vec!["start triage cgwalters-forge/tracker#446 pool=claude"],
+            6,
+            1,
+        ),
+        (
+            "spend just under the budget lets pull requests' rounds and new runs go",
+            Box::new(|r, c| {
+                with_spend(r, c, spend(999.0));
+                followed_draft(r, c);
+            }),
+            vec![
+                "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "within the margin past the budget, pull requests' rounds go on",
+            Box::new(|r, c| {
+                with_spend(r, c, spend(1050.0));
+                followed_draft(r, c);
+            }),
+            vec![
+                "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)",
+                "budget: $1050 of $1000 this week; new runs wait",
+            ],
+            0,
+            0,
+        ),
+        (
+            "past the margin, pull requests' fix rounds wait too",
+            Box::new(|r, c| {
+                with_spend(r, c, spend(1150.0));
+                followed_draft(r, c);
+            }),
+            vec![
+                "budget: $1150 of $1000 this week; pull requests' fix rounds wait",
+                "pools: claude held, openai held",
+                "budget: $1150 of $1000 this week; new runs wait",
+            ],
             0,
             0,
         ),
@@ -1545,6 +1742,22 @@ fn config_table() {
                 "usage": {"url": "http://broker.example/usage", "repository": "o/ops", "issue": 1}}),
             "pr pool mistral is not in pools",
         ),
+        (
+            json!({"budget": {"weeklyUsd": 1000}, "usage": {"repository": "o/ops", "issue": 1}}),
+            "budget needs usage.url",
+        ),
+        (
+            json!({"budget": {"weeklyUsd": 0}, "usage": {"url": "http://b.example/usage", "repository": "o/ops", "issue": 1}}),
+            "budget weeklyUsd is not above 0",
+        ),
+        (
+            json!({"budget": {"weeklyUsd": 1000000}, "usage": {"url": "http://b.example/usage", "repository": "o/ops", "issue": 1}}),
+            "budget weeklyUsd is not above 0 and at most 100000",
+        ),
+        (
+            json!({"budget": {"weeklyUsd": 1000, "monthlyUsd": 1}}),
+            "unknown field `monthlyUsd`",
+        ),
     ] {
         let mut value = minimal.clone();
         value
@@ -2045,6 +2258,40 @@ fn apply_paces_pull_requests_by_this_pass_reading() {
         );
     }
     assert_eq!(report.failures, 0, "{lines:#?}");
+}
+
+/// Past [`FOLLOW_MARGIN`] over the weekly budget, an applying pass starts no
+/// pull request's continuation, which still goes on within the margin.
+#[test]
+fn budget_past_its_margin_holds_pull_request_rounds() {
+    for (total, outcome) in [
+        (1099.0, " -> https://github.com/"),
+        (1100.0, " -> not started: every pool is held (claude)"),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let mut settings = json!({"wip": 2});
+        with_spend(&mut forge.replay, &mut settings, spend(total));
+        followed_draft(&mut forge.replay, &mut settings);
+        for (url, body) in [
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+            (
+                format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+                json!({"private": true}),
+            ),
+        ] {
+            let answer = json!({"status": 200, "link": null, "body": body});
+            let request = json!({"request": {"get": url}, "answer": answer});
+            forge.replay.requests.push(request);
+        }
+        let report = apply(&forge, &config(settings));
+        let lines = &report.lines;
+        let continuation = "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)";
+        let line = lines.iter().find(|l| l.starts_with(continuation));
+        assert!(
+            line.is_some_and(|l| l.contains(outcome)),
+            "{total}: {lines:#?}"
+        );
+    }
 }
 
 /// A run list longer than the request budget is read until the budget is
