@@ -56,7 +56,7 @@ checker would re-derive the same answer at the cost of another moving part.
 Status is derived and written each pass from live facts: Done, Needs human
 and In Progress are never set by hand; Todo, Backlog and Priority are a
 person's choice, and Blocked and Backlog are holds that only Done replaces.
-The rules are pass's [stage 5](pass.md#order-and-effects). Any open pull
+The rules are pass's [stage 6](pass.md#order-and-effects). Any open pull
 request for an item makes it In Progress, draft or not, in any repository
 and by any author, so an upstream issue with a fork's pull request is In
 Progress; an issue a person marked Done that is still open goes back to
@@ -95,6 +95,53 @@ Where the tool keeps its state depends on whose repository the work is in.
 Why: upstream maintainers did not ask for a bot's ledger in their threads,
 while on our own issues the record is most useful where people already look,
 and a person should be able to read what the machine read.
+
+## Promote
+
+Promotion of an approved fork pull request to its upstream is a stage of
+the pass, [stage 5](pass.md#what-is-built), replacing homegit's
+`bot-promote-due` and `bot-pr promote`; decided on 24 October 2026.
+
+* **Approval.** Only the operator's approving review of the fork pull
+  request's *current* head counts; an approval of an older head does not.
+  The `/promote`, `/draft` and `/ready` comment commands are gone; the
+  approving review is the whole signal, and the one marker that the
+  operator wrote the text, `--human-text`, lives in its body.
+* **Where it goes.** Configuration (`promote.forks`), never the pull
+  request's body, which anyone can edit. The fork's GitHub parent or
+  network root must be the configured upstream.
+* **Kept from homegit.** The upstream contribution-policy gate, read from
+  the configured repository's default branch with its loosening rule, never
+  written; the operator's sign-off added at promote when the upstream wants
+  DCO, the only rewrite the stage may make (existing trailers stay); the
+  stacked wait, from the plan's `stacks_on` (a pull request with none is not
+  stacked); one notice per reason, said once; and `--human-text`.
+* **Dropped.** The advisory comment quoting the upstream's rules, unless the
+  policy blocks the promotion, which then quotes them once; `--include-others`,
+  `--no-signoff`, `--why`, the policy-cache issue and the attempts cache
+  (a `refused` notice on the forge is the record that the same approval and
+  head are not tried again).
+* **Drafts and rebases.** A draft fork pull request is never promoted. A
+  branch behind the upstream base is refused, even if it would merge
+  cleanly: the approved head would otherwise go upstream untested against
+  the new base, and rebasing needs `git`.
+* **After.** The fork pull request is closed with its link comment, as
+  homegit did, and its receipt records the upstream pull request. The
+  issue's Status follows GitHub's own closing references: the upstream pull
+  request, which the fork's body named by `OWNER/REPO#N`, keeps the issue
+  In Progress, and its merge closes the issue, Done. The stage therefore
+  refuses a bare `#N` rather than rewrite the text.
+* **Noise.** The upstream repository gets nothing but the pull request. The
+  fork pull request, first-party, gets the readable record and receipt with
+  their machine detail alongside ([bookkeeping](#bookkeeping)).
+* **Writes.** `pass --apply` makes them directly within `--max-writes`,
+  one pull request a pass, over the REST API, never a `git` or `gh`
+  subprocess ([writes](#writes)); the ref update is GraphQL's `updateRefs`
+  leasing the approved head, since the REST one has no compare-and-swap.
+
+Why: the approving review is one authenticated act on the exact head, and
+everything the stage trusts besides it is configuration or a fact it read
+itself; a pull request body, a comment or a local cache can say anything.
 
 ## Async forge I/O
 

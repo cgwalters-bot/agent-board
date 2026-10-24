@@ -1,0 +1,15 @@
+{
+  "operator": "cgwalters",
+  "bot": "cgwalters-bot",
+  "dispatchRepo": "cgwalters-forge/tracker",
+  "dispatchWorkflow": "dispatch.yml",
+  "dispatchRef": "main",
+  "promote": {
+    "forks": {
+      "cgwalters-forge/bootc": {"upstream": "bootc-dev/bootc", "base": "main"}
+    },
+    "signoff": {"name": "Operator Example", "email": "operator@example.com"},
+    "policyRepository": "cgwalters-forge/tracker",
+    "policyPath": "upstream-policy"
+  }
+}

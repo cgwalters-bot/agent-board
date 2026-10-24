@@ -1,4 +1,4 @@
-//! Stage 5 of a pass (docs/pass.md#order-and-effects): every board item's
+//! Stage 6 of a pass (docs/pass.md#order-and-effects): every board item's
 //! Status derived from live facts and written where it differs.
 //!
 //! The rules are [`board_core::derive_status`], which the poll's
@@ -35,7 +35,7 @@ const ITEM_QUERY: &str = r#"query($item: ID!) {
   } }
 }"#;
 
-/// What stage 5 knows of one board item.
+/// What stage 6 knows of one board item.
 #[derive(Clone, Debug, Default)]
 pub struct ItemFacts {
     pub status: Option<Status>,
@@ -149,7 +149,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
-    /// Stage 5: reads the whole board, derives each item's Status from it,
+    /// Stage 6: reads the whole board, derives each item's Status from it,
     /// the runs in flight and the open issues' pull requests, and writes each
     /// change; or, past `--max-status-changes`, refuses them all.
     pub(super) fn status(&mut self, git_ref: &str) -> Result<()> {
@@ -481,6 +481,71 @@ mod tests {
         assert_eq!(lines[2..], refused);
         assert_eq!(report.summary, "summary: dispatched 0, writes 0, held 0");
         assert_eq!(report.failures, 1);
+    }
+
+    /// Once stage 5 has promoted bootc-dev/bootc#1030's fork pull request,
+    /// the issue's closing references show the upstream pull request in
+    /// place of the closed fork one: the issue stays In Progress by it, and
+    /// when the upstream merge closes the issue, Done. Nothing else is
+    /// needed for the hold to carry over.
+    #[test]
+    fn a_promoted_pull_request_keeps_its_issue_in_progress() {
+        let line = |replay: &Replay, expected: &str| {
+            let mode = (Mode::Preview, Limits::default());
+            let report = run(
+                replay,
+                replay,
+                &config(),
+                State::default(),
+                mode,
+                replay.now,
+            )
+            .unwrap();
+            let line = stage(&report)
+                .into_iter()
+                .find(|l| l.contains("bootc-dev/bootc#1030"))
+                .unwrap()
+                .to_owned();
+            assert_eq!(line, expected);
+            assert_eq!(report.failures, 0);
+        };
+        let mut replay = replay();
+        let issue = crate::pass::tests::answer(&mut replay, r#""cursor":null,"field":"Priority""#);
+        let nodes = issue["data"]["repositoryOwner"]["projectV2"]["items"]["nodes"]
+            .as_array_mut()
+            .unwrap();
+        let item = nodes
+            .iter_mut()
+            .find(|n| n["content"]["number"] == 1030)
+            .unwrap();
+        item["content"]["closedByPullRequestsReferences"]["nodes"] = json!([{
+            "author": {"login": "cgwalters-bot"}, "number": 2604, "state": "OPEN",
+            "repository": {"nameWithOwner": "bootc-dev/bootc"},
+        }]);
+        line(
+            &replay,
+            "status bootc-dev/bootc#1030: Draft -> In Progress (pull request bootc-dev/bootc#2604 is open)",
+        );
+        // Merged upstream: GitHub closes the issue, which the whole-board
+        // read shows.
+        let board = crate::pass::tests::answer(&mut replay, r#""graphql":"f803f1b86e4d6afd""#);
+        let items = board
+            .pointer_mut("/data/node/items/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        let item = items
+            .iter_mut()
+            .find(|n| {
+                n["content"]["number"] == 1030
+                    && text(n, "/content/repository/nameWithOwner") == "bootc-dev/bootc"
+            })
+            .unwrap();
+        item["content"]["state"] = "CLOSED".into();
+        item["content"]["closedAt"] = "2026-10-24T12:00:00Z".into();
+        line(
+            &replay,
+            "status bootc-dev/bootc#1030: Draft -> Done (closed)",
+        );
     }
 
     /// The recorded board as a forge that takes Status writes: an item's

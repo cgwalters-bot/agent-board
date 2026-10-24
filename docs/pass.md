@@ -10,7 +10,7 @@ authority for their operations. The differences below are intentional.
 
 ## What is built
 
-The pass implements the configuration below and stages 1 to 5, except
+The pass implements the configuration below and stages 1 to 6, except
 that there is no infrastructure rerun, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
 
@@ -81,7 +81,117 @@ apply set differs now; and a day after its last plan, unless nothing is open.
 Not yet noticed: a Priority change of a sub-issue the apply did not set,
 until that day's replan.
 
-Stage 5 reads the whole board (closed issues and pull requests included, in
+Stage 5 promotes approved fork pull requests upstream
+([decisions](architecture.md#promote)). With `promote.forks` set it reads
+each fork (its GitHub parent or network root must be the configured
+upstream), the bot's open pull requests there and each one's reviews, and
+prints `promote: 1 approved of 3 open pull request(s) of BOT in 2 fork(s)`;
+without the section, `promote: off`. A pull request is ready when the
+operator's latest review that approved, requested changes or was dismissed
+is an approval of its current head; a draft, a `needs-human` label or
+anyone else's review does not count, and a comment review after the
+approval leaves it. Ready pull requests are taken in order of approval,
+then repository and number, and **one is promoted a pass**; the rest print
+`hold promote OWNER/REPO#N: waits; one pull request is promoted a pass`.
+
+Before anything is written the stage checks, in order: the head's
+repository is in the upstream's network and the head is not that
+repository's default branch; the description and title were not edited
+after the approval by anyone but the operator (the review names the head,
+not the words, so the words must be the ones it saw); the title and
+description are not empty and refer to no issue by a bare `#N` or `GH-N`
+(upstream would read it as its own); the plan's `stacks_on` of each issue the pull request closes names a
+lower slice whose pull request has merged upstream (open: promote it
+first; an open upstream pull request: wait; closed with nothing upstream:
+rebase by hand); the upstream is not archived; its contribution-policy
+record passes; no pull request from the branch exists upstream (one open
+with the same head is linked and closed instead, one with another head or
+a closed one refuses); and the branch is ahead of the upstream base and
+not behind it (this stage does not rebase: the branch needs a rebase and a
+fresh approval).
+
+The policy record is `promote.policyPath/OWNER/REPO.md` on the policy
+repository's default branch, read once an upstream a pass: it must exist,
+be a file, parse (`---` front matter with `verdict` and `sources`, then a
+body), have no verdict loosened in its history except by the operator in a
+commit GitHub verified (at most 20 commits of history are checked; the
+pull-request route of homegit's rule is not ported), and be current: each
+source's file still has its recorded blob sha on its default branch, and
+no contribution file (`CONTRIBUTING*`, `AGENTS*`, `CLAUDE*`, `GEMINI*`,
+`copilot-instructions*`, `PULL_REQUEST_TEMPLATE*`, `DCO*`, or AI or LLM as
+a word in the name) in the top level, `.github`, `docs` or `doc` of the
+upstream or of its owner's `.github` repository is missing from `sources`.
+A `human-only` or `no-go` verdict refuses, quoting the record once;
+`human-text` refuses unless the approving review's body has a line
+`--human-text` and GitHub shows the operator pushed the approved head, last
+edited the description and last renamed the title, and the description no
+longer has the bot's `Generated-by` line (otherwise the pull request
+gets `needs-human`); such a pull request gets no text of the bot's. After
+the bot's own sign-off push, recovered by its record, the operator must
+have pushed the approved head and the bot the signed one.
+
+Whether the upstream wants DCO is read from GitHub, never from its text: a
+required status check named like `dco` on the base branch, a `dco` check
+run on the base head, or one on the head of one of its last five pull
+requests (a sample: more pull requests than that are not read). If so, each commit of the series that lacks the operator's
+`Signed-off-by` is written anew over the git-data API with the same tree,
+author and message plus the trailer, and the operator as committer; a
+merge commit anywhere in the series (every commit after the first one
+signed is written anew on one parent), or an unsigned commit by neither
+the bot nor the operator, refuses.
+The line is `promote OWNER/REPO#N -> UPSTREAM: would open a PR (sign-off
+on 1 of 2 commits)`, or `(no sign-off needed)`; an applying pass says
+`opened URL`. Its writes are one step, taken whole or held whole (`held by
+--max-writes: promote …`): the sign-off's record comment on the fork pull
+request and its ref update where there is one, the upstream pull request
+(`maintainer_can_modify`, never a draft), the receipt comment and the
+close. The record (a readable line and a fenced `agent-board-promote` JSON
+block with the approved and signed shas and the approval) is posted
+**before** the ref moves, so a pass cut short between them leaves a head
+the next pass recognises: it accepts the head only if it equals the
+recorded signed sha and the series proves against the approved one (same
+merge base and count, each commit the same tree, author and message apart
+from one trailer), reading both through the API; a record that does not
+prove holds the pull request with `needs-human`. The ref update is
+GraphQL's `updateRefs` with the approved head as `beforeOid`, a lease the
+REST ref update lacks: GitHub rejects it if anyone pushed since, and that
+push is kept. The stage also reads the pull request's head, title and
+description and the ref before the rewrite, the ref after it and once
+more before opening the pull request; a mismatch is an error line, not a
+quiet hold, and the text sent is the text checked. The pull request names
+its head by branch, so a push can still land between that last read and
+GitHub opening it: an answer whose head is not the checked sha closes the
+new pull request again and refuses with `needs-human`, with no receipt and
+the fork pull request left open.
+
+A refusal is one line, `hold promote OWNER/REPO#N: why`, and for the
+reasons that need the operator one notice on the fork pull request (`Not
+promoted: … Next: …`, ending with the bot's line and a hidden
+`agent-board-promote notice=KEY` marker), keyed by the reason, the approval
+and the head, so a rerun says nothing again and a new approval says it
+anew; only the bot's own comments, unedited since posting, count as
+notices or records, since the key is public and anyone's comment, or an
+edit of the bot's by anyone who may edit others' comments, could carry it; `head-moved` (an approval of an older head, naming both) is keyed by
+the approval alone. A `refused` notice is also the attempts cache: the
+same approval and head are not tried again, while nothing is retried on a
+notice for a policy that may since have been fixed. A notice is its own
+write step. The receipt on the fork pull request records the upstream pull
+request; the issue it closes stays In Progress through GitHub's own
+closing references to the upstream pull request, and its merge closes the
+issue, Done (stage 6 reads both), which is why a description that refers
+to the issue by a bare `#N` is refused rather than rewritten. The upstream
+repository gets nothing but the pull request.
+
+No staging run has happened; the first live use should be `pass --record`
+against a fork and its upstream, then a capped local apply, `pass --apply
+--max-dispatch 0 --max-writes 3`. Where the head is in the bot's fork of
+the fork rather than the fork itself (as dispatch opens them), the upstream
+pull request names it `BOTOWNER:BRANCH`; whether GitHub takes a head two
+forks down the network has not been seen live, and a refusal is reported
+as any other (`refused the pull request: HTTP status …`). Pushing the
+branch into the fork first is not built.
+
+Stage 6 reads the whole board (closed issues and pull requests included, in
 about one request per hundred items) besides the runs and open issues that
 scheduling reads, and reuses those where scheduling read them. Its first
 line counts the changes, such as
@@ -109,19 +219,28 @@ October, with a synthetic usage snapshot and an empty whole-board read, and
 stage 3's reads of the epics tracker#596, #766 and #890 that evening appended
 to it. Scenario tests edit that recording; on it #596, frozen by a title
 match until tracker#851, is planned, and #890's applied plan is not applied
-again. Stage 5 has its own recording of the
+again. Stage 6 has its own recording of the
 same day's board, trimmed to items that show each rule
-(`fixtures/pass/status-2026-10-23.json`). No staging run has happened.
+(`fixtures/pass/status-2026-10-23.json`). Stage 5 has a fixture in the
+recording's shape, `fixtures/pass/promote-2026-10-24.json` with
+`fixtures/pass/promote-config.json`, written by hand where no recording
+could be made (no network): one approved fork pull request, a `bot-ok`
+record and an upstream that requires DCO, which its scenario tests edit
+for each rule; the first live `pass --record` with a `promote` section
+should replace it. No staging run has happened.
 
-Try a pass without credentials, against the recorded board:
+Try a pass without credentials, against the recorded board, or the
+promote fixture:
 
 ```sh
 agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json
+agent-board pass --config fixtures/pass/promote-config.json --replay fixtures/pass/promote-2026-10-24.json
 ```
 
 Each decision is one line: `start triage|implement|planning OWNER/REPO#N … pool=P`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`,
-`hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
+`promote OWNER/REPO#N -> UPSTREAM: …`,
+`hold [epic|promote] OWNER/REPO#N: why`, `hold wip|pools: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
 step that a cap held ends `-> held by --max-dispatch` or
@@ -169,7 +288,8 @@ other write steps, forge writes such as comments, labels and merges (stage
 1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues
 and merges, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
-and its recovery, and stage 5's Status changes).
+and its recovery, stage 5's promotion, taken whole, and each of its notices,
+and stage 6's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
 are one dispatch, and a stop's label and marker one write. A step is checked
 before its first write and taken whole or held whole; a held step is
@@ -214,7 +334,14 @@ A pass captures one clock and performs these stages in order:
    then choose and dispatch work by the rule below. Dispatch writes the existing
    plan claim and run link, and the existing board Run update where supported;
    it does not close issues from guessed outcomes.
-5. Derive Status for every board item, closed issues and merged pull
+5. Promote one fork pull request the operator approved on its current head
+   to the upstream its fork is configured for, after the policy gate, the
+   stack, the branch and DCO checks above: the sign-off commits and their
+   record, the upstream pull request, the receipt and the close, as one
+   write step. After stage 2, which may move a head and so unmake an
+   approval; before Status, which then sees the fork pull request closed and
+   the upstream one open in the same pass. It takes no slot and starts no run.
+6. Derive Status for every board item, closed issues and merged pull
    requests included (this stage reads those, which earlier stages skip),
    from this pass's facts and its own starts, and write each one that differs:
    * closed issue, or merged or closed pull request: **Done**;
@@ -399,6 +526,9 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
+| `promote.forks` | Exact map of fork repository to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, where its approved pull requests go; a fork may not be in `follow`; `{}` (stage 5 off) |
+| `promote.signoff.name`, `promote.signoff.email` | The operator's `Signed-off-by` and committer identity; required with `forks`, no default |
+| `promote.policyRepository`, `promote.policyPath` | Where `OWNER/REPO.md` contribution-policy records are read, on the default branch; required with `forks`, `"upstream-policy"` |
 
 The PR stage otherwise uses today's default poll policy, including two fix
 rounds and existing default continuation handling. Its runs use the same inline
@@ -410,7 +540,8 @@ not listed here go with it at the cutover unless a need adds them.
 Credentials and transport-specific provider normalization are not
 per-deployment config keys. The caller enables new work by setting
 `workRepositories`, `wip`, pools and usage; triage additionally needs
-`triage: true`, epic planning `epics.repository`. The cutover PR must supply
+`triage: true`, epic planning `epics.repository`, promotion `promote.forks`
+with `promote.signoff` and `promote.policyRepository`. The cutover PR must supply
 those settings explicitly; merely upgrading the binary enables none of them.
 
 ## Replay and release gate

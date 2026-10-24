@@ -95,12 +95,12 @@ const STARTED: &[&str] = &[
     "wip: no slot left; 185 more candidate(s) wait",
 ];
 
-/// The last line of scheduling, before the Status stage's.
+/// The last line of scheduling, before the promote and Status stages'.
 fn last_scheduled(report: &Report) -> &str {
     let lines = report.lines.iter().rev();
     lines
         .map(String::as_str)
-        .find(|l| !l.starts_with("status"))
+        .find(|l| !l.starts_with("status") && !l.starts_with("promote"))
         .unwrap()
 }
 
@@ -130,8 +130,9 @@ fn replay_idle_board_starts_work() {
     // The planning run took the last slot stage 4 had.
     expected.extend(&STARTED[..STARTED.len() - 2]);
     expected.push("wip: no slot left; 186 more candidate(s) wait");
-    // The recording's whole-board read is an empty board: the Status stage
-    // has its own recording.
+    // No promote section: stage 5 is off. The recording's whole-board read
+    // is an empty board: the Status stage has its own recording.
+    expected.push("promote: off");
     expected.push("status: 0 change(s) of 0 item(s) read");
     assert_eq!(report.lines, expected);
     assert_eq!(report.failures, 0);

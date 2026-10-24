@@ -2150,6 +2150,96 @@ fn pass_replay_previews_without_credentials() {
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
 }
 
+/// The promote fixture previews offline with no token: one pull request
+/// would be promoted, nothing is written. A `promote` section the config
+/// rejects fails before any read.
+#[test]
+fn pass_promote_replay_previews_and_rejects_bad_config() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let output = command()
+        .args([
+            "pass",
+            "--config",
+            "fixtures/pass/promote-config.json",
+            "--replay",
+            "fixtures/pass/promote-2026-10-24.json",
+        ])
+        .current_dir(root)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text,
+        "pass: preview\nfollow: no repositories\nschedule: off (wip 0 or no workRepositories)\npromote: 1 approved of 2 open pull request(s) of cgwalters-bot in 1 fork(s)\npromote cgwalters-forge/bootc#5 -> bootc-dev/bootc: would open a PR (sign-off on 1 of 2 commits)\nstatus: off (no board)\nsummary: dispatched 0, writes 5, held 0\n"
+    );
+    let dir = std::env::temp_dir().join(format!("agent-board-promote-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/promote-config.json")).unwrap();
+    // The case, its edit of the configuration, and the error.
+    type Case = (&'static str, fn(&mut Value), &'static str);
+    let cases: Vec<Case> = vec![
+        (
+            "unknown key",
+            |v| v["promote"]["draft"] = true.into(),
+            "unknown field `draft`",
+        ),
+        (
+            "null",
+            |v| v["promote"]["signoff"] = Value::Null,
+            "config.promote.signoff is null",
+        ),
+        (
+            "a fork not OWNER/REPO",
+            |v| {
+                v["promote"]["forks"] =
+                    serde_json::json!({"bootc": {"upstream": "bootc-dev/bootc", "base": "main"}})
+            },
+            "promote forks: invalid repository \"bootc\"",
+        ),
+        (
+            "a fork also in follow",
+            |v| v["follow"] = serde_json::json!(["cgwalters-forge/bootc"]),
+            "promote fork cgwalters-forge/bootc is also in follow",
+        ),
+        (
+            "forks without signoff",
+            |v| {
+                v["promote"].as_object_mut().unwrap().remove("signoff");
+            },
+            "promote signoff is required with forks",
+        ),
+    ];
+    for (case, edit, error) in cases {
+        let mut config = base.clone();
+        edit(&mut config);
+        let path = dir.join(format!("{}.json", case.replace(' ', "-").replace('/', "_")));
+        std::fs::write(&path, config.to_string()).unwrap();
+        let output = command()
+            .args(["pass", "--config"])
+            .arg(&path)
+            .args(["--replay", "fixtures/pass/promote-2026-10-24.json"])
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(error), "{case}: {stderr}");
+        assert!(
+            output.stdout.is_empty(),
+            "{case}: wrote {:?}",
+            output.stdout
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Outside GitHub Actions, `pass --apply` needs both caps, and is refused
 /// before any token is read without them; with them, it warns that it is
 /// not serialized. Inside Actions it still needs its run.

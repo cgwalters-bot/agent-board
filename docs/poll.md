@@ -50,8 +50,8 @@ A stop is added after its label, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
 repositories only, besides the runs `operatorComments` starts (below); the board widens what is read, not what is changed. The
-workflow, its bounds and the tokens stay in the caller's repository. Promoting operator-approved fork pull requests upstream is not
-implemented. Every workflow of a repository reviews as the Actions bot, and a
+workflow, its bounds and the tokens stay in the caller's repository. Promoting operator-approved fork pull requests upstream is
+the pass's [stage 5](pass.md#what-is-built), not the poll's. Every workflow of a repository reviews as the Actions bot, and a
 branch of the repository could add one that approves its own pull request, so
 the bot's review counts only where the pull request's own workflows cannot
 review (the bot's pull request from its fork into a public repository, on

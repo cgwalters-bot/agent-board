@@ -5,8 +5,9 @@
 //!
 //! Built so far: the configuration, stage 1 (the usage refresh, in
 //! [`usage`]), stage 2 (pull request follow-up), stage 3 (epic apply,
-//! recovery and planning, in [`epics`]), stage 4 (scheduling) and stage 5
-//! (board Status, in [`status`]).
+//! recovery and planning, in [`epics`]), stage 4 (scheduling), stage 5
+//! (approved fork pull requests promoted upstream, in [`promote`]) and
+//! stage 6 (board Status, in [`status`]).
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -182,6 +183,48 @@ pub struct Config {
     pub state: Option<String>,
     #[serde(default)]
     pub pr: Pr,
+    /// Stage 5, promotion of approved fork pull requests upstream; absent
+    /// or without `forks` is off.
+    pub promote: Option<Promote>,
+}
+
+/// `promote` (docs/pass.md#one-configuration-file): which of our forks
+/// send approved pull requests to which upstream, and as whom. Config is
+/// where a pull request goes, never its body, which anyone can edit.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Promote {
+    /// Fork repository to its upstream and base branch; empty is off.
+    #[serde(default)]
+    pub forks: BTreeMap<String, Fork>,
+    /// The operator's `Signed-off-by` and committer identity, which the
+    /// approval authorises; required with `forks`, as a person's identity
+    /// has no default.
+    pub signoff: Option<Signoff>,
+    /// Where contribution-policy records are read, from its default branch;
+    /// required with `forks`.
+    pub policy_repository: Option<String>,
+    /// The directory of `OWNER/REPO.md` records in it.
+    #[serde(default = "policy_path")]
+    pub policy_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fork {
+    pub upstream: String,
+    pub base: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signoff {
+    pub name: String,
+    pub email: String,
+}
+
+fn policy_path() -> String {
+    promote::POLICY_PATH.into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,6 +480,65 @@ impl Config {
             self.follow.is_empty() || self.usage.is_none() || !self.pr.fix_pools.is_empty(),
             "pr fixPools is required to pace followed pull requests' fix runs by usage"
         );
+        if let Some(promote) = &self.promote {
+            self.check_promote(promote)?;
+        }
+        Ok(())
+    }
+
+    fn check_promote(&self, promote: &Promote) -> Result<()> {
+        ensure!(
+            promote.forks.len() <= POLL_REPOSITORY_LIMIT,
+            "promote forks names more than {POLL_REPOSITORY_LIMIT} repositories"
+        );
+        for (fork, settings) in &promote.forks {
+            validate_repository(fork).context("promote forks")?;
+            ensure!(
+                promote
+                    .forks
+                    .keys()
+                    .filter(|f| f.eq_ignore_ascii_case(fork))
+                    .count()
+                    == 1,
+                "promote fork {fork} is named twice"
+            );
+            validate_repository(&settings.upstream)
+                .with_context(|| format!("promote forks {fork} upstream"))?;
+            ensure!(
+                !fork.eq_ignore_ascii_case(&settings.upstream),
+                "promote fork {fork} names itself as upstream"
+            );
+            promote::validate_ref(&settings.base)
+                .with_context(|| format!("promote forks {fork} base"))?;
+            // A fork's main moves only by sync from upstream: stage 2 must
+            // not merge or rebase anything into it.
+            ensure!(
+                !self.follow.iter().any(|r| r.eq_ignore_ascii_case(fork)),
+                "promote fork {fork} is also in follow; a fork's pull requests are promoted, never merged"
+            );
+        }
+        if promote.forks.is_empty() {
+            return Ok(());
+        }
+        let signoff = promote
+            .signoff
+            .as_ref()
+            .context("promote signoff is required with forks: the operator's Signed-off-by")?;
+        let plain = |text: &str| {
+            !text.trim().is_empty()
+                && text.trim() == text
+                && !text.chars().any(|c| c.is_control() || "<>".contains(c))
+        };
+        ensure!(
+            plain(&signoff.name) && plain(&signoff.email) && signoff.email.contains('@'),
+            "promote signoff name and email must be one trimmed line each, the email with an @, neither with < or >"
+        );
+        let policy = promote
+            .policy_repository
+            .as_ref()
+            .context("promote policyRepository is required with forks: where contribution-policy records are read")?;
+        validate_repository(policy).context("promote policyRepository")?;
+        promote::validate_ref(&promote.policy_path).context("promote policyPath")?;
         Ok(())
     }
 
@@ -1051,7 +1153,15 @@ fn stages<C: Rest + Transport + Broker>(
         scheduler.report.failures += 1;
         scheduler.line(format!("schedule error: {error:#}"));
     }
-    // Stage 5: board Status from the facts read, this pass's starts included.
+    // Stage 5: approved fork pull requests opened upstream. After stage 2,
+    // which may move a head and so unmake an approval, and before Status,
+    // which then sees the fork pull request closed and the upstream one
+    // open in the same pass.
+    if let Err(error) = scheduler.promote() {
+        scheduler.report.failures += 1;
+        scheduler.line(format!("promote error: {error:#}"));
+    }
+    // Stage 6: board Status from the facts read, this pass's starts included.
     if let Err(error) = scheduler.status(&git_ref) {
         scheduler.report.failures += 1;
         scheduler.line(format!("status error: {error:#}"));
@@ -2105,7 +2215,19 @@ impl<'a, C> Recorder<'a, C> {
 
 impl<C: Rest> Rest for Recorder<'_, C> {
     fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
-        let response = self.inner.get(url, None)?;
+        let response = match self.inner.get(url, None) {
+            Ok(response) => response,
+            Err(error) => {
+                // A 404 is an answer to some reads (a policy record, a
+                // directory that may not exist): kept as its status, which
+                // a replay answers as the client would.
+                if error.downcast_ref::<crate::github::NotFound>().is_some() {
+                    let answer = json!({"status": 404, "link": null, "body": null});
+                    self.keep(json!({"get": url}), answer);
+                }
+                return Err(error);
+            }
+        };
         self.keep(
             json!({"get": url}),
             json!({"status": response.status, "link": response.link, "body": response.body}),
@@ -2253,6 +2375,7 @@ impl Transport for Replay {
 }
 
 mod epics;
+mod promote;
 mod status;
 mod usage;
 
