@@ -1057,6 +1057,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return;
             }
         };
+        if let Some(why) = self.budget_hold(1.0) {
+            self.line(format!("{due}; {why}"));
+            return;
+        }
         turn.planned = true;
         let options: Vec<String> = (project.iter())
             .flat_map(|p| p.options.iter().map(|(_, n)| n.clone()))

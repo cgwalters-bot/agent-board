@@ -46,6 +46,22 @@ its start. Its requests give the next pass a reading. A pool with requests and
 still no reading, or without a count, stays held, and the published snapshot
 holds it either way (`no-reading`).
 
+With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
+broker's `spend`, the trailing week's cost of every request at API list prices
+in dollars ([praxis-credential-broker#36][spend]), in the snapshot's `budget`
+(`weekly_usd`, `spent_usd`, `prices`, `unpriced_requests`), and its line ends
+`budget: $412 of $1000 this week at list prices`. Spend in another currency,
+basis or window is no reading, and so is a total that leaves requests unpriced
+(`budget: $1000 a week, 3 request(s) unpriced (held)`) or does not say how many
+it does, and a snapshot without it: never $0. The
+broker's split by operator is not read yet, so interactive use counts too and
+the budget holds early, never late. Once the week's spend reaches the budget,
+stages 3 and 4 start no new run (`budget: $1003 of $1000 this week; new runs
+wait`); pull requests' fix and continuation rounds go on until it is 10% past,
+so that work in flight can land, then wait too (`…; pull requests' fix rounds
+wait`). A missing or stale spend reading holds both, as missing usage does.
+Without `budget` nothing holds on spend.
+
 Stage 3 reads the open `epic` issues of `epics.repository` with their
 sub-issues (20 epics a request), the board's Priority options, and each live
 epic's comments, and takes the live epics in Priority order. Its first line
@@ -403,6 +419,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
+| `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
@@ -554,5 +571,6 @@ Links are immutable source locations; retained semantics are described above.
 [workflow]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/workflows/poll.yml#L8-L266
 [usage-refresh]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L232-L264
 [publish]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L266-L295
+[spend]: https://github.com/cgwalters-bot/praxis-credential-broker/issues/36
 [meters]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L123-L187
 [config]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/poll/agent-board.json#L1-L62

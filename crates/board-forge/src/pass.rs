@@ -70,6 +70,11 @@ const DEFAULT_TARGET: f64 = 0.95;
 const BURST_LIMIT: f64 = 100.0;
 const REBASE_ROUNDS_LIMIT: u64 = 3;
 const QUEUE_TRIES_LIMIT: u64 = 5;
+/// The most `budget.weeklyUsd` may be: a typo of a few zeros is no budget.
+const WEEKLY_USD_LIMIT: f64 = 100_000.0;
+/// How far past the weekly budget pull requests' fix rounds go on, so that
+/// work already in flight can land.
+const FOLLOW_MARGIN: f64 = 0.1;
 /// The one marker that the operator must act (docs/architecture.md).
 const NEEDS_HUMAN: &str = "needs-human";
 /// Labels a person puts on an issue to keep runs off it.
@@ -178,6 +183,8 @@ pub struct Config {
     #[serde(default)]
     pub pools: Pools,
     pub usage: Option<Usage>,
+    /// None: no hold on spend.
+    pub budget: Option<WeeklyBudget>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
     #[serde(default)]
@@ -259,6 +266,15 @@ pub struct Usage {
     /// none is in flight on it, so that its requests give a reading.
     #[serde(default)]
     pub probe: bool,
+}
+
+/// The board's spend over the trailing week, at API list prices, across
+/// every pool: past it new runs wait, and pull requests' fix rounds past
+/// [`FOLLOW_MARGIN`] of it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WeeklyBudget {
+    pub weekly_usd: f64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -404,6 +420,17 @@ impl Config {
                 );
             }
         }
+        if let Some(budget) = &self.budget {
+            ensure!(
+                budget.weekly_usd > 0.0 && budget.weekly_usd <= WEEKLY_USD_LIMIT,
+                "budget weeklyUsd is not above 0 and at most {WEEKLY_USD_LIMIT}"
+            );
+            // Only stage 1's reading of the broker records the spend.
+            ensure!(
+                self.usage.as_ref().is_some_and(|u| u.url.is_some()),
+                "budget needs usage.url, the broker that meters spend"
+            );
+        }
         if let Some(workflow) = &self.pr.review_workflow {
             validate_workflow(workflow)?;
         }
@@ -504,22 +531,14 @@ impl Config {
 
 // ---- Pacing ----
 
-/// A pool's room below its pace, in points of its paced window:
-/// `target_percent * elapsed_fraction - used_percent`, or why the pool takes
-/// no run: no fresh snapshot, no current reading, held, used up or reset.
-/// Negative room alone does not exclude a pool: the snapshot's burst-aware
-/// `hold` decides that.
-pub fn room(
-    snapshot: Option<&Value>,
-    pool: &str,
-    settings: &PoolSettings,
-    now: OffsetDateTime,
-) -> std::result::Result<f64, String> {
-    let at = |value: &Value| {
-        value
-            .as_str()
-            .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
-    };
+fn at(value: &Value) -> Option<OffsetDateTime> {
+    value
+        .as_str()
+        .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+}
+
+/// `snapshot` if it is from the last [`USAGE_STALE_SECONDS`], or why not.
+fn fresh(snapshot: Option<&Value>, now: OffsetDateTime) -> std::result::Result<&Value, String> {
     let snapshot = snapshot.ok_or("there is no usage snapshot")?;
     let updated = at(&snapshot["updated_at"]).ok_or("the usage snapshot has no time")?;
     if (now - updated).whole_seconds() < -CLOCK_SKEW_SECONDS {
@@ -534,6 +553,32 @@ pub fn room(
             text(snapshot, "/updated_at")
         ));
     }
+    Ok(snapshot)
+}
+
+/// The week's spend in dollars that a fresh snapshot records, or why there
+/// is none. None is never $0: a snapshot written without a budget, or from a
+/// broker that does not meter spend, holds as missing usage does.
+pub fn spent(snapshot: Option<&Value>, now: OffsetDateTime) -> std::result::Result<f64, String> {
+    let snapshot = fresh(snapshot, now)?;
+    let spent = snapshot["budget"]["spent_usd"].as_f64();
+    spent
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .ok_or_else(|| "the usage snapshot has no spend reading".into())
+}
+
+/// A pool's room below its pace, in points of its paced window:
+/// `target_percent * elapsed_fraction - used_percent`, or why the pool takes
+/// no run: no fresh snapshot, no current reading, held, used up or reset.
+/// Negative room alone does not exclude a pool: the snapshot's burst-aware
+/// `hold` decides that.
+pub fn room(
+    snapshot: Option<&Value>,
+    pool: &str,
+    settings: &PoolSettings,
+    now: OffsetDateTime,
+) -> std::result::Result<f64, String> {
+    let snapshot = fresh(snapshot, now)?;
     let entry = &snapshot["pools"][pool];
     if !entry.is_object() || entry["reason"] == usage::NO_READING {
         return Err(format!("{pool} has no reading"));
@@ -1173,13 +1218,24 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.line("follow: no repositories".into());
             return 0;
         }
+        let mut fresh = self.snapshot.clone().flatten();
+        if let Some(why) = self.budget_hold(1.0 + FOLLOW_MARGIN) {
+            self.line(format!("{why}; pull requests' fix rounds wait"));
+            // Every pool held, as the poll paces fix rounds by the snapshot:
+            // a pool it lacks would be unpaced room.
+            let held = json!({"hold": true, "reason": "budget", "next_dispatch_at": null});
+            let pools: serde_json::Map<String, Value> = (config.pools.0.iter())
+                .map(|(name, _)| (name.clone(), held.clone()))
+                .collect();
+            let at = self.now.format(&Rfc3339).unwrap_or_default();
+            fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
+        }
         let apply = self.apply.then(|| poll::Apply {
             dispatcher: &self.dispatcher,
             workflow: config.dispatch_workflow.clone(),
             pools: config.pr.fix_pools.clone(),
             git_ref: Some(git_ref.to_owned()),
         });
-        let fresh = self.snapshot.clone().flatten();
         let follow = &config.follow;
         match poll::run_capped(
             &self.client,
@@ -1264,6 +1320,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             && slots.probes.is_empty()
         {
             self.line(format!("hold pools: {why}; new runs wait"));
+            return Ok(());
+        }
+        if let Some(why) = self.budget_hold(1.0) {
+            self.line(format!("{why}; new runs wait"));
             return Ok(());
         }
         let board = self.board();
@@ -1492,6 +1552,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.snapshot = Some(read);
         }
         self.snapshot.clone().flatten()
+    }
+
+    /// Why runs wait on `budget` at `share` of it: the week's spend there or
+    /// past it, or no spend reading. None without a budget.
+    fn budget_hold(&mut self, share: f64) -> Option<String> {
+        let weekly = self.config.budget.as_ref()?.weekly_usd;
+        let snapshot = self.snapshot();
+        match spent(snapshot.as_ref(), self.now) {
+            Ok(spent) if spent < weekly * share => None,
+            Ok(spent) => Some(format!("budget: ${spent:.0} of ${weekly:.0} this week")),
+            Err(why) => Some(format!("budget: {why}")),
+        }
     }
 
     /// The bot's usage snapshot from the configured issue, if `usage` is set.
