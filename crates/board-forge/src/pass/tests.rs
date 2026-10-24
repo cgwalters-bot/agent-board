@@ -102,7 +102,7 @@ fn unpooled(replay: &mut Replay) {
 }
 
 /// The broker metering `spend` of the week, at list prices in dollars
-/// (praxis-credential-broker#36), against a budget of $1000 a week.
+/// (praxis-credential-broker#38), against a budget of $1000 a week.
 pub(super) fn with_spend(replay: &mut Replay, settings: &mut Value, spend: Value) {
     let mut broker = usage::tests::broker();
     broker["spend"] = spend;
@@ -116,10 +116,13 @@ fn broker_down(replay: &mut Replay) {
     *replay.requests.last_mut().unwrap() = json!({"request": broker_key(), "answer": down});
 }
 
-/// A week's spend of `total` dollars as the broker reports it.
+/// A week's spend of `total` dollars by runs as the broker reports it, all of
+/// it theirs: no operator's interactive use.
 pub(super) fn spend(total: f64) -> Value {
+    let runs = json!({"total": total, "unpriced_requests": 0, "unmetered_requests": 0});
     json!({"currency": "USD", "basis": "list", "prices": "2026-10-20", "window_days": 7,
-        "total": total, "by_operator": {}, "unpriced_requests": 0})
+        "since": 1_792_454_400, "total": total, "unpriced_requests": 0,
+        "unmetered_requests": 0, "by_operator": {}, "runs": runs})
 }
 
 pub(super) fn set_usage(replay: &mut Replay, snapshot: &Value) {
@@ -560,7 +563,7 @@ fn replay_scenarios() {
             "a total that leaves requests unpriced is no reading, never their $0",
             Box::new(|r, c| {
                 let mut spend = spend(0.0);
-                spend["unpriced_requests"] = 1000.into();
+                spend["runs"]["unpriced_requests"] = 1000.into();
                 with_spend(r, c, spend);
             }),
             vec![
@@ -574,7 +577,10 @@ fn replay_scenarios() {
             "a total that does not say it prices every request is no reading",
             Box::new(|r, c| {
                 let mut spend = spend(0.0);
-                spend.as_object_mut().unwrap().remove("unpriced_requests");
+                spend["runs"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("unpriced_requests");
                 with_spend(r, c, spend);
             }),
             vec!["budget: the usage snapshot has no spend reading; new runs wait"],
@@ -582,10 +588,39 @@ fn replay_scenarios() {
             0,
         ),
         (
+            "a broker that does not split out runs' spend is no reading",
+            Box::new(|r, c| {
+                let mut spend = spend(0.0);
+                spend.as_object_mut().unwrap().remove("runs");
+                with_spend(r, c, spend);
+            }),
+            vec!["budget: the usage snapshot has no spend reading; new runs wait"],
+            0,
+            0,
+        ),
+        (
+            "an operator's unpriced interactive use neither counts nor holds",
+            Box::new(|r, c| {
+                let mut spend = spend(412.37);
+                let operator = json!({"total": 900.0, "unpriced_requests": 7,
+                    "unmetered_requests": 0});
+                spend["by_operator"] = json!({"alice": operator});
+                spend["total"] = 1312.37.into();
+                spend["unpriced_requests"] = 7.into();
+                with_spend(r, c, spend);
+            }),
+            vec![
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $412 of $1000 this week at list prices",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
             "with requests unpriced, pull requests' fix rounds wait too",
             Box::new(|r, c| {
                 let mut spend = spend(0.0);
-                spend["unpriced_requests"] = 1.into();
+                spend["runs"]["unpriced_requests"] = 1.into();
                 with_spend(r, c, spend);
                 followed_draft(r, c);
             }),
