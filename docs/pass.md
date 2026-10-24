@@ -47,15 +47,18 @@ still no reading, or without a count, stays held, and the published snapshot
 holds it either way (`no-reading`).
 
 With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
-broker's `spend`, the trailing week's cost of every request at API list prices
-in dollars ([praxis-credential-broker#36][spend]), in the snapshot's `budget`
-(`weekly_usd`, `spent_usd`, `prices`, `unpriced_requests`), and its line ends
-`budget: $412 of $1000 this week at list prices`. Spend in another currency,
-basis or window is no reading, and so is a total that leaves requests unpriced
+broker's `spend.runs`, the trailing week's cost of runs' requests at API list
+prices in dollars ([praxis-credential-broker#38][spend]), in the snapshot's
+`budget` (`weekly_usd`, `spent_usd`, `prices`, `unpriced_requests`, and the
+broker's `since` and `unmetered_requests` where it gives them), and its line
+ends `budget: $412 of $1000 this week at list prices`. Spend in another
+currency, basis or window is no reading, and so is a broker without `runs`, a
+total that leaves runs' requests unpriced
 (`budget: $1000 a week, 3 request(s) unpriced (held)`) or does not say how many
-it does, and a snapshot without it: never $0. The
-broker's split by operator is not read yet, so interactive use counts too and
-the budget holds early, never late. Once the week's spend reaches the budget,
+it does, and a snapshot without it: never $0. Operators' interactive use
+neither counts nor, unpriced, holds. A `since` under a week old does not hold
+either: the broker's spend restarts with it until praxis-credential-broker#35,
+so the week may read low after a deploy. Once the week's spend reaches the budget,
 stages 3 and 4 start no new run (`budget: $1003 of $1000 this week; new runs
 wait`); pull requests' fix and continuation rounds go on until it is 10% past,
 so that work in flight can land, then wait too (`…; pull requests' fix rounds
@@ -571,6 +574,6 @@ Links are immutable source locations; retained semantics are described above.
 [workflow]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/workflows/poll.yml#L8-L266
 [usage-refresh]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L232-L264
 [publish]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L266-L295
-[spend]: https://github.com/cgwalters-bot/praxis-credential-broker/issues/36
+[spend]: https://github.com/cgwalters-bot/praxis-credential-broker/issues/38
 [meters]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L123-L187
 [config]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/poll/agent-board.json#L1-L62

@@ -182,20 +182,27 @@ fn mistral(broker: &Value, at: &str) -> Result<Option<Value>> {
 }
 
 /// The snapshot's `budget`: `weekly`, and the broker's trailing week of
-/// spend at list prices, in dollars, of every operator
-/// (praxis-credential-broker#36). The broker's split by operator is not
-/// read yet, so interactive use counts too: the budget holds early, never
-/// late. Anything but a week in dollars at list prices is no reading, and so
-/// is a total that leaves requests unpriced, or does not say it prices them
-/// all: a model missing from the broker's price table would spend unbounded
-/// at $0.
+/// spend at list prices, in dollars, of runs alone (`spend.runs`,
+/// praxis-credential-broker#38), so that operators' interactive use neither
+/// counts against the board nor, unpriced, holds it. Anything but a week in
+/// dollars at list prices is no reading, and so is a broker without `runs`,
+/// or a total that leaves runs' requests unpriced or does not say it prices
+/// them all: a model missing from the broker's price table would spend
+/// unbounded at $0.
+///
+/// `since` (when metering began) and the unmetered count are published for
+/// the review app but hold nothing: spend resets on each broker restart
+/// until praxis-credential-broker#35, and holding on a young `since` would
+/// stall the board for a week after every deploy.
 fn spend(broker: &Value, weekly: f64) -> Value {
     let spend = &broker["spend"];
+    let runs = &spend["runs"];
     let week = spend["currency"] == "USD"
         && spend["basis"] == "list"
         && spend["window_days"].as_u64() == Some(7);
-    let unpriced = spend["unpriced_requests"].as_u64();
-    match number(&spend["total"]).filter(|t| week && unpriced == Some(0) && *t >= 0.0) {
+    let unpriced = runs["unpriced_requests"].as_u64();
+    let total = number(&runs["total"]).filter(|t| week && unpriced == Some(0) && *t >= 0.0);
+    let mut out = match total {
         Some(total) => json!({"weekly_usd": weekly, "spent_usd": total,
             "prices": spend["prices"].as_str(), "unpriced_requests": 0}),
         None => {
@@ -205,7 +212,14 @@ fn spend(broker: &Value, weekly: f64) -> Value {
             }
             none
         }
+    };
+    if let Some(n) = runs["unmetered_requests"].as_u64() {
+        out["unmetered_requests"] = n.into();
     }
+    if let Some(since) = number(&spend["since"]).and_then(|s| stamp(s).ok()) {
+        out["since"] = since.into();
+    }
+    out
 }
 
 /// The `bot-usage/v1` snapshot of the configured pools the broker reads,
@@ -578,28 +592,52 @@ pub(super) mod tests {
     }
 
     /// The snapshot's `budget`, which the review app reads: the broker's
-    /// week at list prices in dollars, or no reading, never $0.
+    /// week of runs at list prices in dollars, or no reading, never $0.
     #[test]
     fn spend_of_the_week() {
+        let operator = json!({"total": 88.1, "unpriced_requests": 0, "unmetered_requests": 0});
         let week = json!({"currency": "USD", "basis": "list", "prices": "2026-10-20",
-            "window_days": 7, "total": 412.37, "by_operator": {}, "unpriced_requests": 0});
-        let read = json!({"weekly_usd": 1000.0, "spent_usd": 412.37,
-            "prices": "2026-10-20", "unpriced_requests": 0});
-        let none = json!({"weekly_usd": 1000.0, "spent_usd": null, "reason": NO_READING});
+            "window_days": 7, "since": 1_792_454_400, "total": 500.47,
+            "unpriced_requests": 0, "unmetered_requests": 3, "by_operator": {"alice": operator},
+            "runs": {"total": 412.37, "unpriced_requests": 0, "unmetered_requests": 3}});
+        let extras = json!({"since": "2026-10-20T00:00:00Z", "unmetered_requests": 3});
+        let with = |mut budget: Value| {
+            for (key, value) in extras.as_object().unwrap() {
+                budget[key] = value.clone();
+            }
+            budget
+        };
+        let read = with(json!({"weekly_usd": 1000.0, "spent_usd": 412.37,
+            "prices": "2026-10-20", "unpriced_requests": 0}));
+        let bare = json!({"weekly_usd": 1000.0, "spent_usd": null, "reason": NO_READING});
+        let none = with(bare.clone());
         let mut unpriced = none.clone();
         unpriced["unpriced_requests"] = 2.into();
+        let mut unsince = read.clone();
+        unsince.as_object_mut().unwrap().remove("since");
         for (edit, expected) in [
             (None, &read),
             (Some(("/currency", json!("EUR"))), &none),
             (Some(("/basis", json!("effective"))), &none),
             (Some(("/window_days", json!(30))), &none),
-            (Some(("/total", json!(-1))), &none),
-            (Some(("/total", json!("412"))), &none),
-            (Some(("/unpriced_requests", json!(2))), &unpriced),
-            (Some(("/unpriced_requests", Value::Null)), &none),
-            (Some(("/unpriced_requests", json!("0"))), &none),
-            (Some(("/unpriced_requests", json!(-1))), &none),
-            (Some(("/unpriced_requests", json!(0.5))), &none),
+            (Some(("/runs/total", json!(-1))), &none),
+            (Some(("/runs/total", json!("412"))), &none),
+            (Some(("/runs/unpriced_requests", json!(2))), &unpriced),
+            (Some(("/runs/unpriced_requests", Value::Null)), &none),
+            (Some(("/runs/unpriced_requests", json!("0"))), &none),
+            (Some(("/runs/unpriced_requests", json!(-1))), &none),
+            (Some(("/runs/unpriced_requests", json!(0.5))), &none),
+            // An operator's interactive use, priced or not, is not the board's.
+            (Some(("/unpriced_requests", json!(5))), &read),
+            (
+                Some(("/by_operator/alice/unpriced_requests", json!(5))),
+                &read,
+            ),
+            (Some(("/total", json!(5000))), &read),
+            // `since` is three days before `now()` and holds nothing; one
+            // that is not a time is left out.
+            (Some(("/since", json!(1e15))), &unsince),
+            (Some(("/since", json!("today"))), &unsince),
         ] {
             let mut broker = broker();
             broker["spend"] = week.clone();
@@ -608,15 +646,20 @@ pub(super) mod tests {
             }
             assert_eq!(&spend(&broker, 1000.0), expected, "{edit:?}");
         }
-        let mut broker = broker();
-        broker["spend"] = week.clone();
-        broker["spend"]
-            .as_object_mut()
-            .unwrap()
-            .remove("unpriced_requests");
-        assert_eq!(spend(&broker, 1000.0), none);
-        assert_eq!(spend(&self::broker(), 1000.0), none);
-        let mut snap = snapshot(&broker, &pools(), now()).unwrap();
+        let mut norunsince = bare.clone();
+        norunsince["since"] = extras["since"].clone();
+        for (parent, key, expected) in [
+            ("/runs", "unpriced_requests", &none),
+            ("", "runs", &norunsince),
+        ] {
+            let mut broker = broker();
+            broker["spend"] = week.clone();
+            let object = broker["spend"].pointer_mut(parent).unwrap();
+            object.as_object_mut().unwrap().remove(key);
+            assert_eq!(&spend(&broker, 1000.0), expected, "{parent} without {key}");
+        }
+        assert_eq!(spend(&self::broker(), 1000.0), bare);
+        let mut snap = snapshot(&broker(), &pools(), now()).unwrap();
         for (budget, line) in [
             (read, "- budget: $412 of $1000 this week at list prices\n"),
             (
