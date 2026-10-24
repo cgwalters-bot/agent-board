@@ -435,7 +435,11 @@ fn execute(cli: Cli) -> Result<()> {
         cli.template.is_none(),
         "unsupported_capability: --template is not implemented"
     );
-    board(&cli)?;
+    if let board_forge::forgejo::Board::Forgejo(config) = board(&cli)?
+        && let Some(warning) = config.plain_http_warning()
+    {
+        eprintln!("{warning}");
+    }
     match &cli.command {
         Command::HelpMarkdown => {
             use clap::CommandFactory;
