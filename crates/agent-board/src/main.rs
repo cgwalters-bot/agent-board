@@ -1,6 +1,7 @@
 mod action;
 mod apps;
 mod ask;
+mod broker;
 mod cli_docs;
 mod decisions;
 mod dispatch;
@@ -139,6 +140,11 @@ enum Command {
     Status(org_status::Status),
     /// One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply).
     ReleaseTrain(release_train::ReleaseTrain),
+    /// Probe the inference broker and keep one outage issue open while it is unreachable.
+    Broker {
+        #[command(subcommand)]
+        command: Broker,
+    },
     /// Create the per-role GitHub Apps (docs/apps.md).
     Apps {
         #[command(subcommand)]
@@ -152,6 +158,12 @@ enum Command {
     /// Print this CLI's reference as Markdown (docs/cli.md).
     #[command(hide = true)]
     HelpMarkdown,
+}
+
+#[derive(Subcommand)]
+enum Broker {
+    /// Probe the broker (TCP, then one HTTP request) and open, refresh or close the outage issue; prints unless --apply, and fails while the broker is unreachable.
+    Probe(broker::Probe),
 }
 
 #[derive(Subcommand)]
@@ -861,6 +873,27 @@ fn execute(cli: Cli) -> Result<()> {
                 "release-train supports only github.com"
             );
             release_train::run(
+                args,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Broker {
+            command: Broker::Probe(args),
+        } => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none(),
+                "broker probe prints lines and reads its settings from --config only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "broker probe supports only github.com"
+            );
+            broker::run(
                 args,
                 board_forge::github::Client::from_env,
                 &mut io::stdout().lock(),

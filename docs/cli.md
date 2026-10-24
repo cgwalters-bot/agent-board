@@ -31,6 +31,7 @@ Commands:
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
+- [`broker`](#agent-board-broker): Probe the inference broker and keep one outage issue open while it is unreachable
 - [`apps`](#agent-board-apps): Create the per-role GitHub Apps (docs/apps.md)
 - [`test`](#agent-board-test): Run the credential-bearing staging integration test
 
@@ -664,6 +665,31 @@ Options:
 
 - `--config <FILE>`: The train's configuration from a trusted default-branch checkout: the bot, the release repository, the wrappers and callers to pin, labels and thresholds
 - `--apply`: Take the pass's step with GH_TOKEN, the bot's; without it the pass only reads and prints
+
+## agent-board broker
+
+Probe the inference broker and keep one outage issue open while it is unreachable
+
+```text
+agent-board broker [OPTIONS] <COMMAND>
+```
+
+Commands:
+
+- [`probe`](#agent-board-broker-probe): Probe the broker (TCP, then one HTTP request) and open, refresh or close the outage issue; prints unless --apply, and fails while the broker is unreachable
+
+## agent-board broker probe
+
+Probe the broker (TCP, then one HTTP request) and open, refresh or close the outage issue; prints unless --apply, and fails while the broker is unreachable
+
+```text
+agent-board broker probe [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The probe's configuration from a trusted default-branch checkout: the broker's url, and the outage issue's repository and label
+- `--apply`: Open, refresh or close the outage issue with GH_TOKEN, the bot's; without it the probe reads and prints each write
 
 ## agent-board apps
 

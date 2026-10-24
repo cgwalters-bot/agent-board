@@ -166,7 +166,7 @@ const QUEUE_BRANCH_PREFIX: &str = "gh-readonly-queue/";
 /// `.github/poll/broker.cjs` writes them, are read with one page of each of
 /// open and recently closed ones; a fuller list is not read on.
 const OUTAGE_LABEL: &str = "outage";
-const OUTAGE_MARKER: &str = "<!-- tracker-broker-outage -->";
+pub(crate) const OUTAGE_MARKER: &str = "<!-- tracker-broker-outage -->";
 const OUTAGE_ISSUE_LIMIT: usize = 30;
 /// How long after its close an outage still refunds a run: passes are at most
 /// [`MAX_INTERVAL_SECONDS`] apart, so a few of them see it.
