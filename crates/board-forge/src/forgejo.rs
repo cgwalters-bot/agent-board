@@ -29,6 +29,9 @@ const PAGE_LIMIT: &str = "50";
 const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
 /// The GitHub token variables, which must not be sent to another host.
 const GITHUB_TOKEN_ENVS: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+/// Names that resolve only inside a cluster or local network, so plain HTTP
+/// to them does not warn.
+const LOCAL_NAME_SUFFIXES: [&str; 4] = [".svc", ".cluster.local", ".local", ".internal"];
 
 /// The `board` entry of the caller's trusted agent-board.json. Absent, the
 /// board is a GitHub project chosen by `--owner`/`--project`, as before.
@@ -56,7 +59,8 @@ impl Board {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
-    /// The Forgejo instance, for example `https://forge.example/`.
+    /// The Forgejo instance, for example `https://forge.example/` or
+    /// `http://forgejo-http.forgejo.svc:3000/`.
     pub url: Url,
     /// The environment variable holding a token that can read the issues.
     #[serde(default = "default_token_env")]
@@ -97,15 +101,13 @@ impl Config {
     fn validate(&self) -> Result<()> {
         let url = &self.url;
         ensure!(
-            url.scheme() == "https"
+            matches!(url.scheme(), "http" | "https")
                 && url.host_str().is_some()
-                // Item identities carry a bare host, so a port cannot be kept.
-                && url.port().is_none()
                 && url.username().is_empty()
                 && url.password().is_none()
                 && url.query().is_none()
                 && url.fragment().is_none(),
-            "board url must be a canonical HTTPS URL without a port"
+            "board url must be a canonical HTTP(S) URL without credentials, query or fragment"
         );
         ensure!(
             !self.token_env.is_empty() && !GITHUB_TOKEN_ENVS.contains(&self.token_env.as_str()),
@@ -144,6 +146,35 @@ impl Config {
             "invalid board recorder id"
         );
         Ok(())
+    }
+
+    /// A warning for a plain `http://` URL to a host that is not loopback,
+    /// a private address or a cluster or local name: anyone on the path to
+    /// it can read the token sent with each request.
+    pub fn plain_http_warning(&self) -> Option<String> {
+        if self.url.scheme() != "http" {
+            return None;
+        }
+        let local = match self.url.host()? {
+            url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+            url::Host::Ipv6(ip) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+            url::Host::Domain(name) => {
+                let name = name.trim_end_matches('.');
+                !name.contains('.')
+                    || LOCAL_NAME_SUFFIXES
+                        .iter()
+                        .any(|suffix| name.ends_with(suffix))
+            }
+        };
+        if local {
+            return None;
+        }
+        Some(format!(
+            "Warning: board url {} is plain HTTP to a non-local host; the token is sent unencrypted",
+            self.url
+        ))
     }
 
     /// The instance URL as a directory, so joins keep a subpath install.
@@ -1003,11 +1034,27 @@ mod tests {
                 false,
             ),
             (
-                json!({"board": {"forge": "forgejo", "url": "http://forge.example/", "repositories": ["sample/board"], "membership": "open"}}),
-                false,
+                json!({"board": {"forge": "forgejo", "url": "http://forgejo-http.forgejo.svc:3000/", "repositories": ["sample/board"], "membership": "open"}}),
+                true,
             ),
             (
                 json!({"board": {"forge": "forgejo", "url": "https://forge.example:3000/", "repositories": ["sample/board"], "membership": "open"}}),
+                true,
+            ),
+            (
+                json!({"board": {"forge": "forgejo", "url": "http://user:pw@forge.example/", "repositories": ["sample/board"], "membership": "open"}}),
+                false,
+            ),
+            (
+                json!({"board": {"forge": "forgejo", "url": "http://forge.example/?a=b", "repositories": ["sample/board"], "membership": "open"}}),
+                false,
+            ),
+            (
+                json!({"board": {"forge": "forgejo", "url": "https://forge.example/#x", "repositories": ["sample/board"], "membership": "open"}}),
+                false,
+            ),
+            (
+                json!({"board": {"forge": "forgejo", "url": "ftp://forge.example/", "repositories": ["sample/board"], "membership": "open"}}),
                 false,
             ),
             (
@@ -1046,5 +1093,47 @@ mod tests {
             "https://forge.example/git/api/v1/"
         );
         assert_eq!(config.token_env, DEFAULT_TOKEN_ENV);
+        let Board::Forgejo(config) = Board::from_config(&json!({"board": {"forge": "forgejo", "url": "http://forgejo-http.forgejo.svc:3000/git", "repositories": ["sample/board"], "membership": "open"}})).unwrap() else {
+            panic!("not forgejo");
+        };
+        assert_eq!(
+            config.api_root().unwrap().as_str(),
+            "http://forgejo-http.forgejo.svc:3000/git/api/v1/"
+        );
+    }
+
+    #[test]
+    fn plain_http_warning_table() {
+        for (url, warns) in [
+            ("http://localhost:3000/", false),
+            ("http://forgejo/", false),
+            ("http://127.0.0.1/", false),
+            ("http://127.8.0.1/", false),
+            ("http://[::1]:3000/", false),
+            ("http://10.0.0.5/", false),
+            ("http://172.16.0.1/", false),
+            ("http://192.168.1.10:3000/", false),
+            ("http://169.254.0.1/", false),
+            ("http://[fd00::1]/", false),
+            ("http://[fe80::1]/", false),
+            ("http://forgejo-http.forgejo.svc:3000/", false),
+            ("http://forgejo-http.forgejo.svc.cluster.local/", false),
+            ("http://forge.local/", false),
+            ("http://forge.corp.internal/", false),
+            ("http://forge.example/", true),
+            ("http://forge.example:3000/", true),
+            ("http://8.8.8.8/", true),
+            ("http://[2001:db8::1]/", true),
+            ("http://forge.svc.example/", true),
+            ("https://forge.example/", false),
+            ("https://8.8.8.8:3000/", false),
+        ] {
+            let config = config(json!({"url": url}));
+            let warning = config.plain_http_warning();
+            assert_eq!(warning.is_some(), warns, "{url}");
+            if let Some(warning) = warning {
+                assert!(warning.contains("unencrypted"), "{warning}");
+            }
+        }
     }
 }

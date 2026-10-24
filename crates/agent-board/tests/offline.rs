@@ -677,7 +677,7 @@ fn board_config_cli_table() {
     let invalid = dir.join("invalid.json");
     std::fs::write(
         &invalid,
-        r#"{"board":{"forge":"forgejo","url":"http://forge.example/","repositories":["sample/board"],"membership":"open"}}"#,
+        r#"{"board":{"forge":"forgejo","url":"https://forge.example/?a=b","repositories":["sample/board"],"membership":"open"}}"#,
     )
     .unwrap();
     let github = dir.join("github.json");
@@ -687,6 +687,34 @@ fn board_config_cli_table() {
         invalid.to_str().unwrap(),
         github.to_str().unwrap(),
     );
+    // Plain HTTP warns once on stderr, and only for a host outside the cluster.
+    for (url, warnings) in [
+        ("http://forge.example:3000/", 1),
+        ("http://forgejo-http.forgejo.svc:3000/", 0),
+    ] {
+        let plain = dir.join("plain.json");
+        std::fs::write(
+            &plain,
+            format!(
+                r#"{{"board":{{"forge":"forgejo","url":"{url}","tokenEnv":"AGENT_BOARD_TEST_FORGEJO_TOKEN","repositories":["sample/board"],"membership":"open"}}}}"#
+            ),
+        )
+        .unwrap();
+        let output = command()
+            .env_remove("AGENT_BOARD_TEST_FORGEJO_TOKEN")
+            .args(["item", "list", "--board-config", plain.to_str().unwrap()])
+            .assert()
+            .code(4)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr.matches("token is sent unencrypted").count(),
+            warnings,
+            "{url}: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{url}");
+    }
     for (args, code, message) in [
         // No token in the configured variable: gh's authentication exit code.
         (
@@ -712,7 +740,7 @@ fn board_config_cli_table() {
         (
             vec!["item", "list", "--board-config", invalid],
             1,
-            "canonical HTTPS URL",
+            "canonical HTTP(S) URL",
         ),
         // GitHub stays the default: the board config adds nothing to it.
         (

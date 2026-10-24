@@ -232,8 +232,8 @@ impl Snapshot {
             self.schema
         );
         ensure!(
-            self.project.scheme() == "https",
-            "project must be an HTTPS URL"
+            matches!(self.project.scheme(), "http" | "https"),
+            "project must be an HTTP(S) URL"
         );
         ensure!(
             self.project.username().is_empty()
@@ -908,8 +908,18 @@ mod tests {
         }
         let mut snapshot: Snapshot =
             serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
-        snapshot.project = Url::parse("http://forge.example/board").unwrap();
-        assert!(snapshot.validate().is_err());
+        for (project, ok) in [
+            ("http://forge.example/board", true),
+            ("http://forgejo-http.forgejo.svc:3000/", true),
+            ("https://forge.example:3000/", true),
+            ("ftp://forge.example/board", false),
+            ("http://user@forge.example/board", false),
+            ("http://forge.example/board?a=b", false),
+            ("https://forge.example/board#x", false),
+        ] {
+            snapshot.project = Url::parse(project).unwrap();
+            assert_eq!(snapshot.validate().is_ok(), ok, "{project}");
+        }
         let mut snapshot: Snapshot =
             serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
         snapshot.items[0].field_errors = vec!["no priority/ label".into()];

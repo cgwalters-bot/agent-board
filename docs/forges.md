@@ -10,7 +10,7 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels | No ([#269](https://github.com/cgwalters-forge/agent-board/issues/269), [#270](https://github.com/cgwalters-forge/agent-board/issues/270), [#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
+| Forgejo | Issues of configured repositories, fields from labels | No ([#269](https://github.com/cgwalters-forge/agent-board/issues/269), [#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Dispatch itself is a GitHub Actions request today on every forge; making it a
@@ -60,9 +60,18 @@ match the listing's `X-Total-Count`. Status and close reasons do not exist there
 so they are null. The GitHub token variables are never sent to the Forgejo host.
 Without `board`, or with `"forge": "github"`, the board is a GitHub project.
 
-Open: reconcile still holds Forgejo items to GitHub's Status options (#269), the
-URL must be `https://` without a port (#270), and there is no write side or
-dispatch (#271).
+`url` may be `https://` or `http://` and may carry a port, as for a Forgejo
+reached inside a cluster (`http://forgejo-http.forgejo.svc:3000/`); it may not
+carry credentials, a query or a fragment. Plain HTTP sends the token
+unencrypted with each request, so the CLI warns on stderr when an `http://` URL
+names a host that is not loopback, a private, link-local or unique-local
+address, a single-label name, or a name ending in `.svc`, `.cluster.local`,
+`.local` or `.internal`. Item identities keep only the host name, without
+scheme or port, so two instances on one host cannot share a board. Run and Result
+marker URLs must still be `https://`.
+
+Open: reconcile still holds Forgejo items to GitHub's Status options (#269), and
+there is no write side or dispatch (#271).
 
 ## GitLab
 
