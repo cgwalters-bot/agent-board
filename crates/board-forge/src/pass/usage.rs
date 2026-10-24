@@ -206,6 +206,29 @@ pub(super) fn snapshot(broker: &Value, pools: &Pools, now: OffsetDateTime) -> Re
     Ok(out)
 }
 
+/// The broker's provider for each pool it reads, under which it counts the
+/// requests it has sent since it started, as it does Mistral's.
+const PROVIDERS: &[(&str, &str)] = &[("claude", "anthropic"), ("openai", "codex")];
+
+/// The pools of `snapshot` without a reading that the broker has sent no
+/// request for since it started: it learns a pool's windows only from its
+/// responses, so after a restart no reading arrives until a run asks. A pool
+/// with requests and still no reading is stale, and stays held; so is one
+/// whose count the broker does not give.
+pub(super) fn unasked(broker: &Value, snapshot: &Value) -> BTreeSet<String> {
+    let unread = |pool: &str| snapshot["pools"][pool]["reason"] == NO_READING;
+    let asked = |provider: &str| {
+        let counts = &broker[provider]["counts"];
+        let count = |key: &str| counts[key].as_u64();
+        Some(count("requests")?.saturating_add(count("unmetered").unwrap_or(0)))
+    };
+    PROVIDERS
+        .iter()
+        .filter(|(pool, provider)| unread(pool) && asked(provider) == Some(0))
+        .map(|(pool, _)| (*pool).to_owned())
+        .collect()
+}
+
 fn describe(name: &str, entry: &Value) -> String {
     if entry["reason"] == NO_READING {
         return format!("{name}: no reading (held)");
@@ -260,9 +283,17 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             self.line("usage: no usage.url; pacing reads the published snapshot".into());
             return;
         };
-        let read = self.client.usage(url);
-        let snapshot = match read.and_then(|broker| snapshot(&broker, &config.pools, self.now)) {
-            Ok(snapshot) => snapshot,
+        let read = self.client.usage(url).and_then(|broker| {
+            let snapshot = snapshot(&broker, &config.pools, self.now)?;
+            Ok((unasked(&broker, &snapshot), snapshot))
+        });
+        let snapshot = match read {
+            Ok((unasked, snapshot)) => {
+                if usage.probe {
+                    self.probes = unasked;
+                }
+                snapshot
+            }
             Err(error) => {
                 // Left unset, the published snapshot is read when pacing needs it.
                 self.report.failures += 1;

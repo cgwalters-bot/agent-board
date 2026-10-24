@@ -254,6 +254,11 @@ pub struct Usage {
     pub url: Option<String>,
     pub repository: String,
     pub issue: u64,
+    /// Off unless set: lets a pool the broker has no reading for and has
+    /// sent no request through since it started take one run a pass while
+    /// none is in flight on it, so that its requests give a reading.
+    #[serde(default)]
+    pub probe: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1037,6 +1042,7 @@ fn stages<C: Rest + Transport + Broker>(
         snapshot: None,
         other: None,
         epic_starts: Vec::new(),
+        probes: BTreeSet::new(),
     };
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
@@ -1094,7 +1100,14 @@ struct Slots {
     mine: Vec<Option<u64>>,
     /// Issues with a run listed when the pass began, or started since.
     busy: BTreeMap<String, String>,
+    /// Pools without a reading that may take one run to get one
+    /// ([`Usage::probe`]): none is in flight on them, and none started yet.
+    probes: BTreeSet<String>,
 }
+
+/// The runs that hold a slot, the issues they name and the pools they run on
+/// ([`Scheduler::listed`]).
+type Listed = (BTreeSet<u64>, BTreeMap<String, String>, BTreeSet<String>);
 
 impl Slots {
     /// The runs active with `listed`, the ids a listing shows now. The
@@ -1138,6 +1151,9 @@ struct Scheduler<'a, C> {
     other: Option<std::result::Result<Option<String>, String>>,
     /// The epics stage 3 started planning runs on.
     epic_starts: Vec<ItemRef>,
+    /// The pools stage 1 found may take a run to get a reading
+    /// ([`usage::unasked`]), where [`Usage::probe`] is set.
+    probes: BTreeSet<String>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -1215,21 +1231,26 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let target = config.target(git_ref);
         target.validate()?;
-        let mut listed = self.runs(&target);
+        let mut listed = self.listed(&target);
         // Stage 3's planning runs, which the listing may not show yet.
-        if let Ok((_, busy)) = &mut listed {
+        if let Ok((_, busy, _)) = &mut listed {
             for epic in &self.epic_starts {
                 busy.insert(key(epic), "started in this pass".into());
             }
         }
-        self.busy = Some(listed.as_ref().ok().map(|(_, busy)| busy.clone()));
-        let (runs, busy) = listed?;
+        self.busy = Some(listed.as_ref().ok().map(|(_, busy, _)| busy.clone()));
+        let (runs, busy, pools) = listed?;
+        // A run in flight on a pool will give it its reading: no probe goes
+        // alongside it. One that names no pool may be on any; once it has
+        // asked, the broker's count says so, and the next pass probes none.
+        let probes = self.probes.difference(&pools).cloned().collect();
         let wip = config.wip as usize;
         let slots = Slots {
             wip,
             earlier,
             mine: Vec::new(),
             busy,
+            probes,
         };
         let active = slots.active(&runs);
         if active >= wip {
@@ -1239,7 +1260,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let snapshot = self.snapshot();
         // No pool to start anything on: the board is not read for nothing.
         let all: Vec<String> = config.pools.0.iter().map(|(n, _)| n.clone()).collect();
-        if let Err(why) = choose(snapshot.as_ref(), &config.pools, &all, self.now) {
+        if let Err(why) = choose(snapshot.as_ref(), &config.pools, &all, self.now)
+            && slots.probes.is_empty()
+        {
             self.line(format!("hold pools: {why}; new runs wait"));
             return Ok(());
         }
@@ -1266,10 +1289,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     ) -> (usize, usize) {
         let candidates = self.candidates(board);
         let mut taken = 0;
+        let pools = &self.config.pools;
+        let all: Vec<String> = pools.0.iter().map(|(n, _)| n.clone()).collect();
         for (n, facts) in candidates.iter().enumerate() {
             if free == 0 {
                 let left = candidates.len() - n;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
+                break;
+            }
+            // The probes taken, no pool is left to start on.
+            if let Err(why) = choose(snapshot, pools, &all, self.now)
+                && slots.probes.is_empty()
+            {
+                let left = candidates.len() - n;
+                self.line(format!("hold pools: {why}; {left} more candidate(s) wait"));
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
@@ -1305,6 +1338,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     break;
                 }
                 Step::Capped(line) => {
+                    // Not sent: the cap holds the rest of the pass anyway.
+                    if let Some(pool) = line_pool(&line) {
+                        slots.probes.remove(pool);
+                    }
                     self.line(line);
                     free -= 1;
                     continue;
@@ -1312,6 +1349,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Step::Started(line, holds) => (line, holds, false),
                 Step::Failed(line, holds) => (line, holds, true),
             };
+            self.probed(&mut slots, &line);
             // Sent or planned: a failed start may have dispatched.
             self.caps.count(Kind::Dispatch);
             if failed {
@@ -1409,8 +1447,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// The caller workflow's runs that hold a slot, by id, and the issue each
     /// names, by key. A list cut short is an error ([`Self::workflow_runs`]).
     fn runs(&self, target: &Target) -> Result<(BTreeSet<u64>, BTreeMap<String, String>)> {
+        self.listed(target).map(|(ids, busy, _)| (ids, busy))
+    }
+
+    /// [`Self::runs`], and the pools they name (`KIND OWNER/REPO#N (POOL)`).
+    fn listed(&self, target: &Target) -> Result<Listed> {
         let mut ids = BTreeSet::new();
         let mut busy = BTreeMap::new();
+        let mut pools = BTreeSet::new();
         for status in ACTIVE_RUNS {
             let url = format!(
                 "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page=100",
@@ -1424,9 +1468,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     busy.entry(format!("{repo}#{number}").to_ascii_lowercase())
                         .or_insert(url);
                 }
+                let pool = title
+                    .rsplit_once(" (")
+                    .and_then(|(_, pool)| pool.strip_suffix(')'));
+                pools.extend(pool.map(str::to_owned));
             }
         }
-        Ok((ids, busy))
+        Ok((ids, busy, pools))
     }
 
     /// [`Scheduler::usage`], read once a pass; a failure to read it is
@@ -1853,7 +1901,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             true => config.pools.0.iter().map(|(n, _)| n.clone()).collect(),
             false => vec![plan.pool.clone()],
         };
-        let pool = match choose(snapshot, &config.pools, &names, self.now) {
+        let pool = match self.pool(snapshot, &names, slots) {
             Ok(pool) => pool,
             Err(why) => return Ok(Step::Hold(format!("no pool: {why}"))),
         };
@@ -1917,6 +1965,30 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Some(Step::Capped(format!("{held}: {line}")))
     }
 
+    /// [`choose`] of `names`, or where none has room, the first that may
+    /// take one run to get a reading ([`Slots::probes`]).
+    fn pool(
+        &self,
+        snapshot: Option<&Value>,
+        names: &[String],
+        slots: &Slots,
+    ) -> std::result::Result<String, String> {
+        choose(snapshot, &self.config.pools, names, self.now).or_else(|why| {
+            let probe = names.iter().find(|name| slots.probes.contains(*name));
+            probe.cloned().ok_or(why)
+        })
+    }
+
+    /// Takes the pool of a start's `line` off `slots`' probes, saying so,
+    /// where it was one: one run a pass is enough to get a reading.
+    fn probed(&mut self, slots: &mut Slots, line: &str) {
+        if let Some(pool) = line_pool(line)
+            && slots.probes.remove(pool)
+        {
+            self.line(format!("probe: {pool} has no reading; one run to take one"));
+        }
+    }
+
     /// A run's outcome as a step: no record is a wait, with nothing written.
     fn dispatched(
         &self,
@@ -1956,7 +2028,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !config.triage {
             return Ok(Step::Hold("no plan, and triage is off".into()));
         }
-        let pool = match choose(snapshot, &config.pools, config.triage_pools(), self.now) {
+        let pool = match self.pool(snapshot, config.triage_pools(), slots) {
             Ok(pool) => pool,
             Err(why) => return Ok(Step::Hold(format!("no plan; no pool for triage: {why}"))),
         };
@@ -2039,6 +2111,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 /// The run id in a started line's `run=` URL, where GitHub named the run.
 fn run_id(line: &str) -> Option<u64> {
     line.split(" run=").nth(1)?.rsplit('/').next()?.parse().ok()
+}
+
+/// The pool in a start's line, `… pool=POOL[ …]`.
+fn line_pool(line: &str) -> Option<&str> {
+    line.split(' ').find_map(|word| word.strip_prefix("pool="))
 }
 
 // ---- Recording and replay ----
