@@ -1960,6 +1960,8 @@ fn supervise_offline_table() {
         "requests": {"repository": "o/tracker", "issue": 5}, "log": {"repository": "o/operator", "issue": 2},
         "kinds": ["research"], "maxDispatchesPerPass": 1, "maxDispatchesPerDay": 3});
     let on = write("on.json", supervisor.clone());
+    supervisor["agent"]["skipUnchangedFailures"] = true.into();
+    let skip = write("skip.json", supervisor.clone());
     supervisor["wrapperPath"] = "../elsewhere".into();
     let bad = write("bad.json", supervisor);
     let pools = write(
@@ -1974,6 +1976,11 @@ fn supervise_offline_table() {
     let failing = write(
         "failing.json",
         serde_json::json!([{"id": "release", "status": "fail"}]),
+    );
+    let comment = write(
+        "comment.json",
+        serde_json::json!({"comment": {"user": {"login": "other"}, "body": "x"},
+            "issue": {"number": 5, "locked": true}}),
     );
     // Each case is decided before any request: none reaches the network.
     for (args, token, code, stdout, stderr) in [
@@ -2051,6 +2058,80 @@ fn supervise_offline_table() {
             "",
             "not configured",
         ),
+        (
+            vec![
+                "repeat",
+                "--supervisor-config",
+                &skip,
+                "--health",
+                &failing,
+                "--previous",
+                &failing,
+            ],
+            false,
+            0,
+            "skip=true\n",
+            "release failing as in the previous pass",
+        ),
+        (
+            vec!["repeat", "--supervisor-config", &skip, "--health", &failing],
+            false,
+            0,
+            "skip=false\n",
+            "",
+        ),
+        (
+            vec![
+                "repeat",
+                "--supervisor-config",
+                &on,
+                "--health",
+                &failing,
+                "--previous",
+                &failing,
+            ],
+            false,
+            0,
+            "skip=false\n",
+            "",
+        ),
+        (
+            vec![
+                "compose",
+                "--supervisor-config",
+                &on,
+                "--task",
+                "t",
+                "--event",
+                &ok,
+            ],
+            true,
+            1,
+            "",
+            "agent.profile is not configured",
+        ),
+        (
+            vec![
+                "compose",
+                "--supervisor-config",
+                &on,
+                "--task",
+                "t",
+                "--event",
+                &comment,
+            ],
+            true,
+            1,
+            "",
+            "not an operator comment",
+        ),
+        (
+            vec!["preview", "--supervisor-config", &on, "--result-url", "u"],
+            true,
+            1,
+            "",
+            "not a comment on the supervisor requests issue",
+        ),
     ] {
         let mut command = command();
         command
@@ -2088,6 +2169,49 @@ fn supervise_offline_table() {
         ])
         .assert()
         .code(1);
+    // The pacing reads no settings: a lookup that worked but found no
+    // previous run is a sweep; one that failed is not.
+    let times = dir.join("times.json");
+    // A prompt is text, even one that looks like a flag.
+    for (event, prompt, previous, stdout) in [
+        (
+            "schedule",
+            "",
+            Some("missing.json"),
+            "health=true\ndaily=true\n",
+        ),
+        ("schedule", "", None, "health=true\ndaily=false\n"),
+        ("workflow_dispatch", "", None, "health=true\ndaily=false\n"),
+        (
+            "workflow_dispatch",
+            "--help",
+            None,
+            "health=true\ndaily=true\n",
+        ),
+    ] {
+        let mut command = command();
+        command.args([
+            "supervise",
+            "due",
+            "--event",
+            event,
+            "--prompt",
+            prompt,
+            "--out",
+        ]);
+        command.arg(&times);
+        if let Some(name) = previous {
+            command.arg("--previous").arg(dir.join(name));
+        }
+        command.assert().success().stdout(stdout);
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&times).unwrap()).unwrap();
+        assert_eq!(
+            written["sweep"].is_string(),
+            stdout.ends_with("daily=true\n"),
+            "{written}"
+        );
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
