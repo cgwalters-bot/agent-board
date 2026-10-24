@@ -65,7 +65,7 @@ const BLOCK: &str = "supervisor-actions";
 const MAX_REQUEST_BYTES: usize = 32 * 1024;
 const MAX_REQUESTS: usize = 10;
 /// The wrapper takes a task of 64 KiB including the issue's text.
-const MAX_TASK_BYTES: usize = 48 * 1024;
+pub(crate) const MAX_TASK_BYTES: usize = 48 * 1024;
 /// The workflow's job that calls the wrapper; its jobs are `agent / ...`
 /// when it ran and one skipped `agent` job when it did not.
 const AGENT_JOB: &str = "agent";

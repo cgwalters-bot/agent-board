@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 
 pub mod agent;
 pub mod health;
+pub mod pace;
+pub mod profile;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -282,6 +284,12 @@ pub struct AgentSettings {
     pub state: Option<IssueRef>,
     pub tracker: Option<String>,
     pub project: Option<String>,
+    /// The reviewed profile and skill the agent's task starts with
+    /// ([`profile`]); without it `compose` and `session` refuse.
+    pub profile: Option<profile::Profile>,
+    /// Whether a pass that is not a sweep leaves the agent out when no check
+    /// newly fails ([`pace::unchanged`]).
+    pub skip_unchanged_failures: bool,
 }
 
 /// The supervisor file's optional settings that switch something on, read
@@ -300,12 +308,11 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "state",
     "tracker",
     "project",
+    "profile",
+    "skipUnchangedFailures",
 ];
 /// The agent object's other keys, without which it stays off or is refused.
 const AGENT_REQUIRED: &[&str] = &["pool", "cooldownHours", "requests", "log"];
-/// The agent object's keys that the caller's own scripts read and agent-board
-/// ignores.
-const AGENT_CALLER_KEYS: &[&str] = &["profile", "skipUnchangedFailures"];
 
 /// The options of [`POLL_OPTIONS`], [`SUPERVISOR_OPTIONS`] and, with an
 /// agent, [`AGENT_OPTIONS`] (as `agent.NAME`) that the files leave out or
@@ -557,11 +564,7 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         return Ok(None);
     };
     // Before the issues: a misspelt `requests` would leave the agent off too.
-    crate::poll::check_keys(
-        &[AGENT_OPTIONS, AGENT_REQUIRED, AGENT_CALLER_KEYS],
-        agent,
-        "supervisor agent",
-    )?;
+    crate::poll::check_keys(&[AGENT_OPTIONS, AGENT_REQUIRED], agent, "supervisor agent")?;
     let (Some(requests), Some(log)) = (
         IssueRef::from_json(agent.get("requests"), "supervisor agent.requests")?,
         IssueRef::from_json(agent.get("log"), "supervisor agent.log")?,
@@ -642,6 +645,14 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         state,
         tracker,
         project,
+        profile: profile::Profile::from_json(get("profile")?)?,
+        skip_unchanged_failures: get("skipUnchangedFailures")?
+            .map(|v| {
+                v.as_bool()
+                    .context("supervisor agent.skipUnchangedFailures")
+            })
+            .transpose()?
+            .unwrap_or(false),
     }))
 }
 
@@ -737,7 +748,7 @@ mod tests {
                 "log": {"repository": "example/operator", "issue": 7},
                 "kinds": ["triage", "research"],
                 "maxDispatchesPerPass": 2, "maxDispatchesPerDay": 3,
-                "profile": {"repository": "example/home", "ref": "main"},
+                "profile": {"repository": "example/home", "ref": "a".repeat(40)},
                 "skipUnchangedFailures": false,
             },
         })
@@ -759,6 +770,8 @@ mod tests {
         assert_eq!(s.usage.as_ref().unwrap().issue.repository, "example/ops");
         let agent = s.agent.unwrap();
         assert_eq!(agent.max_dispatches_per_pass, 2);
+        assert_eq!(agent.profile.unwrap().repository, "example/home");
+        assert!(!agent.skip_unchanged_failures);
         for key in ["requests", "log"] {
             let mut cfg = supervisor();
             cfg["agent"][key] = Value::Null;
@@ -898,6 +911,25 @@ mod tests {
             ),
             ("kinds", json!(["Triage", "research"])),
             ("kinds", json!(["fix"])),
+            // A profile read at a branch, or from a path that is not a
+            // repository, could change without a review of the caller.
+            (
+                "profile",
+                json!({"repository": "example/home", "ref": "main"}),
+            ),
+            (
+                "profile",
+                json!({"repository": "example/..", "ref": "a".repeat(40)}),
+            ),
+            (
+                "profile",
+                json!({"repository": "example/home", "ref": "A".repeat(40)}),
+            ),
+            (
+                "profile",
+                json!({"repository": "example/home", "ref": "a".repeat(40), "path": "x"}),
+            ),
+            ("skipUnchangedFailures", json!("true")),
         ] {
             let mut cfg = supervisor();
             cfg["agent"][key] = value.clone();

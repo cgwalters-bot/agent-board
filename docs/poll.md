@@ -91,8 +91,8 @@ of these and none of the other commands' sections (`board`, `statusReconcile`,
 `epics`, `decisions`, `schedule`) or the caller's scheduler's (`coordinator`,
 `source`, `branch`, which agent-board ignores): every option ships off, so a
 misspelt one would otherwise leave its feature off silently. The supervisor's
-`agent` object likewise refuses unknown keys other than the caller's `profile` and
-`skipUnchangedFailures`, and `agent.kinds` a kind it cannot dispatch. The
+`agent` object likewise refuses unknown keys, and `agent.kinds` a kind it
+cannot dispatch. The
 workflow must check this file out from its trusted
 default branch, never a dispatched head or dispatcher-controlled workflow input.
 The board and `watch` still only widen activity reads. No account or repository

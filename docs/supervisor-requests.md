@@ -62,6 +62,51 @@ release train and scheduler-log settings are optional, so an organization
 without them leaves those checks not configured, and `unset` names them. The checks
 have been exercised against recorded responses only.
 
+## Workflow steps
+
+The caller's workflow runs these around `health` and `trigger`; each prints
+`key=value` lines for `$GITHUB_OUTPUT` (a multiline value under a random
+delimiter) and keeps its diagnostics on stderr. All but `due` also take
+`--config` and `--supervisor-config`, left out below.
+
+- `supervise due --event EVENT [--prompt TEXT] [--previous times.json]`
+  prints `health` and `daily`, and writes this run's `times.json` for the next
+  run, uploaded beside `health.json`. Every run is a health pass, so `health`
+  is always `true`; it is kept so that steps conditioned on it work unchanged.
+  `daily`, which `trigger --daily` and `repeat --daily` take, is true for an
+  operator comment, a dispatch with a prompt, or a sweep due two hours after
+  the one the previous times record. Pass `--previous` whenever the previous
+  run's artifact was looked up, even if none existed (then the sweep is due);
+  leave it out when the lookup failed, so that unknown times make no sweep
+  but an explicit request still does.
+- `supervise repeat --health health.json --previous OLD/health.json [--daily]`
+  prints `skip`. With `agent.skipUnchangedFailures` true, a pass that is not
+  a sweep skips the trigger when every failing check also failed in the
+  previous report; without two readable reports it never skips. Off by
+  default.
+- `supervise compose --task TASK --event "$GITHUB_EVENT_PATH" [--prompt TEXT]`
+  prints `task`: the profile and skill read from `agent.profile`, then the
+  trigger's task, then the operator request, at most 48 KiB. The request is
+  the dispatch's prompt, or a comment's body when the event is a comment by
+  the configured `operator` on the locked `agent.requests` issue (not a pull
+  request); any other comment is refused.
+- `supervise preview --result-url URL` prints the agent's comment on the
+  requests issue between `::stop-commands::` markers, applying nothing.
+- `supervise session --session session.json --rules session.md --pools
+  pools.json --pool NAME [--idle-minutes N] [--prompt TEXT]` prints an
+  operator session's `repo`, `item`, `idle`, `agent`, `model`, `budget` and
+  `task`. The session file is `{"enabled", "repository", "issue",
+  "idleMinutes"}` and must have `enabled: true`; idle minutes are 1 to 60. The
+  task is the rules, the `agent.state` and `agent.requests` issues, the
+  profile and skill, and the opening prompt as task data, at most 60,000
+  bytes.
+
+`agent.profile` is `{"repository": "OWNER/agenthome", "ref": "FULL_COMMIT"}`:
+a 40-character commit, never a branch, so that what the agent is told
+changes only with a reviewed config edit. `compose` and `session` read
+`.github/agentic-job/profiles/supervisor.md` and `skills/supervisor/SKILL.md`
+there through the contents API with `GH_TOKEN`, each at most 64 KiB.
+
 ## Requests
 
 `supervise execute` treats the supervisor's comment as attacker-controlled data.
@@ -117,7 +162,9 @@ A complete supervisor file:
     },
     "tracker": "OWNER/tracker",
     "state": {"repository": "OWNER/tracker", "issue": 123},
-    "project": "PVT_CONFIGURED_NODE_ID"
+    "project": "PVT_CONFIGURED_NODE_ID",
+    "profile": {"repository": "OWNER/agenthome", "ref": "0123456789abcdef0123456789abcdef01234567"},
+    "skipUnchangedFailures": false
   }
 }
 ```
@@ -162,7 +209,8 @@ dropped or misspelled key is seen:
   (the pools file's pool the agent's run uses) and `agent.cooldownHours` (how
   long after an agent run a failing check may start another, a positive number) are
   required. The cooldown applies outside the daily pass. `kinds`, `maxDispatchesPerPass`, `maxDispatchesPerDay`,
-  `dailyCaps`, `tracker`, `state` and `project` are described below.
+  `dailyCaps`, `tracker`, `state` and `project` are described below;
+  `profile` and `skipUnchangedFailures` under [workflow steps](#workflow-steps).
 
 All new daily caps default to zero (disabled), accept integers from zero to 100,
 and `status_update` accepts at most one. Dispatches of all admitted kinds share

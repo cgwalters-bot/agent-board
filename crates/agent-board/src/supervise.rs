@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use board_forge::supervise::{self, Api, Bounded, Settings, agent, health};
+use board_forge::supervise::{self, Api, Bounded, Settings, agent, health, pace, profile};
 use serde_json::Value;
 use std::{
     io::Write,
@@ -20,6 +20,16 @@ enum Command {
     Trigger(Trigger),
     /// Perform the agent's validated dispatch requests and log them (writes with GH_TOKEN, the bot's).
     Execute(Execute),
+    /// Say whether this pass is a sweep, from the previous run's times, for $GITHUB_OUTPUT (offline).
+    Due(Due),
+    /// Say whether to skip the trigger because no check newly fails, for $GITHUB_OUTPUT (offline).
+    Repeat(Repeat),
+    /// Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads).
+    Compose(Compose),
+    /// Print the agent's result comment without applying it (GH_TOKEN reads).
+    Preview(Preview),
+    /// Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads).
+    Session(Session),
 }
 
 /// Repository-owned settings from a trusted default-branch checkout, never a
@@ -76,6 +86,87 @@ struct Execute {
     result_url: String,
 }
 
+#[derive(clap::Args)]
+struct Due {
+    /// The event that started the run (`github.event_name`).
+    #[arg(long)]
+    event: String,
+    /// The dispatch's prompt; one makes a prompt-less dispatch an explicit request.
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+    /// The previous run's times. Give it whenever the lookup worked, even if
+    /// there was no previous run; left out, the times are unknown and only an
+    /// explicit request is a sweep.
+    #[arg(long, value_name = "FILE")]
+    previous: Option<PathBuf>,
+    /// Where this run's times are written, for the next run to read.
+    #[arg(long, value_name = "FILE", default_value = "times.json")]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct Repeat {
+    #[command(flatten)]
+    files: Files,
+    /// The report `health` wrote.
+    #[arg(long, value_name = "FILE", default_value = "health.json")]
+    health: PathBuf,
+    /// The previous run's report.
+    #[arg(long, value_name = "FILE")]
+    previous: Option<PathBuf>,
+    /// A sweep, which never skips.
+    #[arg(long)]
+    daily: bool,
+}
+
+#[derive(clap::Args)]
+struct Compose {
+    #[command(flatten)]
+    files: Files,
+    /// The task `trigger` printed.
+    #[arg(long, allow_hyphen_values = true)]
+    task: String,
+    /// The dispatch's prompt; an operator comment's body takes its place.
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+    /// The event payload (`$GITHUB_EVENT_PATH`).
+    #[arg(long, value_name = "FILE")]
+    event: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct Preview {
+    #[command(flatten)]
+    files: Files,
+    /// The agent run's result URL: its comment on the requests issue.
+    #[arg(long, value_name = "URL")]
+    result_url: String,
+}
+
+#[derive(clap::Args)]
+struct Session {
+    #[command(flatten)]
+    files: Files,
+    /// The session settings: enabled, repository, issue, idleMinutes.
+    #[arg(long, value_name = "FILE")]
+    session: PathBuf,
+    /// The session's own rules, put before the supervisor's profile.
+    #[arg(long, value_name = "FILE")]
+    rules: PathBuf,
+    /// The pools file.
+    #[arg(long, value_name = "FILE")]
+    pools: PathBuf,
+    /// The pool, of the pools file, the session runs on.
+    #[arg(long)]
+    pool: String,
+    /// The idle timeout, 1 to 60 minutes; empty uses the session settings'.
+    #[arg(long)]
+    idle_minutes: Option<String>,
+    /// The opening prompt, task data.
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+}
+
 fn read(path: &Path) -> Result<Value> {
     serde_json::from_slice(
         &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -110,6 +201,41 @@ fn output_line(name: &str, value: &str) -> Result<String> {
         "{name} must be a single line"
     );
     Ok(format!("{name}={value}\n"))
+}
+
+/// A multiline value for `$GITHUB_OUTPUT`, under a delimiter it cannot contain.
+fn output_block(name: &str, value: &str, delimiter: &str) -> Result<String> {
+    ensure!(!value.contains(delimiter), "{name} contains its delimiter");
+    Ok(format!("{name}<<{delimiter}\n{value}\n{delimiter}\n"))
+}
+
+/// A random delimiter, which text written before it was drawn cannot hold.
+fn delimiter(prefix: &str) -> Result<String> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| anyhow::anyhow!("generate delimiter"))?;
+    Ok(nonce.iter().fold(format!("{prefix}-"), |mut s, b| {
+        s.push_str(&format!("{b:02x}"));
+        s
+    }))
+}
+
+/// The agent's settings, which `compose`, `preview` and `session` need.
+fn agent_settings(s: &Settings) -> Result<&supervise::AgentSettings> {
+    s.agent
+        .as_ref()
+        .context("supervisor: the requests and log issues are not configured")
+}
+
+fn pinned_profile(s: &Settings) -> Result<&supervise::profile::Profile> {
+    agent_settings(s)?
+        .profile
+        .as_ref()
+        .context("supervisor agent.profile is not configured")
+}
+
+/// A file that may be absent: `None` when it cannot be read or decoded.
+fn read_optional(path: Option<&Path>) -> Option<Value> {
+    path.and_then(|p| read(p).ok())
 }
 
 pub fn run(args: &Supervise) -> Result<()> {
@@ -167,15 +293,12 @@ pub fn run(args: &Supervise) -> Result<()> {
                     hours,
                 )
             })?;
-            let mut nonce = [0u8; 16];
-            getrandom::fill(&mut nonce).map_err(|_| anyhow::anyhow!("generate delimiter"))?;
-            let delimiter: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
             let out = trigger_output(
                 &decision,
                 policy.as_ref(),
                 &pools,
                 checks,
-                &format!("task-{delimiter}"),
+                &delimiter("task")?,
             )?;
             std::io::stdout().lock().write_all(out.as_bytes())?;
             eprintln!(
@@ -211,7 +334,125 @@ pub fn run(args: &Supervise) -> Result<()> {
             ensure!(outcome.ok, "supervisor: not every request was performed");
             Ok(())
         }
+        Command::Due(args) => {
+            // A previous run without a times file, or with one this cannot
+            // read, is no previous sweep: Null.
+            let previous = args
+                .previous
+                .as_deref()
+                .map(|p| read_optional(Some(p)).unwrap_or_default());
+            let (daily, times) = pace::due(
+                &args.event,
+                args.prompt.as_deref().unwrap_or_default(),
+                previous.as_ref(),
+                now(),
+            );
+            std::fs::write(&args.out, format!("{times}\n"))
+                .with_context(|| format!("write {}", args.out.display()))?;
+            // Every run is a health pass now that only the caller's crons
+            // start it; `health` stays so that the caller's step conditions
+            // keep reading it.
+            let mut out = std::io::stdout().lock();
+            out.write_all(output_line("health", "true")?.as_bytes())?;
+            out.write_all(output_line("daily", &daily.to_string())?.as_bytes())?;
+            Ok(())
+        }
+        Command::Repeat(args) => {
+            let s = settings(&args.files)?;
+            let enabled = s.agent.as_ref().is_some_and(|a| a.skip_unchanged_failures);
+            let skip = pace::unchanged(
+                enabled,
+                args.daily,
+                read_optional(Some(&args.health)).as_ref(),
+                read_optional(args.previous.as_deref()).as_ref(),
+            );
+            if let Some(failing) = &skip {
+                let failing: Vec<&str> = failing.iter().map(String::as_str).collect();
+                eprintln!(
+                    "{} failing as in the previous pass; the sweep reads them",
+                    if failing.is_empty() {
+                        "no check".to_owned()
+                    } else {
+                        failing.join(", ")
+                    }
+                );
+            }
+            std::io::stdout()
+                .lock()
+                .write_all(output_line("skip", &skip.is_some().to_string())?.as_bytes())?;
+            Ok(())
+        }
+        Command::Compose(args) => {
+            let s = settings(&args.files)?;
+            let requests = &agent_settings(&s)?.requests;
+            let request = profile::request(
+                &read(&args.event)?,
+                args.prompt.as_deref().unwrap_or_default(),
+                &s.operator,
+                requests,
+            )?;
+            let client = board_forge::github::Client::from_env()?;
+            let text = pinned_profile(&s)?.read(&client)?;
+            let task = profile::supervisor_task(&text, &args.task, &request)?;
+            std::io::stdout()
+                .lock()
+                .write_all(output_block("task", &task, &delimiter("task")?)?.as_bytes())?;
+            Ok(())
+        }
+        Command::Preview(args) => {
+            let s = settings(&args.files)?;
+            let requests = &agent_settings(&s)?.requests;
+            let id = agent::request_comment(&args.result_url, requests)?;
+            let client = board_forge::github::Client::from_env()?;
+            let comment = client.get(&format!(
+                "/repos/{}/issues/comments/{id}",
+                requests.repository
+            ))?;
+            let body = comment["body"].as_str().context("comment has no body")?;
+            // The agent's text must not be read as workflow commands.
+            let token = delimiter("preview")?;
+            ensure!(!body.contains(&token), "comment contains its delimiter");
+            write!(
+                std::io::stdout().lock(),
+                "::stop-commands::{token}\nPreview only; no requests applied.\n{body}\n::{token}::\n"
+            )?;
+            Ok(())
+        }
+        Command::Session(args) => {
+            let s = settings(&args.files)?;
+            let agent = agent_settings(&s)?;
+            let rules = std::fs::read_to_string(&args.rules)
+                .with_context(|| format!("read {}", args.rules.display()))?;
+            let client = board_forge::github::Client::from_env()?;
+            let outputs = profile::session(
+                &read(&args.session)?,
+                &read(&args.pools)?,
+                &rules,
+                agent.state.as_ref(),
+                &agent.requests,
+                &pinned_profile(&s)?.read(&client)?,
+                &args.pool,
+                args.idle_minutes.as_deref().unwrap_or_default(),
+                args.prompt.as_deref().unwrap_or_default(),
+            )?;
+            std::io::stdout()
+                .lock()
+                .write_all(session_output(&outputs, &delimiter("session")?)?.as_bytes())?;
+            Ok(())
+        }
     }
+}
+
+/// A session's `$GITHUB_OUTPUT` lines: its task under a delimiter, every
+/// other value a single line.
+fn session_output(outputs: &profile::Outputs, delimiter: &str) -> Result<String> {
+    outputs
+        .iter()
+        .map(|(name, value)| match *name {
+            "task" => output_block(name, value, delimiter),
+            _ => output_line(name, value),
+        })
+        .collect()
 }
 
 /// The trigger's `$GITHUB_OUTPUT` lines: `act`, and when the agent runs, its
@@ -229,7 +470,6 @@ fn trigger_output(
     };
     let pool = &pools[policy.agent.pool.as_str()];
     let task = agent::compose(checks, policy, &decision.reason)?;
-    ensure!(!task.contains(delimiter), "task contains its delimiter");
     out.push_str(&output_line("repo", &policy.agent.requests.repository)?);
     out.push_str(&output_line(
         "item",
@@ -241,7 +481,7 @@ fn trigger_output(
             .with_context(|| format!("pool {} has no {key}", policy.agent.pool))?;
         out.push_str(&output_line(key, value)?);
     }
-    out.push_str(&format!("task<<{delimiter}\n{task}\n{delimiter}\n"));
+    out.push_str(&output_block("task", &task, delimiter)?);
     Ok(out)
 }
 
@@ -286,5 +526,18 @@ mod tests {
         assert!(trigger_output(&run, policy.as_ref(), &forged, &checks, "task-d").is_err());
         assert!(trigger_output(&run, policy.as_ref(), &pools, &checks, "release").is_err());
         assert!(output_line("x", "a\rb").is_err());
+        // A session's prompt is task data under the delimiter; a pool value
+        // cannot add a line.
+        let session = vec![
+            ("agent", "a".to_owned()),
+            ("task", "hello\nrepo=attacker/repo".to_owned()),
+        ];
+        assert_eq!(
+            session_output(&session, "session-d").unwrap(),
+            "agent=a\ntask<<session-d\nhello\nrepo=attacker/repo\nsession-d\n"
+        );
+        let forged = vec![("agent", "a\nrepo=x".to_owned())];
+        assert!(session_output(&forged, "session-d").is_err());
+        assert!(session_output(&session, "hello").is_err());
     }
 }

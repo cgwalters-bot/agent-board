@@ -589,6 +589,11 @@ Commands:
 - [`health`](#agent-board-supervise-health): Read the health observations and write the report (read-only; GH_TOKEN reads)
 - [`trigger`](#agent-board-supervise-trigger): Say whether the agent runs on this pass and print its inputs for $GITHUB_OUTPUT
 - [`execute`](#agent-board-supervise-execute): Perform the agent's validated dispatch requests and log them (writes with GH_TOKEN, the bot's)
+- [`due`](#agent-board-supervise-due): Say whether this pass is a sweep, from the previous run's times, for $GITHUB_OUTPUT (offline)
+- [`repeat`](#agent-board-supervise-repeat): Say whether to skip the trigger because no check newly fails, for $GITHUB_OUTPUT (offline)
+- [`compose`](#agent-board-supervise-compose): Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads)
+- [`preview`](#agent-board-supervise-preview): Print the agent's result comment without applying it (GH_TOKEN reads)
+- [`session`](#agent-board-supervise-session): Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads)
 
 ## agent-board supervise health
 
@@ -638,6 +643,90 @@ Options:
 - `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
 - `--pools <FILE>`: The pools file; a request must name one of its pools
 - `--result-url <URL>`: The agent run's result URL: its comment on the requests issue
+
+## agent-board supervise due
+
+Say whether this pass is a sweep, from the previous run's times, for $GITHUB_OUTPUT (offline)
+
+```text
+agent-board supervise due [OPTIONS] --event <EVENT>
+```
+
+Options:
+
+- `--event <EVENT>`: The event that started the run (`github.event_name`)
+- `--prompt <PROMPT>`: The dispatch's prompt; one makes a prompt-less dispatch an explicit request
+- `--previous <FILE>`: The previous run's times. Give it whenever the lookup worked, even if there was no previous run; left out, the times are unknown and only an explicit request is a sweep
+- `--out <FILE>`: Where this run's times are written, for the next run to read (default: `times.json`)
+
+## agent-board supervise repeat
+
+Say whether to skip the trigger because no check newly fails, for $GITHUB_OUTPUT (offline)
+
+```text
+agent-board supervise repeat [OPTIONS] --config <FILE> --supervisor-config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The poll's agent-board.json: operator, bot, dispatch repository and workflow, follow
+- `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
+- `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
+- `--health <FILE>`: The report `health` wrote (default: `health.json`)
+- `--previous <FILE>`: The previous run's report
+- `--daily`: A sweep, which never skips
+
+## agent-board supervise compose
+
+Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads)
+
+```text
+agent-board supervise compose [OPTIONS] --config <FILE> --supervisor-config <FILE> --task <TASK> --event <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The poll's agent-board.json: operator, bot, dispatch repository and workflow, follow
+- `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
+- `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
+- `--task <TASK>`: The task `trigger` printed
+- `--prompt <PROMPT>`: The dispatch's prompt; an operator comment's body takes its place
+- `--event <FILE>`: The event payload (`$GITHUB_EVENT_PATH`)
+
+## agent-board supervise preview
+
+Print the agent's result comment without applying it (GH_TOKEN reads)
+
+```text
+agent-board supervise preview [OPTIONS] --config <FILE> --supervisor-config <FILE> --result-url <URL>
+```
+
+Options:
+
+- `--config <FILE>`: The poll's agent-board.json: operator, bot, dispatch repository and workflow, follow
+- `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
+- `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
+- `--result-url <URL>`: The agent run's result URL: its comment on the requests issue
+
+## agent-board supervise session
+
+Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads)
+
+```text
+agent-board supervise session [OPTIONS] --config <FILE> --supervisor-config <FILE> --session <FILE> --rules <FILE> --pools <FILE> --pool <POOL>
+```
+
+Options:
+
+- `--config <FILE>`: The poll's agent-board.json: operator, bot, dispatch repository and workflow, follow
+- `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
+- `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
+- `--session <FILE>`: The session settings: enabled, repository, issue, idleMinutes
+- `--rules <FILE>`: The session's own rules, put before the supervisor's profile
+- `--pools <FILE>`: The pools file
+- `--pool <POOL>`: The pool, of the pools file, the session runs on
+- `--idle-minutes <IDLE_MINUTES>`: The idle timeout, 1 to 60 minutes; empty uses the session settings'
+- `--prompt <PROMPT>`: The opening prompt, task data
 
 ## agent-board status
 
