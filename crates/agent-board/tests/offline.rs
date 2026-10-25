@@ -672,8 +672,7 @@ fn forgejo_snapshot_table() {
                 "--jq",
                 ".diagnostics | to_entries[] | \"\\(.key) \\(.value)\"",
             ],
-            "sample/board#1 schema_drift: Status has no unambiguous single-select option \"Triage\"; no repair proposed\n\
-             sample/board#2 missing_data: incomplete fields: 2 priority/ labels\n\
+            "sample/board#2 missing_data: incomplete fields: 2 priority/ labels\n\
              sample/board#3 missing_data: incomplete fields: no priority/ label\n",
         ),
     ] {

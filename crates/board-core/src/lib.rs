@@ -205,6 +205,11 @@ pub struct Snapshot {
     pub items: Vec<Item>,
     #[serde(default)]
     pub fields: Vec<serde_json::Value>,
+    /// The board has no Status field at all (a label board), so reconcile
+    /// proposes no Status or close-reason repairs. Only a reader that never
+    /// has one sets it; an empty `fields` list is not taken to mean this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub status_field_absent: bool,
 }
 
 impl Snapshot {
@@ -261,7 +266,15 @@ impl Snapshot {
                 item.field_errors.is_empty() || !item.fields_complete,
                 "field errors on an item with complete fields"
             );
+            ensure!(
+                !self.status_field_absent || item.status.is_none(),
+                "Status on a board without a Status field"
+            );
         }
+        ensure!(
+            !self.status_field_absent || !self.fields.iter().any(|field| field["name"] == "Status"),
+            "Status field on a board marked as having none"
+        );
         Ok(())
     }
 }
@@ -461,6 +474,9 @@ fn reconcile_inner(
             Some(item.identity.host.as_str()) == snapshot.project.host_str(),
             "item host differs from project host"
         );
+        if snapshot.status_field_absent {
+            continue;
+        }
         let derived = status_facts
             .and_then(|facts| facts.get(&item.identity))
             .and_then(|facts| {
@@ -674,7 +690,32 @@ mod tests {
             } else {
                 assert!(!plan.diagnostics.is_empty());
             }
+            // The same open or closed item on a board without a Status
+            // field: nothing to repair, and no Status diagnostic, but an
+            // incomplete item is still named.
+            snapshot.items[0].status = None;
+            snapshot.fields.clear();
+            snapshot.status_field_absent = true;
+            let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+            assert!(plan.actions.is_empty() && plan.diagnostics.is_empty());
+            snapshot.items[0].fields_complete = false;
+            let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
+            assert!(plan.diagnostics["example/intake#1"].contains("incomplete fields"));
         }
+    }
+
+    #[test]
+    fn status_field_absent_must_hold() {
+        let mut snapshot: Snapshot =
+            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
+        snapshot.status_field_absent = true;
+        assert!(snapshot.validate().is_err(), "Status field present");
+        snapshot.fields.retain(|field| field["name"] != "Status");
+        assert!(snapshot.validate().is_err(), "Status value present");
+        for item in &mut snapshot.items {
+            item.status = None;
+        }
+        snapshot.validate().unwrap();
     }
 
     #[test]
