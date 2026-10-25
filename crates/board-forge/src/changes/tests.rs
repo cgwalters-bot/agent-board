@@ -427,7 +427,9 @@ fn reads_page_the_items_from_the_latest_update() {
             "Item 20\n- [example/project#31](https://github.com/example/project/pull/31) Item 31\n",
         );
     assert_eq!(
-        read(&forge, "P", since, None, false).unwrap().markdown(),
+        read(&forge, "P", since, None, None, false)
+            .unwrap()
+            .markdown(),
         expected
     );
     let variables = forge.variables.borrow();
@@ -445,7 +447,7 @@ fn reads_page_the_items_from_the_latest_update() {
     drop(variables);
     assert_eq!(last_update(&forge, "P").unwrap(), None);
     // A repeated cursor never completes the list.
-    assert!(read(&forge, "P", since, None, false).is_err());
+    assert!(read(&forge, "P", since, None, None, false).is_err());
 }
 
 #[test]
@@ -496,14 +498,18 @@ fn public_only_leaves_out_private_repositories() {
     let since = parse_time(SINCE).unwrap();
     // Unfiltered, the private issue and reference are listed and searched.
     let all = forge(&items, 4);
-    let body = read(&all, "P", since, None, false).unwrap().markdown();
+    let body = read(&all, "P", since, None, None, false)
+        .unwrap()
+        .markdown();
     assert!(
         body.contains("example/secret#5") && body.contains("example/secret#4"),
         "{body}"
     );
     assert_eq!(all.variables.borrow().len(), 6);
     let public = forge(&items, 2);
-    let body = read(&public, "P", since, None, true).unwrap().markdown();
+    let body = read(&public, "P", since, None, None, true)
+        .unwrap()
+        .markdown();
     assert_eq!(
         body,
         "**Landed**\n- [example/project#12](https://github.com/example/project/issues/12) Item 12 \
@@ -516,11 +522,107 @@ fn public_only_leaves_out_private_repositories() {
     drop(variables);
     // A visibility the read lacks is not taken for public.
     let unread = vec![item("Issue", 6, json!({"createdAt": IN}))];
-    let error = read(&forge(&unread, 2), "P", since, None, true).unwrap_err();
+    let error = read(&forge(&unread, 2), "P", since, None, None, true).unwrap_err();
     assert!(
         format!("{error:#}").contains("unread visibility of example/project"),
         "{error:#}"
     );
+}
+
+#[test]
+fn until_ends_the_window() {
+    const UNTIL: &str = "2026-10-22T00:00:00Z";
+    const LATER: &str = "2026-10-23T00:00:00Z";
+    let items = vec![
+        // Merged in the window, and merged after it but opened in it.
+        item(
+            "PullRequest",
+            1,
+            json!({"merged": true, "mergedAt": IN, "closedAt": IN}),
+        ),
+        item(
+            "PullRequest",
+            2,
+            json!({"createdAt": IN, "merged": true, "mergedAt": LATER, "closedAt": LATER}),
+        ),
+        // Opened after the window, and closed after it.
+        item("Issue", 3, json!({"createdAt": LATER})),
+        item("Issue", 4, json!({"closedAt": LATER})),
+        // A hold changed only after the window.
+        item(
+            "Issue",
+            5,
+            json!({"timelineItems": event("LabeledEvent", "needs-human", LATER)}),
+        ),
+    ];
+    let open = classify(&items, &[], SINCE, &authors()).unwrap().markdown();
+    for n in 1..=5 {
+        assert!(open.contains(&format!("example/project#{n}]")), "{open}");
+    }
+    let bounded = classify_window(&items, &[], SINCE, Some(UNTIL), &authors()).unwrap();
+    assert_eq!(
+        bounded.markdown(),
+        "**Landed**\n- [example/project#1](https://github.com/example/project/pull/1) Item 1\n\n\
+        **Opened**\n- [example/project#2](https://github.com/example/project/pull/2) Item 2\n"
+    );
+    assert_eq!(serde_json::to_value(&bounded).unwrap()["until"], UNTIL);
+    // Off the board, a pull request opened in the window is still Opened
+    // when it merged or closed after it, and is no news when it closed
+    // unmerged in it.
+    let searched = [
+        pr(
+            6,
+            json!({"createdAt": IN, "merged": true, "mergedAt": LATER, "closedAt": LATER}),
+        ),
+        pr(7, json!({"createdAt": IN, "closedAt": LATER})),
+        pr(8, json!({"createdAt": IN, "closedAt": IN})),
+        pr(9, json!({"createdAt": LATER})),
+    ];
+    let body = classify_window(&[], &searched, SINCE, Some(UNTIL), &authors())
+        .unwrap()
+        .markdown();
+    assert_eq!(
+        body,
+        "**Opened**\n- [example/project#6](https://github.com/example/project/pull/6) Item 6\n\
+        - [example/project#7](https://github.com/example/project/pull/7) Item 7\n"
+    );
+    // Without an end, only what is open now is Opened, as before.
+    let body = classify(&[], &searched, SINCE, &authors())
+        .unwrap()
+        .markdown();
+    assert!(
+        body.starts_with("**Landed**\n- [example/project#6]"),
+        "{body}"
+    );
+    assert!(
+        body.contains("**Opened**\n- [example/project#9]") && !body.contains("#7]"),
+        "{body}"
+    );
+    let empty = classify_window(&[], &[], SINCE, Some(UNTIL), &authors()).unwrap();
+    assert_eq!(
+        empty.markdown(),
+        format!("No changes from {SINCE} to {UNTIL}\n")
+    );
+
+    // The searches take the window as a range.
+    let page = json!({"node": {"items": {"nodes": [items[0].clone()], "pageInfo": {"hasNextPage": false, "endCursor": null}}}});
+    let none = json!({"search": {"nodes": [], "pageInfo": {"hasNextPage": false}}});
+    let forge = Pages {
+        pages: RefCell::new(vec![
+            json!({"viewer": {"login": VIEWER}}),
+            page,
+            none.clone(),
+            none,
+        ]),
+        variables: RefCell::new(vec![]),
+    };
+    let (since, until) = (parse_time(SINCE).unwrap(), parse_time(UNTIL).unwrap());
+    read(&forge, "P", since, Some(until), None, false).unwrap();
+    assert_eq!(
+        forge.variables.borrow()[2],
+        json!({"q": format!("repo:example/project is:pr merged:{SINCE}..{UNTIL}")})
+    );
+    assert!(read(&forge, "P", until, Some(since), None, false).is_err());
 }
 
 #[test]

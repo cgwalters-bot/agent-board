@@ -123,6 +123,10 @@ that was not read counts as private. `--max-chars N` trims the Markdown to at
 most N characters as a generated status update is trimmed (the sections with
 the most lines lose their last lines first, ending with `+K more`). Status
 updates themselves stay unfiltered: they are posted on the project.
+`--until TIME` ends the window there instead of at the read, for a fixed
+period such as a week: what merged, closed, opened or changed hold after it is
+left out, and the searches take the window as a range. Labels are read as they
+are now, so a hold released after the end may show as released.
 
 Apart from those pull requests, the list describes current members, not a
 historical board diff: removed members, project-field changes and draft issues

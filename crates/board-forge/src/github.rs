@@ -1056,11 +1056,12 @@ impl<T: Transport> GitHub<T> {
     pub fn changes(
         &self,
         since: time::OffsetDateTime,
+        until: Option<time::OffsetDateTime>,
         operator: Option<&str>,
         public_only: bool,
     ) -> Result<Changes> {
         let (id, _, _) = self.schema()?;
-        changes::read(&self.diagnostic(), &id, since, operator, public_only)
+        changes::read(&self.diagnostic(), &id, since, until, operator, public_only)
     }
 
     /// Explicit operator publication, not delegated output application.
@@ -1082,20 +1083,19 @@ impl<T: Transport> GitHub<T> {
         }
         let (id, _, _) = self.schema()?;
         let generated;
-        let body =
-            match body {
-                Some(body) => body,
-                None => {
-                    let diagnostic = self.diagnostic();
-                    let since = match changes::last_update(&diagnostic, &id)? {
-                        Some(since) => since,
-                        None => time::OffsetDateTime::now_utc() - changes::FIRST_WINDOW,
-                    };
-                    generated = changes::read(&diagnostic, &id, since, operator, false)?
-                        .status_body(None, &BTreeMap::new(), STATUS_BODY_LIMIT)?;
-                    &generated
-                }
-            };
+        let body = match body {
+            Some(body) => body,
+            None => {
+                let diagnostic = self.diagnostic();
+                let since = match changes::last_update(&diagnostic, &id)? {
+                    Some(since) => since,
+                    None => time::OffsetDateTime::now_utc() - changes::FIRST_WINDOW,
+                };
+                generated = changes::read(&diagnostic, &id, since, None, operator, false)?
+                    .status_body(None, &BTreeMap::new(), STATUS_BODY_LIMIT)?;
+                &generated
+            }
+        };
         validate_status_body(body)?;
         let data = self.diagnostic().graphql(
             "mutation($project:ID!,$status:ProjectV2StatusUpdateStatus!,$body:String!){createProjectV2StatusUpdate(input:{projectId:$project,status:$status,body:$body}){statusUpdate{id body status}}}",

@@ -116,6 +116,9 @@ pub struct Bots {
 #[derive(Debug, Serialize)]
 pub struct Changes {
     pub since: String,
+    /// The window's end, if it has one; otherwise it runs to the read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
     #[serde(flatten)]
     pub sections: BTreeMap<Section, Vec<Line>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -150,15 +153,27 @@ pub fn last_update(t: &impl Transport, project: &str) -> Result<Option<OffsetDat
 /// The project's changes since `since`: its items, then a search of each
 /// covered repository, all within one request budget. New pull requests
 /// outside the board are listed when the token's viewer or `operator` wrote
-/// them. With `public_only`, nothing of a private repository is.
+/// them. With `public_only`, nothing of a private repository is. With
+/// `until`, the window ends there rather than at the read.
 pub fn read(
     t: &impl Transport,
     project: &str,
     since: OffsetDateTime,
+    until: Option<OffsetDateTime>,
     operator: Option<&str>,
     public_only: bool,
 ) -> Result<Changes> {
+    ensure!(
+        until.is_none_or(|until| until > since),
+        "the window must end after it starts"
+    );
     let since = format_time(since)?;
+    let until = until.map(format_time).transpose()?;
+    // GitHub's search takes a closed range of times, or an open end.
+    let range = match &until {
+        Some(until) => format!("{since}..{until}"),
+        None => format!(">={since}"),
+    };
     let budget = ReadBudget::new(t, SNAPSHOT_REQUEST_LIMIT);
     let viewer = budget.graphql(VIEWER_QUERY, json!({}))?;
     let mut authors = BTreeSet::from([text(&viewer["viewer"], "login")?.to_ascii_lowercase()]);
@@ -184,7 +199,7 @@ pub fn read(
             let (found, complete) = connection(
                 &budget,
                 SEARCH_QUERY,
-                json!({"q": format!("repo:{repo} is:pr {qualifier}:>={since}")}),
+                json!({"q": format!("repo:{repo} is:pr {qualifier}:{range}")}),
                 "/search",
             )?;
             ensure!(complete, "incomplete pull request search in {repo}");
@@ -196,7 +211,7 @@ pub fn read(
     } else {
         searched
     };
-    classify(&items, &searched, &since, &authors)
+    classify_window(&items, &searched, &since, until.as_deref(), &authors)
 }
 
 /// Whether a repository, as the queries read it, is public. A visibility
@@ -325,11 +340,29 @@ pub fn classify(
     since: &str,
     authors: &BTreeSet<String>,
 ) -> Result<Changes> {
+    classify_window(items, searched, since, None, authors)
+}
+
+/// [`classify`] in a window that ends at `until`, when given: what happened
+/// after it is as if it had not happened yet. Labels are read as they are
+/// now, so a hold released after the end may already show as released.
+pub fn classify_window(
+    items: &[Value],
+    searched: &[Value],
+    since: &str,
+    until: Option<&str>,
+    authors: &BTreeSet<String>,
+) -> Result<Changes> {
     let cutoff = parse_time(since)?;
+    let end = until.map(parse_time).transpose()?;
+    // Whether `field` is a time in the window.
     let after = |content: &Value, field: &str| -> Result<bool> {
         match &content[field] {
             Value::Null => Ok(false),
-            Value::String(at) => Ok(parse_time(at)? > cutoff),
+            Value::String(at) => {
+                let at = parse_time(at)?;
+                Ok(at > cutoff && end.is_none_or(|end| at <= end))
+            }
             _ => bail!("invalid GitHub {field}"),
         }
     };
@@ -410,9 +443,19 @@ pub fn classify(
             && content["merged"] == true
             && after(content, "mergedAt")?;
         let bot = by_bot(content);
+        // Open at the window's end: now, or, in a window that ends, not yet
+        // merged or closed then, whatever it is now.
+        let open = match end {
+            None => content["state"] == "OPEN",
+            Some(end) => match &content["closedAt"] {
+                Value::Null => true,
+                Value::String(at) => parse_time(at)? > end,
+                _ => bail!("invalid GitHub closedAt"),
+            },
+        };
         let section = if merged {
             Section::Landed
-        } else if content["state"] == "OPEN" && after(content, "createdAt")? {
+        } else if open && after(content, "createdAt")? {
             Section::Opened
         } else {
             continue;
@@ -469,6 +512,7 @@ pub fn classify(
     }
     Ok(Changes {
         since: since.to_owned(),
+        until: until.map(str::to_owned),
         sections,
         bots,
         repositories: covered(items),
@@ -818,7 +862,10 @@ impl Changes {
             head.push(format!("{}\n", linkify(summary.trim(), &resolve, &known)));
         }
         if empty {
-            head.push(format!("No changes since {}\n", self.since));
+            head.push(match &self.until {
+                Some(until) => format!("No changes from {} to {until}\n", self.since),
+                None => format!("No changes since {}\n", self.since),
+            });
         }
         loop {
             let mut parts = head.clone();

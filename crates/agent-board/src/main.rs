@@ -88,6 +88,9 @@ enum Command {
         /// Start of the window, RFC 3339 (such as 2026-10-23T00:00:00Z).
         #[arg(long)]
         since: String,
+        /// End of the window, RFC 3339; without it, the window runs to now.
+        #[arg(long)]
+        until: Option<String>,
         /// Output format.
         #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
         format: String,
@@ -665,6 +668,7 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Command::Changes {
             since,
+            until,
             format,
             public_only,
             max_chars,
@@ -680,6 +684,10 @@ fn execute(cli: Cli) -> Result<()> {
             );
             let changes = github(&cli)?.changes(
                 board_forge::changes::parse_time(since)?,
+                until
+                    .as_deref()
+                    .map(board_forge::changes::parse_time)
+                    .transpose()?,
                 configured_operator(&cli)?.as_deref(),
                 *public_only,
             )?;

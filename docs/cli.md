@@ -155,6 +155,7 @@ agent-board changes [OPTIONS] --since <SINCE>
 Options:
 
 - `--since <SINCE>`: Start of the window, RFC 3339 (such as 2026-10-23T00:00:00Z)
+- `--until <UNTIL>`: End of the window, RFC 3339; without it, the window runs to now
 - `--format <FORMAT>`: Output format (possible values: `markdown`, `json`) (default: `markdown`)
 - `--public-only`: Leave out issues and pull requests of private repositories, for a list that will be published
 - `--max-chars <N>`: Trim the Markdown to at most N characters as a generated status update is trimmed: the longest sections lose their last lines first, each ending with `+K more`
