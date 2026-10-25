@@ -44,12 +44,22 @@ reproducible. Every command and flag is in the [CLI reference](cli.md).
 
 ## Connect one lane
 
-1. **Choose the identities.** A target repository, a trusted caller repository
-   that holds the dispatch workflow, its bounds and agent-board's configuration,
-   and an existing organization Project v2. Each is a separate identity; none is
-   provisioned for you by an existing deployment.
+A deployment is configuration on a caller repository's protected default
+branch plus [workflow callers](#pinned-callers), each of which builds
+agent-board at a pinned, reviewed revision and runs one subcommand. No
+agent-board code is copied into the caller or resynced from another
+deployment. Two steps below still copy workflow files from elsewhere, the
+dispatch caller (step 2) and the review caller (step 4); each says so.
 
-2. **Prove model-free dispatch first.** Follow agentic-job's
+1. **Choose the identities.** A target repository, a trusted caller repository
+   that holds the dispatch workflow, its bounds, agent-board's configuration
+   and the callers, and an existing organization Project v2. Each is a
+   separate identity; none is provisioned for you by an existing deployment.
+
+2. **Prove model-free dispatch first.** This step still copies a workflow: the
+   caller needs its own dispatch workflow, which calls a reusable agentic-job
+   workflow (directly, or through an organization wrapper), with its bounds
+   and the profile of each kind beside it. Follow agentic-job's
    [ten-minute scripted trial](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md#ten-minute-scripted-trial):
    copy its dispatch workflow and bounds into the caller, pin the reusable
    workflow to a reviewed commit, set exact `repos` and keep `bases = ["main"]`.
@@ -65,9 +75,13 @@ reproducible. Every command and flag is in the [CLI reference](cli.md).
    and [broker admission](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/inference.md#which-workflows-a-broker-admits),
    matching admission to the identity that calls the broker.
 
-4. **Install review independently.** Follow agentic-job's review
+4. **Install review independently.** This step also still copies a workflow:
+   each reviewed repository needs its own review caller and its bounds and
+   task files. Follow agentic-job's review
    [Another repository](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md#another-repository)
-   and [Configuration](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md#configuration).
+   and [Configuration](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/review.md#configuration);
+   [actions#129](https://github.com/cgwalters-forge/actions/issues/129) plans
+   one organization-wide review workflow instead.
    Choose merge policy separately: an agent verdict is not human authorization.
 
 5. **Provision and read the board before writes.** Pre-create the Status
@@ -90,18 +104,91 @@ reproducible. Every command and flag is in the [CLI reference](cli.md).
 6. **Preview a plan, then wire scheduling deliberately.** Use
    [job-plan dispatch](job-plans.md#dispatch), starting with
    `dispatch ISSUE --dry-run`; apply needs a writer's user token and records the
-   plan before dispatching. Write the caller's `agent-board.json` on its
+   plan before dispatching. Write the callers' configuration on the caller's
    protected default branch: owner and project, exact repository lists, the
    dispatch caller and the identities, never from dispatcher-set inputs. Every
-   option ships off; [pull request follow-up](poll.md#configuration) lists them.
-   Audit dispatch and fix bounds and pools before enabling a scheduled applier,
-   and never run two appliers against one board.
+   option ships off; [pull request follow-up](poll.md#configuration) and the
+   [pass configuration](pass.md#one-configuration-file) list them. Add the
+   [callers](#pinned-callers) one at a time, each previewing before it
+   applies. Audit dispatch and fix bounds and pools before enabling a scheduled
+   applier, and never run two appliers against one board.
 
 Operator-only work, which no agent and no guide can do: authorize the network
 identity and its ACLs, admit the specific repository and workflow identities and
 finite budgets at the broker, keep model credentials only at the broker, and
 provision the protected apply, reconcile and live-test secrets with effective
 Projects access.
+
+### Pinned callers
+
+Each caller is a scheduled or dispatched workflow in the caller repository.
+It checks out the caller's default branch for its configuration, builds
+agent-board at a full commit reviewed in the caller repository (never a
+branch, since the binary then runs with a write token; the build step itself
+gets no token), and runs one subcommand, for example:
+
+```sh
+[[ $AGENT_BOARD_REV =~ ^[0-9a-f]{40}$ ]]
+cargo install --locked --root "$RUNNER_TEMP/agent-board" \
+  --git https://github.com/cgwalters-forge/agent-board --rev "$AGENT_BOARD_REV" agent-board
+"$RUNNER_TEMP/agent-board/bin/agent-board" pass --config CONFIG
+```
+
+Moving a caller to a newer agent-board is a reviewed edit of its pinned
+revision. Configuration is read only from files on the default branch; a
+caller may add a value from a repository variable, such as the broker's
+address, before passing the file on. The caller workflows themselves are
+written per deployment: copying another deployment's means replacing its
+names, secrets and defaults, and resyncing the steps around each subcommand
+by hand.
+
+> **Example caller, not a requirement:** cgwalters-forge/tracker at
+> [`bb8363a`][tracker]. The paths and file names are that deployment's.
+> [tracker#890](https://github.com/cgwalters-forge/tracker/issues/890) plans
+> to move the deployment to cgwalters-forge/infra, so the caller repository
+> may change.
+>
+> - [`poll.yml`][poll], every ten minutes: `agent-board pass --config .github/pass.json`
+>   ([pass](pass.md)) with `--max-dispatch`, `--max-writes` and
+>   `--max-status-changes` caps; a scheduled pass adds `--apply` only once a
+>   repository variable enables it.
+> - [`release-train.yml`][release-train], hourly: `agent-board release-train --config .github/release-train/config.json`
+>   ([release train](release-train.md)), off until a repository variable
+>   enables it.
+> - [`supervisor.yml`][supervisor], on its own crons, by dispatch and on the
+>   operator's comments on its requests issue, with this deployment's
+>   defaults for the operator and that issue:
+>   `agent-board supervise` `due`, `health`, `repeat`, `trigger`, `compose`,
+>   `preview` and `execute` ([supervisor](supervisor-requests.md)), reading
+>   `.github/poll/agent-board.json`, `.github/supervisor/config.json`,
+>   `.github/usage/config.json` and `.github/agentic-job/pools.json`; its
+>   agent job runs the dispatch wrapper with `.github/agentic-job/supervisor.toml`.
+> - [`session.yml`][session], by dispatch: `agent-board supervise session`,
+>   reading `.github/poll/agent-board.json`, `.github/supervisor/config.json`,
+>   `.github/agentic-job/session.json`, `.github/agentic-job/profiles/session.md`
+>   and `.github/agentic-job/pools.json`; its agent job runs the dispatch
+>   wrapper with `.github/agentic-job/dispatch.toml` and `hosted.toml`.
+> - [`broker-probe.yml`][broker-probe], every 15 minutes: `agent-board broker probe --config .github/broker/config.json --apply`
+>   ([broker probe](broker-probe.md)), with the broker's address added, off
+>   until a repository variable enables it.
+>
+> Two parts of that caller are still copies rather than configuration:
+> [`dispatch.yml`][dispatch], which calls cgwalters-forge/actions'
+> `cgwalters-agentic-job.yml` wrapper, with its bounds and profiles under
+> `.github/agentic-job` (step 2), and [`review.yml`][review] with
+> `workflow/review.*` (step 4). Its callers also build through a
+> `just build-agent-board` recipe in tracker's own Justfile, which runs the
+> check and `cargo install` above (taking the source from `agent-board.json`);
+> a deployment does not need that recipe.
+
+[tracker]: https://github.com/cgwalters-forge/tracker/tree/bb8363a8cc856cbdb5538b1089d3d175385a3a91
+[poll]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/poll.yml
+[release-train]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/release-train.yml
+[supervisor]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/supervisor.yml
+[session]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/session.yml
+[broker-probe]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/broker-probe.yml
+[dispatch]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/dispatch.yml
+[review]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/review.yml
 
 ## Repeat a staging trial
 
@@ -129,7 +216,8 @@ unverified, and remove only scratch objects the trial created.
 
 This repository's [reconcile.yml](../.github/workflows/reconcile.yml) is a
 staging example of applying `reconcile plan` repairs from CI; the pass's
-Status stage ([pass](pass.md#order-and-effects)) replaces it at cutover.
+Status stage ([pass](pass.md#order-and-effects)) replaces it at cutover, so a
+deployment does not copy it: once its pass caller runs, that derives Status.
 Every ten minutes on main it reads a staging board with a read-only token,
 writes `reconcile plan --emit` proposals as an artifact, and hands them to
 agentic-job's independent check and apply, bounded by [reconcile.toml](../.github/agentic-job/reconcile.toml) to
