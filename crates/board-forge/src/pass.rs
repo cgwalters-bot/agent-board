@@ -53,7 +53,8 @@ pub(super) const OBSERVED_STALE_SECONDS: i64 = 30 * 60 * 60;
 /// differ a little: a later one is a mistake, never a fresh reading.
 pub(super) const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 /// Requests a start is left before its first write, enough for every read
-/// and write after it: the triage plan's post, the plan protocol's two reads
+/// and write after it: the triage plan's post, or a body plan's second read
+/// of the body and the comments and its post, the plan protocol's two reads
 /// of the comments (10 pages each), its account read, the overlap check (at
 /// most 14), the record, the dispatch (two tries) and its note, with room for
 /// a stack's reads. A start never runs out of budget between claim and run.
@@ -102,6 +103,12 @@ const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 const ASK_VERDICTS: &[&str] = &["done", "needs-design", "needs-operator"];
 /// What a triage plan posted again by [`Scheduler::follow_up`] says first.
 const AGAIN: &str = "The board pass asks a triage run to plan this issue again.";
+/// How many of the board's first Priority options (P0 and P1) an issue's
+/// own body plan is taken for, with [`Config::body_plans`].
+const BODY_PLAN_PRIORITIES: usize = 2;
+/// What the copy of an issue's body plan posted by [`Scheduler::consider`]
+/// says first.
+const BODY_PLAN: &str = "The board pass takes this issue's plan from its body.";
 
 const FACTS: &str = r#"fragment Facts on Issue {
   number state createdAt
@@ -155,6 +162,19 @@ const FRESH_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
 }
 "#;
 
+/// An issue's own text, as a comment's is read ([`plan::comment`]), for the
+/// plan in its body ([`Config::body_plans`]).
+const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { issue(number: $number) {
+    url body createdAt lastEditedAt author { login } editor { login }
+  } }
+}
+"#;
+
+/// An issue's body plan ([`Scheduler::body_plan`]): the plan, its JSON block
+/// and the body it was read from.
+type BodyPlan = (plan::JobPlan, Value, plan::Comment);
+
 /// An issue's open closing pull requests, past the ten [`FACTS`] reads.
 const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
@@ -197,6 +217,11 @@ pub struct Config {
     /// ([`Scheduler::follow_up`]).
     #[serde(default)]
     pub triage_follow_up_days: u64,
+    /// Off unless set: a P0 or P1 issue with no plan comment whose body
+    /// holds a writer's plan is started by that plan, not triaged
+    /// ([`Scheduler::body_plan`]).
+    #[serde(default)]
+    pub body_plans: bool,
     #[serde(default)]
     pub pools: Pools,
     pub usage: Option<Usage>,
@@ -2010,26 +2035,38 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let issue = &facts.issue;
         let comments = plan::issue_comments(&self.client, issue)?;
-        if plan::no_plan(&comments, &writers) {
-            let intro = "The board pass asks a triage run to plan this issue.";
-            return self.triage(issue, intro, (snapshot, target, slots));
-        }
-        let (plan, from) = match plan::newest_plan(&comments, &writers) {
-            Ok(found) => found,
-            Err(error) => return Ok(Step::Hold(format!("its newest plan is invalid: {error:#}"))),
-        };
-        let id = plan::plan_id(from)?;
-        if let Some((_, record)) =
-            batch::held(&self.client, &comments, &writers, &id, issue)?.first()
-        {
-            if plan.kind == "triage" && config.triage_follow_up_days > 0 {
-                return self.follow_up(issue, &comments, record, (snapshot, target, slots));
+        // The body's plan, posted as a comment at its start, which the plan
+        // protocol then dispatches and records as any other.
+        let (plan, id, body) = if plan::no_plan(&comments, &writers) {
+            match self.body_plan(&facts, board)? {
+                None => {
+                    let intro = "The board pass asks a triage run to plan this issue.";
+                    return self.triage(issue, intro, (snapshot, target, slots));
+                }
+                Some(Err(why)) => return Ok(Step::Hold(why)),
+                Some(Ok((plan, block, read))) => (plan, "body".to_owned(), Some((block, read))),
             }
-            return Ok(Step::Hold(format!(
-                "plan {id} was dispatched already, {}",
-                record.url
-            )));
-        }
+        } else {
+            let (plan, from) = match plan::newest_plan(&comments, &writers) {
+                Ok(found) => found,
+                Err(error) => {
+                    return Ok(Step::Hold(format!("its newest plan is invalid: {error:#}")));
+                }
+            };
+            let id = plan::plan_id(from)?;
+            if let Some((_, record)) =
+                batch::held(&self.client, &comments, &writers, &id, issue)?.first()
+            {
+                if plan.kind == "triage" && config.triage_follow_up_days > 0 {
+                    return self.follow_up(issue, &comments, record, (snapshot, target, slots));
+                }
+                return Ok(Step::Hold(format!(
+                    "plan {id} was dispatched already, {}",
+                    record.url
+                )));
+            }
+            (plan, id, None)
+        };
         if plan.kind != "implement" {
             return Ok(Step::Hold(format!(
                 "plan {id} is for {}, which is dispatched by hand",
@@ -2105,8 +2142,24 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(step) = self.recheck(slots, issue, &dest, target)? {
             return Ok(step);
         }
+        // A body plan is dispatched as the copy just posted, and only while
+        // that copy is the issue's newest plan.
+        let chosen = match &body {
+            None => id,
+            Some((block, read)) => {
+                if let Some(why) = self.body_moved(issue, read)? {
+                    return Ok(Step::Hold(why));
+                }
+                match self.post_plan(issue, BODY_PLAN, block) {
+                    Ok(posted) => posted,
+                    Err(error) => {
+                        return Ok(Step::Failed(format!("{line} failed: {error:#}"), holds));
+                    }
+                }
+            }
+        };
         let scheduled = Scheduled {
-            plan: Some(&id),
+            plan: Some(&chosen),
             pool: Some(&pool),
             strict: true,
         };
@@ -2325,15 +2378,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "pool": pool,
             "brief": brief,
         });
-        let body = format!(
-            "{intro}\n\n```{PLAN_FENCE}\n{plan:#}\n```\n\n{}",
-            crate::Footer::default()
-        );
-        let comments = format!(
-            "{API_ROOT}repos/{}/issues/{}/comments",
-            issue.repository, issue.number
-        );
-        if let Err(error) = plan::send(&self.client, "POST", &comments, &json!({"body": body}), 0) {
+        if let Err(error) = self.post_plan(issue, intro, &plan) {
             return Ok(Step::Failed(format!("{line} failed: {error:#}"), holds));
         }
         // No overlap check: a triage run changes no files.
@@ -2353,6 +2398,99 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             options,
         );
         Ok(self.dispatched(line, holds, done))
+    }
+
+    /// Posts `plan` on `issue` after `intro`, as the plan writer the pass's
+    /// token is, and returns the posted plan's id ([`plan::plan_id`]).
+    fn post_plan(&self, issue: &ItemRef, intro: &str, plan: &Value) -> Result<String> {
+        let body = format!(
+            "{intro}\n\n```{PLAN_FENCE}\n{plan:#}\n```\n\n{}",
+            crate::Footer::default()
+        );
+        let comments = format!(
+            "{API_ROOT}repos/{}/issues/{}/comments",
+            issue.repository, issue.number
+        );
+        let (_, posted) = plan::send(&self.client, "POST", &comments, &json!({"body": body}), 0)?;
+        let field = |key: &str| {
+            posted[key]
+                .as_str()
+                .with_context(|| format!("posted plan has no {key}"))
+        };
+        let created = OffsetDateTime::parse(field("created_at")?, &Rfc3339)
+            .context("posted plan's created_at")?;
+        plan::plan_id(&plan::Comment {
+            url: field("html_url")?.into(),
+            body,
+            author: None,
+            edited: false,
+            editor: None,
+            changed: created,
+        })
+    }
+
+    /// With [`Config::body_plans`], the plan an issue with no plan comment
+    /// holds in its body, with its JSON block and the body as read: none for an issue outside
+    /// the board's first [`BODY_PLAN_PRIORITIES`] Priority options, or whose
+    /// body holds no plan block by a writer, which leaves it to triage. The
+    /// body is weighed as a plan comment is ([`plan::newest_plan`]), so one
+    /// last edited by someone else, or an invalid plan, holds the issue.
+    fn body_plan(
+        &self,
+        facts: &Facts,
+        board: &BoardRead,
+    ) -> Result<Option<std::result::Result<BodyPlan, String>>> {
+        let top = &board.options[..board.options.len().min(BODY_PLAN_PRIORITIES)];
+        if !self.config.body_plans || !top.iter().any(|p| facts.priority.as_ref() == Some(p)) {
+            return Ok(None);
+        }
+        let body = [self.body(&facts.issue)?];
+        let writers = self.writers();
+        if !plan::has_fence(&body[0].body, PLAN_FENCE) || plan::no_plan(&body, &writers) {
+            return Ok(None);
+        }
+        let plan = match plan::newest_plan(&body, &writers) {
+            Ok((plan, _)) => plan,
+            Err(error) => return Ok(Some(Err(format!("its body's plan is invalid: {error:#}")))),
+        };
+        let block = plan::fenced_json(&body[0].body, PLAN_FENCE)?.context("plan fence vanished")?;
+        let [read] = body;
+        Ok(Some(Ok((plan, block, read))))
+    }
+
+    /// `issue`'s own text, as [`plan::comment`] reads a comment.
+    fn body(&self, issue: &ItemRef) -> Result<plan::Comment> {
+        let (owner, name) = issue.repository.split_once('/').context("repository")?;
+        let data = self.client.graphql(
+            BODY_QUERY,
+            json!({"owner": owner, "name": name, "number": issue.number}),
+        )?;
+        let node = data
+            .pointer("/repository/issue")
+            .filter(|n| n.is_object())
+            .with_context(|| format!("{} is not an issue", issue.display()))?;
+        plan::comment(node)
+    }
+
+    /// Why a body plan [`Self::body_plan`] read as `read` may no longer be
+    /// copied: its body changed, or a plan comment, which takes precedence,
+    /// appeared since. Read just before the copy is posted, since the copy
+    /// then outranks the body.
+    fn body_moved(&self, issue: &ItemRef, read: &plan::Comment) -> Result<Option<String>> {
+        let now = self.body(issue)?;
+        let same = now.body == read.body
+            && now.author == read.author
+            && (now.edited, &now.editor, now.changed) == (read.edited, &read.editor, read.changed);
+        if !same {
+            return Ok(Some("its body changed since the pass read its plan".into()));
+        }
+        let comments = plan::issue_comments(&self.client, issue)?;
+        if !plan::no_plan(&comments, &self.writers()) {
+            return Ok(Some(
+                "a plan comment appeared since the pass read its body".into(),
+            ));
+        }
+        Ok(None)
     }
 }
 

@@ -116,6 +116,8 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
 - a `reason` holding an `` ```agent-board `` fence or a `<!--` marker: it is
   posted as a comment by the applier, which may also be a plan writer, where it
   would count as a plan or a dispatch record;
+- a `body` holding an `` ```agent-board-plan `` fence: the pass's `bodyPlans`
+  would take it as the issue's plan, unchecked against the issue it names;
 - more than 20 actions, titles over 256 characters, bodies over 60,000 and
   reasons over 4,000, and empty text.
 

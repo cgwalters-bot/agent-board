@@ -969,6 +969,8 @@ fn replay_scenarios() {
 /// read after a dispatch record is posted fails instead. An issue read again
 /// before a start is its board item's facts. `late` edits each answer, by its
 /// request, once a run is dispatched: what changed since the board was read.
+/// `racing` edits each GraphQL answer, by its query, before then: what
+/// changes while the pass reads.
 struct Forge {
     replay: Replay,
     added: RefCell<BTreeMap<(String, u64), Vec<Value>>>,
@@ -978,6 +980,7 @@ struct Forge {
     ids: Cell<u64>,
     login: &'static str,
     late: Option<Late>,
+    racing: Option<Late>,
     /// Other runs of the pass's own workflow in progress ([`own`]).
     passes: Vec<Value>,
 }
@@ -1016,6 +1019,7 @@ impl Forge {
             ids: Cell::new(9_000_000_000),
             login: "cgwalters-bot",
             late: None,
+            racing: None,
             passes: vec![],
         }
     }
@@ -1110,7 +1114,10 @@ impl Forge {
                     "id": id, "url": html_url, "body": text, "createdAt": created,
                     "lastEditedAt": null, "author": {"login": "cgwalters-bot"}, "editor": null,
                 }));
-            return Ok((201, json!({"id": id, "html_url": html_url})));
+            return Ok((
+                201,
+                json!({"id": id, "html_url": html_url, "created_at": created}),
+            ));
         }
         if method == "PATCH" {
             let edited: u64 = path.rsplit('/').next().unwrap_or_default().parse()?;
@@ -1197,6 +1204,13 @@ impl Transport for Forge {
                     .cloned()
                     .unwrap_or_default(),
             );
+        }
+        if let Some(racing) = self
+            .racing
+            .as_ref()
+            .filter(|_| self.dispatches().is_empty())
+        {
+            racing(query, &mut data);
         }
         Ok(data)
     }
@@ -2012,6 +2026,24 @@ fn implement_waits_when_its_overlap_check_cannot_read() {
     assert_eq!(report.failures, 0);
 }
 
+/// The text of tracker#446 for the overlap check, which names no path:
+/// nothing to overlap.
+fn unpathed(replay: &mut Replay) {
+    let mut text = replay
+        .requests
+        .iter()
+        .find(|e| {
+            let request = e["request"].to_string();
+            request.contains(r#""number":527"#) && !request.contains("after")
+        })
+        .unwrap()
+        .clone();
+    text["request"]["variables"]["number"] = 446.into();
+    text["answer"]["data"]["repository"]["issue"] =
+        json!({"title": "Staging", "body": "A staging organization."});
+    replay.requests.push(text);
+}
+
 /// A plan that names no pool is sent with the one pace chose; the dispatch
 /// record and the run are the plan protocol's.
 #[test]
@@ -2019,21 +2051,7 @@ fn implement_takes_the_paced_pool() {
     let forge = {
         let mut forge = Forge::new(None, false);
         implement_plan(&mut forge.replay);
-        // The issue's text, which names no path: nothing to overlap.
-        let mut text = forge
-            .replay
-            .requests
-            .iter()
-            .find(|e| {
-                let request = e["request"].to_string();
-                request.contains(r#""number":527"#) && !request.contains("after")
-            })
-            .unwrap()
-            .clone();
-        text["request"]["variables"]["number"] = 446.into();
-        text["answer"]["data"]["repository"]["issue"] =
-            json!({"title": "Staging", "body": "A staging organization."});
-        forge.replay.requests.push(text);
+        unpathed(&mut forge.replay);
         forge
     };
     let report = apply(&forge, &config(json!({"wip": 3})));
@@ -2052,6 +2070,202 @@ fn implement_takes_the_paced_pool() {
     assert_eq!(sent["inputs"]["kind"], "implement");
     assert_eq!(sent["inputs"]["pool"], "claude");
     assert_eq!(sent["ref"], "main");
+}
+
+/// With `bodyPlans` (agent-board#342), a P0 or P1 issue with no plan comment
+/// whose body holds a writer's plan is started by it, once: a copy posted as
+/// its plan comment, then the plan protocol's record and run. A body with no
+/// plan block or by someone else, a lower Priority or the setting off leave
+/// it to triage; a body someone else edited last, or an invalid plan, hold it.
+#[test]
+fn body_plans_start_a_p0_or_p1_issue() {
+    let bot = "cgwalters-bot";
+    let block = body_plan_block();
+    let triage = "start triage cgwalters-forge/tracker#446 pool=claude record=";
+    let implement = "start implement cgwalters-forge/tracker#446 plan=body pool=claude record=";
+    let invalid = "hold cgwalters-forge/tracker#446: its body's plan is invalid: ";
+    // Name, bodyPlans, the issue's Priority, its body, the body's author and
+    // editor (empty for one GitHub cannot name), and the issue's line.
+    type Case<'a> = (
+        &'a str,
+        bool,
+        &'a str,
+        String,
+        &'a str,
+        Option<&'a str>,
+        String,
+    );
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("the bot's plan on P0", true, "P0", block.clone(), bot, None, implement.into()),
+        ("the operator's on P1, edited by the bot", true, "P1", block.clone(), "cgwalters", Some(bot), implement.into()),
+        ("the setting off", false, "P0", block.clone(), bot, None, triage.into()),
+        ("P2", true, "P2", block.clone(), bot, None, triage.into()),
+        ("no plan block", true, "P0", "Write the staging design down.".into(), bot, None, triage.into()),
+        ("a visitor's plan", true, "P0", block.clone(), "visitor", None, triage.into()),
+        ("a plan a visitor edited", true, "P0", block.clone(), bot, Some("visitor"),
+            format!("{invalid}newest plan https://github.com/cgwalters-forge/tracker/issues/446 was last edited by visitor")),
+        ("a plan an unnamed account edited", true, "P0", block.clone(), bot, Some(""),
+            format!("{invalid}newest plan https://github.com/cgwalters-forge/tracker/issues/446 was last edited by an unidentified account")),
+        ("an invalid plan", true, "P0", format!("```{PLAN_FENCE}\n{{}}\n```\n"), bot, None,
+            format!("{invalid}newest plan https://github.com/cgwalters-forge/tracker/issues/446: plan has no schema")),
+        // Then held as a plan comment would be.
+        ("a research plan", true, "P0", block.replace("implement", "research"), bot, None,
+            "hold cgwalters-forge/tracker#446: plan body is for research, which is dispatched by hand".into()),
+        ("a plan outside the work repositories", true, "P0", block.replace("cgwalters-forge/tracker", "o/r"), bot, None,
+            "hold cgwalters-forge/tracker#446: its plan's o/r#446 is not in a work repository".into()),
+    ];
+    for (name, on, priority, body, author, editor, expected) in cases {
+        let forge = body_plan_forge(priority, &body, author, editor);
+        let config = config(json!({"bodyPlans": on}));
+        let first = apply(&forge, &config);
+        assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
+        let line = first.lines.iter().find(|l| l.contains("tracker#446"));
+        assert!(
+            line.is_some_and(|l| l.starts_with(&expected)),
+            "{name}: no line {expected:?} in {:#?}",
+            first.lines
+        );
+        if expected.starts_with("hold") {
+            assert!(forge.writes.borrow().is_empty(), "{name}");
+            continue;
+        }
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        assert_eq!(comments.len(), 2, "{name}: {comments:#?}");
+        let kind = if expected == implement {
+            "implement"
+        } else {
+            "triage"
+        };
+        assert!(
+            comments[0].contains(&format!("\"kind\": \"{kind}\"")),
+            "{name}: {}",
+            comments[0]
+        );
+        assert_eq!(
+            comments[0].starts_with(BODY_PLAN),
+            kind == "implement",
+            "{name}"
+        );
+        assert!(
+            comments[1].starts_with("<!-- agent-board-dispatch: "),
+            "{name}"
+        );
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = (writes.iter())
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap();
+        assert_eq!(sent["inputs"]["kind"], kind, "{name}");
+        assert_eq!(sent["inputs"]["pool"], "claude", "{name}");
+        drop(writes);
+        // The copy is the issue's plan now, recorded once.
+        let second = apply(&forge, &config);
+        assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        assert_eq!(forge.dispatches().len(), 1, "{name}: {:#?}", second.lines);
+    }
+}
+
+/// An issue body holding the bot's implement plan for tracker#446.
+fn body_plan_block() -> String {
+    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,
+        "kind": "implement", "runner": "hosted", "brief": "Write the staging design down."});
+    format!("Some context.\n\n```{PLAN_FENCE}\n{plan}\n```\n")
+}
+
+/// The recording with only tracker#446, at `priority`, whose `body` is by
+/// `author` and last edited by `editor` (empty for one GitHub cannot name).
+fn body_plan_forge(priority: &str, body: &str, author: &str, editor: Option<&str>) -> Forge {
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    unpathed(&mut forge.replay);
+    for entry in &mut forge.replay.requests {
+        let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+            if node["content"]["number"] == 446 {
+                node["priority"] = json!({"name": priority});
+            }
+        }
+    }
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
+    let issue = json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446",
+        "body": body, "createdAt": "2026-10-20T00:00:00Z",
+        "lastEditedAt": editor.map(|_| "2026-10-21T00:00:00Z"),
+        "author": {"login": author},
+        "editor": editor.filter(|e| !e.is_empty()).map(|e| json!({"login": e}))});
+    forge
+        .replay
+        .requests
+        .push(json!({"request": graphql_key(BODY_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": issue}}}}));
+    forge
+}
+
+/// A body plan is copied only as it was read, with still no plan comment,
+/// and dispatched only while the copy is the newest plan: a plan written in
+/// between, which the pass did not check, starts nothing.
+#[test]
+fn body_plans_refuse_a_plan_changed_while_read() {
+    let block = body_plan_block();
+    // Another writer's plan, for a repository outside the work repositories.
+    let other = json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-1",
+        "body": block.replace("cgwalters-forge/tracker", "o/r"), "createdAt": "2026-12-01T00:00:00Z",
+        "lastEditedAt": null, "author": {"login": "cgwalters"}, "editor": null});
+    let comments = "comments(first: 100";
+    // Name, the query raced, from which of its reads, the edit, and the
+    // line the issue gets and whether the copy was posted.
+    type Edit = fn(&mut Value, &Value);
+    let edited: Edit = |data, _| {
+        let body = &mut data["repository"]["issue"]["body"];
+        *body = json!(body.as_str().unwrap().replace("Write", "Rewrite"));
+    };
+    let planned: Edit = |data, other| {
+        let nodes = data.pointer_mut("/repository/issue/comments/nodes");
+        nodes
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .push(other.clone());
+    };
+    let copied: Edit = |data, other| {
+        let nodes = data.pointer_mut("/repository/issue/comments/nodes");
+        let nodes = nodes.and_then(Value::as_array_mut).unwrap();
+        if nodes
+            .iter()
+            .any(|n| text(n, "/body").starts_with(BODY_PLAN))
+        {
+            nodes.push(other.clone());
+        }
+    };
+    #[rustfmt::skip]
+    let cases: [(&str, &str, usize, Edit, &str, bool); 3] = [
+        ("the body edited", BODY_QUERY, 2, edited,
+            "hold cgwalters-forge/tracker#446: its body changed since the pass read its plan", false),
+        ("a plan comment posted", comments, 2, planned,
+            "hold cgwalters-forge/tracker#446: a plan comment appeared since the pass read its body", false),
+        ("a plan posted after the copy", comments, 1, copied,
+            "start implement cgwalters-forge/tracker#446 plan=body pool=claude failed: the newest plan is 1@2026-12-01T00:00:00Z, not ", true),
+    ];
+    for (name, query, from, edit, expected, posted) in cases {
+        let mut forge = body_plan_forge("P0", &block, "cgwalters-bot", None);
+        let (query, other, reads) = (query.to_owned(), other.clone(), Cell::new(0));
+        forge.racing = Some(Box::new(move |request, data| {
+            if request.contains(&query) {
+                reads.set(reads.get() + 1);
+                if reads.get() >= from {
+                    edit(data, &other);
+                }
+            }
+        }));
+        let report = apply(&forge, &config(json!({"bodyPlans": true})));
+        let line = report.lines.iter().find(|l| l.contains("tracker#446"));
+        assert!(
+            line.is_some_and(|l| l.starts_with(expected)),
+            "{name}: no line {expected:?} in {:#?}",
+            report.lines
+        );
+        assert!(forge.dispatches().is_empty(), "{name}");
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        assert_eq!(comments.len(), usize::from(posted), "{name}: {comments:#?}");
+    }
 }
 
 // ---- Pure logic ----
