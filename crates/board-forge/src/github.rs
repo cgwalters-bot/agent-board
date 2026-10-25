@@ -940,9 +940,20 @@ const BROKER_BYTES: u64 = 256 * 1024;
 const BROKER_SECONDS: u64 = 10;
 
 impl crate::pass::Broker for Client {
-    /// Without the token, which is GitHub's alone; the errors name no
-    /// address, which may be private.
     fn usage(&self, url: &str) -> Result<Value> {
+        self.broker_get(url, "/usage")
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.broker_get(url, "/usage/grant")
+    }
+}
+
+impl Client {
+    /// The broker's answer at `url`, read without the token, which is
+    /// GitHub's alone; the errors name `path`, not the address, which may be
+    /// private.
+    fn broker_get(&self, url: &str, path: &str) -> Result<Value> {
         let mut response = self
             .agent
             .get(url)
@@ -955,17 +966,17 @@ impl crate::pass::Broker for Client {
             .call()
             .map_err(|error| match error {
                 // It would repeat the address.
-                ureq::Error::BadUri(_) => anyhow::anyhow!("GET /usage: invalid address"),
-                error => anyhow::anyhow!("GET /usage: {error}"),
+                ureq::Error::BadUri(_) => anyhow::anyhow!("GET {path}: invalid address"),
+                error => anyhow::anyhow!("GET {path}: {error}"),
             })?;
         let status = response.status().as_u16();
-        ensure!(status == 200, "GET /usage: HTTP status {status}");
+        ensure!(status == 200, "GET {path}: HTTP status {status}");
         response
             .body_mut()
             .with_config()
             .limit(BROKER_BYTES)
             .read_json()
-            .with_context(|| format!("GET /usage: not JSON, or over {BROKER_BYTES} bytes"))
+            .with_context(|| format!("GET {path}: not JSON, or over {BROKER_BYTES} bytes"))
     }
 }
 

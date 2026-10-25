@@ -340,7 +340,7 @@ pub fn read<T: Transport>(client: &T, config: &Config) -> Result<Tree> {
     }
     items.retain(|i| !below.contains(&key(&i.issue)));
     Ok(Tree {
-        weekly_usd: config.budget.as_ref().map(|b| b.weekly_usd),
+        weekly_usd: config.budget.as_ref().and_then(|b| b.weekly_usd),
         epics: items,
     })
 }
