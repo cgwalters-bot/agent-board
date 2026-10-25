@@ -1087,6 +1087,7 @@ fn stages<C: Rest + Transport + Broker>(
         snapshot: None,
         other: None,
         epic_starts: Vec::new(),
+        considered: false,
         probes: BTreeSet::new(),
     };
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
@@ -1124,8 +1125,8 @@ fn default_branch(client: &impl Rest, repo: &str) -> Result<String> {
 /// What one candidate came to.
 enum Step {
     Hold(String),
-    /// Nothing more starts in this pass: why, and whether that is a failure.
-    Stop(String, bool),
+    /// Nothing more starts in this pass: why, and what stopped it.
+    Stop(String, Halt),
     /// A run started, or was sent and may have started: its slot is taken.
     Started(String, Vec<ItemRef>),
     Failed(String, Vec<ItemRef>),
@@ -1133,6 +1134,31 @@ enum Step {
     /// takes the slot it would have had, so the pass reads no further than
     /// it would have without the cap.
     Capped(String),
+}
+
+/// What stopped a pass's starts.
+#[derive(Clone, Copy)]
+enum Halt {
+    /// Every slot is taken.
+    Full,
+    /// Too few requests are left for a start. The rest wait for the next
+    /// pass, as they would for a slot: a failure only when no candidate came
+    /// before, as then the budget let the pass consider nothing.
+    Budget,
+    /// The time bound passed.
+    Time,
+}
+
+impl Halt {
+    /// Whether the stop is a failure, where `earlier` says a candidate was
+    /// considered before it.
+    fn failed(self, earlier: bool) -> bool {
+        match self {
+            Halt::Full => false,
+            Halt::Budget => !earlier,
+            Halt::Time => true,
+        }
+    }
 }
 
 /// What holds a slot or an issue besides the runs a listing shows.
@@ -1196,6 +1222,9 @@ struct Scheduler<'a, C> {
     other: Option<std::result::Result<Option<String>, String>>,
     /// The epics stage 3 started planning runs on.
     epic_starts: Vec<ItemRef>,
+    /// Whether stage 4 has considered a candidate, after which a budget
+    /// stop defers the rest ([`Halt::Budget`]).
+    considered: bool,
     /// The pools stage 1 found may take a run to get a reading
     /// ([`usage::unasked`]), where [`Usage::probe`] is set.
     probes: BTreeSet<String>,
@@ -1375,6 +1404,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             let issue = facts.issue.display();
             let step = self.consider(facts, board, &slots, snapshot, target);
+            let earlier = std::mem::replace(&mut self.considered, true);
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.finishing.set(false);
             let step = match step {
@@ -1390,8 +1420,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.line(format!("hold {issue}: {why}"));
                     continue;
                 }
-                Step::Stop(why, failed) => {
-                    self.report.failures += usize::from(failed);
+                Step::Stop(why, halt) => {
+                    self.report.failures += usize::from(halt.failed(earlier));
                     let left = candidates.len() - n;
                     self.line(format!("{why}; {left} more candidate(s) wait"));
                     free = 0;
@@ -1869,7 +1899,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let active = slots.active(&listed);
         if active >= slots.wip {
             let why = format!("hold wip: {active} of {} runs active", slots.wip);
-            return Ok(Some(Step::Stop(why, false)));
+            return Ok(Some(Step::Stop(why, Halt::Full)));
         }
         busy.extend(slots.busy.clone());
         let writers = self.writers();
@@ -1889,12 +1919,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!(
                 "budget: {left} requests left, fewer than a start may take ({START_REQUESTS})"
             );
-            return Ok(Some(Step::Stop(why, true)));
+            return Ok(Some(Step::Stop(why, Halt::Budget)));
         }
         // These reads were in time, so the start may finish past the bound.
         if Instant::now() > bounds.admit_by {
             let why = format!("time: the pass ran past {PASS_SECONDS_LIMIT} seconds");
-            return Ok(Some(Step::Stop(why, true)));
+            return Ok(Some(Step::Stop(why, Halt::Time)));
         }
         bounds.finishing.set(true);
         Ok(None)

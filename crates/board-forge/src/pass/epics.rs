@@ -1083,8 +1083,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         match step {
             Step::Hold(why) => self.line(format!("hold epic {name}: {why}")),
-            Step::Stop(why, failed) => {
-                self.report.failures += usize::from(failed);
+            Step::Stop(why, halt) => {
+                // Stage 4's candidates come after: none was considered.
+                self.report.failures += usize::from(halt.failed(false));
                 self.line(why);
             }
             Step::Capped(line) => {

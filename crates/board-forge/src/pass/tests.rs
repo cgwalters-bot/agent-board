@@ -1621,6 +1621,56 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
     assert!(started.is_some(), "no limit up to 200 started a run");
 }
 
+/// A budget that runs out once candidates were held and started defers the
+/// rest to the next pass, as a full wip does, rather than failing it
+/// (tracker#908); one too small for the first candidate is still a failure.
+#[test]
+fn apply_defers_the_rest_when_its_budget_runs_out() {
+    let config = config(json!({"wip": 8}));
+    let cases = [
+        (
+            168,
+            "budget: 61 requests left, fewer than a start may take (64); 1 more candidate(s) wait",
+            0,
+        ),
+        (
+            84,
+            "budget: 62 requests left, fewer than a start may take (64); 9 more candidate(s) wait",
+            1,
+        ),
+    ];
+    for (limit, line, failures) in cases {
+        let forge = Forge::new(None, false);
+        let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+        let report = run_within(
+            &forge,
+            &forge,
+            &config,
+            (
+                State::default(),
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.replay.now,
+            ),
+            &Bounds::new(limit, admit_by),
+        )
+        .unwrap();
+        assert_eq!(last_scheduled(&report), line, "limit {limit}");
+        assert_eq!(
+            report.failures, failures,
+            "limit {limit}: {:#?}",
+            report.lines
+        );
+        if failures == 0 {
+            let holds = (report.lines.iter())
+                .filter(|l| l.starts_with("hold cgwalters-forge/"))
+                .count();
+            assert_eq!(holds, 3, "limit {limit}: {:#?}", report.lines);
+            assert_eq!(forge.dispatches().len(), 5, "limit {limit}");
+        }
+    }
+}
+
 /// The operator's implement plan for tracker#446, without a pool.
 fn implement_plan(replay: &mut Replay) {
     let comments = &mut answer(replay, r#""name":"tracker","number":446"#)["data"]["repository"]["issue"]
