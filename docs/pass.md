@@ -370,6 +370,17 @@ issue on a verdict, since no review follows a close. Any other verdict, or
 none, triages the issue again `triageFollowUpDays` after the verdict (or the
 record): at most one triage run per issue in that many days.
 
+With `replanAfterDays` (agent-board#347), an issue whose newest plan is an
+implement plan that was dispatched, whose run is no longer in flight, and that
+is still open with no open bot or operator pull request, is triaged again to
+plan the rest of it, through the same triage run and dispatch-record protocol,
+with no other scheduler marker. It is due `replanAfterDays` after the plan's
+dispatch record last changed: the pass does not read when the run ended, and
+the run-in-flight hold already waits while it runs. Until then the issue is
+held with its due time. The triage posts its own plan, which becomes the
+newest and gets its own record, so each implement run is re-planned at most
+once; once that triage ends, it is handled as any triage above.
+
 With `bodyPlans` (agent-board#342), an issue in the board's first two Priority
 options (P0 and P1) that has no plan comment is first read for a plan in its
 own body: one `agent-board-plan` block, weighed as a plan comment is. The
@@ -520,6 +531,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `triage` | Permit no-plan triage; `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again after this many days (0–30), see [scheduling](#scheduling); needs `triage`; `0` (off) |
+| `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |

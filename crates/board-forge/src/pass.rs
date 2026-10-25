@@ -95,7 +95,7 @@ const RUN_LIST_LIMIT: u64 = 1000;
 const RUNS_PER_PAGE: u64 = 100;
 /// The runner a triage plan asks for.
 const TRIAGE_RUNNER: &str = "hosted";
-/// The most `triageFollowUpDays` may be.
+/// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// Triage verdicts that ask the operator, which label the issue
 /// [`NEEDS_HUMAN`]: `done` for a close, which the pass does not make since no
@@ -103,6 +103,9 @@ const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 const ASK_VERDICTS: &[&str] = &["done", "needs-design", "needs-operator"];
 /// What a triage plan posted again by [`Scheduler::follow_up`] says first.
 const AGAIN: &str = "The board pass asks a triage run to plan this issue again.";
+/// What a triage plan posted by [`Scheduler::replan`] says first.
+const REPLAN: &str = "The board pass asks a triage run to plan the rest of this issue: \
+                      its last planned run ended and the issue is still open.";
 /// How many of the board's first Priority options (P0 and P1) an issue's
 /// own body plan is taken for, with [`Config::body_plans`].
 const BODY_PLAN_PRIORITIES: usize = 2;
@@ -217,6 +220,11 @@ pub struct Config {
     /// ([`Scheduler::follow_up`]).
     #[serde(default)]
     pub triage_follow_up_days: u64,
+    /// Off at 0: else an issue still open after its implement plan's run
+    /// ended is triaged again this many days after the plan's dispatch
+    /// record ([`Scheduler::replan`]).
+    #[serde(default)]
+    pub replan_after_days: u64,
     /// Off unless set: a P0 or P1 issue with no plan comment whose body
     /// holds a writer's plan is started by that plan, not triaged
     /// ([`Scheduler::body_plan`]).
@@ -503,6 +511,14 @@ impl Config {
         ensure!(
             self.triage_follow_up_days == 0 || self.triage,
             "triageFollowUpDays needs triage"
+        );
+        ensure!(
+            self.replan_after_days <= FOLLOW_UP_DAYS_LIMIT,
+            "replanAfterDays is not 0 to {FOLLOW_UP_DAYS_LIMIT}"
+        );
+        ensure!(
+            self.replan_after_days == 0 || self.triage,
+            "replanAfterDays needs triage"
         );
         if !self.pools.0.is_empty() {
             ensure!(self.usage.is_some(), "pools need usage");
@@ -2165,6 +2181,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 if plan.kind == "triage" && config.triage_follow_up_days > 0 {
                     return self.follow_up(issue, &comments, record, (snapshot, target, slots));
                 }
+                if plan.kind == "implement" && config.replan_after_days > 0 {
+                    return self.replan(issue, &id, record, (snapshot, target, slots));
+                }
                 return Ok(Step::Hold(format!(
                     "plan {id} was dispatched already, {}",
                     record.url
@@ -2449,6 +2468,30 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(Step::Hold(format!(
             "{said}; triaged again from {due}, or once {} comments",
             config.operator
+        )))
+    }
+
+    /// An implement plan `id` dispatched already, on an issue still open
+    /// whose run has ended (one in flight, or an open bot or operator pull
+    /// request, holds the issue before this): triaged again
+    /// [`Config::replan_after_days`] after its `record` last changed, so that
+    /// the rest of the issue is planned. The triage's own plan is then the
+    /// newest, with its own record, so each record is acted on once.
+    fn replan(
+        &self,
+        issue: &ItemRef,
+        id: &str,
+        record: &plan::Comment,
+        context: (Option<&Value>, &Target, &Slots),
+    ) -> Result<Step> {
+        let due = record.changed + time::Duration::days(self.config.replan_after_days as i64);
+        if self.now >= due {
+            return self.triage(issue, REPLAN, context);
+        }
+        let due = due.format(&Rfc3339).unwrap_or_default();
+        Ok(Step::Hold(format!(
+            "plan {id} was dispatched already, {}; re-planned from {due}",
+            record.url
         )))
     }
 
