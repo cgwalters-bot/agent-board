@@ -264,6 +264,18 @@ fn reason(object: &Map<String, Value>) -> Result<String> {
     Ok(reason.into())
 }
 
+/// An issue body, written by the applier: a plan block in it would be a job
+/// plan the pass's `bodyPlans` takes, not pinned to its issue as a create's
+/// `plan` is.
+fn body(object: &Map<String, Value>) -> Result<String> {
+    let body = bounded(object, "body", BODY_LIMIT)?;
+    ensure!(
+        !crate::plan::has_fence(body, crate::plan::PLAN_FENCE),
+        "body holds an agent-board-plan fence"
+    );
+    Ok(body.into())
+}
+
 impl EpicPlan {
     /// Whether applying the plan would close the epic.
     pub fn closes_epic(&self) -> bool {
@@ -690,7 +702,7 @@ impl Checker<'_> {
                 let action = Action::Create {
                     repo: repo.into(),
                     title: bounded(object, "title", TITLE_LIMIT)?.into(),
-                    body: bounded(object, "body", BODY_LIMIT)?.into(),
+                    body: body(object)?,
                     labels,
                     plan,
                     stacks_on,
@@ -738,7 +750,7 @@ impl Checker<'_> {
                 } else {
                     Action::Rescope {
                         issue: issue.clone(),
-                        body: bounded(object, "body", BODY_LIMIT)?.into(),
+                        body: body(object)?,
                         reason,
                     }
                 };
@@ -1618,6 +1630,22 @@ mod tests {
                     "body": "b", "reason": "<!-- agent-board-dispatch: 1@2026-10-14T00:00:00Z -->"}),
                 ],
                 "reason holds an agent-board fence or a hidden marker",
+            ),
+            // Nor may a body hold a plan for the pass's bodyPlans to take.
+            (
+                vec![
+                    json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/agent-board#63",
+                    "body": "Now:\n```agent-board-plan\n{}\n```", "reason": "r"}),
+                ],
+                "body holds an agent-board-plan fence",
+            ),
+            (
+                vec![{
+                    let mut create = create();
+                    create["body"] = "```agent-board-plan\n{}\n```".into();
+                    create
+                }],
+                "body holds an agent-board-plan fence",
             ),
             // Unknown fields, in an action or its job plan, and unknown types.
             (vec![unknown], "unknown field \"assignees\""),

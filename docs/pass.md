@@ -343,6 +343,21 @@ issue on a verdict, since no review follows a close. Any other verdict, or
 none, triages the issue again `triageFollowUpDays` after the verdict (or the
 record): at most one triage run per issue in that many days.
 
+With `bodyPlans` (agent-board#342), an issue in the board's first two Priority
+options (P0 and P1) that has no plan comment is first read for a plan in its
+own body: one `agent-board-plan` block, weighed as a plan comment is. The
+body must be the operator's or the bot's, if edited last edited by one of
+them, and its plan must pass the plan checks. Such a plan is treated as the
+issue's accepted plan, with the same holds, target repository and pool checks.
+At its start the pass reads the body and comments again, and holds the issue
+if the body changed or a plan comment appeared. It then posts a copy as the
+issue's plan comment and dispatches and records that copy through the plan
+protocol, only while it is still the newest plan, so it runs once; from
+then on the copy is the plan, and a later edit of the body changes nothing. A
+body with no such block, or another author's, leaves the issue to triage. A
+body plan that is invalid, or that someone else edited last, holds the issue.
+An epic plan may not put a plan block in a body it writes.
+
 The one automatic rerun is for infrastructure: a scheduled run that failed
 before the agent's work could succeed or fail on its own (runner lost, setup
 or checkout failed, broker or forge outage; the exact rule is an
@@ -478,6 +493,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `triage` | Permit no-plan triage; `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again after this many days (0–30), see [scheduling](#scheduling); needs `triage`; `0` (off) |
+| `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
