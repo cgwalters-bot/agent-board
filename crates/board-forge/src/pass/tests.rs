@@ -2583,6 +2583,7 @@ fn followed_draft(replay: &mut Replay, settings: &mut Value) {
         "author": {"__typename": "User", "login": "cgwalters-bot"},
         "headRepositoryOwner": {"login": "cgwalters-bot"},
         "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+        "closingIssuesReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}},
         "autoMergeRequest": null, "mergeQueueEntry": null,
         "files": {"nodes": [{"path": "README.md"}], "pageInfo": {"hasNextPage": false}},
         "timelineItems": {"nodes": []}, "baseChange": {"nodes": []},

@@ -65,13 +65,20 @@ review workflow calls) can still produce a verdict that counts: a push workflow
 can copy the marker while the job runs, and a branch can be the base of a pull
 request with the same head. Without the flag, and elsewhere,
 only the operator's verdict counts; a `review` commit status is not a verdict.
-The operator's verdict of the head outranks the job's either way. Activity is
+The operator's verdict of the head outranks the job's either way. A pull
+request labelled `needs-operator-approval` (any case), or that closes an issue
+so labelled, is not merged or re-queued on the job's approval: it waits for the
+operator's own approval of its head (agent-board#293). The label is read from
+the pull request and the issues it closes, so anyone with triage access to
+either can set it; the operator creates it in each followed repository. The
+bot's token can remove labels too, so it guards against a merge by default,
+not against a hostile bot. Activity is
 printed, not yet handed to a controller pass, and
 the events API serves one page of 100 a pass, so a busier gap is reported as
 such. A pull request with more labels, reviews or commits than its one query
-reads waits rather than being decided on part of them; its head's checks are
-read on for up to 5 pages of 100, and past them, or if the head moves or the
-count changes between pages, it waits too. Of a check that ran more than once
+reads, or that closes more than 10 issues or one with more than 50 labels,
+waits rather than being decided on part of them; its head's checks are read on
+for up to 5 pages of 100, and past them, or if the head moves or the count changes between pages, it waits too. Of a check that ran more than once
 (by the same app, workflow and event), only the newest run counts. Required checks come from the base branch's rulesets and its classic
 protection; a required check that never reported is pending, and a protected
 branch whose requirements cannot be read is an error. Where the base has no
