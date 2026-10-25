@@ -25,6 +25,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
 };
+use tokio::runtime::Runtime;
 
 #[derive(Parser)]
 #[command(
@@ -362,7 +363,12 @@ fn main() {
             std::process::exit(code);
         }
     };
-    if let Err(error) = execute(cli) {
+    // One runtime for the process; only the GitHub snapshot is async so far.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("start the async runtime");
+    if let Err(error) = runtime.and_then(|runtime| execute(cli, &runtime)) {
         eprintln!("error: {error:#}");
         std::process::exit(live::error_exit_code(&error));
     }
@@ -430,7 +436,7 @@ fn board(cli: &Cli) -> Result<board_forge::forgejo::Board> {
     Ok(board)
 }
 
-fn load(cli: &Cli) -> Result<Snapshot> {
+fn load(cli: &Cli, runtime: &Runtime) -> Result<Snapshot> {
     let policy = agent_policy(cli)?;
     let live = if let board_forge::forgejo::Board::Forgejo(config) = board(cli)? {
         ensure!(
@@ -440,7 +446,9 @@ fn load(cli: &Cli) -> Result<Snapshot> {
         let transport = board_forge::forgejo::Client::from_env(&config)?;
         Some(board_forge::forgejo::Forgejo { transport, config }.snapshot_with_policy(&policy)?)
     } else if cli.snapshot.is_none() {
-        Some(github(cli)?.snapshot_with_policy(&policy)?)
+        let github = github(cli)?;
+        let budget = board_forge::github::SNAPSHOT_REQUEST_LIMIT;
+        Some(runtime.block_on(github.snapshot_with_policy(&policy, budget))?)
     } else {
         None
     };
@@ -463,7 +471,7 @@ fn load(cli: &Cli) -> Result<Snapshot> {
     Ok(snapshot)
 }
 
-fn execute(cli: Cli) -> Result<()> {
+fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
     ensure!(
         cli.template.is_none(),
         "unsupported_capability: --template is not implemented"
@@ -528,7 +536,7 @@ fn execute(cli: Cli) -> Result<()> {
                         .with_context(|| format!("decode proposal line {}", index + 1))
                 })
                 .collect::<Result<_>>()?;
-            board_core::check_proposals(&policy, identity, &load(&cli)?, &outputs)
+            board_core::check_proposals(&policy, identity, &load(&cli, runtime)?, &outputs)
         }
         Command::Request {
             command: Request::Dispatch(args),
@@ -537,7 +545,12 @@ fn execute(cli: Cli) -> Result<()> {
                 cli.json.is_none(),
                 "dispatch prints its own JSON command schema"
             );
-            dispatch::prepare(&load(&cli)?, args, cli.repo.as_deref(), &cli.hostname)
+            dispatch::prepare(
+                &load(&cli, runtime)?,
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+            )
         }
         Command::Dispatch(args) => {
             ensure!(
@@ -617,7 +630,7 @@ fn execute(cli: Cli) -> Result<()> {
                 !args.apply || cli.snapshot.is_none(),
                 "--apply writes to the live board; it cannot use --snapshot"
             );
-            let snapshot = load(&cli)?;
+            let snapshot = load(&cli, runtime)?;
             // Lookup is lazy: existing Run and explicit --run retain the offline path.
             let mut args = args.clone();
             if args.needs_lookup(&snapshot, cli.repo.as_deref(), &cli.hostname)? {
@@ -645,11 +658,11 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Command::Snapshot {
             command: SnapshotCommand::Create,
-        } => render(serde_json::to_value(load(&cli)?)?, &cli),
+        } => render(serde_json::to_value(load(&cli, runtime)?)?, &cli),
         Command::Project {
             command: Project::View,
         } => {
-            let snapshot = load(&cli)?;
+            let snapshot = load(&cli, runtime)?;
             if cli.json.is_some() {
                 render(serde_json::to_value(snapshot)?, &cli)
             } else {
@@ -661,7 +674,7 @@ fn execute(cli: Cli) -> Result<()> {
         } => {
             ensure!(cli.json.is_none(), "project init prints a field table");
             if cli.snapshot.is_some() {
-                dispatch::init_plan(&load(&cli)?, &mut io::stdout().lock())
+                dispatch::init_plan(&load(&cli, runtime)?, &mut io::stdout().lock())
             } else {
                 dispatch::init(&github(&cli)?, &mut io::stdout().lock())
             }
@@ -736,7 +749,7 @@ fn execute(cli: Cli) -> Result<()> {
                 ["open", "closed", "all"].contains(&args.state.as_str()),
                 "--state must be open, closed or all"
             );
-            let snapshot = load(&cli)?;
+            let snapshot = load(&cli, runtime)?;
             let items: Vec<_> = snapshot
                 .items
                 .iter()
@@ -756,7 +769,7 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Ask {
             command: Ask::List { limit },
         } => {
-            let snapshot = load(&cli)?;
+            let snapshot = load(&cli, runtime)?;
             let items = snapshot
                 .items
                 .iter()
@@ -786,7 +799,7 @@ fn execute(cli: Cli) -> Result<()> {
                     "--apply writes to the live board; it cannot use --snapshot"
                 );
                 return ask::create_preview(
-                    &load(&cli)?,
+                    &load(&cli, runtime)?,
                     &blocked,
                     repository,
                     args,
@@ -839,7 +852,12 @@ fn execute(cli: Cli) -> Result<()> {
                     !args.apply,
                     "--apply writes to the live board; it cannot use --snapshot"
                 );
-                return ask::resolve_preview(&load(&cli)?, &identity, &args.answer, &mut out);
+                return ask::resolve_preview(
+                    &load(&cli, runtime)?,
+                    &identity,
+                    &args.answer,
+                    &mut out,
+                );
             }
             ask::resolve(
                 &github(&cli)?,
@@ -852,7 +870,7 @@ fn execute(cli: Cli) -> Result<()> {
         Command::Item {
             command: Item::View { item },
         } => {
-            let snapshot = load(&cli)?;
+            let snapshot = load(&cli, runtime)?;
             let identity = parse_github_item(item, cli.repo.as_deref(), &cli.hostname)?;
             let item = snapshot
                 .items
@@ -875,7 +893,14 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Command::Item {
             command: Item::Add(add),
-        } => item_write(&cli, &add.item, &add.edits(), item::Mode::Add, add.apply),
+        } => item_write(
+            &cli,
+            runtime,
+            &add.item,
+            &add.edits(),
+            item::Mode::Add,
+            add.apply,
+        ),
         Command::Item {
             command:
                 Item::Edit(item::Edit {
@@ -883,11 +908,11 @@ fn execute(cli: Cli) -> Result<()> {
                     fields,
                     apply,
                 }),
-        } => item_write(&cli, item, fields, item::Mode::Edit, *apply),
+        } => item_write(&cli, runtime, item, fields, item::Mode::Edit, *apply),
         Command::Reconcile {
             command: Reconcile::Plan { emit, config },
         } => {
-            let snapshot = load(&cli)?;
+            let snapshot = load(&cli, runtime)?;
             // Offline scope is only a proposal; independent policy checking is mandatory.
             let policy = Policy {
                 project: snapshot.project.clone(),
@@ -989,7 +1014,7 @@ fn execute(cli: Cli) -> Result<()> {
                 if cli.snapshot.is_none() && cli.owner.is_none() && cli.project.is_none() {
                     return Ok(None);
                 }
-                Ok(Some(load(&cli)?))
+                Ok(Some(load(&cli, runtime)?))
             })
         }
         Command::Pass(args) => {
@@ -1002,7 +1027,7 @@ fn execute(cli: Cli) -> Result<()> {
                     && cli.board_config.is_none(),
                 "pass reads its settings from --config only"
             );
-            pass::run(args, &mut io::stdout().lock())
+            pass::run(args, runtime, &mut io::stdout().lock())
         }
         Command::Supervise(args) => {
             ensure!(
@@ -1039,7 +1064,7 @@ fn execute(cli: Cli) -> Result<()> {
             }
             // Refused before any read, as every other section needs the token too.
             let client = board_forge::github::Client::from_env()?;
-            let board = cli.project.map(|_| load(&cli));
+            let board = cli.project.map(|_| load(&cli, runtime));
             let report = org_status::report(&client, &settings, board);
             let complete = board_forge::org_status::complete(&report);
             if cli.json.is_some() {
@@ -1077,6 +1102,7 @@ fn execute(cli: Cli) -> Result<()> {
         } => {
             ensure!(cli.snapshot.is_none(), "live fixture cannot use --snapshot");
             live::run(
+                runtime,
                 options,
                 cli.owner.as_deref(),
                 cli.repo.as_deref(),
@@ -1091,6 +1117,7 @@ fn execute(cli: Cli) -> Result<()> {
 
 fn item_write(
     cli: &Cli,
+    runtime: &Runtime,
     input: &str,
     edits: &[String],
     mode: item::Mode,
@@ -1104,7 +1131,7 @@ fn item_write(
             !apply,
             "--apply writes to the live board; it cannot use --snapshot"
         );
-        return item::preview(&load(cli)?, &identity, edits, mode, &mut out);
+        return item::preview(&load(cli, runtime)?, &identity, edits, mode, &mut out);
     }
     item::write(
         &github(cli)?,

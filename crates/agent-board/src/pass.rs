@@ -2,10 +2,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use board_forge::caps::Limits;
 use board_forge::github::Client;
-use board_forge::github::Transport;
+use board_forge::github::{GraphQl, Transport};
 use board_forge::pass::{self, Config, Mode, PassRun, Recorder, Replay, Report, Seeded};
 use board_forge::poll::{Rest, State};
 use std::{io::Write, path::PathBuf};
+use tokio::runtime::Runtime;
 
 #[derive(clap::Args)]
 pub struct Pass {
@@ -33,7 +34,8 @@ pub struct Pass {
 }
 
 /// A preview through `live` whose reads are saved to `path` as a replay fixture.
-fn record_pass<C: Rest + Transport + pass::Broker>(
+fn record_pass<C: Rest + Transport + GraphQl + pass::Broker>(
+    runtime: &Runtime,
     live: &C,
     config: &Config,
     (path, limits): (&PathBuf, Limits),
@@ -41,7 +43,8 @@ fn record_pass<C: Rest + Transport + pass::Broker>(
 ) -> Result<Report> {
     let recorder = Recorder::new(live);
     let preview = (Mode::Preview, limits);
-    let report = pass::run(&recorder, &recorder, config, State::default(), preview, now)?;
+    let pass = pass::run(&recorder, &recorder, config, State::default(), preview, now);
+    let report = runtime.block_on(pass)?;
     std::fs::write(path, recorder.fixture(now)?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(report)
@@ -87,7 +90,7 @@ fn read(path: &PathBuf) -> Result<String> {
 /// One pass: a line per decision on stdout, after one saying whether it
 /// previews or applies, and a summary of its caps last. Any failed operation
 /// fails the command, after the rest of the pass has run.
-pub fn run(args: &Pass, out: &mut impl Write) -> Result<()> {
+pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     let config = Config::parse(&read(&args.config)?)
         .with_context(|| format!("{}", args.config.display()))?;
     let limits = Limits {
@@ -119,7 +122,9 @@ pub fn run(args: &Pass, out: &mut impl Write) -> Result<()> {
         (Some(replay), None) => {
             let state = State::default();
             let preview = (Mode::Preview, limits);
-            pass::run(replay, replay, &config, state, preview, replay.now)?
+            runtime.block_on(pass::run(
+                replay, replay, &config, state, preview, replay.now,
+            ))?
         }
         (seed, record) => {
             let now = time::OffsetDateTime::now_utc();
@@ -130,9 +135,9 @@ pub fn run(args: &Pass, out: &mut impl Write) -> Result<()> {
                         seed,
                         live: &client,
                     };
-                    record_pass(&seeded, &config, (path, limits), now)?
+                    record_pass(runtime, &seeded, &config, (path, limits), now)?
                 }
-                (None, Some(path)) => record_pass(&client, &config, (path, limits), now)?,
+                (None, Some(path)) => record_pass(runtime, &client, &config, (path, limits), now)?,
                 (_, None) => {
                     // Only an applying pass writes the cache; a preview reads it.
                     let state = match config.state.as_deref().map(PathBuf::from) {
@@ -148,8 +153,8 @@ pub fn run(args: &Pass, out: &mut impl Write) -> Result<()> {
                     };
                     let dispatcher = Client::from_var("DISPATCH_TOKEN");
                     let dispatcher = dispatcher.as_ref().unwrap_or(&client);
-                    let report =
-                        pass::run(&client, dispatcher, &config, state, (mode, limits), now)?;
+                    let pass = pass::run(&client, dispatcher, &config, state, (mode, limits), now);
+                    let report = runtime.block_on(pass)?;
                     if let (true, Some(path), Some(state)) =
                         (args.apply, &config.state, &report.state)
                     {

@@ -40,15 +40,21 @@ pub(super) fn config(edit: Value) -> Config {
     Config::parse(&value.to_string()).unwrap()
 }
 
+/// A pass run to its end on a current-thread runtime, as the CLI runs it.
+pub(super) fn block<T>(pass: impl Future<Output = T>) -> T {
+    let runtime = tokio::runtime::Builder::new_current_thread().build();
+    runtime.unwrap().block_on(pass)
+}
+
 pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
-    run(
+    block(run(
         replay,
         replay,
         config,
         State::default(),
         (Mode::Preview, Limits::default()),
         replay.now,
-    )
+    ))
     .unwrap()
 }
 
@@ -1156,6 +1162,12 @@ impl Rest for Forge {
     }
 }
 
+impl crate::github::GraphQl for Forge {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         self.failing(&format!("graphql {query}"))?;
@@ -1191,14 +1203,14 @@ impl Transport for Forge {
 }
 
 fn apply(forge: &Forge, config: &Config) -> Report {
-    run(
+    block(run(
         forge,
         forge,
         config,
         State::default(),
         (Mode::Actions(&own()), Limits::default()),
         forge.replay.now,
-    )
+    ))
     .unwrap()
 }
 
@@ -1261,14 +1273,14 @@ fn apply_publishes_the_refreshed_usage() {
         };
         let now = forge.replay.now;
         let mode = (Mode::Actions(&own()), limits);
-        let report = run(
+        let report = block(run(
             &forge,
             &forge,
             &config(settings),
             State::default(),
             mode,
             now,
-        )
+        ))
         .unwrap();
         assert!(
             report.lines.iter().any(|l| l.starts_with(&line)),
@@ -1319,7 +1331,7 @@ fn apply_stops_at_its_time_bound() {
     let config = config(json!({}));
     let forge = Forge::new(None, false);
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
-    let report = run_within(
+    let report = block(run_within(
         &forge,
         &forge,
         &config,
@@ -1330,7 +1342,7 @@ fn apply_stops_at_its_time_bound() {
             forge.replay.now,
         ),
         &Bounds::new(PASS_REQUEST_LIMIT, past),
-    )
+    ))
     .unwrap();
     assert_eq!(
         last_scheduled(&report),
@@ -1581,14 +1593,14 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             writes,
             ..Limits::default()
         };
-        let second = run(
+        let second = block(run(
             &forge,
             &forge,
             &config,
             State::default(),
             (Mode::Actions(&own()), limits),
             forge.replay.now,
-        )
+        ))
         .unwrap();
         assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
         let line = second.lines.iter().find(|l| l.contains("tracker#446"));
@@ -1660,24 +1672,24 @@ fn caps_hold_starts_past_max_dispatch() {
     ] {
         let replay = without_epics(replay());
         let preview = (Mode::Preview, limits);
-        let preview = run(
+        let preview = block(run(
             &replay,
             &replay,
             &config,
             State::default(),
             preview,
             replay.now,
-        );
+        ));
         let forge = Forge::new(None, false);
         let local = (Mode::Local, limits);
-        let applied = run(
+        let applied = block(run(
             &forge,
             &forge,
             &config,
             State::default(),
             local,
             forge.replay.now,
-        );
+        ));
         for report in [preview.unwrap(), applied.unwrap()] {
             let held: Vec<&str> = report
                 .lines
@@ -1891,7 +1903,7 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
     for limit in 1..=200 {
         let forge = Forge::new(None, false);
         let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
-        run_within(
+        block(run_within(
             &forge,
             &forge,
             &config,
@@ -1902,7 +1914,7 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
                 forge.replay.now,
             ),
             &Bounds::new(limit, admit_by),
-        )
+        ))
         .unwrap();
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
         let planned = comments.iter().any(|c| c.contains("```agent-board-plan"));
@@ -1940,7 +1952,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     for (limit, line, failures) in cases {
         let forge = Forge::new(None, false);
         let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
-        let report = run_within(
+        let report = block(run_within(
             &forge,
             &forge,
             &config,
@@ -1951,7 +1963,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
                 forge.replay.now,
             ),
             &Bounds::new(limit, admit_by),
-        )
+        ))
         .unwrap();
         assert_eq!(last_scheduled(&report), line, "limit {limit}");
         assert_eq!(

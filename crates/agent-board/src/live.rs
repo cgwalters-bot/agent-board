@@ -1,6 +1,8 @@
 //! Opt-in staging fixture. Only locally held creation IDs authorize cleanup.
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{Capability, ItemRef, Policy, Status};
+// `GraphQl` is named by path, not imported, so that `graphql` here stays
+// the sync one.
 use board_forge::{
     Forge,
     github::{
@@ -9,6 +11,7 @@ use board_forge::{
 };
 use clap::Args;
 use serde_json::{Value, json};
+use tokio::runtime::Runtime;
 
 const DELETE: &str =
     "mutation($id:ID!){deleteProjectV2(input:{projectId:$id}){deletedProjectV2Id}}";
@@ -43,6 +46,7 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
 }
 
 pub fn run(
+    runtime: &Runtime,
     options: &Options,
     owner: Option<&str>,
     repo: Option<&str>,
@@ -77,7 +81,7 @@ pub fn run(
         "agent-board-ci-{}",
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
-    lifecycle(&Client::from_env()?, owner, repo, &title, project)
+    lifecycle(runtime, &Client::from_env()?, owner, repo, &title, project)
 }
 
 struct Borrowed<'a, T>(&'a T);
@@ -85,6 +89,12 @@ struct Borrowed<'a, T>(&'a T);
 impl<T: Transport> Transport for Borrowed<'_, T> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         self.0.graphql(query, variables)
+    }
+}
+
+impl<T: board_forge::github::GraphQl> board_forge::github::GraphQl for Borrowed<'_, T> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.0.graphql(query, variables).await
     }
 }
 
@@ -97,7 +107,8 @@ fn string(value: &Value, pointer: &str) -> Result<String> {
 }
 
 fn lifecycle(
-    t: &impl Transport,
+    runtime: &Runtime,
+    t: &(impl Transport + board_forge::github::GraphQl),
     owner: &str,
     repo: &str,
     title: &str,
@@ -224,12 +235,12 @@ fn lifecycle(
             &mut item_id,
             &mut std::io::sink(),
         )?;
-        let snapshot = GitHub {
+        let github = GitHub {
             transport: Borrowed(t),
             owner: owner.into(),
             number,
-        }
-        .snapshot()?;
+        };
+        let snapshot = runtime.block_on(github.snapshot())?;
         ensure!(
             snapshot.coverage.complete,
             "live snapshot did not return complete fixture membership"
@@ -381,7 +392,20 @@ fn lifecycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use board_forge::github::Blocking;
     use std::cell::RefCell;
+
+    /// [`lifecycle`] through a sync fake, on a runtime as the CLI's.
+    fn lifecycle_of(
+        t: &impl Transport,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        kept: Option<u64>,
+    ) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        lifecycle(&runtime, &Blocking(t), owner, repo, title, kept)
+    }
 
     struct Recorded {
         calls: RefCell<Vec<String>>,
@@ -487,7 +511,7 @@ mod tests {
                     calls: RefCell::new(vec![]),
                     fail,
                 };
-                let result = lifecycle(
+                let result = lifecycle_of(
                     &t,
                     "cgwalters-forge-stage",
                     "cgwalters-forge-stage/board-test",
@@ -561,7 +585,7 @@ mod tests {
                     },
                     fail_set,
                 };
-                let result = lifecycle(
+                let result = lifecycle_of(
                     &transport,
                     "cgwalters-forge-stage",
                     "cgwalters-forge-stage/board-test",
@@ -609,7 +633,7 @@ mod tests {
                 },
                 permission,
             };
-            let error = lifecycle(
+            let error = lifecycle_of(
                 &transport,
                 "cgwalters-forge-stage",
                 "cgwalters-forge-stage/board-test",
@@ -645,7 +669,7 @@ mod tests {
         }
 
         let transport = Refused(RefCell::new(vec![]));
-        let error = lifecycle(
+        let error = lifecycle_of(
             &transport,
             "cgwalters-forge-stage",
             "cgwalters-forge-stage/board-test",
@@ -694,7 +718,7 @@ mod tests {
                 },
                 corrupt,
             };
-            let result = lifecycle(
+            let result = lifecycle_of(
                 &transport,
                 "cgwalters-forge-stage",
                 "cgwalters-forge-stage/board-test",

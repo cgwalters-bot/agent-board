@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use board_core::{Capability, Coverage, Evidence, Item, ItemRef, Snapshot};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
 use url::Url;
 
 pub const DEFAULT_HOST: &str = "github.com";
@@ -155,6 +156,40 @@ pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
 }
 
+/// The async [`Transport`], which the snapshot reads through. Its futures
+/// need not be `Send`: the CLI runs them on one current-thread runtime.
+#[allow(async_fn_in_trait)]
+pub trait GraphQl {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
+}
+
+/// A sync [`Transport`] as a [`GraphQl`] one too, whose futures are ready
+/// when first polled: for fakes, and for the sync paths that share the
+/// async paging ([`ready`]).
+pub struct Blocking<'a, T>(pub &'a T);
+
+impl<T: Transport> Transport for Blocking<'_, T> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.0.graphql(query, variables)
+    }
+}
+
+impl<T: Transport> GraphQl for Blocking<'_, T> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.0.graphql(query, variables)
+    }
+}
+
+/// The output of a future that never waits, as one reading only through
+/// [`Blocking`] does; one that would wait is an error, not a hang.
+fn ready<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::pin::pin!(future).poll(&mut context) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => anyhow::bail!("a synchronous GitHub read had to wait"),
+    }
+}
+
 /// Attach the operation and its fine-grained permission to live failures.
 pub struct DiagnosticTransport<'a, T> {
     pub transport: &'a T,
@@ -162,7 +197,7 @@ pub struct DiagnosticTransport<'a, T> {
     pub repository: String,
 }
 
-fn operation(query: &str) -> (&str, &str, bool) {
+fn operation(query: &str) -> (&'static str, &'static str, bool) {
     for (marker, step, permission, repository) in [
         (
             "issue(number:",
@@ -336,6 +371,39 @@ mod diagnostic_tests {
 
 impl<T: Transport> Transport for DiagnosticTransport<'_, T> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let (context, permission) = self.explain(query, &variables);
+        let result = self.transport.graphql(query, variables);
+        result.map_err(|error| refusal(error, context, permission))
+    }
+}
+
+impl<T: GraphQl> GraphQl for DiagnosticTransport<'_, T> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let (context, permission) = self.explain(query, &variables);
+        let result = self.transport.graphql(query, variables).await;
+        result.map_err(|error| refusal(error, context, permission))
+    }
+}
+
+/// `error` with `context`, and on a refusal the `permission` it needs.
+fn refusal(error: anyhow::Error, context: String, permission: &str) -> anyhow::Error {
+    let message = format!("{error:#}");
+    let context = if ["FORBIDDEN", "HTTP status 403", "HTTP status 404"]
+        .iter()
+        .any(|s| message.contains(s))
+    {
+        format!(
+            "{context}\nFine-grained token needs {permission}; an organization can also hold a fine-grained token pending approval."
+        )
+    } else {
+        context
+    };
+    error.context(context)
+}
+
+impl<T> DiagnosticTransport<'_, T> {
+    /// The step of `query` and its target, and the permission it needs.
+    fn explain(&self, query: &str, variables: &Value) -> (String, &'static str) {
         let (step, permission, repository) = operation(query);
         let target = if repository {
             &self.repository
@@ -357,21 +425,15 @@ impl<T: Transport> Transport for DiagnosticTransport<'_, T> {
             "{detail} {target} (node {})",
             variables["id"].as_str().unwrap_or("project/repository")
         );
-        self.transport.graphql(query, variables).map_err(|error| {
-            let message = format!("{error:#}");
-            let context = if ["FORBIDDEN", "HTTP status 403", "HTTP status 404"].iter().any(|s| message.contains(s)) {
-                format!("{context}\nFine-grained token needs {permission}; an organization can also hold a fine-grained token pending approval.")
-            } else {
-                context
-            };
-            error.context(context)
-        })
+        (context, permission)
     }
 }
 
-// Shared across every connection and per-item read in one snapshot. Exhaustion
-// returns an error, never a partial snapshot that could yield proposals.
-pub(crate) const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
+/// The default request budget of a snapshot, which its caller passes, and of
+/// the other whole-board reads. Shared across every connection and per-item
+/// read in one read. Exhaustion returns an error, never a partial snapshot
+/// that could yield proposals.
+pub const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
 
 // A snapshot page reads each item's field values, labels and assignees inline,
 // so a board costs a request per page rather than three per item (#276).
@@ -455,23 +517,38 @@ impl<'a, T> ReadBudget<'a, T> {
             remaining: std::cell::Cell::new(limit),
         }
     }
-}
 
-impl<T: Transport> Transport for ReadBudget<'_, T> {
-    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+    fn spend(&self) -> Result<()> {
         let remaining = self.remaining.get();
         ensure!(
             remaining > 0,
             "GitHub snapshot request budget exhausted; no snapshot produced"
         );
         self.remaining.set(remaining - 1);
+        Ok(())
+    }
+}
+
+impl<T: Transport> Transport for ReadBudget<'_, T> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.spend()?;
         self.transport.graphql(query, variables)
     }
 }
 
+impl<T: GraphQl> GraphQl for ReadBudget<'_, T> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.spend()?;
+        self.transport.graphql(query, variables).await
+    }
+}
+
+/// The live GitHub client: [`Api`] for the snapshot, and ureq for every
+/// other read and write, which are still sync.
 pub struct Client {
     token: String,
     agent: ureq::Agent,
+    api: Api,
 }
 
 impl Client {
@@ -552,10 +629,221 @@ impl Client {
 
     fn with_token(token: String) -> Self {
         Self {
+            api: Api::new(token.clone()),
             token,
             agent: http_agent(),
         }
     }
+}
+
+impl GraphQl for Client {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.api.graphql(query, variables).await
+    }
+}
+
+const GRAPHQL_URL: &str = "https://api.github.com/graphql";
+
+/// Requests one [`Api`] has in flight at once. GitHub counts concurrent
+/// requests toward its secondary rate limits and asks clients to keep them
+/// few; a snapshot reads its pages one after another today.
+pub const MAX_IN_FLIGHT: usize = 4;
+
+/// Retries of one request GitHub refused under a rate limit. They are the
+/// client's, not one of an operation's budgeted requests.
+pub const RATE_LIMIT_RETRIES: u32 = 3;
+
+/// The longest one request's retries may wait together; a wait past it
+/// gives up at once. Per request, not per operation: a read of many
+/// requests may wait this long for each.
+pub const RATE_LIMIT_WAIT: Duration = Duration::from_secs(120);
+
+/// The most of a response body read, as ureq's default for JSON.
+const RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
+/// One request's time bound, as [`http_agent`]'s.
+const REQUEST_SECONDS: u64 = 30;
+
+/// One HTTP response, as [`Api`] sees it.
+#[derive(Clone)]
+pub(crate) struct Reply {
+    status: u16,
+    retry_after: Option<String>,
+    /// `x-ratelimit-remaining` and `x-ratelimit-reset`.
+    remaining: Option<String>,
+    reset: Option<String>,
+    body: Vec<u8>,
+}
+
+/// One POST of JSON to the API: [`Https`] live, a fake in tests.
+pub(crate) trait Http {
+    async fn post(&self, url: &str, body: &[u8]) -> Result<Reply>;
+}
+
+/// reqwest with the token, its TLS client built at the first request.
+pub(crate) struct Https {
+    token: String,
+    client: tokio::sync::OnceCell<reqwest::Client>,
+}
+
+/// rustls with ring, as ureq's, and the platform's trust store, which
+/// honors locally installed CAs, including sandbox egress proxies.
+fn https_client() -> Result<reqwest::Client> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("TLS protocol versions")?
+        .with_platform_verifier()
+        .context("platform TLS verifier")?
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .timeout(Duration::from_secs(REQUEST_SECONDS))
+        .user_agent("agent-board")
+        .build()
+        .context("build the GitHub HTTPS client")
+}
+
+impl Http for Https {
+    async fn post(&self, url: &str, body: &[u8]) -> Result<Reply> {
+        let client = self
+            .client
+            .get_or_try_init(|| async { https_client() })
+            .await?;
+        let failed = |_| anyhow::anyhow!("GitHub transport failed");
+        let mut response = client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header("Content-Type", "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(failed)?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let (retry_after, remaining, reset) = (
+            header("retry-after"),
+            header("x-ratelimit-remaining"),
+            header("x-ratelimit-reset"),
+        );
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(failed)? {
+            ensure!(
+                body.len() + chunk.len() <= RESPONSE_BYTES,
+                "GitHub response over {RESPONSE_BYTES} bytes"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Reply {
+            status,
+            retry_after,
+            remaining,
+            reset,
+            body,
+        })
+    }
+}
+
+/// The async GitHub client, which holds its limits in one place: at most
+/// [`MAX_IN_FLIGHT`] requests at once, and a request refused under a rate
+/// limit retried at most [`RATE_LIMIT_RETRIES`] times within
+/// [`RATE_LIMIT_WAIT`] ([`rate_limit_wait`]). An operation's request budget
+/// is its own ([`GitHub::snapshot_with_policy`]).
+pub(crate) struct Api<H = Https> {
+    http: H,
+    in_flight: tokio::sync::Semaphore,
+}
+
+impl Api {
+    fn new(token: String) -> Self {
+        Self::with_http(Https {
+            token,
+            client: tokio::sync::OnceCell::new(),
+        })
+    }
+}
+
+impl<H: Http> Api<H> {
+    fn with_http(http: H) -> Self {
+        Self {
+            http,
+            in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
+        }
+    }
+
+    /// POST `body`, and again after each rate-limited refusal while the
+    /// bounds allow. A request waiting out a limit holds no slot. The last
+    /// reply comes back with why it was not retried, if it was refused.
+    async fn post(&self, url: &str, body: &[u8]) -> Result<(Reply, Option<String>)> {
+        let mut waited = Duration::ZERO;
+        let mut retries = 0;
+        loop {
+            let reply = {
+                let _slot = self.in_flight.acquire().await?;
+                self.http.post(url, body).await?
+            };
+            let Some(wait) = rate_limit_wait(&reply, SystemTime::now()) else {
+                return Ok((reply, None));
+            };
+            let total = waited.checked_add(wait).filter(|t| *t <= RATE_LIMIT_WAIT);
+            let Some(total) = total.filter(|_| retries < RATE_LIMIT_RETRIES) else {
+                let why = format!(
+                    "GitHub rate limit: gave up after {retries} retries and {}s of waiting, asked to wait {}s more",
+                    waited.as_secs(),
+                    wait.as_secs()
+                );
+                return Ok((reply, Some(why)));
+            };
+            tokio::time::sleep(wait).await;
+            waited = total;
+            retries += 1;
+        }
+    }
+}
+
+impl<H: Http> GraphQl for Api<H> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let request = serde_json::to_vec(&json!({"query":query,"variables":variables}))?;
+        let (reply, gave_up) = self.post(GRAPHQL_URL, &request).await?;
+        let body: Value = match serde_json::from_slice(&reply.body) {
+            Ok(body) => body,
+            Err(_) if !(200..300).contains(&reply.status) => json!({}),
+            Err(error) => return Err(error).context("decode GitHub GraphQL response"),
+        };
+        // A refusal given up on keeps today's error, and says why.
+        http_response_data(reply.status, body).map_err(|error| match gave_up {
+            Some(why) => error.context(why),
+            None => error,
+        })
+    }
+}
+
+/// How long to wait before retrying `reply`, if GitHub refused it under a
+/// rate limit: a 403 or 429 with `Retry-After` seconds, or else with no
+/// requests remaining until `x-ratelimit-reset`. A 403 with neither is a
+/// refusal, and is not retried.
+fn rate_limit_wait(reply: &Reply, now: SystemTime) -> Option<Duration> {
+    if !matches!(reply.status, 403 | 429) {
+        return None;
+    }
+    let seconds = |value: &Option<String>| value.as_deref()?.trim().parse::<u64>().ok();
+    if let Some(after) = seconds(&reply.retry_after) {
+        return Some(Duration::from_secs(after));
+    }
+    if seconds(&reply.remaining) != Some(0) {
+        return None;
+    }
+    let reset = seconds(&reply.reset)?;
+    let now = now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    // A reset already past waits a second rather than none.
+    Some(Duration::from_secs(reset.saturating_sub(now).max(1)))
 }
 
 /// The HTTPS agent every live forge client uses.
@@ -832,20 +1120,30 @@ pub(crate) fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
         .with_context(|| format!("missing GitHub {key}"))
 }
 
-pub(crate) fn connection(
+/// [`connection`] through a sync transport.
+pub(crate) fn sync_connection(
     t: &impl Transport,
     query: &str,
     variables: Value,
     pointer: &str,
 ) -> Result<(Vec<Value>, bool)> {
-    continue_connection(t, None, query, variables, pointer)
+    ready(connection(&Blocking(t), query, variables, pointer))
+}
+
+pub(crate) async fn connection(
+    t: &impl GraphQl,
+    query: &str,
+    variables: Value,
+    pointer: &str,
+) -> Result<(Vec<Value>, bool)> {
+    continue_connection(t, None, query, variables, pointer).await
 }
 
 /// Collect a connection from its `first` page, if already read, then read the
 /// rest with `query` from its cursor. Only a page that says it is the last one
 /// is complete.
-fn continue_connection(
-    t: &impl Transport,
+async fn continue_connection(
+    t: &impl GraphQl,
     first: Option<&Value>,
     query: &str,
     mut variables: Value,
@@ -856,7 +1154,7 @@ fn continue_connection(
     let mut complete = true;
     let mut conn = match first {
         Some(first) => first.clone(),
-        None => read_page(t, query, &variables, pointer)?,
+        None => read_page(t, query, &variables, pointer).await?,
     };
     loop {
         let page = conn["nodes"]
@@ -881,12 +1179,18 @@ fn continue_connection(
             }
             None => return Ok((nodes, false)),
         }
-        conn = read_page(t, query, &variables, pointer)?;
+        conn = read_page(t, query, &variables, pointer).await?;
     }
 }
 
-fn read_page(t: &impl Transport, query: &str, variables: &Value, pointer: &str) -> Result<Value> {
-    t.graphql(query, variables.clone())?
+async fn read_page(
+    t: &impl GraphQl,
+    query: &str,
+    variables: &Value,
+    pointer: &str,
+) -> Result<Value> {
+    t.graphql(query, variables.clone())
+        .await?
         .pointer_mut(pointer)
         .map(Value::take)
         .context("missing GitHub connection")
@@ -903,7 +1207,7 @@ fn nested_value_field(value: &Value) -> Option<&'static str> {
 
 /// An item's field values: the page's, when it held all of them whole, or else
 /// all of them read again by themselves, which nests a full page in each.
-fn item_field_values(t: &impl Transport, member: &Value) -> Result<(Vec<Value>, bool)> {
+async fn item_field_values(t: &impl GraphQl, member: &Value) -> Result<(Vec<Value>, bool)> {
     let inline = &member["fieldValues"];
     let truncated = inline["pageInfo"]["hasNextPage"] == true
         || inline["nodes"].as_array().is_some_and(|values| {
@@ -915,9 +1219,9 @@ fn item_field_values(t: &impl Transport, member: &Value) -> Result<(Vec<Value>, 
     let query = item_field_values_query();
     let variables = json!({"id":text(member, "id")?});
     if truncated {
-        connection(t, &query, variables, "/node/fieldValues")
+        connection(t, &query, variables, "/node/fieldValues").await
     } else {
-        continue_connection(t, Some(inline), &query, variables, "/node/fieldValues")
+        continue_connection(t, Some(inline), &query, variables, "/node/fieldValues").await
     }
 }
 
@@ -1025,28 +1329,33 @@ pub fn field_writes(fields: &[Value], edits: &[String]) -> Result<Vec<FieldWrite
 }
 
 // The project (id, url) and its complete field schema; shared by snapshots and `project init`.
-fn read_schema(t: &impl Transport, owner: &str, number: u64) -> Result<(Value, Vec<Value>, bool)> {
-    let data = t.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":owner,"number":number}))?;
+async fn read_schema(
+    t: &impl GraphQl,
+    owner: &str,
+    number: u64,
+) -> Result<(Value, Vec<Value>, bool)> {
+    let data = t.graphql("query($owner:String!,$number:Int!){repositoryOwner(login:$owner){... on Organization{projectV2(number:$number){id url}} ... on User{projectV2(number:$number){id url}}}}", json!({"owner":owner,"number":number})).await?;
     let project = data["repositoryOwner"]["projectV2"].clone();
     let (fields, complete) = connection(
         t,
         "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{fields(first:100,after:$cursor){nodes{... on ProjectV2Field{id name dataType} ... on ProjectV2SingleSelectField{id name dataType options{id name}} ... on ProjectV2IterationField{id name dataType configuration{iterations{id title startDate duration} completedIterations{id title startDate duration}}}} pageInfo{hasNextPage endCursor}}}}}",
         json!({"id":text(&project, "id")?}),
         "/node/fields",
-    )?;
+    )
+    .await?;
     Ok((project, fields, complete))
 }
 
-impl<T: Transport> Forge for GitHub<T> {
+impl<T: GraphQl> Forge for GitHub<T> {
     fn capabilities(&self) -> Result<Vec<Capability>> {
         // Read access never establishes mutation authority.
         Ok(vec![])
     }
 
-    fn snapshot(&self) -> Result<Snapshot> {
-        self.snapshot_with_policy(&board_core::AgentPolicy::parse(
-            board_core::DEFAULT_AGENT_POLICY,
-        )?)
+    async fn snapshot(&self) -> Result<Snapshot> {
+        let policy = board_core::AgentPolicy::parse(board_core::DEFAULT_AGENT_POLICY)?;
+        self.snapshot_with_policy(&policy, SNAPSHOT_REQUEST_LIMIT)
+            .await
     }
 }
 
@@ -1123,24 +1432,14 @@ impl<T: Transport> GitHub<T> {
         Ok(text(receipt, "id")?.to_owned())
     }
 
-    fn diagnostic(&self) -> DiagnosticTransport<'_, T> {
-        DiagnosticTransport {
-            transport: &self.transport,
-            project: format!("{}/{}", self.owner, self.number),
-            repository: String::new(),
-        }
-    }
-
     /// The project's node ID, URL and complete field schema, without reading items.
     /// The returned URL must name the requested project before anything writes to its ID.
     pub fn schema(&self) -> Result<(String, Url, Vec<Value>)> {
         ensure!(self.number > 0, "project number must be positive");
         let diagnostic = self.diagnostic();
-        let transport = ReadBudget {
-            transport: &diagnostic,
-            remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
-        };
-        let (project, fields, complete) = read_schema(&transport, &self.owner, self.number)?;
+        let transport = ReadBudget::new(&diagnostic, SNAPSHOT_REQUEST_LIMIT);
+        let (project, fields, complete) =
+            ready(read_schema(&Blocking(&transport), &self.owner, self.number))?;
         let url: Url = text(&project, "url")?
             .parse()
             .context("parse project URL")?;
@@ -1466,7 +1765,7 @@ impl<T: Transport> GitHub<T> {
     pub fn open_board_issues(&self, project: &str, label: &str) -> Result<(Vec<BoardIssue>, bool)> {
         let diagnostic = self.diagnostic();
         let transport = ReadBudget::new(&diagnostic, SNAPSHOT_REQUEST_LIMIT);
-        let (members, mut complete) = connection(
+        let (members, mut complete) = sync_connection(
             &transport,
             &format!(
                 "query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2{{items(first:{ITEM_PAGE},after:$cursor){{nodes{{content{{__typename ... on Issue{{number state body repository{{nameWithOwner}} labels(first:{FOLLOW_UP_PAGE}){{nodes{{name}} pageInfo{{hasNextPage}}}}}}}}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
@@ -1528,15 +1827,32 @@ impl<T: Transport> GitHub<T> {
         );
         Ok(())
     }
+}
 
-    pub fn snapshot_with_policy(&self, policy: &board_core::AgentPolicy) -> Result<Snapshot> {
+impl<T> GitHub<T> {
+    fn diagnostic(&self) -> DiagnosticTransport<'_, T> {
+        DiagnosticTransport {
+            transport: &self.transport,
+            project: format!("{}/{}", self.owner, self.number),
+            repository: String::new(),
+        }
+    }
+}
+
+impl<T: GraphQl> GitHub<T> {
+    /// The whole board in at most `budget` requests: running out is an
+    /// error, never a partial snapshot. [`SNAPSHOT_REQUEST_LIMIT`] is the
+    /// default.
+    pub async fn snapshot_with_policy(
+        &self,
+        policy: &board_core::AgentPolicy,
+        budget: usize,
+    ) -> Result<Snapshot> {
         ensure!(self.number > 0, "project number must be positive");
         let diagnostic = self.diagnostic();
-        let transport = ReadBudget {
-            transport: &diagnostic,
-            remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
-        };
-        let (project, fields, mut complete) = read_schema(&transport, &self.owner, self.number)?;
+        let transport = ReadBudget::new(&diagnostic, budget);
+        let (project, fields, mut complete) =
+            read_schema(&transport, &self.owner, self.number).await?;
         let id = text(&project, "id")?;
         let clock = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)?;
@@ -1545,7 +1861,8 @@ impl<T: Transport> GitHub<T> {
             &snapshot_items_query(),
             json!({"id":id}),
             "/node/items",
-        )?;
+        )
+        .await?;
         complete &= members_complete;
         let mut items = Vec::new();
         for member in members {
@@ -1562,7 +1879,7 @@ impl<T: Transport> GitHub<T> {
                     || (kind == Some("PullRequest") && native_state == "MERGED"),
                 "unknown GitHub content state"
             );
-            let (values, values_complete) = item_field_values(&transport, &member)?;
+            let (values, values_complete) = item_field_values(&transport, &member).await?;
             let mut item_fields = BTreeMap::new();
             let mut values_supported = true;
             for mut value in values {
@@ -1628,7 +1945,8 @@ impl<T: Transport> GitHub<T> {
                     &content_fact_query(field, selection),
                     json!({"id":content_id}),
                     &format!("/node/{field}"),
-                )?;
+                )
+                .await?;
                 facts_complete &= full;
                 facts.insert(
                     field,
@@ -1763,6 +2081,181 @@ mod tests {
             ureq::tls::RootCerts::PlatformVerifier
         ));
         assert!(!tls.disable_verification());
+        // reqwest takes the preconfigured rustls only of its own version.
+        https_client().unwrap();
+    }
+
+    /// A [`Http`] that answers from a script, and counts what it is sent
+    /// and how many requests were in flight at once. Each takes a second.
+    #[derive(Default)]
+    struct Scripted {
+        replies: RefCell<VecDeque<Reply>>,
+        posts: std::cell::Cell<usize>,
+        in_flight: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+    }
+
+    impl Http for Scripted {
+        async fn post(&self, _: &str, _: &[u8]) -> Result<Reply> {
+            self.posts.set(self.posts.get() + 1);
+            self.in_flight.set(self.in_flight.get() + 1);
+            self.peak.set(self.peak.get().max(self.in_flight.get()));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            self.in_flight.set(self.in_flight.get() - 1);
+            Ok(self.replies.borrow_mut().pop_front().unwrap_or(Reply {
+                status: 200,
+                retry_after: None,
+                remaining: None,
+                reset: None,
+                body: br#"{"data":{"ok":true}}"#.to_vec(),
+            }))
+        }
+    }
+
+    /// A refusal with `Retry-After` and the rate-limit headers.
+    fn refused(status: u16, retry_after: Option<&str>, remaining: Option<&str>) -> Reply {
+        Reply {
+            status,
+            retry_after: retry_after.map(str::to_owned),
+            remaining: remaining.map(str::to_owned),
+            reset: Some("1000090".into()),
+            body: br#"{"message":"You have exceeded a secondary rate limit"}"#.to_vec(),
+        }
+    }
+
+    #[test]
+    fn rate_limit_wait_table() {
+        // The reset above is 90 seconds after this.
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for (reply, expected) in [
+            (refused(200, Some("30"), Some("0")), None),
+            (refused(500, Some("30"), Some("0")), None),
+            (refused(403, Some("30"), None), Some(30)),
+            (refused(429, Some("0"), None), Some(0)),
+            (refused(429, Some(" 7 "), Some("0")), Some(7)),
+            // Without Retry-After, the reset when no requests remain.
+            (refused(403, None, Some("0")), Some(90)),
+            (refused(429, Some("soon"), Some("0")), Some(90)),
+            // A 403 that is not a rate limit is a refusal, not retried.
+            (refused(403, None, None), None),
+            (refused(403, None, Some("12")), None),
+            (refused(429, None, None), None),
+        ] {
+            let context = (
+                reply.status,
+                reply.retry_after.clone(),
+                reply.remaining.clone(),
+            );
+            let wait = rate_limit_wait(&reply, now);
+            assert_eq!(wait, expected.map(Duration::from_secs), "{context:?}");
+        }
+        let past = std::time::UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let wait = rate_limit_wait(&refused(403, None, Some("0")), past);
+        assert_eq!(wait, Some(Duration::from_secs(1)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_retry_table() {
+        let limited = |after: &str| refused(429, Some(after), None);
+        // The script, then the requests made, the time waited between
+        // them and what the read ends with.
+        for (script, posts, waited, expected) in [
+            (vec![], 1, 0, "ok"),
+            (vec![limited("10")], 2, 10, "ok"),
+            (vec![refused(403, Some("30"), None); 2], 3, 60, "ok"),
+            // The reset, long past by the wall clock, waits a second.
+            (vec![refused(403, None, Some("0"))], 2, 1, "ok"),
+            // The retry bound: the last refusal is not waited out.
+            (
+                vec![limited("1"); RATE_LIMIT_RETRIES as usize + 1],
+                RATE_LIMIT_RETRIES as usize + 1,
+                u64::from(RATE_LIMIT_RETRIES),
+                "gave up after 3 retries",
+            ),
+            // The wait bound: a wait past it gives up at once, with
+            // today's error for the refusal.
+            (
+                vec![limited("3600")],
+                1,
+                0,
+                "gave up after 0 retries and 0s of waiting, asked to wait 3600s more: GitHub HTTP status 429: You have exceeded",
+            ),
+            (
+                vec![limited("100"), refused(403, Some("30"), None)],
+                2,
+                100,
+                "gave up after 1 retries and 100s of waiting, asked to wait 30s more: GitHub HTTP status 403",
+            ),
+            (
+                vec![limited("10"), limited(&u64::MAX.to_string())],
+                2,
+                10,
+                "gave up after 1 retries",
+            ),
+            // Not a rate limit: today's errors, without a retry.
+            (
+                vec![refused(403, None, None)],
+                1,
+                0,
+                "GitHub HTTP status 403",
+            ),
+            (vec![refused(401, Some("5"), None)], 1, 0, "authentication"),
+        ] {
+            let api = Api::with_http(Scripted {
+                replies: RefCell::new(script.into()),
+                ..Default::default()
+            });
+            let start = tokio::time::Instant::now();
+            let result = api.graphql("query", json!({})).await;
+            let outcome = match &result {
+                Ok(data) => {
+                    assert_eq!(data, &json!({"ok": true}));
+                    "ok".to_owned()
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(outcome.contains(expected), "{expected}: {outcome}");
+            assert_eq!(
+                result.is_err_and(|e| e.is::<AuthenticationRequired>()),
+                expected == "authentication"
+            );
+            assert_eq!(api.http.posts.get(), posts, "{expected}");
+            // Each request takes a second of the paused clock.
+            let elapsed = start.elapsed().as_secs();
+            assert_eq!(elapsed, waited + posts as u64, "{expected}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_cap_table() {
+        for requests in [1, MAX_IN_FLIGHT, MAX_IN_FLIGHT + 1, 3 * MAX_IN_FLIGHT] {
+            let api = Api::with_http(Scripted::default());
+            let start = tokio::time::Instant::now();
+            let mut reads: Vec<_> = (0..requests)
+                .map(|_| Box::pin(api.graphql("query", json!({}))))
+                .collect();
+            // Every read polled together on this task, as a join would.
+            std::future::poll_fn(|cx| {
+                reads.retain_mut(|read| match read.as_mut().poll(cx) {
+                    std::task::Poll::Ready(result) => {
+                        result.unwrap();
+                        false
+                    }
+                    std::task::Poll::Pending => true,
+                });
+                if reads.is_empty() {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            assert_eq!(api.http.posts.get(), requests);
+            assert_eq!(api.http.peak.get(), requests.min(MAX_IN_FLIGHT));
+            // A second per round of at most MAX_IN_FLIGHT requests.
+            let rounds = requests.div_ceil(MAX_IN_FLIGHT) as u64;
+            assert_eq!(start.elapsed().as_secs(), rounds, "{requests}");
+        }
     }
 
     struct Recorded {
@@ -1788,6 +2281,12 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .context("unexpected request")
+        }
+    }
+
+    impl GraphQl for Recorded {
+        async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            Transport::graphql(self, query, variables)
         }
     }
 
@@ -1998,8 +2497,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pagination_table() {
+    #[tokio::test]
+    async fn pagination_table() {
         for (responses, expected_complete, count, requests) in [
             (
                 vec![page(json!([{"id":"one"}]), false, Value::Null)],
@@ -2043,7 +2542,9 @@ mod tests {
                 variables: RefCell::new(vec![]),
             };
             let (nodes, complete) =
-                connection(&t, "recorded", json!({"id":"project"}), "/node/connection").unwrap();
+                connection(&t, "recorded", json!({"id":"project"}), "/node/connection")
+                    .await
+                    .unwrap();
             assert_eq!(complete, expected_complete);
             assert_eq!(nodes.len(), count);
             assert_eq!(t.variables.borrow().len(), requests);
@@ -2053,8 +2554,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn aggregate_request_budget_table() {
+    #[tokio::test]
+    async fn aggregate_request_budget_table() {
         for (pages, limit, succeeds) in [(2, 2, true), (3, 2, false)] {
             let t = Recorded {
                 responses: RefCell::new(
@@ -2068,7 +2569,7 @@ mod tests {
                 transport: &t,
                 remaining: std::cell::Cell::new(limit),
             };
-            let result = connection(&budget, "recorded", json!({}), "/node/connection");
+            let result = connection(&budget, "recorded", json!({}), "/node/connection").await;
             assert_eq!(result.is_ok(), succeeds);
             if !succeeds {
                 assert!(
@@ -2080,35 +2581,34 @@ mod tests {
             }
             assert_eq!(t.variables.borrow().len(), limit);
             // A second connection cannot reset the snapshot's aggregate budget.
-            assert!(connection(&budget, "another", json!({}), "/node/connection").is_err());
+            let another = connection(&budget, "another", json!({}), "/node/connection");
+            assert!(another.await.is_err());
+            // The sync paths share the paging and the budget.
+            let sync = sync_connection(&budget, "another", json!({}), "/node/connection");
+            assert!(sync.is_err());
             assert_eq!(t.variables.borrow().len(), limit);
         }
     }
 
-    #[test]
-    fn snapshot_unique_cursor_exhaustion() {
-        let mut responses = vec![json!({"repositoryOwner":{"projectV2":{"id":"P"}}})];
-        for i in 1..SNAPSHOT_REQUEST_LIMIT {
-            responses.push(json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{i}")}}}}));
+    #[tokio::test]
+    async fn snapshot_unique_cursor_exhaustion() {
+        // The default budget, and a smaller one the caller passes.
+        for budget in [SNAPSHOT_REQUEST_LIMIT, 5] {
+            let mut responses = vec![json!({"repositoryOwner":{"projectV2":{"id":"P"}}})];
+            for i in 1..SNAPSHOT_REQUEST_LIMIT {
+                responses.push(json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":format!("cursor-{i}")}}}}));
+            }
+            let github = recorded(responses);
+            let policy = board_core::AgentPolicy::parse(board_core::DEFAULT_AGENT_POLICY).unwrap();
+            let read = github.snapshot_with_policy(&policy, budget).await;
+            let error = read.unwrap_err();
+            assert!(error.to_string().contains("request budget exhausted"));
+            assert_eq!(github.transport.variables.borrow().len(), budget);
         }
-        let github = GitHub {
-            transport: Recorded {
-                responses: RefCell::new(responses.into()),
-                variables: RefCell::new(vec![]),
-            },
-            owner: "example".into(),
-            number: 1,
-        };
-        let error = github.snapshot().unwrap_err();
-        assert!(error.to_string().contains("request budget exhausted"));
-        assert_eq!(
-            github.transport.variables.borrow().len(),
-            SNAPSHOT_REQUEST_LIMIT
-        );
     }
 
-    #[test]
-    fn malformed_pagination_table() {
+    #[tokio::test]
+    async fn malformed_pagination_table() {
         for responses in [
             vec![page(json!([]), true, Value::Null)],
             vec![
@@ -2121,12 +2621,13 @@ mod tests {
                 responses: RefCell::new(responses.into()),
                 variables: RefCell::new(vec![]),
             };
-            assert!(connection(&t, "recorded", json!({}), "/node/connection").is_err());
+            let read = connection(&t, "recorded", json!({}), "/node/connection");
+            assert!(read.await.is_err());
         }
     }
 
-    #[test]
-    fn redacted_membership_blocks_reconcile() {
+    #[tokio::test]
+    async fn redacted_membership_blocks_reconcile() {
         let t = Recorded { responses: RefCell::new(vec![
             json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
             json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}),
@@ -2138,6 +2639,7 @@ mod tests {
             number: 1,
         }
         .snapshot()
+        .await
         .unwrap();
         assert!(!snapshot.coverage.complete);
         let policy = board_core::Policy {
@@ -2183,8 +2685,8 @@ mod tests {
         assert!(typed_field(&[], &BTreeMap::new(), "Status").is_err());
     }
 
-    #[test]
-    fn issue_and_pull_request_facts_table() {
+    #[tokio::test]
+    async fn issue_and_pull_request_facts_table() {
         for (kind, state, reason, repairs) in [
             ("Issue", "OPEN", None, 0),
             ("Issue", "CLOSED", None, 0),
@@ -2209,7 +2711,8 @@ mod tests {
                     json!([{"login":"human"}])
                 )]),
             );
-            let snapshot = recorded([project, fields, items]).snapshot().unwrap();
+            let github = recorded([project, fields, items]);
+            let snapshot = github.snapshot().await.unwrap();
             assert!(snapshot.coverage.complete);
             let item = &snapshot.items[0];
             assert!(item.fields_complete);
@@ -2236,8 +2739,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn agent_assignment_reader_table() {
+    #[tokio::test]
+    async fn agent_assignment_reader_table() {
         for (name, valid) in [
             (None, true),
             (Some("rust-worker"), true),
@@ -2259,7 +2762,9 @@ mod tests {
                 board_core::DEFAULT_AGENT_POLICY
             ))
             .unwrap();
-            let result = github.snapshot_with_policy(&policy);
+            let result = github
+                .snapshot_with_policy(&policy, SNAPSHOT_REQUEST_LIMIT)
+                .await;
             if valid {
                 assert_eq!(result.unwrap().items[0].assignment.as_deref(), name);
             } else {
@@ -2268,8 +2773,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn board_pages_table() {
+    #[tokio::test]
+    async fn board_pages_table() {
         const ITEMS: u64 = 250;
         // Item 7's connection that is longer than the page holds, and its
         // follow-up read: the request it makes and the response it gets.
@@ -2345,7 +2850,7 @@ mod tests {
             assert_eq!(page_requests, 3);
             responses.extend(follow_up.iter().map(|(_, response)| response.clone()));
             let github = recorded(responses);
-            let snapshot = github.snapshot().unwrap();
+            let snapshot = github.snapshot().await.unwrap();
             let requests = github.transport.variables.borrow().clone();
             assert_eq!(snapshot.items.len(), ITEMS as usize, "{case}");
             assert_eq!(snapshot.coverage.complete, complete, "{case}");
@@ -2372,8 +2877,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inline_field_connections_table() {
+    #[tokio::test]
+    async fn inline_field_connections_table() {
         // API-shaped synthetic responses: these four value types have no id.
         let fixture: Vec<Value> =
             serde_json::from_str(include_str!("../../../fixtures/github-field-values.json"))
@@ -2423,7 +2928,7 @@ mod tests {
                         .into_iter()
                         .chain(follow_up.map(|case| conn("fieldValues", values(case)))),
                 );
-                let snapshot = github.snapshot().unwrap();
+                let snapshot = github.snapshot().await.unwrap();
                 let context = format!("{field}/{case}/{follow_up:?}");
                 assert_eq!(snapshot.coverage.complete, expected_complete, "{context}");
                 assert_eq!(snapshot.items[0].fields_complete, expected_complete);

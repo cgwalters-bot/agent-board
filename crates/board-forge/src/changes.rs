@@ -34,7 +34,7 @@
 //! a list that goes somewhere public: every query reads each repository's
 //! `isPrivate`, so this costs no request, and a private repository is then
 //! neither listed, searched, nor named in a landing's `closes`.
-use crate::github::{ReadBudget, SNAPSHOT_REQUEST_LIMIT, Transport, connection, text};
+use crate::github::{ReadBudget, SNAPSHOT_REQUEST_LIMIT, Transport, sync_connection, text};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -136,7 +136,7 @@ pub fn parse_time(value: &str) -> Result<OffsetDateTime> {
 /// When the project's latest status update was posted, if it has one.
 pub fn last_update(t: &impl Transport, project: &str) -> Result<Option<OffsetDateTime>> {
     let budget = ReadBudget::new(t, SNAPSHOT_REQUEST_LIMIT);
-    let (updates, complete) = connection(
+    let (updates, complete) = sync_connection(
         &budget,
         UPDATES_QUERY,
         json!({"id": project}),
@@ -178,7 +178,7 @@ pub fn read(
     let viewer = budget.graphql(VIEWER_QUERY, json!({}))?;
     let mut authors = BTreeSet::from([text(&viewer["viewer"], "login")?.to_ascii_lowercase()]);
     authors.extend(operator.map(str::to_ascii_lowercase));
-    let (items, complete) = connection(
+    let (items, complete) = sync_connection(
         &budget,
         ITEMS_QUERY,
         json!({"id": project, "since": since}),
@@ -196,7 +196,7 @@ pub fn read(
         // Names come from GitHub, but they go into query text.
         crate::poll::validate_repository(&repo)?;
         for qualifier in SEARCHES {
-            let (found, complete) = connection(
+            let (found, complete) = sync_connection(
                 &budget,
                 SEARCH_QUERY,
                 json!({"q": format!("repo:{repo} is:pr {qualifier}:{range}")}),

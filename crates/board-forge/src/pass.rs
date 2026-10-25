@@ -10,6 +10,8 @@
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
+// `GraphQl` is named by path, not imported: `graphql` on a type of both
+// traits would be ambiguous.
 use crate::github::{API_ROOT, DEFAULT_HOST, Transport, is_github_login};
 use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
@@ -975,6 +977,14 @@ impl<C: Transport> Transport for Budget<'_, C> {
     }
 }
 
+/// The whole-board read of stage 5, the pass's one async read.
+impl<C: crate::github::GraphQl> crate::github::GraphQl for Budget<'_, C> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.spend(query.trim_start().starts_with("mutation"))?;
+        self.inner.graphql(query, variables).await
+    }
+}
+
 /// Not a forge request, so not one of the budget's.
 impl<C: Broker> Broker for Budget<'_, C> {
     fn usage(&self, url: &str) -> Result<Value> {
@@ -1023,13 +1033,14 @@ pub enum Mode<'a> {
 
 /// One pass at `now` within `limits`. `client` reads and writes as the bot;
 /// `dispatcher` starts runs. In [`Mode::Preview`], nothing is written or
-/// dispatched.
-pub fn run<C: Rest + Transport + Broker>(
+/// dispatched. Only stage 5's board read awaits ([`GraphQl`]); the rest of
+/// the pass is still sync.
+pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
     state: State,
-    (mode, limits): (Mode, Limits),
+    (mode, limits): (Mode<'_>, Limits),
     now: OffsetDateTime,
 ) -> Result<Report> {
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
@@ -1041,15 +1052,16 @@ pub fn run<C: Rest + Transport + Broker>(
         (state, mode, limits, now),
         &bounds,
     )
+    .await
 }
 
 /// [`run`] within `bounds` rather than [`PASS_REQUEST_LIMIT`] and
 /// [`PASS_SECONDS_LIMIT`].
-fn run_within<C: Rest + Transport + Broker>(
+async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
-    (state, mode, limits, now): (State, Mode, Limits, OffsetDateTime),
+    (state, mode, limits, now): (State, Mode<'_>, Limits, OffsetDateTime),
     bounds: &Bounds,
 ) -> Result<Report> {
     let caps = Caps::new(limits);
@@ -1060,16 +1072,17 @@ fn run_within<C: Rest + Transport + Broker>(
         (state, mode, now),
         bounds,
         &caps,
-    );
+    )
+    .await;
     report.summary = caps.summary();
     Ok(report)
 }
 
-fn stages<C: Rest + Transport + Broker>(
+async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
-    (state, mode, now): (State, Mode, OffsetDateTime),
+    (state, mode, now): (State, Mode<'_>, OffsetDateTime),
     bounds: &Bounds,
     caps: &Caps,
 ) -> Report {
@@ -1132,7 +1145,7 @@ fn stages<C: Rest + Transport + Broker>(
         scheduler.line(format!("schedule error: {error:#}"));
     }
     // Stage 5: board Status from the facts read, this pass's starts included.
-    if let Err(error) = scheduler.status(&git_ref) {
+    if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
         scheduler.line(format!("status error: {error:#}"));
     }
@@ -2431,19 +2444,28 @@ impl<C: Broker> Broker for Recorder<'_, C> {
     }
 }
 
+impl<C> Recorder<'_, C> {
+    fn keep_graphql(&self, request: Value, read: Result<Value>) -> Result<Value> {
+        let answer = match &read {
+            Ok(data) => json!({"data": data}),
+            Err(error) => json!({"error": format!("{error:#}")}),
+        };
+        self.keep(request, answer);
+        read
+    }
+}
+
 impl<C: Transport> Transport for Recorder<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let request = graphql_key(query, &variables);
-        match self.inner.graphql(query, variables) {
-            Ok(data) => {
-                self.keep(request, json!({"data": data}));
-                Ok(data)
-            }
-            Err(error) => {
-                self.keep(request, json!({"error": format!("{error:#}")}));
-                Err(error)
-            }
-        }
+        self.keep_graphql(request, self.inner.graphql(query, variables))
+    }
+}
+
+impl<C: crate::github::GraphQl> crate::github::GraphQl for Recorder<'_, C> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let request = graphql_key(query, &variables);
+        self.keep_graphql(request, self.inner.graphql(query, variables).await)
     }
 }
 
@@ -2510,8 +2532,17 @@ impl<C: Broker> Broker for Seeded<'_, C> {
 impl<C: Transport> Transport for Seeded<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         match self.seed.answer(&graphql_key(query, &variables)) {
-            Ok(_) => self.seed.graphql(query, variables),
+            Ok(_) => self.seed.data(query, variables),
             Err(_) => self.live.graphql(query, variables),
+        }
+    }
+}
+
+impl<C: crate::github::GraphQl> crate::github::GraphQl for Seeded<'_, C> {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        match self.seed.answer(&graphql_key(query, &variables)) {
+            Ok(_) => self.seed.data(query, variables),
+            Err(_) => self.live.graphql(query, variables).await,
         }
     }
 }
@@ -2543,13 +2574,26 @@ impl Broker for Replay {
     }
 }
 
-impl Transport for Replay {
-    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+impl Replay {
+    /// The recorded answer to a GraphQL request.
+    fn data(&self, query: &str, variables: Value) -> Result<Value> {
         let answer = self.answer(&graphql_key(query, &variables))?;
         match answer.get("error") {
             Some(error) => bail!("{}", error.as_str().unwrap_or("recorded error")),
             None => Ok(answer["data"].clone()),
         }
+    }
+}
+
+impl Transport for Replay {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.data(query, variables)
+    }
+}
+
+impl crate::github::GraphQl for Replay {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.data(query, variables)
     }
 }
 
