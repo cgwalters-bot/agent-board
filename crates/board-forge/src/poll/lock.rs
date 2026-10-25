@@ -488,6 +488,7 @@ mod tests {
             apply: None,
             dispatched: 0,
             queues: BTreeMap::new(),
+            updated: Default::default(),
             outages: None,
             paces: None,
             envelope: None,

@@ -208,6 +208,18 @@ are used, a conflict is a fix round as before. Setting it lets the poll start
 up to that many more runs for a pull request; the cap bounds runs on a base
 that keeps moving under it or a rebase that never lands.
 
+A head that is approved and green but behind a base without a merge queue
+whose rules require it up to date (`mergeStateStatus` `BEHIND`) is not merged:
+GitHub refuses that merge (agent-board#273). The bot's own pull request is
+instead rebased onto its base with `updatePullRequestBranch`, pinned to the
+approved head, at most one per base per pass; the rest on that base wait for a
+later pass, and the base moving again means another update. Updates are not
+counted against `rebaseRounds` or any cap but `--max-writes`. As after a rebase
+round, the new head needs the review's (or the operator's) approval again
+before it merges. A `mergeAuthors` pull request that is behind is a skip, left
+to its author. Only `BEHIND` is read: a head GitHub reports with another state,
+such as `BLOCKED`, is merged as before, and a refusal is an error.
+
 Stacked pull requests ([job plans](job-plans.md#stacking), agent-board#133):
 the poll merges or queues a pull request only into its repository's default
 branch (`defaultBranchRef`; one not read waits), so an approved, green pull

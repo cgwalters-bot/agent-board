@@ -107,6 +107,8 @@ const FAILED: &[&str] = &[
 ];
 const PASSED: &[&str] = &["SUCCESS", "SKIPPED", "NEUTRAL"];
 const CONFLICTING: &str = "CONFLICTING";
+/// The merge state of a head behind a base that requires it up to date.
+const BEHIND: &str = "BEHIND";
 // The harness's words where an author's should be (cgwalters-forge/tracker#517).
 const PLACEHOLDER_PREFIX: &str = "Agent run ";
 const PARTIAL_TITLE_PREFIX: &str = "[partial:";
@@ -188,6 +190,10 @@ const FAILED_RUNS: &[&str] = &["failure", "timed_out"];
 // admission. Auto-merge remains excluded because it can admit a later push.
 const MERGE: &str = "mutation($id: ID!, $head: GitObjectID!) { mergePullRequest(input: {pullRequestId: $id, mergeMethod: REBASE, expectedHeadOid: $head}) { clientMutationId } }";
 const ENQUEUE: &str = "mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { clientMutationId } }";
+// A head behind a base that requires it up to date, which GitHub refuses to
+// merge (#273), is rebased onto the base instead; the new head is reviewed
+// again before it merges.
+const UPDATE: &str = "mutation($id: ID!, $head: GitObjectID!) { updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $head, updateMethod: REBASE}) { clientMutationId } }";
 
 /// What `PULL_QUERY` and `CHECKS_QUERY` read of each check, so a later page
 /// is read as the first one is.
@@ -205,7 +211,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number url title body state isDraft mergeable headRefOid headRefName baseRefName isCrossRepository
+      id number url title body state isDraft mergeable mergeStateStatus headRefOid headRefName baseRefName isCrossRepository
       baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
       author { __typename login }
       headRepositoryOwner { login }
@@ -3021,6 +3027,11 @@ struct Pass<'a, R, G> {
     /// entries were read, and the entries and their files, with what this pass
     /// added to it after.
     queues: BTreeMap<(String, String), (bool, Vec<Entry>)>,
+    /// The base branches, by repository, a behind pull request was brought
+    /// up to date with this pass. Once that one merges the base moves again,
+    /// so updating the others in the same pass would spend their reviews
+    /// sooner; they wait for a later pass.
+    updated: BTreeSet<(String, String)>,
     /// The broker's outages, read once a pass and only for a failed run.
     outages: Option<Outages>,
     /// The pools' modes, read once a pass where `pace` is set.
@@ -3706,6 +3717,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     Ok(Some(
                         "not merged: the base no longer has a merge queue".into(),
                     ))
+                } else if pull["mergeStateStatus"] == BEHIND {
+                    // Only the bot's own: a `mergeAuthors` one is a skip
+                    // before it gets here. The approval was of the old head
+                    // and does not carry over.
+                    let base = text(pull, "/baseRefName");
+                    if !self.updated.insert((repo.to_owned(), base.to_owned())) {
+                        return Ok(Some(format!(
+                            "not merged: behind {base}; another pull request was brought up to date with it this pass, so this one waits"
+                        )));
+                    }
+                    self.mutate(UPDATE, json!({"id": id, "head": head}))?;
+                    Ok(Some(format!(
+                        "brought up to date with {base}; waits for the review of the new head"
+                    )))
                 } else {
                     let repo_settings = self.get(&format!("repos/{repo}"))?;
                     let method = [
@@ -4688,6 +4713,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 ),
             );
         }
+        // GitHub refuses to merge it directly (#273), and the branch is its
+        // author's to update; the bot's own is updated where it is taken.
+        if merge_only
+            && decision.action == "merge"
+            && !*queued
+            && pull["mergeStateStatus"] == BEHIND
+        {
+            decision = step("skip", format!("behind {base}, left to its author"));
+        }
         // Whatever its checks say of the old base, a broken or moved stack
         // comes first: a round started against a merged branch is wasted.
         let mut retarget = None;
@@ -4923,6 +4957,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         apply,
         dispatched: 0,
         queues: BTreeMap::new(),
+        updated: BTreeSet::new(),
         outages: None,
         paces: None,
         envelope: None,
@@ -5187,6 +5222,7 @@ mod tests {
     fn pull_with_author(name: &str, change: Value, author: Value) -> Value {
         let mut p = fixture(name);
         p["mergeable"] = "MERGEABLE".into();
+        p["mergeStateStatus"] = "CLEAN".into();
         // The recordings predate `baseRepository`; the forge is public.
         p["baseRepository"] = json!({"nameWithOwner": REPO, "isPrivate": false,
             "defaultBranchRef": {"name": "main"}});
@@ -8492,6 +8528,149 @@ mod tests {
             } else {
                 assert!(writes[0].0.contains(&format!("mergeMethod: {method}")));
             }
+        }
+    }
+
+    #[test]
+    fn a_behind_head_is_updated_once_a_base_and_never_merged() {
+        // #469 comes first, then #470; both approved and green on main.
+        let (update, merge) = ("update", "merge");
+        for (queue, author, states, apply, expected, line) in [
+            (
+                false,
+                BOT,
+                [BEHIND, BEHIND],
+                true,
+                vec![(update, 469)],
+                "#470 488f45ebacd0 merge: review approved and checks green -> not merged: behind main",
+            ),
+            (
+                false,
+                "updater",
+                [BEHIND, BEHIND],
+                true,
+                vec![(update, 470)],
+                "#469 488f45ebacd0 skip: behind main, left to its author",
+            ),
+            (
+                false,
+                BOT,
+                ["CLEAN", BEHIND],
+                true,
+                vec![(merge, 469), (update, 470)],
+                "#470 488f45ebacd0 merge: review approved and checks green -> brought up to date with main; waits for the review of the new head",
+            ),
+            (
+                false,
+                BOT,
+                ["CLEAN", "CLEAN"],
+                true,
+                vec![(merge, 469), (merge, 470)],
+                "#470 488f45ebacd0 merge: review approved and checks green -> merged",
+            ),
+            (
+                true,
+                BOT,
+                [BEHIND, BEHIND],
+                true,
+                vec![(ENQUEUE, 469), (ENQUEUE, 470)],
+                "#470 488f45ebacd0 merge: review approved and checks green -> added to the merge queue",
+            ),
+            (
+                false,
+                BOT,
+                [BEHIND, BEHIND],
+                false,
+                vec![],
+                "#469 488f45ebacd0 merge: review approved and checks green",
+            ),
+        ] {
+            let mut fake = github();
+            if queue {
+                fake.rest
+                    .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                    .unwrap()
+                    .3
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "merge_queue"}));
+            }
+            let listed = if author == BOT {
+                BOT.to_owned()
+            } else {
+                format!("{author}[bot]")
+            };
+            fake.page(
+                &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                None,
+                None,
+                json!([
+                    {"number": 469, "user": {"login": listed}},
+                    {"number": 470, "user": {"login": BOT}}
+                ]),
+            );
+            fake.page(
+                &format!("repos/{REPO}/issues/469/comments?per_page=100"),
+                None,
+                None,
+                json!([]),
+            );
+            let mut p = pull(
+                "pull-470",
+                json!({"id": "pull-469", "number": 469, "mergeStateStatus": states[0]}),
+            );
+            let kind = if author == BOT { "User" } else { "Bot" };
+            p["author"] = json!({"__typename": kind, "login": author});
+            p["reviews"]["nodes"] = json!([review(
+                "APPROVED",
+                json!({"__typename": "User", "login": "cgwalters"}),
+                HEAD,
+                "approved"
+            )]);
+            fake.pulls.insert(469, p);
+            let p = fake.pulls.get_mut(&470).unwrap();
+            p["id"] = "pull-470".into();
+            p["mergeStateStatus"] = states[1].into();
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(&json!({"mergeAuthors": ["updater[bot]"]})).unwrap();
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                if apply { applying(&dispatcher) } else { None },
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(
+                outcome.lines.iter().any(|l| l.contains(line)),
+                "{line}: {:?}",
+                outcome.lines
+            );
+            let writes: Vec<_> = fake
+                .writes
+                .borrow()
+                .iter()
+                .map(|(query, variables)| {
+                    let kind = match query.as_str() {
+                        UPDATE => update,
+                        q if q.contains("mergePullRequest") => merge,
+                        q => q,
+                    };
+                    assert_eq!(variables["head"], HEAD);
+                    (kind.to_owned(), variables["id"].clone())
+                })
+                .collect();
+            let expected: Vec<_> = expected
+                .iter()
+                .map(|(kind, number)| (kind.to_string(), json!(format!("pull-{number}"))))
+                .collect();
+            assert_eq!(writes, expected, "{:?}", outcome.lines);
+            assert!(dispatcher.writes.borrow().is_empty());
         }
     }
 
@@ -12053,6 +12232,7 @@ mod tests {
             apply: None,
             dispatched: 0,
             queues: BTreeMap::new(),
+            updated: BTreeSet::new(),
             outages: None,
             paces: None,
             envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),

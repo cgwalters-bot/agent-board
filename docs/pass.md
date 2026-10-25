@@ -195,8 +195,8 @@ two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
 starts, stage 2's fix, rebase, continuation and answer rounds, stage 3's
 planning run and stage 4's starts together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
-1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues
-and merges, stage 3's
+1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues,
+merges and branch updates, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
 and its recovery, and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
