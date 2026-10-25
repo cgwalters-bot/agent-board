@@ -96,19 +96,31 @@ publishes one update using the operator's project-write token. Status is require
 `on-track`, `at-risk`, or `off-track`. Nothing schedules or enables automatic
 publication. This is an explicit operator write, not delegated output application.
 
-Pass `--body FILE` to publish a UTF-8 body verbatim. Without it, the command reads
-the project's status history and reports issue and pull request activity strictly
-after the latest update's creation time. The first report covers all current
-members. Each changed member appears once, sorted by repository, number and kind,
-as closed, created, or updated (in that precedence). Titles and bodies are not
-included. No activity still produces an explicit empty report.
+Pass `--body FILE` to publish a UTF-8 body verbatim. Without it, the command
+posts the project's changes since its latest update (the week before now for a
+first update): `agent-board changes --since TIME` prints the same list, as
+Markdown or `--format json`. Its sections are **Landed** (pull requests merged,
+with the issues each closes), **Closed** (issues and pull requests closed
+without a merge), **Opened**, and **Held** (a `needs-human` or `needs-design`
+label added or removed, marked released when none is left). Besides the
+project's items, it searches each repository they are in for pull requests
+merged or opened in the window. Every merged one counts as Landed; a new one
+counts as Opened only when the token's own login or the `operator` of
+`--board-config` wrote it. Apps' and dependency bots' pull requests (a `Bot`
+author, a login ending in `[bot]`, renovate or dependabot) get one count line
+at the end of their section instead of lines of their own; project items are
+always listed. Landed is grouped by repository past eight lines. Each item appears
+once, in the first of Landed, Closed, Opened and Held it fits, and every line is
+`[owner/repo#N](url) title`, sorted by repository and number. Empty sections are
+left out; with no changes the body says `No changes since TIME`.
 
-The summary describes current members' content timestamps, not a historical board
-diff: removed members and field-only changes cannot be recovered from these facts.
-Incomplete reads, draft/redacted members and invalid timestamps fail rather than
-publish a misleading summary. Reads use the existing pagination request limit.
-Bodies must be nonempty and at most 4,000 Unicode characters; oversized summaries
-fail rather than silently drop activity. Use a concise body file in that case.
+Apart from those pull requests, the list describes current members, not a
+historical board diff: removed members, project-field changes and draft issues
+are not in it. Incomplete reads,
+redacted members and invalid timestamps fail rather than publish a misleading
+list. Reads use the existing pagination request limit. Bodies are at most 4,000
+Unicode characters; a longer list trims its longest sections, each ending with
+`+K more`.
 
 The command rejects offline snapshots and JSON rendering and prints the created
 update node ID. It requires project write permission, checks the requested project

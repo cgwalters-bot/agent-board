@@ -276,7 +276,7 @@ fn apps_create_cli_refusals() {
 }
 
 #[test]
-fn status_update_cli_refusals() {
+fn live_project_cli_refusals() {
     for (args, reason) in [
         (vec!["project", "status-update"], "--status"),
         (
@@ -304,6 +304,31 @@ fn status_update_cli_refusals() {
                 "project",
             ],
             "does not support --json",
+        ),
+        (vec!["changes"], "--since"),
+        (
+            vec![
+                "changes",
+                "--since",
+                "2026-10-20T00:00:00Z",
+                "--format",
+                "html",
+            ],
+            "invalid value",
+        ),
+        (
+            vec![
+                "changes",
+                "--since",
+                "2026-10-20T00:00:00Z",
+                "--snapshot",
+                &fixture(),
+            ],
+            "requires a live project",
+        ),
+        (
+            vec!["changes", "--since", "2026-10-20T00:00:00Z", "--json", "x"],
+            "--format json",
         ),
     ] {
         let output = command().args(args).assert().code(1).get_output().clone();

@@ -17,6 +17,7 @@ Commands:
 - [`action`](#agent-board-action): Validate proposed operator mutations; never execute them
 - [`check`](#agent-board-check): Check proposals without applying them
 - [`project`](#agent-board-project): Inspect a project's summary and schema
+- [`changes`](#agent-board-changes): What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed
 - [`item`](#agent-board-item): List or inspect board items
 - [`ask`](#agent-board-ask): Ask the operator a question as an issue, list or resolve asks
 - [`run`](#agent-board-run): Propose run field updates, or write them with --apply
@@ -141,7 +142,20 @@ agent-board project status-update [OPTIONS] --status <STATUS>
 Options:
 
 - `--status <STATUS>`: Overall project health (possible values: `on-track`, `at-risk`, `off-track`)
-- `--body <FILE>`: Read the update body from a UTF-8 file; otherwise summarize since the last update
+- `--body <FILE>`: Read the update body from a UTF-8 file; otherwise post the changes since the last update
+
+## agent-board changes
+
+What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed
+
+```text
+agent-board changes [OPTIONS] --since <SINCE>
+```
+
+Options:
+
+- `--since <SINCE>`: Start of the window, RFC 3339 (such as 2026-10-23T00:00:00Z)
+- `--format <FORMAT>`: Output format (possible values: `markdown`, `json`) (default: `markdown`)
 
 ## agent-board item
 

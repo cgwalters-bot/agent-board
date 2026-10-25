@@ -235,7 +235,7 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"close","repository":"OWNER/repo","item":1,"triage_run":"https://github.com/OWNER/tracker/actions/runs/456","triage_comment":789}
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
 {"type":"supervisor_action","action":"replace_state","body":"Arbitrary memory, including structured state."}
-{"type":"supervisor_action","action":"status_update","status":"on-track","body":"Project progress."}
+{"type":"supervisor_action","action":"status_update","status":"on-track","summary":"What it means.","notes":{"OWNER/repo#1":"Why it matters."}}
 ```
 
 Dispatch uses the configured pool allowlist and kind-to-pool assignments, and
@@ -264,8 +264,16 @@ comment markers or the triage-done receipt phrase below: an injected request
 must not forge a bot-authored plan, poll marker or closure receipt. State alone
 allows arbitrary text (including empty memory), bounded by 60,000 characters
 and the batch byte limit. Its action replaces only the configured issue body.
-Status accepts `on-track`, `at-risk` or `off-track` and publishes the supplied
-body using the same Projects v2 mutation as `project status-update`.
+Status accepts `on-track`, `at-risk` or `off-track`. The executor writes the
+body itself, as `project status-update` does: the project's changes since its
+last status update (see [operator](operator.md#project-status-updates)), under
+the agent's `summary` (at most 1,000 characters, every full `owner/repo#N`
+linked, and a short `repo#N` when one covered repository has that name) and
+with each of its `notes` (at most 20, one line and 280 characters each, keyed
+by ref) on that item's line, or under **Also** when the item is not listed.
+The changes are read before the first write of the batch. A body that cannot
+be read or fit refuses that request alone, with its reason in the log; the
+batch's other requests, dispatches included, still go ahead.
 
 A comment or new issue is the agent's text posted as the bot, so the executor appends the
 fixed visible note, an `agent-board-supervisor-note` fenced JSON block (the

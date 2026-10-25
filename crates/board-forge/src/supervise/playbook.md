@@ -69,12 +69,23 @@ use exactly these fields in addition to `type` and `action`:
   request whose only problem is a merge conflict, approved and green on the
   same head as its stop marker, may be removed. No arbitrary labels.
 - `replace_state`: `body`; only the configured state issue body is replaced.
-- `status_update`: `status` (`on-track`, `at-risk`, `off-track`), `body`; only
-  the configured project, at most once per rolling day. When the cap is
-  positive, the daily pass sends one unless one went out in the last day,
-  even when nothing else needs doing: it is how the operator follows the
-  board. Say in plain prose what moved since the last update, what waits on
-  the operator (with links), and what runs next.
+- `status_update`: `status` (`on-track`, `at-risk`, `off-track`), `summary`,
+  optional `notes`; only the configured project, at most once per rolling day.
+  When the cap is positive, the daily pass sends one unless one went out in
+  the last day, even when nothing else needs doing: it is how the operator
+  follows the board. You do not write the facts: the executor lists what
+  landed, closed, opened and changed hold since the last update, each line a
+  link (`agent-board changes --since TIME` prints the same list). `summary`
+  is a few sentences, at most 1,000 characters, on what the list means: what
+  waits on the operator and what runs next. Name items as full
+  `owner/repo#N`, which the executor links. A short `repo#N` works too when
+  only one of the board's repositories has that name, but full refs are
+  preferred. `notes` is an object of at most 20 one-line notes of at most 280
+  characters, keyed by ref, such as
+  `{"owner/repo#12": "Unblocks the cutover."}`. A note goes on its item's
+  line, or under **Also** when the item is not listed. If the list cannot
+  be read, only the status update is refused; the rest of the batch goes
+  ahead.
 
 Ordinary targets cannot be epics or the supervisor's requests, log or state
 issues. Public bodies are nonempty, at most 4,000 characters, and cannot hold

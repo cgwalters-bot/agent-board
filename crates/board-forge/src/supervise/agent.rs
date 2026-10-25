@@ -746,7 +746,7 @@ fn prepare(
                 .as_str(),
         "The requests comment is not the bot's as posted"
     );
-    let requests = judgment::parse_batch(
+    let mut requests = judgment::parse_batch(
         &extract(comment["body"].as_str().unwrap_or_default())?,
         policy,
     )?;
@@ -761,8 +761,8 @@ fn prepare(
     }
     .validate()
     .context("No default branch to dispatch on")?;
-    for r in &requests {
-        r.preflight(api, policy)?;
+    for r in &mut requests {
+        r.preflight(api, policy, ctx.now)?;
     }
     // Counted, then recorded: two executors at once could both count before
     // either records. The caller runs one at a time (supervisor.yml's
@@ -809,9 +809,10 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
         }
     };
     let mut ok = true;
+    let mut stopped = false;
     let mut lines = vec![];
     for r in &requests {
-        if !ok {
+        if stopped {
             lines.push(format!("- {}: not attempted", r.describe()));
             continue;
         }
@@ -822,6 +823,7 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
             Err(error) => {
                 // Stop at the first failure: a failing dispatch is likely to fail again.
                 ok = false;
+                stopped = r.stops_batch();
                 lines.push(format!("- {}: failed ({error:#}), {link}", r.describe()));
             }
         }

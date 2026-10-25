@@ -1,5 +1,6 @@
 //! GitHub Projects v2 read transport. Connections are exhausted, never inferred complete.
 use super::Forge;
+use crate::changes::{self, Changes};
 use anyhow::{Context, Result, ensure};
 use board_core::{Capability, Coverage, Evidence, Item, ItemRef, Snapshot};
 use serde_json::{Value, json};
@@ -370,7 +371,7 @@ impl<T: Transport> Transport for DiagnosticTransport<'_, T> {
 
 // Shared across every connection and per-item read in one snapshot. Exhaustion
 // returns an error, never a partial snapshot that could yield proposals.
-const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
+pub(crate) const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
 
 // A snapshot page reads each item's field values, labels and assignees inline,
 // so a board costs a request per page rather than three per item (#276).
@@ -442,9 +443,18 @@ fn content_fact_query(field: &str, selection: &str) -> String {
     )
 }
 
-struct ReadBudget<'a, T> {
+pub(crate) struct ReadBudget<'a, T> {
     transport: &'a T,
     remaining: std::cell::Cell<usize>,
+}
+
+impl<'a, T> ReadBudget<'a, T> {
+    pub(crate) fn new(transport: &'a T, limit: usize) -> Self {
+        Self {
+            transport,
+            remaining: std::cell::Cell::new(limit),
+        }
+    }
 }
 
 impl<T: Transport> Transport for ReadBudget<'_, T> {
@@ -802,13 +812,13 @@ pub struct GitHub<T> {
     pub number: u64,
 }
 
-fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+pub(crate) fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
         .with_context(|| format!("missing GitHub {key}"))
 }
 
-fn connection(
+pub(crate) fn connection(
     t: &impl Transport,
     query: &str,
     variables: Value,
@@ -1038,69 +1048,23 @@ fn validate_status_body(body: &str) -> Result<()> {
     Ok(())
 }
 
-fn status_summary(items: &[Value], since: Option<&str>) -> Result<String> {
-    let parse = |s: &str| {
-        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-            .context("invalid status summary timestamp")
-    };
-    let cutoff = since.map(parse).transpose()?;
-    let mut changes = BTreeMap::new();
-    for item in items {
-        let content = &item["content"];
-        ensure!(
-            matches!(
-                content["__typename"].as_str(),
-                Some("Issue" | "PullRequest")
-            ),
-            "cannot summarize redacted or draft project items"
-        );
-        let created = parse(text(content, "createdAt")?)?;
-        let updated = parse(text(content, "updatedAt")?)?;
-        ensure!(
-            content
-                .get("closedAt")
-                .is_some_and(|value| value.is_null() || value.is_string()),
-            "missing or invalid closedAt"
-        );
-        let closed = content["closedAt"].as_str().map(parse).transpose()?;
-        if cutoff.is_some_and(|cutoff| updated <= cutoff) {
-            continue;
-        }
-        let change = if closed.is_some_and(|closed| cutoff.is_none_or(|cutoff| closed > cutoff)) {
-            "closed"
-        } else if cutoff.is_none_or(|cutoff| created > cutoff) {
-            "created"
-        } else {
-            "updated"
-        };
-        let repo = text(&content["repository"], "nameWithOwner")?;
-        let number = content["number"]
-            .as_u64()
-            .context("missing content number")?;
-        let kind = text(content, "__typename")?;
-        ensure!(
-            changes.insert((repo, number, kind), change).is_none(),
-            "duplicate project content"
-        );
-    }
-    let mut body = match since {
-        Some(since) => format!("Project activity since {since}:\n"),
-        None => "Project activity (first status update):\n".to_owned(),
-    };
-    if changes.is_empty() {
-        body.push_str("\nNo issue or pull request activity.\n");
-    }
-    for ((repo, number, kind), change) in changes {
-        use std::fmt::Write;
-        writeln!(body, "- {repo}#{number} ({kind}): {change}")?;
-    }
-    validate_status_body(&body)?;
-    Ok(body)
-}
-
 impl<T: Transport> GitHub<T> {
+    /// The project's changes since `since`, read with the snapshot's request
+    /// budget; new pull requests outside the board are listed when the token's
+    /// viewer or `operator` wrote them.
+    pub fn changes(&self, since: time::OffsetDateTime, operator: Option<&str>) -> Result<Changes> {
+        let (id, _, _) = self.schema()?;
+        changes::read(&self.diagnostic(), &id, since, operator)
+    }
+
     /// Explicit operator publication, not delegated output application.
-    pub fn status_update(&self, status: &str, body: Option<&str>) -> Result<String> {
+    /// `operator` is as for [`Self::changes`], when the body is generated.
+    pub fn status_update(
+        &self,
+        status: &str,
+        body: Option<&str>,
+        operator: Option<&str>,
+    ) -> Result<String> {
         let status = match status {
             "on-track" => "ON_TRACK",
             "at-risk" => "AT_RISK",
@@ -1116,40 +1080,15 @@ impl<T: Transport> GitHub<T> {
             Some(body) => body,
             None => {
                 let diagnostic = self.diagnostic();
-                let transport = ReadBudget {
-                    transport: &diagnostic,
-                    remaining: std::cell::Cell::new(SNAPSHOT_REQUEST_LIMIT),
+                let since = match changes::last_update(&diagnostic, &id)? {
+                    Some(since) => since,
+                    None => time::OffsetDateTime::now_utc() - changes::FIRST_WINDOW,
                 };
-                let (updates, complete) = connection(
-                    &transport,
-                    "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{statusUpdates(first:100,after:$cursor){nodes{createdAt} pageInfo{hasNextPage endCursor}}}}}",
-                    json!({"id":id}),
-                    "/node/statusUpdates",
+                generated = changes::read(&diagnostic, &id, since, operator)?.status_body(
+                    None,
+                    &BTreeMap::new(),
+                    STATUS_BODY_LIMIT,
                 )?;
-                ensure!(complete, "incomplete status update history");
-                let since = updates
-                    .iter()
-                    .map(|u| {
-                        let value = text(u, "createdAt")?;
-                        let timestamp = time::OffsetDateTime::parse(
-                            value,
-                            &time::format_description::well_known::Rfc3339,
-                        )
-                        .context("invalid status update timestamp")?;
-                        Ok((timestamp, value))
-                    })
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .max()
-                    .map(|(_, value)| value);
-                let (items, complete) = connection(
-                    &transport,
-                    "query($id:ID!,$cursor:String){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{content{__typename ... on Issue{number createdAt updatedAt closedAt repository{nameWithOwner}} ... on PullRequest{number createdAt updatedAt closedAt repository{nameWithOwner}}}} pageInfo{hasNextPage endCursor}}}}}",
-                    json!({"id":id}),
-                    "/node/items",
-                )?;
-                ensure!(complete, "incomplete project items");
-                generated = status_summary(&items, since)?;
                 &generated
             }
         };
@@ -1794,7 +1733,10 @@ mod tests {
                     variables: RefCell::new(vec![]),
                 },
             };
-            assert_eq!(github.status_update(status, Some("Report")).unwrap(), "U");
+            assert_eq!(
+                github.status_update(status, Some("Report"), None).unwrap(),
+                "U"
+            );
             assert_eq!(
                 github.transport.variables.borrow()[2],
                 json!({"project":"P","body":"Report","status":native})
@@ -1804,65 +1746,16 @@ mod tests {
                 " ".to_owned(),
                 "x".repeat(STATUS_BODY_LIMIT + 1),
             ] {
-                assert!(github.status_update(status, Some(&body)).is_err());
+                assert!(github.status_update(status, Some(&body), None).is_err());
             }
-            assert!(github.status_update("unknown", Some("Report")).is_err());
+            assert!(
+                github
+                    .status_update("unknown", Some("Report"), None)
+                    .is_err()
+            );
+            assert!(validate_status_body(&"é".repeat(STATUS_BODY_LIMIT)).is_ok());
             assert_eq!(github.transport.variables.borrow().len(), 3);
         }
-    }
-
-    #[test]
-    fn summary_is_sorted_and_since_last_update() {
-        let make = |number, created, updated, closed| json!({"content":{"__typename":"Issue","repository":{"nameWithOwner":"example/repo"},"number":number,"createdAt":created,"updatedAt":updated,"closedAt":closed}});
-        let old = "2026-10-01T00:00:00Z";
-        let cutoff = "2026-10-02T00:00:00Z";
-        let new = "2026-10-03T00:00:00Z";
-        let items = vec![
-            make(3, old, new, Some(new)),
-            make(2, new, new, None),
-            make(1, old, new, None),
-            make(4, old, cutoff, None),
-        ];
-        let body = status_summary(&items, Some(cutoff)).unwrap();
-        assert_eq!(
-            body,
-            format!(
-                "Project activity since {cutoff}:\n- example/repo#1 (Issue): updated\n- example/repo#2 (Issue): created\n- example/repo#3 (Issue): closed\n"
-            )
-        );
-        let mut reversed = items.clone();
-        reversed.reverse();
-        assert_eq!(status_summary(&reversed, Some(cutoff)).unwrap(), body);
-        assert!(
-            status_summary(&[], None)
-                .unwrap()
-                .contains("first status update")
-        );
-        assert!(status_summary(&[json!({"content":null})], None).is_err());
-        assert!(status_summary(&items, Some("bad date")).is_err());
-        assert!(validate_status_body(&"é".repeat(STATUS_BODY_LIMIT)).is_ok());
-        let mut pr = make(5, new, new, None);
-        pr["content"]["__typename"] = json!("PullRequest");
-        assert!(
-            status_summary(&[pr], Some(cutoff))
-                .unwrap()
-                .contains("(PullRequest): created")
-        );
-        let many: Vec<_> = (1..200)
-            .map(|number| make(number, new, new, None))
-            .collect();
-        assert!(
-            status_summary(&many, None)
-                .unwrap_err()
-                .to_string()
-                .contains("exceeds")
-        );
-        let mut missing = make(1, old, new, None);
-        missing["content"]
-            .as_object_mut()
-            .unwrap()
-            .remove("closedAt");
-        assert!(status_summary(&[missing], None).is_err());
     }
 
     #[test]
@@ -1879,7 +1772,7 @@ mod tests {
             } else {
                 "https://github.com/orgs/example/projects/1"
             };
-            let body = "Project activity since 2026-10-02T00:00:00Z:\n\nNo issue or pull request activity.\n";
+            let body = "No changes since 2026-10-02T00:00:00Z\n";
             let github = GitHub {
                 owner: "example".into(),
                 number: 1,
@@ -1888,25 +1781,29 @@ mod tests {
                         json!({"repositoryOwner":{"projectV2":{"id":"P","url":url}}}),
                         json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}),
                         json!({"node":{"statusUpdates":{"nodes":[{"createdAt":"2026-10-02T00:00:00Z"},{"createdAt":"2026-10-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}}),
+                        json!({"viewer":{"login":"worker"}}),
                         json!({"node":{"items":{"nodes":if case == "redacted" {json!([{"content":null}])} else {json!([])},"pageInfo":{"hasNextPage":case == "incomplete","endCursor":null}}}}),
                         json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":if case == "receipt" {"wrong"} else {body},"status":"ON_TRACK"}}}),
                     ])),
                     variables: RefCell::new(vec![]),
                 },
             };
-            let result = github.status_update("on-track", None);
+            let result = github.status_update("on-track", None, None);
             assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
             let count = github.transport.variables.borrow().len();
             assert_eq!(
                 count,
                 match case {
                     "wrong-project" => 2,
-                    "incomplete" | "redacted" => 4,
-                    _ => 5,
+                    "incomplete" | "redacted" => 5,
+                    _ => 6,
                 }
             );
             if case == "valid" {
-                assert_eq!(github.transport.variables.borrow()[4]["body"], body);
+                let variables = github.transport.variables.borrow();
+                // The window starts at the latest update, not the first listed.
+                assert_eq!(variables[4]["since"], "2026-10-02T00:00:00Z");
+                assert_eq!(variables[5]["body"], body);
             }
         }
     }

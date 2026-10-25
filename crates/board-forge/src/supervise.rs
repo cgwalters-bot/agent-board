@@ -58,6 +58,15 @@ impl Api for Client {
     }
 }
 
+/// The supervisor's reads, for code written against a GraphQL [`Transport`].
+pub(crate) struct Graphql<'a>(pub &'a dyn Api);
+
+impl Transport for Graphql<'_> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.0.graphql(query, variables)
+    }
+}
+
 /// The health pass's bounds: a census too large or an API call that stalls
 /// must not exhaust the runner or the token's rate limit. It writes nothing;
 /// a write or a GraphQL mutation through it is refused.

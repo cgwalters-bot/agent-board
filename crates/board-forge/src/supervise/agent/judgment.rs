@@ -2,7 +2,9 @@
 //! bot-authored plans, poll markers or execution receipts on the next pass.
 use super::*;
 use crate::Footer;
+use crate::changes;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 pub const ACTIONS: &[&str] = &[
     "comment",
@@ -47,11 +49,25 @@ pub enum Write {
     ReplaceState {
         body: String,
     },
+    /// The executor writes the body: `summary` over the project's changes
+    /// since its last status update, each of `notes` (keyed `owner/repo#N`)
+    /// on its item's line.
     StatusUpdate {
         status: String,
-        body: String,
+        summary: String,
+        #[serde(default)]
+        notes: BTreeMap<String, String>,
+        /// Built by [`Checked::preflight`], read before any write; the
+        /// reason it could not be, which refuses this request alone.
+        #[serde(skip)]
+        body: Option<std::result::Result<String, String>>,
     },
 }
+
+/// A status update's own text: the facts come from the forge.
+const SUMMARY_LIMIT: usize = 1_000;
+const NOTE_LIMIT: usize = 280;
+const MAX_NOTES: usize = 20;
 
 pub enum Checked {
     Dispatch(Request),
@@ -262,13 +278,27 @@ impl Checked {
                     // Memory is deliberately arbitrary, but it is never a dispatch target.
                     ensure!(body.chars().count() <= 60_000, "Oversized supervisor state");
                 }
-                Write::StatusUpdate { status, body } => {
+                Write::StatusUpdate {
+                    status,
+                    summary,
+                    notes,
+                    ..
+                } => {
                     ensure!(p.agent.project.is_some(), "No configured project");
                     ensure!(
                         ["on-track", "at-risk", "off-track"].contains(&status.as_str()),
                         "Unknown project status"
                     );
-                    text(body, 4000, true, &p.settings.footer)?;
+                    text(summary, SUMMARY_LIMIT, true, &p.settings.footer)?;
+                    ensure!(notes.len() <= MAX_NOTES, "Too many status notes");
+                    for (reference, note) in notes {
+                        ensure!(
+                            changes::is_ref(reference),
+                            "Malformed status note reference"
+                        );
+                        text(note, NOTE_LIMIT, true, &p.settings.footer)?;
+                        ensure!(!note.contains(['\n', '\r']), "A status note is one line");
+                    }
                 }
                 Write::Close {
                     triage_run,
@@ -318,18 +348,34 @@ impl Checked {
             .unwrap_or_default()
     }
 
-    pub fn preflight(&self, api: &dyn Api, p: &Policy) -> Result<()> {
-        if let Self::Dispatch(r) = self {
+    /// Checks the target as it is now; a status update reads its changes.
+    pub fn preflight(&mut self, api: &dyn Api, p: &Policy, now: i64) -> Result<()> {
+        if let Self::Write(Write::StatusUpdate {
+            summary,
+            notes,
+            body,
+            ..
+        }) = self
+        {
+            // A board read the update could not make is no reason to hold
+            // back the batch's other requests.
+            *body = Some(
+                status_body(api, p, now, summary, notes).map_err(|error| format!("{error:#}")),
+            );
+            return Ok(());
+        }
+        let this = &*self;
+        if let Self::Dispatch(r) = this {
             return super::preflight(api, p, r);
         }
-        if let Some((repo, item)) = self.issue() {
+        if let Some((repo, item)) = this.issue() {
             let issue = api.get(&format!("/repos/{repo}/issues/{item}"))?;
             ensure!(issue["labels"].is_array(), "Missing target labels");
             ensure!(
                 !has_label(&issue, "epic"),
                 "The epic is not a supervisor target"
             );
-            match self {
+            match this {
                 // Later dispatches refuse the conversation once the note is in
                 // it; a run already started would read it unchecked.
                 Self::Write(Write::Comment { .. }) => ensure!(
@@ -367,7 +413,7 @@ impl Checked {
                 _ => (),
             }
         }
-        if let Self::Write(Write::ReplaceState { .. }) = self {
+        if let Self::Write(Write::ReplaceState { .. }) = this {
             let s = p
                 .agent
                 .state
@@ -381,6 +427,12 @@ impl Checked {
             );
         }
         Ok(())
+    }
+
+    /// Whether a failure leaves the batch's later requests to go ahead: a
+    /// status update is a report on the board, not one of the board's writes.
+    pub fn stops_batch(&self) -> bool {
+        !matches!(self, Self::Write(Write::StatusUpdate { .. }))
     }
 
     pub fn apply(&self, api: &dyn Api, p: &Policy, ctx: &Run) -> Result<Value> {
@@ -448,14 +500,21 @@ impl Checked {
                         json!({"body": body}),
                     )
                 }
-                Write::StatusUpdate { status, body } => (
-                    "POST",
-                    "/graphql".into(),
-                    json!({
-                        "query": "mutation($project:ID!,$status:ProjectV2StatusUpdateStatus!,$body:String!){createProjectV2StatusUpdate(input:{projectId:$project,status:$status,body:$body}){statusUpdate{id}}}",
-                        "variables": {"project": p.agent.project, "status": status.replace('-', "_").to_ascii_uppercase(), "body": signed(body, None, &p.settings.footer)}
-                    }),
-                ),
+                Write::StatusUpdate { status, body, .. } => {
+                    let body = match body {
+                        Some(Ok(body)) => body,
+                        Some(Err(reason)) => bail!("Status body refused: {reason}"),
+                        None => bail!("The status update was not prepared"),
+                    };
+                    (
+                        "POST",
+                        "/graphql".into(),
+                        json!({
+                            "query": "mutation($project:ID!,$status:ProjectV2StatusUpdateStatus!,$body:String!){createProjectV2StatusUpdate(input:{projectId:$project,status:$status,body:$body}){statusUpdate{id}}}",
+                            "variables": {"project": p.agent.project, "status": status.replace('-', "_").to_ascii_uppercase(), "body": body}
+                        }),
+                    )
+                }
             },
         };
         let receipt = api.send(method, &path, &body)?;
@@ -470,6 +529,36 @@ impl Checked {
         }
         Ok(receipt)
     }
+}
+
+/// `summary` and `notes` over the project's changes since its last status
+/// update, signed.
+fn status_body(
+    api: &dyn Api,
+    p: &Policy,
+    now: i64,
+    summary: &str,
+    notes: &BTreeMap<String, String>,
+) -> Result<String> {
+    let project = p
+        .agent
+        .project
+        .as_deref()
+        .context("No configured project")?;
+    let forge = super::super::Graphql(api);
+    let since = match changes::last_update(&forge, project)? {
+        Some(since) => since,
+        None => {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)?
+                - changes::FIRST_WINDOW
+        }
+    };
+    let footer = &p.settings.footer;
+    // Room for the attribution [`signed`] appends.
+    let limit = crate::github::STATUS_BODY_LIMIT - footer.as_str().chars().count() - 2;
+    let changes = changes::read(&forge, project, since, Some(&p.settings.operator))?;
+    let body = changes.status_body(Some(unsigned(summary, footer)), notes, limit)?;
+    Ok(signed(&body, None, footer))
 }
 
 fn run_id(url: &str, p: &Policy) -> Result<u64> {

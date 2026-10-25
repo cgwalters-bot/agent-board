@@ -337,6 +337,23 @@ impl Api for Fake {
         self.calls
             .borrow_mut()
             .push(("GRAPHQL".into(), String::new(), variables.clone()));
+        // A status update's project reads: its history, its items, then a
+        // search of each covered repository.
+        if query.contains("viewer{") {
+            return Ok(json!({"viewer": {"login": "worker"}}));
+        }
+        if query.contains("search(") {
+            let nodes = self.objects.get("search").cloned().unwrap_or(json!([]));
+            return Ok(json!({"search": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}));
+        }
+        for (marker, name) in [("statusUpdates(", "statusUpdates"), ("items(", "items")] {
+            if query.contains(marker) {
+                let nodes = self.objects.get(name).cloned().unwrap_or(json!([]));
+                return Ok(
+                    json!({"node": {name: {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}),
+                );
+            }
+        }
         let n = variables["number"].as_u64().unwrap();
         if query.contains("pullRequest(number:") {
             return Ok(

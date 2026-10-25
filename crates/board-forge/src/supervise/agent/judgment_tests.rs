@@ -58,7 +58,8 @@ fn actions_signed(footer: &Footer) -> Vec<Value> {
         ),
         action(
             "status_update",
-            json!({"status": "on-track", "body": "Work is progressing."}),
+            json!({"status": "on-track", "summary": format!("Work is progressing.\n\n{footer}"),
+                "notes": {"example/project#3": "Triage is next."}}),
         ),
         // Already signed: the executor signs it once.
         action(
@@ -243,9 +244,13 @@ fn signs_with(generated_by: Option<&str>) {
             "status_update" => {
                 assert_eq!(path, "/graphql");
                 assert_eq!(body["variables"]["project"], "PVT_project");
+                // No earlier update: the changes of the week before now.
                 assert_eq!(
                     body["variables"]["body"],
-                    format!("Work is progressing.\n\n{footer}")
+                    format!(
+                        "Work is progressing.\n\nNo changes since 2026-10-09T12:00:00Z\n\n\
+                        **Also**\n- [example/project#3](https://github.com/example/project/issues/3) — Triage is next.\n\n{footer}"
+                    )
                 );
                 assert_eq!(out.lines[0], "- `status_update` configured target: done, ");
             }
@@ -264,6 +269,118 @@ fn refuses(s: &Settings, r: Value, change: impl FnOnce(&mut Fake)) {
         fake.writes().is_empty(),
         "refusal must precede the first write: {r}"
     );
+}
+
+#[test]
+fn status_updates_carry_a_summary_and_notes_on_read_changes() {
+    let s = configured();
+    let footer = &s.footer;
+    let request = |fields: Value| {
+        let mut r = action(
+            "status_update",
+            json!({"status": "at-risk", "summary": "Shipped."}),
+        );
+        for (k, v) in fields.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    let many: serde_json::Map<_, _> = (1..=21)
+        .map(|n| (format!("example/project#{n}"), json!("Seen.")))
+        .collect();
+    for refused in [
+        json!({"body": "The old shape: the agent's own facts."}),
+        json!({"summary": ""}),
+        json!({"summary": "x".repeat(1001)}),
+        json!({"summary": "```fence```"}),
+        json!({"notes": {"tracker#x": "Not an item number."}}),
+        json!({"notes": {"example/project#0": "Not an item."}}),
+        json!({"notes": {"example/project#3": "Two\nlines."}}),
+        json!({"notes": {"example/project#3": "<!-- marker -->"}}),
+        json!({"notes": {"example/project#3": "x".repeat(281)}}),
+        json!({"notes": many}),
+        json!({"notes": ["example/project#3"]}),
+    ] {
+        refuses(&s, request(refused), |_| {});
+    }
+    // Facts since the latest update, read before the first write; a note on
+    // a listed item rides its line, the summary's full refs become links.
+    let r = request(
+        json!({"summary": "Landed example/project#12; tracker#885 stays text.",
+        "notes": {"example/project#12": "The first slice.", "example/control#2": "Waiting."}}),
+    );
+    let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
+    fake.objects.insert(
+        "statusUpdates".into(),
+        json!([{"createdAt": "2026-10-15T00:00:00Z"}, {"createdAt": "2026-10-14T00:00:00Z"}]),
+    );
+    fake.objects.insert("items".into(), json!([{"content": {
+        "__typename": "PullRequest", "number": 12, "title": "Add changes", "url": "https://github.com/example/project/pull/12",
+        "createdAt": "2026-10-14T00:00:00Z", "closedAt": "2026-10-15T01:00:00Z", "merged": true, "mergedAt": "2026-10-15T01:00:00Z",
+        "state": "MERGED", "repository": {"nameWithOwner": "example/project"},
+        "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+        "timelineItems": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+        "closingIssuesReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}}}}]));
+    let out = run(&fake, &s, RESULT_URL, 1);
+    assert!(out.ok, "{out:?}");
+    let reads = fake.calls.borrow();
+    let items = reads
+        .iter()
+        .find(|(_, _, v)| v.get("since").is_some())
+        .unwrap();
+    assert_eq!(items.2["since"], "2026-10-15T00:00:00Z");
+    let (_, path, body) = &fake.writes()[1];
+    assert_eq!(path, "/graphql");
+    assert_eq!(body["variables"]["status"], "AT_RISK");
+    assert_eq!(
+        body["variables"]["body"],
+        format!(
+            "Landed [example/project#12](https://github.com/example/project/pull/12); tracker#885 stays text.\n\n\
+            **Landed**\n- [example/project#12](https://github.com/example/project/pull/12) Add changes — The first slice.\n\n\
+            **Also**\n- [example/control#2](https://github.com/example/control/issues/2) — Waiting.\n\n{footer}"
+        )
+    );
+}
+
+#[test]
+fn a_status_body_that_cannot_be_built_refuses_only_itself() {
+    let s = configured();
+    let status = action(
+        "status_update",
+        json!({"status": "on-track", "summary": "Shipped."}),
+    );
+    let comment = actions()[0].clone();
+    for (items, reason) in [
+        (
+            json!([{"content": null}]),
+            "cannot list redacted project items",
+        ),
+        (Value::Null, "missing connection nodes"),
+    ] {
+        let mut fake = Fake::new(&block(&[status.clone(), comment.clone()]));
+        evidence(&mut fake);
+        fake.objects.insert("items".into(), items);
+        let out = run(&fake, &s, RESULT_URL, 1);
+        // Failed, so the pass reports it, but the comment after it still went out.
+        assert!(!out.ok, "{out:?}");
+        assert_eq!(
+            out.lines[0],
+            format!(
+                "- `status_update` configured target: failed (Status body refused: {reason}), "
+            )
+        );
+        assert!(
+            out.lines[1].contains("`comment` example/project #3: done"),
+            "{out:?}"
+        );
+        let writes = fake.writes();
+        assert!(writes.iter().all(|(_, path, _)| path != "/graphql"));
+        assert!(
+            writes
+                .iter()
+                .any(|(_, path, _)| path == "/repos/example/project/issues/3/comments")
+        );
+    }
 }
 
 #[test]

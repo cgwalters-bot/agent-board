@@ -83,6 +83,15 @@ enum Command {
         #[command(subcommand)]
         command: Project,
     },
+    /// What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed.
+    Changes {
+        /// Start of the window, RFC 3339 (such as 2026-10-23T00:00:00Z).
+        #[arg(long)]
+        since: String,
+        /// Output format.
+        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+        format: String,
+    },
     /// List or inspect board items.
     Item {
         #[command(subcommand)]
@@ -197,7 +206,7 @@ enum Project {
         /// Overall project health.
         #[arg(long, value_parser = ["on-track", "at-risk", "off-track"])]
         status: String,
-        /// Read the update body from a UTF-8 file; otherwise summarize since the last update.
+        /// Read the update body from a UTF-8 file; otherwise post the changes since the last update.
         #[arg(long, value_name = "FILE")]
         body: Option<PathBuf>,
     },
@@ -354,6 +363,18 @@ fn agent_policy(cli: &Cli) -> Result<board_core::AgentPolicy> {
         None => board_core::DEFAULT_AGENT_POLICY.to_owned(),
     };
     board_core::AgentPolicy::parse(&input)
+}
+
+/// The `operator` of `--board-config`, if one is given.
+fn configured_operator(cli: &Cli) -> Result<Option<String>> {
+    let Some(path) = &cli.board_config else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_slice(
+        &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+    )
+    .with_context(|| format!("parse {}", path.display()))?;
+    Ok(value["operator"].as_str().map(str::to_owned))
 }
 
 fn github(cli: &Cli) -> Result<board_forge::github::GitHub<board_forge::github::Client>> {
@@ -633,6 +654,24 @@ fn execute(cli: Cli) -> Result<()> {
                 dispatch::init(&github(&cli)?, &mut io::stdout().lock())
             }
         }
+        Command::Changes { since, format } => {
+            ensure!(cli.snapshot.is_none(), "changes requires a live project");
+            ensure!(
+                cli.json.is_none(),
+                "changes takes --format json, not --json"
+            );
+            let changes = github(&cli)?.changes(
+                board_forge::changes::parse_time(since)?,
+                configured_operator(&cli)?.as_deref(),
+            )?;
+            let mut out = io::stdout().lock();
+            if format == "json" {
+                writeln!(out, "{}", serde_json::to_string_pretty(&changes)?)?;
+            } else {
+                write!(out, "{}", changes.markdown())?;
+            }
+            Ok(())
+        }
         Command::Project {
             command: Project::StatusUpdate { status, body },
         } => {
@@ -653,7 +692,11 @@ fn execute(cli: Cli) -> Result<()> {
                     String::from_utf8(bytes).context("status body must be UTF-8")
                 })
                 .transpose()?;
-            let id = github(&cli)?.status_update(status, body.as_deref())?;
+            let id = github(&cli)?.status_update(
+                status,
+                body.as_deref(),
+                configured_operator(&cli)?.as_deref(),
+            )?;
             writeln!(io::stdout().lock(), "{id}")?;
             Ok(())
         }
