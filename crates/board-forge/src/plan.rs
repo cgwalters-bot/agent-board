@@ -72,6 +72,17 @@ const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: 
   }
 }"#;
 
+const PULL_REQUEST_COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $after) {
+        nodes { url body createdAt lastEditedAt author { login } editor { login } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}"#;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobPlan {
     /// Target repository, OWNER/NAME.
@@ -462,6 +473,29 @@ pub(crate) fn comment(node: &Value) -> Result<Comment> {
 /// Every comment on an issue, in order. A pull request is refused: plans
 /// live on issues.
 pub fn issue_comments<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Vec<Comment>> {
+    comments(transport, issue, COMMENTS_QUERY, "issue", "an issue")
+}
+
+/// Every comment on a pull request, in order, with the same bounds and
+/// refusals as [`issue_comments`]; an issue is refused.
+pub fn pull_request_comments<T: Transport>(transport: &T, pull: &ItemRef) -> Result<Vec<Comment>> {
+    comments(
+        transport,
+        pull,
+        PULL_REQUEST_COMMENTS_QUERY,
+        "pullRequest",
+        "a pull request",
+    )
+}
+
+/// Every comment on `issue`'s `field` (`issue` or `pullRequest`), read by `query`.
+fn comments<T: Transport>(
+    transport: &T,
+    issue: &ItemRef,
+    query: &str,
+    field: &str,
+    what: &str,
+) -> Result<Vec<Comment>> {
     ensure!(
         issue.host == crate::github::DEFAULT_HOST,
         "plans are read only from github.com"
@@ -475,13 +509,13 @@ pub fn issue_comments<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Ve
     let mut after = Value::Null;
     for _ in 0..PLAN_COMMENT_PAGES {
         let data = transport.graphql(
-            COMMENTS_QUERY,
+            query,
             json!({"owner": owner, "name": name, "number": issue.number, "after": after}),
         )?;
         let connection = data
-            .pointer("/repository/issue/comments")
+            .pointer(&format!("/repository/{field}/comments"))
             .filter(|c| c.is_object())
-            .with_context(|| format!("{} is not an issue", issue.display()))?;
+            .with_context(|| format!("{} is not {what}", issue.display()))?;
         for node in connection["nodes"]
             .as_array()
             .context("comments have no nodes")?
@@ -498,7 +532,7 @@ pub fn issue_comments<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Ve
         }
     }
     bail!(
-        "{} has more than {} comments; its newest plan could be unread",
+        "{} has more than {} comments; the newest could be unread",
         issue.display(),
         PLAN_COMMENT_PAGES * 100
     )

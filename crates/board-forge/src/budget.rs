@@ -4,17 +4,21 @@
 //! [`BUDGET_FIELD`]. Read-only: nothing is held on it yet.
 //!
 //! A run's cost is the line agentic-job writes into the run's status comment
-//! on its item (agentic-job#1945), `<!-- agentic-job-cost: RUN usd=N
-//! partial=B -->`, at API list prices. Only such a line on a line of its own,
-//! in a comment by the pass's bot that no one else last edited, counts:
-//! anyone may comment on a public issue, and a pasted line must not move an
-//! item's actual. A run whose cost was unknown leaves no line, a partial cost
-//! is a lower bound, and a rerun that edits the item's one marked status
-//! comment replaces the line before it, so an actual is at least what it says.
+//! on its item or on a pull request that closes it (agentic-job#1945),
+//! `<!-- agentic-job-cost: RUN usd=N partial=B -->`, at API list prices. Only
+//! such a line on a line of its own, in a comment by the pass's bot that no one
+//! else last edited and that carries the same run's [`RUN_MARKER`] line,
+//! counts: anyone may comment on a public issue, and a pasted line must not
+//! move an item's actual; the marker keeps a line copied into the agent's
+//! result comment from counting. A run whose cost was unknown leaves no line,
+//! a partial cost is a lower bound, and a rerun that edits the item's one
+//! marked status comment replaces the line before it, so an actual is at
+//! least what it says. A run counts once in the tree, at the first item that
+//! names it.
 use crate::epic::EPIC_LABEL;
 use crate::github::{DEFAULT_HOST, Transport};
 use crate::pass::{Board, Config, board_item};
-use crate::plan::{Comment, issue_comments};
+use crate::plan::{Comment, issue_comments, pull_request_comments};
 use crate::poll::validate_repository;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
@@ -24,6 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The marker of a run's cost line.
 pub const COST_MARKER: &str = "agentic-job-cost";
+/// The marker agentic-job's status.cjs ends a run's status comment with.
+pub const RUN_MARKER: &str = "agentic-job-run";
 /// The board's number field that holds an item's budget in dollars.
 pub const BUDGET_FIELD: &str = "Budget ($)";
 /// Open epics read, one page; more is an error.
@@ -32,7 +38,10 @@ const EPIC_LIMIT: usize = 100;
 const DEPTH_LIMIT: usize = 8;
 /// Items read in all, epics included; more is an error, never a smaller total.
 pub const ITEM_LIMIT: usize = 300;
-/// Forge requests in all: an item's read and its pages of comments.
+/// Pull requests read that close one item; more is an error.
+const PULL_REQUEST_LIMIT: usize = 20;
+/// Forge requests in all: an item's read and its and its pull requests'
+/// pages of comments.
 pub const REQUEST_LIMIT: usize = 1000;
 
 const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!) {
@@ -44,8 +53,9 @@ const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $label: Stri
   }
 }"#;
 
-/// An item's state, its budget on each board and its sub-issues.
-const ITEM_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $field: String!) {
+/// An item's state, its budget on each board, its sub-issues and the pull
+/// requests that close it, closed ones included.
+const ITEM_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $field: String!, $pulls: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       state
@@ -57,6 +67,10 @@ const ITEM_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!
         totalCount
       }
       subIssues(first: 100) { nodes { number repository { nameWithOwner } } totalCount }
+      closedByPullRequestsReferences(first: $pulls, includeClosedPrs: true) {
+        nodes { number repository { nameWithOwner } }
+        totalCount
+      }
     }
   }
 }"#;
@@ -100,6 +114,16 @@ impl Item {
         self.children.iter().map(Item::actual).fold(own, add)
     }
 
+    /// Drops the runs in `seen` from it and its descendants, in the order
+    /// they are shown, adding the rest: a pull request that closes several
+    /// items counts at the first.
+    fn count_once(&mut self, seen: &mut BTreeSet<u64>) {
+        self.runs.retain(|run, _| seen.insert(*run));
+        for child in &mut self.children {
+            child.count_once(seen);
+        }
+    }
+
     fn descendants(&self, into: &mut BTreeSet<String>) {
         for child in &self.children {
             into.insert(key(&child.issue));
@@ -127,20 +151,22 @@ pub struct Tree {
     pub epics: Vec<Item>,
 }
 
-/// The run costs on `comments` that count: lines of their own in comments
-/// by `bot` that no one else last edited, each run once.
-pub fn costs(comments: &[Comment], bot: &str) -> BTreeMap<u64, Cost> {
+/// The run costs on `comments` that count, into `runs`: lines of their own in
+/// comments by `bot` that no one else last edited and that carry the same
+/// run's [`RUN_MARKER`], each run once.
+pub fn costs(comments: &[Comment], bot: &str, runs: &mut BTreeMap<u64, Cost>) {
     let by_bot = |login: Option<&str>| login.is_some_and(|l| l.eq_ignore_ascii_case(bot));
-    let mut runs = BTreeMap::new();
     for comment in comments.iter().filter(|c| {
         by_bot(c.author.as_deref())
             && (!c.edited && c.editor.is_none() || by_bot(c.editor.as_deref()))
     }) {
         for (run, cost) in comment.body.lines().filter_map(cost_line) {
-            runs.entry(run).or_insert(cost);
+            let marker = format!("<!-- {RUN_MARKER}: {run} -->");
+            if comment.body.lines().any(|line| line == marker) {
+                runs.entry(run).or_insert(cost);
+            }
         }
     }
-    runs
 }
 
 /// A cost line as agentic-job writes it, or `None`.
@@ -205,7 +231,8 @@ impl<T: Transport> Reader<'_, T> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
         let data = self.client.graphql(
             ITEM_QUERY,
-            json!({"owner": owner, "name": name, "number": issue.number, "field": BUDGET_FIELD}),
+            json!({"owner": owner, "name": name, "number": issue.number,
+                "field": BUDGET_FIELD, "pulls": PULL_REQUEST_LIMIT}),
         )?;
         let node = data
             .pointer("/repository/issue")
@@ -217,39 +244,26 @@ impl<T: Transport> Reader<'_, T> {
             _ => bail!("{} has no state", issue.display()),
         };
         let budget = budget(node, self.board).with_context(|| issue.display())?;
-        let subs = &node["subIssues"];
-        let nodes = subs["nodes"]
-            .as_array()
-            .filter(|n| subs["totalCount"].as_u64() == Some(n.len() as u64))
-            .with_context(|| {
-                format!(
-                    "the sub-issues of {} could not all be read",
-                    issue.display()
-                )
-            })?;
+        let subs = refs(&node["subIssues"], &issue, "sub-issues")?;
         ensure!(
-            nodes.is_empty() || depth < DEPTH_LIMIT,
+            subs.is_empty() || depth < DEPTH_LIMIT,
             "{} is more than {DEPTH_LIMIT} levels below an epic",
             issue.display()
         );
-        let runs = costs(&issue_comments(&self.client, &issue)?, self.bot);
-        let children = nodes
-            .iter()
-            .map(|sub| {
-                let repository = sub["repository"]["nameWithOwner"]
-                    .as_str()
-                    .context("sub-issue has no repository")?;
-                validate_repository(repository)?;
-                let number = sub["number"].as_u64().context("sub-issue has no number")?;
-                self.read(
-                    ItemRef {
-                        host: DEFAULT_HOST.into(),
-                        repository: repository.into(),
-                        number,
-                    },
-                    depth + 1,
-                )
-            })
+        let pulls = refs(
+            &node["closedByPullRequestsReferences"],
+            &issue,
+            "closing pull requests",
+        )?;
+        let mut runs = BTreeMap::new();
+        costs(&issue_comments(&self.client, &issue)?, self.bot, &mut runs);
+        for pull in pulls.into_iter().collect::<BTreeSet<_>>() {
+            let comments = pull_request_comments(&self.client, &pull)?;
+            costs(&comments, self.bot, &mut runs);
+        }
+        let children = subs
+            .into_iter()
+            .map(|sub| self.read(sub, depth + 1))
             .collect::<Result<_>>()?;
         Ok(Item {
             issue,
@@ -259,6 +273,32 @@ impl<T: Transport> Reader<'_, T> {
             children,
         })
     }
+}
+
+/// The issues or pull requests of a connection with `totalCount`, or an error
+/// when not all of them were read.
+fn refs(connection: &Value, issue: &ItemRef, what: &str) -> Result<Vec<ItemRef>> {
+    let of = || format!("the {what} of {}", issue.display());
+    let nodes = connection["nodes"]
+        .as_array()
+        .filter(|n| connection["totalCount"].as_u64() == Some(n.len() as u64))
+        .with_context(|| format!("{} could not all be read", of()))?;
+    nodes
+        .iter()
+        .map(|node| {
+            let repository = node["repository"]["nameWithOwner"]
+                .as_str()
+                .context("one has no repository")?;
+            validate_repository(repository)?;
+            let number = node["number"].as_u64().context("one has no number")?;
+            Ok(ItemRef {
+                host: DEFAULT_HOST.into(),
+                repository: repository.into(),
+                number,
+            })
+        })
+        .collect::<Result<_>>()
+        .with_context(of)
 }
 
 /// An item's [`BUDGET_FIELD`] on `board`, or an error when not all of its
@@ -339,6 +379,10 @@ pub fn read<T: Transport>(client: &T, config: &Config) -> Result<Tree> {
         item.descendants(&mut below);
     }
     items.retain(|i| !below.contains(&key(&i.issue)));
+    let mut seen = BTreeSet::new();
+    for item in &mut items {
+        item.count_once(&mut seen);
+    }
     Ok(Tree {
         weekly_usd: config.budget.as_ref().map(|b| b.weekly_usd),
         epics: items,
@@ -409,7 +453,9 @@ mod tests {
     }
 
     /// A forge of issues by `OWNER/REPO#N`: state, budget on board 1 (or
-    /// `null`), sub-issues and comments; and the open epics of tracker.
+    /// `null`), sub-issues, closing pull requests (all of them unless
+    /// `pullsTotal` says more) and comments; pull requests' comments, or
+    /// `broken`; and the open epics of tracker.
     struct Forge {
         epics: Vec<u64>,
         issues: BTreeMap<String, Value>,
@@ -437,17 +483,34 @@ mod tests {
                 .with_context(|| format!("no {name}"))?;
             if query == ITEM_QUERY {
                 assert_eq!(v["field"], BUDGET_FIELD);
-                let subs: Vec<_> = (issue["subs"].as_array().unwrap().iter())
-                    .map(|s| {
-                        let (repo, n) = s.as_str().unwrap().split_once('#').unwrap();
-                        json!({"number": n.parse::<u64>().unwrap(), "repository": {"nameWithOwner": repo}})
-                    })
-                    .collect();
+                assert_eq!(v["pulls"], PULL_REQUEST_LIMIT);
+                let refs = |list: &Value| -> Vec<Value> {
+                    (list.as_array().unwrap().iter())
+                        .map(|s| {
+                            let (repo, n) = s.as_str().unwrap().split_once('#').unwrap();
+                            json!({"number": n.parse::<u64>().unwrap(), "repository": {"nameWithOwner": repo}})
+                        })
+                        .collect()
+                };
+                let (subs, pulls) = (refs(&issue["subs"]), refs(&issue["pulls"]));
+                let pulls_total = issue
+                    .get("pullsTotal")
+                    .cloned()
+                    .unwrap_or(pulls.len().into());
                 let board = json!({"project": {"number": 1, "owner": {"login": "cgwalters-forge"}},
                     "budget": if issue["budget"].is_null() { Value::Null } else { json!({"number": issue["budget"]}) }});
                 return Ok(json!({"repository": {"issue": {"state": issue["state"],
                     "projectItems": {"nodes": [board], "totalCount": 1},
-                    "subIssues": {"nodes": subs, "totalCount": subs.len()}}}}));
+                    "subIssues": {"nodes": subs, "totalCount": subs.len()},
+                    "closedByPullRequestsReferences": {"nodes": pulls, "totalCount": pulls_total}}}}));
+            }
+            let field = if query.contains("pullRequest(") {
+                "pullRequest"
+            } else {
+                "issue"
+            };
+            if issue["broken"] == true {
+                return Ok(json!({"repository": {field: null}}));
             }
             let comments: Vec<_> = (issue["comments"].as_array().unwrap().iter().enumerate())
                 .map(|(i, c)| json!({"url": format!("https://github.com/{name}#issuecomment-{i}"),
@@ -456,14 +519,18 @@ mod tests {
                     "author": {"login": c[0]}, "editor": if c[2].is_null() { Value::Null } else { json!({"login": c[2]}) }}))
                 .collect();
             Ok(
-                json!({"repository": {"issue": {"comments": {"nodes": comments,
+                json!({"repository": {field: {"comments": {"nodes": comments,
                 "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}),
             )
         }
     }
 
     fn issue(state: &str, budget: Value, subs: &[&str], comments: Value) -> Value {
-        json!({"state": state, "budget": budget, "subs": subs, "comments": comments})
+        json!({"state": state, "budget": budget, "subs": subs, "pulls": [], "comments": comments})
+    }
+
+    fn closed_by(issue: &mut Value, pulls: &[&str]) {
+        issue["pulls"] = json!(pulls);
     }
 
     fn cost(run: u64, usd: &str, partial: bool) -> String {
@@ -541,16 +608,53 @@ mod tests {
                         [BOT, cost(8, "99", false), "cgwalters"],
                         [
                             BOT,
-                            format!("Say `<!-- {COST_MARKER}: 9 usd=99 partial=false -->`."),
+                            format!(
+                                "Say `<!-- {COST_MARKER}: 9 usd=99 partial=false -->`.\n<!-- {RUN_MARKER}: 9 -->"
+                            ),
                             Value::Null
                         ]
                     ]),
                 ),
             ),
+            // #6's pull request with two fix rounds, and one closing #5 and
+            // #7, counted at #5.
+            (
+                "cgwalters-forge/agent-board#50",
+                json!({"comments": [
+                    [BOT, cost(20, "1", false), BOT],
+                    [BOT, cost(21, "2", false), Value::Null],
+                    // Not counted: no run marker for the line's run, as in an
+                    // agent's result comment.
+                    [BOT, format!("<!-- {COST_MARKER}: 23 usd=99 partial=false -->\n<!-- {RUN_MARKER}: 24 -->"), Value::Null],
+                    [BOT, format!("<!-- {COST_MARKER}: 25 usd=99 partial=false -->"), Value::Null]
+                ]}),
+            ),
+            (
+                "cgwalters-forge/agent-board#51",
+                json!({"comments": [[BOT, cost(22, "4", false), Value::Null]]}),
+            ),
         ];
+        let mut issues: BTreeMap<String, Value> =
+            issues.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        for (issue, pulls) in [
+            (
+                "cgwalters-forge/agent-board#5",
+                &["cgwalters-forge/agent-board#51"][..],
+            ),
+            (
+                "cgwalters-forge/agent-board#6",
+                &["cgwalters-forge/agent-board#50"],
+            ),
+            (
+                "cgwalters-forge/agent-board#7",
+                &["cgwalters-forge/agent-board#51"],
+            ),
+        ] {
+            closed_by(issues.get_mut(issue).unwrap(), pulls);
+        }
         Forge {
             epics: vec![10, 11, 12],
-            issues: issues.into_iter().map(|(k, v)| (k.into(), v)).collect(),
+            issues,
             reads: Cell::new(0),
         }
     }
@@ -562,17 +666,18 @@ mod tests {
         assert_eq!(
             lines(&tree),
             [
-                "board: no weekly budget; actual at least $26.00 (6 run(s)) under 2 open epic(s), all time, at list prices",
-                "  cgwalters-forge/tracker#10: budget $50.00, actual at least $26.00 (6 run(s))",
-                "    cgwalters-forge/agent-board#5, closed: actual $16.50 (3 run(s))",
-                "    cgwalters-forge/agent-board#6: budget $5.00, over, actual at least $9.00 (2 run(s))",
+                "board: no weekly budget; actual at least $33.00 (9 run(s)) under 2 open epic(s), all time, at list prices",
+                "  cgwalters-forge/tracker#10: budget $50.00, actual at least $33.00 (9 run(s))",
+                "    cgwalters-forge/agent-board#5, closed: actual $20.50 (4 run(s))",
+                "    cgwalters-forge/agent-board#6: budget $5.00, over, actual at least $12.00 (4 run(s))",
                 "      cgwalters-forge/agent-board#7: actual $6.00 (1 run(s))",
                 "    cgwalters-forge/tracker#11: actual $0.00 (0 run(s))",
                 "  cgwalters-forge/tracker#12: actual $0.00 (0 run(s))",
             ]
         );
-        // Each item's state and comments, and the epics; #11 read twice.
-        assert_eq!(forge.reads.get(), 1 + 2 * 7);
+        // Each item's state and comments, and the epics; #11 read twice;
+        // and each closing pull request's comments, #51 for #5 and #7.
+        assert_eq!(forge.reads.get(), 1 + 2 * 7 + 3);
         let tree = read(
             &forge,
             &config(json!({"budget": {"weeklyUsd": 1000},
@@ -611,7 +716,21 @@ mod tests {
     #[test]
     fn unreadable_trees_are_refused() {
         type Edit = fn(&mut Forge);
-        let cases: [(Edit, &str); 4] = [
+        let cases: [(Edit, &str); 6] = [
+            (
+                |f| {
+                    f.issues.get_mut("cgwalters-forge/agent-board#6").unwrap()["pullsTotal"] =
+                        json!(PULL_REQUEST_LIMIT + 1)
+                },
+                "the closing pull requests of cgwalters-forge/agent-board#6 could not all be read",
+            ),
+            (
+                |f| {
+                    f.issues.get_mut("cgwalters-forge/agent-board#50").unwrap()["broken"] =
+                        json!(true)
+                },
+                "cgwalters-forge/agent-board#50 is not a pull request",
+            ),
             (
                 |f| {
                     f.issues.get_mut("cgwalters-forge/agent-board#6").unwrap()["budget"] = json!(-1)

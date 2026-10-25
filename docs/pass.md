@@ -434,19 +434,28 @@ of its own runs plus that of its descendants. An epic that sits under another
 epic appears only there. The command is read-only and holds nothing.
 
 A run's cost is the `<!-- agentic-job-cost: RUN usd=N partial=B -->` line that
-agentic-job (agentic-job#1945) writes into the run's status comment on its item.
-It is the list price in dollars. A line counts only if it stands on a line of its
-own, in a comment by `bot` that nobody else edited last, and it counts once per run.
-Anyone can comment on a public issue, so this keeps a pasted line from
-moving an actual. Each actual is a lower bound, and an `at least` marks one
-that includes a partial cost. Some costs are left out without an error: a run
-with an unknown cost leaves no line, a status comment written as
-`github-actions` is not `bot`'s, a rerun that edits an item's single marked
-status comment replaces the line before it, and runs on pull requests are not
-read. Actuals cover all time, not the week. What it reads, it reads whole: it
-refuses more than 100 open epics or 300 items, 1000 requests, a sub-issue list
-or a set of boards that could not be read whole, and a `Budget ($)` value that
-is not a dollar amount.
+agentic-job (agentic-job#1945) writes into the run's status comment on its
+target. It is the list price in dollars. An item's own runs are those on the
+item and on every pull request that closes it (GitHub's closing references,
+closed pull requests included), so its implement, fix rounds and reruns all
+count. A line counts only if it stands on a line of its own, in a comment by
+`bot` that nobody else edited last, and that comment also carries the same
+run's `<!-- agentic-job-run: RUN -->` line, as agentic-job's status comment
+does. Anyone can comment on a public issue, so this keeps a pasted line from
+moving an actual, and the run marker keeps a cost line copied into the agent's
+own result comment from counting; it does not stop an agent that writes both
+lines on purpose. Each run counts once in the whole tree, at the
+first item that names it in the order shown: a pull request that closes two
+sub-issues adds its runs to the first of them only. Each actual is a lower
+bound, and an `at least` marks one that includes a partial cost. Some costs are
+left out without an error: a run with an unknown cost leaves no line, a status
+comment written as `github-actions` is not `bot`'s, a rerun that edits a single
+marked status comment replaces the line before it, and a pull request that does
+not say which issue it closes is not read. Actuals cover all time, not the
+week. What it reads, it reads whole: it refuses more than 100 open epics or 300
+items, 1000 requests, 1000 comments on an item or pull request, a sub-issue
+list, a list of more than 20 closing pull requests or a set of boards that
+could not be read whole, and a `Budget ($)` value that is not a dollar amount.
 
 ## One configuration file
 
