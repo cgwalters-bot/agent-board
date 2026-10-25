@@ -82,18 +82,37 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
+        // Org-scoped mutations print like the others, unchanged and in order.
         assert_eq!(values, *fixture["valid"]["actions"].as_array().unwrap());
-        std::fs::write(&path, "{}").unwrap();
-        assert!(
-            check(
-                &args,
-                None,
-                "github.com",
-                || -> Result<Forge> { panic!("must not read token") },
-                &mut Vec::new()
-            )
-            .is_err()
-        );
+        assert!(values.iter().any(|v| v["type"] == "apply_org_ruleset"));
+        // The proposal's org kinds need the configured org.
+        for org in [None, Some(""), Some("elsewhere")] {
+            let mut config = fixture["config"].clone();
+            match org {
+                Some(org) => config["org"] = json!(org),
+                None => drop(config.as_object_mut().unwrap().remove("org")),
+            }
+            std::fs::write(&path, config.to_string()).unwrap();
+            let mut output = Vec::new();
+            assert!(check(&args, None, "github.com", || Ok(Forge), &mut output).is_err());
+            assert!(output.is_empty(), "{org:?}");
+        }
+        for config in [
+            "{}",
+            r#"{"writers": ["operator"], "repositories": ["example/work"], "org": "-bad"}"#,
+        ] {
+            std::fs::write(&path, config).unwrap();
+            assert!(
+                check(
+                    &args,
+                    None,
+                    "github.com",
+                    || -> Result<Forge> { panic!("must not read token") },
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+        }
         std::fs::remove_file(path).unwrap();
     }
 }

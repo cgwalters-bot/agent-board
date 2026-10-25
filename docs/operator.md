@@ -30,10 +30,14 @@ the schema half of tracker#582, not its execution UI.
 One unquoted, unindented `agent-board-action` fence holds one object. Its
 `schema` is `agent-board/operator-action/v1`, `title` is one line (200 characters),
 `why` is a nonblank reason (4,000 characters), and `actions` holds 1–50 mutations
-in execution order. Unknown fields and nulls are refused. Numbers are positive
-JavaScript-safe integers. Text lengths count Unicode characters.
+in execution order. Unknown fields and nulls are refused, except the
+[expected prior state](#organisation-actions) of the organisation kinds.
+Numbers are positive JavaScript-safe integers. Text lengths count Unicode
+characters.
 
-Every mutation has `type`, `repo` (`OWNER/NAME`) and `number`. The types are:
+Every mutation has `type`. Those on one issue or pull request also have `repo`
+(`OWNER/NAME`) and `number`; the two organisation kinds have `org` instead, and
+neither `repo` nor `number`. The types are:
 
 | Type | Additional required fields | Intended mutation |
 |---|---|---|
@@ -45,6 +49,8 @@ Every mutation has `type`, `repo` (`OWNER/NAME`) and `number`. The types are:
 | `move_sub_issue` | `parent_repo`, `parent_number`, `previous_parent_repo`, `previous_parent_number` | Remove from the named old parent, then attach to the new one |
 | `approve_pull_request` | `head_sha` | Approve exactly this 40-character lowercase hex head |
 | `merge_pull_request` | `head_sha`, `method` | Merge exactly this head using merge, squash or rebase |
+| `set_org_variable` | `org`, `name`, `value`, `visibility`, `repositories` with `selected`, `expected_current` | Create or update this Actions variable of the organisation |
+| `apply_org_ruleset` | `org`, `source` (`repo`, `path`, `sha`), `ruleset_name`, `expected_current_sha256` | Create or replace the organisation ruleset of this name with the body of a reviewed file |
 
 Labels and field values are nonblank, at most 200 characters; reasons are at
 most 4,000. Project URLs use the existing GitHub project identity rules.
@@ -54,6 +60,62 @@ and JavaScript do. Each parent repository must also be on the allowlist. These a
 not arbitrary API requests; a consumer must not infer an issue is a PR or vice
 versa from its number.
 
+### Organisation actions
+
+The organisation kinds exist for org-wide settings that the bot, an org member
+only, may propose but not make (cgwalters-forge/actions#129); the operator, an
+org owner, executes them. `org` must be the configured one ([check](#check)).
+There is no secret kind, by design: a proposal is a
+public comment, and a secret's value cannot be shown for review.
+
+A variable `name` is upper case, as GitHub stores it: letters, digits and
+underscores, not starting with a digit or `GITHUB_`, at most 100 characters.
+`value` is shown in full, never trimmed or truncated: 1–49,152 characters in the
+schema, and the checkers also refuse more than 49,152 UTF-8 bytes, GitHub's
+48 KB limit. A GitHub comment holds at most 65,536 characters, so a value and
+`expected_current` both near the limit cannot be proposed together.
+`visibility` is `all`, or `selected` with `repositories` (1–100 repositories of
+`org`, each on the allowlist, none twice); there is no `private`.
+
+A ruleset body is never inline. `source` names a JSON file at a 40-hex commit of
+an allowlisted repository: a relative `/`-separated path of
+`[A-Za-z0-9_.-]` segments, none `.` or `..`, ending in `.json`, at most 200
+characters. The executor applies it only if that commit is reachable from the
+repository's default branch, so the body is reviewed code, not a branch a member
+pushed. The file holds the writable body only: `name` (equal to `ruleset_name`),
+`target` (`branch`, `tag` or `push`), `enforcement` (`evaluate` or `active`;
+`disabled` is refused), `rules` (objects with a string `type`), and optionally
+`conditions` and `bypass_actors`, with integer numbers only, at most 64 KiB. It
+may not add a bypass actor: each actor must already be in the live ruleset,
+compared as normalised objects, so a create has none. Removing actors is allowed.
+`check_ruleset_source` in `board-forge` implements these file checks; agent-board
+itself never fetches the file.
+
+Unlike the other kinds, these two carry the prior state the proposer saw:
+`expected_current` (the variable's value, or null for unset) and
+`expected_current_sha256` (the live ruleset's digest, or null for none of that
+name). The proposal replaces org state that is itself its input, and there is
+no issue or head to re-read; the operator must know the value being replaced is
+still the one the proposal was written against, and the review site flags the
+action stale otherwise. These are the only fields that may be null.
+A proposer that is only an org member can read a variable's current value
+through a repository it is visible to, but generally not the owner's view of a
+ruleset (its `bypass_actors` are hidden). So `expected_current_sha256` for an
+update normally comes from the operator: the review site shows the live digest
+when it refuses a stale action. A wrong expectation only makes the action
+stale; it never applies it.
+
+A ruleset is normalised by keeping only its writable fields, `name`, `target`,
+`enforcement`, `bypass_actors`, `conditions` and `rules`, that are present
+(dropping `id`, `source`, `source_type`, `node_id`, `_links`, `created_at`,
+`updated_at`, `current_user_can_bypass` and anything else), sorting object keys
+recursively by UTF-16 code unit (JavaScript's default sort, so `"10"` precedes
+`"2"`; `JSON.stringify` of an object would not keep that order), keeping arrays in
+order, and serialising as compact JSON with `JSON.stringify` string escaping.
+Numbers must be integers in JavaScript's safe range, spelled as integers. The digest is the lowercase hex SHA-256 of its
+UTF-8 bytes (`ruleset_digest` in `board-forge`); `ruleset_digests` in the
+shared fixture pins it for both sides.
+
 ### Check
 
 ```sh
@@ -61,9 +123,11 @@ agent-board action check "$ISSUE" --config /trusted-checkout/operator-actions.js
 ```
 
 The repository-owned file, read from a protected default-branch checkout, has
-exactly `writers` (operator and bot logins) and `repositories` (explicit allowed
-repositories), both nonempty arrays of at most 100 strings. There is no implicit
-organisation allowlist, no default configuration and no execution switch. Do not
+`writers` (operator and bot logins) and `repositories` (explicit allowed
+repositories), both nonempty arrays of at most 100 strings, and optionally `org`:
+the one organisation the organisation kinds may change, compared without case.
+Absent or empty, they are refused. There is no implicit organisation repository
+allowlist, no default configuration and no execution switch. Do not
 source this file or its path from proposal content or dispatcher workflow inputs.
 To widen repository scope, the operator changes that file through normal review.
 
@@ -75,11 +139,12 @@ fallback. It prints each validated mutation as JSON Lines, preserving order,
 and identifies the source comment on stderr. No writes occur.
 
 Checking does not inspect current target state, project membership/options, old
-parent relationships or PR heads. The review site must check these before acting,
-flag stale actions, use the viewer's credentials, stop on the first failure and
-record execution once. Project scope is not write authority: repository scope
-alone does not authorize changes to any project. Execution and result markers
-are deliberately left to that separate implementation.
+parent relationships, PR heads, live organisation variables or rulesets, or
+ruleset source files and their reachability. The review site must check these
+before acting, flag stale actions, use the viewer's credentials, stop on the
+first failure and record execution once. Project scope is not write authority:
+repository scope alone does not authorize changes to any project. Execution and
+result markers are deliberately left to that separate implementation.
 
 `fixtures/operator-actions.json` contains shared accepted/rejected schema cases
 and configuration. Both validators should run every case; provenance checks are

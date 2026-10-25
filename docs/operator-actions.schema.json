@@ -16,32 +16,57 @@
     "repo": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/(?!\\.{1,2}(?![\\s\\S]))[A-Za-z0-9_.-]{1,100}(?![\\s\\S])"},
     "number": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
     "sha": {"type": "string", "pattern": "^[0-9a-f]{40}(?![\\s\\S])"},
+    "owner": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}(?![\\s\\S])"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}(?![\\s\\S])"},
+    "variable_value": {"type": "string", "minLength": 1, "maxLength": 49152},
+    "target": {
+      "type": "object",
+      "required": ["repo", "number"],
+      "properties": {"repo": {"$ref": "#/$defs/repo"}, "number": {"$ref": "#/$defs/number"}}
+    },
     "action": {
       "type": "object",
-      "required": ["type", "repo", "number"],
-      "properties": {
-        "repo": {"$ref": "#/$defs/repo"},
-        "number": {"$ref": "#/$defs/number"}
-      },
+      "required": ["type"],
       "unevaluatedProperties": false,
       "oneOf": [
-        {"required": ["reason"], "properties": {"type": {"const": "close_issue"}, "reason": {"$ref": "#/$defs/reason"}}},
-        {"properties": {"type": {"const": "reopen_issue"}}},
-        {"required": ["label"], "properties": {"type": {"enum": ["add_label", "remove_label"]}, "label": {"$ref": "#/$defs/text"}}},
-        {"required": ["project", "field", "value"], "properties": {
+        {"$ref": "#/$defs/target", "required": ["reason"], "properties": {"type": {"const": "close_issue"}, "reason": {"$ref": "#/$defs/reason"}}},
+        {"$ref": "#/$defs/target", "properties": {"type": {"const": "reopen_issue"}}},
+        {"$ref": "#/$defs/target", "required": ["label"], "properties": {"type": {"enum": ["add_label", "remove_label"]}, "label": {"$ref": "#/$defs/text"}}},
+        {"$ref": "#/$defs/target", "required": ["project", "field", "value"], "properties": {
           "type": {"const": "set_project_field"},
           "project": {"type": "string", "maxLength": 200, "pattern": "^https://github\\.com/(orgs|users)/[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/projects/[1-9][0-9]{0,14}(?![\\s\\S])"},
           "field": {"enum": ["Priority", "Status"]}, "value": {"$ref": "#/$defs/text"}
         }},
-        {"required": ["parent_repo", "parent_number"], "properties": {
+        {"$ref": "#/$defs/target", "required": ["parent_repo", "parent_number"], "properties": {
           "type": {"const": "add_sub_issue"}, "parent_repo": {"$ref": "#/$defs/repo"}, "parent_number": {"$ref": "#/$defs/number"}
         }},
-        {"required": ["parent_repo", "parent_number", "previous_parent_repo", "previous_parent_number"], "properties": {
+        {"$ref": "#/$defs/target", "required": ["parent_repo", "parent_number", "previous_parent_repo", "previous_parent_number"], "properties": {
           "type": {"const": "move_sub_issue"}, "parent_repo": {"$ref": "#/$defs/repo"}, "parent_number": {"$ref": "#/$defs/number"},
           "previous_parent_repo": {"$ref": "#/$defs/repo"}, "previous_parent_number": {"$ref": "#/$defs/number"}
         }},
-        {"required": ["head_sha"], "properties": {"type": {"const": "approve_pull_request"}, "head_sha": {"$ref": "#/$defs/sha"}}},
-        {"required": ["head_sha", "method"], "properties": {"type": {"const": "merge_pull_request"}, "head_sha": {"$ref": "#/$defs/sha"}, "method": {"enum": ["merge", "squash", "rebase"]}}}
+        {"$ref": "#/$defs/target", "required": ["head_sha"], "properties": {"type": {"const": "approve_pull_request"}, "head_sha": {"$ref": "#/$defs/sha"}}},
+        {"$ref": "#/$defs/target", "required": ["head_sha", "method"], "properties": {"type": {"const": "merge_pull_request"}, "head_sha": {"$ref": "#/$defs/sha"}, "method": {"enum": ["merge", "squash", "rebase"]}}},
+        {"required": ["org", "name", "value", "visibility", "expected_current"], "properties": {
+          "type": {"const": "set_org_variable"}, "org": {"$ref": "#/$defs/owner"},
+          "name": {"type": "string", "pattern": "^(?!GITHUB_)[A-Z_][A-Z0-9_]{0,99}(?![\\s\\S])"},
+          "value": {"$ref": "#/$defs/variable_value"},
+          "expected_current": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/variable_value"}]}
+        }, "oneOf": [
+          {"properties": {"visibility": {"const": "all"}}},
+          {"required": ["repositories"], "properties": {
+            "visibility": {"const": "selected"},
+            "repositories": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"$ref": "#/$defs/repo"}}
+          }}
+        ]},
+        {"required": ["org", "source", "ruleset_name", "expected_current_sha256"], "properties": {
+          "type": {"const": "apply_org_ruleset"}, "org": {"$ref": "#/$defs/owner"},
+          "source": {"type": "object", "additionalProperties": false, "required": ["repo", "path", "sha"], "properties": {
+            "repo": {"$ref": "#/$defs/repo"}, "sha": {"$ref": "#/$defs/sha"},
+            "path": {"type": "string", "maxLength": 200, "pattern": "^(?:(?!\\.{1,2}/)[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]*\\.json(?![\\s\\S])"}
+          }},
+          "ruleset_name": {"$ref": "#/$defs/text"},
+          "expected_current_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]}
+        }}
       ]
     }
   }

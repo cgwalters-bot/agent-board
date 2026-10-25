@@ -1,5 +1,5 @@
 {
-  "config": {"writers": ["operator", "planner-bot"], "repositories": ["example/work", "example/other"]},
+  "config": {"writers": ["operator", "planner-bot"], "repositories": ["example/work", "example/other", "elsewhere/work"], "org": "example"},
   "valid": {
     "schema": "agent-board/operator-action/v1", "title": "Resolve superseded work", "why": "The replacement is complete.",
     "actions": [
@@ -11,7 +11,9 @@
       {"type": "add_sub_issue", "repo": "example/work", "number": 2, "parent_repo": "example/other", "parent_number": 3},
       {"type": "move_sub_issue", "repo": "example/work", "number": 2, "parent_repo": "example/work", "parent_number": 4, "previous_parent_repo": "example/other", "previous_parent_number": 3},
       {"type": "approve_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567"},
-      {"type": "merge_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567", "method": "squash"}
+      {"type": "merge_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567", "method": "squash"},
+      {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "example/work/.github/workflows/review.yml@refs/heads/main", "visibility": "selected", "repositories": ["example/work", "example/other"], "expected_current": null},
+      {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": "b1f9e67a8407125d85862a518278f4abd2707844488effb8c614942364b222b3"}
     ]
   },
   "invalid_actions": [
@@ -27,16 +29,81 @@
     {"type": "add_label", "repo": "example/work", "number": 1, "label": " "},
     {"type": "reopen_issue", "repo": "example/work", "number": 1, "method": "POST"},
     {"type": "approve_pull_request", "repo": "example/work", "number": 5, "head_sha": "main"},
-    {"type": "merge_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567", "method": "auto"}
+    {"type": "merge_pull_request", "repo": "example/work", "number": 5, "head_sha": "0123456789abcdef0123456789abcdef01234567", "method": "auto"},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all", "expected_current": null, "repo": "example/work"},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all", "expected_current": null, "number": 1},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": "b1f9e67a8407125d85862a518278f4abd2707844488effb8c614942364b222b3", "repo": "example/work"},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": "b1f9e67a8407125d85862a518278f4abd2707844488effb8c614942364b222b3", "number": 1},
+    {"type": "reopen_issue", "repo": "example/work", "number": 1, "org": "example"},
+    {"type": "set_org_variable", "org": "example", "name": "review_workflow", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "GITHUB_TOKEN", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "1_WORKFLOW", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW-WORKFLOW", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all", "repositories": ["example/work"], "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "repositories": [], "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "repositories": ["example/work\n"], "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "private", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": null, "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all", "expected_current": ""},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all"},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": null, "expected_current": null},
+    {"type": "set_org_variable", "org": "example/work", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_secret", "org": "example", "name": "REVIEW_TOKEN", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": "0123456789abcdef0123456789abcdef01234567"},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review"},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": null, "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "main"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/../required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/./required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "/rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets//required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.yml", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567", "ref": "main"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "ruleset": {"name": "Required review", "enforcement": "active"}, "ruleset_name": "Required review", "expected_current_sha256": null}
   ],
   "valid_actions": [
     {"type": "reopen_issue", "repo": "example/work", "number": 1.0},
     {"type": "reopen_issue", "repo": "example/work", "number": 1e0},
     {"type": "reopen_issue", "repo": "example/work", "number": 9007199254740991},
-    {"type": "set_project_field", "repo": "example/work", "number": 2, "project": "https://github.com/orgs/example/projects/999999999999999", "field": "Priority", "value": "P1"}
+    {"type": "set_project_field", "repo": "example/work", "number": 2, "project": "https://github.com/orgs/example/projects/999999999999999", "field": "Priority", "value": "P1"},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "optional", "visibility": "all", "expected_current": "required"},
+    {"type": "set_org_variable", "org": "EXAMPLE", "name": "_REVIEW_MODE2", "value": " ", "visibility": "selected", "repositories": ["Example/Work"], "expected_current": " "},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/other", "path": "required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null}
   ],
   "scope_rejections": [
     {"type": "reopen_issue", "repo": "outside/work", "number": 1},
-    {"type": "add_sub_issue", "repo": "example/work", "number": 1, "parent_repo": "outside/work", "parent_number": 2}
+    {"type": "add_sub_issue", "repo": "example/work", "number": 1, "parent_repo": "outside/work", "parent_number": 2},
+    {"type": "set_org_variable", "org": "outside", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "all", "expected_current": null},
+    {"type": "set_org_variable", "org": "elsewhere", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "repositories": ["elsewhere/work"], "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "repositories": ["example/unlisted"], "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "repositories": ["example/work", "elsewhere/work"], "expected_current": null},
+    {"type": "set_org_variable", "org": "example", "name": "REVIEW_WORKFLOW", "value": "x", "visibility": "selected", "repositories": ["example/work", "EXAMPLE/Work"], "expected_current": null},
+    {"type": "apply_org_ruleset", "org": "outside", "source": {"repo": "example/work", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null},
+    {"type": "apply_org_ruleset", "org": "example", "source": {"repo": "example/unlisted", "path": "rulesets/required-review.json", "sha": "0123456789abcdef0123456789abcdef01234567"}, "ruleset_name": "Required review", "expected_current_sha256": null}
+  ],
+  "ruleset_digests": [
+    {"ruleset": {
+      "id": 42, "name": "Required review", "target": "branch", "source_type": "Organization", "source": "example",
+      "enforcement": "active", "node_id": "RRS_lACqUmVwb3NpdG9yec4AAAAq",
+      "conditions": {"repository_name": {"protected": true, "include": ["~ALL"], "exclude": ["sandbox-\u00e9"]}, "ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+      "rules": [
+        {"type": "workflows", "parameters": {"workflows": [{"repository_id": 123456, "path": ".github/workflows/review.yml", "ref": "refs/heads/main"}], "do_not_enforce_on_create": false}},
+        {"type": "deletion"}
+      ],
+      "bypass_actors": [{"bypass_mode": "always", "actor_type": "OrganizationAdmin", "actor_id": null}],
+      "current_user_can_bypass": "always", "created_at": "2026-10-01T00:00:00.000Z", "updated_at": "2026-10-02T00:00:00.000Z",
+      "_links": {"self": {"href": "https://api.github.com/orgs/example/rulesets/42"}, "html": {"href": "https://github.com/organizations/example/settings/rules/42"}}
+    }, "sha256": "b1f9e67a8407125d85862a518278f4abd2707844488effb8c614942364b222b3"},
+    {"ruleset": {"rules": [{"type": "deletion"}], "enforcement": "evaluate", "target": "tag", "name": "Tags \"v*\""}, "sha256": "f7bf98d0e4436b1bca8f3ace4dc54d59f02a6da2d0970833c03fd059b3d14385"},
+    {"ruleset": {"name": "UTF-16 key order", "target": "branch", "enforcement": "evaluate", "rules": [],
+      "conditions": {"\uff61": 1, "\ud800\udc00": 2, "z": 3}}, "sha256": "a981538c641e301c0c510caf580aea49cfe439d0dd6032602e512d88aba5d472"},
+    {"ruleset": {"name": "Integer-like keys", "target": "branch", "enforcement": "evaluate", "rules": [],
+      "conditions": {"10": 1, "2": 2, "a": 3}}, "sha256": "47e51fead202b44db2d64f47f72bda3288304f2bde3bac00876d7f2798c8c56d"}
   ]
 }
