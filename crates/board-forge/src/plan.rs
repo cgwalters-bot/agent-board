@@ -6,10 +6,12 @@
 //! has an input for, so nothing in it is silently dropped on the way; the
 //! caller's bounds still decide whether the run may do what the plan asks.
 use crate::batch::{BATCH_LIMIT, batch_line, held};
+pub use crate::dispatch::Target;
+use crate::dispatch::{GitHub, Start, StartOutcome};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::overlap::Decision;
 use crate::poll::pace::is_tier;
-use crate::poll::{Rest, validate_repository, validate_workflow};
+use crate::poll::{Rest, validate_repository};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
 use serde_json::{Value, json};
@@ -193,6 +195,20 @@ impl JobPlan {
     /// `base` is the branch [`crate::stack::resolve`] found, and only a
     /// stacked plan sends one, so a caller without that input is unaffected.
     pub fn dispatch_request(&self, target: &Target, base: Option<&str>) -> Result<Value> {
+        self.check_start(target, base)?;
+        let github = GitHub {
+            target,
+            run_details: false,
+        };
+        Ok(json!({
+            "method": "POST",
+            "url": format!("{API_ROOT}{}", github.path()),
+            "body": github.body(&self.start(base)),
+        }))
+    }
+
+    /// Refuses a route or base [`Self::dispatch_request`] would not send.
+    fn check_start(&self, target: &Target, base: Option<&str>) -> Result<()> {
         target.validate()?;
         ensure!(
             base.is_some() == self.stacks_on.is_some(),
@@ -201,59 +217,20 @@ impl JobPlan {
         if let Some(base) = base {
             crate::stack::validate_branch(base)?;
         }
-        let Target {
-            caller,
-            workflow,
-            git_ref,
-        } = target;
-        let mut request = json!({
-            "method": "POST",
-            "url": format!("{API_ROOT}repos/{caller}/actions/workflows/{workflow}/dispatches"),
-            "body": {
-                "ref": git_ref,
-                "inputs": {
-                    "task": self.brief,
-                    "repo": self.repo,
-                    // workflow_dispatch inputs are strings.
-                    "item": self.item.to_string(),
-                    "kind": self.kind,
-                    "pool": self.pool,
-                },
-            },
-        });
-        if let Some(base) = base {
-            request["body"]["inputs"]["base"] = base.into();
-        }
-        Ok(request)
-    }
-}
-
-/// Where plans are dispatched: the caller's workflow and the ref it runs
-/// from. These come from the caller's own configuration, never from a plan.
-pub struct Target {
-    /// Caller repository, OWNER/NAME.
-    pub caller: String,
-    /// Its workflow file that takes a plan's inputs, such as dispatch.yml.
-    pub workflow: String,
-    pub git_ref: String,
-}
-
-impl Target {
-    /// Each part goes into an API path that carries the dispatch token.
-    pub fn validate(&self) -> Result<()> {
-        validate_repository(&self.caller).context("invalid caller repository")?;
-        validate_workflow(&self.workflow)?;
-        let git_ref = &self.git_ref;
-        ensure!(
-            !git_ref.is_empty()
-                && !git_ref.starts_with('-')
-                && !git_ref.contains("..")
-                && git_ref
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)),
-            "invalid caller ref"
-        );
         Ok(())
+    }
+
+    /// The job this plan starts; a plan always sends its pool, empty or not.
+    fn start<'a>(&'a self, base: Option<&'a str>) -> Start<'a> {
+        Start {
+            repository: &self.repo,
+            item: self.item,
+            kind: &self.kind,
+            brief: &self.brief,
+            pool: Some(&self.pool),
+            runner: Some(&self.runner),
+            base,
+        }
     }
 }
 
@@ -844,12 +821,14 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     if let Some(rule) = collaborators {
         check_inputs(client, issue, &dest, &chosen.extras, rule)?;
     }
+    let base = base.as_ref().map(|b| b.branch.as_str());
     let request = |extras: &[&crate::batch::Extra]| {
-        JobPlan {
+        let job = JobPlan {
             brief: crate::batch::brief(&plan, extras),
             ..plan.clone()
-        }
-        .dispatch_request(target, base.as_ref().map(|b| b.branch.as_str()))
+        };
+        job.check_start(target, base)?;
+        anyhow::Ok(job)
     };
     // Built before anything is written, so a bad request posts no record.
     request(&chosen.extras.iter().collect::<Vec<_>>())?;
@@ -918,7 +897,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     // Extras left out, by index into `chosen.extras`, why, and whether their
     // record is released (the read-back failed rather than found a conflict).
     let mut dropped: Vec<(usize, String, bool)> = Vec::new();
-    let started = (|| -> Result<Value> {
+    let started = (|| -> Result<Option<String>> {
         for extra in &chosen.extras {
             records.push(post(
                 &extra.issue,
@@ -947,18 +926,21 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             .filter(|(n, _)| !dropped.iter().any(|(d, ..)| d == n))
             .map(|(_, e)| e)
             .collect();
-        let request = request(&taken)?;
-        let url = request["url"].as_str().context("dispatch request URL")?;
-        let mut body = request["body"].clone();
-        body["return_run_details"] = true.into();
-        // The run id comes back only where the API knows `return_run_details`;
-        // elsewhere it is refused with a 422, and asked again without.
-        let (status, run) = send(dispatcher, "POST", url, &body, 422)?;
-        if status != 422 {
-            return Ok(run);
+        let job = request(&taken)?;
+        let github = GitHub {
+            target,
+            run_details: true,
+        };
+        // Either failure is recorded the same way: not dispatched, or not knowingly.
+        match github.start(
+            &job.start(base),
+            || Ok(()),
+            |path, body| dispatcher.send("POST", &format!("{API_ROOT}{path}"), body),
+        ) {
+            StartOutcome::Started(run) => Ok(Some(run.url)),
+            StartOutcome::Unnamed => Ok(None),
+            StartOutcome::NotStarted(error) | StartOutcome::Ambiguous(error) => Err(error),
         }
-        body.as_object_mut().map(|b| b.remove("return_run_details"));
-        Ok(send(dispatcher, "POST", url, &body, 0)?.1)
     })();
     let run = match started {
         Ok(run) => run,
@@ -977,9 +959,6 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             });
         }
     };
-    let run = run["workflow_run_id"]
-        .as_u64()
-        .map(|n| format!("https://github.com/{}/actions/runs/{n}", target.caller));
     let mut notes = chosen.notes;
     for (n, record) in records.iter().enumerate() {
         let left = n

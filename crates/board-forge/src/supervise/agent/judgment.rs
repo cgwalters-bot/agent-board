@@ -3,6 +3,7 @@
 use super::*;
 use crate::Footer;
 use crate::changes;
+use crate::dispatch::{GitHub, Start, StartOutcome};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -437,14 +438,35 @@ impl Checked {
 
     pub fn apply(&self, api: &dyn Api, p: &Policy, ctx: &Run) -> Result<Value> {
         let (method, path, body) = match self {
-            Self::Dispatch(r) => (
-                "POST",
-                format!(
-                    "/repos/{}/actions/workflows/{}/dispatches",
-                    p.settings.dispatch_repo, p.settings.dispatch_workflow
-                ),
-                json!({"ref": ctx.default_branch, "inputs": {"task": r.task(&ctx.run_url), "repo": r.repository, "item": r.item.to_string(), "kind": r.kind, "pool": r.pool}}),
-            ),
+            Self::Dispatch(r) => {
+                let target = Target {
+                    caller: p.settings.dispatch_repo.clone(),
+                    workflow: p.settings.dispatch_workflow.clone(),
+                    git_ref: ctx.default_branch.clone(),
+                };
+                // The run is found by its title, so its details are not asked for.
+                let github = GitHub {
+                    target: &target,
+                    run_details: false,
+                };
+                let start = Start {
+                    repository: &r.repository,
+                    item: r.item,
+                    kind: &r.kind,
+                    brief: &r.task(&ctx.run_url),
+                    pool: Some(&r.pool),
+                    runner: None,
+                    base: None,
+                };
+                // `Api::send` refuses any status but a 2xx itself.
+                let send = |path: &str, body: &Value| {
+                    Ok((200, api.send("POST", &format!("/{path}"), body)?))
+                };
+                return match github.start(&start, || Ok(()), send) {
+                    StartOutcome::Started(_) | StartOutcome::Unnamed => Ok(Value::Null),
+                    StartOutcome::NotStarted(error) | StartOutcome::Ambiguous(error) => Err(error),
+                };
+            }
             Self::Write(w) => match w {
                 Write::Comment {
                     repository,
