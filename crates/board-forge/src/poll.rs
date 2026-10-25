@@ -49,6 +49,9 @@ pub(crate) use tests::conflict_stop_fixture;
 /// This poll's own: the claim a pass posts before it starts a fix round.
 const CLAIM: &str = "agent-board-fix-claim";
 const LABEL: &str = "needs-human";
+/// On a pull request or an issue it closes: the review job's approval alone
+/// does not merge it, the operator's of the head does (agent-board#293).
+const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
 const MAX_FIX_ROUNDS: u64 = 2;
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
@@ -80,6 +83,10 @@ const WORKFLOWS_DIR: &str = ".github/workflows/";
 /// read on with `CHECKS_QUERY` first, up to [`CHECK_PAGES`].
 const CONNECTIONS: &[(&str, &str)] = &[
     ("/labels/pageInfo/hasNextPage", "labels"),
+    (
+        "/closingIssuesReferences/pageInfo/hasNextPage",
+        "closed issues",
+    ),
     ("/reviews/pageInfo/hasPreviousPage", "reviews"),
     ("/series/pageInfo/hasNextPage", "commits"),
     (
@@ -203,6 +210,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       author { __typename login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
+      closingIssuesReferences(first: 10) { nodes { labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
       files(first: 100) { nodes { path } pageInfo { hasNextPage } }
@@ -1845,9 +1853,34 @@ pub fn in_flight(pull: &Value, bot: &str, action: &str) -> bool {
     is_harness(pull, bot) && (action == "answer" || action != "needs-human" && !labelled(pull))
 }
 
+/// Whether the pull request or an issue it closes carries
+/// [`OPERATOR_APPROVAL_LABEL`]. GitHub's label names are case-insensitive.
+fn needs_operator_approval(pull: &Value) -> bool {
+    let carries = |item: &Value| {
+        nodes(item, "/labels/nodes").iter().any(|l| {
+            l["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(OPERATOR_APPROVAL_LABEL))
+        })
+    };
+    carries(pull)
+        || nodes(pull, "/closingIssuesReferences/nodes")
+            .iter()
+            .any(carries)
+}
+
 /// The connections the query did not read whole. A head with no checks at all
-/// has a null rollup, which is complete.
+/// has a null rollup, which is complete. The labels of each closed issue are
+/// one more, as [`OPERATOR_APPROVAL_LABEL`] past them would go unseen.
 fn truncated(pull: &Value) -> Vec<&'static str> {
+    let issue_labels = nodes(pull, "/closingIssuesReferences/nodes")
+        .iter()
+        .any(|issue| {
+            issue
+                .pointer("/labels/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                != Some(false)
+        });
     CONNECTIONS
         .iter()
         .filter(|(pointer, _)| {
@@ -1856,6 +1889,7 @@ fn truncated(pull: &Value) -> Vec<&'static str> {
             !none && pull.pointer(pointer).and_then(Value::as_bool) != Some(false)
         })
         .map(|(_, what)| *what)
+        .chain(issue_labels.then_some("closed issues' labels"))
         .collect()
 }
 
@@ -2813,6 +2847,19 @@ pub fn decide(
             );
         }
         _ => return step("wait", "no approving review of the head yet"),
+    }
+    // Every merge and re-queue ([`queue_step`]) is this step's, so none passes
+    // the label on the review job's approval alone.
+    if needs_operator_approval(pull)
+        && !matches!(verdicts(pull, config).0, Some((Review::Approved, _)))
+    {
+        return step(
+            "wait",
+            format!(
+                "labelled {OPERATOR_APPROVAL_LABEL} (it or an issue it closes); it needs {}'s approval of the head",
+                config.operator
+            ),
+        );
     }
     if !checks.pending.is_empty() {
         return step(
@@ -5102,7 +5149,7 @@ mod tests {
     /// contexts changed (null removes one). Mergeable on main unless a case
     /// says otherwise. The recordings predate real reviews, so unless a case
     /// gives `reviews`, the recorded `review` status becomes the supplied author's
-    /// review of the head. They predate `pageInfo` too: each connection is
+    /// review of the head. They predate `pageInfo` too: each of [`CONNECTIONS`] is
     /// complete unless `truncated` sets its flag (null removes it).
     fn pull_with_author(name: &str, change: Value, author: Value) -> Value {
         let mut p = fixture(name);
@@ -5162,6 +5209,10 @@ mod tests {
         if p.get("series").is_none() {
             p["series"] = json!({"nodes": []});
         }
+        // And `closingIssuesReferences`: they close none unless a case says so.
+        if p.get("closingIssuesReferences").is_none() {
+            p["closingIssuesReferences"] = json!({"nodes": []});
+        }
         for (pointer, what) in CONNECTIONS {
             let (connection, flag) = pointer.rsplit_once("/pageInfo/").unwrap();
             let info = p.pointer_mut(connection).unwrap().as_object_mut().unwrap();
@@ -5207,6 +5258,13 @@ mod tests {
         let ci_failed = json!({"ci": {"conclusion": "FAILURE"}});
         let changes = json!({"review": {"state": "FAILURE"}});
         let label = json!({"nodes": [{"name": LABEL}]});
+        let approval_label = json!({"nodes": [{"name": OPERATOR_APPROVAL_LABEL}]});
+        // A closed issue with `labels`, read whole unless `more` is set.
+        let closes = |labels: &[&str], more: bool| {
+            json!({"nodes": [{"labels": {"nodes": labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+                "pageInfo": {"hasNextPage": more}}}]})
+        };
+        let operator_approved = |oid: &str| json!({"nodes": [review("APPROVED", job(), HEAD, ""), later(review("APPROVED", user("cgwalters"), oid, ""))]});
         let someone = json!({"login": "someone"});
         let head_511 = text(&fixture("pull-511"), "/headRefOid").to_owned();
         let none = Value::Null;
@@ -6404,6 +6462,106 @@ mod tests {
                 json!({"rounds": 0}),
                 none.clone(),
                 "skip",
+                None,
+            ),
+            // The operator's approval label (approved by the job and green otherwise).
+            (
+                "the operator-approval label waits on the job's approval alone",
+                "pull-470",
+                json!({"labels": approval_label}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the operator-approval label merges on the operator's approval of the head",
+                "pull-470",
+                json!({"labels": approval_label, "reviews": operator_approved(HEAD)}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "the operator's approval of an older head does not lift the label",
+                "pull-470",
+                json!({"labels": approval_label, "reviews": operator_approved("older")}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the operator-approval label in another case still waits",
+                "pull-470",
+                json!({"labels": {"nodes": [{"name": "Needs-Operator-Approval"}]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the operator-approval label on a closed issue waits on the job's approval alone",
+                "pull-470",
+                json!({"closingIssuesReferences": closes(&["bug", OPERATOR_APPROVAL_LABEL], false)}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "a closed issue without the label merges",
+                "pull-470",
+                json!({"closingIssuesReferences": closes(&["bug"], false)}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "closed issues past those read wait",
+                "pull-470",
+                json!({"truncated": {"closed issues": true}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "closed issues without pageInfo wait",
+                "pull-470",
+                json!({"truncated": {"closed issues": null}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "a closed issue's labels without pageInfo wait",
+                "pull-470",
+                json!({"closingIssuesReferences": {"nodes": [{"labels": {"nodes": []}}]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "the operator's approval of the head lifts a closed issue's label",
+                "pull-470",
+                json!({"closingIssuesReferences": closes(&[OPERATOR_APPROVAL_LABEL], false), "reviews": operator_approved(HEAD)}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
+                "a closed issue's labels past those read wait",
+                "pull-470",
+                json!({"closingIssuesReferences": closes(&["bug"], true)}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
                 None,
             ),
             (
