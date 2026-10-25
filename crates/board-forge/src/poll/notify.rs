@@ -231,13 +231,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         outcome: &mut Outcome,
     ) -> Result<(String, Option<String>)> {
         let floor = self.now - Duration::seconds(comments::LOOKBACK_SECONDS);
-        let since = since
-            .and_then(|c| OffsetDateTime::parse(c, &Rfc3339).ok())
+        let since = timestamp(since)
             .map_or(floor, |c| c.clamp(floor, self.now))
             .replace_nanosecond(0)?;
-        let before = before
-            .and_then(|c| OffsetDateTime::parse(c, &Rfc3339).ok())
-            .filter(|b| *b > since && *b <= self.now);
+        let before = timestamp(before).filter(|b| *b > since && *b <= self.now);
         let (pages, until) = match before {
             Some(before) => (NOTIFY_PAGES, format!("&before={}", stamp(before)?)),
             None => (1, String::new()),

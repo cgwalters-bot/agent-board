@@ -4,6 +4,7 @@
 //! its `## Review` and `## Comments` sections. [`send`] checks the newest
 //! draft against the pull request at its `head` and posts it once.
 use crate::Footer;
+use crate::batch::issue_node;
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::plan::{
     Comment, code_fence, comment, comment_id, fence_spans, has_fence, issue_comments, viewer,
@@ -455,18 +456,7 @@ pub fn parse(text: &str, checkbox: &str) -> Result<Draft> {
 
 /// The issue's body, as a comment; whether it is open and labelled a draft.
 fn read_issue<T: Transport>(client: &T, issue: &ItemRef) -> Result<(Comment, bool, bool)> {
-    let (owner, name) = issue
-        .repository
-        .split_once('/')
-        .context("issue repository")?;
-    let data = client.graphql(
-        ISSUE_QUERY,
-        json!({"owner": owner, "name": name, "number": issue.number}),
-    )?;
-    let node = data
-        .pointer("/repository/issue")
-        .filter(|n| n.is_object())
-        .with_context(|| format!("{} is not an issue", issue.display()))?;
+    let node = &issue_node(client, ISSUE_QUERY, issue)?;
     let labels = node
         .pointer("/labels/nodes")
         .and_then(Value::as_array)

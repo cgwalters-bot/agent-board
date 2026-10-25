@@ -167,7 +167,7 @@ struct Session {
     prompt: Option<String>,
 }
 
-fn read(path: &Path) -> Result<Value> {
+pub(crate) fn read(path: &Path) -> Result<Value> {
     serde_json::from_slice(
         &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
     )

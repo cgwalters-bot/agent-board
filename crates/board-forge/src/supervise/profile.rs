@@ -197,6 +197,7 @@ pub fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::supervise::tests::base64;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -208,25 +209,6 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
-    }
-
-    fn base64(text: &str) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::new();
-        for chunk in text.as_bytes().chunks(3) {
-            let n = chunk
-                .iter()
-                .enumerate()
-                .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-            for i in 0..4 {
-                out.push(if i <= chunk.len() {
-                    ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char
-                } else {
-                    '='
-                });
-            }
-        }
-        out
     }
 
     /// The contents API, answering only the paths it holds.

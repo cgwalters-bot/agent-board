@@ -156,7 +156,7 @@ fn needs_human(kind: &str, item: &ItemRef) -> Value {
     json!({"type": kind, "target_repo": item.repository, "item_number": item.number, "labels": [NEEDS_HUMAN_LABEL]})
 }
 
-fn print_proposals(out: &mut impl Write, values: &[Value]) -> Result<()> {
+pub(crate) fn print_proposals(out: &mut impl Write, values: &[Value]) -> Result<()> {
     for value in values {
         serde_json::to_writer(&mut *out, value)?;
         writeln!(out)?;

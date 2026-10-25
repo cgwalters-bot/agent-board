@@ -375,7 +375,6 @@ mod tests {
     use crate::pass::tests::block;
     use Status::{Backlog, Blocked, Done, Draft, InProgress, InReview, NeedsHuman, Todo};
 
-    const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
     /// The live board read on 23 October 2026 by `pass --record`, trimmed
     /// to items that show each rule: the whole-board read, the runs in
     /// flight and the open issues' pull requests.
@@ -427,9 +426,7 @@ mod tests {
     /// The pass's configuration with scheduling off, so that this stage
     /// reads the runs and the open issues itself.
     fn config() -> Config {
-        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
-        value["wip"] = 0.into();
-        Config::parse(&value.to_string()).unwrap()
+        crate::pass::tests::config(json!({"wip": 0}))
     }
 
     fn replay() -> Replay {

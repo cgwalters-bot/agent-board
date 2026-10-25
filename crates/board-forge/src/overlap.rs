@@ -240,7 +240,7 @@ fn check<C: Transport + Rest>(
     })
 }
 
-fn owner_name(issue: &ItemRef) -> Result<(&str, &str)> {
+pub(crate) fn owner_name(issue: &ItemRef) -> Result<(&str, &str)> {
     validate_repository(&issue.repository)?;
     issue.repository.split_once('/').context("issue repository")
 }

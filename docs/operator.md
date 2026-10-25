@@ -9,16 +9,12 @@ token; none is delegated to an agent.
 ## Asking the operator
 
 The `needs-human` label is the one marker that the operator must act
-([architecture](architecture.md#one-marker-for-the-operator)). A question is
-an ordinary issue or pull request carrying the label, with the question and
-its options in the body or a comment; the operator answers there and takes the
-label off. The board's Needs human status is derived from the label by the
-[pass](pass.md#order-and-effects), never set by hand, and the pass holds
-labelled work.
-
-The `ask` commands, which kept separate question issues and a decisions
-document, are superseded by the label and are not part of this model; the
-[CLI reference](cli.md) lists them until they are removed.
+([architecture](architecture.md#one-marker-for-the-operator)): the operator
+answers on the labelled item and takes the label off, or on the `question`
+issue `ask create` opens, which `ask resolve` closes and unlabels. The
+[pass](pass.md#order-and-effects) derives the Needs human status from the
+label, never set by hand, and holds labelled work. The decisions document of
+`ask add` and `ask read` is superseded by it.
 
 ## Operator actions
 
@@ -158,8 +154,9 @@ for the Rust contract and provenance tests.
 
 `agent-board project status-update --owner my-org --project 7 --status on-track`
 publishes one update using the operator's project-write token. Status is required:
-`on-track`, `at-risk`, or `off-track`. Nothing schedules or enables automatic
-publication. This is an explicit operator write, not delegated output application.
+`on-track`, `at-risk`, or `off-track`. This is an explicit operator write; the
+supervisor's `status_update` ([requests](supervisor-requests.md#lines)) is the
+only automatic one.
 
 Pass `--body FILE` to publish a UTF-8 body verbatim. Without it, the command
 posts the project's changes since its latest update (the week before now for a

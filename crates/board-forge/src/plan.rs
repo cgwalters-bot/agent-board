@@ -9,7 +9,7 @@ use crate::batch::{BATCH_LIMIT, batch_line, held};
 pub use crate::dispatch::Target;
 use crate::dispatch::{GitHub, Start, StartOutcome};
 use crate::github::{API_ROOT, Transport, is_github_login};
-use crate::overlap::Decision;
+use crate::overlap::{Decision, owner_name};
 use crate::poll::pace::is_tier;
 use crate::poll::{Rest, validate_repository};
 use anyhow::{Context, Result, bail, ensure};
@@ -500,11 +500,7 @@ fn comments<T: Transport>(
         issue.host == crate::github::DEFAULT_HOST,
         "plans are read only from github.com"
     );
-    validate_repository(&issue.repository)?;
-    let (owner, name) = issue
-        .repository
-        .split_once('/')
-        .context("issue repository")?;
+    let (owner, name) = owner_name(issue)?;
     let mut comments = Vec::new();
     let mut after = Value::Null;
     for _ in 0..PLAN_COMMENT_PAGES {

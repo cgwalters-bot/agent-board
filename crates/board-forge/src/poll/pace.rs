@@ -264,9 +264,7 @@ pub fn mode(entry: &Value, now: OffsetDateTime, margin: f64) -> Mode {
         // `true`, or a hold this does not understand: missing usage holds
         // rather than reading as room.
         Some(_) => Mode::Held {
-            until: entry["next_dispatch_at"]
-                .as_str()
-                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok()),
+            until: timestamp(entry["next_dispatch_at"].as_str()),
         },
     }
 }

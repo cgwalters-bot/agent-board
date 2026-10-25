@@ -529,10 +529,6 @@ mod tests {
         json!({"state": state, "budget": budget, "subs": subs, "pulls": [], "comments": comments})
     }
 
-    fn closed_by(issue: &mut Value, pulls: &[&str]) {
-        issue["pulls"] = json!(pulls);
-    }
-
     fn cost(run: u64, usd: &str, partial: bool) -> String {
         format!(
             "Finished.\n\n<!-- {COST_MARKER}: {run} usd={usd} partial={partial} -->\n\n<!-- agentic-job-run: {run} -->"
@@ -650,7 +646,7 @@ mod tests {
                 &["cgwalters-forge/agent-board#51"],
             ),
         ] {
-            closed_by(issues.get_mut(issue).unwrap(), pulls);
+            issues.get_mut(issue).unwrap()["pulls"] = json!(pulls);
         }
         Forge {
             epics: vec![10, 11, 12],
