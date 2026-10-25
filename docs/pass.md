@@ -423,6 +423,31 @@ nothing changed.` is not success evidence, and stale local pending state cannot
 freeze an epic whose apply is already proved. This observation-based recovery
 is part of the first implementation, not deferred cleanup.
 
+## Budget tree
+
+`agent-board budget --config FILE` reads the pass configuration and prints
+what work has cost so far (agent-board#281). The first line is the board, with its
+`budget.weeklyUsd`. Below it come the open epics of `epics.repository`, then
+each epic's sub-issues, nested as deep as GitHub nests them. Each item shows its
+`Budget ($)` number field on `board` where one is set, and its actual: the cost
+of its own runs plus that of its descendants. An epic that sits under another
+epic appears only there. The command is read-only and holds nothing.
+
+A run's cost is the `<!-- agentic-job-cost: RUN usd=N partial=B -->` line that
+agentic-job (agentic-job#1945) writes into the run's status comment on its item.
+It is the list price in dollars. A line counts only if it stands on a line of its
+own, in a comment by `bot` that nobody else edited last, and it counts once per run.
+Anyone can comment on a public issue, so this keeps a pasted line from
+moving an actual. Each actual is a lower bound, and an `at least` marks one
+that includes a partial cost. Some costs are left out without an error: a run
+with an unknown cost leaves no line, a status comment written as
+`github-actions` is not `bot`'s, a rerun that edits an item's single marked
+status comment replaces the line before it, and runs on pull requests are not
+read. Actuals cover all time, not the week. What it reads, it reads whole: it
+refuses more than 100 open epics or 300 items, 1000 requests, a sub-issue list
+or a set of boards that could not be read whole, and a `Budget ($)` value that
+is not a dollar amount.
+
 ## One configuration file
 
 The proposed JSON schema below is exhaustive; reject unknown keys and nulls.
