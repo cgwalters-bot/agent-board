@@ -842,7 +842,7 @@ fn person_hold(labels: &[String], complete: bool, status: Option<&str>) -> Optio
 }
 
 /// The item of an issue's `projectItems` nodes on `board`.
-fn board_item<'a>(items: &'a [Value], board: &Board) -> Option<&'a Value> {
+pub(crate) fn board_item<'a>(items: &'a [Value], board: &Board) -> Option<&'a Value> {
     items.iter().find(|item| {
         item.pointer("/project/number").and_then(Value::as_u64) == Some(board.project)
             && text(item, "/project/owner/login").eq_ignore_ascii_case(&board.owner)

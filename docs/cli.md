@@ -29,6 +29,7 @@ Commands:
 - [`reconcile`](#agent-board-reconcile): Preview deterministic board repairs; never apply them
 - [`poll`](#agent-board-poll): One pass of the pull request poll, previewed or applied; says when the next is due
 - [`pass`](#agent-board-pass): One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
+- [`budget`](#agent-board-budget): What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field (read-only; docs/pass.md#budget-tree)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -595,6 +596,18 @@ Options:
 - `--max-status-changes <N>`: Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through
 - `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage
 - `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture
+
+## agent-board budget
+
+What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field (read-only; docs/pass.md#budget-tree)
+
+```text
+agent-board budget [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: its `epics.repository`, `board`, `bot` and `budget.weeklyUsd`. GH_TOKEN reads
 
 ## agent-board supervise
 

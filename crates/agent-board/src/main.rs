@@ -2,6 +2,7 @@ mod action;
 mod apps;
 mod ask;
 mod broker;
+mod budget;
 mod cli_docs;
 mod decisions;
 mod dispatch;
@@ -156,6 +157,8 @@ enum Command {
     Poll(poll::Poll),
     /// One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md).
     Pass(pass::Pass),
+    /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field (read-only; docs/pass.md#budget-tree).
+    Budget(budget::Budget),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
     /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
@@ -1028,6 +1031,26 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 "pass reads its settings from --config only"
             );
             pass::run(args, runtime, &mut io::stdout().lock())
+        }
+        Command::Budget(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "budget reads its settings from --config only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            budget::run(
+                args,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
         }
         Command::Supervise(args) => {
             ensure!(
