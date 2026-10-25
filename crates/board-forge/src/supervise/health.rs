@@ -94,6 +94,9 @@ fn status_end(run: u64) -> String {
     format!("\n\n<!-- agentic-job-run: {run} -->\n\n<!-- agentic-job-status -->")
 }
 const STATUS_REASON: &str = " Its reason:";
+/// agentic-job's policy step refusing a request outside the caller's bounds,
+/// such as a fix on a branch its fix bounds do not name: misdirected work.
+const BOUNDS_REFUSAL: &str = "is not within the bounds";
 const RUNNING: &[&str] = &["in_progress", "queued", "waiting", "pending"];
 /// The census of epics reads at most this many, in pages of a hundred.
 const MAX_EPICS: usize = 50;
@@ -1359,6 +1362,8 @@ impl Collector<'_> {
                 Some("secret")
             } else if refusal_code(&text) {
                 Some("refused")
+            } else if text.contains(BOUNDS_REFUSAL) {
+                Some("bounds")
             } else if text.contains("required data was missing")
                 && self.closed_blocker(run, id, repo, number)?
             {

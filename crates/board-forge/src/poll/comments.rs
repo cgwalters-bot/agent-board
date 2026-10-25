@@ -1101,6 +1101,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
             return Ok((true, format!("left to a person: labelled {LABEL}")));
         }
+        // As on a followed pull request: the policy step would refuse the run.
+        if let Some(why) = self
+            .config
+            .policy
+            .fix_bounds
+            .as_ref()
+            .and_then(|b| b.refusal(repo, text(&pull, "/head/ref")))
+        {
+            return Ok((true, format!("left to the operator: {why}")));
+        }
         let marker = find_marker(read, &self.config.bot);
         // A stop whose label is gone was reset, as decide reads it.
         let carried = if marker.stopped {
@@ -1577,6 +1587,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::poll::bounds::FixBounds;
     use crate::poll::tests::marker_body;
     use std::cell::RefCell;
 
@@ -2138,8 +2149,27 @@ pub(super) mod tests {
                 "triage on example/tracker#1002 -> https://github.com/example/tracker/actions/runs/1234",
                 false,
             ),
+            // With the caller's fix bounds, a round is started only inside
+            // them: bootc-dev/bootc#2583's head was the midstream fork's
+            // `ci-drop-grub-cc`, which agentic-job refused (agent-board#264).
+            (
+                "inside the bounds",
+                "fix round 2 -> https://github.com/example/tracker/actions/runs/1234",
+                false,
+            ),
+            (
+                "outside the branches",
+                r#"left to the operator: head branch "ci-drop-grub-cc" is outside the fix bounds"#,
+                false,
+            ),
+            (
+                "outside the repositories",
+                "left to the operator: repository upstream/app is outside the fix bounds",
+                false,
+            ),
         ] {
             let fake = github();
+            let mut config = config();
             let pull = format!("{API_ROOT}repos/upstream/app/pulls/7");
             let thread = format!("{API_ROOT}repos/upstream/app/issues/7/comments?per_page=100");
             let mut marker = Marker {
@@ -2158,6 +2188,28 @@ pub(super) mod tests {
                     &format!("repos/{DISPATCH}/actions/runs/5"),
                     json!({"status": "in_progress"}),
                 ),
+                "inside the bounds" | "outside the branches" | "outside the repositories" => {
+                    let (repos, (owner, branch)) = match case {
+                        "outside the branches" => {
+                            ("upstream/*", ("cgwalters-forge", "ci-drop-grub-cc"))
+                        }
+                        "outside the repositories" => ("example/*", (BOT, "dispatch/x")),
+                        _ => ("Upstream/app", (BOT, "dispatch/x")),
+                    };
+                    config.policy.fix_bounds = Some(
+                        FixBounds::parse(&format!(
+                            "repos = [\"{repos}\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]\n"
+                        ))
+                        .unwrap(),
+                    );
+                    fake.rest.borrow_mut().get_mut(&pull).unwrap()["head"] = json!({
+                        "sha": "abcdef0123456789", "ref": branch,
+                        "repo": {"full_name": format!("{owner}/app")}});
+                    fake.page(
+                        &format!("repos/{DISPATCH}/actions/runs/5"),
+                        json!({"status": "completed"}),
+                    );
+                }
                 _ => {
                     let (field, value) = if case == "closed" {
                         ("state", json!("closed"))
@@ -2170,7 +2222,7 @@ pub(super) mod tests {
             }
             fake.rest.borrow_mut().get_mut(&thread).unwrap().as_array_mut().unwrap().push(json!({
                 "id": 50, "user": {"login": BOT}, "body": marker_body(&marker.state(), "Fix round 1.")}));
-            let outcome = pass(&fake, None, true);
+            let outcome = pass_configured(&fake, &config, (None, None), true, now());
             assert_eq!(
                 outcome.lines[0],
                 format!(
@@ -2178,10 +2230,18 @@ pub(super) mod tests {
                 ),
                 "{case}"
             );
-            assert!(
-                !dispatches(&fake).iter().any(|i| i["kind"] == "fix"),
+            let started = case == "inside the bounds";
+            assert_eq!(
+                dispatches(&fake).iter().any(|i| i["kind"] == "fix"),
+                started,
                 "{case}"
             );
+            // Nothing is claimed, marked or labelled outside the bounds.
+            let touched = fake.writes.borrow().iter().any(|(w, _)| {
+                w.contains("repos/upstream/app/issues/7/")
+                    || w.contains("repos/upstream/app/pulls/7")
+            });
+            assert!(!touched || !case.starts_with("outside"), "{case}");
             // A waiting thread holds the cursor, so the next pass reads it again.
             let cursor = if held {
                 "2026-10-16T10:00:00Z"

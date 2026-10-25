@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub mod bounds;
 pub mod comments;
 pub mod lock;
 pub mod notify;
@@ -436,6 +437,10 @@ pub struct PollPolicy {
     /// from the caller's pools file by [`PollPolicy::read_tiers`] ([`pace::tiers`]);
     /// none (the default) where they name only pools.
     pub tiers: pace::Tiers,
+    /// `--fix-bounds`: the caller's bounds for its `fix` kind, which a pull
+    /// request must be inside for the poll to start a fix-kind run on it
+    /// ([`bounds`]); none (the default) checks nothing.
+    pub fix_bounds: Option<bounds::FixBounds>,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -716,6 +721,8 @@ impl PollPolicy {
                 .transpose()?,
             footer: Footer::from_json(get("generatedBy")?)?,
             tiers: pace::Tiers::new(),
+            // The CLI's `--fix-bounds`, never the config's.
+            fix_bounds: None,
         })
     }
 
@@ -4654,7 +4661,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             comments.push(stop);
             marker = find_marker(&comments, &self.config.bot);
         }
-        let (answer, labelled_by) = if self.config.policy.operator_answers
+        let (mut answer, labelled_by) = if self.config.policy.operator_answers
             && !merge_only
             && marker.stopped
             && labelled(&pull)
@@ -4730,6 +4737,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             };
             retarget = onto;
         }
+        // Every round here is dispatched as the `fix` kind, so one outside
+        // the caller's fix bounds would only be refused by its policy step
+        // (agent-board#264). Nothing is written; the operator takes it.
+        let left = matches!(decision.action, "fix" | "continue" | "rebase" | "answer")
+            .then(|| self.config.policy.fix_bounds.as_ref())
+            .flatten()
+            .and_then(|b| b.refusal(repo, text(&pull, "/headRefName")));
+        if let Some(why) = &left {
+            answer.clear();
+            decision = step("skip", format!("left to the operator: {why}"));
+        }
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
         // in its place, so that it cannot hold the round or the stop.
@@ -4799,6 +4817,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok((
             line,
             text(&pull, "/author/login") == self.config.bot
+                && left.is_none()
                 && in_flight(&pull, &self.config.bot, decision.action),
         ))
     }
@@ -5103,6 +5122,7 @@ pub fn run_capped<R: Rest, G: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bounds::FixBounds;
     use std::cell::RefCell;
 
     /// A marker as a pass with the default attribution posts it.
@@ -9543,6 +9563,12 @@ mod tests {
         ];
         let patch = |id: u64| format!("PATCH repos/{REPO}/issues/comments/{id}");
         let none = Value::Null;
+        // The caller's fix bounds, as tracker's fix.toml gives them.
+        let bounds = |repos: &str| {
+            format!(
+                "repos = [\"{repos}\"]\n[outputs]\npush_to_pull_request_branch = {{ branches = [\"dispatch/**\", \"bot/**\"] }}\n"
+            )
+        };
         #[rustfmt::skip]
         // Name, change, marker, refused mutations, dispatch answers, line, the
         // bot's writes, and the dispatcher's.
@@ -9619,6 +9645,46 @@ mod tests {
                 1,
             ),
             (
+                "a change request on a branch inside the fix bounds starts a fix run",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "bounds": bounds(REPO)}),
+                none.clone(),
+                vec![],
+                vec![(200, json!({"workflow_run_id": 1234}))],
+                "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![comment.clone(), patch(99), patch(99)],
+                1,
+            ),
+            (
+                "a change request on a branch outside the fix bounds starts nothing and writes nothing",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "bounds": bounds(REPO), "headRefName": "ci-drop-grub-cc"}),
+                none.clone(),
+                vec![],
+                vec![],
+                r#"skip: left to the operator: head branch "ci-drop-grub-cc" is outside the fix bounds"#,
+                vec![],
+                0,
+            ),
+            (
+                "a continuation in a repository outside the fix bounds is not started",
+                json!({"isDraft": true, "body": checkpointed("budget"), "contexts": {"review": null}, "bounds": bounds("bootc-dev/*")}),
+                none.clone(),
+                vec![],
+                vec![],
+                "skip: left to the operator: repository cgwalters-forge/agentic-job is outside the fix bounds",
+                vec![],
+                0,
+            ),
+            (
+                "a merge is not held by the fix bounds",
+                json!({"bounds": bounds("bootc-dev/*"), "headRefName": "ci-drop-grub-cc"}),
+                none.clone(),
+                vec![],
+                vec![],
+                "merge: review approved and checks green -> merged",
+                vec!["mergePullRequest".into()],
+                0,
+            ),
+            (
                 "an API without run details is asked again without them",
                 changes.clone(),
                 none.clone(),
@@ -9693,14 +9759,15 @@ mod tests {
                 .as_object_mut()
                 .and_then(|c| c.remove("pushed"))
                 .map(|head| (470, head.as_str().unwrap().to_owned()));
-            let run = format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}");
+            let bounds = change.as_object_mut().and_then(|c| c.remove("bounds"));
+            let review_run = format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}");
             for (field, value) in change
                 .as_object_mut()
                 .and_then(|c| c.remove("run"))
                 .iter()
                 .flat_map(|r| r.as_object().unwrap().clone())
             {
-                fake.rest.get_mut(&run).unwrap().3[field] = value;
+                fake.rest.get_mut(&review_run).unwrap().3[field] = value;
             }
             fake.pulls.insert(470, pull("pull-470", change));
             fake.refused = refused;
@@ -9720,10 +9787,26 @@ mod tests {
                 .answers
                 .borrow_mut()
                 .insert(DISPATCHES.into(), dispatch);
-            let outcome = applied(&fake, &dispatcher);
+            let mut cfg = config();
+            cfg.policy.fix_bounds = bounds.map(|b| FixBounds::parse(b.as_str().unwrap()).unwrap());
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
             let got = outcome.lines.last().unwrap();
             assert!(got.ends_with(line), "{name}: {got}");
             assert_eq!(written(&fake.writes), writes, "{name}");
+            // Left to the operator, it is not the poll's in flight.
+            if got.contains("left to the operator") {
+                assert_eq!(outcome.in_flight, 0, "{name}");
+            }
             // Fix runs are started with the caller's token only.
             assert_eq!(dispatcher.writes.borrow().len(), dispatches, "{name}");
             assert!(
