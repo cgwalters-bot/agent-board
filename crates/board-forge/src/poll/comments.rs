@@ -433,7 +433,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> Result<(String, u64)> {
         let floor = self.now - Duration::seconds(LOOKBACK_SECONDS);
         let lag = Duration::seconds(SEARCH_LAG_SECONDS);
-        let saved = cursor.and_then(|c| OffsetDateTime::parse(c, &Rfc3339).ok());
+        let saved = timestamp(cursor);
         let cursor = saved
             .map_or(floor, |c| c.clamp(floor, self.now))
             .replace_nanosecond(0)?;

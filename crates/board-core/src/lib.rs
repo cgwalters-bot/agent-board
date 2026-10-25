@@ -48,31 +48,6 @@ impl ItemRef {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ChangeRef {
-    pub item: ItemRef,
-    pub revision: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RunRef {
-    pub host: String,
-    pub repository: String,
-    pub id: u64,
-    pub attempt: u32,
-    pub workflow_ref: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Actor {
-    pub host: String,
-    pub login: String,
-    pub provenance: String,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BoardField {
     IssueState,
@@ -875,48 +850,6 @@ mod tests {
                     plan.actions.is_empty(),
                     should_block,
                     "{restriction}: {status:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rule_table() {
-        for (status, complete, allowed, count) in [
-            (None, true, true, 1),
-            (Some(Status::Triage), true, true, 0),
-            (Some(Status::Done), true, true, 0),
-            (None, false, true, 0),
-            (None, true, false, 0),
-        ] {
-            let mut snapshot: Snapshot =
-                serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
-            snapshot.items.truncate(1);
-            snapshot.items[0].status = status;
-            snapshot.items[0].fields_complete = complete;
-            let policy = Policy {
-                project: snapshot.project.clone(),
-                repositories: if allowed {
-                    vec!["example/intake".into()]
-                } else {
-                    vec![]
-                },
-                capabilities: vec![Capability::ProjectFieldEdit],
-            };
-            let plan = reconcile(&snapshot, &policy, &snapshot.clock).unwrap();
-            assert_eq!(plan.actions.len(), count);
-            assert_eq!(
-                serde_json::to_vec(&plan).unwrap(),
-                serde_json::to_vec(&reconcile(&snapshot, &policy, &snapshot.clock).unwrap())
-                    .unwrap()
-            );
-            if count == 1 {
-                snapshot.items[0].status = Some(Status::Triage);
-                assert!(
-                    reconcile(&snapshot, &policy, &snapshot.clock)
-                        .unwrap()
-                        .actions
-                        .is_empty()
                 );
             }
         }

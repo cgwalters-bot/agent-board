@@ -16,7 +16,7 @@
 //! slice's run waits until the caller opens it from the repository. The
 //! caller's bounds check the base again. See docs/job-plans.md#stacking.
 use crate::github::Transport;
-use crate::poll::validate_repository;
+use crate::overlap::owner_name;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
 use serde_json::{Value, json};
@@ -122,11 +122,7 @@ fn closes(body: &str, repo: &str, number: u64) -> bool {
 /// Unlike the overlap check, a read that fails is an error: dispatching a
 /// stacked run on the default branch would bring back the conflicts it avoids.
 pub fn resolve<T: Transport>(client: &T, dest: &ItemRef, lower: u64, bot: &str) -> Result<Stack> {
-    validate_repository(&dest.repository)?;
-    let (owner, name) = dest
-        .repository
-        .split_once('/')
-        .context("issue repository")?;
+    let (owner, name) = owner_name(dest)?;
     let issue = ItemRef {
         number: lower,
         ..dest.clone()

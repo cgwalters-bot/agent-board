@@ -153,6 +153,9 @@ fn reconcile_config_is_opt_in() {
         .get_output()
         .stdout
         .clone();
+    let value: Value = serde_json::from_slice(&baseline).unwrap();
+    assert_eq!(value["type"], "update_project");
+    assert_eq!(value["fields"]["Status"], "Triage");
     for contents in [r#"{}"#, r#"{"statusReconcile":{"enabled":false}}"#] {
         std::fs::write(&config, contents).unwrap();
         let output = command()
@@ -796,20 +799,6 @@ fn board_config_cli_table() {
         assert!(stderr.contains(message), "{args:?}: {stderr}");
     }
     std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn emitted_proposal() {
-    let output = command()
-        .args(["reconcile", "plan", "--snapshot", &fixture(), "--emit"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let value: Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(value["type"], "update_project");
-    assert_eq!(value["fields"]["Status"], "Triage");
 }
 
 #[test]

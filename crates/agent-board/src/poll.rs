@@ -1,3 +1,4 @@
+use crate::supervise::read;
 use anyhow::{Context, Result, ensure};
 use board_forge::poll::{self, State, bounds::FixBounds};
 use std::{io::Write, path::PathBuf};
@@ -109,14 +110,8 @@ pub fn run(
     args: &Poll,
     board: impl FnOnce() -> Result<Option<board_core::Snapshot>>,
 ) -> Result<()> {
-    let read = |path: &PathBuf| -> Result<serde_json::Value> {
-        serde_json::from_slice(
-            &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-        )
-        .with_context(|| format!("decode {}", path.display()))
-    };
-    let value = args.config.as_ref().map(read).transpose()?;
-    let pools = args.pools.as_ref().map(read).transpose()?;
+    let value = args.config.as_deref().map(read).transpose()?;
+    let pools = args.pools.as_deref().map(read).transpose()?;
     let now = time::OffsetDateTime::now_utc();
     let (effective, mut policy) = configured(args, value.as_ref(), pools.as_ref(), now)?;
     policy.fix_bounds = args
@@ -134,12 +129,7 @@ pub fn run(
         "poll takes its steps only when asked; pass --dry-run or --apply"
     );
     let state = match &args.state {
-        Some(path) if path.exists() => State::from_json(
-            &serde_json::from_slice(
-                &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-            )
-            .with_context(|| format!("decode {}", path.display()))?,
-        )?,
+        Some(path) if path.exists() => State::from_json(&read(path)?)?,
         _ => State::default(),
     };
     let config = poll::Config {

@@ -2357,18 +2357,11 @@ mod tests {
     fn status_publication_validates_before_writing() {
         for status in ["on-track", "at-risk", "off-track"] {
             let native = status.replace('-', "_").to_uppercase();
-            let github = GitHub {
-                owner: "example".into(),
-                number: 1,
-                transport: Recorded {
-                    responses: RefCell::new(VecDeque::from([
-                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
-                        json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
-                        json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":"Report","status":native}}}),
-                    ])),
-                    variables: RefCell::new(vec![]),
-                },
-            };
+            let github = recorded([
+                json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
+                json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}),
+                json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":"Report","status":native}}}),
+            ]);
             assert_eq!(
                 github.status_update(status, Some("Report"), None).unwrap(),
                 "U"
@@ -2409,21 +2402,14 @@ mod tests {
                 "https://github.com/orgs/example/projects/1"
             };
             let body = "No changes since 2026-10-02T00:00:00Z\n";
-            let github = GitHub {
-                owner: "example".into(),
-                number: 1,
-                transport: Recorded {
-                    responses: RefCell::new(VecDeque::from([
-                        json!({"repositoryOwner":{"projectV2":{"id":"P","url":url}}}),
-                        json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}),
-                        json!({"node":{"statusUpdates":{"nodes":[{"createdAt":"2026-10-02T00:00:00Z"},{"createdAt":"2026-10-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}}),
-                        json!({"viewer":{"login":"worker"}}),
-                        json!({"node":{"items":{"nodes":if case == "redacted" {json!([{"content":null}])} else {json!([])},"pageInfo":{"hasNextPage":case == "incomplete","endCursor":null}}}}),
-                        json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":if case == "receipt" {"wrong"} else {body},"status":"ON_TRACK"}}}),
-                    ])),
-                    variables: RefCell::new(vec![]),
-                },
-            };
+            let github = recorded([
+                json!({"repositoryOwner":{"projectV2":{"id":"P","url":url}}}),
+                json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}),
+                json!({"node":{"statusUpdates":{"nodes":[{"createdAt":"2026-10-02T00:00:00Z"},{"createdAt":"2026-10-01T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}}),
+                json!({"viewer":{"login":"worker"}}),
+                json!({"node":{"items":{"nodes":if case == "redacted" {json!([{"content":null}])} else {json!([])},"pageInfo":{"hasNextPage":case == "incomplete","endCursor":null}}}}),
+                json!({"createProjectV2StatusUpdate":{"statusUpdate":{"id":"U","body":if case == "receipt" {"wrong"} else {body},"status":"ON_TRACK"}}}),
+            ]);
             let result = github.status_update("on-track", None, None);
             assert_eq!(result.is_ok(), case == "valid", "{case}: {result:?}");
             let count = github.transport.variables.borrow().len();
@@ -2640,16 +2626,11 @@ mod tests {
 
     #[tokio::test]
     async fn redacted_membership_blocks_reconcile() {
-        let t = Recorded { responses: RefCell::new(vec![
+        let snapshot = recorded([
             json!({"repositoryOwner":{"projectV2":{"id":"P","url":"https://github.com/orgs/example/projects/1"}}}),
             json!({"node":{"fields":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}),
             json!({"node":{"items":{"nodes":[{"id":"M","content":null}],"pageInfo":{"hasNextPage":false}}}}),
-        ].into()),variables:RefCell::new(vec![]) };
-        let snapshot = GitHub {
-            transport: t,
-            owner: "example".into(),
-            number: 1,
-        }
+        ])
         .snapshot()
         .await
         .unwrap();

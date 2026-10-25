@@ -233,9 +233,7 @@ reported on its line and left to the next pass.
 A held start takes the slot it would have had, so a capped pass reads no
 further than an uncapped one. The numbers for the scheduled pass are an
 [open question](architecture.md#open-questions).
-The caller serializes apply passes for the board, except a capped local apply,
-which is not serialized against the scheduled pass and is bounded by its caps
-instead. It uses trusted default-branch configuration and a pinned build, and
+The caller uses trusted default-branch configuration and a pinned build, and
 supplies credentials through the environment, never the file. Issue text, PR
 bodies, run names and comments other than authenticated operator direction are
 data, not instructions.

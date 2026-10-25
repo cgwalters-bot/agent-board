@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use board_core::Snapshot;
 use board_forge::org_status::{self, REQUEST_LIMIT, Settings, TIMEOUT_SECONDS};
 use board_forge::supervise::{self, Bounded, Limits};
@@ -16,11 +16,11 @@ pub struct Status {
 }
 
 pub fn settings(args: &Status, owner: &str) -> Result<Settings> {
-    let config: Value = serde_json::from_slice(
-        &std::fs::read(&args.config).with_context(|| format!("read {}", args.config.display()))?,
+    Settings::from_json(
+        owner,
+        &crate::supervise::read(&args.config)?,
+        args.job_limit,
     )
-    .with_context(|| format!("decode {}", args.config.display()))?;
-    Settings::from_json(owner, &config, args.job_limit)
 }
 
 /// The report, read with `client`'s token within the pass's bounds;

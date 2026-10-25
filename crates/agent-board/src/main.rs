@@ -416,11 +416,7 @@ fn board(cli: &Cli) -> Result<board_forge::forgejo::Board> {
     let Some(path) = &cli.board_config else {
         return Ok(board_forge::forgejo::Board::Github {});
     };
-    let value: Value = serde_json::from_slice(
-        &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
-    )
-    .with_context(|| format!("decode {}", path.display()))?;
-    let board = board_forge::forgejo::Board::from_config(&value)?;
+    let board = board_forge::forgejo::Board::from_config(&supervise::read(path)?)?;
     ensure!(
         matches!(board, board_forge::forgejo::Board::Github {})
             || matches!(

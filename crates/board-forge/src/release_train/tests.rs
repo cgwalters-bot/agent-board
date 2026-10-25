@@ -1,4 +1,5 @@
 use super::*;
+use crate::supervise::tests::base64;
 use std::cell::RefCell;
 
 /// Recorded from GitHub with one dry-run pass of tracker's train.cjs at
@@ -277,25 +278,6 @@ fn boundaries_hold_on_recorded_state() {
             (got, expected) => panic!("{got:?}, expected {expected:?}"),
         }
     }
-}
-
-/// `text` in base64, as the contents API answers.
-fn base64(text: &str) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in text.as_bytes().chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
-        for i in 0..4 {
-            out.push(match i <= chunk.len() {
-                true => char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]),
-                false => '=',
-            });
-        }
-    }
-    out
 }
 
 #[test]

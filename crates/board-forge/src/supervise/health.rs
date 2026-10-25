@@ -7,6 +7,7 @@ use super::{Api, HOUR_MS, Limits, Release, Settings, encode, iso, millis, run_ti
 use crate::plan::DISPATCH_MARKER;
 use crate::poll::author_login as login;
 use anyhow::{Context, Result, bail, ensure};
+use board_core::NEEDS_HUMAN_LABEL as HOLD;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -82,8 +83,6 @@ pub const CHECKS: &[(&str, &str)] = &[
 
 /// The checks whose settings may be left out, reported "Not configured.".
 const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck"];
-/// The label the poll stops a pull request with.
-const HOLD: &str = "needs-human";
 /// Coordinator checkpoints on an epic: `<!-- coordinator/v1: {...} -->`.
 const CHECKPOINT_MARKER: &str = "coordinator/v1";
 /// The usage snapshot comment (`pass`'s stage 1, or tracker's usage.yml) and its JSON's schema.

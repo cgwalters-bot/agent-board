@@ -7,6 +7,7 @@
 //! checked here, which come from the caller's configuration, are what limit
 //! it. Applying is opt-in and records a claim before making changes.
 use crate::github::{API_ROOT, DEFAULT_HOST, Transport};
+use crate::overlap::owner_name;
 use crate::plan::{Comment, JobPlan, fenced_json, issue_comments, newest_fenced};
 use crate::poll::validate_repository;
 use anyhow::{Context, Result, bail, ensure};
@@ -860,11 +861,7 @@ pub fn read_epic<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Epic> {
         issue.host == DEFAULT_HOST,
         "epic plans are read only from github.com"
     );
-    validate_repository(&issue.repository)?;
-    let (owner, name) = issue
-        .repository
-        .split_once('/')
-        .context("issue repository")?;
+    let (owner, name) = owner_name(issue)?;
     let data = transport.graphql(
         SUB_ISSUES_QUERY,
         json!({"owner": owner, "name": name, "number": issue.number}),
@@ -938,11 +935,7 @@ pub fn epic_labelled_by<T: Transport>(transport: &T, issue: &ItemRef) -> Result<
         issue.host == DEFAULT_HOST,
         "epic plans are read only from github.com"
     );
-    validate_repository(&issue.repository)?;
-    let (owner, name) = issue
-        .repository
-        .split_once('/')
-        .context("issue repository")?;
+    let (owner, name) = owner_name(issue)?;
     let data = transport.graphql(
         LABELED_QUERY,
         json!({"owner": owner, "name": name, "number": issue.number}),

@@ -94,9 +94,9 @@ dispatch caller (step 2) and the review caller (step 4); each says so.
    operator's token, and never edits existing fields or options;
    `project init --snapshot FILE` instead prints copyable
    `gh project field-create` commands on stderr without running them. For asks,
-   provision the `question` label and an assignable operator. Start with
-   `snapshot create` and `reconcile plan` previews. Live writes need a token
-   with organization Projects read and write and repository Issues write, with
+   provision the `question` and `needs-human` labels and an assignable
+   operator. Start with `snapshot create` and `reconcile plan` previews. Live
+   writes need a token with organization Projects read and write and repository Issues write, with
    organization approval and the token owner's access to the project; workflow
    `permissions` and `GITHUB_TOKEN` do not grant organization Projects writes.
    The [live template](../live/board-test.yml) shows a protected staging test.

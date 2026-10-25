@@ -17,12 +17,12 @@ use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
 use crate::poll::{
     self, POLL_REPOSITORY_LIMIT, PollPolicy, Rest, RestResponse, State, next_link,
-    stale::STALE_DAYS_LIMIT, validate_repository, validate_workflow,
+    stale::STALE_DAYS_LIMIT, text, validate_repository, validate_workflow,
 };
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
-use board_core::ItemRef;
+use board_core::{ItemRef, NEEDS_HUMAN_LABEL as NEEDS_HUMAN};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::{Value, json};
@@ -78,8 +78,6 @@ const WEEKLY_USD_LIMIT: f64 = 100_000.0;
 /// How far past the weekly budget pull requests' fix rounds go on, so that
 /// work already in flight can land.
 const FOLLOW_MARGIN: f64 = 0.1;
-/// The one marker that the operator must act (docs/architecture.md).
-const NEEDS_HUMAN: &str = "needs-human";
 /// Labels a person puts on an issue to keep runs off it.
 const HOLD_LABELS: &[&str] = &[NEEDS_HUMAN, "needs-design"];
 /// Issues that are not work: epics, and questions to the operator.
@@ -843,10 +841,6 @@ pub struct Parent {
     pub open: bool,
     pub labels: Vec<String>,
     pub labels_complete: bool,
-}
-
-fn text<'a>(value: &'a Value, pointer: &str) -> &'a str {
-    value.pointer(pointer).and_then(Value::as_str).unwrap_or("")
 }
 
 fn labels(node: &Value) -> Result<(Vec<String>, bool)> {

@@ -150,18 +150,7 @@ pub struct Family {
 }
 
 pub fn family<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Family> {
-    let (owner, name) = issue
-        .repository
-        .split_once('/')
-        .context("issue repository")?;
-    let data = transport.graphql(
-        FAMILY_QUERY,
-        json!({"owner": owner, "name": name, "number": issue.number}),
-    )?;
-    let node = data
-        .pointer("/repository/issue")
-        .filter(|n| n.is_object())
-        .with_context(|| format!("{} is not an issue", issue.display()))?;
+    let node = &issue_node(transport, FAMILY_QUERY, issue)?;
     let mut siblings = Vec::new();
     if let Some(subs) = node["parent"].get("subIssues") {
         // GitHub allows 100 sub-issues per parent; more is not the API this reads.
@@ -407,7 +396,11 @@ pub(crate) fn held<'a, T: Transport>(
     Ok(out)
 }
 
-fn issue_node<T: Transport>(transport: &T, query: &str, issue: &ItemRef) -> Result<Value> {
+pub(crate) fn issue_node<T: Transport>(
+    transport: &T,
+    query: &str,
+    issue: &ItemRef,
+) -> Result<Value> {
     let (owner, name) = issue
         .repository
         .split_once('/')

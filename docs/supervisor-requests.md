@@ -38,25 +38,19 @@ the pools file and one of a fixed set of reasons.
 The executor writes the brief itself. A batch is refused whole if any request
 is invalid, if an issue holds a supervisor note, if an issue has a dispatch
 run in flight, or if the batch would pass
-`maxDispatchesPerPass` or `maxDispatchesPerDay`. Who wrote an issue is not
-checked, nor whether it is locked (agent-board#155, operator decision on #138):
-the run reads the issue as data inside its sandbox, can write only through its
-bounded safe outputs, and its pull request needs the required review before
-merge; those are the boundary. The day's count comes from the
+`maxDispatchesPerPass` or `maxDispatchesPerDay`. The day's count comes from the
 executor's own entries in the log issue, each written before the dispatches it
 names. That count holds only if the caller runs one executor at a time, as
-tracker's execute job does with its own concurrency group. Both caps default
-to zero, which admits nothing. Explicitly enabled implement dispatches additionally
-require native membership under an open, epic-labeled plan. Judgment writes
-(comments, operator-assigned tracker issues, tracker bug issues, triage-proven closure, conflict-only
-poll hold removal, state replacement and a daily project update) have separate
-trusted-config daily caps, all off by default. The
-[request protocol](#requests) below gives the evidence each needs. It never
-merges, enqueues, changes variables or reads secrets. Its
-settings are the poll's agent-board.json (`--config`, which for the supervisor
-must also name `epics.repository`), the supervisor's file
-(`--supervisor-config`) and,
-optionally, the usage snapshot's location (`--usage-config`); every key is in
+tracker's execute job does with its own concurrency group. Explicitly enabled
+implement dispatches additionally require native membership under an open,
+epic-labeled plan. Judgment writes (comments, operator-assigned tracker issues,
+tracker bug issues, triage-proven closure, conflict-only poll hold removal,
+state replacement and a daily project update) have separate trusted-config
+daily caps, all off by default. The [request protocol](#requests) below gives
+the evidence each needs, and [accounting](#accounting-and-limits) what it never
+does. Its settings are the poll's agent-board.json (`--config`, which for the
+supervisor must also name `epics.repository`), the supervisor's file
+(`--supervisor-config`) and, optionally, the usage snapshot's location (`--usage-config`); every key is in
 the [configuration](#configuration) below. The
 release train and scheduler-log settings are optional, so an organization
 without them leaves those checks not configured, and `unset` names them. The checks
@@ -243,7 +237,7 @@ the fixed reasons/brief in the playbook. Triage and research require an open,
 non-held ordinary issue with no supervisor note and no run in flight. Its
 authors and lock are not checked: the run reads the issue as data in its
 sandbox, writes only through bounded safe outputs, and its pull request needs
-review before merge (agent-board#155). Implement requires those checks **and** native parentage under an
+review before merge (agent-board#155, operator decision on #138). Implement requires those checks **and** native parentage under an
 open `epic`-labeled issue in the configured epics repository. A body link claiming
 approval does not suffice. The `epic` label is the approval; this executor
 cannot add it or create parentage, but anyone with triage access can add it

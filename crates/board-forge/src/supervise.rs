@@ -727,9 +727,28 @@ pub(crate) fn word_repo(repo: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `text` in base64, as the contents API answers.
+    pub(crate) fn base64(text: &str) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in text.as_bytes().chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                out.push(match i <= chunk.len() {
+                    true => char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]),
+                    false => '=',
+                });
+            }
+        }
+        out
+    }
 
     pub(crate) fn board() -> Value {
         json!({

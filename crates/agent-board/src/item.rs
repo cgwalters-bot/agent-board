@@ -1,6 +1,7 @@
 //! `item add` and `item edit`. Both print a validated `update_project` proposal unless
 //! `--apply` is given; only then do they write, with the operator's own token, as
 //! `project init` does. No workflow here passes `--apply`, and an agent holds no token.
+use crate::ask::print_proposals;
 use anyhow::{Context, Result, ensure};
 use board_core::{ItemRef, Snapshot};
 use board_forge::github::{DEFAULT_HOST, FieldWrite, GitHub, Transport, field_writes};
@@ -89,13 +90,6 @@ fn proposal(project: &str, item: &ItemRef, writes: &[FieldWrite]) -> Value {
     json!({"type": "update_project", "project": project, "content_type": "issue", "content_number": item.number, "target_repo": item.repository, "fields": fields})
 }
 
-fn print_proposal(out: &mut impl Write, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *out, value)?;
-    writeln!(out)?;
-    eprintln!("Proposed only; not applied. Re-run with --apply to write with your token.");
-    Ok(())
-}
-
 /// Validate against a saved snapshot and print the proposal; never writes.
 pub fn preview(
     snapshot: &Snapshot,
@@ -124,7 +118,10 @@ pub fn preview(
             item.content_kind
         );
     }
-    print_proposal(out, &proposal(snapshot.project.as_str(), identity, &writes))
+    print_proposals(
+        out,
+        &[proposal(snapshot.project.as_str(), identity, &writes)],
+    )
 }
 
 /// Validate against the live schema and membership, then print the proposal or, with
@@ -152,7 +149,7 @@ pub fn write<T: Transport>(
         identity.display()
     );
     if !apply {
-        return print_proposal(out, &proposal(url.as_str(), identity, &writes));
+        return print_proposals(out, &[proposal(url.as_str(), identity, &writes)]);
     }
     let (item, action) = match member {
         Some(item) => (item, "present"),

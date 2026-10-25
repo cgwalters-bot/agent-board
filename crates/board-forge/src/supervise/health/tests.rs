@@ -1,5 +1,8 @@
 use super::*;
-use crate::supervise::{Bounded, tests::settings};
+use crate::supervise::{
+    Bounded,
+    tests::{base64, settings},
+};
 use std::cell::{Cell, RefCell};
 
 const SNAPSHOTS: &str = include_str!("../../../../../fixtures/supervisor-snapshots.json");
@@ -539,22 +542,7 @@ fn wrapper(release: &str, tag: &str) -> Value {
         .iter()
         .map(|n| format!("uses: {release}/.github/workflows/{n}.yml@{tag}\n"))
         .collect();
-    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::new();
-    for chunk in text.as_bytes().chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |acc, (i, b)| acc | u32::from(*b) << (16 - 8 * i));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                encoded.push(table[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                encoded.push('=');
-            }
-        }
-    }
-    json!({"content": encoded})
+    json!({"content": base64(&text)})
 }
 
 #[test]

@@ -16,7 +16,7 @@ use crate::dispatch::{GitHub, Handle, Start, StartOutcome, Target};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::{Footer, overlap};
 use anyhow::{Context, Result, bail, ensure};
-use board_core::admission;
+use board_core::{NEEDS_HUMAN_LABEL as LABEL, admission};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -51,7 +51,6 @@ const MARKER: &str = "tracker-poll";
 pub(crate) use tests::conflict_stop_fixture;
 /// This poll's own: the claim a pass posts before it starts a fix round.
 const CLAIM: &str = "agent-board-fix-claim";
-const LABEL: &str = "needs-human";
 /// On a pull request or an issue it closes: the review job's approval alone
 /// does not merge it, the operator's of the head does (agent-board#293).
 const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
@@ -931,15 +930,18 @@ impl State {
                 Ok((url.clone(), entry.clone()))
             })
             .collect::<Result<_>>()?;
-        let operator_cursor = object
-            .get("operator_cursor")
-            .map(|c| {
-                c.as_str()
-                    .filter(|c| OffsetDateTime::parse(c, &Rfc3339).is_ok())
-                    .map(str::to_owned)
-                    .context("poll state operator_cursor is not a time")
-            })
-            .transpose()?;
+        let time = |key: &str| {
+            object
+                .get(key)
+                .map(|c| {
+                    c.as_str()
+                        .filter(|c| OffsetDateTime::parse(c, &Rfc3339).is_ok())
+                        .map(str::to_owned)
+                        .with_context(|| format!("poll state {key} is not a time"))
+                })
+                .transpose()
+        };
+        let operator_cursor = time("operator_cursor")?;
         let operator_page = object
             .get("operator_page")
             .map(|p| {
@@ -976,17 +978,6 @@ impl State {
                     .context("poll state follow_cursor is not a repository")
             })
             .transpose()?;
-        let time = |key: &str| {
-            object
-                .get(key)
-                .map(|c| {
-                    c.as_str()
-                        .filter(|c| OffsetDateTime::parse(c, &Rfc3339).is_ok())
-                        .map(str::to_owned)
-                        .with_context(|| format!("poll state {key} is not a time"))
-                })
-                .transpose()
-        };
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
         Ok(Self {
@@ -1042,7 +1033,7 @@ pub fn next_interval(previous: i64, active: bool) -> i64 {
     }
 }
 
-fn text<'a>(value: &'a Value, pointer: &str) -> &'a str {
+pub(crate) fn text<'a>(value: &'a Value, pointer: &str) -> &'a str {
     value.pointer(pointer).and_then(Value::as_str).unwrap_or("")
 }
 
@@ -5261,19 +5252,13 @@ mod tests {
         })
     }
 
-    /// A recorded pull request; unless a case gives `reviews`, the review job's
-    /// review of the head stands for its recorded `review` status.
-    fn pull(name: &str, change: Value) -> Value {
-        pull_with_author(name, change, job())
-    }
-
     /// A recorded pull request with fields replaced and some of its head's
     /// contexts changed (null removes one). Mergeable on main unless a case
     /// says otherwise. The recordings predate real reviews, so unless a case
-    /// gives `reviews`, the recorded `review` status becomes the supplied author's
+    /// gives `reviews`, the recorded `review` status becomes the review job's
     /// review of the head. They predate `pageInfo` too: each of [`CONNECTIONS`] is
     /// complete unless `truncated` sets its flag (null removes it).
-    fn pull_with_author(name: &str, change: Value, author: Value) -> Value {
+    fn pull(name: &str, change: Value) -> Value {
         let mut p = fixture(name);
         p["mergeable"] = "MERGEABLE".into();
         p["mergeStateStatus"] = "CLEAN".into();
@@ -5324,8 +5309,8 @@ mod tests {
                 .map(|n| text(n, "/state").to_owned());
             let head = text(&p, "/headRefOid").to_owned();
             p["reviews"] = json!({"nodes": match status.as_deref() {
-                Some("SUCCESS") => vec![review("APPROVED", author, &head, "VERDICT: APPROVE")],
-                Some("FAILURE") => vec![review("CHANGES_REQUESTED", author, &head, "VERDICT: CHANGES")],
+                Some("SUCCESS") => vec![review("APPROVED", job(), &head, "VERDICT: APPROVE")],
+                Some("FAILURE") => vec![review("CHANGES_REQUESTED", job(), &head, "VERDICT: CHANGES")],
                 _ => vec![],
             }});
         }
@@ -7196,37 +7181,6 @@ mod tests {
                 )
                 .action,
                 "fix"
-            );
-        }
-    }
-
-    #[test]
-    fn recorded_job_verdicts_decide() {
-        for (status, verdict, action) in [
-            ("SUCCESS", Review::Approved, "merge"),
-            ("FAILURE", Review::ChangesRequested, "fix"),
-        ] {
-            let p = pull(
-                "pull-470",
-                json!({"contexts": {"review": {"state": status}}}),
-            );
-            assert_eq!(
-                review_at_head(&p, &config(), review_run(&p).as_ref()),
-                Some(verdict)
-            );
-            let checks = classify_checks(&p, &required());
-            assert_eq!(
-                decide(
-                    &config(),
-                    &p,
-                    &checks,
-                    &Marker::default(),
-                    (None, review_run(&p).as_ref()),
-                    &Outages::Off,
-                    now()
-                )
-                .action,
-                action
             );
         }
     }
