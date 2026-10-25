@@ -265,10 +265,15 @@ by id, as a head re-queued onto an unchanged base gets a group on the same
 branch), so the head gets a fix round whose task names the
 job and step and carries its failure annotations; any other reason, even
 where a fix round is due, or a removal past the tries, goes to `needs-human`
-with the reasons. When the marker's head has changed, a removal whose GitHub
-`beforeCommit` names another head is marked seen and not charged to the new
-head. Missing attribution preserves the stop; commit dates are not evidence
-of when a head was queued. Each re-queue,
+with the reasons. GitHub's `beforeCommit` of a removal is the merge-group
+commit, not the head (agent-board#254), so a removal is attributed by the
+poll's own record: every enqueue first records its head in the marker as
+`queued`. A removal whose `beforeCommit` is the current head, or whose
+recorded `queued` is, is charged to it; when the marker's head has changed,
+one recorded for another head whose `beforeCommit` names another commit is
+marked seen and not charged. With no record, as for a head queued by a person
+or before enqueues were recorded, or no `beforeCommit`, missing attribution preserves the stop;
+commit dates are not evidence of when a head was queued. Each enqueue, re-queue,
 fix and stop records the queue state in the marker, and the decision line says
 why. A merge, or a rebase fix round, of any followed pull request waits while
 an entry of the base branch's queue changes one of its files, compared by exact
