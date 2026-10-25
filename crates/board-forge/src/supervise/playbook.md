@@ -147,7 +147,9 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   its pull request merged or with none. The evidence is the record and the
   run. Merged: ask for a triage run with `merged-open`. No pull request:
   read the run's status comment on the issue, then ask for a triage run
-  with `no-pull-request`.
+  with `no-pull-request`. When the pass's `replanAfterDays` is set, the
+  pass triages such an issue itself: do not ask while its line says
+  `re-planned from` a time still to come.
 - **pace**: a pool's used share of its window is outside the margin around
   the share elapsed. Report it. Keep the numbers out of public issues,
   because the snapshot is private.

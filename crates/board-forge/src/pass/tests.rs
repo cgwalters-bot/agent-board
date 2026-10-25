@@ -1900,6 +1900,142 @@ fn apply_follows_up_a_triage_by_its_verdict() {
     }
 }
 
+/// Gives `repo#number` on the board one open pull request by `author`.
+fn closing_pull(replay: &mut Replay, (repo, number): (&str, u64), author: &str) {
+    for entry in &mut replay.requests {
+        let nodes = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut);
+        for node in nodes.into_iter().flatten() {
+            let content = &mut node["content"];
+            if content["number"] == number && text(content, "/repository/nameWithOwner") == repo {
+                content["closedByPullRequestsReferences"] = json!({"nodes": [{"number": 900,
+                    "state": "OPEN", "repository": {"nameWithOwner": repo},
+                    "author": {"login": author}}], "totalCount": 1});
+            }
+        }
+    }
+}
+
+/// With `replanAfterDays`, an issue whose implement plan's run ended and
+/// that is still open is triaged once, that many days after the plan's
+/// dispatch record; a triage plan's record is left to `triageFollowUpDays`.
+/// tracker#468's record last changed 2026-10-22T03:49:24Z, a day and a half
+/// before the recording. Each case: its settings, its edit of the
+/// recording, the issue, the start of its line in a first and in a second
+/// applying pass, and the intro of the one triage plan posted, if any.
+#[test]
+fn apply_replans_an_open_issue_after_its_run() {
+    type Case = (
+        &'static str,
+        Value,
+        fn(&mut Replay),
+        (&'static str, u64),
+        [&'static str; 2],
+        Option<&'static str>,
+    );
+    let held = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967";
+    let tracker = |n| ("cgwalters-forge/tracker", n);
+    let cases: Vec<Case> = vec![
+        (
+            "off, it is dispatched already",
+            json!({}),
+            |_| {},
+            tracker(468),
+            [held, held],
+            None,
+        ),
+        (
+            "before its days, it waits for them",
+            json!({"replanAfterDays": 2}),
+            |_| {},
+            tracker(468),
+            [
+                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; re-planned from 2026-10-24T03:49:24Z",
+                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; re-planned from 2026-10-24T03:49:24Z",
+            ],
+            None,
+        ),
+        (
+            "past them, a triage plans the rest once",
+            json!({"replanAfterDays": 1}),
+            |_| {},
+            tracker(468),
+            [
+                "start triage cgwalters-forge/tracker#468 pool=claude record=",
+                "hold cgwalters-forge/tracker#468: plan ",
+            ],
+            Some(REPLAN),
+        ),
+        (
+            "a run in flight holds it",
+            json!({"replanAfterDays": 1}),
+            |r| {
+                in_flight(
+                    r,
+                    vec![
+                        json!({"id": 7, "display_title": "implement cgwalters-forge/tracker#468 (claude)", "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/7"}),
+                    ],
+                )
+            },
+            tracker(468),
+            [
+                "hold cgwalters-forge/tracker#468: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
+                "hold cgwalters-forge/tracker#468: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
+            ],
+            None,
+        ),
+        (
+            "an open bot pull request holds it",
+            json!({"replanAfterDays": 1}),
+            |r| closing_pull(r, ("cgwalters-forge/tracker", 468), "cgwalters-bot"),
+            tracker(468),
+            [
+                "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
+                "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
+            ],
+            None,
+        ),
+        (
+            "a triage plan's record is followed up as before",
+            json!({"replanAfterDays": 1, "triageFollowUpDays": 3}),
+            |_| {},
+            tracker(446),
+            [
+                "start triage cgwalters-forge/tracker#446 pool=claude record=",
+                "hold cgwalters-forge/tracker#446: its triage, ",
+            ],
+            Some("The board pass asks a triage run to plan this issue."),
+        ),
+    ];
+    for (name, settings, edit, (repo, number), expected, intro) in cases {
+        let config = config(settings);
+        let mut forge = Forge::new(None, false);
+        edit(&mut forge.replay);
+        let item = format!("{repo}#{number}");
+        for (pass, expected) in expected.into_iter().enumerate() {
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+            let line = report
+                .lines
+                .iter()
+                .find(|l| l.contains(&format!("{item}:")) || l.contains(&format!("{item} ")))
+                .map_or("", String::as_str);
+            let replanned = line.contains("re-planned") && !expected.contains("re-planned");
+            assert!(
+                line.starts_with(expected) && !replanned,
+                "{name}, pass {pass}: no line {expected:?} in {:#?}",
+                report.lines
+            );
+        }
+        let started = forge.dispatches().iter().filter(|d| **d == item).count();
+        assert_eq!(started, usize::from(intro.is_some()), "{name}");
+        let comments = forge.comments_on(repo, number);
+        let posted = comments.first().and_then(|c| c.lines().next());
+        assert_eq!(posted, intro, "{name}");
+    }
+}
+
 /// `--max-dispatch` starts the first runs the pass would and holds the rest,
 /// a line each, writing nothing for them; a preview of the recorded board
 /// plans what a local apply over it starts. A start is a dispatch, not a
@@ -2586,6 +2722,18 @@ fn config_table() {
         (
             json!({"triageFollowUpDays": 3}),
             "triageFollowUpDays needs triage",
+        ),
+        (
+            json!({"replanAfterDays": 31}),
+            "replanAfterDays is not 0 to 30",
+        ),
+        (
+            json!({"replanAfterDays": -1}),
+            "invalid value: integer `-1`, expected u64",
+        ),
+        (
+            json!({"replanAfterDays": 1}),
+            "replanAfterDays needs triage",
         ),
         (
             json!({"epics": {"repository": "o/r", "inAnyRepository": true}}),
