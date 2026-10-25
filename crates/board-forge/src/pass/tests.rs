@@ -325,16 +325,26 @@ fn replay_scenarios() {
             0,
         ),
         (
-            "a run list that may be cut short is no capacity",
+            "a run that moved between pages and was missed is no capacity",
             Box::new(|r, _| {
-                answer(r, "status=waiting")["body"]["total_count"] = 101.into();
+                second_page(r, json!({"id": 7}), None);
+                answer(r, "page=2")["body"]["total_count"] = 4.into();
             }),
             vec![
-                "schedule error: waiting runs: 0 read of 101; capacity is unknown",
+                "schedule error: in_progress runs: 3 read of 4; capacity is unknown",
                 "status: the runs in flight could not be listed, so none goes back to Todo",
             ],
             0,
             1,
+        ),
+        (
+            "a stuck run GitHub counts but never lists does not hide the rest",
+            Box::new(|r, _| {
+                answer(r, "status=in_progress")["body"]["total_count"] = 3.into();
+            }),
+            vec!["start triage cgwalters-forge/tracker#446 pool=claude"],
+            6,
+            0,
         ),
         (
             "a run in flight holds its issue and its slot",

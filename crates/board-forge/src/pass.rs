@@ -88,6 +88,8 @@ const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", 
 /// The most runs GitHub lists for one status filter; a longer list cannot
 /// be read whole.
 const RUN_LIST_LIMIT: u64 = 1000;
+/// The runs one page of a run list holds, as `per_page` asks.
+const RUNS_PER_PAGE: u64 = 100;
 /// The runner a triage plan asks for.
 const TRIAGE_RUNNER: &str = "hosted";
 
@@ -1479,7 +1481,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .as_u64()
             .context("this pass's run names no workflow")?;
         let url = format!(
-            "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?status=in_progress&per_page=100"
+            "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?status=in_progress&per_page={RUNS_PER_PAGE}"
         );
         for run in self.workflow_runs(&url, "this pass's workflow's in_progress runs")? {
             if run["id"].as_u64().context("run has no id")? != own.id {
@@ -1492,12 +1494,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Every run `url` lists, page by page within the pass's budget. A list
     /// cut short, by the budget, by [`RUN_LIST_LIMIT`] or by runs that moved
     /// between its pages, is an error that says how many of `what` were
-    /// read: capacity read from it would be guessed.
+    /// read: capacity read from it would be guessed. One page that is not
+    /// full is the whole list, though `total_count` says more: GitHub counts
+    /// a stuck run there that it never lists.
     fn workflow_runs(&self, url: &str, what: &str) -> Result<Vec<Value>> {
         let mut runs: Vec<Value> = Vec::new();
         let mut ids = BTreeSet::new();
         let mut total = None;
         let mut next = Some(url.to_owned());
+        let mut pages = 0;
         let unknown = |read: usize, total: Option<u64>| {
             let of = total.map_or(String::new(), |t| format!(" of {t}"));
             format!("{what}: {read} read{of}; capacity is unknown")
@@ -1515,6 +1520,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let page = response.body["workflow_runs"]
                 .as_array()
                 .context("run list has no workflow_runs")?;
+            pages += 1;
             for run in page {
                 // Listed twice as runs moved between pages: one was missed.
                 if ids.insert(run["id"].as_u64().context("run has no id")?) {
@@ -1530,7 +1536,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             next = response.link.as_deref().and_then(next_link);
         }
-        ensure!(total == Some(runs.len() as u64), unknown(runs.len(), total));
+        let read = runs.len() as u64;
+        let whole = pages == 1 && read < RUNS_PER_PAGE && total.is_some_and(|t| t >= read);
+        ensure!(whole || total == Some(read), unknown(runs.len(), total));
         Ok(runs)
     }
 
@@ -1547,7 +1555,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut pools = BTreeSet::new();
         for status in ACTIVE_RUNS {
             let url = format!(
-                "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page=100",
+                "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page={RUNS_PER_PAGE}",
                 target.caller, target.workflow
             );
             for run in self.workflow_runs(&url, &format!("{status} runs"))? {
