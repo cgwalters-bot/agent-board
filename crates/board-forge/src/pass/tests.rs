@@ -303,6 +303,49 @@ fn closing_pulls(replay: &mut Replay, last: &str) {
     }));
 }
 
+/// Keeps tracker#446 alone, made a visitor's sub-issue of `epic`'s #135, an
+/// open issue labelled `epic`, last by `by` as tracker#160's labelling was
+/// recorded.
+fn sub_issue(replay: &mut Replay, epic: &str, by: &str) {
+    only(replay, &["cgwalters-forge/tracker#446"]);
+    let parent = json!({"number": 135, "state": "OPEN", "repository": {"nameWithOwner": epic},
+        "labels": {"nodes": [{"name": EPIC_LABEL}], "totalCount": 1}});
+    for entry in &mut replay.requests {
+        let nodes = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut);
+        for node in nodes.into_iter().flatten() {
+            if node["content"]["number"] == 446 {
+                node["content"]["author"]["login"] = "visitor".into();
+                node["content"]["parent"] = parent.clone();
+            }
+        }
+    }
+    let tracker_160 = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 160});
+    let mut labelled = (replay.requests.iter())
+        .find(|e| {
+            e["request"]["variables"] == tracker_160
+                && e["answer"]
+                    .pointer("/data/repository/issue/timelineItems")
+                    .is_some()
+        })
+        .unwrap()
+        .clone();
+    let (owner, name) = epic.split_once('/').unwrap();
+    labelled["request"]["variables"] = json!({"owner": owner, "name": name, "number": 135});
+    let events = labelled
+        .pointer_mut("/answer/data/repository/issue/timelineItems/nodes")
+        .and_then(Value::as_array_mut)
+        .unwrap();
+    for event in events
+        .iter_mut()
+        .filter(|e| e["label"]["name"] == EPIC_LABEL)
+    {
+        event["actor"]["login"] = by.into();
+    }
+    replay.requests.push(labelled);
+}
+
 type Edit = Box<dyn Fn(&mut Replay, &mut Value)>;
 
 /// Each edit of the recording, the lines the pass must then print (each the
@@ -820,6 +863,49 @@ fn replay_scenarios() {
             0,
         ),
         (
+            "an epic outside the epics repository is not live",
+            Box::new(|r, _| sub_issue(r, "cgwalters-forge/review", "cgwalters")),
+            vec!["candidates: 0 (0 opened by others, 1 outside a live epic)"],
+            0,
+            0,
+        ),
+        (
+            "inWorkRepositories: the operator's epic in a work repository is live",
+            Box::new(|r, c| {
+                sub_issue(r, "cgwalters-forge/review", "cgwalters");
+                c["epics"] =
+                    json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
+            }),
+            vec![
+                "candidates: 1 (0 opened by others, 0 outside a live epic)",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            1,
+            0,
+        ),
+        (
+            "inWorkRepositories: an epic someone else labelled is not",
+            Box::new(|r, c| {
+                sub_issue(r, "cgwalters-forge/review", "visitor");
+                c["epics"] =
+                    json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
+            }),
+            vec!["candidates: 0 (0 opened by others, 1 outside a live epic)"],
+            0,
+            0,
+        ),
+        (
+            "inWorkRepositories: nor is one outside the work repositories",
+            Box::new(|r, c| {
+                sub_issue(r, "elsewhere/review", "cgwalters");
+                c["epics"] =
+                    json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
+            }),
+            vec!["candidates: 0 (0 opened by others, 1 outside a live epic)"],
+            0,
+            0,
+        ),
+        (
             "a board page that does not say whether more follow is no board",
             Box::new(|r, _| {
                 let page = answer(r, r#""cursor":null"#);
@@ -1031,6 +1117,9 @@ impl Forge {
         }
         if path.ends_with("/dispatches") {
             return Ok((200, json!({"workflow_run_id": id})));
+        }
+        if method == "POST" && path.ends_with("/labels") {
+            return Ok((200, json!([])));
         }
         bail!("unexpected write {method} {url}")
     }
@@ -1329,6 +1418,205 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
         last_scheduled(&second),
         "idle: 6 slot(s) free and nothing started"
     );
+}
+
+/// A triage run's answer on tracker#446, `days` from the pass's clock, by
+/// `author` and edited by `editor`, for [`Forge`] to read after its record.
+fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, days: i64) {
+    let id = forge.ids.get() + 1;
+    forge.ids.set(id);
+    let created = (forge.replay.now + time::Duration::days(days))
+        .format(&Rfc3339)
+        .unwrap();
+    let edited = editor.map(|_| created.clone());
+    let key = ("cgwalters-forge/tracker".to_owned(), 446);
+    forge.added.borrow_mut().entry(key).or_default().push(json!({
+        "id": id, "url": format!("https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-{id}"),
+        "body": body, "createdAt": created, "lastEditedAt": edited,
+        "author": {"login": author}, "editor": editor.map(|e| json!({"login": e})),
+    }));
+}
+
+/// With `triageFollowUpDays`, a triage that ended without a plan is acted on
+/// by its verdict, read only from the bot's answer after the run's record:
+/// one for the operator labels the issue, any other waits the days, and the
+/// operator's comment triages it again at once. Each case: its answers
+/// (author, editor, verdict or body, days from now), `--max-writes`, the
+/// line for tracker#446 (`{record}`, `{answer}` and `{due}` filled in),
+/// whether it was triaged again and whether it was labelled.
+#[test]
+fn apply_follows_up_a_triage_by_its_verdict() {
+    type Answer = (&'static str, Option<&'static str>, &'static str, i64);
+    type Case = (
+        &'static str,
+        Vec<Answer>,
+        Option<usize>,
+        &'static str,
+        bool,
+        bool,
+    );
+    let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let bot = "cgwalters-bot";
+    let cases: Vec<Case> = vec![
+        (
+            "done asks the operator to close it, which the pass does not",
+            vec![(bot, None, "done", 0)],
+            None,
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human",
+            false,
+            true,
+        ),
+        (
+            "needs-design asks the operator",
+            vec![(bot, None, "needs-design", 0)],
+            None,
+            "hold cgwalters-forge/tracker#446: triage verdict needs-design, {answer}; label needs-human",
+            false,
+            true,
+        ),
+        (
+            "--max-writes holds the label",
+            vec![(bot, None, "done", 0)],
+            Some(0),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; held by --max-writes: label needs-human",
+            false,
+            false,
+        ),
+        (
+            "partly waits its days",
+            vec![(bot, None, "partly", 0)],
+            None,
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; triaged again from {due}, or once cgwalters comments",
+            false,
+            false,
+        ),
+        (
+            "partly, its days past, is triaged again",
+            vec![(bot, None, "partly", -4)],
+            None,
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            false,
+        ),
+        (
+            "the operator's comment after the verdict triages it again, unlabelled",
+            vec![
+                (bot, None, "done", 0),
+                ("cgwalters", None, "Not done: see #2.", 0),
+            ],
+            None,
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            false,
+        ),
+        (
+            "a visitor's comment after it does not",
+            vec![
+                (bot, None, "partly", 0),
+                ("visitor", None, "Please retry.", 0),
+            ],
+            None,
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}",
+            false,
+            false,
+        ),
+        (
+            "a visitor's verdict is none",
+            vec![("visitor", None, "done", 0)],
+            None,
+            "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict; triaged again from",
+            false,
+            false,
+        ),
+        (
+            "a verdict a visitor edited is none",
+            vec![(bot, Some("visitor"), "done", 0)],
+            None,
+            "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict",
+            false,
+            false,
+        ),
+        (
+            "two verdicts in one answer are none",
+            vec![(bot, None, "two", 0)],
+            None,
+            "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict",
+            false,
+            false,
+        ),
+    ];
+    let config = config(json!({"triageFollowUpDays": 3}));
+    for (name, answers, writes, expected, again, labelled) in cases {
+        let forge = Forge::new(None, false);
+        let first = apply(&forge, &config);
+        assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        assert!(
+            comments[0].contains("schedule-triage fenced JSON block"),
+            "{name}"
+        );
+        let record = (first.lines.iter())
+            .find_map(|l| l.strip_prefix("start triage cgwalters-forge/tracker#446 "))
+            .and_then(|l| l.split(" record=").nth(1)?.split(' ').next())
+            .unwrap()
+            .to_owned();
+        for (author, editor, said, days) in answers {
+            let body = match said {
+                "two" => verdict("done").repeat(2),
+                "done" | "needs-design" | "partly" => verdict(said),
+                text => text.to_owned(),
+            };
+            answered(&forge, (author, editor), &body, days);
+        }
+        let added = forge.added.borrow()[&("cgwalters-forge/tracker".to_owned(), 446)].clone();
+        let answer = text(&added[2], "/url").to_owned();
+        let due = (forge.replay.now + time::Duration::days(3))
+            .format(&Rfc3339)
+            .unwrap();
+        let expected = expected
+            .replace("{record}", &record)
+            .replace("{answer}", &answer)
+            .replace("{due}", &due);
+        let limits = Limits {
+            writes,
+            ..Limits::default()
+        };
+        let second = run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            (Mode::Actions(&own()), limits),
+            forge.replay.now,
+        )
+        .unwrap();
+        assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        let line = second.lines.iter().find(|l| l.contains("tracker#446"));
+        assert!(
+            line.is_some_and(|l| l.starts_with(&expected)),
+            "{name}: no line {expected:?} in {:#?}",
+            second.lines
+        );
+        let triaged = forge
+            .dispatches()
+            .iter()
+            .filter(|d| d.ends_with("tracker#446"))
+            .count();
+        assert_eq!(triaged, 1 + usize::from(again), "{name}");
+        let labels: Vec<(String, Value)> = (forge.writes.borrow().iter())
+            .filter(|(_, url, _)| url.ends_with("/labels"))
+            .map(|(_, url, body)| (url.clone(), body.clone()))
+            .collect();
+        let label = (
+            format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446/labels"),
+            json!({"labels": ["needs-human"]}),
+        );
+        assert_eq!(
+            labels,
+            if labelled { vec![label] } else { vec![] },
+            "{name}"
+        );
+    }
 }
 
 /// `--max-dispatch` starts the first runs the pass would and holds the rest,
@@ -1808,6 +2096,18 @@ fn config_table() {
         (
             json!({"triage": true}),
             "triage needs triagePools or planPools",
+        ),
+        (
+            json!({"triageFollowUpDays": 31}),
+            "triageFollowUpDays is not 0 to 30",
+        ),
+        (
+            json!({"triageFollowUpDays": 3}),
+            "triageFollowUpDays needs triage",
+        ),
+        (
+            json!({"epics": {"repository": "o/r", "inAnyRepository": true}}),
+            "unknown field `inAnyRepository`",
         ),
         (
             json!({"usage": {"repository": "o/ops", "issue": 1, "url": "ftp://broker"}}),

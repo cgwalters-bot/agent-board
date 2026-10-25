@@ -287,6 +287,8 @@ does not change the apply cache.
 There is one candidate set: open board issues in explicitly configured work
 repositories, excluding epics and the usage issue. An epic child qualifies
 only through a live epic whose latest `epic` label event is the operator's.
+A live epic is in `epics.repository`, or with `epics.inWorkRepositories` in
+any work repository; stage 3 plans only the former.
 An unparented issue qualifies only when opened by the operator or bot; public
 visitors must not be able to spend runs simply by filing issues. Deduplicate by
 repository and number. No separate under-pace candidate source exists.
@@ -316,7 +318,17 @@ With no accepted plan, start one triage run if enabled and a slot/pool is
 available. It proposes an implement plan, or explains a needs-design/human hold;
 it does not close the issue on a `done` verdict. Record the question using the
 existing dispatch claim protocol, not another scheduler marker. A completed run
-without a usable plan remains visible for a person; do not automatically retry.
+without a usable plan remains visible for a person; do not automatically retry,
+unless `triageFollowUpDays` is set. Then the triage brief asks for a
+`schedule-triage` verdict, and once the run is no longer in flight the pass
+reads the newest one the bot posted after the dispatch record, unedited but by
+a writer; a visitor's comment is never a verdict. A comment by the operator
+after it (or after the record, with no verdict) triages the issue again.
+Otherwise `done`, `needs-design` and `needs-operator` label it `needs-human`,
+one write step, so it shows as the operator's ask; the pass never closes an
+issue on a verdict, since no review follows a close. Any other verdict, or
+none, triages the issue again `triageFollowUpDays` after the verdict (or the
+record): at most one triage run per issue in that many days.
 
 The one automatic rerun is for infrastructure: a scheduled run that failed
 before the agent's work could succeed or fail on its own (runner lost, setup
@@ -414,9 +426,11 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `board.owner`, `board.project` | Project owner and positive project number; required when work is enabled |
 | `board.priorityField` | Priority single-select field; `"Priority"` |
 | `epics.repository` | Repository containing live epics; absent disables epic planning |
+| `epics.inWorkRepositories` | Also take operator-labelled epics in every work repository as live, for candidates only; `false` |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage; `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
+| `triageFollowUpDays` | Act on an ended triage's verdict and triage again after this many days (0–30), see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
