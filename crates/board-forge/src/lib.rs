@@ -80,8 +80,9 @@ impl Footer {
     }
 }
 
+#[allow(async_fn_in_trait)]
 pub trait Forge {
-    fn snapshot(&self) -> Result<Snapshot>;
+    async fn snapshot(&self) -> Result<Snapshot>;
     fn capabilities(&self) -> Result<Vec<Capability>>;
 }
 

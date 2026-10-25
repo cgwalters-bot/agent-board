@@ -1,6 +1,6 @@
 use super::*;
 use crate::epic::SUB_ISSUES_QUERY;
-use crate::pass::tests::{answer, config, preview, replay as board, set_usage, usage};
+use crate::pass::tests::{answer, block, config, preview, replay as board, set_usage, usage};
 use std::cell::{Cell, RefCell};
 
 /// The plan tracker#890 applied, and its receipt, as recorded.
@@ -179,14 +179,14 @@ fn replay_plans_one_epic_and_recreates_nothing() {
         writes: Some(0),
         ..Limits::default()
     };
-    let report = run(
+    let report = block(run(
         &replay,
         &replay,
         &config(json!({})),
         State::default(),
         (Mode::Preview, capped),
         replay.now,
-    )
+    ))
     .unwrap();
     let lines = stage(&report);
     assert!(
@@ -429,6 +429,12 @@ impl Rest for Forge {
     }
 }
 
+impl crate::github::GraphQl for Forge {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         if query.contains("viewer {") {
@@ -485,14 +491,14 @@ fn apply_creates_once_with_final_priorities() {
         };
         let mode = (Mode::Local, limits);
         let config = config(json!({}));
-        run(
+        block(run(
             forge,
             forge,
             &config,
             State::default(),
             mode,
             forge.replay.now,
-        )
+        ))
         .unwrap()
     };
     let held = Forge::new(Replay {

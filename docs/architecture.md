@@ -100,11 +100,39 @@ and a person should be able to read what the machine read.
 
 ## Async forge I/O
 
-Forge I/O moves to async, with bounded concurrency and a conditional-request
-cache, after the pass cutover; a forge crate is extracted then.
+Forge I/O moves to async in slices (#300). The first is in: the GitHub board
+snapshot reads through `board-forge`'s async client, on the one
+current-thread tokio runtime the CLI's `main` builds. That covers every
+command that loads a live GitHub board (`item list`, `project view`,
+`reconcile plan` and the others that take `--owner` and `--project`), the
+pass's Status stage and the live fixture's readback. The client holds its
+limits in one place: at most `MAX_IN_FLIGHT` requests at once, and a
+request GitHub refuses under a rate limit (403 or 429 with `Retry-After`,
+or with no requests remaining until `x-ratelimit-reset`) retried at most
+`RATE_LIMIT_RETRIES` times, waiting at most `RATE_LIMIT_WAIT` in all for
+that request. The snapshot's request budget is passed per read,
+`SNAPSHOT_REQUEST_LIMIT` (1,000) by default; running out is an error, never
+a partial snapshot.
+
+Every other forge request is still sync on ureq: the poll's and `status`'s
+own reads (the board they load is the snapshot), the project schema read
+before a write, dispatch, epics, the rest of the pass, the writes, and
+Forgejo. They share the snapshot's paging through an adapter
+whose reads never wait. The conditional-request cache comes later, as client
+middleware; a forge crate is extracted then.
 
 Why: a pass reads many independent things, and sequential requests make its
-time grow with the board. After the cutover keeps the two changes apart.
+time grow with the board. Slices keep each change small, with its tests green.
+
+The client is reqwest (rustls with ring, as ureq's, and the platform's trust
+store) under a thin layer of our own, not octocrab. Octocrab's GraphQL is
+untyped JSON, like ours, and its typed Projects v2 models are for the REST
+endpoints, which the snapshot does not read. Its rate-limit retry bounds the
+number of retries but not the total wait, and it has no cap on requests in
+flight. So we would write both limits either way, on top of about 40 direct
+dependencies (hyper, tower, jsonwebtoken, chrono and more). Its
+conditional-request cache layer is for REST; that slice can look at it
+again.
 
 ## Reruns and the drop list
 

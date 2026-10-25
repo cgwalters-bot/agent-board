@@ -136,7 +136,7 @@ enum Wrote {
     Changed(String),
 }
 
-impl<'a, C: Rest + Transport> Scheduler<'a, C> {
+impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
     /// The board through the pass's budget, without borrowing the pass.
     fn github(&self, board: &Board) -> GitHub<Budget<'a, C>> {
         GitHub {
@@ -152,14 +152,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Stage 5: reads the whole board, derives each item's Status from it,
     /// the runs in flight and the open issues' pull requests, and writes each
     /// change; or, past `--max-status-changes`, refuses them all.
-    pub(super) fn status(&mut self, git_ref: &str) -> Result<()> {
+    pub(super) async fn status(&mut self, git_ref: &str) -> Result<()> {
         let config = self.config;
         let Some(board) = &config.board else {
             self.line("status: off (no board)".into());
             return Ok(());
         };
         let github = self.github(board);
-        let snapshot = github.snapshot().context("reading the whole board")?;
+        let snapshot = github.snapshot().await.context("reading the whole board")?;
         // What scheduling read is reused, and what it failed to read, which
         // it reported, is not read again; what it did not reach is read here.
         let runs = "the runs in flight could not be listed";
@@ -372,6 +372,7 @@ fn item_facts(
 mod tests {
     use super::*;
     use crate::caps::Limits;
+    use crate::pass::tests::block;
     use Status::{Backlog, Blocked, Done, Draft, InProgress, InReview, NeedsHuman, Todo};
 
     const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
@@ -451,14 +452,14 @@ mod tests {
         let replay = replay();
         let preview = |limits| {
             let mode = (Mode::Preview, limits);
-            run(
+            block(run(
                 &replay,
                 &replay,
                 &config(),
                 State::default(),
                 mode,
                 replay.now,
-            )
+            ))
             .unwrap()
         };
         let report = preview(Limits::default());
@@ -538,6 +539,12 @@ mod tests {
         }
     }
 
+    impl crate::github::GraphQl for Board {
+        async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            Transport::graphql(self, query, variables)
+        }
+    }
+
     impl Transport for Board {
         fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
             if query.starts_with("mutation") {
@@ -597,7 +604,7 @@ mod tests {
         let mode = (Mode::Local, limits);
         let config = config();
         let now = board.replay.now;
-        let report = run(&board, &board, &config, State::default(), mode, now).unwrap();
+        let report = block(run(&board, &board, &config, State::default(), mode, now)).unwrap();
         let mut expected = vec![
             "status: 39 change(s) of 46 item(s) read; 2 kept, their own facts not read whole",
             CHANGES[0],
@@ -653,14 +660,14 @@ mod tests {
         };
         let config = config();
         let now = board.replay.now;
-        let report = run(
+        let report = block(run(
             &board,
             &board,
             &config,
             State::default(),
             (Mode::Local, limits),
             now,
-        )
+        ))
         .unwrap();
         assert_eq!(stage(&report)[1..4], CHANGES[..3]);
         assert_eq!(report.failures, 0, "{:#?}", report.lines);
@@ -712,7 +719,7 @@ mod tests {
             Limits::default(),
             board.replay.now,
         );
-        let report = run_within(&board, &board, &config(), state, &bounds).unwrap();
+        let report = block(run_within(&board, &board, &config(), state, &bounds)).unwrap();
         let lines = stage(&report);
         assert_eq!(lines[1..3], CHANGES[..2]);
         assert_eq!(
