@@ -45,11 +45,12 @@ mod tests {
             if query.contains("subIssues") {
                 return Ok(json!({"repository": {"issue": {"state": "OPEN",
                     "projectItems": {"nodes": [], "totalCount": 0},
-                    "subIssues": {"nodes": [], "totalCount": 0}}}}));
+                    "subIssues": {"nodes": [], "totalCount": 0},
+                    "closedByPullRequestsReferences": {"nodes": [], "totalCount": 0}}}}));
             }
             Ok(json!({"repository": {"issue": {"comments": {"nodes": [{
                 "url": "https://github.com/cgwalters-forge/tracker/issues/1#issuecomment-2",
-                "body": "Done.\n\n<!-- agentic-job-cost: 7 usd=1.5 partial=false -->",
+                "body": "Done.\n\n<!-- agentic-job-cost: 7 usd=1.5 partial=false -->\n\n<!-- agentic-job-run: 7 -->",
                 "createdAt": "2026-10-24T00:00:00Z", "lastEditedAt": null,
                 "author": {"login": "cgwalters-bot"}, "editor": null}],
                 "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}))
