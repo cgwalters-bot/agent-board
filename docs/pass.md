@@ -482,11 +482,32 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
+| `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; `0` (off) |
 
 The PR stage otherwise uses today's default poll policy, including two fix
 rounds and existing default continuation handling. Its runs use the same inline
 pool definitions for pacing, by stage 1's refreshed usage like later
 starts; no tiers or second pools file.
+
+`pr.staleDays` (agent-board#325) ends the hold a stopped pull request keeps
+on every item that overlaps it. A pull request of the bot's from its fork
+that the poll labelled `needs-human`, and that conflicts with its base or has
+changes requested (the operator's, or the review job's by its run), is stale
+once the poll's stop is that many days old and the operator has not acted
+since: no comment, review or review comment of theirs with text, no new head,
+and the label's newest `labeled` event still the bot's. If no fix round ran
+before the stop, it gets fix round 1, claimed from the stop and started as
+the round on an operator's answer is (`fix: … so it gets a fix round`): the
+label comes off once the run is recorded, and the old head's approval
+cannot merge it until the round succeeds with a new head. Otherwise the poll
+reads the label, head and operator's comments again, claims the close from the
+stop as a reset or answer round is claimed, posts a new stop saying why and
+closes it (`close: … so it is closed`), one `--max-writes` step; reopened, it
+is left for another `staleDays`. A pull request with more reviews, checks or
+labels than one query reads is left alone, as the poll waits on one otherwise. A round
+on a stale stop counts as fix round 1, so a pull request gets at most one
+such round before it is closed, unless a person resets it. The round
+respects `--fix-bounds`, `--max-dispatch` and pacing like any other.
 No additional poll optional switches are exposed in this initial pass schema;
 `poll` becomes this stage rather than a separate command, so the switches
 not listed here go with it at the cutover unless a need adds them.

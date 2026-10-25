@@ -2133,6 +2133,7 @@ fn config_table() {
             json!({"pr": {"rebaseRounds": 4}}),
             "rebaseRounds is not 0 to 3",
         ),
+        (json!({"pr": {"staleDays": 31}}), "staleDays is not 0 to 30"),
         (
             json!({"pr": {"mergeQueue": {"tries": 6}}}),
             "mergeQueue tries is not 1 to 5",
@@ -2191,9 +2192,12 @@ fn config_table() {
         .is_ok()
     );
     // The PR stage keeps today's poll defaults but for its own keys.
-    let poll = config(json!({"pr": {"mergeQueue": {}, "rebaseRounds": 2}})).poll(None);
+    let poll =
+        config(json!({"pr": {"mergeQueue": {}, "rebaseRounds": 2, "staleDays": 7}})).poll(None);
     assert_eq!(poll.policy.merge_queue, Some(poll::QUEUE_TRIES));
     assert_eq!(poll.policy.rebase_rounds, 2);
+    assert_eq!(poll.policy.stale_days, 7);
+    assert_eq!(config(json!({})).poll(None).policy.stale_days, 0);
     assert_eq!(poll.policy.continuation, poll::Continuation::default());
     assert!(poll.policy.operator_comments.is_empty() && poll.policy.notifications.is_none());
     let pace = poll.policy.pace.unwrap();
