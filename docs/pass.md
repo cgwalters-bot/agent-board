@@ -65,6 +65,33 @@ so that work in flight can land, then wait too (`…; pull requests' fix rounds
 wait`). A missing or stale spend reading holds both, as missing usage does.
 Without `budget` nothing holds on spend.
 
+With `budget.source: "broker"` (agent-board#341), the budget is instead the
+broker's grant for this board, `praxis-broker-grant/v1` from `budget.url`
+([praxis-credential-broker#41][grant]): a share of each grant pool that the
+operator's private policy sets and the broker has already paced, in
+percentages, with no dollar amounts. `budget.pools` maps each of `pools` to the
+grant pool it draws on (`claude` and `fable` to `anthropic`, `openai` to
+`codex`). Stage 1 then writes each pool's entry from the grant, not the
+broker's windows: its line reads `claude: 18% used of 32% granted on anthropic
+unified_7d, read T`, the window with the least room, which ranks the pools. A
+pool is held (`; holds new work (grant)`) when its grant pool or any window
+says `hold`, or a window has used what it allows or gives no figures, however
+old the grant. A grant that holds, a pool missing from it (no share), a pool
+not marked stale without windows, a window used up or without figures, stale
+or not, a grant without `observed_at` or observed in the future, and an
+unreadable grant
+(`usage error: reading the grant: …; every pool holds`, a failure) hold
+outright (`claude: held by the grant (grant)`), and are never probed. A pool
+the grant marks stale, whose holds are then the staleness, and an otherwise
+unheld pool of a grant not observed in the last five hours are no reading,
+which `usage.probe` may probe as above, once after a broker restart: one run
+for each grant pool, none while a run is in flight on any pool drawing on it.
+When `/usage` cannot be read, the pass
+paces by the grant alone (`usage error: reading the broker: …; pacing reads
+the grant`), never by the published snapshot. Pull requests' fix rounds pace by
+the same entries. A `weeklyUsd`, or a pool's `target` or `burst`, beside it
+is refused: the grant replaces them.
+
 Stage 3 reads the open `epic` issues of `epics.repository` with their
 sub-issues (20 epics a request), the board's Priority options, and each live
 epic's comments, and takes the live epics in Priority order. Its first line
@@ -500,6 +527,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
+| `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
@@ -673,5 +701,6 @@ Links are immutable source locations; retained semantics are described above.
 [usage-refresh]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L232-L264
 [publish]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L266-L295
 [spend]: https://github.com/cgwalters-bot/praxis-credential-broker/issues/38
+[grant]: https://github.com/cgwalters-bot/praxis-credential-broker/issues/41
 [meters]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/usage/usage.cjs#L123-L187
 [config]: https://github.com/cgwalters-forge/tracker/blob/1a550cc7d5089b30b5bd1e383a2efc7a9c27759c/.github/poll/agent-board.json#L1-L62

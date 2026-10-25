@@ -22,9 +22,23 @@ const ANTHROPIC_WINDOWS: &[(&str, f64)] = &[
 /// Codex's windows, which give their own length.
 const CODEX_WINDOWS: &[&str] = &["primary", "secondary"];
 
-/// The inference broker's `/usage`, read without the forge's token.
+/// The broker's grant this reads (praxis-credential-broker#41).
+const GRANT_SCHEMA: &str = "praxis-broker-grant/v1";
+/// The snapshot's pools' `source` where the grant paces them.
+pub(super) const GRANT_SOURCE: &str = "grant";
+/// The hold reason of a pool its grant holds.
+const GRANT_HOLD: &str = "grant";
+/// The hold reason of every pool when the grant cannot be read.
+const NO_GRANT: &str = "no-grant";
+/// How old a grant may be: the broker itself calls a reading stale past one
+/// five-hour window.
+const GRANT_STALE_SECONDS: f64 = 5.0 * 3600.0;
+
+/// The inference broker's `/usage`, and its grant for this board's consumer
+/// (`budget.url`), read without the forge's token.
 pub trait Broker {
     fn usage(&self, url: &str) -> Result<Value>;
+    fn grant(&self, url: &str) -> Result<Value>;
 }
 
 /// One of a pool's windows as the broker last saw it, times in Unix seconds.
@@ -247,26 +261,130 @@ pub(super) fn snapshot(broker: &Value, pools: &Pools, now: OffsetDateTime) -> Re
     Ok(out)
 }
 
+/// A pool's snapshot entry from `grant`, the broker's answer for this
+/// board's consumer, on its grant pool `on`: the use and allowance of its
+/// window with the least room, which ranks it.
+///
+/// No grant, a grant that holds, or a pool it lacks (no share) holds, and is
+/// never probed, and so does a window that has used what it allows or gives
+/// no figures, or a grant without a time or with one in the future. Short of
+/// that, a pool the grant calls stale, whose holds are then the staleness, is
+/// no reading: held, and probed where `usage.probe` lets it, as the broker
+/// learns use only from requests. Otherwise the pool holds when it or any
+/// window says `hold` or it has no windows, however old the grant; one with
+/// none of those but not observed in the last [`GRANT_STALE_SECONDS`] is no
+/// reading.
+fn granted(grant: Option<&Value>, on: &str, (now, at): (OffsetDateTime, &str)) -> Result<Value> {
+    let held = |reason: &str| {
+        json!({"source": GRANT_SOURCE, "grant_pool": on, "computed_at": at,
+            "hold": true, "reason": reason, "next_dispatch_at": null})
+    };
+    let Some(grant) = grant else {
+        return Ok(held(NO_GRANT));
+    };
+    let pool = &grant["pools"][on];
+    if grant["hold"] != false || !pool.is_object() {
+        return Ok(held(GRANT_HOLD));
+    }
+    let observed = number(&grant["observed_at"]);
+    let age = observed.map(|o| seconds(now) - o);
+    let fresh = age.is_some_and(|a| a <= GRANT_STALE_SECONDS);
+    // Held whatever else the grant says, stale or not.
+    let mut firm = age.is_none_or(|a| a < -(CLOCK_SKEW_SECONDS as f64));
+    let windows = pool["windows"].as_object().filter(|w| !w.is_empty());
+    let mut flagged = pool["hold"] != false || pool["stale"] != false || windows.is_none();
+    let mut least: Option<(&String, f64, f64)> = None;
+    for (name, window) in windows.into_iter().flatten() {
+        let allowed = number(&window["allowed_percent"]);
+        let used = number(&window["used_percent"]);
+        let (Some(allowed), Some(used)) = (allowed, used) else {
+            firm = true;
+            continue;
+        };
+        flagged |= window["hold"] != false;
+        firm |= used >= allowed;
+        if least.is_none_or(|(_, a, u)| allowed - used < a - u) {
+            least = Some((name, allowed, used));
+        }
+    }
+    if !firm && (pool["stale"] == true || !(flagged || fresh)) {
+        let mut entry = unread(at);
+        entry["grant_pool"] = on.into();
+        return Ok(entry);
+    }
+    let held = firm || flagged;
+    Ok(json!({
+        "source": GRANT_SOURCE,
+        "grant_pool": on,
+        "window": least.map(|(name, _, _)| name),
+        "observed_at": observed.and_then(|o| stamp(o).ok()),
+        "computed_at": at,
+        "used_percent": least.map(|(_, _, used)| used),
+        "allowed_percent": least.map(|(_, allowed, _)| allowed),
+        "hold": held,
+        "reason": held.then_some(GRANT_HOLD),
+        "next_dispatch_at": null,
+    }))
+}
+
+/// `snapshot`'s pools, each on the grant pool `budget.pools` maps it to,
+/// paced by `grant` in place of the broker's windows: every one held where
+/// the grant could not be read.
+pub(super) fn grants(
+    snapshot: &mut Value,
+    grant: Option<&Value>,
+    budget: &WeeklyBudget,
+    now: OffsetDateTime,
+) -> Result<()> {
+    let at = text(snapshot, "/updated_at").to_owned();
+    let pools = snapshot["pools"]
+        .as_object_mut()
+        .context("the usage snapshot has no pools")?;
+    for (name, entry) in pools {
+        let on = budget.pools.get(name).map_or("", String::as_str);
+        *entry = granted(grant, on, (now, &at)).with_context(|| format!("{name}'s grant"))?;
+    }
+    Ok(())
+}
+
+/// A snapshot of `pools` with nothing read, for [`grants`] to fill in when
+/// the broker's `/usage` cannot be read.
+fn bare(pools: &Pools, now: OffsetDateTime) -> Result<Value> {
+    let at = stamp(seconds(now))?;
+    let pools: serde_json::Map<String, Value> = (pools.0.iter())
+        .map(|(name, _)| (name.clone(), unread(&at)))
+        .collect();
+    Ok(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}))
+}
+
 /// The broker's provider for each pool it reads, under which it counts the
-/// requests it has sent since it started, as it does Mistral's.
+/// requests it has sent since it started, as it does Mistral's. A grant
+/// pool is a provider too.
 const PROVIDERS: &[(&str, &str)] = &[("claude", "anthropic"), ("openai", "codex")];
 
 /// The pools of `snapshot` without a reading that the broker has sent no
 /// request for since it started: it learns a pool's windows only from its
 /// responses, so after a restart no reading arrives until a run asks. A pool
 /// with requests and still no reading is stale, and stays held; so is one
-/// whose count the broker does not give.
-pub(super) fn unasked(broker: &Value, snapshot: &Value) -> BTreeSet<String> {
-    let unread = |pool: &str| snapshot["pools"][pool]["reason"] == NO_READING;
+/// whose count the broker does not give. Each with its provider, which
+/// pools on one grant pool share: one run on any of them reads them all.
+pub(super) fn unasked(broker: &Value, snapshot: &Value) -> BTreeMap<String, String> {
     let asked = |provider: &str| {
         let counts = &broker[provider]["counts"];
         let count = |key: &str| counts[key].as_u64();
         Some(count("requests")?.saturating_add(count("unmetered").unwrap_or(0)))
     };
-    PROVIDERS
-        .iter()
-        .filter(|(pool, provider)| unread(pool) && asked(provider) == Some(0))
-        .map(|(pool, _)| (*pool).to_owned())
+    let pools = snapshot["pools"].as_object().into_iter().flatten();
+    pools
+        .filter(|(_, entry)| entry["reason"] == NO_READING)
+        .filter_map(|(pool, entry)| {
+            let provider = match entry["grant_pool"].as_str() {
+                Some(on) => Some(on),
+                None => PROVIDERS.iter().find(|(p, _)| p == pool).map(|(_, on)| *on),
+            };
+            let provider = provider.filter(|on| asked(on) == Some(0))?;
+            Some((pool.clone(), provider.to_owned()))
+        })
         .collect()
 }
 
@@ -275,6 +393,24 @@ fn describe(name: &str, entry: &Value) -> String {
         return format!("{name}: no reading (held)");
     }
     let percent = |key: &str| entry[key].as_f64().unwrap_or(f64::NAN).round();
+    if entry["source"] == GRANT_SOURCE {
+        if !entry["used_percent"].is_number() {
+            let reason = text(entry, "/reason");
+            return format!("{name}: held by the grant ({reason})");
+        }
+        let held = match entry["hold"] == true {
+            true => "; holds new work (grant)",
+            false => "",
+        };
+        return format!(
+            "{name}: {}% used of {}% granted on {} {}, read {}{held}",
+            percent("used_percent"),
+            percent("allowed_percent"),
+            text(entry, "/grant_pool"),
+            text(entry, "/window"),
+            text(entry, "/observed_at"),
+        );
+    }
     let hold = match entry["hold"] == true {
         true => format!(
             "; holds new work until {} ({})",
@@ -326,7 +462,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// applying pass publishes it, one write, and a preview paces by it
     /// unpublished. A failed read is one line,
     /// and pacing falls back to the published snapshot, which holds once
-    /// it is stale.
+    /// it is stale; with a grant, to the grant alone.
     pub(super) fn refresh(&mut self) {
         let config = self.config;
         let Some(usage) = &config.usage else {
@@ -336,13 +472,28 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             self.line("usage: no usage.url; pacing reads the published snapshot".into());
             return;
         };
-        let read = self.client.usage(url).and_then(|broker| {
+        let grant = config.grant().map(|budget| (budget, self.grant(budget)));
+        let mut read = self.client.usage(url).and_then(|broker| {
             let mut snapshot = snapshot(&broker, &config.pools, self.now)?;
-            if let Some(budget) = &config.budget {
-                snapshot["budget"] = spend(&broker, budget.weekly_usd);
+            if let Some((budget, grant)) = &grant {
+                grants(&mut snapshot, grant.as_ref(), budget, self.now)?;
+            } else if let Some(weekly) = config.budget.as_ref().and_then(|b| b.weekly_usd) {
+                snapshot["budget"] = spend(&broker, weekly);
             }
             Ok((unasked(&broker, &snapshot), snapshot))
         });
+        // With a grant, pacing never falls back to the published snapshot,
+        // which may be paced otherwise: the grant decides, or holds.
+        if let (Err(error), Some((budget, grant))) = (&read, &grant) {
+            self.report.failures += 1;
+            self.line(format!(
+                "usage error: reading the broker: {error:#}; pacing reads the grant"
+            ));
+            read = bare(&config.pools, self.now).and_then(|mut snapshot| {
+                grants(&mut snapshot, grant.as_ref(), budget, self.now)?;
+                Ok((BTreeMap::new(), snapshot))
+            });
+        }
         let snapshot = match read {
             Ok((unasked, snapshot)) => {
                 if usage.probe {
@@ -377,6 +528,29 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("usage error: {said}: {error:#}"));
+            }
+        }
+    }
+
+    /// The broker's grant at `budget.url`; one it cannot read, or of another
+    /// schema, is a failure, and none, which holds every pool.
+    fn grant(&mut self, budget: &WeeklyBudget) -> Option<Value> {
+        let url = budget.url.as_deref().unwrap_or_default();
+        let read = self.client.grant(url).and_then(|grant| {
+            ensure!(
+                grant["schema"] == GRANT_SCHEMA,
+                "the grant is not {GRANT_SCHEMA}"
+            );
+            Ok(grant)
+        });
+        match read {
+            Ok(grant) => Some(grant),
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!(
+                    "usage error: reading the grant: {error:#}; every pool holds"
+                ));
+                None
             }
         }
     }
@@ -453,6 +627,250 @@ pub(super) mod tests {
             "mistral": {"counts": {"requests": 2, "unmetered": 1,
                 "tokens": {"input": 1, "cache_read": 0, "output": 1, "reasoning": 0, "total": 2}}},
         })
+    }
+
+    /// The sample grant of praxis-credential-broker#41, observed when
+    /// [`broker`]'s answer was: claude has 13 points of room on anthropic's
+    /// week, openai 26 on codex's.
+    pub(in crate::pass) fn grant() -> Value {
+        let window = |share: f64, allowed: f64, used: f64, resets: Value| {
+            json!({"share_percent": share, "allowed_percent": allowed, "used_percent": used,
+                "resets_at": resets, "hold": false})
+        };
+        json!({
+            "schema": "praxis-broker-grant/v1", "consumer": "public",
+            "observed_at": 1792768000, "hold": false,
+            "pools": {
+                "anthropic": {"hold": false, "stale": false, "windows": {
+                    "unified_7d": window(70.0, 31.5, 18.2, json!(1793055600)),
+                    "unified_5h": window(70.0, 70.0, 12.0, json!(1792774800))}},
+                "codex": {"hold": false, "stale": false, "windows": {
+                    "secondary": window(70.0, 31.5, 5.1, json!(1793361600)),
+                    "primary": window(70.0, 70.0, 2.0, json!(1792774800))}},
+                "mistral": {"hold": false, "stale": false, "windows": {
+                    "spend_7d": window(70.0, 31.5, 0.4, Value::Null)}},
+            },
+        })
+    }
+
+    /// Each pool's entry from the grant with `edits` (JSON pointer, value):
+    /// held or not, its reason, and its room's window.
+    #[test]
+    fn grant_holds() {
+        type Pool = (bool, Option<&'static str>, Option<&'static str>);
+        type Case = (&'static str, Vec<(&'static str, Value)>, Pool, Pool);
+        let free = |window| (false, None, Some(window));
+        let held = |window| (true, Some(GRANT_HOLD), Some(window));
+        let unread: Pool = (true, Some(NO_READING), None);
+        let withheld: Pool = (true, Some(GRANT_HOLD), None);
+        let cases: Vec<Case> = vec![
+            ("as sampled", vec![], free("unified_7d"), free("secondary")),
+            (
+                "anthropic's week used to its allowance",
+                vec![(
+                    "/pools/anthropic/windows/unified_7d/used_percent",
+                    json!(31.5),
+                )],
+                held("unified_7d"),
+                free("secondary"),
+            ),
+            (
+                "anthropic's five hours past its share, the tighter",
+                vec![(
+                    "/pools/anthropic/windows/unified_5h/used_percent",
+                    json!(71),
+                )],
+                held("unified_5h"),
+                free("secondary"),
+            ),
+            (
+                "a window's own hold",
+                vec![("/pools/codex/windows/primary/hold", json!(true))],
+                free("unified_7d"),
+                held("secondary"),
+            ),
+            (
+                "a pool's hold",
+                vec![("/pools/codex/hold", json!(true))],
+                free("unified_7d"),
+                held("secondary"),
+            ),
+            (
+                "the whole grant's hold, stale pools too: never probed",
+                vec![
+                    ("/hold", json!(true)),
+                    ("/pools/anthropic/stale", json!(true)),
+                ],
+                withheld,
+                withheld,
+            ),
+            (
+                "a window without figures",
+                vec![("/pools/codex/windows/primary/used_percent", json!("2"))],
+                free("unified_7d"),
+                held("secondary"),
+            ),
+            (
+                "a hold that is not false",
+                vec![("/hold", Value::Null)],
+                withheld,
+                withheld,
+            ),
+            (
+                "no codex: no share, never probed",
+                vec![("/pools/codex", Value::Null)],
+                free("unified_7d"),
+                withheld,
+            ),
+            (
+                "a stale anthropic, held for it",
+                vec![
+                    ("/pools/anthropic/stale", json!(true)),
+                    ("/pools/anthropic/hold", json!(true)),
+                ],
+                unread,
+                free("secondary"),
+            ),
+            (
+                "a stale anthropic without windows",
+                vec![
+                    ("/pools/anthropic/stale", json!(true)),
+                    ("/pools/anthropic/windows", json!({})),
+                ],
+                unread,
+                free("secondary"),
+            ),
+            (
+                "anthropic without windows, not stale: never probed",
+                vec![("/pools/anthropic/windows", json!({}))],
+                withheld,
+                free("secondary"),
+            ),
+            (
+                "a held anthropic without windows, not stale: never probed",
+                vec![
+                    ("/pools/anthropic/hold", json!(true)),
+                    ("/pools/anthropic/windows", Value::Null),
+                ],
+                withheld,
+                free("secondary"),
+            ),
+            (
+                "a stale anthropic with its week used up: never probed",
+                vec![
+                    ("/pools/anthropic/stale", json!(true)),
+                    ("/pools/anthropic/hold", json!(true)),
+                    (
+                        "/pools/anthropic/windows/unified_7d/allowed_percent",
+                        json!(0),
+                    ),
+                ],
+                held("unified_7d"),
+                free("secondary"),
+            ),
+            (
+                "a grant without a time, anthropic stale: never probed",
+                vec![
+                    ("/observed_at", Value::Null),
+                    ("/pools/anthropic/stale", json!(true)),
+                ],
+                held("unified_7d"),
+                held("secondary"),
+            ),
+            (
+                "a stale anthropic with a window without figures: never probed",
+                vec![
+                    ("/pools/anthropic/stale", json!(true)),
+                    (
+                        "/pools/anthropic/windows/unified_5h/used_percent",
+                        Value::Null,
+                    ),
+                ],
+                held("unified_7d"),
+                free("secondary"),
+            ),
+            (
+                "a stale that is not true or false: never probed",
+                vec![("/pools/anthropic/stale", Value::Null)],
+                held("unified_7d"),
+                free("secondary"),
+            ),
+            (
+                "observed six hours ago",
+                vec![("/observed_at", json!(1792768000 - 6 * 3600))],
+                unread,
+                unread,
+            ),
+            (
+                "observed six hours ago, codex held: never probed",
+                vec![
+                    ("/observed_at", json!(1792768000 - 6 * 3600)),
+                    ("/pools/codex/hold", json!(true)),
+                ],
+                unread,
+                held("secondary"),
+            ),
+            (
+                "observed six hours ago, a window held or used up: never probed",
+                vec![
+                    ("/observed_at", json!(1792768000 - 6 * 3600)),
+                    ("/pools/anthropic/windows/unified_5h/hold", json!(true)),
+                    ("/pools/codex/windows/secondary/used_percent", json!(31.5)),
+                ],
+                held("unified_7d"),
+                held("secondary"),
+            ),
+            (
+                "observed an hour from now, anthropic stale: never probed",
+                vec![
+                    ("/observed_at", json!(1792768000 + 3600)),
+                    ("/pools/anthropic/stale", json!(true)),
+                ],
+                held("unified_7d"),
+                held("secondary"),
+            ),
+        ];
+        let budget: WeeklyBudget = serde_json::from_value(json!({"source": "broker",
+            "pools": {"claude": "anthropic", "openai": "codex"}}))
+        .unwrap();
+        // A broker that has sent nothing on either provider: only no reading
+        // is probed.
+        let mut cold = broker();
+        for provider in ["anthropic", "codex"] {
+            cold[provider]["counts"] = json!({"requests": 0, "unmetered": 0});
+        }
+        for (name, edits, claude, openai) in cases {
+            let mut grant = grant();
+            for (pointer, value) in edits {
+                *grant.pointer_mut(pointer).unwrap() = value;
+            }
+            let mut snap = snapshot(&cold, &pools(), now()).unwrap();
+            grants(&mut snap, Some(&grant), &budget, now()).unwrap();
+            let probed: BTreeMap<String, String> =
+                [("claude", claude, "anthropic"), ("openai", openai, "codex")]
+                    .into_iter()
+                    .filter(|(_, (_, reason, _), _)| *reason == Some(NO_READING))
+                    .map(|(pool, _, on)| (pool.to_owned(), on.to_owned()))
+                    .collect();
+            assert_eq!(unasked(&cold, &snap), probed, "{name}");
+            let got = |pool: &str| {
+                let e = &snap["pools"][pool];
+                (
+                    e["hold"] == true,
+                    e["reason"].as_str(),
+                    e["window"].as_str(),
+                )
+            };
+            assert_eq!((got("claude"), got("openai")), (claude, openai), "{name}");
+        }
+        let mut snap = snapshot(&broker(), &pools(), now()).unwrap();
+        grants(&mut snap, None, &budget, now()).unwrap();
+        let openai = &snap["pools"]["openai"];
+        assert_eq!(
+            (&openai["hold"], &openai["reason"]),
+            (&json!(true), &json!(NO_GRANT))
+        );
+        assert_eq!(openai["grant_pool"], "codex");
     }
 
     pub(in crate::pass) fn now() -> OffsetDateTime {

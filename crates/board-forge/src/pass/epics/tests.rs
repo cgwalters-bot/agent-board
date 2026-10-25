@@ -388,6 +388,10 @@ impl Broker for Forge {
     fn usage(&self, url: &str) -> Result<Value> {
         self.replay.usage(url)
     }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.replay.grant(url)
+    }
 }
 
 impl Rest for Forge {

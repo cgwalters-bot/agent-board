@@ -78,7 +78,7 @@ pub(super) fn usage(replay: &mut Replay) -> Value {
 fn with_broker(replay: &mut Replay, settings: &mut Value, answer: Value) {
     replay
         .requests
-        .push(json!({"request": broker_key(), "answer": answer}));
+        .push(json!({"request": broker_key(USAGE_PATH), "answer": answer}));
     settings["usage"] = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1,
         "url": "https://broker.invalid/usage"});
 }
@@ -116,10 +116,55 @@ pub(super) fn with_spend(replay: &mut Replay, settings: &mut Value, spend: Value
     settings["budget"] = json!({"weeklyUsd": 1000});
 }
 
-/// The broker [`with_spend`] added, failing as when it is down.
+/// The broker serving `grant` (`{"body": …}` or `{"error": …}`) as the
+/// budget, `source: broker`, with claude on `anthropic` and openai on `codex`.
+fn with_grant(replay: &mut Replay, settings: &mut Value, grant: Value) {
+    with_broker(replay, settings, json!({"body": usage::tests::broker()}));
+    replay
+        .requests
+        .push(json!({"request": broker_key(GRANT_PATH), "answer": grant}));
+    settings["pools"] = json!({"claude": {}, "openai": {}});
+    settings["budget"] = json!({"source": "broker", "url": "https://broker.invalid/usage/grant?consumer=public",
+        "pools": {"claude": "anthropic", "openai": "codex"}});
+}
+
+/// [`usage::tests::grant`] with `edits` (JSON pointer, value), served.
+fn granted(replay: &mut Replay, settings: &mut Value, edits: &[(&str, Value)]) {
+    let mut grant = usage::tests::grant();
+    for (pointer, value) in edits {
+        *grant.pointer_mut(pointer).unwrap() = value.clone();
+    }
+    with_grant(replay, settings, json!({"body": grant}));
+}
+
+/// The broker's `/usage` that [`with_broker`] added, failing as when it is down.
 fn broker_down(replay: &mut Replay) {
-    let down = json!({"error": "GET /usage: HTTP status 502"});
-    *replay.requests.last_mut().unwrap() = json!({"request": broker_key(), "answer": down});
+    let usage = broker_key(USAGE_PATH);
+    let entry = replay.requests.iter_mut().find(|e| e["request"] == usage);
+    entry.unwrap()["answer"] = json!({"error": "GET /usage: HTTP status 502"});
+}
+
+/// [`with_grant`] serving `grant`, the other pool held, with `usage.probe`
+/// and a broker that has sent no request on anthropic since it started.
+fn probe_grant(replay: &mut Replay, settings: &mut Value, mut grant: Value) {
+    if let Some(pools) = grant.pointer_mut("/body/pools") {
+        pools["anthropic"]["stale"] = true.into();
+        pools["anthropic"]["hold"] = true.into();
+        pools["codex"]["hold"] = true.into();
+    }
+    with_grant(replay, settings, grant);
+    let broker = &mut answer(replay, "/usage\"")["body"];
+    broker["anthropic"]["counts"] = json!({"requests": 0, "unmetered": 0});
+    settings["usage"]["probe"] = true.into();
+    unpooled(replay);
+}
+
+/// [`probe_grant`] of the sample grant with a third pool, fable, on
+/// anthropic beside claude.
+fn probe_alias(replay: &mut Replay, settings: &mut Value) {
+    probe_grant(replay, settings, json!({"body": usage::tests::grant()}));
+    settings["pools"]["fable"] = json!({});
+    settings["budget"]["pools"]["fable"] = "anthropic".into();
 }
 
 /// A week's spend of `total` dollars by runs as the broker reports it, all of
@@ -135,6 +180,10 @@ pub(super) fn set_usage(replay: &mut Replay, snapshot: &Value) {
     let body = format!("{USAGE_MARKER}\n\n```json\n{snapshot:#}\n```\n");
     answer(replay, "bot-ops/issues/1/comments")["body"][0]["body"] = body.into();
 }
+
+/// The line of a pass whose grant holds both pools.
+const GRANT_HELD: &str =
+    "hold pools: claude is held by its grant; openai is held by its grant; new runs wait";
 
 const STARTED: &[&str] = &[
     "start triage cgwalters-forge/tracker#446 pool=claude",
@@ -771,6 +820,184 @@ fn replay_scenarios() {
             0,
         ),
         (
+            "a grant paces each pool in percentages, and the most room takes the run",
+            Box::new(|r, c| granted(r, c, &[])),
+            vec![
+                "usage: claude: 18% used of 32% granted on anthropic unified_7d, read 2026-10-23T15:06:40Z; openai: 5% used of 32% granted on codex secondary, read 2026-10-23T15:06:40Z",
+                "start triage cgwalters-forge/tracker#446 pool=openai",
+            ],
+            6,
+            0,
+        ),
+        (
+            "a small grant holds its pool, and the other runs",
+            Box::new(|r, c| {
+                let small = json!(0.5);
+                granted(
+                    r,
+                    c,
+                    &[("/pools/codex/windows/secondary/allowed_percent", small)],
+                );
+            }),
+            vec![
+                "usage: claude: 18% used of 32% granted on anthropic unified_7d, read 2026-10-23T15:06:40Z; openai: 5% used of 1% granted on codex secondary, read 2026-10-23T15:06:40Z; holds new work (grant)",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "a grant that holds holds the pass",
+            Box::new(|r, c| granted(r, c, &[("/hold", json!(true))])),
+            vec![
+                "usage: claude: held by the grant (grant); openai: held by the grant (grant)",
+                GRANT_HELD,
+            ],
+            0,
+            0,
+        ),
+        (
+            "a pool missing from the grant has no share, and holds",
+            Box::new(|r, c| granted(r, c, &[("/pools/codex", Value::Null)])),
+            vec![
+                "usage: claude: 18% used of 32% granted on anthropic unified_7d, read 2026-10-23T15:06:40Z; openai: held by the grant (grant)",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "a missing grant holds the pass, and is a failure",
+            Box::new(|r, c| {
+                with_grant(r, c, json!({"error": "GET /usage/grant: HTTP status 404"}));
+            }),
+            vec![
+                "usage error: reading the grant: GET /usage/grant: HTTP status 404; every pool holds",
+                "usage: claude: held by the grant (no-grant); openai: held by the grant (no-grant)",
+                GRANT_HELD,
+            ],
+            0,
+            1,
+        ),
+        (
+            "a grant of another schema holds the pass",
+            Box::new(|r, c| granted(r, c, &[("/schema", json!("praxis-broker-grant/v2"))])),
+            vec![
+                "usage error: reading the grant: the grant is not praxis-broker-grant/v1; every pool holds",
+                GRANT_HELD,
+            ],
+            0,
+            1,
+        ),
+        (
+            "an unreadable broker leaves the grant, never the published snapshot, to hold",
+            Box::new(|r, c| {
+                granted(r, c, &[("/hold", json!(true))]);
+                broker_down(r);
+            }),
+            vec![
+                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the grant",
+                GRANT_HELD,
+            ],
+            0,
+            1,
+        ),
+        (
+            "an unreadable broker leaves the grant to start runs",
+            Box::new(|r, c| {
+                granted(r, c, &[]);
+                broker_down(r);
+            }),
+            vec![
+                "usage: claude: 18% used of 32% granted on anthropic unified_7d, read 2026-10-23T15:06:40Z; openai: 5% used",
+                "start triage cgwalters-forge/tracker#446 pool=openai",
+            ],
+            6,
+            1,
+        ),
+        (
+            "with neither the grant nor the broker read, the pass holds",
+            Box::new(|r, c| {
+                with_grant(r, c, json!({"error": "GET /usage/grant: HTTP status 502"}));
+                broker_down(r);
+            }),
+            vec![
+                "usage error: reading the grant: GET /usage/grant: HTTP status 502; every pool holds",
+                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the grant",
+                GRANT_HELD,
+            ],
+            0,
+            2,
+        ),
+        (
+            "probe: a stale grant pool with no request since takes one run",
+            Box::new(|r, c| probe_grant(r, c, json!({"body": usage::tests::grant()}))),
+            vec![
+                "probe: claude has no reading; one run to take one",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+                "hold pools: claude has no reading; openai is held by its grant; 193 more candidate(s) wait",
+            ],
+            1,
+            0,
+        ),
+        (
+            "probe: one run for two pools on one cold grant pool",
+            Box::new(probe_alias),
+            vec![
+                "probe: claude has no reading; one run to take one",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+                "hold pools: claude has no reading; fable has no reading; openai is held by its grant; 193 more candidate(s) wait",
+            ],
+            1,
+            0,
+        ),
+        (
+            "probe: none on a pool whose grant pool has a run in flight",
+            Box::new(|r, c| {
+                probe_alias(r, c);
+                let runs = &mut answer(r, "status=in_progress")["body"]["workflow_runs"];
+                for run in runs.as_array_mut().unwrap() {
+                    let title = run["display_title"].as_str().unwrap();
+                    run["display_title"] = format!("{title} (claude)").into();
+                }
+            }),
+            vec![
+                "hold pools: claude has no reading; fable has no reading; openai is held by its grant; new runs wait",
+            ],
+            0,
+            0,
+        ),
+        (
+            "probe: none past a grant that holds",
+            Box::new(|r, c| {
+                let mut grant = usage::tests::grant();
+                grant["hold"] = true.into();
+                probe_grant(r, c, json!({"body": grant}));
+            }),
+            vec![GRANT_HELD],
+            0,
+            0,
+        ),
+        (
+            "probe: none on an unreadable grant",
+            Box::new(|r, c| {
+                probe_grant(r, c, json!({"error": "GET /usage/grant: HTTP status 403"}));
+            }),
+            vec![GRANT_HELD],
+            0,
+            1,
+        ),
+        (
+            "with a grant that holds, pull requests' fix rounds wait too",
+            Box::new(|r, c| {
+                granted(r, c, &[("/hold", json!(true))]);
+                followed_draft(r, c);
+            }),
+            vec!["pools: claude held, openai held", GRANT_HELD],
+            0,
+            0,
+        ),
+        (
             "both pools over pace: wait, no fall back to a held pool",
             Box::new(|r, _| {
                 let mut snapshot = usage(r);
@@ -1142,6 +1369,10 @@ impl Broker for Forge {
     fn usage(&self, url: &str) -> Result<Value> {
         self.replay.usage(url)
     }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.replay.grant(url)
+    }
 }
 
 impl Rest for Forge {
@@ -1226,6 +1457,30 @@ fn apply(forge: &Forge, config: &Config) -> Report {
         forge.replay.now,
     ))
     .unwrap()
+}
+
+/// A grant used up on both pools holds the pass, and the same grant restored
+/// after its windows reset, nothing used yet, releases it.
+#[test]
+fn a_grant_restored_after_reset_releases_the_pass() {
+    for (used, expected) in [
+        (40.0, GRANT_HELD),
+        (0.0, "start triage cgwalters-forge/tracker#446 pool=claude"),
+    ] {
+        let mut grant = usage::tests::grant();
+        for week in ["anthropic/windows/unified_7d", "codex/windows/secondary"] {
+            grant["pools"].pointer_mut(&format!("/{week}")).unwrap()["used_percent"] = used.into();
+        }
+        let mut replay = without_epics(replay());
+        let mut settings = json!({});
+        with_grant(&mut replay, &mut settings, json!({"body": grant}));
+        let report = preview(&config(settings), &replay);
+        assert!(
+            report.lines.iter().any(|l| l == expected),
+            "{expected}: {:#?}",
+            report.lines
+        );
+    }
 }
 
 /// An applying pass publishes the refreshed snapshot to the bot's comment,
@@ -2285,6 +2540,7 @@ fn config_table() {
     let names: Vec<&str> = ordered.pools.0.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["zeta", "alpha"]);
     assert_eq!(ordered.pools.0[0].1.target, DEFAULT_TARGET);
+    let usage = json!({"url": "http://b.example/usage", "repository": "o/ops", "issue": 1});
     for (edit, error) in [
         (json!({"extra": 1}), "unknown field `extra`"),
         (json!({"wip": null}), "config.wip is null"),
@@ -2379,6 +2635,60 @@ fn config_table() {
         (
             json!({"budget": {"weeklyUsd": 1000, "monthlyUsd": 1}}),
             "unknown field `monthlyUsd`",
+        ),
+        (
+            json!({"budget": {"source": "broker", "weeklyUsd": 1000, "url": "http://b.example/usage/grant",
+                "pools": {"claude": "anthropic"}}, "pools": {"claude": {}}, "usage": usage.clone()}),
+            "budget weeklyUsd is refused with source broker",
+        ),
+        (
+            json!({"budget": {"source": "broker", "pools": {"claude": "anthropic"}},
+                "pools": {"claude": {}}, "usage": usage.clone()}),
+            "budget url is not an http(s) URL",
+        ),
+        (
+            json!({"budget": {"source": "broker", "url": "http://b.example/usage/grant",
+                "pools": {"claude": "anthropic", "openai": "codex"}},
+                "pools": {"claude": {}}, "usage": usage.clone()}),
+            "budget pools names openai, which is not in pools",
+        ),
+        (
+            json!({"budget": {"source": "broker", "url": "http://b.example/usage/grant",
+                "pools": {"claude": "anthropic"}},
+                "pools": {"claude": {}, "openai": {}}, "usage": usage.clone()}),
+            "pool openai has no grant pool in budget pools",
+        ),
+        (
+            json!({"budget": {"source": "broker", "url": "http://b.example/usage/grant",
+                "pools": {"claude": "anthropic"}},
+                "pools": {"claude": {"target": 0.5}}, "usage": usage.clone()}),
+            "pools.claude sets target or burst, which the broker's grant replaces",
+        ),
+        (
+            json!({"budget": {"source": "broker", "url": "http://b.example/usage/grant",
+                "pools": {"claude": "anthropic"}},
+                "pools": {"claude": {}}, "usage": {"repository": "o/ops", "issue": 1}}),
+            "budget needs usage.url",
+        ),
+        (
+            json!({"budget": {"weeklyUsd": 1000, "pools": {"claude": "anthropic"}},
+                "pools": {"claude": {}}, "usage": usage.clone()}),
+            "budget url and pools need source broker",
+        ),
+        (
+            json!({"budget": {"source": "broker", "url": "http://b.example/usage/grant",
+                "pools": {"claude": "not a pool"}}, "pools": {"claude": {}}, "usage": usage.clone()}),
+            "budget pools.claude is not a pool name",
+        ),
+        (
+            json!({"budget": {"weeklyUsd": 1000, "url": "http://b.example/usage/grant"},
+                "usage": usage.clone()}),
+            "budget url and pools need source broker",
+        ),
+        (json!({"budget": {}}), "budget needs weeklyUsd or source"),
+        (
+            json!({"budget": {"source": "ledger"}}),
+            "unknown variant `ledger`",
         ),
     ] {
         let mut value = minimal.clone();

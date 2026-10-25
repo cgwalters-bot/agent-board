@@ -318,13 +318,37 @@ pub struct Usage {
     pub probe: bool,
 }
 
-/// The board's spend over the trailing week, at API list prices, across
-/// every pool: past it new runs wait, and pull requests' fix rounds past
-/// [`FOLLOW_MARGIN`] of it.
+/// The board's budget: by default its spend over the trailing week, at API
+/// list prices, across every pool: past it new runs wait, and pull
+/// requests' fix rounds past [`FOLLOW_MARGIN`] of it. With `source: broker`,
+/// the broker's grant instead (agent-board#341): each pool runs on the share
+/// its grant pool allows, which only the operator's private policy knows.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WeeklyBudget {
-    pub weekly_usd: f64,
+    pub source: Option<BudgetSource>,
+    /// Required unless `source` is set, and refused with it.
+    pub weekly_usd: Option<f64>,
+    /// With `source: broker`, its grant endpoint for this board's consumer.
+    pub url: Option<String>,
+    /// With `source: broker`, each of `pools` to the grant pool it draws on.
+    #[serde(default)]
+    pub pools: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetSource {
+    Broker,
+}
+
+/// An http(s) URL with a host. Plain HTTP is for a broker on a private
+/// network, such as a tailnet, which encrypts it; its reads carry no
+/// credential.
+fn broker_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -389,7 +413,25 @@ impl Config {
         no_nulls(&value, "config")?;
         let config: Self = serde_json::from_str(text).context("pass config")?;
         config.check()?;
+        // The grant is already paced; a target or burst set beside it, which
+        // has a default, would be read as pacing it does not do.
+        if config.grant().is_some() {
+            let pools = value["pools"].as_object().into_iter().flatten();
+            for (name, settings) in pools {
+                ensure!(
+                    settings.get("target").is_none() && settings.get("burst").is_none(),
+                    "pools.{name} sets target or burst, which the broker's grant replaces"
+                );
+            }
+        }
         Ok(config)
+    }
+
+    /// The budget, where it is the broker's grant.
+    pub fn grant(&self) -> Option<&WeeklyBudget> {
+        self.budget
+            .as_ref()
+            .filter(|b| b.source == Some(BudgetSource::Broker))
     }
 
     fn check(&self) -> Result<()> {
@@ -468,23 +510,55 @@ impl Config {
         if let Some(usage) = &self.usage {
             validate_repository(&usage.repository).context("usage repository")?;
             ensure!(usage.issue > 0, "usage issue is not a positive number");
-            // Plain HTTP is for a broker on a private network, such as a
-            // tailnet, which encrypts it; the read carries no credential.
             // The address is not repeated: it may be private.
             if let Some(url) = &usage.url {
-                let url = url::Url::parse(url).ok();
                 ensure!(
-                    url.is_some_and(|u| matches!(u.scheme(), "http" | "https")
-                        && u.host_str().is_some_and(|h| !h.is_empty())),
+                    broker_url(url),
                     "usage url is not an http(s) URL with a host"
                 );
             }
         }
         if let Some(budget) = &self.budget {
-            ensure!(
-                budget.weekly_usd > 0.0 && budget.weekly_usd <= WEEKLY_USD_LIMIT,
-                "budget weeklyUsd is not above 0 and at most {WEEKLY_USD_LIMIT}"
-            );
+            match budget.source {
+                None => {
+                    let weekly = budget
+                        .weekly_usd
+                        .context("budget needs weeklyUsd or source")?;
+                    ensure!(
+                        weekly > 0.0 && weekly <= WEEKLY_USD_LIMIT,
+                        "budget weeklyUsd is not above 0 and at most {WEEKLY_USD_LIMIT}"
+                    );
+                    ensure!(
+                        budget.url.is_none() && budget.pools.is_empty(),
+                        "budget url and pools need source broker"
+                    );
+                }
+                Some(BudgetSource::Broker) => {
+                    // Two budgets would leave which one holds to the reader.
+                    ensure!(
+                        budget.weekly_usd.is_none(),
+                        "budget weeklyUsd is refused with source broker, whose grant is the budget"
+                    );
+                    let url = budget.url.as_deref().unwrap_or_default();
+                    ensure!(
+                        broker_url(url),
+                        "budget url is not an http(s) URL with a host"
+                    );
+                    for (pool, grant) in &budget.pools {
+                        ensure!(
+                            self.pool(pool).is_some(),
+                            "budget pools names {pool}, which is not in pools"
+                        );
+                        ensure!(valid_pool(grant), "budget pools.{pool} is not a pool name");
+                    }
+                    for (pool, _) in &self.pools.0 {
+                        ensure!(
+                            budget.pools.contains_key(pool),
+                            "pool {pool} has no grant pool in budget pools"
+                        );
+                    }
+                }
+            }
             // Only stage 1's reading of the broker records the spend.
             ensure!(
                 self.usage.as_ref().is_some_and(|u| u.url.is_some()),
@@ -648,6 +722,16 @@ pub fn room(
     let entry = &snapshot["pools"][pool];
     if !entry.is_object() || entry["reason"] == usage::NO_READING {
         return Err(format!("{pool} has no reading"));
+    }
+    // A grant is paced, and its age judged, already: its room is what it
+    // allows past what is used.
+    if entry["source"] == usage::GRANT_SOURCE {
+        let figure = |key: &str| entry[key].as_f64().filter(|n| n.is_finite());
+        let open = entry["hold"] == false;
+        return match (open, figure("allowed_percent"), figure("used_percent")) {
+            (true, Some(allowed), Some(used)) => Ok(allowed - used),
+            _ => Err(format!("{pool} is held by its grant")),
+        };
     }
     match at(&entry["observed_at"]).map(|observed| (now - observed).whole_seconds()) {
         Some(age) if age < -CLOCK_SKEW_SECONDS => {
@@ -1026,6 +1110,10 @@ impl<C: Broker> Broker for Budget<'_, C> {
     fn usage(&self, url: &str) -> Result<Value> {
         self.inner.usage(url)
     }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.inner.grant(url)
+    }
 }
 
 // ---- One pass ----
@@ -1165,7 +1253,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         other: None,
         epic_starts: Vec::new(),
         considered: false,
-        probes: BTreeSet::new(),
+        probes: BTreeMap::new(),
     };
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
@@ -1249,8 +1337,9 @@ struct Slots {
     /// Issues with a run listed when the pass began, or started since.
     busy: BTreeMap<String, String>,
     /// Pools without a reading that may take one run to get one
-    /// ([`Usage::probe`]): none is in flight on them, and none started yet.
-    probes: BTreeSet<String>,
+    /// ([`Usage::probe`]), with their provider: none is in flight on that
+    /// provider, and none started on it yet.
+    probes: BTreeMap<String, String>,
 }
 
 /// The runs that hold a slot, the issues they name and the pools they run on
@@ -1265,6 +1354,16 @@ impl Slots {
         let known: BTreeSet<u64> = self.mine.iter().flatten().copied().collect();
         let unknown = self.mine.iter().filter(|r| r.is_none()).count();
         listed.union(&known).count() + unknown + self.earlier
+    }
+
+    /// Takes `pool` off the probes, with every pool on its provider: one run
+    /// gets them all a reading. Whether it was one.
+    fn probed(&mut self, pool: &str) -> bool {
+        let Some(on) = self.probes.remove(pool) else {
+            return false;
+        };
+        self.probes.retain(|_, other| *other != on);
+        true
     }
 }
 
@@ -1304,7 +1403,7 @@ struct Scheduler<'a, C> {
     considered: bool,
     /// The pools stage 1 found may take a run to get a reading
     /// ([`usage::unasked`]), where [`Usage::probe`] is set.
-    probes: BTreeSet<String>,
+    probes: BTreeMap<String, String>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -1402,10 +1501,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         self.busy = Some(listed.as_ref().ok().map(|(_, busy, _)| busy.clone()));
         let (runs, busy, pools) = listed?;
-        // A run in flight on a pool will give it its reading: no probe goes
-        // alongside it. One that names no pool may be on any; once it has
-        // asked, the broker's count says so, and the next pass probes none.
-        let probes = self.probes.difference(&pools).cloned().collect();
+        // A run in flight on a pool will give its provider a reading: no
+        // probe goes alongside it, on that pool or another on the provider.
+        // One that names no pool may be on any; once it has asked, the
+        // broker's count says so, and the next pass probes none.
+        let flying: BTreeSet<&String> = pools.iter().filter_map(|p| self.probes.get(p)).collect();
+        let probes = (self.probes.iter())
+            .filter(|(_, on)| !flying.contains(on))
+            .map(|(pool, on)| (pool.clone(), on.clone()))
+            .collect();
         let wip = config.wip as usize;
         let slots = Slots {
             wip,
@@ -1507,7 +1611,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Step::Capped(line) => {
                     // Not sent: the cap holds the rest of the pass anyway.
                     if let Some(pool) = line_pool(&line) {
-                        slots.probes.remove(pool);
+                        slots.probed(pool);
                     }
                     self.line(line);
                     free -= 1;
@@ -1669,8 +1773,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// Why runs wait on `budget` at `share` of it: the week's spend there or
     /// past it, or no spend reading. None without a budget.
+    /// A grant holds each pool in its snapshot entry instead.
     fn budget_hold(&mut self, share: f64) -> Option<String> {
-        let weekly = self.config.budget.as_ref()?.weekly_usd;
+        let weekly = self.config.budget.as_ref()?.weekly_usd?;
         let snapshot = self.snapshot();
         match spent(snapshot.as_ref(), self.now) {
             Ok(spent) if spent < weekly * share => None,
@@ -2191,7 +2296,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         slots: &Slots,
     ) -> std::result::Result<String, String> {
         choose(snapshot, &self.config.pools, names, self.now).or_else(|why| {
-            let probe = names.iter().find(|name| slots.probes.contains(*name));
+            let probe = names.iter().find(|name| slots.probes.contains_key(*name));
             probe.cloned().ok_or(why)
         })
     }
@@ -2200,7 +2305,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// where it was one: one run a pass is enough to get a reading.
     fn probed(&mut self, slots: &mut Slots, line: &str) {
         if let Some(pool) = line_pool(line)
-            && slots.probes.remove(pool)
+            && slots.probed(pool)
         {
             self.line(format!("probe: {pool} has no reading; one run to take one"));
         }
@@ -2521,10 +2626,14 @@ fn graphql_key(query: &str, variables: &Value) -> Value {
     json!({"graphql": fnv(query), "variables": variables})
 }
 
-/// The broker's `/usage` in a recording, by no address: the fixture keeps
-/// none, and replays under any `usage.url`.
-fn broker_key() -> Value {
-    json!({"broker": "/usage"})
+/// The broker's endpoints, which a recording keeps them under.
+const USAGE_PATH: &str = "/usage";
+const GRANT_PATH: &str = "/usage/grant";
+
+/// A broker endpoint in a recording, by no address: the fixture keeps none,
+/// and replays under any `usage.url` or `budget.url`.
+fn broker_key(path: &str) -> Value {
+    json!({"broker": path})
 }
 
 /// Reads through `inner`, keeping each request and its answer for a replay
@@ -2583,12 +2692,21 @@ impl<C: Rest> Rest for Recorder<'_, C> {
 
 impl<C: Broker> Broker for Recorder<'_, C> {
     fn usage(&self, url: &str) -> Result<Value> {
-        let read = self.inner.usage(url);
+        self.keep_broker(USAGE_PATH, self.inner.usage(url))
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.keep_broker(GRANT_PATH, self.inner.grant(url))
+    }
+}
+
+impl<C> Recorder<'_, C> {
+    fn keep_broker(&self, path: &str, read: Result<Value>) -> Result<Value> {
         let answer = match &read {
             Ok(body) => json!({"body": body}),
             Err(error) => json!({"error": format!("{error:#}")}),
         };
-        self.keep(broker_key(), answer);
+        self.keep(broker_key(path), answer);
         read
     }
 }
@@ -2671,9 +2789,16 @@ impl<C: Rest> Rest for Seeded<'_, C> {
 
 impl<C: Broker> Broker for Seeded<'_, C> {
     fn usage(&self, url: &str) -> Result<Value> {
-        match self.seed.answer(&broker_key()) {
+        match self.seed.answer(&broker_key(USAGE_PATH)) {
             Ok(_) => self.seed.usage(url),
             Err(_) => self.live.usage(url),
+        }
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        match self.seed.answer(&broker_key(GRANT_PATH)) {
+            Ok(_) => self.seed.grant(url),
+            Err(_) => self.live.grant(url),
         }
     }
 }
@@ -2715,7 +2840,18 @@ impl Rest for Replay {
 
 impl Broker for Replay {
     fn usage(&self, _: &str) -> Result<Value> {
-        let answer = self.answer(&broker_key())?;
+        self.broker(USAGE_PATH)
+    }
+
+    fn grant(&self, _: &str) -> Result<Value> {
+        self.broker(GRANT_PATH)
+    }
+}
+
+impl Replay {
+    /// The recorded answer of the broker's `path`.
+    fn broker(&self, path: &str) -> Result<Value> {
+        let answer = self.answer(&broker_key(path))?;
         match answer.get("error") {
             Some(error) => bail!("{}", error.as_str().unwrap_or("recorded error")),
             None => Ok(answer["body"].clone()),
