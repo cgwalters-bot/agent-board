@@ -129,5 +129,6 @@
       "fields": {}
     }
   ],
-  "fields": []
+  "fields": [],
+  "status_field_absent": true
 }

@@ -1740,6 +1740,7 @@ impl<T: Transport> GitHub<T> {
             },
             items,
             fields,
+            status_field_absent: false,
         };
         validate_github_project(&snapshot.project)?;
         snapshot.validate()?;

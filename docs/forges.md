@@ -10,7 +10,7 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels | No ([#269](https://github.com/cgwalters-forge/agent-board/issues/269), [#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
+| Forgejo | Issues of configured repositories, fields from labels | No ([#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Dispatch itself is a GitHub Actions request today on every forge: agent jobs
@@ -72,8 +72,7 @@ address, a single-label name, or a name ending in `.svc`, `.cluster.local`,
 scheme or port, so two instances on one host cannot share a board. Run and Result
 marker URLs must still be `https://`.
 
-Open: reconcile still holds Forgejo items to GitHub's Status options (#269), and
-there is no write side or dispatch (#271).
+Open: there is no write side or dispatch (#271).
 
 ## GitLab
 

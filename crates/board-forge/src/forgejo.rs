@@ -396,6 +396,8 @@ impl<T: Transport> Forgejo<T> {
             },
             items,
             fields: vec![],
+            // Forgejo has no project board here, only labels.
+            status_field_absent: true,
         };
         snapshot.items.sort_by(|a, b| a.identity.cmp(&b.identity));
         snapshot.validate()?;

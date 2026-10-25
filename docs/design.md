@@ -177,7 +177,8 @@ partial list as complete.
 Terminal-drift plans leave Done/open issues for review, never proposing closure
 from Status alone, so a person's reopen is not undone. Closed issues get Done
 only for `COMPLETED`, Cancelled for `NOT_PLANNED`; an unknown reason blocks repair.
-Every target status must exist unambiguously in the snapshot schema. Both
+Every target status must exist unambiguously in the snapshot schema; a snapshot
+marked `status_field_absent` (a Forgejo label board) gets no Status repairs. Both
 the observed status and issue state, plus the closure reason, are captured as
 preconditions. The pass's Status stage ([pass](pass.md#order-and-effects))
 replaces these plans as the board's Status writer. Incomplete
