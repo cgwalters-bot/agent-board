@@ -268,7 +268,7 @@ enum Ask {
     Add(decisions::Add),
     /// Report edits since the bot's last write to the decisions document.
     Read(decisions::Settings),
-    /// Open a question issue and set it and the blocked item Needs human (writes with --apply).
+    /// Open a question issue and label it and the blocked item needs-human (writes with --apply).
     Create(ask::Create),
     /// List open board issues labelled question.
     List {
@@ -276,7 +276,7 @@ enum Ask {
         #[arg(short = 'L', long, default_value_t = 30)]
         limit: usize,
     },
-    /// Comment the answer, close the ask and set it Done (writes with --apply).
+    /// Comment the answer, close the ask and unlabel the item it blocked (writes with --apply).
     Resolve(ask::Resolve),
 }
 

@@ -327,6 +327,9 @@ pub fn reconcile(snapshot: &Snapshot, policy: &Policy, now: &str) -> Result<Plan
     reconcile_inner(snapshot, policy, now, None)
 }
 
+/// The one label that says the operator must act; Needs human follows it.
+pub const NEEDS_HUMAN_LABEL: &str = "needs-human";
+
 /// Additional observed facts for the opt-in whole-board status pass. Unknown
 /// run state must not be mistaken for an observed absence of running work.
 #[derive(Clone, Debug, Default)]
@@ -467,7 +470,7 @@ fn reconcile_inner(
                         || item
                             .labels
                             .iter()
-                            .any(|label| label == "needs-human" || label == "question"),
+                            .any(|label| label.eq_ignore_ascii_case(NEEDS_HUMAN_LABEL)),
                     active: if facts.draft {
                         Some(true)
                     } else {

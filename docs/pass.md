@@ -260,8 +260,9 @@ A pass captures one clock and performs these stages in order:
      above; a person's **Todo** stays.
 
    The rules' precedence is shared with poll's `statusReconcile` preview.
-   No person or agent sets the derived values; an edit to one is overwritten
-   on the next pass. An item whose facts were not read whole keeps its Status:
+   No person or agent sets the derived values, `agent-board ask` included,
+   which only sets and clears the label; an edit to one is overwritten on the
+   next pass. An item whose facts were not read whole keeps its Status:
    its own fields, labels or state incomplete, or, for the fall back to Todo,
    runs that could not all be listed or an open issue's closing pull requests
    that could not all be read.

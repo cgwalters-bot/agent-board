@@ -251,7 +251,9 @@ mod tests {
             ("closed_pr", Some(Status::Done)),
             ("draft_pr", Some(Status::InProgress)),
             ("label", Some(Status::NeedsHuman)),
-            ("question", Some(Status::NeedsHuman)),
+            ("label_cased", Some(Status::NeedsHuman)),
+            // An ask counts by its needs-human label only, as in the pass's stage 5.
+            ("question", None),
             ("review_requested", Some(Status::NeedsHuman)),
             ("review_requested_cased", Some(Status::NeedsHuman)),
             ("other_reviewer", None),
@@ -293,12 +295,12 @@ mod tests {
                     };
                     offline.pull["requested_reviewers"] = json!([{ "login": login }]);
                 }
-                "label" | "question" | "ask_wins" => {
+                "label" | "label_cased" | "question" | "ask_wins" => {
                     item.labels.push(
-                        if case == "question" {
-                            "question"
-                        } else {
-                            "needs-human"
+                        match case {
+                            "question" => "question",
+                            "label_cased" => "Needs-Human",
+                            _ => "needs-human",
                         }
                         .into(),
                     );
