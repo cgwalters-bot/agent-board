@@ -13,8 +13,10 @@ works today:
 | Forgejo | Issues of configured repositories, fields from labels | No ([#269](https://github.com/cgwalters-forge/agent-board/issues/269), [#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
-Dispatch itself is a GitHub Actions request today on every forge; making it a
-pluggable backend is [#295](https://github.com/cgwalters-forge/agent-board/issues/295)
+Dispatch itself is a GitHub Actions request today on every forge: agent jobs
+start through one backend interface whose only implementation is
+`workflow_dispatch`; status queries and other backends are
+[#295](https://github.com/cgwalters-forge/agent-board/issues/295)
 ([dispatch](dispatch.md)). The design's approach to other forges, capability
 negotiation rather than weakened guarantees, is in
 [Rust boundaries](design.md#7-rust-boundaries).

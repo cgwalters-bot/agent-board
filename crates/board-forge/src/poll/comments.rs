@@ -820,16 +820,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // round on the operator's comments ([`handled`]).
         self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let url = format!("https://github.com/{repo}/pull/{number}");
-        let mut inputs = json!({
-            "task": answer_brief(repo, number, &head, &url, said, &operator),
-            "repo": repo,
-            "item": number.to_string(),
-            "kind": "fix",
-        });
-        if let Some(pool) = pool {
-            inputs["pool"] = pool.into();
-        }
-        let run = match self.dispatch_recorded(dispatcher, &workflow, inputs) {
+        let brief = answer_brief(repo, number, &head, &url, said, &operator);
+        let start = Start {
+            repository: repo,
+            item: number,
+            kind: "fix",
+            brief: &brief,
+            pool: pool.as_deref(),
+            runner: None,
+            base: None,
+        };
+        let run = match self.dispatch_recorded(dispatcher, &workflow, &start) {
             Ok(run) => run,
             // Refused, so nothing started: post an unedited stop to claim
             // from, naming the answer for the next pass. The label stays on.
@@ -873,15 +874,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         marker.comments = std::mem::take(&mut marker.pending);
-        let run = match run["workflow_run_id"].as_u64() {
-            Some(id) => {
-                let run = format!(
-                    "https://github.com/{}/actions/runs/{id}",
-                    self.config.dispatch_repo
-                );
-                marker.run = Some(id);
-                self.record_run(repo, &marker, &format!("{of}: [run]({run})."))?;
-                run
+        let run = match run {
+            Some(run) => {
+                marker.run = Some(run_number(&run)?);
+                self.record_run(repo, &marker, &format!("{of}: [run]({}).", run.url))?;
+                run.url
             }
             None => {
                 self.record_run(repo, &marker, &format!("{of}: started."))?;
@@ -1209,16 +1206,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // it can start more rounds than the bound; the comments are pending.
         self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let url = format!("https://github.com/{repo}/pull/{number}");
-        let mut inputs = json!({
-            "task": fix_brief(repo, number, &head, round, &url, said, &operator),
-            "repo": repo,
-            "item": number.to_string(),
-            "kind": "fix",
-        });
-        if let Some(pool) = pool {
-            inputs["pool"] = pool.into();
-        }
-        let run = match self.dispatch_recorded(dispatcher, &workflow, inputs) {
+        let brief = fix_brief(repo, number, &head, round, &url, said, &operator);
+        let start = Start {
+            repository: repo,
+            item: number,
+            kind: "fix",
+            brief: &brief,
+            pool: pool.as_deref(),
+            runner: None,
+            base: None,
+        };
+        let run = match self.dispatch_recorded(dispatcher, &workflow, &start) {
             Ok(run) => run,
             // Refused: the marker is put back as it was, without the round,
             // and names the comments as refused. Where that write fails, the
@@ -1249,17 +1247,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         marker.comments = std::mem::take(&mut marker.pending);
-        let Some(id) = run["workflow_run_id"].as_u64() else {
+        let Some(run) = run else {
             self.record_run(repo, &marker, &format!("{of}: started."))?;
             return Ok((true, format!("fix round {round} -> run started")));
         };
-        let run = format!(
-            "https://github.com/{}/actions/runs/{id}",
-            self.config.dispatch_repo
-        );
-        marker.run = Some(id);
-        self.record_run(repo, &marker, &format!("{of}: [run]({run})."))?;
-        Ok((true, format!("fix round {round} -> {run}")))
+        marker.run = Some(run_number(&run)?);
+        self.record_run(repo, &marker, &format!("{of}: [run]({}).", run.url))?;
+        Ok((true, format!("fix round {round} -> {}", run.url)))
     }
 
     /// Why nothing of `repo` is copied to the tracker, where it is not public.
@@ -1392,16 +1386,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 (kind, tracking.as_deref()),
             ),
         };
-        let mut inputs = json!({
-            "task": task,
-            "repo": item_repo,
-            "item": item.to_string(),
-            "kind": kind,
-        });
-        if let Some(pool) = pool {
-            inputs["pool"] = pool.into();
-        }
-        let run = match self.dispatch_recorded(dispatcher, &workflow, inputs) {
+        let start = Start {
+            repository: &item_repo,
+            item,
+            kind,
+            brief: &task,
+            pool: pool.as_deref(),
+            runner: None,
+            base: None,
+        };
+        let run = match self.dispatch_recorded(dispatcher, &workflow, &start) {
             Ok(run) => run,
             // Refused: the claim names the comments as refused, for the next
             // pass to try. Where that write fails, it stays pending, and is
@@ -1432,11 +1426,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .context("the run started, but its claim does not record it")?;
         Ok((
             true,
-            match run["workflow_run_id"].as_u64() {
-                Some(id) => format!(
-                    "{kind}{on} -> https://github.com/{}/actions/runs/{id}",
-                    self.config.dispatch_repo
-                ),
+            match run {
+                Some(run) => format!("{kind}{on} -> {}", run.url),
                 None => format!("{kind}{on} -> run started"),
             },
         ))
@@ -1558,15 +1549,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         &mut self,
         dispatcher: &R,
         workflow: &str,
-        inputs: Value,
-    ) -> Result<Value> {
+        start: &Start,
+    ) -> Result<Option<Handle>> {
         if self.remaining < DISPATCH_RECORDED_REQUESTS {
             return Err(NotStarted(format!(
                 "fewer than {DISPATCH_RECORDED_REQUESTS} requests of the poll's budget are left"
             ))
             .into());
         }
-        self.dispatch(dispatcher, workflow, inputs)
+        self.dispatch(dispatcher, workflow, start)
     }
 
     /// A new body for a comment of this pass's.

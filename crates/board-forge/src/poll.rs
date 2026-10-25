@@ -12,6 +12,7 @@
 //! correctness. GraphQL cannot be revalidated, so each pull request followed
 //! costs one query a pass.
 use crate::caps::{self, Kind};
+use crate::dispatch::{GitHub, Handle, Start, StartOutcome, Target};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::{Footer, overlap};
 use anyhow::{Context, Result, bail, ensure};
@@ -1811,6 +1812,14 @@ impl std::fmt::Display for NotStarted {
 
 impl std::error::Error for NotStarted {}
 
+/// The number a marker keeps of a run, which the poll reads its state by:
+/// the GitHub backend's handle id.
+fn run_number(run: &Handle) -> Result<u64> {
+    run.id
+        .parse()
+        .with_context(|| format!("run id {:?} is not a GitHub run number", run.id))
+}
+
 /// What a round's claim is claimed from: the marker it was decided from. A
 /// stop is a marker of its own, so a reset is claimed from it alone.
 fn claim_from(marker: &Marker) -> String {
@@ -3374,45 +3383,37 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         )
     }
 
-    /// Start a run of the caller's `workflow` with `inputs`; the response,
-    /// which names the run where the API gives its details. An error is
-    /// [`NotStarted`] where no run can have started.
-    fn dispatch(&mut self, dispatcher: &R, workflow: &str, inputs: Value) -> Result<Value> {
-        let path = format!(
-            "repos/{}/actions/workflows/{workflow}/dispatches",
-            self.config.dispatch_repo
-        );
+    /// Start a run of the caller's `workflow`; its handle where the API
+    /// names it. Each request is spent from the pass's budget and counted as
+    /// a write. An error is [`NotStarted`] where no run can have started.
+    fn dispatch(
+        &mut self,
+        dispatcher: &R,
+        workflow: &str,
+        start: &Start,
+    ) -> Result<Option<Handle>> {
         let git_ref = self.apply.as_ref().and_then(|a| a.git_ref.clone());
-        let git_ref = git_ref.as_deref().unwrap_or(DISPATCH_REF);
-        let mut request = json!({"ref": git_ref, "inputs": inputs, "return_run_details": true});
-        loop {
-            self.spend().map_err(|e| NotStarted(format!("{e:#}")))?;
+        let target = Target {
+            caller: self.config.dispatch_repo.clone(),
+            workflow: workflow.into(),
+            git_ref: git_ref.unwrap_or_else(|| DISPATCH_REF.into()),
+        };
+        let github = GitHub {
+            target: &target,
+            run_details: true,
+        };
+        let admit = || {
+            self.spend()?;
             self.writes += 1;
-            let (status, run) = dispatcher.send("POST", &format!("{API_ROOT}{path}"), &request)?;
-            if (200..300).contains(&status) {
-                return Ok(run);
-            }
-            // The run id comes back only where the API knows
-            // `return_run_details`; elsewhere it is refused with a 422, and
-            // asked again without.
-            if status == 422
-                && request
-                    .as_object_mut()
-                    .and_then(|r| r.remove("return_run_details"))
-                    .is_some()
-            {
-                continue;
-            }
-            let error = format!(
-                "POST {path}: GitHub HTTP status {status}: {}",
-                run["message"].as_str().unwrap_or("message unavailable")
-            );
-            // A refusal started nothing; a server error or a lost response
-            // may have.
-            if (400..500).contains(&status) {
-                return Err(NotStarted(error).into());
-            }
-            bail!(error);
+            Ok(())
+        };
+        match github.start(start, admit, |path, body| {
+            dispatcher.send("POST", &format!("{API_ROOT}{path}"), body)
+        }) {
+            StartOutcome::Started(run) => Ok(Some(run)),
+            StartOutcome::Unnamed => Ok(None),
+            StartOutcome::NotStarted(error) => Err(NotStarted(format!("{error:#}")).into()),
+            StartOutcome::Ambiguous(error) => Err(error),
         }
     }
 
@@ -3594,16 +3595,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 fix_task(repo, pull, checks, review, round)
             }
         };
-        let mut inputs = json!({
-            "task": task,
-            "repo": repo,
-            "item": number.to_string(),
-            "kind": "fix",
-        });
-        if let Some(pool) = pool {
-            inputs["pool"] = pool.into();
-        }
-        let run = match self.dispatch(dispatcher, &workflow, inputs) {
+        let start = Start {
+            repository: repo,
+            item: number,
+            kind: "fix",
+            brief: &task,
+            pool: pool.as_deref(),
+            runner: None,
+            base: None,
+        };
+        let run = match self.dispatch(dispatcher, &workflow, &start) {
             Ok(run) => run,
             Err(error) => {
                 let why: String = format!("{error:#}").chars().take(200).collect();
@@ -3618,16 +3619,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 return Err(error);
             }
         };
-        let Some(id) = run["workflow_run_id"].as_u64() else {
+        let Some(run) = run else {
             return Ok("run started".into());
         };
-        let url = format!(
-            "https://github.com/{}/actions/runs/{id}",
-            self.config.dispatch_repo
-        );
-        marker.run = Some(id);
-        self.record_run(repo, &marker, &format!("{of}: [run]({url})."))?;
-        Ok(url)
+        marker.run = Some(run_number(&run)?);
+        self.record_run(repo, &marker, &format!("{of}: [run]({}).", run.url))?;
+        Ok(run.url)
     }
 
     /// The step `decision` names, taken; what it did, or nothing for a step

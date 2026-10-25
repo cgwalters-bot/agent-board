@@ -10,6 +10,7 @@ pub mod batch;
 pub mod broker;
 pub mod caps;
 pub mod changes;
+pub mod dispatch;
 pub mod epic;
 pub mod epic_apply;
 pub mod forgejo;

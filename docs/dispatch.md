@@ -5,11 +5,15 @@
 agent-board decides what job to start; something else runs it. The runner of
 agent jobs is meant to be pluggable: [agentic-job](https://github.com/cgwalters-forge/agentic-job)
 on a CI runner is one backend, and any tooling that can run an agent job for an
-issue should be able to take its place. In code today there is exactly one
-backend, a GitHub Actions `workflow_dispatch` request to a caller workflow;
-[agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295)
-tracks making it a real backend interface. This page describes the interface as
-it exists.
+issue should be able to take its place. In code, every caller below starts a
+job through one interface (`board_forge::dispatch`): a start request (target
+repository, item, kind, brief, pool, runner, optional base) and a trusted route
+from configuration, answered with a run handle, a start without one, a refusal
+that started nothing, or an unknown outcome. Its only backend is a GitHub
+Actions `workflow_dispatch` request to a caller workflow. Status queries on a
+handle, and other backends, are still
+[agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295).
+This page describes the interface as it exists.
 
 ## Who dispatches
 
