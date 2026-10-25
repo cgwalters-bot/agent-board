@@ -564,7 +564,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// The operator's comments on a thread, its `comments` as read, and on a
     /// pull request its reviews and review comments, from `since` on, oldest
     /// first. An empty one, such as a bare approval, says nothing.
-    fn said(
+    pub(super) fn said(
         &mut self,
         repo: &str,
         number: u64,
@@ -698,7 +698,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     }
 
     /// The newest event that put `needs-human` on a thread, or null.
-    fn labelled(&mut self, repo: &str, number: u64, fresh: bool) -> Result<Value> {
+    pub(super) fn labelled(&mut self, repo: &str, number: u64, fresh: bool) -> Result<Value> {
         self.labelled_reserved(repo, number, fresh, 0)
     }
 
@@ -743,6 +743,29 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         (stop, read): (&Marker, &[Value]),
         (said, labelled): (&[Said], &Value),
     ) -> Result<String> {
+        let number = pull["number"]
+            .as_u64()
+            .context("pull request has no number")?;
+        let operator = self.config.operator.clone();
+        let url = format!("https://github.com/{repo}/pull/{number}");
+        let head = text(pull, "/headRefOid");
+        let brief = answer_brief(repo, number, head, &url, said, &operator);
+        let keys = said.iter().map(|s| s.key.clone()).collect();
+        let on = format!("on {operator}'s answer");
+        self.stop_round(repo, pull, (stop, read), (keys, &brief, &on), labelled)
+    }
+
+    /// Fix round 1 from the stop, with `brief`, as [`Pass::answer_round`]
+    /// starts it on the operator's comments `keys`, or on none for a stale
+    /// stop ([`super::stale`]); `on` says what it was started on.
+    pub(super) fn stop_round(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        (stop, read): (&Marker, &[Value]),
+        (keys, brief, on): (Vec<String>, &str, &str),
+        labelled: &Value,
+    ) -> Result<String> {
         let apply = self.apply.as_ref().context("not applying")?;
         if self.dispatched >= POLL_DISPATCH_LIMIT {
             return Ok(format!(
@@ -770,10 +793,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .context("pull request has no number")?;
         let head = text(pull, "/headRefOid").to_owned();
         ensure!(!head.is_empty(), "the pull request has no head");
-        let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
-        let operator = self.config.operator.clone();
         let of = format!(
-            "Fix round 1 of {MAX_FIX_ROUNDS} for `{}`, on {operator}'s answer",
+            "Fix round 1 of {MAX_FIX_ROUNDS} for `{}`, {on}",
             short(&head)
         );
         let state = json!({"from": claim_from(stop), "round": 1, "sha": head, "comments": keys});
@@ -819,13 +840,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // The answer is pending until its run may have started, as for any
         // round on the operator's comments ([`handled`]).
         self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
-        let url = format!("https://github.com/{repo}/pull/{number}");
-        let brief = answer_brief(repo, number, &head, &url, said, &operator);
         let start = Start {
             repository: repo,
             item: number,
             kind: "fix",
-            brief: &brief,
+            brief,
             pool: pool.as_deref(),
             runner: None,
             base: None,
@@ -867,7 +886,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     number,
                     &marker,
                     &head,
-                    &format!("the run on {operator}'s answer could not be started ({why})"),
+                    &format!("the run {on} could not be started ({why})"),
                     None,
                 )?;
                 return Err(error);

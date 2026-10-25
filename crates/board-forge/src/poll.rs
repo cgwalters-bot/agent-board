@@ -26,6 +26,7 @@ pub mod comments;
 pub mod lock;
 pub mod notify;
 pub mod pace;
+pub mod stale;
 
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
 // Every GET and GraphQL query of one pass, 304s included. Exhaustion fails the
@@ -441,6 +442,11 @@ pub struct PollPolicy {
     /// request must be inside for the poll to start a fix-kind run on it
     /// ([`bounds`]); none (the default) checks nothing.
     pub fix_bounds: Option<bounds::FixBounds>,
+    /// The pass's `pr.staleDays`: a stopped pull request of the bot's that
+    /// conflicts or has changes requested, untouched by the operator for this
+    /// many days, gets a fix round or is closed ([`stale`]). 0 (the default)
+    /// leaves it labelled for good, as before.
+    pub stale_days: u64,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -723,6 +729,8 @@ impl PollPolicy {
             tiers: pace::Tiers::new(),
             // The CLI's `--fix-bounds`, never the config's.
             fix_bounds: None,
+            // The pass's only.
+            stale_days: 0,
         })
     }
 
@@ -2690,18 +2698,17 @@ pub fn decide(
     // that the instruction was carried out. Even a changed head must wait for
     // the recorded run to succeed; no run id waits until timeout, then stops.
     // A successful answer with no new head deliberately returns to a person.
+    // A stale stop's round ([`stale`]) is held to the same, on no comments.
     if marker.answering
         && !(marker.sha.as_deref().is_some_and(|sha| sha != head)
             && fix_run.is_some_and(|r| r["status"] == "completed" && r["conclusion"] == "success"))
     {
-        return started(
-            config,
-            marker,
-            (fix_run, outages),
-            head,
-            "operator answer pending",
-            now,
-        );
+        let why = if marker.comments.is_empty() {
+            "the stale stop's round pending"
+        } else {
+            "operator answer pending"
+        };
+        return started(config, marker, (fix_run, outages), head, why, now);
     }
     let merge_only = config
         .policy
@@ -4671,7 +4678,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         } else {
             (Vec::new(), Value::Null)
         };
-        let decision = if answer.is_empty() {
+        // An answer comes first: the operator acted.
+        let (stale_decision, stale) = if answer.is_empty() && !merge_only {
+            self.stale(repo, &pull, &checks, (&marker, &comments))?
+                .unzip()
+        } else {
+            (None, None)
+        };
+        let decision = if let Some(decision) = stale_decision {
+            decision
+        } else if answer.is_empty() {
             decide(
                 self.config,
                 &pull,
@@ -4771,15 +4787,35 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let caps = self.caps.zip(kind);
         let held = caps.and_then(|(caps, kind)| caps.check(kind));
         let (capped, before) = (held.is_some(), self.writes);
-        let done = match (&self.apply, &retarget) {
+        // A step that replaced the stale one, such as the fix bounds' skip,
+        // takes none of its writes.
+        let stale = stale.filter(|_| matches!(decision.action, "fix" | "close"));
+        let done = match (&self.apply, &retarget, &stale) {
             _ if capped => Ok(held),
-            (Some(_), _) if !answer.is_empty() => self
+            (Some(_), _, _) if !answer.is_empty() => self
                 .answer_round(repo, &pull, (&marker, &comments), (&answer, &labelled_by))
                 .map(Some),
+            (Some(_), _, Some(stale)) if decision.action == "close" => self
+                .close(repo, &pull, (&marker, &decision.reason), &stale.labelled)
+                .map(Some),
+            (Some(_), _, Some(stale)) => {
+                let on = format!(
+                    "on a stop no one acted on for {} days",
+                    self.config.policy.stale_days
+                );
+                self.stop_round(
+                    repo,
+                    &pull,
+                    (&marker, &comments),
+                    (Vec::new(), &stale.brief, &on),
+                    &stale.labelled,
+                )
+                .map(Some)
+            }
             // The bot's own pull request, so its token may edit it. The head is
             // unchanged, so its approval stands, and the next pass reads how it
             // fares against the new base.
-            (Some(_), Some(onto)) => {
+            (Some(_), Some(onto), _) => {
                 let rest = self.rest;
                 self.send(
                     rest,
@@ -4790,7 +4826,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 )
                 .map(|_| Some(format!("retargeted to {onto}")))
             }
-            (Some(_), None) => self.take(
+            (Some(_), None, _) => self.take(
                 repo,
                 &pull,
                 &checks,
@@ -4798,7 +4834,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 &decision,
                 review_run.as_ref(),
             ),
-            (None, _) => Ok(None),
+            (None, _, _) => Ok(None),
         };
         if let Some((caps, kind)) = caps
             && !capped
@@ -4818,7 +4854,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             line,
             text(&pull, "/author/login") == self.config.bot
                 && left.is_none()
-                && in_flight(&pull, &self.config.bot, decision.action),
+                && (in_flight(&pull, &self.config.bot, decision.action)
+                    || stale.is_some() && decision.action == "fix"),
         ))
     }
 
@@ -11288,6 +11325,241 @@ mod tests {
             fake.writes.borrow().last().unwrap().1,
             json!({"labels": [LABEL]})
         );
+    }
+
+    /// With `staleDays` (agent-board#325), a stop of the poll's on a pull
+    /// request that conflicts or has changes requested, which the operator
+    /// left alone for that many days, gets fix round 1, or is closed where a
+    /// fix round ran before it. The operator commenting, pushing or putting
+    /// the label on, a younger stop, a pull request that does not fail that
+    /// way, or the setting off, leave it to a person.
+    #[test]
+    fn a_stale_stop_gets_a_fix_round_or_is_closed() {
+        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let said = |id: u64, login: &str, at: &str, body: &str| json!({"id": id, "user": {"login": login}, "created_at": at, "submitted_at": at, "body": body});
+        // A day and two hours before `now()`.
+        let stop = |rounds: u64, sha: &str| {
+            said(
+                5,
+                BOT,
+                "2026-10-11T00:00:00Z",
+                &marker_body(
+                    &json!({"rounds": rounds, "sha": sha, "stopped": true}),
+                    "Stopped.",
+                ),
+            )
+        };
+        let conflicting = json!({"mergeable": CONFLICTING});
+        let neither = json!({});
+        let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
+        let comment = format!("POST repos/{REPO}/issues/470/comments");
+        let round = vec![
+            comment.clone(),
+            format!("PATCH repos/{REPO}/issues/comments/99"),
+            format!("PATCH repos/{REPO}/issues/comments/99"),
+            format!("DELETE repos/{REPO}/issues/470/labels/{LABEL}"),
+        ];
+        let close = vec![
+            comment,
+            format!("PATCH repos/{REPO}/issues/comments/99"),
+            format!("PATCH repos/{REPO}/pulls/470"),
+        ];
+        let truncated = json!({"mergeable": CONFLICTING, "truncated": {"reviews": true}});
+        let fix_line = "fix: conflicts with main, and cgwalters has not acted on it in the 1 days since the poll stopped on 2026-10-11T00:00:00Z, so it gets a fix round -> https://github.com/cgwalters-forge/tracker/actions/runs/1234, label removed";
+        let close_line = "close: review requested changes, and cgwalters has not acted on it in the 1 days since the poll stopped on 2026-10-11T00:00:00Z, after a fix round, so it is closed -> closed";
+        // Name, staleDays, the pull request's change, its comments, who put
+        // the label on last, and the line and writes, none for a skip.
+        type Case<'a> = (
+            &'a str,
+            u64,
+            &'a Value,
+            Vec<Value>,
+            &'a str,
+            Option<(&'a str, Vec<String>)>,
+        );
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            ("a conflict with no fix round before the stop gets one", 1, &conflicting, vec![stop(0, HEAD)], BOT, Some((fix_line, round))),
+            ("changes requested after a fix round are closed", 1, &changes, vec![stop(1, HEAD)], BOT, Some((close_line, close))),
+            ("the setting off", 0, &conflicting, vec![stop(0, HEAD)], BOT, None),
+            ("a stop younger than staleDays", 2, &conflicting, vec![stop(0, HEAD)], BOT, None),
+            ("the operator commented since the stop", 1, &conflicting, vec![stop(0, HEAD), said(6, "cgwalters", "2026-10-11T08:00:00Z", "Leave it.")], BOT, None),
+            ("a head pushed since the stop", 1, &conflicting, vec![stop(0, "older")], BOT, None),
+            ("a label a person put back", 1, &conflicting, vec![stop(0, HEAD)], "cgwalters", None),
+            ("neither a conflict nor changes requested", 1, &neither, vec![stop(1, HEAD)], BOT, None),
+            ("a partial read of the reviews", 1, &truncated, vec![stop(1, HEAD)], BOT, None),
+        ];
+        let github_with = |change: &Value, issue: Vec<Value>, labeller: &str| {
+            let mut fake = github();
+            let mut change = change.clone();
+            change["labels"] = json!({"nodes": [{"name": LABEL}]});
+            fake.pulls.insert(470, pull("pull-470", change));
+            fake.rest.get_mut(&comments).unwrap().3 = Value::Array(issue);
+            for url in ["reviews", "comments"] {
+                fake.rest.insert(
+                    format!("{API_ROOT}repos/{REPO}/pulls/470/{url}?per_page=100"),
+                    (None, None, None, json!([])),
+                );
+            }
+            fake.page(
+                &format!("repos/{REPO}/issues/470/events?per_page=100"),
+                None,
+                None,
+                json!([{"id": 1, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": labeller}}]),
+            );
+            fake.page(
+                &format!("repos/{REPO}/pulls/470"),
+                None,
+                None,
+                json!({"state": "open", "head": {"sha": HEAD}}),
+            );
+            fake
+        };
+        for (name, days, change, issue, labeller, expected) in cases {
+            let fake = github_with(change, issue, labeller);
+            let dispatcher = Fake::default();
+            dispatcher.answers.borrow_mut().insert(
+                DISPATCHES.into(),
+                vec![(200, json!({"workflow_run_id": 1234}))],
+            );
+            let mut cfg = config();
+            cfg.policy.stale_days = days;
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            let line = outcome.lines.last().unwrap();
+            let Some((expected, writes)) = expected else {
+                assert!(
+                    line.ends_with("skip: labelled needs-human"),
+                    "{name}: {line}"
+                );
+                assert!(fake.writes.borrow().is_empty(), "{name}");
+                assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+                continue;
+            };
+            assert!(line.ends_with(expected), "{name}: {line}");
+            assert_eq!(written(&fake.writes), writes, "{name}");
+            let writes = fake.writes.borrow();
+            let dispatched = dispatcher.writes.borrow();
+            if line.contains(" fix: ") {
+                assert_eq!(outcome.in_flight, 1, "{name}");
+                // One round, claimed from the stop and held, as an answer's,
+                // to a new head before the old one's approval can merge.
+                assert_eq!(
+                    parse_marker(CLAIM, writes[0].1["body"].as_str().unwrap()).unwrap(),
+                    json!({"from": "5", "round": 1, "sha": HEAD, "comments": []}),
+                    "{name}"
+                );
+                let marker = find_marker(
+                    &[json!({"id": 99, "user": {"login": BOT}, "body": writes[2].1["body"]})],
+                    BOT,
+                );
+                assert_eq!(
+                    (marker.rounds, marker.stopped, marker.answering),
+                    (1, false, true)
+                );
+                let task = dispatched[0].1["inputs"]["task"].as_str().unwrap();
+                assert_eq!(dispatched[0].1["inputs"]["kind"], "fix", "{name}");
+                assert!(task.contains("fix round 1 of 2"), "{name}: {task}");
+            } else {
+                assert_eq!(outcome.in_flight, 0, "{name}");
+                assert!(dispatched.is_empty(), "{name}");
+                // Claimed from the stop, then a stop over the claim, then the close.
+                assert_eq!(
+                    parse_marker(CLAIM, writes[0].1["body"].as_str().unwrap()).unwrap(),
+                    json!({"from": "5", "close": true, "sha": HEAD}),
+                    "{name}"
+                );
+                let stop = find_marker(
+                    &[json!({"id": 99, "user": {"login": BOT}, "body": writes[1].1["body"]})],
+                    BOT,
+                );
+                assert_eq!((stop.rounds, stop.stopped), (1, true), "{name}");
+                assert_eq!(writes[2].1, json!({"state": "closed"}), "{name}");
+            }
+        }
+
+        // What the close reads again since the pass's snapshot: another
+        // pass's round, on a reset or an answer, claimed from the stop
+        // first; the label taken off; or a push. Each leaves it open.
+        let claimed = said(
+            7,
+            BOT,
+            "2026-10-12T01:00:00Z",
+            &format!(
+                "<!-- {CLAIM}: {} -->\nFix round 1: claimed.",
+                json!({"from": "5", "round": 1, "sha": HEAD})
+            ),
+        );
+        let labeled =
+            json!({"id": 1, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": BOT}});
+        let unlabeled = json!({"id": 2, "event": "unlabeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}});
+        let (on, off) = (json!([labeled]), json!([labeled, unlabeled]));
+        #[rustfmt::skip]
+        let races = [
+            ("a round claimed from the stop first", vec![stop(1, HEAD), claimed], &on, HEAD, "not closed: another pass went first, in comment 7"),
+            ("the label taken off", vec![stop(1, HEAD)], &off, HEAD, "not closed: needs-human was taken off or put on again"),
+            ("a push", vec![stop(1, HEAD)], &on, "newer", "not closed: it was pushed to or closed meanwhile"),
+        ];
+        for (name, issue, events, head, expected) in races {
+            let mut fake = github_with(&changes, issue, BOT);
+            fake.page(
+                &format!("repos/{REPO}/issues/470/events?per_page=100"),
+                None,
+                None,
+                events.clone(),
+            );
+            fake.page(
+                &format!("repos/{REPO}/pulls/470"),
+                None,
+                None,
+                json!({"state": "open", "head": {"sha": head}}),
+            );
+            let dispatcher = Fake::default();
+            let mut cfg = config();
+            cfg.policy.stale_days = 1;
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            let line = outcome.lines.last().unwrap();
+            assert!(line.ends_with(expected), "{name}: {line}");
+            assert!(fake.writes.borrow().is_empty(), "{name}");
+        }
+
+        // A preview says so and writes nothing.
+        let fake = github_with(&conflicting, vec![stop(0, HEAD)], BOT);
+        let mut cfg = config();
+        cfg.policy.stale_days = 1;
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[REPO.into()],
+            None,
+            now(),
+        )
+        .unwrap();
+        let line = outcome.lines.last().unwrap();
+        assert!(line.ends_with("so it gets a fix round"), "{line}");
+        assert!(fake.writes.borrow().is_empty());
     }
 
     /// Another pass labels and then adds its stop while this one reads. The

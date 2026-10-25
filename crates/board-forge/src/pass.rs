@@ -17,7 +17,7 @@ use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
 use crate::poll::{
     self, POLL_REPOSITORY_LIMIT, PollPolicy, Rest, RestResponse, State, next_link,
-    validate_repository, validate_workflow,
+    stale::STALE_DAYS_LIMIT, validate_repository, validate_workflow,
 };
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
@@ -315,6 +315,8 @@ pub struct Pr {
     #[serde(default)]
     pub rebase_rounds: u64,
     pub merge_queue: Option<MergeQueue>,
+    #[serde(default)]
+    pub stale_days: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,6 +476,10 @@ impl Config {
             self.pr.rebase_rounds <= REBASE_ROUNDS_LIMIT,
             "pr rebaseRounds is not 0 to {REBASE_ROUNDS_LIMIT}"
         );
+        ensure!(
+            self.pr.stale_days <= STALE_DAYS_LIMIT,
+            "pr staleDays is not 0 to {STALE_DAYS_LIMIT}"
+        );
         if let Some(queue) = &self.pr.merge_queue {
             ensure!(
                 (1..=QUEUE_TRIES_LIMIT).contains(&queue.tries),
@@ -551,6 +557,7 @@ impl Config {
                 snapshot: snapshot.cloned(),
             }),
             fix_bounds: self.fix_bounds.clone(),
+            stale_days: self.pr.stale_days,
             ..PollPolicy::default()
         };
         poll::Config {
