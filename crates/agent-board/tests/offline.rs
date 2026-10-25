@@ -1610,10 +1610,6 @@ fn machine_errors_table() {
 fn ask_preview_and_list_table() {
     let mut board: Value =
         serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
-    board["fields"][0]["options"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({"name":"Needs human"}));
     board["items"][1]["labels"] = serde_json::json!(["question"]);
     let mut closed = board["items"][1].clone();
     closed["identity"]["number"] = 3.into();
@@ -1621,11 +1617,6 @@ fn ask_preview_and_list_table() {
     closed["state_reason"] = "COMPLETED".into();
     closed["status"] = "Done".into();
     board["items"].as_array_mut().unwrap().push(closed);
-    let update = |number: u64, status: &str| {
-        format!(
-            "{{\"content_number\":{number},\"content_type\":\"issue\",\"fields\":{{\"Status\":\"{status}\"}},\"project\":\"https://github.com/orgs/example/projects/1\",\"target_repo\":\"example/intake\",\"type\":\"update_project\"}}\n"
-        )
-    };
     // A snapshot only previews: nothing here has a token, and none is asked for.
     for (args, code, stdout, stderr) in [
         (
@@ -1643,11 +1634,13 @@ fn ask_preview_and_list_table() {
         (
             vec!["ask", "create", "Ok?", "--item", "example/intake#1", "--assignee", "op", "-R", "example/tracker"],
             0,
-            format!(
-                "{}\n{}",
-                r#"{"assignees":["op"],"body":"Blocks: `https://github.com/example/intake/issues/1`\n\nQ: Ok?\n\nReply with your answer in free text. Only comments by @op count.\n","labels":["question"],"target_repo":"example/tracker","title":"Ok?","type":"create_issue"}"#,
-                update(1, "Needs human")
-            ),
+            concat!(
+                r#"{"assignees":["op"],"body":"Blocks: `https://github.com/example/intake/issues/1`\n\nQ: Ok?\n\nReply with your answer in free text. Only comments by @op count.\n","labels":["question","needs-human"],"target_repo":"example/tracker","title":"Ok?","type":"create_issue"}"#,
+                "\n",
+                r#"{"item_number":1,"labels":["needs-human"],"target_repo":"example/intake","type":"add_labels"}"#,
+                "\n"
+            )
+            .to_owned(),
             "not applied",
         ),
         (
@@ -1665,12 +1658,12 @@ fn ask_preview_and_list_table() {
         (
             vec!["ask", "resolve", "example/intake#2", "Use A."],
             0,
-            format!(
-                "{}\n{}",
+            concat!(
                 r#"{"body":"Use A.","issue_number":2,"target_repo":"example/intake","type":"close_issue"}"#,
-                update(2, "Done")
-            ),
-            "not applied",
+                "\n"
+            )
+            .to_owned(),
+            "read from the live forge",
         ),
         (
             vec!["ask", "resolve", "example/intake#1", "Use A."],

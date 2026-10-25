@@ -75,7 +75,9 @@ misleads both the operator and the scheduler.
 The `needs-human` label is the single marker that the operator must act. The
 board's Needs human status comes from it. Question issues and the decisions
 document fold into it: a question is an ordinary issue or pull request with
-the label, and answering it means acting and taking the label off.
+the label, and answering it means acting and taking the label off. `agent-board
+ask create` labels its question and the item it blocks, and `ask resolve` takes
+the label off that item once no other open ask names it; neither writes Status.
 
 Why: several ways to say "waiting on you" mean several places to check, and
 one of them is always forgotten.

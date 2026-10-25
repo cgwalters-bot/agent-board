@@ -1,21 +1,31 @@
 //! `ask create`, `ask list` and `ask resolve`: a question for the operator is an issue
-//! labelled `question` and assigned to them, on the board as Needs human together with
-//! the item it blocks; resolving comments the answer, closes it and sets it Done. This
-//! follows homegit's `bot-board question` and `resolve`. Like `item add`/`item edit`,
-//! both print proposals unless `--apply` is given, and only then write with the
-//! operator's own token. No workflow here passes `--apply`, and an agent holds no token.
+//! labelled `question` and `needs-human`, assigned to them and added to the board; the
+//! item it blocks is labelled `needs-human` too. That label is the one marker that the
+//! operator must act: the pass's stage 5 derives Needs human from it, and Done from the
+//! closed ask, so neither command writes Status. Resolving comments the answer, closes
+//! the ask and takes `needs-human` off the blocked item, unless another open ask on the
+//! board names that item on its `Blocks:` line. The asks are read from the board, not
+//! from search, which may lag a just-opened one. Since anyone who can edit an ask can
+//! change that line, the label only comes off an item on the board, and stays where
+//! the board cannot be read whole, said on stderr. Resolving an ask that is already
+//! closed only finishes taking the label off, so a failed unlabel can be retried
+//! without posting the answer twice. This follows homegit's `bot-board question` and
+//! `resolve`. Like `item
+//! add`/`item edit`, both print proposals unless `--apply` is given, and only then write
+//! with the operator's own token. No workflow here passes `--apply`, and an agent holds
+//! no token.
 use anyhow::{Context, Result, ensure};
-use board_core::{ItemRef, Snapshot};
-use board_forge::github::{FieldWrite, GitHub, Transport, field_writes};
+use board_core::{ItemRef, NEEDS_HUMAN_LABEL, Snapshot};
+use board_forge::github::{GitHub, Transport};
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::Write;
 
-/// The label that marks an issue as an ask; it must already exist in the repository.
+/// The label that marks an issue as an ask; it must already exist in the repository,
+/// as must `needs-human` there and beside the blocked item.
 pub const ASK_LABEL: &str = "question";
-/// The Status both an open ask and the item it blocks carry.
-pub const ASK_STATUS: &str = "Needs human";
-const RESOLVED_STATUS: &str = "Done";
+/// The first line of an ask names the item it blocks.
+const BLOCKS: &str = "Blocks: ";
 /// Options are lettered A to J, as in homegit.
 const OPTION_LETTERS: &str = "ABCDEFGHIJ";
 /// homegit's default title length: the question flattened to one line.
@@ -43,7 +53,7 @@ pub struct Create {
     /// Issue title; defaults to the question on one line, cut to 100 characters.
     #[arg(long)]
     pub title: Option<String>,
-    /// Open the issue and write to the live board with your token; without it, only print proposals.
+    /// Open the issue, add it to the board and label the item with your token; without it, only print proposals.
     #[arg(long)]
     pub apply: bool,
 }
@@ -56,7 +66,7 @@ pub struct Resolve {
     pub item: String,
     /// The answer, posted as a comment before the ask is closed.
     pub answer: String,
-    /// Comment, close and write to the live board with your token; without it, only print proposals.
+    /// Comment, close and unlabel with your token; without it, only print proposals.
     #[arg(long)]
     pub apply: bool,
 }
@@ -101,9 +111,9 @@ pub fn compose(args: &Create, blocked: &ItemRef, repository: &str) -> Result<(St
     // A bare URL to another repository puts a "mentioned this" event on that timeline,
     // which may be an upstream project's; a code span links nothing.
     let mut body = if blocked.repository.eq_ignore_ascii_case(repository) {
-        format!("Blocks: {url}\n\n")
+        format!("{BLOCKS}{url}\n\n")
     } else {
-        format!("Blocks: `{url}`\n\n")
+        format!("{BLOCKS}`{url}`\n\n")
     };
     if let Some(context) = args.context.as_deref().map(str::trim)
         && !context.is_empty()
@@ -141,8 +151,9 @@ pub fn compose(args: &Create, blocked: &ItemRef, repository: &str) -> Result<(St
     Ok((title, body))
 }
 
-fn status(project: &str, item: &ItemRef, value: &str) -> Value {
-    json!({"type": "update_project", "project": project, "content_type": "issue", "content_number": item.number, "target_repo": item.repository, "fields": {"Status": value}})
+/// A gh-aw `add_labels` or `remove_labels` proposal of `needs-human`.
+fn needs_human(kind: &str, item: &ItemRef) -> Value {
+    json!({"type": kind, "target_repo": item.repository, "item_number": item.number, "labels": [NEEDS_HUMAN_LABEL]})
 }
 
 fn print_proposals(out: &mut impl Write, values: &[Value]) -> Result<()> {
@@ -154,23 +165,8 @@ fn print_proposals(out: &mut impl Write, values: &[Value]) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a Status write. `field_writes` also accepts a text field, but the snapshot
-/// reader requires Status to be single-select and marks items incomplete otherwise; so
-/// a text Status is refused here, before anything is written or proposed.
-fn status_write(fields: &[Value], value: &str) -> Result<Vec<FieldWrite>> {
-    ensure!(
-        fields
-            .iter()
-            .filter(|f| f["name"] == "Status")
-            .all(|f| f["dataType"] == "SINGLE_SELECT"),
-        "the board's Status field is not single-select"
-    );
-    field_writes(fields, &[format!("Status={value}")])
-}
-
 /// The ask cannot be proposed onto the board before it has a number; apply adds it.
 fn create_proposals(
-    project: &str,
     blocked: &ItemRef,
     repository: &str,
     args: &Create,
@@ -178,16 +174,37 @@ fn create_proposals(
     body: &str,
 ) -> Vec<Value> {
     vec![
-        json!({"type": "create_issue", "target_repo": repository, "title": title, "body": body, "labels": [ASK_LABEL], "assignees": [args.assignee]}),
-        status(project, blocked, ASK_STATUS),
+        json!({"type": "create_issue", "target_repo": repository, "title": title, "body": body, "labels": [ASK_LABEL, NEEDS_HUMAN_LABEL], "assignees": [args.assignee]}),
+        needs_human("add_labels", blocked),
     ]
 }
 
-fn resolve_proposals(project: &str, ask: &ItemRef, answer: &str) -> Vec<Value> {
-    vec![
-        json!({"type": "close_issue", "target_repo": ask.repository, "issue_number": ask.number, "body": answer}),
-        status(project, ask, RESOLVED_STATUS),
-    ]
+/// `answer` is `None` for an ask already closed, which is not closed again.
+fn resolve_proposals(ask: &ItemRef, answer: Option<&str>, unblock: Option<&ItemRef>) -> Vec<Value> {
+    let close = answer.map(|answer| json!({"type": "close_issue", "target_repo": ask.repository, "issue_number": ask.number, "body": answer}));
+    close
+        .into_iter()
+        .chain(unblock.map(|item| needs_human("remove_labels", item)))
+        .collect()
+}
+
+/// GitHub's hosts and repository names are case-insensitive, and the parser keeps
+/// their spelling.
+fn same_issue(a: &ItemRef, b: &ItemRef) -> bool {
+    a.number == b.number
+        && a.host.eq_ignore_ascii_case(&b.host)
+        && a.repository.eq_ignore_ascii_case(&b.repository)
+}
+
+/// The item an ask's first line names, as `compose` writes it.
+fn blocks(body: &str, host: &str) -> Option<ItemRef> {
+    let url = body
+        .lines()
+        .next()?
+        .strip_prefix(BLOCKS)?
+        .trim()
+        .trim_matches('`');
+    board_forge::parse_github_item(url, None, host).ok()
 }
 
 fn on_board<'a>(snapshot: &'a Snapshot, identity: &ItemRef) -> Result<&'a board_core::Item> {
@@ -220,25 +237,17 @@ pub fn create_preview(
     out: &mut impl Write,
 ) -> Result<()> {
     board_forge::validate_github_project(&snapshot.project)?;
-    status_write(&snapshot.fields, ASK_STATUS)?;
     on_board(snapshot, blocked)?;
     print_proposals(
         out,
-        &create_proposals(
-            snapshot.project.as_str(),
-            blocked,
-            repository,
-            args,
-            title,
-            body,
-        ),
+        &create_proposals(blocked, repository, args, title, body),
     )
 }
 
-/// Validate the schema and the blocked item's membership, then print the proposals or,
-/// with `apply`, open the ask, add it and set both items Needs human. The issue is only
-/// opened once everything else checks out; a failure after that leaves the rows printed
-/// before it done.
+/// Check the blocked item's membership and both labels, then print the proposals or,
+/// with `apply`, open the ask labelled, add it to the board and label the blocked item.
+/// The issue is only opened once everything else checks out; a failure after that
+/// leaves the rows printed before it done.
 pub fn create<T: Transport>(
     github: &GitHub<T>,
     blocked: &ItemRef,
@@ -247,20 +256,20 @@ pub fn create<T: Transport>(
     (title, body): &(String, String),
     out: &mut impl Write,
 ) -> Result<()> {
-    let (project, url, fields) = github.schema()?;
-    let writes = status_write(&fields, ASK_STATUS)?;
-    let (_, blocked_item) = github.issue_item(&project, blocked)?;
-    let blocked_item = blocked_item.with_context(|| {
-        format!(
-            "{} is not on the board; add it with item add",
-            blocked.display()
-        )
-    })?;
-    let target = github.issue_target(repository, ASK_LABEL, &args.assignee)?;
+    let (project, _, _) = github.schema()?;
+    let (blocked_issue, blocked_item) = github.issue_item(&project, blocked)?;
+    ensure!(
+        blocked_item.is_some(),
+        "{} is not on the board; add it with item add",
+        blocked.display()
+    );
+    let target =
+        github.issue_target(repository, &[ASK_LABEL, NEEDS_HUMAN_LABEL], &args.assignee)?;
+    let label = github.label_id(&blocked.repository, NEEDS_HUMAN_LABEL)?;
     if !args.apply {
         return print_proposals(
             out,
-            &create_proposals(url.as_str(), blocked, repository, args, title, body),
+            &create_proposals(blocked, repository, args, title, body),
         );
     }
     let (issue, number) = github.create_issue(&target, title, body)?;
@@ -270,24 +279,14 @@ pub fn create<T: Transport>(
         number,
     };
     writeln!(out, "{}\tcreated", board_forge::github_item_url(&ask)?)?;
-    let item = github
+    github
         .add_item(&project, &issue)
         .context("add the ask; rows above were done")?;
     writeln!(out, "{}\tadded", ask.display())?;
-    for (identity, item) in [(&ask, &item), (blocked, &blocked_item)] {
-        for write in &writes {
-            github
-                .set_field(&project, item, write)
-                .with_context(|| format!("set {}; rows above were done", write.name))?;
-            writeln!(
-                out,
-                "{}\t{}\t{}\tset",
-                identity.display(),
-                write.name,
-                write.value
-            )?;
-        }
-    }
+    github
+        .set_label(&blocked.repository, &blocked_issue, &label, true)
+        .context("label the blocked item; rows above were done")?;
+    writeln!(out, "{}\t{NEEDS_HUMAN_LABEL}\tlabelled", blocked.display())?;
     Ok(())
 }
 
@@ -305,7 +304,6 @@ pub fn resolve_preview(
 ) -> Result<()> {
     check_answer(answer)?;
     board_forge::validate_github_project(&snapshot.project)?;
-    status_write(&snapshot.fields, RESOLVED_STATUS)?;
     let item = on_board(snapshot, ask)?;
     ensure!(
         item.labels.iter().any(|l| l == ASK_LABEL),
@@ -313,17 +311,79 @@ pub fn resolve_preview(
         ask.display()
     );
     ensure!(item.state == "open", "{} is already closed", ask.display());
-    print_proposals(
-        out,
-        &resolve_proposals(snapshot.project.as_str(), ask, answer),
-    )
+    // A snapshot holds neither the ask's body nor the other asks.
+    eprintln!(
+        "Whether {NEEDS_HUMAN_LABEL} comes off the blocked item is read from the live forge; preview without --snapshot to see it."
+    );
+    print_proposals(out, &resolve_proposals(ask, Some(answer), None))
 }
 
-/// Check that the issue is an open ask on the board, then print the proposals or, with
-/// `apply`, comment the answer, close it as completed and set it Done. Only an open ask
-/// is resolved, so a rerun after success does not post the answer twice; one after a
-/// failed close does. As in homegit, the item it blocked keeps its Status: what happens
-/// next depends on the answer.
+/// The item the ask blocks, its node ID and the `needs-human` label's, if the label
+/// should come off it: it is on the board, carries the label and no other open ask on
+/// the board names it. Where that cannot be read whole, the label stays, said on
+/// stderr.
+fn unblock<T: Transport>(
+    github: &GitHub<T>,
+    project: &str,
+    ask: &ItemRef,
+    body: &str,
+) -> Result<Option<(ItemRef, String, String)>> {
+    let Some(blocked) = blocks(body, &ask.host) else {
+        eprintln!(
+            "{} names no item on a {BLOCKS:?} first line; no label removed",
+            ask.display()
+        );
+        return Ok(None);
+    };
+    // The body is editable: an item off the board is not this command's to unlabel.
+    if github.issue_item(project, &blocked)?.1.is_none() {
+        eprintln!(
+            "{} is not on the board; {NEEDS_HUMAN_LABEL} not removed",
+            blocked.display()
+        );
+        return Ok(None);
+    }
+    let facts = github.issue_facts(&blocked)?;
+    if !facts
+        .labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(NEEDS_HUMAN_LABEL))
+    {
+        return Ok(None);
+    }
+    let (asks, complete) = github.open_board_issues(project, ASK_LABEL)?;
+    if !complete {
+        eprintln!(
+            "The board's open asks could not all be read; {NEEDS_HUMAN_LABEL} stays on {}",
+            blocked.display()
+        );
+        return Ok(None);
+    }
+    let others: Vec<_> = asks
+        .iter()
+        .filter(|(other, body)| {
+            !same_issue(other, ask)
+                && blocks(body, &ask.host).is_some_and(|item| same_issue(&item, &blocked))
+        })
+        .map(|(other, _)| other.display())
+        .collect();
+    if !others.is_empty() {
+        eprintln!(
+            "{} stays {NEEDS_HUMAN_LABEL}: still blocked by {}",
+            blocked.display(),
+            others.join(", ")
+        );
+        return Ok(None);
+    }
+    let label = github.label_id(&blocked.repository, NEEDS_HUMAN_LABEL)?;
+    Ok(Some((blocked, facts.id, label)))
+}
+
+/// Check that the issue is an ask on the board, then print the proposals or, with
+/// `apply`, comment the answer, close it as completed and take `needs-human` off the
+/// item it blocked ([`unblock`]). An ask already closed is neither commented nor
+/// closed again, so a rerun after a failed unlabel only finishes it; one after a
+/// failed close posts the answer twice.
 pub fn resolve<T: Transport>(
     github: &GitHub<T>,
     ask: &ItemRef,
@@ -332,41 +392,52 @@ pub fn resolve<T: Transport>(
     out: &mut impl Write,
 ) -> Result<()> {
     check_answer(answer)?;
-    let (project, url, fields) = github.schema()?;
-    let writes = status_write(&fields, RESOLVED_STATUS)?;
-    let (issue, open, labels) = github.issue_labels(ask)?;
+    let (project, _, _) = github.schema()?;
+    let facts = github.issue_facts(ask)?;
     ensure!(
-        labels.iter().any(|l| l == ASK_LABEL),
+        facts.labels.iter().any(|l| l == ASK_LABEL),
         "{} is not labelled {ASK_LABEL}",
         ask.display()
     );
-    ensure!(open, "{} is already closed", ask.display());
     let (_, item) = github.issue_item(&project, ask)?;
-    let item = item.with_context(|| {
-        format!(
-            "{} is not on the board; add it with item add",
+    ensure!(
+        item.is_some(),
+        "{} is not on the board; add it with item add",
+        ask.display()
+    );
+    if !facts.open {
+        eprintln!(
+            "{} is already closed; only {NEEDS_HUMAN_LABEL} is taken off the item it blocks",
             ask.display()
-        )
-    })?;
-    if !apply {
-        return print_proposals(out, &resolve_proposals(url.as_str(), ask, answer));
+        );
     }
-    let comment = github.comment(&ask.repository, &issue, answer)?;
-    writeln!(out, "{comment}\tcommented")?;
-    github
-        .close_completed(&ask.repository, &issue)
-        .context("close the ask; rows above were done")?;
-    writeln!(out, "{}\tclosed", ask.display())?;
-    for write in &writes {
+    let unblock = unblock(github, &project, ask, &facts.body)?;
+    if !apply {
+        return print_proposals(
+            out,
+            &resolve_proposals(
+                ask,
+                facts.open.then_some(answer),
+                unblock.as_ref().map(|(item, _, _)| item),
+            ),
+        );
+    }
+    if facts.open {
+        let comment = github.comment(&ask.repository, &facts.id, answer)?;
+        writeln!(out, "{comment}\tcommented")?;
         github
-            .set_field(&project, &item, write)
-            .with_context(|| format!("set {}; rows above were done", write.name))?;
+            .close_completed(&ask.repository, &facts.id)
+            .context("close the ask; rows above were done")?;
+        writeln!(out, "{}\tclosed", ask.display())?;
+    }
+    if let Some((blocked, issue, label)) = unblock {
+        github
+            .set_label(&blocked.repository, &issue, &label, false)
+            .context("unlabel the blocked item; rows above were done")?;
         writeln!(
             out,
-            "{}\t{}\t{}\tset",
-            ask.display(),
-            write.name,
-            write.value
+            "{}\t{NEEDS_HUMAN_LABEL}\tunlabelled",
+            blocked.display()
         )?;
     }
     Ok(())
@@ -478,14 +549,14 @@ mod tests {
         }
     }
 
+    const ASK_BODY: &str = "Blocks: https://github.com/example/intake/issues/7\n\nQ: Q?\n";
+
     /// Issues #7 (blocked, on the board) and #8 (the ask, once opened or for resolve).
     struct Board {
-        status_type: &'static str,
-        statuses: &'static [&'static str],
-        /// Issue numbers with an item on the board.
+        /// Issue numbers in example/intake with an item on the board.
         members: RefCell<Vec<u64>>,
-        /// Name GitHub returns for the requested label, if it exists.
-        label: Option<&'static str>,
+        /// Labels the repository has; GitHub looks them up case-insensitively.
+        labels: &'static [&'static str],
         /// Logins GitHub lists as assignable for the queried login.
         assignable: &'static [&'static str],
         /// This mutation fails.
@@ -493,24 +564,36 @@ mod tests {
         /// GitHub silently drops the assignee.
         drop_assignee: bool,
         ask_labels: &'static [&'static str],
+        ask_body: &'static str,
         ask_open: bool,
         labels_truncated: bool,
+        blocked_labels: &'static [&'static str],
+        /// Open asks on the board, by number and body, one to a page after #7's.
+        asks: &'static [(u64, &'static str)],
+        /// The board also holds an item whose content cannot be seen.
+        redacted: bool,
         mutations: RefCell<Vec<String>>,
     }
 
     impl Board {
         fn new() -> Self {
             Self {
-                status_type: "SINGLE_SELECT",
-                statuses: &["Todo", "Needs human", "Done"],
                 members: RefCell::new(vec![7]),
-                label: Some(ASK_LABEL),
+                labels: &[ASK_LABEL, NEEDS_HUMAN_LABEL],
                 assignable: &["op-bot", "OP"],
                 fail: None,
                 drop_assignee: false,
-                ask_labels: &["bug", ASK_LABEL],
+                ask_labels: &["bug", ASK_LABEL, NEEDS_HUMAN_LABEL],
+                ask_body: ASK_BODY,
                 ask_open: true,
                 labels_truncated: false,
+                blocked_labels: &[NEEDS_HUMAN_LABEL],
+                // The ask itself, and one that blocks another item.
+                asks: &[
+                    (8, ASK_BODY),
+                    (9, "Blocks: https://github.com/example/intake/issues/70\n"),
+                ],
+                redacted: false,
                 mutations: RefCell::new(vec![]),
             }
         }
@@ -524,14 +607,36 @@ mod tests {
                 );
             }
             if query.contains("fields(first") {
-                let options: Vec<_> = self
-                    .statuses
-                    .iter()
-                    .map(|name| json!({"id": format!("o-{name}"), "name": name}))
-                    .collect();
                 return Ok(json!({"node":{"fields":{"nodes":[
-                    {"id":"F_status","name":"Status","dataType":self.status_type,"options":options}
+                    {"id":"F_status","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"o-Todo","name":"Todo"}]}
                 ],"pageInfo":{"hasNextPage":false}}}}));
+            }
+            if query.contains("items(first:") {
+                assert_eq!(variables["id"], "P");
+                let page = variables["cursor"]
+                    .as_str()
+                    .map_or(0, |c| c.parse::<usize>().unwrap());
+                let issue = |number: u64, labels: &[&str], body: &str| {
+                    let labels: Vec<_> = labels.iter().map(|l| json!({"name": l})).collect();
+                    json!({"content": {"__typename": "Issue", "number": number, "state": "OPEN", "body": body,
+                        "repository": {"nameWithOwner": "example/intake"},
+                        "labels": {"nodes": labels, "pageInfo": {"hasNextPage": false}}}})
+                };
+                let nodes = match page.checked_sub(1) {
+                    None => {
+                        let mut nodes = vec![
+                            issue(7, self.blocked_labels, ""),
+                            json!({"content": {"__typename": "DraftIssue"}}),
+                        ];
+                        if self.redacted {
+                            nodes.push(json!({"content": null}));
+                        }
+                        nodes
+                    }
+                    Some(i) => vec![issue(self.asks[i].0, &[ASK_LABEL], self.asks[i].1)],
+                };
+                return Ok(json!({"node": {"items": {"nodes": nodes, "pageInfo": {
+                    "hasNextPage": page < self.asks.len(), "endCursor": (page + 1).to_string()}}}}));
             }
             let repo = format!(
                 "{}/{}",
@@ -544,23 +649,35 @@ mod tests {
                     .members
                     .borrow()
                     .iter()
-                    .filter(|n| **n == number)
+                    .filter(|n| **n == number && repo == "example/intake")
                     .map(|n| json!({"id": format!("M{n}"), "project": {"id": "P"}}))
                     .collect();
-                let labels: Vec<_> = self.ask_labels.iter().map(|l| json!({"name": l})).collect();
+                let (labels, body) = if number == 8 {
+                    (self.ask_labels, self.ask_body)
+                } else {
+                    (self.blocked_labels, "")
+                };
+                let labels: Vec<_> = labels.iter().map(|l| json!({"name": l})).collect();
                 return Ok(json!({"repository":{"issue":{
                     "id": format!("I{number}"), "number": number,
-                    "state": if self.ask_open { "OPEN" } else { "CLOSED" },
+                    "state": if number != 8 || self.ask_open { "OPEN" } else { "CLOSED" },
+                    "body": body,
                     "repository": {"nameWithOwner": repo},
                     "projectItems": {"nodes": nodes, "pageInfo": {"hasNextPage": false}},
-                    "labels": {"nodes": labels, "pageInfo": {"hasNextPage": self.labels_truncated}}
+                    "labels": {"nodes": labels, "pageInfo": {"hasNextPage": number == 8 && self.labels_truncated}}
                 }}}));
             }
             if query.starts_with("query") && query.contains("label(name:") {
-                assert_eq!(
-                    (&variables["label"], &variables["login"]),
-                    (&json!(ASK_LABEL), &json!("op"))
-                );
+                let wanted = variables["label"].as_str().unwrap();
+                let label = self
+                    .labels
+                    .iter()
+                    .find(|l| l.eq_ignore_ascii_case(wanted))
+                    .map(|name| json!({"id": format!("L-{wanted}"), "name": name}));
+                return Ok(json!({"repository": {"nameWithOwner": repo, "label": label}}));
+            }
+            if query.starts_with("query") && query.contains("assignableUsers") {
+                assert_eq!(variables["login"], "op");
                 let users: Vec<_> = self
                     .assignable
                     .iter()
@@ -568,7 +685,6 @@ mod tests {
                     .collect();
                 return Ok(json!({
                     "repository": {"id": "R", "nameWithOwner": repo,
-                        "label": self.label.map(|name| json!({"id": "L", "name": name})),
                         "assignableUsers": {"nodes": users}}
                 }));
             }
@@ -583,29 +699,35 @@ mod tests {
             match name {
                 "createIssue" => {
                     assert_eq!(
-                        (&variables["repo"], &variables["label"], &variables["user"]),
-                        (&json!("R"), &json!("L"), &json!("U-OP"))
+                        (&variables["repo"], &variables["labels"], &variables["user"]),
+                        (
+                            &json!("R"),
+                            &json!(["L-question", "L-needs-human"]),
+                            &json!("U-OP")
+                        )
                     );
                     let assignees: &[_] = if self.drop_assignee {
                         &[]
                     } else {
                         &[json!({"login":"op"})]
                     };
+                    // GitHub may list the labels in any order.
                     Ok(
                         json!({"createIssue":{"issue":{"id":"I8","number":8,"url":"u",
-                        "labels":{"nodes":[{"name":ASK_LABEL}]},"assignees":{"nodes":assignees}}}}),
+                        "labels":{"nodes":[{"name":NEEDS_HUMAN_LABEL},{"name":ASK_LABEL}]},"assignees":{"nodes":assignees}}}}),
                     )
+                }
+                "addLabelsToLabelable" | "removeLabelsFromLabelable" => {
+                    assert_eq!(
+                        (&variables["id"], &variables["label"]),
+                        (&json!("I7"), &json!("L-needs-human"))
+                    );
+                    Ok(json!({name: {"labelable": {"id": "I7"}}}))
                 }
                 "addProjectV2ItemById" => {
                     assert_eq!(variables["issue"], "I8");
                     self.members.borrow_mut().push(8);
                     Ok(json!({"addProjectV2ItemById":{"item":{"id":"M8"}}}))
-                }
-                "updateProjectV2ItemFieldValue" => {
-                    let value = json!({"optionId": variables["value"]["singleSelectOptionId"]});
-                    Ok(
-                        json!({"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":variables["item"],"fieldValueByName":value}}}),
-                    )
                 }
                 "addComment" => {
                     assert_eq!(variables["id"], "I8");
@@ -634,18 +756,18 @@ mod tests {
 
     #[test]
     fn create_table() {
-        let preview = "{\"assignees\":[\"op\"],\"body\":\"Blocks: https://github.com/example/intake/issues/7\\n\\nQ: Q?\\n\\nOptions:\\nA) a\\nB) b\\n\\nReply with a letter or free text. Only comments by @op count.\\n\",\"labels\":[\"question\"],\"target_repo\":\"example/intake\",\"title\":\"Q?\",\"type\":\"create_issue\"}\n{\"content_number\":7,\"content_type\":\"issue\",\"fields\":{\"Status\":\"Needs human\"},\"project\":\"https://github.com/orgs/example/projects/1\",\"target_repo\":\"example/intake\",\"type\":\"update_project\"}\n";
+        let preview = "{\"assignees\":[\"op\"],\"body\":\"Blocks: https://github.com/example/intake/issues/7\\n\\nQ: Q?\\n\\nOptions:\\nA) a\\nB) b\\n\\nReply with a letter or free text. Only comments by @op count.\\n\",\"labels\":[\"question\",\"needs-human\"],\"target_repo\":\"example/intake\",\"title\":\"Q?\",\"type\":\"create_issue\"}\n{\"item_number\":7,\"labels\":[\"needs-human\"],\"target_repo\":\"example/intake\",\"type\":\"add_labels\"}\n";
         // Columns: board setup, apply, stdout, mutations in order, error.
+        // No Status is written: the pass derives it from the labels.
         for (setup, apply, stdout, mutations, error) in [
             (
                 NONE,
                 true,
-                "https://github.com/example/intake/issues/8\tcreated\nexample/intake#8\tadded\nexample/intake#8\tStatus\tNeeds human\tset\nexample/intake#7\tStatus\tNeeds human\tset\n",
+                "https://github.com/example/intake/issues/8\tcreated\nexample/intake#8\tadded\nexample/intake#7\tneeds-human\tlabelled\n",
                 vec![
                     "createIssue",
                     "addProjectV2ItemById",
-                    "updateProjectV2ItemFieldValue",
-                    "updateProjectV2ItemFieldValue",
+                    "addLabelsToLabelable",
                 ],
                 None,
             ),
@@ -659,40 +781,32 @@ mod tests {
                 Some("example/intake#7 is not on the board"),
             ),
             (
-                |b| b.statuses = &["Todo", "Done"],
-                true,
-                "",
-                vec![],
-                Some("Status has no unambiguous option \"Needs human\""),
-            ),
-            // A text Status would take the value, but snapshots then mark items incomplete.
-            (
-                |b| b.status_type = "TEXT",
-                true,
-                "",
-                vec![],
-                Some("Status field is not single-select"),
-            ),
-            (
-                |b| b.status_type = "TEXT",
-                false,
-                "",
-                vec![],
-                Some("Status field is not single-select"),
-            ),
-            (
-                |b| b.label = None,
+                |b| b.labels = &[NEEDS_HUMAN_LABEL],
                 true,
                 "",
                 vec![],
                 Some("has no \"question\" label; create it first"),
             ),
             (
-                |b| b.label = Some("Question"),
+                |b| b.labels = &["Question", NEEDS_HUMAN_LABEL],
                 true,
                 "",
                 vec![],
                 Some("has no \"question\" label"),
+            ),
+            (
+                |b| b.labels = &[ASK_LABEL],
+                true,
+                "",
+                vec![],
+                Some("has no \"needs-human\" label; create it first"),
+            ),
+            (
+                |b| b.labels = &[ASK_LABEL],
+                false,
+                "",
+                vec![],
+                Some("has no \"needs-human\" label"),
             ),
             (
                 |b| b.assignable = &[],
@@ -711,7 +825,7 @@ mod tests {
             ),
             // A preview checks what apply would, so it does not promise an ask that fails.
             (
-                |b| b.label = None,
+                |b| b.labels = &[NEEDS_HUMAN_LABEL],
                 false,
                 "",
                 vec![],
@@ -723,6 +837,17 @@ mod tests {
                 "https://github.com/example/intake/issues/8\tcreated\n",
                 vec!["createIssue", "addProjectV2ItemById"],
                 Some("add the ask; rows above were done"),
+            ),
+            (
+                |b| b.fail = Some("addLabelsToLabelable"),
+                true,
+                "https://github.com/example/intake/issues/8\tcreated\nexample/intake#8\tadded\n",
+                vec![
+                    "createIssue",
+                    "addProjectV2ItemById",
+                    "addLabelsToLabelable",
+                ],
+                Some("label the blocked item; rows above were done"),
             ),
             // A dropped assignee is reported, naming the issue that now exists.
             (
@@ -772,18 +897,129 @@ mod tests {
 
     #[test]
     fn resolve_table() {
-        let preview = "{\"body\":\"Use A.\",\"issue_number\":8,\"target_repo\":\"example/intake\",\"type\":\"close_issue\"}\n{\"content_number\":8,\"content_type\":\"issue\",\"fields\":{\"Status\":\"Done\"},\"project\":\"https://github.com/orgs/example/projects/1\",\"target_repo\":\"example/intake\",\"type\":\"update_project\"}\n";
+        let close = "{\"body\":\"Use A.\",\"issue_number\":8,\"target_repo\":\"example/intake\",\"type\":\"close_issue\"}\n";
+        let preview = &*format!(
+            "{close}{{\"item_number\":7,\"labels\":[\"needs-human\"],\"target_repo\":\"example/intake\",\"type\":\"remove_labels\"}}\n"
+        );
+        let closed = "https://github.com/example/intake/issues/8#issuecomment-1\tcommented\nexample/intake#8\tclosed\n";
         let on_board: Setup = |b| b.members.borrow_mut().push(8);
+        // Columns: board setup, answer, apply, stdout, mutations in order, error.
+        // No Status is written: the pass derives Done from the closed ask.
         for (setup, answer, apply, stdout, mutations, error) in [
             (
                 on_board,
                 "Use A.",
                 true,
-                "https://github.com/example/intake/issues/8#issuecomment-1\tcommented\nexample/intake#8\tclosed\nexample/intake#8\tStatus\tDone\tset\n",
-                vec!["addComment", "closeIssue", "updateProjectV2ItemFieldValue"],
+                &*format!("{closed}example/intake#7\tneeds-human\tunlabelled\n"),
+                vec!["addComment", "closeIssue", "removeLabelsFromLabelable"],
                 None,
             ),
             (on_board, "Use A.", false, preview, vec![], None),
+            // The label stays while another open ask on the board names the item, on
+            // any page and in any spelling of its repository (search could miss an
+            // ask just opened), ...
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.asks = &[
+                        (8, ASK_BODY),
+                        (10, "Blocks: `https://github.com/example/intake/issues/7`\n"),
+                    ]
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.asks = &[(10, "Blocks: https://github.com/Example/Intake/issues/7\n")]
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.asks = &[(10, "Blocks: https://github.com/example/intake/issues/7\n")]
+                },
+                "Use A.",
+                false,
+                close,
+                vec![],
+                None,
+            ),
+            // ... when the board cannot all be read, ...
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.redacted = true
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            // ... when the edited ask names an item off the board, or the item left it, ...
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.ask_body = "Blocks: https://github.com/other/repo/issues/7\n\nQ: Q?\n"
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            (
+                |b| *b.members.borrow_mut() = vec![8],
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            // ... and the ask names no item; one not labelled has nothing to remove.
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.ask_body = "Q: Q?\n"
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.blocked_labels = &["bug"]
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue"],
+                None,
+            ),
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.fail = Some("removeLabelsFromLabelable")
+                },
+                "Use A.",
+                true,
+                closed,
+                vec!["addComment", "closeIssue", "removeLabelsFromLabelable"],
+                Some("unlabel the blocked item; rows above were done"),
+            ),
             (
                 |b| {
                     b.members.borrow_mut().push(8);
@@ -826,7 +1062,8 @@ mod tests {
                 vec![],
                 Some("is not labelled question"),
             ),
-            // A rerun after success finds the ask closed and posts nothing twice.
+            // A rerun finds the ask closed and posts nothing twice: after a failed
+            // unlabel it only finishes that, and after success it does nothing.
             (
                 |b| {
                     b.members.borrow_mut().push(8);
@@ -834,9 +1071,32 @@ mod tests {
                 },
                 "A",
                 true,
+                "example/intake#7\tneeds-human\tunlabelled\n",
+                vec!["removeLabelsFromLabelable"],
+                None,
+            ),
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.ask_open = false
+                },
+                "A",
+                false,
+                "{\"item_number\":7,\"labels\":[\"needs-human\"],\"target_repo\":\"example/intake\",\"type\":\"remove_labels\"}\n",
+                vec![],
+                None,
+            ),
+            (
+                |b| {
+                    b.members.borrow_mut().push(8);
+                    b.ask_open = false;
+                    b.blocked_labels = &["bug"]
+                },
+                "A",
+                true,
                 "",
                 vec![],
-                Some("already closed"),
+                None,
             ),
             (
                 |b| {
@@ -860,24 +1120,13 @@ mod tests {
             (
                 |b| {
                     b.members.borrow_mut().push(8);
-                    b.statuses = &["Todo"]
+                    b.labels = &[ASK_LABEL]
                 },
                 "A",
                 true,
                 "",
                 vec![],
-                Some("Status has no unambiguous option \"Done\""),
-            ),
-            (
-                |b| {
-                    b.members.borrow_mut().push(8);
-                    b.status_type = "TEXT"
-                },
-                "A",
-                true,
-                "",
-                vec![],
-                Some("Status field is not single-select"),
+                Some("has no \"needs-human\" label"),
             ),
         ] {
             let mut board = Board::new();
@@ -897,32 +1146,5 @@ mod tests {
                 None => result.unwrap(),
             }
         }
-    }
-
-    #[test]
-    fn previews_refuse_text_status() {
-        let mut snapshot: Snapshot =
-            serde_json::from_str(include_str!("../../../fixtures/board.json")).unwrap();
-        snapshot.fields = vec![json!({"name":"Status","dataType":"TEXT"})];
-        let ask = board_forge::parse_github_item("example/intake#2", None, "github.com").unwrap();
-        let args = create_args(&["Q?", "--item", "1", "--assignee", "op"]);
-        let composed = compose(&args, &blocked(), "example/intake").unwrap();
-        let mut out = Vec::new();
-        for result in [
-            create_preview(
-                &snapshot,
-                &blocked(),
-                "example/intake",
-                &args,
-                &composed,
-                &mut out,
-            ),
-            resolve_preview(&snapshot, &ask, "A", &mut out),
-        ] {
-            assert!(
-                format!("{:#}", result.unwrap_err()).contains("Status field is not single-select")
-            );
-        }
-        assert!(out.is_empty());
     }
 }

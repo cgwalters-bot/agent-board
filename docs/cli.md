@@ -247,9 +247,9 @@ Commands:
 
 - [`add`](#agent-board-ask-add): Append to the configured decisions document (preview unless --apply)
 - [`read`](#agent-board-ask-read): Report edits since the bot's last write to the decisions document
-- [`create`](#agent-board-ask-create): Open a question issue and set it and the blocked item Needs human (writes with --apply)
+- [`create`](#agent-board-ask-create): Open a question issue and label it and the blocked item needs-human (writes with --apply)
 - [`list`](#agent-board-ask-list): List open board issues labelled question
-- [`resolve`](#agent-board-ask-resolve): Comment the answer, close the ask and set it Done (writes with --apply)
+- [`resolve`](#agent-board-ask-resolve): Comment the answer, close the ask and unlabel the item it blocked (writes with --apply)
 
 ## agent-board ask add
 
@@ -287,7 +287,7 @@ Options:
 
 ## agent-board ask create
 
-Open a question issue and set it and the blocked item Needs human (writes with --apply)
+Open a question issue and label it and the blocked item needs-human (writes with --apply)
 
 ```text
 agent-board ask create [OPTIONS] --item <ITEM> --assignee <ASSIGNEE> <QUESTION>
@@ -305,7 +305,7 @@ Options:
 - `--recommend <WHY>`: Recommend the first option (A), for this reason
 - `--context <CONTEXT>`: Background printed before the question
 - `--title <TITLE>`: Issue title; defaults to the question on one line, cut to 100 characters
-- `--apply`: Open the issue and write to the live board with your token; without it, only print proposals
+- `--apply`: Open the issue, add it to the board and label the item with your token; without it, only print proposals
 
 ## agent-board ask list
 
@@ -321,7 +321,7 @@ Options:
 
 ## agent-board ask resolve
 
-Comment the answer, close the ask and set it Done (writes with --apply)
+Comment the answer, close the ask and unlabel the item it blocked (writes with --apply)
 
 ```text
 agent-board ask resolve [OPTIONS] <ITEM> <ANSWER>
@@ -335,7 +335,7 @@ Arguments:
 Options:
 
 - `--config <FILE>`: Caller-owned agent-board.json from a trusted default-branch checkout (default: `agent-board.json`)
-- `--apply`: Comment, close and write to the live board with your token; without it, only print proposals
+- `--apply`: Comment, close and unlabel with your token; without it, only print proposals
 
 ## agent-board run
 
