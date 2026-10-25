@@ -426,7 +426,10 @@ fn reads_page_the_items_from_the_latest_update() {
             "Item 20\n",
             "Item 20\n- [example/project#31](https://github.com/example/project/pull/31) Item 31\n",
         );
-    assert_eq!(read(&forge, "P", since, None).unwrap().markdown(), expected);
+    assert_eq!(
+        read(&forge, "P", since, None, false).unwrap().markdown(),
+        expected
+    );
     let variables = forge.variables.borrow();
     assert_eq!(
         variables[3],
@@ -442,7 +445,102 @@ fn reads_page_the_items_from_the_latest_update() {
     drop(variables);
     assert_eq!(last_update(&forge, "P").unwrap(), None);
     // A repeated cursor never completes the list.
-    assert!(read(&forge, "P", since, None).is_err());
+    assert!(read(&forge, "P", since, None, false).is_err());
+}
+
+#[test]
+fn public_only_leaves_out_private_repositories() {
+    let visible = |mut content: Value, repo: &str, private: bool| {
+        let c = if content.get("content").is_some() {
+            &mut content["content"]
+        } else {
+            &mut content
+        };
+        c["repository"] = json!({"nameWithOwner": repo, "isPrivate": private});
+        c["url"] = json!(format!("https://github.com/{repo}/issues/{}", c["number"]));
+        content
+    };
+    let private_ref = json!({"number": 4, "url": "https://github.com/example/secret/issues/4",
+        "repository": {"nameWithOwner": "example/secret", "isPrivate": true}});
+    let mut landed = visible(
+        item(
+            "PullRequest",
+            12,
+            json!({"merged": true, "mergedAt": IN, "closedAt": IN}),
+        ),
+        "example/project",
+        false,
+    );
+    let mut public_ref = closes(3)["nodes"][0].take();
+    public_ref["repository"]["isPrivate"] = json!(false);
+    landed["content"]["closingIssuesReferences"]["nodes"] = json!([public_ref, private_ref]);
+    let items = vec![
+        landed,
+        visible(
+            item("Issue", 5, json!({"createdAt": IN})),
+            "example/secret",
+            true,
+        ),
+    ];
+    let page = |nodes: Value| json!({"node": {"items": {"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}}}});
+    let none = json!({"search": {"nodes": [], "pageInfo": {"hasNextPage": false}}});
+    let forge = |items: &[Value], searches: usize| Pages {
+        pages: RefCell::new(
+            [json!({"viewer": {"login": VIEWER}}), page(json!(items))]
+                .into_iter()
+                .chain(std::iter::repeat_n(none.clone(), searches))
+                .collect(),
+        ),
+        variables: RefCell::new(vec![]),
+    };
+    let since = parse_time(SINCE).unwrap();
+    // Unfiltered, the private issue and reference are listed and searched.
+    let all = forge(&items, 4);
+    let body = read(&all, "P", since, None, false).unwrap().markdown();
+    assert!(
+        body.contains("example/secret#5") && body.contains("example/secret#4"),
+        "{body}"
+    );
+    assert_eq!(all.variables.borrow().len(), 6);
+    let public = forge(&items, 2);
+    let body = read(&public, "P", since, None, true).unwrap().markdown();
+    assert_eq!(
+        body,
+        "**Landed**\n- [example/project#12](https://github.com/example/project/issues/12) Item 12 \
+        (closes [example/project#3](https://github.com/example/project/issues/3))\n"
+    );
+    // Only the public repository is searched.
+    let variables = public.variables.borrow();
+    assert_eq!(variables.len(), 4);
+    assert!(variables.iter().all(|v| !v.to_string().contains("secret")));
+    drop(variables);
+    // A visibility the read lacks is not taken for public.
+    let unread = vec![item("Issue", 6, json!({"createdAt": IN}))];
+    let error = read(&forge(&unread, 2), "P", since, None, true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("unread visibility of example/project"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn markdown_within_trims_like_a_status_body() {
+    let changes = classify(&window(), &[], SINCE, &authors()).unwrap();
+    let whole = changes.markdown();
+    assert_eq!(
+        changes.markdown_within(whole.chars().count()).unwrap(),
+        whole
+    );
+    let short = changes.markdown_within(whole.chars().count() - 1).unwrap();
+    assert!(short.chars().count() < whole.chars().count());
+    assert!(short.contains("- +1 more\n"), "{short}");
+    assert_eq!(
+        short,
+        changes
+            .status_body(None, &BTreeMap::new(), whole.chars().count() - 1)
+            .unwrap()
+    );
+    assert!(changes.markdown_within(10).is_err());
 }
 
 #[test]

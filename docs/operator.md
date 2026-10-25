@@ -114,6 +114,16 @@ once, in the first of Landed, Closed, Opened and Held it fits, and every line is
 `[owner/repo#N](url) title`, sorted by repository and number. Empty sections are
 left out; with no changes the body says `No changes since TIME`.
 
+For a list that is published somewhere other than the project, such as the
+weekly notes on the organization site, `changes --public-only` leaves out the
+issues and pull requests of private repositories, does not search those
+repositories, and drops a private issue from a landing's `closes`. It needs no
+extra request: the reads already carry each repository's `isPrivate`, and one
+that was not read counts as private. `--max-chars N` trims the Markdown to at
+most N characters as a generated status update is trimmed (the sections with
+the most lines lose their last lines first, ending with `+K more`). Status
+updates themselves stay unfiltered: they are posted on the project.
+
 Apart from those pull requests, the list describes current members, not a
 historical board diff: removed members, project-field changes and draft issues
 are not in it. Incomplete reads,

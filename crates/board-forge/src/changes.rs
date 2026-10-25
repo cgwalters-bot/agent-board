@@ -28,7 +28,12 @@
 //! groups its lines by repository once it is long. When the body
 //! would exceed its limit, the sections with the most lines (the later on a
 //! tie, so Landed goes last) drop their un-noted lines first and end with
-//! `+K more`.
+//! `+K more`; [`Changes::markdown_within`] trims the plain list the same way.
+//!
+//! [`read`] can leave out private repositories (`changes --public-only`), for
+//! a list that goes somewhere public: every query reads each repository's
+//! `isPrivate`, so this costs no request, and a private repository is then
+//! neither listed, searched, nor named in a landing's `closes`.
 use crate::github::{ReadBudget, SNAPSHOT_REQUEST_LIMIT, Transport, connection, text};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -44,14 +49,14 @@ pub const FIRST_WINDOW: time::Duration = time::Duration::days(7);
 pub const HOLD_LABELS: &[&str] = &["needs-human", "needs-design"];
 
 const ITEMS_QUERY: &str = "query($id:ID!,$cursor:String,$since:DateTime!){node(id:$id){... on ProjectV2{items(first:100,after:$cursor){nodes{content{__typename \
-... on Issue{number title url state createdAt closedAt repository{nameWithOwner} labels(first:100){nodes{name} pageInfo{hasNextPage}} timelineItems(first:100,since:$since,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]){nodes{__typename ... on LabeledEvent{createdAt label{name}} ... on UnlabeledEvent{createdAt label{name}}} pageInfo{hasNextPage}}} \
-... on PullRequest{number title url state createdAt closedAt merged mergedAt repository{nameWithOwner} labels(first:100){nodes{name} pageInfo{hasNextPage}} timelineItems(first:100,since:$since,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]){nodes{__typename ... on LabeledEvent{createdAt label{name}} ... on UnlabeledEvent{createdAt label{name}}} pageInfo{hasNextPage}} closingIssuesReferences(first:25){nodes{number url repository{nameWithOwner}} pageInfo{hasNextPage}}}\
+... on Issue{number title url state createdAt closedAt repository{nameWithOwner isPrivate} labels(first:100){nodes{name} pageInfo{hasNextPage}} timelineItems(first:100,since:$since,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]){nodes{__typename ... on LabeledEvent{createdAt label{name}} ... on UnlabeledEvent{createdAt label{name}}} pageInfo{hasNextPage}}} \
+... on PullRequest{number title url state createdAt closedAt merged mergedAt repository{nameWithOwner isPrivate} labels(first:100){nodes{name} pageInfo{hasNextPage}} timelineItems(first:100,since:$since,itemTypes:[LABELED_EVENT,UNLABELED_EVENT]){nodes{__typename ... on LabeledEvent{createdAt label{name}} ... on UnlabeledEvent{createdAt label{name}}} pageInfo{hasNextPage}} closingIssuesReferences(first:25){nodes{number url repository{nameWithOwner isPrivate}} pageInfo{hasNextPage}}}\
 }} pageInfo{hasNextPage endCursor}}}}}";
 
 /// A covered repository's pull requests by search qualifier; only what a
 /// Landed or Opened line needs.
 const SEARCH_QUERY: &str = "query($q:String!,$cursor:String){search(query:$q,type:ISSUE,first:100,after:$cursor){nodes{__typename \
-... on PullRequest{number title url state createdAt closedAt merged mergedAt author{__typename login} repository{nameWithOwner} closingIssuesReferences(first:25){nodes{number url repository{nameWithOwner}} pageInfo{hasNextPage}}}\
+... on PullRequest{number title url state createdAt closedAt merged mergedAt author{__typename login} repository{nameWithOwner isPrivate} closingIssuesReferences(first:25){nodes{number url repository{nameWithOwner isPrivate}} pageInfo{hasNextPage}}}\
 } pageInfo{hasNextPage endCursor}}}";
 /// The qualifiers each covered repository is searched with.
 const SEARCHES: &[&str] = &["merged", "created"];
@@ -145,12 +150,13 @@ pub fn last_update(t: &impl Transport, project: &str) -> Result<Option<OffsetDat
 /// The project's changes since `since`: its items, then a search of each
 /// covered repository, all within one request budget. New pull requests
 /// outside the board are listed when the token's viewer or `operator` wrote
-/// them.
+/// them. With `public_only`, nothing of a private repository is.
 pub fn read(
     t: &impl Transport,
     project: &str,
     since: OffsetDateTime,
     operator: Option<&str>,
+    public_only: bool,
 ) -> Result<Changes> {
     let since = format_time(since)?;
     let budget = ReadBudget::new(t, SNAPSHOT_REQUEST_LIMIT);
@@ -164,6 +170,12 @@ pub fn read(
         "/node/items",
     )?;
     ensure!(complete, "incomplete project items");
+    // Before `covered`, so that a private repository is not searched either.
+    let items = if public_only {
+        without_private(items, "/content")?
+    } else {
+        items
+    };
     let mut searched = vec![];
     for repo in covered(&items) {
         // Names come from GitHub, but they go into query text.
@@ -179,7 +191,64 @@ pub fn read(
             searched.extend(found);
         }
     }
+    let searched = if public_only {
+        without_private(searched, "")?
+    } else {
+        searched
+    };
     classify(&items, &searched, &since, &authors)
+}
+
+/// Whether a repository, as the queries read it, is public. A visibility
+/// that was not read counts as private: this decides what is published.
+fn public(repository: &Value) -> Result<bool> {
+    repository["isPrivate"]
+        .as_bool()
+        .map(|p| !p)
+        .with_context(|| {
+            format!(
+                "unread visibility of {}",
+                repository["nameWithOwner"]
+                    .as_str()
+                    .unwrap_or("a repository")
+            )
+        })
+}
+
+/// `values` less the issues and pull requests (at `pointer` in each) of
+/// private repositories, and less the private issues a pull request closes.
+/// Anything else is left for [`classify`] to judge.
+fn without_private(values: Vec<Value>, pointer: &str) -> Result<Vec<Value>> {
+    let mut kept = Vec::with_capacity(values.len());
+    for mut value in values {
+        let Some(content) = value.pointer_mut(pointer) else {
+            kept.push(value);
+            continue;
+        };
+        if !matches!(
+            content["__typename"].as_str(),
+            Some("Issue" | "PullRequest")
+        ) {
+            kept.push(value);
+            continue;
+        }
+        if !public(&content["repository"])? {
+            continue;
+        }
+        if let Some(nodes) = content
+            .pointer_mut("/closingIssuesReferences/nodes")
+            .and_then(Value::as_array_mut)
+        {
+            let shown = nodes
+                .iter()
+                .map(|n| public(&n["repository"]))
+                .collect::<Result<Vec<_>>>()?;
+            let mut shown = shown.into_iter();
+            nodes.retain(|_| shown.next().unwrap_or(false));
+        }
+        kept.push(value);
+    }
+    Ok(kept)
 }
 
 /// Whether a pull request's author is an app or a dependency bot.
@@ -600,6 +669,13 @@ impl Changes {
         // Without notes or a limit, nothing can refuse it.
         self.render(None, &BTreeMap::new(), usize::MAX)
             .unwrap_or_default()
+    }
+
+    /// The list in at most `limit` characters, trimmed as [`Self::status_body`]
+    /// trims: the sections with the most lines lose their last lines first,
+    /// each ending with `+K more`.
+    pub fn markdown_within(&self, limit: usize) -> Result<String> {
+        self.render(None, &BTreeMap::new(), limit)
     }
 
     /// A status update body of at most `limit` characters: `summary` on

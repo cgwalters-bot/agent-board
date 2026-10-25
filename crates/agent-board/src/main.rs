@@ -91,6 +91,15 @@ enum Command {
         /// Output format.
         #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
         format: String,
+        /// Leave out issues and pull requests of private repositories, for a
+        /// list that will be published.
+        #[arg(long)]
+        public_only: bool,
+        /// Trim the Markdown to at most N characters as a generated status
+        /// update is trimmed: the longest sections lose their last lines
+        /// first, each ending with `+K more`.
+        #[arg(long, value_name = "N")]
+        max_chars: Option<usize>,
     },
     /// List or inspect board items.
     Item {
@@ -654,19 +663,31 @@ fn execute(cli: Cli) -> Result<()> {
                 dispatch::init(&github(&cli)?, &mut io::stdout().lock())
             }
         }
-        Command::Changes { since, format } => {
+        Command::Changes {
+            since,
+            format,
+            public_only,
+            max_chars,
+        } => {
             ensure!(cli.snapshot.is_none(), "changes requires a live project");
             ensure!(
                 cli.json.is_none(),
                 "changes takes --format json, not --json"
             );
+            ensure!(
+                format == "markdown" || max_chars.is_none(),
+                "--max-chars trims Markdown, not --format json"
+            );
             let changes = github(&cli)?.changes(
                 board_forge::changes::parse_time(since)?,
                 configured_operator(&cli)?.as_deref(),
+                *public_only,
             )?;
             let mut out = io::stdout().lock();
             if format == "json" {
                 writeln!(out, "{}", serde_json::to_string_pretty(&changes)?)?;
+            } else if let Some(limit) = max_chars {
+                write!(out, "{}", changes.markdown_within(*limit)?)?;
             } else {
                 write!(out, "{}", changes.markdown())?;
             }

@@ -556,7 +556,7 @@ fn status_body(
     let footer = &p.settings.footer;
     // Room for the attribution [`signed`] appends.
     let limit = crate::github::STATUS_BODY_LIMIT - footer.as_str().chars().count() - 2;
-    let changes = changes::read(&forge, project, since, Some(&p.settings.operator))?;
+    let changes = changes::read(&forge, project, since, Some(&p.settings.operator), false)?;
     let body = changes.status_body(Some(unsigned(summary, footer)), notes, limit)?;
     Ok(signed(&body, None, footer))
 }
