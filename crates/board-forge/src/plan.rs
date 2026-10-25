@@ -21,6 +21,10 @@ pub const PLAN_FENCE: &str = "agent-board-plan";
 /// The tag of the hidden first line of the comment that records a plan's
 /// dispatch: `<!-- agent-board-dispatch: PLAN-ID -->`.
 pub const DISPATCH_MARKER: &str = "agent-board-dispatch";
+/// The info string of the fence a triage run's answer puts its verdict in:
+/// ```` ```schedule-triage ```` around `{"verdict": "done"}`, as tracker's
+/// scheduler asked for it and the supervisor reads it.
+pub const TRIAGE_FENCE: &str = "schedule-triage";
 /// Characters of a failed dispatch's error kept in its record.
 const ERROR_LIMIT: usize = 200;
 /// Profiles a plan may ask for. dispatch.yml also has review and fix, which
@@ -349,6 +353,17 @@ pub(crate) fn no_fenced(comments: &[Comment], writers: &[&str], fence: &str) -> 
 
 pub(crate) fn has_fence(body: &str, fence: &str) -> bool {
     !fence_blocks(body, fence).is_empty()
+}
+
+/// The verdict of a triage answer: the `verdict` string of the one closed
+/// [`TRIAGE_FENCE`] block in `body`. None for no block, an open one, more
+/// than one, or one that is not JSON with a string verdict.
+pub(crate) fn triage_verdict(body: &str) -> Option<String> {
+    let [Some(block)] = &fence_blocks(body, TRIAGE_FENCE)[..] else {
+        return None;
+    };
+    let answer: Value = serde_json::from_str(block).ok()?;
+    answer["verdict"].as_str().map(str::to_owned)
 }
 
 /// The `fence` blocks of a comment body, in order: each one's text, or
