@@ -193,6 +193,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "toml",
  "ureq",
  "url",
 ]

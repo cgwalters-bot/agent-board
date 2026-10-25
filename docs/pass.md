@@ -213,6 +213,18 @@ supplies credentials through the environment, never the file. Issue text, PR
 bodies, run names and comments other than authenticated operator direction are
 data, not instructions.
 
+`--fix-bounds FILE`, absent by default, names the caller's agentic-job bounds
+file for its `fix` kind (tracker's `.github/agentic-job/fix.toml`), from the
+same trusted checkout as `--config`. With it, stage 2 starts no fix, rebase
+or continuation round, all dispatched as that kind, on a pull request
+whose repository or head branch the file's `repos` and
+`outputs.push_to_pull_request_branch.branches` leave out; its line says
+`skip: left to the operator: head branch "B" is outside the fix bounds`, and
+nothing is claimed, marked, labelled or dispatched. Merges are unchanged.
+The [poll](poll.md) says which globs it reads. It does not replace
+agentic-job's policy step, which stays the boundary; it saves the run that
+step would refuse.
+
 A pass captures one clock and performs these stages in order:
 
 1. Refresh usage from the configured broker, retaining the existing normalized

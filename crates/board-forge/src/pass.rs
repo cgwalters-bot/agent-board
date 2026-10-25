@@ -206,6 +206,9 @@ pub struct Config {
     pub state: Option<String>,
     #[serde(default)]
     pub pr: Pr,
+    /// `--fix-bounds`, never the file's: the poll's [`PollPolicy::fix_bounds`].
+    #[serde(skip)]
+    pub fix_bounds: Option<poll::bounds::FixBounds>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,6 +550,7 @@ impl Config {
                 overrides: vec![],
                 snapshot: snapshot.cloned(),
             }),
+            fix_bounds: self.fix_bounds.clone(),
             ..PollPolicy::default()
         };
         poll::Config {

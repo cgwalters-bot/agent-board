@@ -177,6 +177,28 @@ names no tier needs no pools file and behaves as before. The supervisor's
 executor reads its kind's tier from the pools file it already takes, and admits
 a request for any automatic pool of it.
 
+`poll --fix-bounds PATH` (and `pass --fix-bounds PATH`) reads the caller's
+agentic-job bounds file for its `fix` kind, tracker's
+`.github/agentic-job/fix.toml`, from the same trusted checkout, never from a
+dispatched head or a workflow input (agent-board#264). Every round the poll
+starts is dispatched as that kind: fix, rebase (a conflict's included),
+diagnostic, continuation and answer rounds, and a fix round on the operator's
+comments. A pull request whose base repository is not in the file's `repos`,
+or whose head branch is not in its `outputs.push_to_pull_request_branch.branches`,
+gets none of them: no claim, marker, label or dispatch (only an earlier
+answer round's interrupted stop is still finished), and the line says
+`skip: left to the operator: head branch "ci-drop-grub-cc" is outside the fix bounds`
+(or `repository OWNER/REPO is outside …`). It is not counted in flight. On the
+operator's comments the thread's line says the same and the comments are
+handled, as for a `left to a person` thread. Merges and every other step are
+unchanged. Only those two keys are read; the rest is agentic-job's. A glob is
+read only as `OWNER/*` in `repos` (owner and name compare case-insensitively)
+and `PREFIX/**` in `branches` (any branch starting `PREFIX/`), and any other
+`*`, `?`, `[` or `{`, a missing key or a value that is not an array of strings
+refuses the file. This only saves the run the policy step would refuse; it
+reads the bounds file and does not replace that step, which stays the
+boundary. Without the flag nothing is checked, as before.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`

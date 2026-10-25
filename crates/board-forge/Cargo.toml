@@ -12,6 +12,7 @@ serde_json.workspace = true
 url = "2"
 ureq = { version = "3", features = ["json", "platform-verifier"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
+toml = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-platform-verifier = "0.7"

@@ -152,8 +152,14 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   the share elapsed. Report it. Keep the numbers out of public issues,
   because the snapshot is private.
 - **failures**: an agent run's newest attempt failed for a reason that
-  recurs if run again unchanged. Ask for a triage run on its target with
-  `secret-shaped`, `apply-refused` or `blocker-closed`.
+  recurs if run again unchanged. Its `reason` is `secret`, `refused`,
+  `blocker` or `bounds`. Ask for a triage run on its target with
+  `secret-shaped`, `apply-refused` or `blocker-closed` for the first three.
+  `bounds` is misdirected work: agentic-job's policy step refused the run as
+  outside the caller's bounds (`is not within the bounds`), such as a fix
+  round on a branch fix.toml does not name. A triage run cannot change that;
+  report the run and its target to the operator, who promotes or fixes such
+  work by hand, and whether the poll and pass read `--fix-bounds`.
 - **held**: `needs-human` on the bot's pull request for longer than the
   configured hours. The evidence is the pull request and its latest
   comment, which says why. Report what the operator has to decide.

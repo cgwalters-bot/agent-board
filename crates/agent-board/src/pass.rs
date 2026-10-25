@@ -4,7 +4,7 @@ use board_forge::caps::Limits;
 use board_forge::github::Client;
 use board_forge::github::{GraphQl, Transport};
 use board_forge::pass::{self, Config, Mode, PassRun, Recorder, Replay, Report, Seeded};
-use board_forge::poll::{Rest, State};
+use board_forge::poll::{Rest, State, bounds::FixBounds};
 use std::{io::Write, path::PathBuf};
 use tokio::runtime::Runtime;
 
@@ -13,6 +13,9 @@ pub struct Pass {
     /// The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN (the bot's) and DISPATCH_TOKEN, never the file.
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
+    /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos`, or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase or continuation round and is left to the operator. The policy step stays the boundary.
+    #[arg(long, value_name = "FILE")]
+    pub fix_bounds: Option<PathBuf>,
     /// Take the steps: follow up pull requests, publish the usage snapshot, apply epic plans, start the chosen runs and write board Status as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow.
     #[arg(long)]
     pub apply: bool,
@@ -91,8 +94,13 @@ fn read(path: &PathBuf) -> Result<String> {
 /// previews or applies, and a summary of its caps last. Any failed operation
 /// fails the command, after the rest of the pass has run.
 pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
-    let config = Config::parse(&read(&args.config)?)
+    let mut config = Config::parse(&read(&args.config)?)
         .with_context(|| format!("{}", args.config.display()))?;
+    config.fix_bounds = args
+        .fix_bounds
+        .as_deref()
+        .map(FixBounds::read)
+        .transpose()?;
     let limits = Limits {
         dispatch: args.max_dispatch,
         writes: args.max_writes,

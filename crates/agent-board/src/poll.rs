@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use board_forge::poll::{self, State};
+use board_forge::poll::{self, State, bounds::FixBounds};
 use std::{io::Write, path::PathBuf};
 
 #[derive(Clone, clap::Args)]
@@ -11,6 +11,9 @@ pub struct Poll {
     /// Repository-owned pools file (each pool's `tier`), from the same trusted checkout, needed only where fixPools or kindPools names a tier such as tier-1.
     #[arg(long, value_name = "FILE")]
     pub pools: Option<PathBuf>,
+    /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos`, or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase, continuation or answer round and is left to the operator, nor does a fix round on the operator's comments start there. The policy step stays the boundary.
+    #[arg(long, value_name = "FILE")]
+    pub fix_bounds: Option<PathBuf>,
     /// Print the step a pass would take for each pull request and take none.
     #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
@@ -115,7 +118,12 @@ pub fn run(
     let value = args.config.as_ref().map(read).transpose()?;
     let pools = args.pools.as_ref().map(read).transpose()?;
     let now = time::OffsetDateTime::now_utc();
-    let (effective, policy) = configured(args, value.as_ref(), pools.as_ref(), now)?;
+    let (effective, mut policy) = configured(args, value.as_ref(), pools.as_ref(), now)?;
+    policy.fix_bounds = args
+        .fix_bounds
+        .as_deref()
+        .map(FixBounds::read)
+        .transpose()?;
     let args = &effective;
     ensure!(
         !args.apply || args.dispatch_workflow.is_some(),

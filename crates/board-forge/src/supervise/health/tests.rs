@@ -671,7 +671,16 @@ fn collector_reads_scheduler_logs_records_runs_annotations_and_pull_requests() {
                     run(42, "implement example/project#3", json!({})),
                     run(51, "research example/project#4 (claude)", json!({"conclusion": "failure"})),
                     run(52, "research example/project#4 (claude)", json!({"conclusion": "failure"})),
+                    run(53, "fix example/project#8 (claude)", json!({"conclusion": "failure"})),
                 ]}));
+            }
+            if path.starts_with(&format!("{root}/actions/runs/53/jobs")) {
+                return Ok(json!({"jobs": [{"id": 531, "conclusion": "failure"}]}));
+            }
+            if path.starts_with(&format!("{root}/check-runs/531/annotations")) {
+                return Ok(
+                    json!([{"message": "pull request branch \"ci-drop-grub-cc\" is not within the bounds (dispatch/**, bot/**, release-train/**)"}]),
+                );
             }
             if path.starts_with(&format!("{root}/actions/runs/50/jobs")) {
                 return Ok(
@@ -740,8 +749,8 @@ fn collector_reads_scheduler_logs_records_runs_annotations_and_pull_requests() {
         .iter()
         .map(|f| f["reason"].clone())
         .collect();
-    assert_eq!(reasons, [json!("refused"), Value::Null]);
-    assert_eq!(checks["failures"]["evidence"], json!([url(50)]));
+    assert_eq!(reasons, [json!("refused"), Value::Null, json!("bounds")]);
+    assert_eq!(checks["failures"]["evidence"], json!([url(50), url(53)]));
     assert_eq!(checks["held"]["status"], "fail");
     assert_eq!(
         checks["held"]["evidence"],
