@@ -1532,6 +1532,10 @@ pub struct QueueState {
     /// nor one from before then is read as evidence of a later removal.
     pub group: Option<String>,
     pub since: Option<String>,
+    /// The head the poll last put in the queue, kept across heads: GitHub's
+    /// `beforeCommit` names the merge-group commit, not the head, so this is
+    /// what tells a removal of the current head from an old head's.
+    pub queued: Option<String>,
 }
 
 /// Text from GitHub as the marker may carry it: job and step names come from
@@ -1556,6 +1560,7 @@ impl QueueState {
             "reasons": self.reasons.iter().map(|r| plain(r)).collect::<Vec<_>>(),
             "group": some(&self.group),
             "since": some(&self.since),
+            "queued": some(&self.queued),
         })
     }
 
@@ -1584,6 +1589,8 @@ impl QueueState {
                 .collect(),
             group: string("group"),
             since: string("since"),
+            // A marker written before enqueues were recorded has none.
+            queued: string("queued"),
         })
     }
 }
@@ -2467,8 +2474,9 @@ pub enum Removal {
 
 /// [`decide`]'s step for a pull request whose merge queue the poll owns: an
 /// approved green head that a removal took out goes back in (counted, with
-/// why) until `tries` are used, and then to a human. A fix or a stop records
-/// `state` too, so the removal it saw is not read as new by the next pass.
+/// why) until `tries` are used, and then to a human. A merge, fix or stop
+/// records `state` too, so the removal it saw is not read as new by the next
+/// pass, and a merge records the head it queues.
 pub fn queue_step(
     decision: Decision,
     removal: Removal,
@@ -2499,8 +2507,18 @@ pub fn queue_step(
                 decision.reason, state.tries
             );
             state.reasons.push(why);
+            state.queued = Some(state.head.clone());
             Decision {
                 reason,
+                queue: Some(state),
+                ..decision
+            }
+        }
+        // The first enqueue is recorded too, so that its removal is charged
+        // to this head ([`Pass::removal`]).
+        ("merge", Removal::None) => {
+            state.queued = Some(state.head.clone());
+            Decision {
                 queue: Some(state),
                 ..decision
             }
@@ -3631,6 +3649,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .filter(|id| !id.is_empty())
             .context("pull request has no id")?;
         let head = text(pull, "/headRefOid");
+        // An enqueue whose state the marker already has, as one GitHub refused
+        // last pass, is not recorded again.
+        let new_queue = marker.stopped || decision.queue != marker.queue;
         let recorded;
         let marker = match &decision.queue {
             Some(queue) => {
@@ -3650,9 +3671,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         .collect::<String>()
                 ))?;
                 if merge_queued(&rules)? {
-                    // A re-queue is recorded first: a pass that dies after it
-                    // has spent the try, rather than re-queuing for nothing.
-                    if let Some(queue) = &decision.queue {
+                    // An enqueue is recorded first: a pass that dies after a
+                    // re-queue has spent the try, rather than re-queuing for
+                    // nothing, and a removal is charged to the head recorded.
+                    if let Some(queue) = &decision.queue
+                        && new_queue
+                    {
                         // After a reset, the rounds start again as decide read them.
                         let mut next = if marker.stopped {
                             Marker {
@@ -3991,6 +4015,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             state = QueueState {
                 head: head.to_owned(),
                 seen: state.seen,
+                queued: state.queued,
                 ..QueueState::default()
             };
         }
@@ -4001,11 +4026,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         state.seen = id;
         let removed_at = text(latest, "/createdAt");
-        // Attribute the removal to GitHub's recorded head, not a commit's
-        // committer-controlled date. Missing attribution must retain the stop:
-        // the current head may have been queued and dequeued between polls.
+        // Attribute the removal to the head the poll recorded enqueuing, not a
+        // commit's committer-controlled date: GitHub's `beforeCommit` is the
+        // merge-group commit, which is the head only where it was the group
+        // (agent-board#254). Only a record of another head, on a head the
+        // marker has not tracked, and a `beforeCommit` that is not this head,
+        // makes it an old head's; missing attribution must retain the stop
+        // (#203), as a head queued before enqueues were recorded, or by a
+        // person, has none, and a missing `beforeCommit` may be a person's
+        // removal of this head after the record. A fix round tracks the new
+        // head with the old head's record kept, so a later removal is this head's.
         let removed_head = text(latest, "/beforeCommit/oid");
-        if new_head && !removed_head.is_empty() && removed_head != head {
+        let old = state.queued.as_deref().is_some_and(|q| q != head);
+        if !removed_head.is_empty() && removed_head != head && new_head && old {
             return Ok((Removal::None, state, None));
         }
         let since = state.since.replace(plain(removed_at));
@@ -12335,6 +12368,7 @@ mod tests {
             reasons: vec!["the queue rebuilt around it".into()],
             group: Some("gh-readonly-queue/main/pr-470-aaa".into()),
             since: Some("2026-10-12T01:30:00Z".into()),
+            queued: Some(format!("{HEAD}\"}} -->")),
         };
         let comment = |queue: &QueueState| {
             let marker = Marker {
@@ -12350,8 +12384,14 @@ mod tests {
         assert_eq!(read.jobs, ["rust -- rounds: 0"]);
         assert_eq!(read.tries, 2);
         assert_eq!(read.reasons, queue.reasons);
+        assert_eq!(read.queued, Some(format!("{HEAD} --")));
         let reread = find_marker(&[comment(&read)], BOT).queue.unwrap();
         assert_eq!(reread, read);
+        // A marker from before enqueues were recorded names none.
+        let mut unrecorded = queue.to_json();
+        unrecorded.as_object_mut().unwrap().remove("queued");
+        let unrecorded = QueueState::from_json(&unrecorded).unwrap();
+        assert_eq!((unrecorded.queued, unrecorded.tries), (None, 2));
         // A marker naming more failed jobs than the bound is read cut to it.
         let mut many = queue.clone();
         many.jobs = (0..QUEUE_JOBS_LIMIT + 5)
@@ -12399,8 +12439,24 @@ mod tests {
             format!("POST repos/{REPO}/labels"),
             format!("POST repos/{REPO}/issues/470/labels"),
         ];
-        let removed = |id: &str, reason: &str| json!({"nodes": [{"id": id, "createdAt": "2026-10-12T01:30:00Z", "reason": reason}]});
-        let state = |seen: &str, tries: u64, jobs: &[&str], failed: Value| json!({"rounds": 0, "queue": {"head": HEAD, "seen": seen, "tries": tries, "jobs": jobs, "failed": failed, "reasons": (["a", "b", "c"][..tries as usize])}});
+        // GitHub's `beforeCommit` of a removal is the merge-group commit, as
+        // on agentic-job#1632 a squash commit on main, not the head.
+        const GROUP: &str = "5d2c7e1a9b8f40c3e6d17a2b9c0f4e8d3a1b6c72";
+        let old = "a".repeat(40);
+        let removed = |id: &str, reason: &str| json!({"nodes": [{"id": id, "createdAt": "2026-10-12T01:30:00Z", "reason": reason, "beforeCommit": {"oid": GROUP}}]});
+        // As the poll records it, having queued the head.
+        let state = |seen: &str, tries: u64, jobs: &[&str], failed: Value| json!({"rounds": 0, "queue": {"head": HEAD, "seen": seen, "tries": tries, "jobs": jobs, "failed": failed, "reasons": (["a", "b", "c"][..tries as usize]), "queued": HEAD}});
+        // The old head's state, queued by the poll or, without `queued`, not.
+        let old_head = |queued: bool| {
+            let mut s = state("R1", 1, &[], Value::Null);
+            s["queue"]["head"] = old.clone().into();
+            s["queue"]["queued"] = if queued {
+                old.clone().into()
+            } else {
+                Value::Null
+            };
+            s
+        };
         let files = |paths: &[&str]| json!({"nodes": paths.iter().map(|p| json!({"path": p})).collect::<Vec<_>>(), "pageInfo": {"hasNextPage": false}});
         let ahead = json!([{"pullRequest": {"number": 471, "files": files(&["crates/a.rs"])}}]);
         let read = |seen: &str, group: &str, since: &str| {
@@ -12436,7 +12492,30 @@ mod tests {
                 json!([]),
                 "merge: review approved and checks green; re-queue 1 of 3, after the queue rebuilt around it -> added to the merge queue",
                 vec![comment.clone(), "enqueuePullRequest".into()],
-                json!({"seen": "R1", "tries": 1, "reasons": ["the queue rebuilt around it"]}),
+                json!({"seen": "R1", "tries": 1, "reasons": ["the queue rebuilt around it"], "queued": HEAD}),
+            ),
+            (
+                "a first enqueue is recorded before it, so that its removal is charged to the head",
+                Some(3),
+                json!({}),
+                none.clone(),
+                None,
+                json!([]),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"head": HEAD, "seen": "", "tries": 0, "queued": HEAD}),
+            ),
+            (
+                // The state is read back as the next pass reads it.
+                "a re-queue's state survives a pass restart, and the next removal is counted",
+                Some(3),
+                json!({"timelineItems": removed("R1", "stack_invalidated"), "restart": removed("R2", "stack_invalidated")}),
+                none.clone(),
+                None,
+                json!([]),
+                "re-queue 2 of 3, after the queue rebuilt around it -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"seen": "R2", "tries": 2, "queued": HEAD}),
             ),
             (
                 "a run that failed in its checkout is the cascade, not its own",
@@ -12450,6 +12529,8 @@ mod tests {
                 json!({"seen": "R2", "tries": 2, "jobs": ["rust"]}),
             ),
             (
+                // agentic-job#1632: queued with no state recorded, and removed
+                // with a merge-group commit as `beforeCommit`.
                 "a job's first failure is retried, and the job remembered",
                 Some(3),
                 json!({"timelineItems": removed("R1", "failed_checks")}),
@@ -12458,7 +12539,7 @@ mod tests {
                 json!([]),
                 "re-queue 1 of 3, after job rust failed at step Run cargo test, once -> added to the merge queue",
                 vec![comment.clone(), "enqueuePullRequest".into()],
-                json!({"seen": "R1", "tries": 1, "jobs": ["job rust failed at step Run cargo test"], "group": "77"}),
+                json!({"head": HEAD, "seen": "R1", "tries": 1, "jobs": ["job rust failed at step Run cargo test"], "group": "77", "queued": HEAD}),
             ),
             (
                 "the same job failing at another step is another failure, and retried",
@@ -12647,27 +12728,19 @@ mod tests {
                 // removal is the old head's, and this head is queued.
                 "an old head's removal before a pre-created commit was pushed is not charged to it",
                 Some(3),
-                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": "a".repeat(40)}}]}, "committedDate": "2026-10-12T01:00:00Z"}),
-                {
-                    let mut s = state("R1", 1, &[], none.clone());
-                    s["queue"]["head"] = "a".repeat(40).into();
-                    s
-                },
+                json!({"timelineItems": removed("R2", "dequeued"), "committedDate": "2026-10-12T01:00:00Z"}),
+                old_head(true),
                 None,
                 json!([]),
                 "merge: review approved and checks green -> added to the merge queue",
-                vec!["enqueuePullRequest".into()],
-                none.clone(),
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"head": HEAD, "seen": "R2", "tries": 0, "queued": HEAD}),
             ),
             (
-                "an unattributed removal still stops a future-dated current head",
+                "a removal with no recorded enqueue still stops a future-dated current head",
                 Some(3),
                 json!({"timelineItems": removed("R2", "dequeued"), "committedDate": "2027-10-12T01:20:00Z"}),
-                {
-                    let mut s = state("R1", 1, &[], none.clone());
-                    s["queue"]["head"] = "a".repeat(40).into();
-                    s
-                },
+                old_head(false),
                 None,
                 json!([]),
                 "needs-human: removed from the merge queue (dequeued), which the poll does not retry -> labelled needs-human",
@@ -12675,12 +12748,39 @@ mod tests {
                 json!({"seen": "R2"}),
             ),
             (
-                "a future-dated current head queued and dequeued between polls still stops",
+                // GitHub names the head where the group was the head alone.
+                "a removal naming the current head still stops it, whatever head was recorded",
                 Some(3),
                 json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": HEAD}}]}, "committedDate": "2027-10-12T01:20:00Z"}),
+                old_head(true),
+                None,
+                json!([]),
+                "needs-human: removed from the merge queue (dequeued), which the poll does not retry -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                json!({"seen": "R2"}),
+            ),
+            (
+                // The poll queued the old head; a person queued this head and
+                // removed it between polls, and GitHub names no commit.
+                "a removal with no beforeCommit still stops a new head, whatever head was recorded",
+                Some(3),
+                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z"}]}}),
+                old_head(true),
+                None,
+                json!([]),
+                "needs-human: removed from the merge queue (dequeued), which the poll does not retry -> labelled needs-human",
+                vec![label[0].clone(), label[1].clone(), comment.clone()],
+                json!({"seen": "R2"}),
+            ),
+            (
+                // A fix round tracked this head and kept the old head's record;
+                // a person then queued this head and removed it.
+                "a removal of a head the marker tracks still stops it, whatever head was recorded",
+                Some(3),
+                json!({"timelineItems": removed("R2", "dequeued")}),
                 {
-                    let mut s = state("R1", 1, &[], none.clone());
-                    s["queue"]["head"] = "a".repeat(40).into();
+                    let mut s = state("R1", 0, &[], Value::Null);
+                    s["queue"]["queued"] = old.clone().into();
                     s
                 },
                 None,
@@ -12690,14 +12790,10 @@ mod tests {
                 json!({"seen": "R2"}),
             ),
             (
-                "nor does it hold a new head's fix round",
+                "nor does an old head's removal hold a new head's fix round",
                 Some(3),
-                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "dequeued", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": "a".repeat(40)}}]}, "contexts": {"ci": {"conclusion": "FAILURE"}}}),
-                {
-                    let mut s = state("R1", 1, &[], none.clone());
-                    s["queue"]["head"] = "a".repeat(40).into();
-                    s
-                },
+                json!({"timelineItems": removed("R2", "dequeued"), "contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                old_head(true),
                 None,
                 json!([]),
                 "fix: check ci failed -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
@@ -12711,20 +12807,19 @@ mod tests {
             (
                 "nor spend one of a new head's re-queues",
                 Some(3),
-                json!({"timelineItems": {"nodes": [{"id": "R2", "reason": "stack_invalidated", "createdAt": "2026-10-12T01:30:00Z", "beforeCommit": {"oid": "a".repeat(40)}}]}}),
+                json!({"timelineItems": removed("R2", "stack_invalidated")}),
                 {
-                    let mut s = state("R1", 1, &[], none.clone());
+                    let mut s = old_head(true);
                     s["rounds"] = 1.into();
-                    s["sha"] = "a".repeat(40).into();
+                    s["sha"] = old.clone().into();
                     s["run"] = 7.into();
-                    s["queue"]["head"] = "a".repeat(40).into();
                     s
                 },
                 None,
                 json!([]),
                 "merge: review approved and checks green -> added to the merge queue",
-                vec!["enqueuePullRequest".into()],
-                none.clone(),
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"seen": "R2", "tries": 0, "queued": HEAD}),
             ),
             (
                 "a reason the poll does not know goes to a human",
@@ -12819,7 +12914,11 @@ mod tests {
                 none.clone(),
             ),
         ];
-        for (name, tries, change, marker, failing, queue, line, writes, recorded) in cases {
+        let pass = |tries: Option<u64>,
+                    change: Value,
+                    marker: &Value,
+                    failing: Option<&str>,
+                    queue: &Value| {
             let mut fake = github();
             fake.rest
                 .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
@@ -12852,7 +12951,7 @@ mod tests {
             if !marker.is_null() {
                 let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
                 fake.rest.get_mut(&comments).unwrap().3 = json!([
-                    {"id": 5, "user": {"login": BOT}, "body": marker_body(&marker, "Merge queue.")}
+                    {"id": 5, "user": {"login": BOT}, "body": marker_body(marker, "Merge queue.")}
                 ]);
             }
             if let Some(failing) = failing {
@@ -12913,15 +13012,34 @@ mod tests {
                 now(),
             )
             .unwrap();
-            let got = outcome.lines.last().unwrap();
-            assert!(got.ends_with(line), "{name}: {got}");
-            assert_eq!(written(&fake.writes), writes, "{name}");
             let markers: Vec<Value> = fake
                 .writes
                 .borrow()
                 .iter()
                 .filter_map(|(_, body)| parse_marker(MARKER, body["body"].as_str()?))
                 .collect();
+            (fake, dispatcher, outcome, markers)
+        };
+        for (name, tries, mut change, marker, failing, queue, line, writes, recorded) in cases {
+            let restart = change.as_object_mut().unwrap().remove("restart");
+            let (mut fake, mut dispatcher, mut outcome, mut markers) =
+                pass(tries, change.clone(), &marker, failing, &queue);
+            if let Some(removal) = restart {
+                // The next pass reads the newest marker the first wrote.
+                let newest = markers.last().unwrap().clone();
+                let body = marker_body(&newest, "Merge queue.");
+                let read = find_marker(
+                    &[json!({"id": 6, "user": {"login": BOT}, "body": body})],
+                    BOT,
+                );
+                assert_eq!(read.queue.unwrap().queued.as_deref(), Some(HEAD), "{name}");
+                change["timelineItems"] = removal;
+                (fake, dispatcher, outcome, markers) =
+                    pass(tries, change, &newest, failing, &queue);
+            }
+            let got = outcome.lines.last().unwrap();
+            assert!(got.ends_with(line), "{name}: {got}");
+            assert_eq!(written(&fake.writes), writes, "{name}");
             match markers.last() {
                 Some(newest) => {
                     for (key, want) in recorded.as_object().unwrap() {
