@@ -2771,6 +2771,7 @@ pub(super) mod tests {
                 apply: Some(apply),
                 dispatched: 0,
                 queues: BTreeMap::new(),
+                updated: Default::default(),
                 outages: None,
                 paces: None,
                 envelope: None,
