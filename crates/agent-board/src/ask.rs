@@ -16,7 +16,7 @@
 //! no token.
 use anyhow::{Context, Result, ensure};
 use board_core::{ItemRef, NEEDS_HUMAN_LABEL, Snapshot};
-use board_forge::github::{GitHub, Transport};
+use board_forge::github::{ASK_BLOCKS as BLOCKS, GitHub, Transport, ask_blocks as blocks};
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -24,8 +24,6 @@ use std::io::Write;
 /// The label that marks an issue as an ask; it must already exist in the repository,
 /// as must `needs-human` there and beside the blocked item.
 pub const ASK_LABEL: &str = "question";
-/// The first line of an ask names the item it blocks.
-const BLOCKS: &str = "Blocks: ";
 /// Options are lettered A to J, as in homegit.
 const OPTION_LETTERS: &str = "ABCDEFGHIJ";
 /// homegit's default title length: the question flattened to one line.
@@ -194,17 +192,6 @@ fn same_issue(a: &ItemRef, b: &ItemRef) -> bool {
     a.number == b.number
         && a.host.eq_ignore_ascii_case(&b.host)
         && a.repository.eq_ignore_ascii_case(&b.repository)
-}
-
-/// The item an ask's first line names, as `compose` writes it.
-fn blocks(body: &str, host: &str) -> Option<ItemRef> {
-    let url = body
-        .lines()
-        .next()?
-        .strip_prefix(BLOCKS)?
-        .trim()
-        .trim_matches('`');
-    board_forge::parse_github_item(url, None, host).ok()
 }
 
 fn on_board<'a>(snapshot: &'a Snapshot, identity: &ItemRef) -> Result<&'a board_core::Item> {

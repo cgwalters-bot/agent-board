@@ -330,7 +330,17 @@ edit, or comment may follow the receipt, except the bot's own comments before
 the triage run ended.
 Like a dispatch, a close refuses an issue that carries `epic`, `question` or
 `needs-human` when the request runs, however long after the receipt the hold
-was added.
+was added, with one exception: the pass's own `needs-human` on a done verdict
+(`triageFollowUpDays`). That label is accepted when its newest label-add event
+is the bot's and later than the triage run's end, and no comment after the
+receipt carries a triage verdict, since the pass holds the newest. The rule
+above already refuses any comment after the run, the operator's included.
+A label the operator added, or one added before the run ended, still refuses
+the close. So does an open ask on the configured project whose `Blocks:` line
+names it, or a board whose open asks cannot all be read, as `ask resolve` reads
+them: `ask create` run as the bot adds the same label and no comment, nor a
+cross-reference from another repository, which the label event alone cannot
+tell from the pass's hold.
 Nothing reviews a closure, so unlike a dispatch it keeps agent-board#111's
 input check: the issue must have been locked since before the triage run
 started, and every author and editor of its body and comments, the bot

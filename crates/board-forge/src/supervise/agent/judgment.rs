@@ -483,12 +483,16 @@ impl Checked {
                     );
                     // The labels are read now, so a hold the operator added
                     // after the triage receipt still stops the close, as it
-                    // stops a dispatch.
+                    // stops a dispatch. Only the pass's own `needs-human` on
+                    // this done verdict may stand, checked with the receipt.
                     ensure!(
-                        !super::HELD_LABELS.iter().any(|h| has_label(&issue, h)),
+                        !super::HELD_LABELS
+                            .iter()
+                            .any(|h| *h != "needs-human" && has_label(&issue, h)),
                         "The issue is the operator's or held"
                     );
-                    triage_done(api, p, repo, item, triage_run, *triage_comment)?;
+                    let held = has_label(&issue, "needs-human");
+                    triage_done(api, p, repo, item, triage_run, *triage_comment, held)?;
                 }
                 Self::Write(Write::RemoveNeedsHuman { .. }) => {
                     ensure!(
@@ -1013,6 +1017,7 @@ fn triage_done(
     item: u64,
     url: &str,
     comment: u64,
+    held: bool,
 ) -> Result<()> {
     let id = run_id(url, p)?;
     let run = api.get(&format!(
@@ -1061,7 +1066,8 @@ fn triage_done(
     // now, so that no one else could add, edit or delete any, and written
     // only by collaborators (agent-board#155 left that check to closure).
     let (mut locked, mut unlocked) = (None, None);
-    for e in paged(api, repo, item, "events")? {
+    let events = paged(api, repo, item, "events")?;
+    for e in &events {
         let newest = match e["event"].as_str() {
             Some("locked") => Some(&mut locked),
             Some("unlocked") => Some(&mut unlocked),
@@ -1078,17 +1084,71 @@ fn triage_done(
             );
         }
     }
+    let mut superseded = false;
+    let mut past = false;
     for later in paged(api, repo, item, "comments")? {
         let created = millis(&later["created_at"]).context("Comment timestamp")?;
         ensure!(
             created <= at || (later["user"]["login"] == p.settings.bot && created <= end),
             "The issue was discussed after its triage"
         );
+        // The pass labels the newest verdict, in this order; any verdict after
+        // the receipt, even the run's own, makes a hold that one's.
+        superseded |= past
+            && later["body"]
+                .as_str()
+                .and_then(crate::plan::triage_verdict)
+                .is_some();
+        past |= later["id"] == comment;
     }
     ensure!(
         locked.is_some_and(|t| t < start && unlocked < Some(t)),
         "The issue was not locked throughout its triage"
     );
+    if held {
+        // The pass holds a done verdict `needs-human` (`triageFollowUpDays`).
+        // That hold is the bot's newest label-add, after the run; an operator's
+        // or an earlier one stays. The checks above refuse any comment since
+        // the run ended, the operator's included, and any verdict after the
+        // receipt, so the hold is this verdict's: the pass labels the newest.
+        ensure!(!superseded, "A later triage verdict holds the issue");
+        let last = events
+            .iter()
+            .rev()
+            .find(|e| {
+                e["event"] == "labeled"
+                    && e["label"]["name"]
+                        .as_str()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("needs-human"))
+            })
+            .context("No label provenance")?;
+        ensure!(
+            last["actor"]["login"] == p.settings.bot
+                && millis(&last["created_at"]).is_some_and(|t| t > end),
+            "The issue is the operator's or held"
+        );
+        // `ask create`, run as the bot, adds the same label without a
+        // comment here, so the label alone cannot tell its hold from the
+        // pass's. Its ask is on the board and names this issue on its
+        // `Blocks:` line, in a code span from another repository so that no
+        // cross-reference shows here: an open one on the board refuses, as
+        // does a board not read whole, as `ask resolve` keeps the label.
+        let project = p
+            .agent
+            .project
+            .as_deref()
+            .context("No configured project to read open asks from")?;
+        let (asks, complete) =
+            crate::github::open_board_issues(&super::super::Graphql(api), project, "question")?;
+        ensure!(complete, "The board's open asks could not all be read");
+        ensure!(
+            !asks.iter().any(|(_, body)| {
+                crate::github::ask_blocks(body, crate::github::DEFAULT_HOST)
+                    .is_some_and(|b| b.number == item && b.repository.eq_ignore_ascii_case(repo))
+            }),
+            "An open question holds the issue"
+        );
+    }
     super::conversation(api, repo, item, true)
 }
 

@@ -918,13 +918,124 @@ fn closure_needs_a_successful_targeted_triage_and_its_unedited_done_finding() {
     refuses(&s, actions()[2].clone(), |f| {
         f.issues.get_mut(&3).unwrap()["lastEditedAt"] = json!(later);
     });
-    // An operator's hold, whenever added, outranks the finding.
+    // A question, or a `needs-human` with no label event to show it is the
+    // pass's own, outranks the finding.
     for label in ["needs-human", "Question"] {
         refuses(&s, actions()[2].clone(), |f| {
             f.objects
                 .get_mut("/repos/example/project/issues/3")
                 .unwrap()["labels"] = json!([{"name": label}]);
         });
+    }
+}
+
+#[test]
+fn closure_accepts_only_the_pass_s_own_later_hold() {
+    let s = configured();
+    // The triage run ended at 11:00; its receipt is from 10:30.
+    let after = "2026-10-16T12:00:00Z";
+    // The run corrects its done receipt with a later verdict, which the pass
+    // then holds: the hold is not the receipt's.
+    let corrected = "```schedule-triage\n{\"verdict\":\"needs-design\"}\n```";
+    // `ask create`, run as the bot, labels the issue it blocks without a
+    // comment there, nor a cross-reference from another repository, whose
+    // ask names it in a code span; the board item is its ask.
+    let ask = |repository: &str, state: &str, blocks: &str| {
+        json!({"content": {"__typename": "Issue", "number": 9, "state": state,
+            "body": format!("Blocks: {blocks}\n\nQ: Ship it?\n"),
+            "repository": {"nameWithOwner": repository},
+            "labels": {"nodes": [{"name": "question"}, {"name": "needs-human"}],
+                "pageInfo": {"hasNextPage": false}}}})
+    };
+    let blocked = "https://github.com/example/project/issues/3";
+    let spanned = format!("`{blocked}`");
+    for (actor, labeled, comment, board, admitted) in [
+        ("worker", after, None, None, true),
+        ("owner", after, None, None, false),
+        ("worker", "2026-10-16T10:00:00Z", None, None, false),
+        (
+            "worker",
+            after,
+            Some(("owner", "2026-10-16T13:00:00Z", "")),
+            None,
+            false,
+        ),
+        (
+            "worker",
+            after,
+            Some(("worker", "2026-10-16T10:45:00Z", corrected)),
+            None,
+            false,
+        ),
+        (
+            "worker",
+            after,
+            None,
+            Some(ask("example/control", "OPEN", &spanned)),
+            false,
+        ),
+        (
+            "worker",
+            after,
+            None,
+            Some(ask("example/project", "OPEN", blocked)),
+            false,
+        ),
+        (
+            "worker",
+            after,
+            None,
+            Some(ask("example/control", "CLOSED", &spanned)),
+            true,
+        ),
+        (
+            "worker",
+            after,
+            None,
+            Some(ask(
+                "example/control",
+                "OPEN",
+                "`https://github.com/example/project/issues/4`",
+            )),
+            true,
+        ),
+        // An item the token cannot see may be an ask.
+        ("worker", after, None, Some(json!({"content": null})), false),
+    ] {
+        let r = actions()[2].clone();
+        let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
+        evidence(&mut fake);
+        fake.objects
+            .get_mut("/repos/example/project/issues/3")
+            .unwrap()["labels"] = json!([{"name": "needs-human"}]);
+        let path = |resource: &str| {
+            format!("/repos/example/project/issues/3/{resource}?per_page=100&page=1")
+        };
+        fake.objects
+            .get_mut(&path("events"))
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"event": "labeled", "label": {"name": "needs-human"},
+                "actor": {"login": actor}, "created_at": labeled}));
+        if let Some((login, at, body)) = comment {
+            fake.objects
+                .get_mut(&path("comments"))
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id": 26, "user": {"login": login},
+                    "created_at": at, "body": body}));
+        }
+        fake.objects
+            .insert("items".into(), json!(Vec::from_iter(board.clone())));
+        let out = run(&fake, &s, RESULT_URL, 1);
+        let case = format!("{actor} at {labeled}, comment {comment:?}, board {board:?}");
+        assert_eq!(out.ok, admitted, "{case}: {out:?}");
+        let closed = fake.writes().iter().any(|(method, path, _)| {
+            method == "PATCH" && path == "/repos/example/project/issues/3"
+        });
+        assert_eq!(closed, admitted, "{case}");
     }
 }
 

@@ -1334,6 +1334,72 @@ pub struct IssueFacts {
 /// A `GitHub::open_board_issues` entry: the issue and its body.
 pub type BoardIssue = (ItemRef, String);
 
+/// The first line of an ask names the item it blocks.
+pub const ASK_BLOCKS: &str = "Blocks: ";
+
+/// The item an ask's first line names, as `agent-board ask create` writes it: a
+/// bare URL, or one in a code span when it is in another repository.
+pub fn ask_blocks(body: &str, host: &str) -> Option<ItemRef> {
+    let url = body
+        .lines()
+        .next()?
+        .strip_prefix(ASK_BLOCKS)?
+        .trim()
+        .trim_matches('`');
+    parse_github_item(url, None, host).ok()
+}
+
+/// The open issues on the project with node ID `project` labelled `label`, with
+/// their bodies, and whether every item was read: unlike search, which may lag a
+/// just-opened issue, the board is read directly. An item whose content cannot be
+/// seen, or whose labels were not all read and do not include `label`, makes the
+/// list incomplete.
+pub(crate) fn open_board_issues(
+    transport: &impl Transport,
+    project: &str,
+    label: &str,
+) -> Result<(Vec<BoardIssue>, bool)> {
+    let transport = ReadBudget::new(transport, SNAPSHOT_REQUEST_LIMIT);
+    let (members, mut complete) = sync_connection(
+        &transport,
+        &format!(
+            "query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2{{items(first:{ITEM_PAGE},after:$cursor){{nodes{{content{{__typename ... on Issue{{number state body repository{{nameWithOwner}} labels(first:{FOLLOW_UP_PAGE}){{nodes{{name}} pageInfo{{hasNextPage}}}}}}}}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
+        ),
+        json!({"id":project}),
+        "/node/items",
+    )?;
+    let mut issues = Vec::new();
+    for member in members {
+        let content = &member["content"];
+        if content.is_null() {
+            complete = false;
+            continue;
+        }
+        if content["__typename"] != "Issue" || content["state"] != "OPEN" {
+            continue;
+        }
+        let labels = &content["labels"];
+        if !labels["nodes"]
+            .as_array()
+            .context("missing issue labels")?
+            .iter()
+            .any(|n| n["name"] == label)
+        {
+            complete &= labels["pageInfo"]["hasNextPage"] == false;
+            continue;
+        }
+        let identity = ItemRef {
+            host: DEFAULT_HOST.into(),
+            repository: text(&content["repository"], "nameWithOwner")?.into(),
+            number: content["number"]
+                .as_u64()
+                .context("missing content number")?,
+        };
+        issues.push((identity, text(content, "body")?.to_owned()));
+    }
+    Ok((issues, complete))
+}
+
 /// Labels `GitHub::create_issue` applies and checks in one receipt.
 const ISSUE_LABELS_MAX: usize = 10;
 
@@ -1987,51 +2053,9 @@ impl<T: Transport> GitHub<T> {
         Ok(())
     }
 
-    /// The open issues on `project` labelled `label`, with their bodies, and whether
-    /// every item was read: unlike search, which may lag a just-opened issue, the
-    /// board is read directly. An item whose content cannot be seen, or whose labels
-    /// were not all read and do not include `label`, makes the list incomplete.
+    /// [`open_board_issues`] on `project`.
     pub fn open_board_issues(&self, project: &str, label: &str) -> Result<(Vec<BoardIssue>, bool)> {
-        let diagnostic = self.diagnostic();
-        let transport = ReadBudget::new(&diagnostic, SNAPSHOT_REQUEST_LIMIT);
-        let (members, mut complete) = sync_connection(
-            &transport,
-            &format!(
-                "query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2{{items(first:{ITEM_PAGE},after:$cursor){{nodes{{content{{__typename ... on Issue{{number state body repository{{nameWithOwner}} labels(first:{FOLLOW_UP_PAGE}){{nodes{{name}} pageInfo{{hasNextPage}}}}}}}}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
-            ),
-            json!({"id":project}),
-            "/node/items",
-        )?;
-        let mut issues = Vec::new();
-        for member in members {
-            let content = &member["content"];
-            if content.is_null() {
-                complete = false;
-                continue;
-            }
-            if content["__typename"] != "Issue" || content["state"] != "OPEN" {
-                continue;
-            }
-            let labels = &content["labels"];
-            if !labels["nodes"]
-                .as_array()
-                .context("missing issue labels")?
-                .iter()
-                .any(|n| n["name"] == label)
-            {
-                complete &= labels["pageInfo"]["hasNextPage"] == false;
-                continue;
-            }
-            let identity = ItemRef {
-                host: DEFAULT_HOST.into(),
-                repository: text(&content["repository"], "nameWithOwner")?.into(),
-                number: content["number"]
-                    .as_u64()
-                    .context("missing content number")?,
-            };
-            issues.push((identity, text(content, "body")?.to_owned()));
-        }
-        Ok((issues, complete))
+        open_board_issues(&self.diagnostic(), project, label)
     }
 
     /// Comment on an issue, returning the comment URL.
