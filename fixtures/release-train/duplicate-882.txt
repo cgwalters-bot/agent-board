@@ -1,6 +1,3 @@
 not following v0.6.3: no single pin of cgwalters-forge/agentic-job with its version
 due: 49 pull requests merged since v0.6.3; next is v0.6.4
-would: open the tracking issue "agentic-job v0.6.4 release train"
-(new tracking issue) v0.6.4: bump
-would: open a PR on cgwalters-forge/agentic-job from cgwalters-bot/agentic-job:release-train/v0.6.4 changing Cargo.toml, Cargo.lock: release: Prepare 0.6.4
-would: comment on (new tracking issue): Opened the version bump: (dry run)
+https://github.com/cgwalters-forge/tracker/issues/772 is open but the open trains listed by creator miss it: the listings disagree, not starting

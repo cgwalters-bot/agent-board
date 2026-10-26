@@ -6,8 +6,8 @@
 train: it cuts a release of one Rust repository and then moves the pins of the
 repositories that use it, one step a pass. It is tracker's
 `.github/release-train/train.cjs` (at 1a550cc) moved here, with the same
-decisions, except for the checks before a release and the wrappers' commit pins
-described below. A scheduled workflow in the caller's repository runs it, for example
+decisions, except for the checks before a release, the second listing before
+opening a train and the wrappers' commit pins described below. A scheduled workflow in the caller's repository runs it, for example
 hourly.
 
 The steps of a train, each a pass:
@@ -35,7 +35,10 @@ train, it follows a release cut outside the train whose version the wrappers
 are behind, from step 3; otherwise it opens one when a release is due: at once
 after a PR labelled urgent merges, or once `threshold` PRs have merged and
 `intervalHours` have passed since the last release. A PR labelled breaking makes
-a minor rather than a patch release.
+a minor rather than a patch release. Before opening a train it lists the open
+trains again without GitHub's creator filter, and opens one only if that read
+also finds none of the bot's; otherwise it ends the pass without writing
+([tracker#882](https://github.com/cgwalters-forge/tracker/issues/882)).
 
 A pass that finds something a person must fix (a PR closed unmerged or merged
 into another branch, a failed release run, a reverted or superseded version
@@ -85,7 +88,5 @@ bound is fixed, and every request has the client's 30-second timeout.
 These are carried over unchanged; the replay fixtures in
 `fixtures/release-train/` record them:
 
-- A listing of open trains that comes back empty while one is open opens a
-  second train ([tracker#882](https://github.com/cgwalters-forge/tracker/issues/882)).
 - Wrappers that pin the release by commit with a bare `# vX.Y.Z` comment are
   not read, so the wrappers step stalls ([tracker#887](https://github.com/cgwalters-forge/tracker/issues/887)).
