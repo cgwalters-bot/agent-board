@@ -148,9 +148,18 @@ one line an epic:
   against `--max-dispatch`; one epic is planned a pass.
 * `epic OWNER/REPO#N: plan ID applied; nothing changed since T`, or
   `hold epic OWNER/REPO#N: why`: a planning run in flight, a request waiting
-  for its plan or answered by none, an invalid newest plan, or a person's
-  hold (`needs-human`, `needs-design`, board Blocked), which also says what
-  the epic would otherwise come to.
+  for its plan, or for its retry six hours after its run ended, an invalid
+  newest plan, or a person's hold (`needs-human`, `needs-design`, board
+  Blocked), which also says what the epic would otherwise come to.
+* A request that got no plan is planned once more (`start planning …: its
+  planning request URL got no plan, retried once`), its plan's comment
+  naming the request it retries. When the retry gets no plan either, the
+  epic is held for the operator: `hold epic …; label needs-human, Why Q: …`
+  labels it `needs-human` and sets its board Why to a question with what
+  the planner said (the first line of the bot's newest comment since the
+  request, else how the run ended), two write steps held whole by
+  `--max-writes`. A person takes the label off and comments to plan it
+  again; without a comment it is labelled again.
 
 An applied plan is recognised from its receipt, older receipts (the hidden
 claim and fingerprint comment) included, never from titles: a sub-issue
@@ -468,8 +477,14 @@ accepted epic plan's comment ID and change time to identify the answer. Pin
 request, comment and change time when applying. No separate `coordinator/v1`
 pending checkpoint may override the forge evidence. A completed run gets five
 minutes for its answer to arrive; an unconfirmed dispatch gets six hours before
-being reported unresolved. Neither starts an automatic retry. New operator
-direction or a replacement plan is the recovery path.
+being reported unresolved. An unresolved request is retried once, six hours
+after its run ended (or after the request, where GitHub named no run), since
+a run that answers nothing usually failed for a passing reason; the retry's
+plan comment names the request it retries, so the next pass reads it from the
+forge. A retry that is unresolved too is not retried again: the epic is
+labelled `needs-human` with a `Q:` in its Why, so that it reaches the
+operator's queue. New operator direction or a replacement plan is the
+recovery path from there.
 
 An epic's repository is first-party, so its apply receipt follows the
 [bookkeeping rule](architecture.md#bookkeeping): one comment on the epic, the

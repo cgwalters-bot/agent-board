@@ -72,27 +72,47 @@ fn posted(replay: &Replay, n: u64, id: u64, author: &str, minutes: i64, body: &s
         "author": {"login": author}, "editor": null})
 }
 
-/// A planning request on tracker#596 an hour before the recording, after
+/// A planning request on tracker#596 `minutes` before the recording, after
 /// its plan: the record of a dispatch whose run is 77.
-fn requested(replay: &mut Replay) {
+fn requested(replay: &mut Replay, minutes: i64) {
     let record = posted(
         replay,
         596,
         7_000_000_001,
         "cgwalters-bot",
-        60,
+        minutes,
         "<!-- agent-board-dispatch: 7000000000@2026-10-23T20:03:00Z -->\nDispatched the plan in https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000000: [run](https://github.com/cgwalters-forge/tracker/actions/runs/77).",
     );
     comments(replay, COMMENTS_596).push(record);
 }
 
-/// Run 77 as GitHub answers it: finished `minutes` before the recording,
-/// or in progress.
+/// [`requested`] eight hours before the recording as the retry of an earlier
+/// request, its run 77 ended in failure seven hours before.
+fn retried(replay: &mut Replay) {
+    let intro = format!(
+        "{RETRY_INTRO}https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6999999999 got no plan."
+    );
+    let plan = posted(
+        replay,
+        596,
+        7_000_000_000,
+        "cgwalters-bot",
+        8 * 60 + 1,
+        &intro,
+    );
+    comments(replay, COMMENTS_596).push(plan);
+    requested(replay, 8 * 60);
+    run_77(replay, Some(7 * 60));
+}
+
+/// Run 77 as GitHub answers it: finished in failure `minutes` before the
+/// recording, or in progress.
 fn run_77(replay: &mut Replay, minutes: Option<i64>) {
     let body = match minutes {
         Some(m) => {
             let at = replay.now - time::Duration::minutes(m);
-            json!({"id": 77, "status": "completed", "updated_at": at.format(&Rfc3339).unwrap()})
+            json!({"id": 77, "status": "completed", "conclusion": "failure",
+                "updated_at": at.format(&Rfc3339).unwrap()})
         }
         None => json!({"id": 77, "status": "in_progress"}),
     };
@@ -260,25 +280,57 @@ fn replay_epic_scenarios() {
         (
             "a planning request whose run finished a minute ago waits for its plan",
             Box::new(|r| {
-                requested(r);
+                requested(r, 60);
                 run_77(r, Some(1));
             }),
             "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 waits for its plan",
             0,
         ),
         (
-            "a planning request whose run finished without a plan is not retried",
+            "a planning request whose run finished without a plan is retried after a cooldown",
             Box::new(|r| {
-                requested(r);
+                requested(r, 60);
                 run_77(r, Some(10));
             }),
-            "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, and is not retried",
+            "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan; planned once more from 2026-10-24T02:54:10Z, six hours after its run ended",
+            0,
+        ),
+        (
+            "and once the cooldown has passed, retried once",
+            Box::new(|r| {
+                requested(r, 8 * 60);
+                run_77(r, Some(7 * 60));
+            }),
+            "start planning cgwalters-forge/tracker#596 pool=claude: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, retried once",
+            0,
+        ),
+        (
+            "a retry that got no plan either is held and asks the operator",
+            Box::new(retried),
+            "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, nor did https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6999999999 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (its run 77 ended failure). What should change?",
+            0,
+        ),
+        (
+            "with what the planner said, where it said something",
+            Box::new(|r| {
+                retried(r);
+                let said = posted(
+                    r,
+                    596,
+                    7_000_000_005,
+                    "cgwalters-bot",
+                    7 * 60,
+                    "\nThe brief is too large to plan in one run.\n\nMore detail.",
+                );
+                comments(r, COMMENTS_596).push(said);
+            }),
+            "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, nor did https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6999999999 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (The brief is too large to plan in one run.). What should change?",
             0,
         ),
         (
             "a planning run in flight holds its epic",
             Box::new(|r| {
-                requested(r);
+                requested(r, 60);
                 let body = &mut answer(r, "status=queued")["body"];
                 body["total_count"] = 1.into();
                 body["workflow_runs"] = json!([{"id": 77, "display_title": "triage cgwalters-forge/tracker#596 (claude)",
@@ -452,8 +504,10 @@ impl Transport for Forge {
         .iter()
         .find(|m| query.contains(*m))
         {
+            let item = variables["item"].clone();
             self.kept(format!("graphql {}", name.trim_end_matches('(')), variables);
-            return Ok(json!({"addProjectV2ItemById": {"item": {"id": "PVTI_new"}}}));
+            return Ok(json!({"addProjectV2ItemById": {"item": {"id": "PVTI_new"}},
+                "updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item}}}));
         }
         if query.contains("issue(number: $number) { id } }") {
             return Ok(
@@ -478,6 +532,26 @@ impl Transport for Forge {
     }
 }
 
+/// An applying pass in `forge`, starting no run, within `writes` writes.
+fn local(forge: &Forge, writes: usize) -> Report {
+    let limits = Limits {
+        dispatch: Some(0),
+        writes: Some(writes),
+        ..Limits::default()
+    };
+    let config = config(json!({}));
+    let mode = (Mode::Local, limits);
+    block(run(
+        forge,
+        forge,
+        &config,
+        State::default(),
+        mode,
+        forge.replay.now,
+    ))
+    .unwrap()
+}
+
 /// An applying pass applies tracker#890's plan, had it no receipt, once:
 /// each new sub-issue created, on the receipt before it is linked, and given
 /// its final Priority in one write; the receipt says what was done, and the
@@ -487,29 +561,11 @@ impl Transport for Forge {
 fn apply_creates_once_with_final_priorities() {
     let mut replay = replay();
     unapplied(&mut replay);
-    let pass = |forge: &Forge, writes| {
-        let limits = Limits {
-            dispatch: Some(0),
-            writes: Some(writes),
-            ..Limits::default()
-        };
-        let mode = (Mode::Local, limits);
-        let config = config(json!({}));
-        block(run(
-            forge,
-            forge,
-            &config,
-            State::default(),
-            mode,
-            forge.replay.now,
-        ))
-        .unwrap()
-    };
     let held = Forge::new(Replay {
         now: replay.now,
         requests: replay.requests.clone(),
     });
-    let report = pass(&held, 9);
+    let report = local(&held, 9);
     assert!(
         report
             .lines
@@ -522,7 +578,7 @@ fn apply_creates_once_with_final_priorities() {
     assert!(held.written().is_empty(), "{:?}", held.written());
 
     let forge = Forge::new(replay);
-    let report = pass(&forge, 10);
+    let report = local(&forge, 10);
     let line = (report.lines.iter())
         .find(|l| l.starts_with("apply epic cgwalters-forge/tracker#890"))
         .unwrap_or_else(|| panic!("{:#?}", report.lines));
@@ -579,7 +635,7 @@ fn apply_creates_once_with_final_priorities() {
 
     // The next pass reads the receipt: nothing is written again.
     let before = written.len();
-    let report = pass(&forge, 10);
+    let report = local(&forge, 10);
     assert_eq!(forge.written().len(), before, "{:#?}", report.lines);
     assert!(
         (report.lines.iter()).any(|l| l.starts_with(&format!(
@@ -588,6 +644,65 @@ fn apply_creates_once_with_final_priorities() {
         "{:#?}",
         report.lines
     );
+}
+
+/// An applying pass holds tracker#596, whose retried planning request got
+/// no plan either, for the operator: it labels it needs-human and sets its
+/// Why to the question, both or, past --max-writes, neither.
+#[test]
+fn second_empty_plan_labels_and_asks() {
+    let mut replay = replay();
+    retried(&mut replay);
+    let variables =
+        json!({"owner": "cgwalters-forge", "name": "tracker", "number": 596, "field": WHY_FIELD});
+    replay.requests.push(json!({
+        "request": graphql_key(WHY_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"projectItems": {"nodes": [{"id": "PVTI_596",
+            "project": {"id": "PVT_1", "number": 1, "owner": {"login": "cgwalters-forge"},
+                "field": {"id": "F_why", "dataType": "TEXT"}},
+            "why": null}], "totalCount": 1}}}}},
+    }));
+    let ours = |forge: &Forge| -> Vec<(String, Value)> {
+        (forge.writes.borrow().iter())
+            .filter(|(w, body)| w.ends_with("/596/labels") || body["field"] == "F_why")
+            .cloned()
+            .collect()
+    };
+    let question =
+        "Q: Planning this epic got no plan twice (its run 77 ended failure). What should change?";
+    for (writes, expected) in [
+        (1, vec![]),
+        (
+            2,
+            vec![
+                (
+                    "POST repos/cgwalters-forge/tracker/issues/596/labels".to_owned(),
+                    json!({"labels": ["needs-human"]}),
+                ),
+                (
+                    "graphql updateProjectV2ItemFieldValue".to_owned(),
+                    json!({"project": "PVT_1", "item": "PVTI_596", "field": "F_why", "text": question}),
+                ),
+            ],
+        ),
+    ] {
+        let forge = Forge::new(Replay {
+            now: replay.now,
+            requests: replay.requests.clone(),
+        });
+        let report = local(&forge, writes);
+        let line = (report.lines.iter())
+            .find(|l| l.contains("hold epic cgwalters-forge/tracker#596: "))
+            .unwrap_or_else(|| panic!("{:#?}", report.lines));
+        let held = line.starts_with("held by --max-writes: ");
+        assert_eq!(held, expected.is_empty(), "{line}");
+        assert!(
+            line.ends_with(&format!("; label needs-human, Why {question}")),
+            "{line}"
+        );
+        assert_eq!(ours(&forge), expected, "{:#?}", report.lines);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    }
 }
 
 /// [`decide`] on tracker#890's recorded facts at other times: changes wait

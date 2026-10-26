@@ -28,6 +28,18 @@ const COALESCE_SECONDS: i64 = 3 * 60 * 60;
 const ANSWER_SECONDS: i64 = 5 * 60;
 /// How long a planning request whose run GitHub did not name may wait.
 const UNCONFIRMED_SECONDS: i64 = 6 * 60 * 60;
+/// How long after its run ended (or its request, where GitHub named no run)
+/// a planning request that got no plan is retried, once: most such runs
+/// failed for a passing reason, a timeout or an agent error.
+const RETRY_SECONDS: i64 = 6 * 60 * 60;
+/// The start of a retried planning request's plan comment, followed by the
+/// request it retries: how the next pass tells that it was the retry.
+const RETRY_INTRO: &str =
+    "The board pass asks a triage run to plan this epic once more: its planning request ";
+/// The board's text field where the bot asks the operator, as `Q: …`.
+const WHY_FIELD: &str = "Why";
+/// Characters of the planner's own words put in a question.
+const REPORT_CHARS: usize = 200;
 /// Requests an epic plan's apply takes besides its actions and its
 /// comment reads: its epic and label reads before and after the claim, the
 /// claim, the receipt and the final read.
@@ -79,6 +91,28 @@ fragment Project on ProjectV2 {
   id
   field(name: $field) { ... on ProjectV2SingleSelectField { id options { id name } } }
 }"#;
+
+/// An epic's board items with their Why, and each board's Why field.
+const WHY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $field: String!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      projectItems(first: 10) {
+        nodes {
+          id
+          project {
+            id number owner { ... on Organization { login } ... on User { login } }
+            field(name: $field) { ... on ProjectV2Field { id dataType } }
+          }
+          why: fieldValueByName(name: $field) { ... on ProjectV2ItemFieldTextValue { text } }
+        }
+        totalCount
+      }
+    }
+  }
+}"#;
+
+/// Sets a board item's Why.
+const WHY_MUTATION: &str = "mutation($project: ID!, $item: ID!, $field: ID!, $text: String!) { updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {text: $text}}) { projectV2Item { id } } }";
 
 /// The board as an apply writes to it.
 #[derive(Clone, Debug)]
@@ -254,11 +288,13 @@ pub(super) enum Next {
         url: String,
         direction: bool,
     },
-    /// A planning request with no plan yet, and the run it started.
+    /// A planning request with no plan yet, the run it started, and the
+    /// earlier request it retried.
     Unanswered {
         record: String,
         at: OffsetDateTime,
         run: Option<u64>,
+        retried: Option<String>,
     },
     /// Due to be planned, and why.
     Plan(String),
@@ -295,6 +331,37 @@ fn record_run(body: &str) -> Option<u64> {
     let (_, rest) = body.split_once("/actions/runs/")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
+}
+
+/// The earlier planning request that `record` retried: the one its plan's
+/// comment names after [`RETRY_INTRO`], where a writer posted that plan.
+fn retried(comments: &[Comment], writers: &[&str], record: &Comment) -> Option<String> {
+    let marker = format!("<!-- {DISPATCH_MARKER}: ");
+    let (id, _) = record.body.strip_prefix(&marker)?.split_once('@')?;
+    let id: u64 = id.parse().ok()?;
+    let posted = (comments.iter())
+        .find(|c| plan::comment_id(&c.url) == Some(id) && is(c.author.as_deref(), writers))?;
+    let rest = posted.body.strip_prefix(RETRY_INTRO)?;
+    rest.split_whitespace().next().map(str::to_owned)
+}
+
+/// What the planner said after a planning request at `at`: the first line
+/// of the bot's newest comment since, unedited by anyone else, that is
+/// neither a record nor a plan.
+fn reported(comments: &[Comment], bot: &str, at: OffsetDateTime) -> Option<String> {
+    let marker = format!("<!-- {DISPATCH_MARKER}: ");
+    let said = (comments.iter())
+        .filter(|c| {
+            c.changed > at
+                && is(c.author.as_deref(), &[bot])
+                && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[bot]))
+                && !c.body.starts_with(&marker)
+                && !has_fence(&c.body, PLAN_FENCE)
+                && !has_fence(&c.body, EPIC_PLAN_FENCE)
+        })
+        .max_by_key(|c| c.changed)?;
+    let line = said.body.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.chars().take(REPORT_CHARS).collect())
 }
 
 /// What an epic needs now, from its comments and sub-issues alone, by the
@@ -404,6 +471,7 @@ pub(super) fn decide(i: &Inputs) -> Next {
             record: q.url.clone(),
             at: q.changed,
             run: record_run(&q.body),
+            retried: retried(i.comments, &writers, q),
         };
     }
     if let Some(run) = i.busy {
@@ -744,7 +812,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let refused = self.apply_epic(facts, project, (&id, &url, changed), pages, turn);
                 if refused && direction {
                     let why = "operator direction since its plan, which cannot be applied";
-                    self.plan_epic(facts, why, project, slots, target, turn);
+                    self.plan_epic(facts, (why, None), project, slots, target, turn);
                 }
             }
             Next::Recover {
@@ -786,7 +854,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.recover_epic(facts, &receipt, &url, outcome);
                 } else if direction {
                     let why = "operator direction since its apply was cut short";
-                    self.plan_epic(facts, why, project, slots, target, turn);
+                    self.plan_epic(facts, (why, None), project, slots, target, turn);
                 } else {
                     self.line(format!(
                         "hold epic {name}: the apply of plan {id} was {outcome}, and is not proved: {}; it is never replayed: a person inspects {}, then replaces the plan or comments",
@@ -795,12 +863,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     ));
                 }
             }
-            Next::Unanswered { record, at, run } => {
-                let unresolved = match run {
-                    None => (self.now - at).whole_seconds() >= UNCONFIRMED_SECONDS,
+            Next::Unanswered {
+                record,
+                at,
+                run,
+                retried,
+            } => {
+                // When the request is unresolved, from which its retry is
+                // timed, and how its run ended.
+                let ended = match run {
+                    None => ((self.now - at).whole_seconds() >= UNCONFIRMED_SECONDS)
+                        .then(|| (at, "GitHub did not name its run".to_owned())),
                     Some(run) => match self.finished(run) {
-                        Ok(Some(done)) => (self.now - done).whole_seconds() >= ANSWER_SECONDS,
-                        Ok(None) => false,
+                        Ok(Some((done, how))) => ((self.now - done).whole_seconds()
+                            >= ANSWER_SECONDS)
+                            .then(|| (done, format!("its run {run} {how}"))),
+                        Ok(None) => None,
                         Err(error) => {
                             self.report.failures += 1;
                             self.line(format!(
@@ -810,30 +888,60 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         }
                     },
                 };
-                self.line(match unresolved {
-                    true => format!(
-                        "hold epic {name}: its planning request {record} got no plan, and is not retried; a person comments on the epic to plan it again"
-                    ),
-                    false => format!("hold epic {name}: its planning request {record} waits for its plan"),
-                });
+                let Some((from, how)) = ended else {
+                    self.line(format!(
+                        "hold epic {name}: its planning request {record} waits for its plan"
+                    ));
+                    return;
+                };
+                let none = format!("its planning request {record} got no plan");
+                if let Some(earlier) = retried {
+                    let said = reported(&comments, &self.config.bot, at).unwrap_or(how);
+                    let held = format!(
+                        "{none}, nor did {earlier} before it; a person comments on the epic to plan it again"
+                    );
+                    let question = format!(
+                        "Q: Planning this epic got no plan twice ({said}). What should change?"
+                    );
+                    self.ask_epic(facts, &held, &question);
+                    return;
+                }
+                let until = from + time::Duration::seconds(RETRY_SECONDS);
+                if self.now < until {
+                    let after = match run {
+                        Some(_) => "its run ended",
+                        None => "its request",
+                    };
+                    self.line(format!(
+                        "hold epic {name}: {none}; planned once more from {}, six hours after {after}",
+                        stamp(until)
+                    ));
+                    return;
+                }
+                let why = format!("{none}, retried once");
+                self.plan_epic(facts, (&why, Some(&record)), project, slots, target, turn);
             }
-            Next::Plan(why) => self.plan_epic(facts, &why, project, slots, target, turn),
+            Next::Plan(why) => self.plan_epic(facts, (&why, None), project, slots, target, turn),
         }
     }
 
-    /// When the caller's run `id` finished, or `None` while it runs. A run
-    /// deleted since is finished.
-    fn finished(&self, id: u64) -> Result<Option<OffsetDateTime>> {
+    /// When the caller's run `id` finished and how, or `None` while it runs.
+    /// A run deleted since is finished.
+    fn finished(&self, id: u64) -> Result<Option<(OffsetDateTime, String)>> {
         let url = format!(
             "{API_ROOT}repos/{}/actions/runs/{id}",
             self.config.dispatch_repo
         );
         let response = self.client.get(&url, None)?;
         match response.status {
-            404 => Ok(Some(OffsetDateTime::UNIX_EPOCH)),
-            200 if response.body["status"] == "completed" => Ok(Some(
+            404 => Ok(Some((OffsetDateTime::UNIX_EPOCH, "was deleted".into()))),
+            200 if response.body["status"] == "completed" => Ok(Some((
                 time(&response.body, "updated_at").context("the run has no update time")?,
-            )),
+                match response.body["conclusion"].as_str() {
+                    Some(conclusion) => format!("ended {conclusion}"),
+                    None => "ended".into(),
+                },
+            ))),
             200 => Ok(None),
             status => bail!("GitHub HTTP status {status}"),
         }
@@ -1006,13 +1114,98 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
+    /// An epic whose retried planning request got no plan either, `held`
+    /// for a person, who sees it: labelled [`NEEDS_HUMAN`], and with a board
+    /// its Why set to `question`. One write step each, taken whole.
+    fn ask_epic(&mut self, facts: &EpicFacts, held: &str, question: &str) {
+        let name = facts.issue.display();
+        let board = self.config.board.as_ref();
+        let mut line = format!("hold epic {name}: {held}; label {NEEDS_HUMAN}");
+        if board.is_some() {
+            line.push_str(&format!(", {WHY_FIELD} {question}"));
+        }
+        let writes = 1 + usize::from(board.is_some());
+        if let Some(cap) = self.caps.check_many(Kind::Write, writes) {
+            self.line(format!("{cap}: {line}"));
+            return;
+        }
+        if let Some(why) = self.other_holds() {
+            self.line(format!("{line}; {why}"));
+            return;
+        }
+        // Counted once sent, whether or not its answer comes back.
+        self.caps.count_many(Kind::Write, writes);
+        if !self.apply {
+            self.line(line);
+            return;
+        }
+        let issue = &facts.issue;
+        let labels = format!(
+            "{API_ROOT}repos/{}/issues/{}/labels",
+            issue.repository, issue.number
+        );
+        let sent = plan::send(
+            &self.client,
+            "POST",
+            &labels,
+            &json!({"labels": [NEEDS_HUMAN]}),
+            0,
+        )
+        .and_then(|_| board.map_or(Ok(()), |b| self.set_why(issue, b, question)));
+        match sent {
+            Ok(()) => self.line(line),
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("{line} failed: {error:#}"));
+            }
+        }
+    }
+
+    /// Sets `issue`'s Why on `board` to `text`, unless it is that already.
+    fn set_why(&self, issue: &ItemRef, board: &Board, text: &str) -> Result<()> {
+        let (owner, name) = issue.repository.split_once('/').context("repository")?;
+        let data = self.client.graphql(
+            WHY_QUERY,
+            json!({"owner": owner, "name": name, "number": issue.number, "field": WHY_FIELD}),
+        )?;
+        let items = data
+            .pointer("/repository/issue/projectItems")
+            .context("the epic's board items could not be read")?;
+        let nodes = items["nodes"].as_array().context("no project items")?;
+        ensure!(
+            items["totalCount"].as_u64() == Some(nodes.len() as u64),
+            "not all of its boards could be read"
+        );
+        let item = board_item(nodes, board).context("it is not on the board")?;
+        if item.pointer("/why/text").and_then(Value::as_str) == Some(text) {
+            return Ok(());
+        }
+        let field = &item["project"]["field"];
+        let id = (field["id"].as_str())
+            .filter(|_| field["dataType"] == "TEXT")
+            .with_context(|| format!("the board has no {WHY_FIELD} text field"))?;
+        let item_id = item["id"].as_str().context("its board item has no id")?;
+        let data = self.client.graphql(
+            WHY_MUTATION,
+            json!({"project": item["project"]["id"], "item": item_id, "field": id, "text": text}),
+        )?;
+        ensure!(
+            data.pointer("/updateProjectV2ItemFieldValue/projectV2Item/id")
+                .and_then(Value::as_str)
+                == Some(item_id),
+            "{WHY_FIELD} update receipt mismatch"
+        );
+        Ok(())
+    }
+
     /// One planning run for a due epic, if this pass has started none: a
     /// triage plan on the epic asking for an epic plan, dispatched by the
-    /// plan protocol, whose record is the planning request.
+    /// plan protocol, whose record is the planning request. `retry`: the
+    /// request that got no plan, which the plan's comment names.
     fn plan_epic(
         &mut self,
         facts: &EpicFacts,
-        why: &str,
+        (why, retry): (&str, Option<&str>),
         project: Option<&Project>,
         slots: Option<&(BTreeSet<u64>, Slots)>,
         target: &Target,
@@ -1067,8 +1260,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .collect();
         let brief = self.planning_brief(&facts.issue, why, &options);
         let line = format!("start planning {name} pool={pool}: {why}");
-        let intro = "The board pass asks a triage run to plan this epic.";
-        let step = self.start_triage(&facts.issue, (&pool, brief, intro), line, slots, target);
+        let intro = match retry {
+            Some(record) => format!("{RETRY_INTRO}{record} got no plan."),
+            None => "The board pass asks a triage run to plan this epic.".into(),
+        };
+        let step = self.start_triage(&facts.issue, (&pool, brief, &intro), line, slots, target);
         self.client.bounds.finishing.set(false);
         let step = match step {
             Ok(step) => step,
