@@ -227,13 +227,13 @@ impl Pace {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     /// Not held: the share of its window used and the most it may use now,
-    /// in percent; the pool with the most room between them is preferred.
+    /// in percent, for reporting rather than selection weight.
     Normal { used: f64, ceiling: f64 },
     /// Held by the snapshot, or over its pace by more than the margin, until
     /// the time given, where there is one.
     Held { until: Option<OffsetDateTime> },
     /// No window to pace by, as for mistral's monthly dollar allowance until
-    /// the snapshot reports it: usable, but never preferred to a paced pool.
+    /// the snapshot reports it. Claude/OpenAI wait without a current reading.
     Unpaced,
     /// Paced by an override in force rather than by the snapshot.
     Overridden(Override),
@@ -330,8 +330,7 @@ fn capped(entry: &Value, now: OffsetDateTime) -> Option<Mode> {
 
 /// The modes of the snapshot's pools, if it is fresh, with `overrides` in
 /// force in place of pace. A pool whose entry is null, or absent, is
-/// unpaced: the snapshot does not pace it, and the line says so, so a pool
-/// named in the configuration but not the snapshot shows. Missing usage
+/// unpaced: the line says so, and Claude/OpenAI are ineligible. Missing usage
 /// still holds every run, an override's pool too: without it a used-up
 /// window could not be told.
 pub fn paces(
@@ -350,12 +349,23 @@ pub fn paces(
         .ok_or("the usage snapshot has no pools")?;
     let mut modes: BTreeMap<String, Mode> = pools
         .iter()
-        .map(|(name, entry)| (name.clone(), mode(entry, now, margin)))
+        .map(|(name, entry)| {
+            (
+                name.clone(),
+                capped(entry, now).unwrap_or_else(|| mode(entry, now, margin)),
+            )
+        })
         .collect();
     for o in overrides.iter().filter(|o| o.in_force(now)) {
         let entry = pools.get(&o.pool).unwrap_or(&Value::Null);
         let mode = match (o.mode, capped(entry, now)) {
             (OverrideMode::Spend, Some(held)) => held,
+            (OverrideMode::Spend, _)
+                if (o.pool == "claude" || o.pool == "openai")
+                    && matches!(mode(entry, now, margin), Mode::Unpaced) =>
+            {
+                Mode::Held { until: None }
+            }
             _ => Mode::Overridden(o.clone()),
         };
         modes.insert(o.pool.clone(), mode);
@@ -363,31 +373,41 @@ pub fn paces(
     Ok(modes)
 }
 
-/// Of `candidates`, the pool with the most room under its ceiling; an
-/// unpaced one only where no other is unheld. A tie goes to `turn`, the pool
-/// the round would take without pace, so that pools the snapshot does not
-/// tell apart still take turns; else to the configured order. Held pools
-/// are skipped, and the reason the run waits is the error.
+/// Uniformly choose an eligible configured pool, preferring eligible spend
+/// overrides as a class. `turn` is retained for callers with pacing off;
+/// it is not an explicit operator selection (those restrict candidates).
 pub fn choose(
     paces: &Paces,
     candidates: &[String],
-    turn: Option<&str>,
+    _turn: Option<&str>,
+) -> std::result::Result<String, String> {
+    choose_with(paces, candidates, crate::pool_choice::index)
+}
+
+fn choose_with(
+    paces: &Paces,
+    candidates: &[String],
+    draw: impl FnMut(usize) -> std::result::Result<usize, String>,
 ) -> std::result::Result<String, String> {
     let paces = paces
         .as_ref()
         .map_err(|why| format!("{why}, so new runs wait"))?;
-    let mut best: Option<(&String, f64)> = None;
+    let mut ordinary = Vec::new();
+    let mut spend = Vec::new();
     let mut held = Vec::new();
     for pool in candidates {
-        let room = match paces.get(pool).unwrap_or(&Mode::Unpaced) {
-            Mode::Normal { used, ceiling } => ceiling - used,
-            Mode::Unpaced => f64::NEG_INFINITY,
+        match paces.get(pool).unwrap_or(&Mode::Unpaced) {
+            Mode::Normal { .. } => ordinary.push(pool.clone()),
+            Mode::Unpaced if pool == "claude" || pool == "openai" => {
+                held.push(format!("{pool} has no current reading"));
+            }
+            Mode::Unpaced => ordinary.push(pool.clone()),
             // Work goes to a spend pool, not to one that happens to be
             // further under its pace.
             Mode::Overridden(Override {
                 mode: OverrideMode::Spend,
                 ..
-            }) => f64::INFINITY,
+            }) => spend.push(pool.clone()),
             Mode::Held { until } => {
                 held.push(format!("{pool}{}", until_minute(*until)));
                 continue;
@@ -400,13 +420,12 @@ pub fn choose(
                 held.push(format!("{pool} until {}", minute(*until)));
                 continue;
             }
-        };
-        if best.is_none_or(|(_, most)| room > most || (room == most && turn == Some(pool))) {
-            best = Some((pool, room));
         }
     }
-    best.map(|(pool, _)| pool.clone())
-        .ok_or_else(|| format!("every pool is held ({})", held.join(", ")))
+    if ordinary.is_empty() && spend.is_empty() {
+        return Err(format!("every pool is held ({})", held.join(", ")));
+    }
+    crate::pool_choice::choose(if spend.is_empty() { ordinary } else { spend }, draw)
 }
 
 /// The pass's line naming each pool's mode, the snapshot's and those the
@@ -646,6 +665,105 @@ impl PollPolicy {
 mod tests {
     use super::*;
 
+    // Existing precedence cases inject a deterministic ticket, never entropy.
+    fn choose(paces: &Paces, candidates: &[String], turn: Option<&str>) -> Result<String, String> {
+        choose_with(paces, candidates, |len| {
+            let index = candidates
+                .iter()
+                .position(|p| Some(p.as_str()) == turn)
+                .unwrap_or(0);
+            Ok(index.min(len - 1))
+        })
+    }
+
+    #[test]
+    fn uniform_tickets_ignore_headroom_order_and_duplicate_mentions() {
+        let now = at(NOW);
+        for overrides in [
+            vec![],
+            vec![
+                over("claude", "2026-10-18T00:00:00Z", "spend"),
+                over("openai", "2026-10-18T00:00:00Z", "spend"),
+            ],
+        ] {
+            let read = paces(
+                Some(&snapshot(json!({
+                    "claude": pool(40.0, 84), "openai": pool(1.0, 84)
+                }))),
+                now,
+                0.0,
+                &overrides,
+            );
+            for (candidates, expected) in [
+                (names(&["claude", "openai", "claude"]), ["claude", "openai"]),
+                (names(&["openai", "claude", "openai"]), ["openai", "claude"]),
+            ] {
+                for (index, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        choose_with(&read, &candidates, |len| {
+                            assert_eq!(len, 2);
+                            Ok(index)
+                        }),
+                        Ok(expected.into())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_candidates_hold_caps_and_unknown_usage_take_precedence() {
+        let now = at(NOW);
+        for (entry, overrides) in [
+            (
+                pool(0.0, 84),
+                vec![over("claude", "2026-10-18T00:00:00Z", "hold")],
+            ),
+            (json!({"hold": false, "used_percent": 100}), vec![]),
+            (Value::Null, vec![]),
+            (
+                Value::Null,
+                vec![over("claude", "2026-10-18T00:00:00Z", "spend")],
+            ),
+            (
+                led(0.0, 50.0, None, json!(true)),
+                vec![over("claude", "2026-10-18T00:00:00Z", "spend")],
+            ),
+        ] {
+            let read = paces(
+                Some(&snapshot(json!({"claude": entry, "openai": pool(0.0, 84)}))),
+                now,
+                0.0,
+                &overrides,
+            );
+            assert!(
+                choose_with(&read, &names(&["claude"]), |_| panic!(
+                    "held explicit pool must wait"
+                ))
+                .is_err()
+            );
+            assert_eq!(
+                choose_with(&read, &names(&["claude", "openai"]), |_| panic!(
+                    "sole eligible pool"
+                )),
+                Ok("openai".into())
+            );
+        }
+        // A spend override cannot bring a pool outside an explicit selection in.
+        let read = paces(
+            Some(&snapshot(
+                json!({"claude": pool(0.0, 84), "openai": pool(0.0, 84)}),
+            )),
+            now,
+            0.0,
+            &[over("openai", "2026-10-18T00:00:00Z", "spend")],
+        );
+        assert_eq!(
+            choose_with(&read, &names(&["claude"]), |_| panic!("singleton")),
+            Ok("claude".into())
+        );
+    }
+
     fn at(stamp: &str) -> OffsetDateTime {
         OffsetDateTime::parse(stamp, &Rfc3339).unwrap()
     }
@@ -725,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pool_furthest_under_its_pace_is_chosen_and_held_ones_wait() {
+    fn eligible_pools_are_chosen_and_held_ones_wait() {
         let now = at(NOW);
         let read = |pools: Value| paces(Some(&snapshot(pools)), now, 0.0, &[]);
         for (case, pools, (candidates, turn), expected) in [
@@ -736,10 +854,10 @@ mod tests {
                 Ok("claude"),
             ),
             (
-                "furthest under pace, whoever's turn",
+                "headroom does not override the injected ticket",
                 json!({"claude": pool(40.0, 84), "openai": pool(10.0, 84)}),
                 (&["claude", "openai"], Some("claude")),
-                Ok("openai"),
+                Ok("claude"),
             ),
             (
                 "a tie goes to the round's turn",
@@ -748,10 +866,12 @@ mod tests {
                 Ok("openai"),
             ),
             (
-                "pools the snapshot does not pace take turns",
+                "missing pool readings fail closed",
                 json!({}),
                 (&["claude", "openai"], Some("openai")),
-                Ok("openai"),
+                Err(
+                    "every pool is held (claude has no current reading, openai has no current reading)",
+                ),
             ),
             (
                 "else a tie keeps the configured order",
@@ -760,10 +880,10 @@ mod tests {
                 Ok("openai"),
             ),
             (
-                "an unpaced pool only where no paced one has room",
+                "explicitly configured unpaced pools keep their eligibility",
                 json!({"claude": pool(50.0, 84), "mistral": null}),
                 (&["mistral", "claude"], Some("mistral")),
-                Ok("claude"),
+                Ok("mistral"),
             ),
             (
                 "an unpaced pool rather than a held one",
@@ -906,18 +1026,18 @@ mod tests {
                 Ok("claude"),
             ),
             (
-                "the bigger burst's room, whoever's turn",
+                "the bigger burst does not weight the draw",
                 json!({"claude": led(70.0, 26.0, Some(95.0), json!(false)),
                     "openai": led(10.0, 18.0, Some(3.0), json!(false))}),
                 "openai",
-                Ok("claude"),
+                Ok("openai"),
             ),
             (
-                "an older entry ranks by its pace beside a snapshot-led one",
+                "an older eligible entry has no headroom preference",
                 json!({"claude": led(70.0, 26.0, Some(95.0), json!(false)),
                     "openai": pool(10.0, 120)}),
                 "claude",
-                Ok("openai"),
+                Ok("claude"),
             ),
             (
                 "every pool held by the snapshot",

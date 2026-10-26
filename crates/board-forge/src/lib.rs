@@ -22,6 +22,7 @@ pub mod overlap;
 pub mod pass;
 pub mod plan;
 pub mod poll;
+mod pool_choice;
 pub mod prune;
 pub mod release_train;
 pub mod review;

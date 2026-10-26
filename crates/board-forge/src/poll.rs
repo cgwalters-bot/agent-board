@@ -9114,7 +9114,7 @@ mod tests {
                 ),
             ),
             (
-                "a tier's pool furthest under its pace, whoever's turn",
+                "a tier's first injected ticket wins despite unequal headroom",
                 tier,
                 usage(json!({"claude": pool(10.0, 84), "openai": pool(40.0, 84)})),
                 (Ok("claude"), "openai normal 40%/50%"),
@@ -9159,16 +9159,18 @@ mod tests {
             let dispatcher = Fake::default();
             let mut apply = applying(&dispatcher).unwrap();
             apply.pools = fix_pools;
-            let outcome = run(
-                &fake,
-                &fake,
-                &cfg,
-                State::default(),
-                &[],
-                &[REPO.into()],
-                Some(apply),
-                now(),
-            )
+            let outcome = crate::pool_choice::with_index(0, || {
+                run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    Some(apply),
+                    now(),
+                )
+            })
             .unwrap();
             assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
             let line = outcome.lines.last().unwrap();

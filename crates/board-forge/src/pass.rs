@@ -877,16 +877,25 @@ fn allowed(target: f64, window_minutes: f64, resets: OffsetDateTime, now: Offset
     target * 100.0 * (1.0 - left / window_minutes).clamp(0.0, 1.0)
 }
 
-/// Of `names`, in their order, the pool with the most room; a tie goes to
-/// the first. None qualifying is a wait, never a fall back to a held or
-/// unknown pool.
+/// Uniformly choose among eligible configured pools. Headroom and configured
+/// order do not weight the draw. None qualifying is a wait.
 pub fn choose(
     snapshot: Option<&Value>,
     pools: &Pools,
     names: &[String],
     now: OffsetDateTime,
 ) -> std::result::Result<String, String> {
-    let mut best: Option<(&String, f64)> = None;
+    choose_with(snapshot, pools, names, now, crate::pool_choice::index)
+}
+
+fn choose_with(
+    snapshot: Option<&Value>,
+    pools: &Pools,
+    names: &[String],
+    now: OffsetDateTime,
+    draw: impl FnMut(usize) -> std::result::Result<usize, String>,
+) -> std::result::Result<String, String> {
+    let mut eligible = Vec::new();
     let mut why = Vec::new();
     for name in names {
         let Some((_, settings)) = pools.0.iter().find(|(n, _)| n == name) else {
@@ -894,17 +903,18 @@ pub fn choose(
             continue;
         };
         match room(snapshot, name, settings, now) {
-            Ok(room) if best.is_none_or(|(_, most)| room > most) => best = Some((name, room)),
-            Ok(_) => {}
+            Ok(_) => eligible.push(name.clone()),
             // One reason the snapshot gives every pool is said once.
             Err(reason) if !why.contains(&reason) => why.push(reason),
             Err(_) => {}
         }
     }
-    match best {
-        Some((name, _)) => Ok(name.clone()),
-        None if names.is_empty() => Err("no automatic pool is configured".into()),
-        None => Err(why.join("; ")),
+    if !eligible.is_empty() {
+        crate::pool_choice::choose(eligible, draw)
+    } else if names.is_empty() {
+        Err("no automatic pool is configured".into())
+    } else {
+        Err(why.join("; "))
     }
 }
 
