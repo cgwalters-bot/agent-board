@@ -384,6 +384,95 @@ fn a_status_body_that_cannot_be_built_refuses_only_itself() {
 }
 
 #[test]
+fn a_status_update_appends_the_spend_split_or_goes_out_without_it() {
+    let name = format!("supervise-pass-{}.json", std::process::id());
+    let pass = std::env::temp_dir().join(name);
+    std::fs::write(
+        &pass,
+        json!({"operator": "owner", "bot": "worker", "dispatchRepo": "example/control",
+            "dispatchWorkflow": "dispatch.yml", "budget": {"harnessRepositories": ["example/control"]}})
+        .to_string(),
+    )
+    .unwrap();
+    // The update's line in the log and its body.
+    let send = |path: Option<String>, summary: &str, notes: &Value| {
+        let mut s = configured();
+        s.agent.as_mut().unwrap().pass_config = path;
+        let status = action(
+            "status_update",
+            json!({"status": "on-track", "summary": summary, "notes": notes}),
+        );
+        let mut fake = Fake::new(&block(std::slice::from_ref(&status)));
+        // The window's one run, on a public upstream issue.
+        fake.objects.insert(
+            "split".into(),
+            json!([{"__typename": "Issue", "number": 9,
+                "repository": {"nameWithOwner": "example/project", "isPrivate": false}}]),
+        );
+        fake.issues.insert(9, json!({"comments": {"pageInfo": {"hasNextPage": false}, "nodes": [{
+            "url": "https://github.com/example/project/issues/9#issuecomment-1",
+            "body": "Done.\n\n<!-- agentic-job-cost: 5 usd=1.5 partial=false -->\n\n<!-- agentic-job-run: 5 -->",
+            "createdAt": "2026-10-15T00:00:00Z", "lastEditedAt": null,
+            "author": {"login": "worker"}, "editor": null}]}}));
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert!(out.ok, "{out:?}");
+        let (_, path, body) = &fake.writes()[1];
+        assert_eq!(path, "/graphql");
+        let body = body["variables"]["body"].as_str().unwrap().to_owned();
+        (out.lines, body)
+    };
+    let footer = configured().footer;
+    let done = "- `status_update` configured target: done, ".to_owned();
+    let missing = format!("{}.missing", pass.display());
+    for (path, line, logged) in [
+        (
+            pass.display().to_string(),
+            "\n\nspend: 100% upstream, 0% harness (1 and 0 runs)",
+            done.clone(),
+        ),
+        // An unreadable split leaves out its line, not the update.
+        (
+            missing.clone(),
+            "",
+            format!(
+                "- `status_update` configured target (no spend split: read {missing}: No such file or directory (os error 2)): done, "
+            ),
+        ),
+    ] {
+        let (lines, body) = send(Some(path), "Shipped.", &json!({}));
+        assert_eq!(lines, [logged]);
+        assert_eq!(
+            body,
+            format!("Shipped.\n\nNo changes since 2026-10-09T12:00:00Z{line}\n\n{footer}")
+        );
+    }
+    // A body that fills the bound without the line makes room for it as it
+    // makes room for anything: its longest section loses its last line.
+    let notes: serde_json::Map<_, _> = (100..110)
+        .map(|n| (format!("example/project#{n}"), json!("x".repeat(280))))
+        .collect();
+    let notes = Value::Object(notes);
+    let (_, body) = send(None, "s", &notes);
+    let summary = "s".repeat(1 + crate::github::STATUS_BODY_LIMIT - 5 - body.chars().count());
+    let (_, without) = send(None, &summary, &notes);
+    assert_eq!(
+        without.chars().count(),
+        crate::github::STATUS_BODY_LIMIT - 5
+    );
+    assert!(!without.contains("more"), "{without}");
+    let (lines, body) = send(Some(pass.display().to_string()), &summary, &notes);
+    assert_eq!(lines, [done]);
+    assert!(body.chars().count() <= crate::github::STATUS_BODY_LIMIT);
+    assert!(
+        body.ends_with(&format!(
+            "- +1 more\n\nspend: 100% upstream, 0% harness (1 and 0 runs)\n\n{footer}"
+        )),
+        "{body}"
+    );
+    std::fs::remove_file(&pass).unwrap();
+}
+
+#[test]
 fn a_created_issue_link_comes_from_the_tracker_and_the_receipt_number() {
     let s = configured();
     let p = policy(&s);

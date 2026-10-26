@@ -21,5 +21,15 @@
   "triage": true,
   "planPools": ["claude", "openai"],
   "pools": {"claude": {"target": 0.95, "burst": 95}, "openai": {"target": 0.95, "burst": 3}},
-  "usage": {"repository": "cgwalters-forge/bot-ops", "issue": 1}
+  "usage": {"repository": "cgwalters-forge/bot-ops", "issue": 1},
+  "budget": {
+    "harnessRepositories": [
+      "cgwalters-forge/agent-board",
+      "cgwalters-forge/agentic-job",
+      "cgwalters-forge/actions",
+      "cgwalters-forge/review",
+      "cgwalters-forge/tracker",
+      "cgwalters-forge/agenthome"
+    ]
+  }
 }

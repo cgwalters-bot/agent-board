@@ -3032,6 +3032,30 @@ fn config_table() {
         ),
         (json!({"budget": {}}), "budget needs weeklyUsd or source"),
         (
+            json!({"budget": {"harnessRepositories": ["o/r", "O/R"]}}),
+            "budget harnessRepositories names O/R twice",
+        ),
+        (
+            json!({"budget": {"harnessRepositories": ["o/r", null]}}),
+            "config.budget.harnessRepositories[1] is null",
+        ),
+        (
+            json!({"budget": {"harnessRepositories": ["not a repo"]}}),
+            "budget harnessRepositories: invalid repository",
+        ),
+        (
+            json!({"budget": {"harnessRepositories": ["o/r"], "url": "http://b.example/usage/grant"}}),
+            "budget url and pools need source broker",
+        ),
+        (
+            json!({"budget": {"harnessRepositories": ["o/r"], "harness": ["o/s"]}}),
+            "unknown field `harness`",
+        ),
+        (
+            json!({"budget": {"harnessRepositories": ["o/r"], "weeklyUsd": 1000}}),
+            "budget needs usage.url",
+        ),
+        (
             json!({"budget": {"source": "ledger"}}),
             "unknown variant `ledger`",
         ),
@@ -3049,6 +3073,15 @@ fn config_table() {
     assert!(
         format!("{:#}", Config::parse(duplicate).unwrap_err()).contains("pool a is named twice")
     );
+    // The harness's repositories alone set no budget and need no broker.
+    let mut harness = minimal.clone();
+    harness["budget"] = json!({"harnessRepositories": ["o/r"]});
+    let harness = Config::parse(&harness.to_string()).unwrap();
+    assert_eq!(
+        harness.harness_repositories(),
+        Some(&["o/r".to_owned()][..])
+    );
+    assert!(harness.budget.unwrap().weekly_usd.is_none());
     // Pacing holds followed pull requests' fix runs only on the pools named.
     let paced = config(json!({"follow": ["o/r"], "pr": {"fixPools": ["claude"]}}));
     assert_eq!(paced.pr.fix_pools, ["claude"]);

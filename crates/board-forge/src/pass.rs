@@ -371,6 +371,18 @@ pub struct WeeklyBudget {
     /// With `source: broker`, each of `pools` to the grant pool it draws on.
     #[serde(default)]
     pub pools: BTreeMap<String, String>,
+    /// The harness's own repositories, against which `budget --split`
+    /// reports the share of spend on upstream work (agent-board#355); absent,
+    /// the split is not reported. Needs neither a budget nor `usage.url`.
+    pub harness_repositories: Option<Vec<String>>,
+}
+
+impl WeeklyBudget {
+    /// Whether it sets a budget that new runs wait on, rather than only
+    /// [`Self::harness_repositories`].
+    fn spends(&self) -> bool {
+        self.source.is_some() || self.weekly_usd.is_some() || self.harness_repositories.is_none()
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -479,10 +491,14 @@ impl Config {
         if let Some(git_ref) = &self.dispatch_ref {
             self.target(git_ref).validate()?;
         }
+        let harness = self.harness_repositories();
         for (what, list) in [
-            ("follow", &self.follow),
+            ("follow", &self.follow[..]),
             ("workRepositories", &self.work_repositories),
-        ] {
+        ]
+        .into_iter()
+        .chain(harness.map(|list| ("budget harnessRepositories", list)))
+        {
             ensure!(
                 list.len() <= POLL_REPOSITORY_LIMIT,
                 "{what} names more than {POLL_REPOSITORY_LIMIT} repositories"
@@ -490,6 +506,13 @@ impl Config {
             for repo in list {
                 validate_repository(repo).with_context(|| what.to_owned())?;
             }
+        }
+        let mut harness_seen = BTreeSet::new();
+        for repo in harness.into_iter().flatten() {
+            ensure!(
+                harness_seen.insert(repo.to_ascii_lowercase()),
+                "budget harnessRepositories names {repo} twice"
+            );
         }
         ensure!(self.wip <= WIP_LIMIT, "wip is not 0 to {WIP_LIMIT}");
         if self.work() {
@@ -567,7 +590,13 @@ impl Config {
             validate_repository(&holds.repository).context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
         }
-        if let Some(budget) = &self.budget {
+        if let Some(budget) = self.budget.as_ref().filter(|b| !b.spends()) {
+            ensure!(
+                budget.url.is_none() && budget.pools.is_empty(),
+                "budget url and pools need source broker"
+            );
+        }
+        if let Some(budget) = self.budget.as_ref().filter(|b| b.spends()) {
             match budget.source {
                 None => {
                     let weekly = budget
@@ -657,6 +686,11 @@ impl Config {
             "pr fixPools is required to pace followed pull requests' fix runs by usage"
         );
         Ok(())
+    }
+
+    /// `budget.harnessRepositories`, where set.
+    pub fn harness_repositories(&self) -> Option<&[String]> {
+        self.budget.as_ref()?.harness_repositories.as_deref()
     }
 
     /// Whether the pass starts new work at all.

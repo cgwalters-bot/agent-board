@@ -287,7 +287,7 @@ fn covered(items: &[Value]) -> BTreeSet<String> {
         .collect()
 }
 
-fn format_time(at: OffsetDateTime) -> Result<String> {
+pub(crate) fn format_time(at: OffsetDateTime) -> Result<String> {
     Ok(at
         .to_offset(time::UtcOffset::UTC)
         .replace_nanosecond(0)?
