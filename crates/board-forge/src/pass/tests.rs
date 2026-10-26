@@ -1571,6 +1571,143 @@ fn apply_publishes_the_refreshed_usage() {
     }
 }
 
+/// With `usage.holds`, an applying pass publishes stage 4's holds by kind,
+/// sorted by item, to their own bot comment on the usage issue: one write
+/// that `--max-writes` holds, only to a private repository, and none where
+/// the comment already has the same holds. tracker#446 is board Blocked and
+/// #527 has no Priority; at WIP 2 the two runs in flight hold every new run.
+#[test]
+fn apply_publishes_the_holds() {
+    let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    let add = format!("POST {bot_ops}/issues/1/comments");
+    let edit = format!("PATCH {bot_ops}/issues/comments/7");
+    let publish = "holds: publish to cgwalters-forge/bot-ops#1";
+    let not_private = format!("holds error: {publish}: cgwalters-forge/bot-ops is not private");
+    let published = "holds: published ".to_owned();
+    // The WIP limit, the --max-writes cap, whether the repository is
+    // private, the holds of the bot's hold comment if it has one ("same" as
+    // the first case published), and what the pass says and writes.
+    type Case<'a> = (
+        u64,
+        Option<usize>,
+        bool,
+        Option<&'a str>,
+        String,
+        Option<&'a String>,
+    );
+    let cases: Vec<Case> = vec![
+        (8, None, true, None, published.clone(), Some(&add)),
+        (8, None, true, Some("same"), "holds: unchanged".into(), None),
+        (8, None, true, Some("old"), published.clone(), Some(&edit)),
+        (
+            8,
+            Some(0),
+            true,
+            None,
+            format!("held by --max-writes: {publish}"),
+            None,
+        ),
+        (8, None, false, None, not_private, None),
+        (2, None, true, None, published, Some(&add)),
+    ];
+    let usage = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1, "holds": true});
+    let items = "/data/repositoryOwner/projectV2/items/nodes";
+    let mut first: Option<String> = None;
+    for (wip, writes, private, found, line, wrote) in cases {
+        let mut forge = Forge::new(None, false);
+        for entry in &mut forge.replay.requests {
+            let nodes = entry["answer"].pointer_mut(items);
+            for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                match node["content"]["number"].as_u64() {
+                    Some(446) => node["status"] = json!({"name": "Blocked"}),
+                    Some(527) => node["priority"] = Value::Null,
+                    _ => {}
+                }
+            }
+        }
+        let comment = match found {
+            Some("same") => first.clone(),
+            Some(_) => {
+                let old = json!({"schema": HOLDS_SCHEMA, "holds": []});
+                Some(usage::render_holds(&old).unwrap())
+            }
+            None => None,
+        };
+        if let Some(body) = comment {
+            let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+            let comment = json!({"id": 7, "user": {"login": "cgwalters-bot"}, "body": body});
+            comments.as_array_mut().unwrap().push(comment);
+        }
+        let reply = |body| json!({"status": 200, "link": null, "body": body});
+        for (url, body) in [
+            (bot_ops.clone(), json!({"private": private})),
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+        ] {
+            let request = json!({"request": {"get": url}, "answer": reply(body)});
+            forge.replay.requests.push(request);
+        }
+        let settings = json!({"wip": wip, "usage": usage});
+        let limits = Limits {
+            writes,
+            ..Limits::default()
+        };
+        let now = forge.replay.now;
+        let mode = (Mode::Actions(&own()), limits);
+        let config = config(settings);
+        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(&line)),
+            "{line}: {:#?}",
+            report.lines
+        );
+        assert_eq!(report.failures, usize::from(!private), "{line}");
+        let writes = forge.writes.borrow();
+        let holds = writes
+            .iter()
+            .find(|(m, url, _)| url.starts_with(&bot_ops) && m != "GET")
+            .map(|(m, url, body)| (format!("{m} {url}"), text(body, "/body").to_owned()));
+        assert_eq!(holds.as_ref().map(|(w, _)| w), wrote, "{line}");
+        let Some((_, body)) = holds else {
+            continue;
+        };
+        assert!(body.starts_with(HOLDS_MARKER), "{body}");
+        let snapshot = json_block(&body).unwrap();
+        assert_eq!(snapshot["schema"], HOLDS_SCHEMA);
+        assert_eq!(snapshot["at"], now.format(&Rfc3339).unwrap());
+        // Each entry's reason is what its line says.
+        let mut kinds = vec![];
+        for hold in snapshot["holds"].as_array().unwrap() {
+            let on = hold["item"].as_str().unwrap_or(text(hold, "/kind"));
+            let said = format!("hold {on}: {}", text(hold, "/reason"));
+            assert!(report.lines.contains(&said), "{said}: {:#?}", report.lines);
+            kinds.push(json!([hold["item"], hold["kind"], hold["priority"]]));
+        }
+        let expected = match wip {
+            2 => json!([[null, "wip", null]]),
+            _ => json!([
+                ["cgwalters-forge/agentic-job#188", "dispatched", "P0"],
+                ["cgwalters-forge/tracker#446", "person", "P0"],
+                ["cgwalters-forge/tracker#468", "dispatched", "P0"],
+                ["cgwalters-forge/tracker#527", "overlap", null],
+            ]),
+        };
+        assert_eq!(Value::Array(kinds), expected, "{line}");
+        first.get_or_insert(body);
+    }
+    // A pass that waits for another in progress leaves that one's holds.
+    let url = "https://github.com/cgwalters-forge/tracker/actions/runs/4243";
+    let mut forge = Forge::new(None, false);
+    forge.passes = vec![json!({"id": 4243, "html_url": url})];
+    let report = apply(&forge, &config(json!({"usage": usage})));
+    let line = format!("holds: not published; another pass is in progress, {url}");
+    assert!(report.lines.contains(&line), "{:#?}", report.lines);
+    assert!(forge.writes.borrow().is_empty());
+    // A preview says what it would write.
+    let report = preview(&config(json!({"usage": usage})), &replay());
+    let line = format!("{publish}; a preview does not write it");
+    assert!(report.lines.contains(&line), "{:#?}", report.lines);
+}
+
 /// Two passes compete for the last slot, each with a different plan: the
 /// one that sees the other in progress starts nothing, as the other may
 /// take the slot it saw free; alone, it takes the slot.
@@ -3072,36 +3209,40 @@ fn hold_table() {
     type Change = fn(&mut Facts);
     for (name, change, expected) in [
         ("ready", (|_| {}) as Change, None),
-        ("closed", |f| f.open = false, Some("closed")),
+        (
+            "closed",
+            |f| f.open = false,
+            Some((HoldKind::Closed, "closed")),
+        ),
         (
             "needs-human",
             |f| f.labels = vec!["Needs-Human".into()],
-            Some("labelled needs-human"),
+            Some((HoldKind::Person, "labelled needs-human")),
         ),
         (
             "needs-design",
             |f| f.labels = vec!["needs-design".into()],
-            Some("labelled needs-design"),
+            Some((HoldKind::Person, "labelled needs-design")),
         ),
         (
             "unread labels",
             |f| f.labels_complete = false,
-            Some("its labels could not all be read"),
+            Some((HoldKind::Unreadable, "its labels could not all be read")),
         ),
         (
             "board Blocked",
             |f| f.status = Some("Blocked".into()),
-            Some("board Status is Blocked"),
+            Some((HoldKind::Person, "board Status is Blocked")),
         ),
         (
             "dependency",
             |f| f.blocked_by = 2,
-            Some("2 open dependencies"),
+            Some((HoldKind::Dependencies, "2 open dependencies")),
         ),
         (
             "bot pull request",
             |f| f.pulls = vec![(9, "o/r".into(), Some("bot".into()))],
-            Some("pull request o/r#9 is open"),
+            Some((HoldKind::PullRequest, "pull request o/r#9 is open")),
         ),
         (
             "visitor pull request",
@@ -3111,7 +3252,10 @@ fn hold_table() {
         (
             "unread pull requests",
             |f| f.pulls_complete = false,
-            Some("its pull requests could not all be read"),
+            Some((
+                HoldKind::Unreadable,
+                "its pull requests could not all be read",
+            )),
         ),
         (
             "a trusted pull request among those read",
@@ -3119,21 +3263,17 @@ fn hold_table() {
                 f.pulls = vec![(9, "o/r".into(), Some("op".into()))];
                 f.pulls_complete = false;
             },
-            Some("pull request o/r#9 is open"),
+            Some((HoldKind::PullRequest, "pull request o/r#9 is open")),
         ),
     ] {
         let mut f = base.clone();
         change(&mut f);
-        assert_eq!(
-            hold(&f, &BTreeMap::new(), &people).as_deref(),
-            expected,
-            "{name}"
-        );
+        let held = hold(&f, &BTreeMap::new(), &people);
+        let held = held.as_ref().map(|(kind, why)| (*kind, why.as_str()));
+        assert_eq!(held, expected, "{name}");
     }
-    assert_eq!(
-        hold(&base, &busy, &people).as_deref(),
-        Some("a run is in flight, https://run")
-    );
+    let why = "a run is in flight, https://run".to_owned();
+    assert_eq!(hold(&base, &busy, &people), Some((HoldKind::InFlight, why)));
 }
 
 #[test]

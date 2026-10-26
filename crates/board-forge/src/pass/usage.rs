@@ -457,6 +457,15 @@ fn render(snapshot: &Value) -> Result<String> {
     ))
 }
 
+/// The hold snapshot's comment: its marker, then the JSON the review app reads.
+pub(in crate::pass) fn render_holds(snapshot: &Value) -> Result<String> {
+    Ok(format!(
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{}\n```\n",
+        text(snapshot, "/at"),
+        serde_json::to_string_pretty(snapshot)?
+    ))
+}
+
 impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// Stage 1: read the broker and pace this pass's runs by it; an
     /// applying pass publishes it, one write, and a preview paces by it
@@ -522,8 +531,12 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             self.line(format!("{said}; a preview paces by it unpublished"));
             return;
         }
-        let comment = self.usage_comment();
-        match comment.and_then(|c| self.publish(usage, c.as_ref(), &snapshot)) {
+        let comment = self.usage_comment(USAGE_MARKER, "usage snapshot");
+        let published = comment.and_then(|c| {
+            let body = render(&snapshot)?;
+            self.publish(usage, c.as_ref(), "usage", body)
+        });
+        match published {
             Ok(url) => self.line(format!("usage: published {url}")),
             Err(error) => {
                 self.report.failures += 1;
@@ -555,10 +568,17 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
     }
 
-    /// Write `snapshot` to the bot's usage comment, `comment`, or a new one,
-    /// only on a private repository: it says what the subscriptions are
-    /// used for, and when. Its URL.
-    fn publish(&self, usage: &Usage, comment: Option<&Value>, snapshot: &Value) -> Result<String> {
+    /// Write `body` to the bot's `name` comment on the usage issue, `comment`,
+    /// or a new one, only on a private repository: the usage snapshot says
+    /// what the subscriptions are used for, and when, and the hold snapshot
+    /// what the board's private issues wait on. Its URL.
+    fn publish(
+        &self,
+        usage: &Usage,
+        comment: Option<&Value>,
+        name: &str,
+        body: String,
+    ) -> Result<String> {
         let repo = &usage.repository;
         let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
         ensure!(
@@ -568,14 +588,14 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         );
         ensure!(
             response.body["private"] == true,
-            "{repo} is not private; the usage snapshot is not written there"
+            "{repo} is not private; the {name} snapshot is not written there"
         );
-        let body = json!({"body": render(snapshot)?});
+        let body = json!({"body": body});
         let (method, url) = match comment {
             Some(comment) => {
                 let id = comment["id"]
                     .as_u64()
-                    .context("the usage comment has no id")?;
+                    .with_context(|| format!("the {name} comment has no id"))?;
                 (
                     "PATCH",
                     format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
@@ -599,9 +619,70 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let (status, answer) = self.client.send(method, &url, &body)?;
         ensure!(
             (200..300).contains(&status),
-            "{method} the usage comment: GitHub HTTP status {status}"
+            "{method} the {name} comment: GitHub HTTP status {status}"
         );
         Ok(text(&answer, "/html_url").to_owned())
+    }
+
+    /// Publishes stage 4's holds where [`Usage::holds`] is set: one write
+    /// step, skipped where the bot's hold comment already has the same
+    /// holds. A failure is one line, and the pass goes on.
+    pub(in crate::pass) fn publish_holds(&mut self) {
+        let Some(usage) = self.config.usage.as_ref().filter(|u| u.holds) else {
+            return;
+        };
+        // That pass considered the candidates, and publishes their holds.
+        if let Some(why) = self.other_holds() {
+            self.line(format!("holds: not published; {why}"));
+            return;
+        }
+        // Stage 4 may have stopped on these, which is not a failure.
+        let bounds = self.client.bounds;
+        if bounds.left.get() < WRITE_RESERVE + HOLDS_READS || Instant::now() > bounds.admit_by {
+            let why = "the pass's request budget or time is spent";
+            self.line(format!("holds: not published; {why}"));
+            return;
+        }
+        let mut holds = std::mem::take(&mut self.holds);
+        // Stable: the holds of every new run, without an item, first.
+        holds.sort_by_key(|h| h["item"].as_str().map(str::to_ascii_lowercase));
+        let holds = Value::Array(holds);
+        let said = format!("holds: publish to {}#{}", usage.repository, usage.issue);
+        let comment = match self.usage_comment(HOLDS_MARKER, "hold snapshot") {
+            Ok(comment) => comment,
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("holds error: {said}: {error:#}"));
+                return;
+            }
+        };
+        let published = (comment.as_ref())
+            .and_then(|c| json_block(text(c, "/body")))
+            .filter(|s| s["schema"] == HOLDS_SCHEMA);
+        if published.is_some_and(|s| s["holds"] == holds) {
+            self.line("holds: unchanged".into());
+            return;
+        }
+        if let Some(held) = self.caps.check(Kind::Write) {
+            self.line(format!("{held}: {said}"));
+            return;
+        }
+        if !self.apply {
+            self.caps.count(Kind::Write);
+            self.line(format!("{said}; a preview does not write it"));
+            return;
+        }
+        let at = self.now.format(&Rfc3339).unwrap_or_default();
+        let snapshot = json!({"schema": HOLDS_SCHEMA, "at": at, "holds": holds});
+        let published = render_holds(&snapshot)
+            .and_then(|body| self.publish(usage, comment.as_ref(), "hold", body));
+        match published {
+            Ok(url) => self.line(format!("holds: published {url}")),
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("holds error: {said}: {error:#}"));
+            }
+        }
     }
 }
 
