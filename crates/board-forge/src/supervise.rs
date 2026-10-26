@@ -299,6 +299,10 @@ pub struct AgentSettings {
     /// Whether a pass that is not a sweep leaves the agent out when no check
     /// newly fails ([`pace::unchanged`]).
     pub skip_unchanged_failures: bool,
+    /// The pass configuration file (docs/pass.md) whose
+    /// `budget.harnessRepositories` a status update's spend split reads
+    /// ([`crate::budget::split`]); absent, the update has no split.
+    pub pass_config: Option<String>,
 }
 
 /// The supervisor file's optional settings that switch something on, read
@@ -319,6 +323,7 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "project",
     "profile",
     "skipUnchangedFailures",
+    "passConfig",
 ];
 /// The agent object's other keys, without which it stays off or is refused.
 const AGENT_REQUIRED: &[&str] = &["pool", "cooldownHours", "requests", "log"];
@@ -662,6 +667,14 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
             })
             .transpose()?
             .unwrap_or(false),
+        pass_config: get("passConfig")?
+            .map(|v| {
+                v.as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .context("supervisor agent.passConfig: a file path")
+            })
+            .transpose()?,
     }))
 }
 
@@ -879,7 +892,10 @@ pub(crate) mod tests {
             .filter(|k| !["mergeAuthors", "kindPools", "dispatchWorkflow"].contains(k))
             .map(|k| (*k).to_owned())
             .collect();
-        expected.extend(["dailyCaps", "state", "tracker", "project"].map(|k| format!("agent.{k}")));
+        expected.extend(
+            ["dailyCaps", "state", "tracker", "project", "passConfig"]
+                .map(|k| format!("agent.{k}")),
+        );
         assert_eq!(s.unset, expected);
         // A named option is set; null is unset.
         let mut board = board();
@@ -958,6 +974,8 @@ pub(crate) mod tests {
                 json!({"repository": "example/home", "ref": "a".repeat(40), "path": "x"}),
             ),
             ("skipUnchangedFailures", json!("true")),
+            ("passConfig", json!("")),
+            ("passConfig", json!(1)),
         ] {
             let mut cfg = supervisor();
             cfg["agent"][key] = value.clone();

@@ -594,6 +594,25 @@ items, 1000 requests, 1000 comments on an item or pull request, a sub-issue
 list, a list of more than 20 closing pull requests or a set of boards that
 could not be read whole, and a `Budget ($)` value that is not a dollar amount.
 
+`agent-board budget --config FILE --split --since TIME [--until TIME]`
+(agent-board#355) prints instead the share of a window's public spend that
+went to upstream work rather than to the harness, as one line of percentages
+and never dollars, for example `spend: 62% upstream, 38% harness (14 and 9 runs;
+2 without a cost; at least, partial costs)`. A run is in the window when its
+status comment last changed in it, and the window runs to now without
+`--until`. One search, `commenter:BOT updated:>=SINCE`, finds the issues
+and pull requests to read, with no upper bound since an item touched after the
+window can still hold a status comment from it; items of private repositories are left out, as
+`changes --public-only` leaves them out. The cost lines count under the rules
+above, each run once. A run is the harness's when its status comment is on an
+item in `budget.harnessRepositories`, and upstream otherwise. The percentages
+are of the summed known cost, and the run counts are of priced runs; runs whose
+status comment has no cost line are counted apart, and a window with no cost
+reads `no priced runs`. `--split` is refused without `budget.harnessRepositories`,
+and so is a search that finds more than 1000 items or a read past 1000 requests.
+The supervisor's daily status update can carry the same line (see
+[supervisor](supervisor-requests.md#lines), `agent.passConfig`).
+
 ## One configuration file
 
 The proposed JSON schema below is exhaustive; reject unknown keys and nulls.
@@ -625,6 +644,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
+| `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |

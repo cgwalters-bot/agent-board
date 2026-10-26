@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod split;
+
 /// The marker of a run's cost line.
 pub const COST_MARKER: &str = "agentic-job-cost";
 /// The marker agentic-job's status.cjs ends a run's status comment with.
@@ -155,11 +157,7 @@ pub struct Tree {
 /// comments by `bot` that no one else last edited and that carry the same
 /// run's [`RUN_MARKER`], each run once.
 pub fn costs(comments: &[Comment], bot: &str, runs: &mut BTreeMap<u64, Cost>) {
-    let by_bot = |login: Option<&str>| login.is_some_and(|l| l.eq_ignore_ascii_case(bot));
-    for comment in comments.iter().filter(|c| {
-        by_bot(c.author.as_deref())
-            && (!c.edited && c.editor.is_none() || by_bot(c.editor.as_deref()))
-    }) {
+    for comment in comments.iter().filter(|c| trusted(c, bot)) {
         for (run, cost) in comment.body.lines().filter_map(cost_line) {
             let marker = format!("<!-- {RUN_MARKER}: {run} -->");
             if comment.body.lines().any(|line| line == marker) {
@@ -169,17 +167,31 @@ pub fn costs(comments: &[Comment], bot: &str, runs: &mut BTreeMap<u64, Cost>) {
     }
 }
 
+/// Whether `comment` is `bot`'s and no one else last edited it.
+fn trusted(comment: &Comment, bot: &str) -> bool {
+    let by_bot = |login: Option<&str>| login.is_some_and(|l| l.eq_ignore_ascii_case(bot));
+    by_bot(comment.author.as_deref())
+        && (!comment.edited && comment.editor.is_none() || by_bot(comment.editor.as_deref()))
+}
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A run ID as the markers write it: digits without a leading zero.
+fn run_id(s: &str) -> Option<u64> {
+    (digits(s) && !s.starts_with('0'))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 /// A cost line as agentic-job writes it, or `None`.
 fn cost_line(line: &str) -> Option<(u64, Cost)> {
     let rest = line
         .strip_prefix(&format!("<!-- {COST_MARKER}: "))?
         .strip_suffix(" -->")?;
     let mut words = rest.split(' ');
-    let run = words.next()?;
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    if !digits(run) || run.starts_with('0') {
-        return None;
-    }
+    let run = run_id(words.next()?)?;
     let usd = words.next()?.strip_prefix("usd=")?;
     let (whole, fraction) = usd.split_once('.').unwrap_or((usd, "0"));
     if !digits(whole) || !digits(fraction) {
@@ -194,7 +206,15 @@ fn cost_line(line: &str) -> Option<(u64, Cost)> {
     words
         .next()
         .is_none()
-        .then_some((run.parse().ok()?, Cost { usd, partial }))
+        .then_some((run, Cost { usd, partial }))
+}
+
+/// The run a status comment's [`RUN_MARKER`] line names, or `None`.
+fn run_line(line: &str) -> Option<u64> {
+    run_id(
+        line.strip_prefix(&format!("<!-- {RUN_MARKER}: "))?
+            .strip_suffix(" -->")?,
+    )
 }
 
 /// Counts requests against [`REQUEST_LIMIT`].
@@ -207,7 +227,7 @@ impl<T: Transport> Transport for Counted<'_, T> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         ensure!(
             self.used.get() < REQUEST_LIMIT,
-            "the budget tree takes more than {REQUEST_LIMIT} requests"
+            "the budget read takes more than {REQUEST_LIMIT} requests"
         );
         self.used.set(self.used.get() + 1);
         self.inner.graphql(query, variables)

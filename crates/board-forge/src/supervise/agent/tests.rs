@@ -343,8 +343,17 @@ impl Api for Fake {
             return Ok(json!({"viewer": {"login": "worker"}}));
         }
         if query.contains("search(") {
-            let nodes = self.objects.get("search").cloned().unwrap_or(json!([]));
-            return Ok(json!({"search": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}));
+            // The spend split's search for the bot's comments, or the changes'.
+            let name = if variables["q"].as_str().unwrap().starts_with("commenter:") {
+                "split"
+            } else {
+                "search"
+            };
+            let nodes = self.objects.get(name).cloned().unwrap_or(json!([]));
+            return Ok(
+                json!({"search": {"issueCount": nodes.as_array().unwrap().len(),
+                "nodes": nodes, "pageInfo": {"hasNextPage": false}}}),
+            );
         }
         for (marker, name) in [("statusUpdates(", "statusUpdates"), ("items(", "items")] {
             if query.contains(marker) {

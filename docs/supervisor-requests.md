@@ -158,7 +158,8 @@ A complete supervisor file:
     "state": {"repository": "OWNER/tracker", "issue": 123},
     "project": "PVT_CONFIGURED_NODE_ID",
     "profile": {"repository": "OWNER/agenthome", "ref": "0123456789abcdef0123456789abcdef01234567"},
-    "skipUnchangedFailures": false
+    "skipUnchangedFailures": false,
+    "passConfig": ".github/pass.json"
   }
 }
 ```
@@ -203,7 +204,7 @@ dropped or misspelled key is seen:
   (the pools file's pool the agent's run uses) and `agent.cooldownHours` (how
   long after an agent run a failing check may start another, a positive number) are
   required. The cooldown applies outside the daily pass. `kinds`, `maxDispatchesPerPass`, `maxDispatchesPerDay`,
-  `dailyCaps`, `tracker`, `state` and `project` are described below;
+  `dailyCaps`, `tracker`, `state`, `project` and `passConfig` are described below;
   `profile` and `skipUnchangedFailures` under [workflow steps](#workflow-steps).
 
 All new daily caps default to zero (disabled), accept integers from zero to 100,
@@ -268,6 +269,12 @@ by ref) on that item's line, or under **Also** when the item is not listed.
 The changes are read before the first write of the batch. A body that cannot
 be read or fit refuses that request alone, with its reason in the log; the
 batch's other requests, dispatches included, still go ahead.
+With `agent.passConfig`, the path of the pass configuration (docs/pass.md)
+from the caller's checkout, the body ends with the
+[spend split](pass.md#budget-tree) of the same window, from the changes'
+start to now, in percentages only; the sections are trimmed to make room for
+it under the bound. A split that cannot be read leaves out only
+its line, with the reason on the update's line in the log. Absent, off.
 
 A comment or new issue is the agent's text posted as the bot, so the executor appends the
 fixed visible note, an `agent-board-supervisor-note` fenced JSON block (the

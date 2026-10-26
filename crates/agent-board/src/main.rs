@@ -157,7 +157,7 @@ enum Command {
     Poll(poll::Poll),
     /// One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md).
     Pass(pass::Pass),
-    /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field (read-only; docs/pass.md#budget-tree).
+    /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree).
     Budget(budget::Budget),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),

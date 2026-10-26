@@ -62,6 +62,10 @@ pub enum Write {
         /// reason it could not be, which refuses this request alone.
         #[serde(skip)]
         body: Option<std::result::Result<String, String>>,
+        /// Why the body has no spend split though `agent.passConfig` asks
+        /// for one: an unreadable split leaves out only its line.
+        #[serde(skip)]
+        no_split: Option<String>,
     },
 }
 
@@ -318,6 +322,13 @@ impl Checked {
     pub fn describe(&self) -> String {
         match self {
             Self::Dispatch(r) => r.describe(),
+            Self::Write(Write::StatusUpdate {
+                no_split: Some(reason),
+                ..
+            }) => format!(
+                "`{}` configured target (no spend split: {reason})",
+                self.action()
+            ),
             _ => {
                 let target = self
                     .issue()
@@ -355,14 +366,19 @@ impl Checked {
             summary,
             notes,
             body,
+            no_split,
             ..
         }) = self
         {
             // A board read the update could not make is no reason to hold
             // back the batch's other requests.
-            *body = Some(
-                status_body(api, p, now, summary, notes).map_err(|error| format!("{error:#}")),
-            );
+            match status_body(api, p, now, summary, notes) {
+                Ok((text, reason)) => {
+                    *body = Some(Ok(text));
+                    *no_split = reason;
+                }
+                Err(error) => *body = Some(Err(format!("{error:#}"))),
+            }
             return Ok(());
         }
         let this = &*self;
@@ -554,26 +570,25 @@ impl Checked {
 }
 
 /// `summary` and `notes` over the project's changes since its last status
-/// update, signed.
+/// update, then with `agent.passConfig` the same window's spend split,
+/// signed; and why a split asked for was left out.
 fn status_body(
     api: &dyn Api,
     p: &Policy,
     now: i64,
     summary: &str,
     notes: &BTreeMap<String, String>,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let project = p
         .agent
         .project
         .as_deref()
         .context("No configured project")?;
     let forge = super::super::Graphql(api);
+    let now = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)?;
     let since = match changes::last_update(&forge, project)? {
         Some(since) => since,
-        None => {
-            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)?
-                - changes::FIRST_WINDOW
-        }
+        None => now - changes::FIRST_WINDOW,
     };
     let footer = &p.settings.footer;
     // Room for the attribution [`signed`] appends.
@@ -586,8 +601,33 @@ fn status_body(
         Some(&p.settings.operator),
         false,
     )?;
-    let body = changes.status_body(Some(unsigned(summary, footer)), notes, limit)?;
-    Ok(signed(&body, None, footer))
+    let split = p.agent.pass_config.as_deref().map(|path| {
+        let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+        let config = crate::pass::Config::parse(&text).with_context(|| path.to_owned())?;
+        let split = crate::budget::split::read(&forge, &config, since, now)?;
+        anyhow::Ok(crate::budget::split::line(&split))
+    });
+    let summary = Some(unsigned(summary, footer));
+    let (body, no_split) = match split {
+        Some(Ok(line)) => {
+            let room = limit.saturating_sub(line.chars().count() + 2);
+            match changes.status_body(summary, notes, room) {
+                Ok(body) => (format!("{}\n\n{line}", body.trim_end()), None),
+                // The body trims its sections to fit, so only a summary and
+                // notes that fill the room the line would leave come here.
+                Err(_) => (
+                    changes.status_body(summary, notes, limit)?,
+                    Some("it does not fit".to_owned()),
+                ),
+            }
+        }
+        Some(Err(error)) => (
+            changes.status_body(summary, notes, limit)?,
+            Some(format!("{error:#}")),
+        ),
+        None => (changes.status_body(summary, notes, limit)?, None),
+    };
+    Ok((signed(&body, None, footer), no_split))
 }
 
 fn run_id(url: &str, p: &Policy) -> Result<u64> {
