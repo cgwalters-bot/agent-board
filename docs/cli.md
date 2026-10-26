@@ -442,6 +442,7 @@ Options:
 - `--caller <OWNER/REPO>`: Repository whose --workflow the request starts; from the caller's configuration
 - `--workflow <FILE>`: Workflow file in --caller that takes a plan's inputs, such as dispatch.yml
 - `--ref <GIT_REF>`: Ref of the caller to run --workflow from (default: `main`)
+- `--dispatch-routing <FILE>`: Trusted namespace routing JSON. Off without it; never read from a job plan
 - `--operator <LOGIN>`: Login whose plans count: the operator
 - `--planner <LOGIN>`: Login the planning run comments as, whose plans also count
 - `--batch <N>`: Add up to N small, ready sub-issues of the issue's epic, each with its own implement plan, to one run; 0 runs the issue alone. From the caller's configuration (default: `0`)

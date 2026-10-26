@@ -783,6 +783,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             pool: Some(pool),
             strict: true,
             ended: None,
+            routing: None,
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);

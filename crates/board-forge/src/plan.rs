@@ -206,6 +206,24 @@ impl JobPlan {
     /// `base` is the branch [`crate::stack::resolve`] found, and only a
     /// stacked plan sends one, so a caller without that input is unaffected.
     pub fn dispatch_request(&self, target: &Target, base: Option<&str>) -> Result<Value> {
+        self.routed_request(target, base, None)
+    }
+
+    pub fn routed_request(
+        &self,
+        target: &Target,
+        base: Option<&str>,
+        routing: Option<&crate::dispatch::Routing>,
+    ) -> Result<Value> {
+        let route = routing
+            .map(|r| r.select(&self.start(base)))
+            .transpose()?
+            .unwrap_or(false);
+        let target = if route {
+            &routing.context("missing route")?.target
+        } else {
+            target
+        };
         self.check_start(target, base)?;
         let github = GitHub {
             target,
@@ -214,7 +232,7 @@ impl JobPlan {
         Ok(json!({
             "method": "POST",
             "url": format!("{API_ROOT}{}", github.path()),
-            "body": github.body(&self.start(base)),
+            "body": github.routed_body(&self.start(base), routing.filter(|_| route))?,
         }))
     }
 
@@ -739,6 +757,8 @@ pub fn dispatch<C: Transport + Rest, D: Rest>(
 /// it chose, read again here, and the pool it checked against pace.
 #[derive(Clone, Copy, Default)]
 pub struct Scheduled<'a> {
+    /// Operator's opt-in routing file, not a job-plan field.
+    pub routing: Option<&'a crate::dispatch::Routing>,
     /// The plan id the pass chose; another newest plan dispatches nothing.
     pub plan: Option<&'a str>,
     /// The pool the pass checked: a plan that names none takes it, and one
@@ -789,6 +809,25 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     }
     let comments = issue_comments(client, issue)?;
     let (mut plan, from) = newest_plan(&comments, writers)?;
+    let legacy = target;
+    let routing = scheduled
+        .routing
+        .map(|route| {
+            route
+                .select(&plan.start(None))
+                .map(|selected| selected.then_some(route))
+        })
+        .transpose()?
+        .flatten();
+    let target = routing.map(|route| &route.target).unwrap_or(target);
+    if let Some(route) = routing {
+        ensure!(
+            plan.stacks_on.is_none(),
+            "route does not support stacked plans/base input"
+        );
+        ensure!(batch == 0, "routed dispatch does not support batching yet");
+        route.check_idle(client, legacy, &plan.repo)?;
+    }
     let id = plan_id(from)?;
     if let Some(chosen) = scheduled.plan {
         ensure!(
@@ -979,9 +1018,15 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             run_details: true,
         };
         // Either failure is recorded the same way: not dispatched, or not knowingly.
-        match github.start(
+        match github.start_routed(
             &job.start(base),
-            || Ok(()),
+            routing,
+            || {
+                if let Some(route) = routing {
+                    route.check_idle(client, legacy, &job.repo)?;
+                }
+                Ok(())
+            },
             |path, body| dispatcher.send("POST", &format!("{API_ROOT}{path}"), body),
         ) {
             StartOutcome::Started(run) => Ok(Some(run.url)),
@@ -1698,6 +1743,19 @@ mod tests {
 
     impl Rest for Forge {
         fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+            if self.overlap["routing"] == true {
+                ensure!(
+                    url.contains("/actions/workflows/"),
+                    "unexpected routing GET"
+                );
+                return Ok(crate::poll::RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body: json!({"total_count": 0, "workflow_runs": []}),
+                });
+            }
             if url.contains("/collaborators/") {
                 return Ok(crate::poll::RestResponse {
                     status: 200,
@@ -1796,18 +1854,96 @@ mod tests {
                 node["editor"] = json!({"login": self.viewer});
                 return Ok((200, json!({})));
             }
-            assert_eq!(
-                (method, url),
-                (
-                    "POST",
-                    "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches"
-                )
-            );
+            let expected = if self.overlap["routing"] == true {
+                "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/workflows/agent.yml/dispatches"
+            } else {
+                "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches"
+            };
+            assert_eq!((method, url), ("POST", expected));
             if self.twist == "refused" {
                 return Err(Refused("lease admission: no slot".into()).into());
             }
             self.dispatches.borrow_mut().push(body.clone());
             Ok(self.answers.borrow_mut().remove(0))
+        }
+    }
+
+    #[test]
+    fn routed_plan_uses_target_not_tracking_issue_and_is_not_retried() {
+        let routing: crate::dispatch::Routing = serde_json::from_value(json!({
+            "namespace": "bootc-dev", "repositories": ["bootc-dev/bootc"],
+            "target": {"caller": "bootc-dev/cgwalters-devspace-sandbox", "workflow": "agent.yml", "gitRef": "main"},
+            "runnerConfig": "rhel10"
+        })).unwrap();
+        let mut block = plan();
+        block["repo"] = "bootc-dev/bootc".into();
+        block["pool"] = "openai".into();
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        for (answer, expected) in [
+            (
+                (200, json!({"workflow_run_id": 99})),
+                "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/99",
+            ),
+            ((404, json!({"message": "Not Found"})), "not dispatched"),
+            ((500, json!({"message": "unavailable"})), "not dispatched"),
+        ] {
+            let fenced = format!("```{PLAN_FENCE}\n{block}\n```");
+            let mut forge = Forge::new(
+                vec![node(7, PLANNER, "2026-10-13T10:00:00Z", &fenced)],
+                vec![answer],
+            );
+            forge.overlap = json!({"routing": true});
+            let options = || {
+                (
+                    0,
+                    None,
+                    None,
+                    Scheduled {
+                        routing: Some(&routing),
+                        ..Default::default()
+                    },
+                )
+            };
+            let result = dispatch_with(
+                &forge,
+                &forge,
+                &issue,
+                &[OPERATOR, PLANNER],
+                &target(),
+                options(),
+            );
+            if expected.starts_with("https:") {
+                assert_eq!(result.unwrap().run.as_deref(), Some(expected));
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(forge.dispatches.borrow().len(), 1);
+            let sent = &forge.dispatches.borrow()[0];
+            assert_eq!(sent["inputs"]["repo"], "bootc-dev/bootc");
+            assert_eq!(sent["inputs"]["pool"], "openai");
+            assert_eq!(sent["inputs"]["cores"], "4");
+            assert!(
+                forge
+                    .bodies()
+                    .last()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains(expected)
+            );
+            let again = dispatch_with(
+                &forge,
+                &forge,
+                &issue,
+                &[OPERATOR, PLANNER],
+                &target(),
+                options(),
+            )
+            .unwrap_err();
+            assert!(
+                again.to_string().contains("dispatch record already"),
+                "{again:#}"
+            );
+            assert_eq!(forge.dispatches.borrow().len(), 1);
         }
     }
 
