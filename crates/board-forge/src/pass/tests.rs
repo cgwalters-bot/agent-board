@@ -922,8 +922,11 @@ fn replay_scenarios() {
             0,
         ),
         (
-            "a grant paces each pool in percentages, and the most room takes the run",
-            Box::new(|r, c| granted(r, c, &[])),
+            "a grant paces each pool in percentages; a sole configured pool takes the run",
+            Box::new(|r, c| {
+                granted(r, c, &[]);
+                c["triagePools"] = json!(["openai"]);
+            }),
             vec![
                 "usage: claude: 18% used of 32% granted on anthropic unified_7d, read 2026-10-23T15:06:40Z; openai: 5% used of 32% granted on codex secondary, read 2026-10-23T15:06:40Z",
                 "start triage cgwalters-forge/tracker#446 pool=openai",
@@ -1008,6 +1011,7 @@ fn replay_scenarios() {
             "an unreadable broker leaves the grant to start runs",
             Box::new(|r, c| {
                 granted(r, c, &[]);
+                c["triagePools"] = json!(["openai"]);
                 broker_down(r);
             }),
             vec![
@@ -1111,8 +1115,9 @@ fn replay_scenarios() {
             0,
         ),
         (
-            "the pool furthest under its pace takes the run",
-            Box::new(|r, _| {
+            "a sole configured pool takes the run regardless of another pool's headroom",
+            Box::new(|r, c| {
+                c["triagePools"] = json!(["openai"]);
                 let mut snapshot = usage(r);
                 snapshot["pools"]["openai"]["hold"] = false.into();
                 snapshot["pools"]["openai"]["used_percent"] = 0.into();
@@ -1273,7 +1278,7 @@ fn replay_scenarios() {
         let mut replay = without_epics(replay());
         let mut settings = json!({});
         edit(&mut replay, &mut settings);
-        let report = preview(&config(settings), &replay);
+        let report = crate::pool_choice::with_index(0, || preview(&config(settings), &replay));
         for line in &lines {
             assert!(
                 report.lines.iter().any(|l| l.starts_with(line)),
@@ -1576,6 +1581,7 @@ fn a_grant_restored_after_reset_releases_the_pass() {
         let mut replay = without_epics(replay());
         let mut settings = json!({});
         with_grant(&mut replay, &mut settings, json!({"body": grant}));
+        settings["triagePools"] = json!(["claude"]);
         let report = preview(&config(settings), &replay);
         assert!(
             report.lines.iter().any(|l| l == expected),
@@ -2940,28 +2946,90 @@ fn unpathed(replay: &mut Replay) {
 /// record and the run are the plan protocol's.
 #[test]
 fn implement_takes_the_paced_pool() {
-    let forge = {
+    for (ticket, expected) in [(0, "claude"), (1, "openai")] {
+        let forge = {
+            let mut forge = Forge::new(None, false);
+            implement_plan(&mut forge.replay);
+            unpathed(&mut forge.replay);
+            let mut snapshot = usage(&mut forge.replay);
+            snapshot["pools"]["openai"]["hold"] = json!(false);
+            snapshot["pools"]["openai"]["used_percent"] = json!(1);
+            set_usage(&mut forge.replay, &snapshot);
+            forge
+        };
+        let report =
+            crate::pool_choice::with_index(ticket, || apply(&forge, &config(json!({"wip": 3}))));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let line = format!(
+            "start implement cgwalters-forge/tracker#446 plan=9@2026-10-23T00:00:00Z pool={expected} record="
+        );
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(&line)),
+            "{:#?}",
+            report.lines
+        );
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = writes
+            .iter()
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap();
+        assert_eq!(sent["inputs"]["kind"], "implement");
+        assert_eq!(sent["inputs"]["pool"], expected);
+        assert_eq!(sent["ref"], "main");
+    }
+}
+
+#[test]
+fn generated_triage_plan_keeps_the_drawn_pool_and_explicit_held_plan_waits() {
+    for explicit in [false, true] {
         let mut forge = Forge::new(None, false);
-        implement_plan(&mut forge.replay);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
         unpathed(&mut forge.replay);
-        forge
-    };
-    let report = apply(&forge, &config(json!({"wip": 3})));
-    assert_eq!(report.failures, 0, "{:#?}", report.lines);
-    let line = "start implement cgwalters-forge/tracker#446 plan=9@2026-10-23T00:00:00Z pool=claude record=";
-    assert!(
-        report.lines.iter().any(|l| l.starts_with(line)),
-        "{:#?}",
-        report.lines
-    );
-    let writes = forge.writes.borrow();
-    let (_, _, sent) = writes
-        .iter()
-        .find(|(_, url, _)| url.ends_with("/dispatches"))
-        .unwrap();
-    assert_eq!(sent["inputs"]["kind"], "implement");
-    assert_eq!(sent["inputs"]["pool"], "claude");
-    assert_eq!(sent["ref"], "main");
+        if explicit {
+            implement_plan(&mut forge.replay);
+            let comments = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]
+                ["repository"]["issue"]["comments"]["nodes"];
+            let body = comments.as_array_mut().unwrap().last_mut().unwrap();
+            let pinned = body["body"].as_str().unwrap().replace(
+                "\"kind\":\"implement\"",
+                "\"kind\":\"implement\",\"pool\":\"openai\"",
+            );
+            body["body"] = json!(pinned);
+            // Fixture's openai is held. The available claude must not replace it.
+        } else {
+            let mut snapshot = usage(&mut forge.replay);
+            snapshot["pools"]["openai"]["hold"] = json!(false);
+            set_usage(&mut forge.replay, &snapshot);
+        }
+        let report =
+            crate::pool_choice::with_index(1, || apply(&forge, &config(json!({"wip": 3}))));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let sent = forge.dispatches();
+        if explicit {
+            assert!(sent.is_empty(), "{:#?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("no pool: openai is held"))
+            );
+        } else {
+            assert_eq!(sent.len(), 1, "{:#?}", report.lines);
+            let writes = forge.writes.borrow();
+            let (_, _, sent) = writes
+                .iter()
+                .find(|(_, url, _)| url.ends_with("/dispatches"))
+                .unwrap();
+            assert_eq!(sent["inputs"]["pool"], "openai");
+            assert_eq!(sent["inputs"]["kind"], "triage");
+            assert!(
+                forge
+                    .comments_on("cgwalters-forge/tracker", 446)
+                    .iter()
+                    .any(|body| body.replace(' ', "").contains("\"pool\":\"openai\""))
+            );
+        }
+    }
 }
 
 /// With `bodyPlans` (agent-board#342), a P0 or P1 issue with no plan comment
@@ -3592,7 +3660,7 @@ fn room_table() {
         let got = room(snap.as_ref(), "p", &settings, now).map(|r| (r * 1000.0).round() / 1000.0);
         assert_eq!(got, expected.map_err(str::to_owned), "{name}");
     }
-    // Most room wins; a tie goes to the first named; held pools are skipped.
+    // Every eligible pool gets a ticket regardless of headroom or order.
     let pools = Pools(vec![
         ("a".into(), settings.clone()),
         ("b".into(), settings.clone()),
@@ -3607,16 +3675,23 @@ fn room_table() {
     let three = json!({"updated_at": "2026-10-23T11:50:00Z", "pools": {"a": entry.clone(), "b": entry.clone(), "c": entry.clone()}});
     let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     assert_eq!(
-        choose(Some(&three), &pools, &names(&["a", "b"]), now),
+        choose_with(Some(&three), &pools, &names(&["a", "b"]), now, |_| Ok(0)),
         Ok("a".into())
     );
     assert_eq!(
-        choose(Some(&three), &pools, &names(&["b", "a"]), now),
+        choose_with(Some(&three), &pools, &names(&["b", "a"]), now, |_| Ok(0)),
         Ok("b".into())
     );
     assert_eq!(
-        choose(Some(&three), &pools, &names(&["a", "c"]), now),
+        choose_with(Some(&three), &pools, &names(&["a", "c"]), now, |_| Ok(1)),
         Ok("c".into())
+    );
+    assert_eq!(
+        choose_with(Some(&three), &pools, &names(&["a", "c", "a"]), now, |len| {
+            assert_eq!(len, 2);
+            Ok(0)
+        }),
+        Ok("a".into())
     );
     let mut held = three.clone();
     held["pools"]["c"]["hold"] = true.into();

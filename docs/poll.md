@@ -127,7 +127,7 @@ the fix-round list is empty; other kinds are not dispatched by poll.
 `pace` (absent by default, which leaves pool selection as above) names the
 usage snapshot the supervisor's pace check reads (`repository`, `issue`, `bot`)
 and an optional `marginPercent` (0 to 100, default 0). With it, a fix round
-takes the `fixPools` pool with the most room under its ceiling instead of the
+takes a uniform random draw among eligible `fixPools` instead of the
 next in turn, and a round, triage or continuation whose single configured pool
 is held waits; so does every run with a configured pool while the snapshot is
 missing or older than 45 minutes. A pool is held when its snapshot entry says
@@ -135,9 +135,10 @@ missing or older than 45 minutes. A pool is held when its snapshot entry says
 a `hold` that is not a boolean; its room is `allowed_percent + burst -
 used_percent`. Only an entry without `hold`, from an older snapshot, is held
 here when its share used exceeds the share of its window passed by more than
-the margin, with room the share passed less the share used. A pool the
-snapshot gives no current window for, or does not name, is unpaced: usable, but never
-chosen over a paced pool with room, and ties go to the round's usual turn. Each pass ends
+the margin. Claude/OpenAI with no current reading wait, including under a spend
+override. Other explicitly configured unpaced pools retain their eligibility;
+none is added by the selector. Headroom, turn, configured order and duplicate
+mentions do not weight a pool's chance. Each pass ends
 with a `pools:` line naming every pool's mode.
 
 `pace.overrides` (absent by default) changes one pool's pacing for a while
@@ -145,7 +146,7 @@ from the committed file rather than by editing the margin and pool lists and
 remembering to revert (agent-board#235). Each entry has a `pool`, a required
 `until` (RFC 3339, at most 7 days ahead), a `mode` and an optional one-line
 `reason`. In force, `spend` means the pool is not held by the poll's own pacing
-and is chosen over any pool without an override; a used-up window still holds
+and eligible spend pools are drawn uniformly before ordinary pools; a used-up window still holds
 it (indefinitely where its reset is absent or unreadable), and so does missing
 usage, since an override lifts pacing, not caps. `hold` holds the pool
 until `until` whatever its pace. An entry past its `until` is ignored and named
@@ -165,8 +166,8 @@ spreads over claude and openai rather than going to one hardcoded pool. `poll
 --pools PATH` reads the caller's repository-owned pools file (from the same
 trusted checkout), where each pool has its `tier`
 (1 to 9) and `"auto": false` keeps a hand-dispatch pool out of its tier. A
-tier stands for its automatic pools in name order: with `pace`, the run takes
-the one furthest under its pace, skipping held ones and waiting with the usual
+tier stands for its automatic pools: with `pace`, the run draws uniformly,
+skipping held ones and waiting with the usual
 message when all are held; without it, fix rounds take the tier's pools in
 turn as listed `fixPools` do, and a `kindPools` run takes the tier's first pool. The dispatched run's `pool` input and its marker name the pool
 chosen, never the tier. A tier the file does not give, a tier with no automatic
@@ -176,6 +177,12 @@ one pool a round must take) refuses the configuration. A configuration that
 names no tier needs no pools file and behaves as before. The supervisor's
 executor reads its kind's tier from the pools file it already takes, and admits
 a request for any automatic pool of it.
+
+This changes new selections only, never an active job's pool. An explicit
+operator/plan pool restricts the candidate set, not a preference to replace when
+held. Snapshot holds and exhausted caps win over spend; administrative hold
+always excludes its pool. Eligibility describes known usage, not a promise the
+provider's next request cannot return 429. There are no new retries or dispatches.
 
 `poll --fix-bounds PATH` (and `pass --fix-bounds PATH`) reads the caller's
 agentic-job bounds file for its `fix` kind, tracker's
