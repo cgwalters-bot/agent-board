@@ -2294,6 +2294,14 @@ fn caps_hold_starts_past_max_dispatch() {
             let begun = report.lines.iter().filter(|l| l.starts_with("start "));
             assert_eq!(begun.count(), started, "{limits:?}");
             assert_eq!(report.summary, summary);
+            // Then what it spent, every GraphQL point an estimate here.
+            let line = report.summary_line();
+            let spent = format!(
+                "{summary}, requests {}, points ~{}",
+                report.spent.requests, report.spent.points
+            );
+            assert_eq!(line, spent);
+            assert!(report.spent.requests > 0 && report.spent.points > 0);
             assert_eq!(report.failures, 0, "{:#?}", report.lines);
         }
         let issue = |line: &str| line.split(' ').nth(2).unwrap().to_owned();
@@ -3428,6 +3436,114 @@ fn budget_refuses_past_its_time() {
         // The replay refuses a write the budget lets through.
         let error = budget.send("PATCH", url, &json!({})).unwrap_err();
         assert_eq!(error.to_string() != spent, write, "{case}: {error}");
+    }
+}
+
+/// A [`Forge`] that GitHub refuses under a rate limit, past the client's
+/// retries, from its `after`th request on; it counts what reaches it.
+struct Throttled {
+    forge: Forge,
+    after: usize,
+    sent: Cell<usize>,
+}
+
+impl Throttled {
+    fn send(&self) -> Result<()> {
+        let sent = self.sent.get();
+        self.sent.set(sent + 1);
+        ensure!(
+            sent < self.after,
+            RateLimited("GitHub rate limit: gave up after 3 retries".into())
+        );
+        Ok(())
+    }
+}
+
+impl Broker for Throttled {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.forge.usage(url)
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.forge.grant(url)
+    }
+}
+
+impl Rest for Throttled {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        self.send()?;
+        self.forge.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        Throttled::send(self)?;
+        self.forge.send(method, url, body)
+    }
+}
+
+impl Transport for Throttled {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.send()?;
+        Transport::graphql(&self.forge, query, variables)
+    }
+}
+
+impl crate::github::GraphQl for Throttled {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
+/// A pass refused under a rate limit at any point sends nothing after the
+/// refusal, reports it in one `rate-limited` line rather than a failure
+/// per operation, and still ends with its summary.
+#[test]
+fn apply_stops_at_the_first_rate_limit() {
+    let config = config(json!({"wip": 3}));
+    // Where the refusal comes: the first request, stage 4's first read and
+    // its capacity read, a start's write, the note after its run, and stage
+    // 5's board read.
+    for after in [0, 10, 20, 25, 28, 30] {
+        let forge = Throttled {
+            forge: Forge::new(None, false),
+            after,
+            sent: Cell::new(0),
+        };
+        let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
+        let report = block(run_within(
+            &forge,
+            &forge,
+            &config,
+            (
+                State::default(),
+                Mode::Actions(&own()),
+                Limits::default(),
+                forge.forge.replay.now,
+            ),
+            &bounds,
+        ))
+        .unwrap();
+        let lines = &report.lines;
+        assert_eq!(forge.sent.get(), after + 1, "{after}: {lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains(NOT_SENT)), "{lines:#?}");
+        let limited: Vec<_> = (lines.iter())
+            .filter(|l| l.starts_with("rate-limited: "))
+            .collect();
+        assert_eq!(limited.len(), 1, "{after}: {lines:#?}");
+        assert!(
+            limited[0].contains("GitHub rate limit: gave up after 3 retries; "),
+            "{}",
+            limited[0]
+        );
+        assert_eq!(lines.last(), Some(limited[0]), "{lines:#?}");
+        // The refused operation's failure, and nothing for what was not sent.
+        assert_eq!(report.failures, 1, "{after}: {lines:#?}");
+        let spent = report.spent;
+        assert_eq!((spent.requests, spent.rate_limited), (after + 1, true));
+        let line = report.summary_line();
+        assert!(line.starts_with(&report.summary), "{line}");
+        assert!(line.ends_with(", rate-limited"), "{line}");
     }
 }
 

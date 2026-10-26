@@ -107,10 +107,16 @@ command that loads a live GitHub board (`item list`, `project view`,
 `reconcile plan` and the others that take `--owner` and `--project`), the
 pass's Status stage and the live fixture's readback. The client holds its
 limits in one place: at most `MAX_IN_FLIGHT` requests at once, and a
-request GitHub refuses under a rate limit (403 or 429 with `Retry-After`,
-or with no requests remaining until `x-ratelimit-reset`) retried at most
+request GitHub refuses under a rate limit retried at most
 `RATE_LIMIT_RETRIES` times, waiting at most `RATE_LIMIT_WAIT` in all for
-that request. The snapshot's request budget is passed per read,
+that request and never past its deadline (a pass's time bound). A refusal
+is a 429; a 403 with `Retry-After`, no requests remaining or a message
+naming a rate limit; or GraphQL `RATE_LIMIT` errors without data, which is
+how GitHub answers a secondary limit, with HTTP 200 and no `Retry-After`.
+Each retry waits what `Retry-After` or `x-ratelimit-reset` asks, or else
+`SECONDARY_WAIT` (a minute) doubled for each retry before, as GitHub asks.
+The sync paths below retry by the same policy, and one given up on is a
+typed `RateLimited` error. The snapshot's request budget is passed per read,
 `SNAPSHOT_REQUEST_LIMIT` (1,000) by default; running out is an error, never
 a partial snapshot.
 

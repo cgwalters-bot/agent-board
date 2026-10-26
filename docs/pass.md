@@ -256,9 +256,16 @@ Each decision is one line: `start triage|implement|planning OWNER/REPO#N … poo
 step that a cap held ends `-> held by --max-dispatch` or
 `-> held by --max-writes`. With `--apply`, a started line also names its
 dispatch record and run. The last line is a summary such as
-`summary: dispatched 1/1, writes 3/5, held 12`, which counts what a preview
-plans and what an apply did, and the steps the caps held; an uncapped kind
-has no `/N`.
+`summary: dispatched 1/1, writes 3/5, held 12, requests 80, points ~95`, which
+counts what a preview plans and what an apply did, the steps the caps held
+(an uncapped kind has no `/N`), and the pass's budgeted requests and GraphQL
+points; `~` marks points estimated as 1 a query and 5 a mutation where the
+response reads no `rateLimit { cost }`.
+A request GitHub still refuses under a rate limit after the client's
+retries stops the pass from sending anything more, as more requests only
+prolong a secondary limit: the refused operation fails as usual, the
+requests not sent are left out, and one `rate-limited: …` line says why,
+before the summary, which then ends `, rate-limited`. The next pass carries on.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
 snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 2 actually starts, so it

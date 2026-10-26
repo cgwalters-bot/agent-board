@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use board_core::{Capability, Coverage, Evidence, Item, ItemRef, Snapshot};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use url::Url;
 
 pub const DEFAULT_HOST: &str = "github.com";
@@ -151,6 +151,20 @@ impl std::fmt::Display for NotFound {
 }
 
 impl std::error::Error for NotFound {}
+
+/// GitHub refused a request under a rate limit, primary or secondary, and
+/// it was not waited out ([`Backoff`]); or a pass stopped by one did not
+/// send it. It says why.
+#[derive(Debug)]
+pub struct RateLimited(pub String);
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 pub trait Transport {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value>;
@@ -388,9 +402,10 @@ impl<T: GraphQl> GraphQl for DiagnosticTransport<'_, T> {
 /// `error` with `context`, and on a refusal the `permission` it needs.
 fn refusal(error: anyhow::Error, context: String, permission: &str) -> anyhow::Error {
     let message = format!("{error:#}");
-    let context = if ["FORBIDDEN", "HTTP status 403", "HTTP status 404"]
-        .iter()
-        .any(|s| message.contains(s))
+    let context = if !error.is::<RateLimited>()
+        && ["FORBIDDEN", "HTTP status 403", "HTTP status 404"]
+            .iter()
+            .any(|s| message.contains(s))
     {
         format!(
             "{context}\nFine-grained token needs {permission}; an organization can also hold a fine-grained token pending approval."
@@ -571,6 +586,13 @@ impl Client {
         Self::with_token(String::new())
     }
 
+    /// The client with no retry under a rate limit waiting past `deadline`,
+    /// as a pass's time bound ([`Backoff`]).
+    pub fn retry_within(mut self, deadline: Instant) -> Self {
+        self.api.deadline = Some(deadline);
+        self
+    }
+
     fn authorize<B>(&self, request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         if self.token.is_empty() {
             return request;
@@ -653,10 +675,17 @@ pub const MAX_IN_FLIGHT: usize = 4;
 /// client's, not one of an operation's budgeted requests.
 pub const RATE_LIMIT_RETRIES: u32 = 3;
 
-/// The longest one request's retries may wait together; a wait past it
-/// gives up at once. Per request, not per operation: a read of many
-/// requests may wait this long for each.
-pub const RATE_LIMIT_WAIT: Duration = Duration::from_secs(120);
+/// The first wait for a refusal that names none, doubled for each retry
+/// after it: GitHub asks for at least a minute, backing off exponentially,
+/// for a secondary rate limit.
+pub const SECONDARY_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest one request's retries may wait together, the secondary waits
+/// of every retry; a wait past it gives up at once. Per request, not per
+/// operation: a read of many requests may wait this long for each, within
+/// its client's deadline ([`Client::retry_within`]).
+pub const RATE_LIMIT_WAIT: Duration =
+    Duration::from_secs(SECONDARY_WAIT.as_secs() * ((1 << RATE_LIMIT_RETRIES) - 1));
 
 /// The most of a response body read, as ureq's default for JSON.
 const RESPONSE_BYTES: usize = 10 * 1024 * 1024;
@@ -668,11 +697,38 @@ const REQUEST_SECONDS: u64 = 30;
 #[derive(Clone)]
 pub(crate) struct Reply {
     status: u16,
+    limits: Limits,
+    body: Vec<u8>,
+}
+
+/// A response's rate-limit headers.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Limits {
     retry_after: Option<String>,
     /// `x-ratelimit-remaining` and `x-ratelimit-reset`.
     remaining: Option<String>,
     reset: Option<String>,
-    body: Vec<u8>,
+}
+
+impl Limits {
+    /// The headers `header` looks up by their lower-case names.
+    fn read(header: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            retry_after: header("retry-after"),
+            remaining: header("x-ratelimit-remaining"),
+            reset: header("x-ratelimit-reset"),
+        }
+    }
+
+    /// Those of a ureq response.
+    fn of(headers: &ureq::http::HeaderMap) -> Self {
+        Self::read(|name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        })
+    }
 }
 
 /// One POST of JSON to the API: [`Https`] live, a fake in tests.
@@ -720,18 +776,13 @@ impl Http for Https {
             .send()
             .await
             .map_err(failed)?;
-        let header = |name: &str| {
+        let limits = Limits::read(|name| {
             response
                 .headers()
                 .get(name)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned)
-        };
-        let (retry_after, remaining, reset) = (
-            header("retry-after"),
-            header("x-ratelimit-remaining"),
-            header("x-ratelimit-reset"),
-        );
+        });
         let status = response.status().as_u16();
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(failed)? {
@@ -743,9 +794,7 @@ impl Http for Https {
         }
         Ok(Reply {
             status,
-            retry_after,
-            remaining,
-            reset,
+            limits,
             body,
         })
     }
@@ -754,11 +803,13 @@ impl Http for Https {
 /// The async GitHub client, which holds its limits in one place: at most
 /// [`MAX_IN_FLIGHT`] requests at once, and a request refused under a rate
 /// limit retried at most [`RATE_LIMIT_RETRIES`] times within
-/// [`RATE_LIMIT_WAIT`] ([`rate_limit_wait`]). An operation's request budget
+/// [`RATE_LIMIT_WAIT`] ([`Backoff`]). An operation's request budget
 /// is its own ([`GitHub::snapshot_with_policy`]).
 pub(crate) struct Api<H = Https> {
     http: H,
     in_flight: tokio::sync::Semaphore,
+    /// No retry waits past it ([`Client::retry_within`]).
+    deadline: Option<Instant>,
 }
 
 impl Api {
@@ -775,6 +826,7 @@ impl<H: Http> Api<H> {
         Self {
             http,
             in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
+            deadline: None,
         }
     }
 
@@ -782,28 +834,21 @@ impl<H: Http> Api<H> {
     /// bounds allow. A request waiting out a limit holds no slot. The last
     /// reply comes back with why it was not retried, if it was refused.
     async fn post(&self, url: &str, body: &[u8]) -> Result<(Reply, Option<String>)> {
-        let mut waited = Duration::ZERO;
-        let mut retries = 0;
+        let mut backoff = Backoff::new(self.deadline);
         loop {
             let reply = {
                 let _slot = self.in_flight.acquire().await?;
                 self.http.post(url, body).await?
             };
-            let Some(wait) = rate_limit_wait(&reply, SystemTime::now()) else {
+            let decoded = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+            let Some(wait) = rate_limited(reply.status, &reply.limits, &decoded, SystemTime::now())
+            else {
                 return Ok((reply, None));
             };
-            let total = waited.checked_add(wait).filter(|t| *t <= RATE_LIMIT_WAIT);
-            let Some(total) = total.filter(|_| retries < RATE_LIMIT_RETRIES) else {
-                let why = format!(
-                    "GitHub rate limit: gave up after {retries} retries and {}s of waiting, asked to wait {}s more",
-                    waited.as_secs(),
-                    wait.as_secs()
-                );
-                return Ok((reply, Some(why)));
-            };
-            tokio::time::sleep(wait).await;
-            waited = total;
-            retries += 1;
+            match backoff.next(wait, tokio::time::Instant::now().into_std()) {
+                Ok(wait) => tokio::time::sleep(wait).await,
+                Err(why) => return Ok((reply, Some(why))),
+            }
         }
     }
 }
@@ -817,33 +862,146 @@ impl<H: Http> GraphQl for Api<H> {
             Err(_) if !(200..300).contains(&reply.status) => json!({}),
             Err(error) => return Err(error).context("decode GitHub GraphQL response"),
         };
-        // A refusal given up on keeps today's error, and says why.
-        http_response_data(reply.status, body).map_err(|error| match gave_up {
-            Some(why) => error.context(why),
-            None => error,
-        })
+        http_response_data(reply.status, body).map_err(|error| given_up(error, gave_up))
     }
 }
 
-/// How long to wait before retrying `reply`, if GitHub refused it under a
-/// rate limit: a 403 or 429 with `Retry-After` seconds, or else with no
-/// requests remaining until `x-ratelimit-reset`. A 403 with neither is a
-/// refusal, and is not retried.
-fn rate_limit_wait(reply: &Reply, now: SystemTime) -> Option<Duration> {
-    if !matches!(reply.status, 403 | 429) {
-        return None;
+/// A refusal given up on keeps today's error, and says why, as a
+/// [`RateLimited`] one.
+fn given_up(error: anyhow::Error, why: Option<String>) -> anyhow::Error {
+    match why {
+        Some(why) => error.context(RateLimited(why)),
+        None => error,
     }
+}
+
+/// How long GitHub asks a request refused under a rate limit to wait.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Wait {
+    /// By `Retry-After`, or by `x-ratelimit-reset` with no requests left.
+    Asked(Duration),
+    /// It does not say, as for most secondary rate limits.
+    Unsaid,
+}
+
+/// Whether a GraphQL error is a rate limit's: `RATE_LIMITED` for the
+/// hourly points, `RATE_LIMIT` (`graphql_rate_limit`) for a secondary one.
+fn rate_limit_error(error: &Value) -> bool {
+    ["RATE_LIMITED", "RATE_LIMIT"].contains(&error["type"].as_str().unwrap_or_default())
+        || error["code"] == "graphql_rate_limit"
+}
+
+/// Whether a refusal's REST message names a rate limit, as GitHub's for a
+/// primary and a secondary one do, where a permission refusal does not.
+fn rate_limit_message(body: &Value) -> bool {
+    body["message"]
+        .as_str()
+        .is_some_and(|m| m.to_ascii_lowercase().contains("rate limit"))
+}
+
+/// Whether GitHub refused a response under a rate limit, and how long it
+/// asks to wait if so: a 429; a 403 that asks to wait, has no requests
+/// left or names a rate limit; or GraphQL rate-limit errors without data,
+/// as GitHub answers a secondary limit with HTTP 200. A GraphQL response
+/// with data was answered, and a 403 that is none of these is a refusal:
+/// neither is retried.
+fn rate_limited(status: u16, limits: &Limits, body: &Value, now: SystemTime) -> Option<Wait> {
     let seconds = |value: &Option<String>| value.as_deref()?.trim().parse::<u64>().ok();
-    if let Some(after) = seconds(&reply.retry_after) {
-        return Some(Duration::from_secs(after));
-    }
-    if seconds(&reply.remaining) != Some(0) {
+    let after = seconds(&limits.retry_after);
+    let exhausted = seconds(&limits.remaining) == Some(0);
+    let graphql = body["data"].is_null()
+        && body["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(rate_limit_error));
+    let refused = match status {
+        429 => true,
+        403 => graphql || after.is_some() || exhausted || rate_limit_message(body),
+        _ => graphql,
+    };
+    if !refused {
         return None;
     }
-    let reset = seconds(&reply.reset)?;
-    let now = now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    // A reset already past waits a second rather than none.
-    Some(Duration::from_secs(reset.saturating_sub(now).max(1)))
+    if let Some(after) = after {
+        return Some(Wait::Asked(Duration::from_secs(after)));
+    }
+    let reset = seconds(&limits.reset).filter(|_| exhausted);
+    let now = now.duration_since(std::time::UNIX_EPOCH).ok();
+    Some(match reset.zip(now) {
+        // A reset already past waits a second rather than none.
+        Some((reset, now)) => Wait::Asked(Duration::from_secs(
+            reset.saturating_sub(now.as_secs()).max(1),
+        )),
+        None => Wait::Unsaid,
+    })
+}
+
+/// The waits of one request's retries under a rate limit: what GitHub asks,
+/// or else [`SECONDARY_WAIT`] doubled for each retry before; at most
+/// [`RATE_LIMIT_RETRIES`], [`RATE_LIMIT_WAIT`] together, and none past the
+/// deadline. Every transport path retries by it.
+struct Backoff {
+    retries: u32,
+    waited: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Backoff {
+    fn new(deadline: Option<Instant>) -> Self {
+        Self {
+            retries: 0,
+            waited: Duration::ZERO,
+            deadline,
+        }
+    }
+
+    /// How long to wait at `now` before retrying a refusal that asks for
+    /// `wait`, or why it is not retried.
+    fn next(&mut self, wait: Wait, now: Instant) -> std::result::Result<Duration, String> {
+        let (wait, asked) = match wait {
+            Wait::Asked(wait) => (wait, "asked to wait"),
+            Wait::Unsaid => {
+                let doubled = 1u32.checked_shl(self.retries).unwrap_or(u32::MAX);
+                (SECONDARY_WAIT.saturating_mul(doubled), "backing off")
+            }
+        };
+        let total = self.waited.saturating_add(wait);
+        let late = self
+            .deadline
+            .is_some_and(|deadline| now.checked_add(wait).is_none_or(|at| at > deadline));
+        if self.retries >= RATE_LIMIT_RETRIES || total > RATE_LIMIT_WAIT || late {
+            let past = if late { ", past the time bound" } else { "" };
+            return Err(format!(
+                "GitHub rate limit: gave up after {} retries and {}s of waiting, {asked} {}s more{past}",
+                self.retries,
+                self.waited.as_secs(),
+                wait.as_secs()
+            ));
+        }
+        self.retries += 1;
+        self.waited = total;
+        Ok(wait)
+    }
+}
+
+/// `send` again after each refusal under a rate limit, sleeping between by
+/// `sleep`, while `backoff` allows: the sync transport paths' [`Api::post`].
+/// The last answer comes back with why it was not retried, if it was
+/// refused.
+fn retrying<T>(
+    mut backoff: Backoff,
+    mut send: impl FnMut() -> Result<(T, Option<Wait>)>,
+    mut sleep: impl FnMut(Duration),
+) -> Result<(T, Option<String>)> {
+    loop {
+        let (answer, wait) = send()?;
+        let Some(wait) = wait else {
+            return Ok((answer, None));
+        };
+        match backoff.next(wait, Instant::now()) {
+            Ok(wait) => sleep(wait),
+            Err(why) => return Ok((answer, Some(why))),
+        }
+    }
 }
 
 /// The HTTPS agent every live forge client uses.
@@ -903,6 +1061,13 @@ fn response_data(response: Value) -> Result<Value> {
         return Err(anyhow::Error::from(AuthenticationRequired)
             .context(format!("GitHub GraphQL: {details}")));
     }
+    if response["errors"]
+        .as_array()
+        .is_some_and(|errors| errors.iter().any(rate_limit_error))
+    {
+        let why = format!("GitHub GraphQL: {details}; response may be partial");
+        return Err(RateLimited(why).into());
+    }
     ensure!(
         response
             .get("errors")
@@ -918,20 +1083,33 @@ fn response_data(response: Value) -> Result<Value> {
 
 impl Transport for Client {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        let mut response = self
-            .agent
-            .post("https://api.github.com/graphql")
-            .header("Authorization", &format!("Bearer {}", self.token))
-            .header("User-Agent", "agent-board")
-            .send_json(json!({"query":query,"variables":variables}))
-            .map_err(transport_error)?;
-        let status = response.status().as_u16();
-        let body: Value = match response.body_mut().read_json() {
-            Ok(body) => body,
-            Err(_) if !(200..300).contains(&status) => json!({}),
-            Err(error) => return Err(error).context("decode GitHub GraphQL response"),
+        let request = json!({"query":query,"variables":variables});
+        let send = || {
+            let mut response = self
+                .agent
+                .post(GRAPHQL_URL)
+                .header("Authorization", &format!("Bearer {}", self.token))
+                .header("User-Agent", "agent-board")
+                .send_json(&request)
+                .map_err(transport_error)?;
+            let status = response.status().as_u16();
+            let limits = Limits::of(response.headers());
+            let body: Value = match response.body_mut().read_json() {
+                Ok(body) => body,
+                Err(_) if !(200..300).contains(&status) => json!({}),
+                Err(error) => return Err(error).context("decode GitHub GraphQL response"),
+            };
+            let wait = rate_limited(status, &limits, &body, SystemTime::now());
+            Ok(((status, body), wait))
         };
-        http_response_data(status, body)
+        let ((status, body), gave_up) = retrying(self.backoff(), send, std::thread::sleep)?;
+        http_response_data(status, body).map_err(|error| given_up(error, gave_up))
+    }
+}
+
+impl Client {
+    fn backoff(&self) -> Backoff {
+        Backoff::new(self.api.deadline)
     }
 }
 
@@ -1000,31 +1178,44 @@ impl crate::poll::Rest for Client {
                 body => request.send_json(body),
             }
         };
-        let mut response = match method {
-            // Unconditional, with its status for the caller to judge.
-            "GET" => request(self.agent.get(url).force_send_body()),
-            "POST" => request(self.agent.post(url)),
-            "PATCH" => request(self.agent.patch(url)),
-            "PUT" => request(self.agent.put(url)),
-            "DELETE" => request(self.agent.delete(url).force_send_body()),
-            _ => anyhow::bail!("unsupported method {method}"),
-        }
-        .map_err(transport_error)?;
-        let status = response.status().as_u16();
-        if status == 401 {
-            return Err(anyhow::Error::from(AuthenticationRequired)
-                .context(format!("{method} {path}: GitHub HTTP status 401")));
-        }
-        // 204 (a dispatch without run details) has no body.
-        let text = response
-            .body_mut()
-            .read_to_string()
-            .with_context(|| format!("read {method} {path}"))?;
-        let body = if text.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&text).unwrap_or(Value::String(text))
+        let send = || {
+            let mut response = match method {
+                // Unconditional, with its status for the caller to judge.
+                "GET" => request(self.agent.get(url).force_send_body()),
+                "POST" => request(self.agent.post(url)),
+                "PATCH" => request(self.agent.patch(url)),
+                "PUT" => request(self.agent.put(url)),
+                "DELETE" => request(self.agent.delete(url).force_send_body()),
+                _ => anyhow::bail!("unsupported method {method}"),
+            }
+            .map_err(transport_error)?;
+            let status = response.status().as_u16();
+            if status == 401 {
+                return Err(anyhow::Error::from(AuthenticationRequired)
+                    .context(format!("{method} {path}: GitHub HTTP status 401")));
+            }
+            let limits = Limits::of(response.headers());
+            // 204 (a dispatch without run details) has no body.
+            let text = response
+                .body_mut()
+                .read_to_string()
+                .with_context(|| format!("read {method} {path}"))?;
+            let body = if text.trim().is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(&text).unwrap_or(Value::String(text))
+            };
+            let wait = rate_limited(status, &limits, &body, SystemTime::now());
+            Ok(((status, body), wait))
         };
+        let ((status, body), gave_up) = retrying(self.backoff(), send, std::thread::sleep)?;
+        if let Some(why) = gave_up {
+            let message = body["message"].as_str().unwrap_or("message unavailable");
+            return Err(
+                anyhow::anyhow!("{method} {path}: GitHub HTTP status {status}: {message}")
+                    .context(RateLimited(why)),
+            );
+        }
         Ok((status, body))
     }
 
@@ -1034,16 +1225,41 @@ impl crate::poll::Rest for Client {
             url.starts_with(API_ROOT),
             "refusing to send the token outside {API_ROOT}"
         );
-        let mut request = self
-            .authorize(self.agent.get(url))
-            .header("User-Agent", "agent-board")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some((name, value)) = validator {
-            request = request.header(name, value);
-        }
-        let mut response = request.call().map_err(transport_error)?;
+        let path = url.trim_start_matches(API_ROOT);
+        let send = || {
+            let mut request = self
+                .authorize(self.agent.get(url))
+                .header("User-Agent", "agent-board")
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28");
+            if let Some((name, value)) = validator {
+                request = request.header(name, value);
+            }
+            let mut response = request.call().map_err(transport_error)?;
+            let status = response.status().as_u16();
+            // Only a refusal's body says whether it is a rate limit's.
+            let wait = matches!(status, 403 | 429).then(|| {
+                let body = response.body_mut().read_json().unwrap_or(Value::Null);
+                let limits = Limits::of(response.headers());
+                (
+                    rate_limited(status, &limits, &body, SystemTime::now()),
+                    body,
+                )
+            });
+            let (wait, refusal) = wait.unzip();
+            Ok(((response, refusal), wait.flatten()))
+        };
+        let ((mut response, refusal), gave_up) =
+            retrying(self.backoff(), send, std::thread::sleep)?;
         let status = response.status().as_u16();
+        if let Some(why) = gave_up {
+            let body = refusal.unwrap_or_default();
+            let message = body["message"].as_str().unwrap_or("message unavailable");
+            return Err(
+                anyhow::anyhow!("GET {path}: GitHub HTTP status {status}: {message}")
+                    .context(RateLimited(why)),
+            );
+        }
         let header = |name: &str| {
             response
                 .headers()
@@ -1053,7 +1269,6 @@ impl crate::poll::Rest for Client {
         };
         let (etag, last_modified) = (header("etag"), header("last-modified"));
         let link = header("link");
-        let path = url.trim_start_matches(API_ROOT);
         let body = match status {
             304 => Value::Null,
             200..300 => response
@@ -1089,6 +1304,9 @@ fn http_response_data(status: u16, body: Value) -> Result<Value> {
         }
         if status == 401 {
             return Err(anyhow::Error::from(AuthenticationRequired).context(diagnostic));
+        }
+        if status == 429 || (status == 403 && rate_limit_message(&body)) {
+            return Err(RateLimited(diagnostic).into());
         }
         anyhow::bail!("{diagnostic}");
     }
@@ -2116,108 +2334,311 @@ mod tests {
             self.in_flight.set(self.in_flight.get() - 1);
             Ok(self.replies.borrow_mut().pop_front().unwrap_or(Reply {
                 status: 200,
-                retry_after: None,
-                remaining: None,
-                reset: None,
+                limits: Limits::default(),
                 body: br#"{"data":{"ok":true}}"#.to_vec(),
             }))
         }
     }
 
-    /// A refusal with `Retry-After` and the rate-limit headers.
-    fn refused(status: u16, retry_after: Option<&str>, remaining: Option<&str>) -> Reply {
+    /// A REST secondary rate limit, a permission refusal, and GitHub's
+    /// GraphQL secondary rate limit, which it answers with HTTP 200 and
+    /// without `Retry-After`.
+    const SECONDARY: &str = r#"{"message":"You have exceeded a secondary rate limit"}"#;
+    const PERMISSION: &str = r#"{"message":"Resource not accessible by integration"}"#;
+    const GRAPHQL_LIMIT: &str = r#"{"errors":[{"type":"RATE_LIMIT","code":"graphql_rate_limit","message":"API rate limit already exceeded for user ID 1."}]}"#;
+
+    /// A response with `Retry-After`, the rate-limit headers and `body`.
+    fn reply(status: u16, retry_after: Option<&str>, remaining: Option<&str>, body: &str) -> Reply {
         Reply {
             status,
-            retry_after: retry_after.map(str::to_owned),
-            remaining: remaining.map(str::to_owned),
-            reset: Some("1000090".into()),
-            body: br#"{"message":"You have exceeded a secondary rate limit"}"#.to_vec(),
+            limits: Limits {
+                retry_after: retry_after.map(str::to_owned),
+                remaining: remaining.map(str::to_owned),
+                reset: Some("1000090".into()),
+            },
+            body: body.as_bytes().to_vec(),
         }
     }
 
+    /// Each response shape: whether it is refused under a rate limit and
+    /// what wait it asks, and whether its error is a [`RateLimited`] one.
     #[test]
-    fn rate_limit_wait_table() {
+    fn rate_limit_classification_table() {
         // The reset above is 90 seconds after this.
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        for (reply, expected) in [
-            (refused(200, Some("30"), Some("0")), None),
-            (refused(500, Some("30"), Some("0")), None),
-            (refused(403, Some("30"), None), Some(30)),
-            (refused(429, Some("0"), None), Some(0)),
-            (refused(429, Some(" 7 "), Some("0")), Some(7)),
+        let asked = |seconds| Some(Wait::Asked(Duration::from_secs(seconds)));
+        let unsaid = Some(Wait::Unsaid);
+        for (reply, expected, typed) in [
+            (
+                reply(200, None, None, r#"{"data":{"ok":true}}"#),
+                None,
+                false,
+            ),
+            // GraphQL's secondary limit, with points left: the 26 Oct pass.
+            (reply(200, None, Some("4350"), GRAPHQL_LIMIT), unsaid, true),
+            (reply(200, None, Some("0"), GRAPHQL_LIMIT), asked(90), true),
+            (
+                reply(200, None, None, r#"{"errors":[{"type":"RATE_LIMITED"}]}"#),
+                unsaid,
+                true,
+            ),
+            // Answered with data: not retried, as a mutation may have applied.
+            (
+                reply(
+                    200,
+                    None,
+                    None,
+                    r#"{"data":{},"errors":[{"type":"RATE_LIMIT"}]}"#,
+                ),
+                None,
+                true,
+            ),
+            (reply(500, Some("30"), Some("0"), SECONDARY), None, false),
+            (reply(403, Some("30"), None, PERMISSION), asked(30), false),
+            (reply(429, Some("0"), None, SECONDARY), asked(0), true),
+            (
+                reply(429, Some(" 7 "), Some("0"), SECONDARY),
+                asked(7),
+                true,
+            ),
             // Without Retry-After, the reset when no requests remain.
-            (refused(403, None, Some("0")), Some(90)),
-            (refused(429, Some("soon"), Some("0")), Some(90)),
+            (reply(403, None, Some("0"), PERMISSION), asked(90), false),
+            (
+                reply(429, Some("soon"), Some("0"), SECONDARY),
+                asked(90),
+                true,
+            ),
+            // Without either, a secondary limit's message, or any 429.
+            (reply(403, None, None, SECONDARY), unsaid, true),
+            (
+                reply(
+                    403,
+                    None,
+                    Some("12"),
+                    r#"{"message":"API rate limit exceeded"}"#,
+                ),
+                unsaid,
+                true,
+            ),
+            (reply(429, None, None, ""), unsaid, true),
             // A 403 that is not a rate limit is a refusal, not retried.
-            (refused(403, None, None), None),
-            (refused(403, None, Some("12")), None),
-            (refused(429, None, None), None),
+            (reply(403, None, None, PERMISSION), None, false),
+            (reply(403, None, Some("12"), PERMISSION), None, false),
+            (reply(401, Some("5"), None, SECONDARY), None, false),
         ] {
-            let context = (
-                reply.status,
-                reply.retry_after.clone(),
-                reply.remaining.clone(),
+            let body = serde_json::from_slice(&reply.body).unwrap_or(json!({}));
+            let context = (reply.status, reply.limits.clone(), body.clone());
+            let wait = rate_limited(reply.status, &reply.limits, &body, now);
+            assert_eq!(wait, expected, "{context:?}");
+            let result = http_response_data(reply.status, body);
+            assert_eq!(
+                result.is_err_and(|e| e.is::<RateLimited>()),
+                typed,
+                "{context:?}"
             );
-            let wait = rate_limit_wait(&reply, now);
-            assert_eq!(wait, expected.map(Duration::from_secs), "{context:?}");
         }
         let past = std::time::UNIX_EPOCH + Duration::from_secs(2_000_000);
-        let wait = rate_limit_wait(&refused(403, None, Some("0")), past);
-        assert_eq!(wait, Some(Duration::from_secs(1)));
+        let reply = reply(403, None, Some("0"), PERMISSION);
+        let wait = rate_limited(reply.status, &reply.limits, &Value::Null, past);
+        assert_eq!(wait, Some(Wait::Asked(Duration::from_secs(1))));
+    }
+
+    /// The waits [`Backoff`] gives a run of refusals, by a clock that moves
+    /// only by them, with an optional deadline that many seconds away.
+    #[test]
+    fn backoff_table() {
+        use Wait::{Asked, Unsaid};
+        let secs = Duration::from_secs;
+        type Case = (
+            Option<u64>,
+            Vec<Wait>,
+            Vec<std::result::Result<u64, &'static str>>,
+        );
+        let cases: Vec<Case> = vec![
+            // At least a minute, doubled for each retry.
+            (
+                None,
+                vec![Unsaid; 4],
+                vec![
+                    Ok(60),
+                    Ok(120),
+                    Ok(240),
+                    Err("gave up after 3 retries and 420s of waiting, backing off 480s more"),
+                ],
+            ),
+            (None, vec![Asked(secs(10)), Unsaid], vec![Ok(10), Ok(120)]),
+            (
+                None,
+                vec![Asked(secs(3600))],
+                vec![Err(
+                    "gave up after 0 retries and 0s of waiting, asked to wait 3600s more",
+                )],
+            ),
+            (
+                None,
+                vec![Asked(secs(400)), Asked(secs(30))],
+                vec![Ok(400), Err("400s of waiting, asked to wait 30s more")],
+            ),
+            // Never past the deadline.
+            (
+                Some(90),
+                vec![Unsaid; 2],
+                vec![Ok(60), Err("backing off 120s more, past the time bound")],
+            ),
+            (
+                Some(30),
+                vec![Asked(secs(10)), Asked(secs(30))],
+                vec![Ok(10), Err("asked to wait 30s more, past the time bound")],
+            ),
+        ];
+        for (deadline, waits, expected) in cases {
+            let start = Instant::now();
+            let mut backoff = Backoff::new(deadline.map(|d| start + secs(d)));
+            let mut now = start;
+            let got: Vec<_> = waits
+                .into_iter()
+                .map(|wait| {
+                    let next = backoff.next(wait, now);
+                    now += next.clone().unwrap_or_default();
+                    next
+                })
+                .collect();
+            assert_eq!(got.len(), expected.len());
+            for (got, expected) in got.iter().zip(&expected) {
+                match (got, expected) {
+                    (Ok(got), Ok(expected)) => assert_eq!(got.as_secs(), *expected),
+                    (Err(got), Err(expected)) => assert!(got.contains(expected), "{got}"),
+                    _ => panic!("{deadline:?}: {got:?}, expected {expected:?}"),
+                }
+            }
+        }
+    }
+
+    /// The sync paths' retry sleeps through the sleep it is given.
+    #[test]
+    fn sync_retry_table() {
+        let (asked, unsaid) = (
+            Some(Wait::Asked(Duration::from_secs(5))),
+            Some(Wait::Unsaid),
+        );
+        for (script, slept, gave_up) in [
+            (vec![None], vec![], false),
+            (vec![asked, None], vec![5], false),
+            (vec![unsaid, unsaid, None], vec![60, 120], false),
+            (vec![unsaid; 4], vec![60, 120, 240], true),
+        ] {
+            let sends = script.len();
+            let mut script = script.into_iter();
+            let mut sent = 0;
+            let mut sleeps = vec![];
+            let send = || {
+                sent += 1;
+                Ok((sent, script.next().flatten()))
+            };
+            let (last, why) =
+                retrying(Backoff::new(None), send, |wait| sleeps.push(wait.as_secs())).unwrap();
+            assert_eq!(last, sends, "{slept:?}");
+            assert_eq!(sleeps, slept);
+            assert_eq!(why.is_some(), gave_up, "{why:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn rate_limit_retry_table() {
-        let limited = |after: &str| refused(429, Some(after), None);
-        // The script, then the requests made, the time waited between
-        // them and what the read ends with.
-        for (script, posts, waited, expected) in [
-            (vec![], 1, 0, "ok"),
-            (vec![limited("10")], 2, 10, "ok"),
-            (vec![refused(403, Some("30"), None); 2], 3, 60, "ok"),
+        let limited = |after: &str| reply(429, Some(after), None, SECONDARY);
+        let graphql = || reply(200, None, Some("4350"), GRAPHQL_LIMIT);
+        // The script and the deadline, if any, in seconds; then the
+        // requests made, the time waited between them and what the read
+        // ends with.
+        for (script, deadline, posts, waited, expected) in [
+            (vec![], None, 1, 0, "ok"),
+            (vec![limited("10")], None, 2, 10, "ok"),
+            (
+                vec![reply(403, Some("30"), None, PERMISSION); 2],
+                None,
+                3,
+                60,
+                "ok",
+            ),
             // The reset, long past by the wall clock, waits a second.
-            (vec![refused(403, None, Some("0"))], 2, 1, "ok"),
+            (
+                vec![reply(403, None, Some("0"), PERMISSION)],
+                None,
+                2,
+                1,
+                "ok",
+            ),
+            // A refusal that asks no wait waits a minute, then two.
+            (vec![reply(403, None, None, SECONDARY)], None, 2, 60, "ok"),
+            (vec![graphql(); 2], None, 3, 180, "ok"),
             // The retry bound: the last refusal is not waited out.
             (
                 vec![limited("1"); RATE_LIMIT_RETRIES as usize + 1],
+                None,
                 RATE_LIMIT_RETRIES as usize + 1,
                 u64::from(RATE_LIMIT_RETRIES),
                 "gave up after 3 retries",
+            ),
+            (
+                vec![graphql(); RATE_LIMIT_RETRIES as usize + 1],
+                None,
+                RATE_LIMIT_RETRIES as usize + 1,
+                RATE_LIMIT_WAIT.as_secs(),
+                "gave up after 3 retries and 420s of waiting, backing off 480s more: GitHub GraphQL: RATE_LIMIT",
             ),
             // The wait bound: a wait past it gives up at once, with
             // today's error for the refusal.
             (
                 vec![limited("3600")],
+                None,
                 1,
                 0,
                 "gave up after 0 retries and 0s of waiting, asked to wait 3600s more: GitHub HTTP status 429: You have exceeded",
             ),
             (
-                vec![limited("100"), refused(403, Some("30"), None)],
+                vec![limited("400"), reply(403, Some("30"), None, PERMISSION)],
+                None,
                 2,
-                100,
-                "gave up after 1 retries and 100s of waiting, asked to wait 30s more: GitHub HTTP status 403",
+                400,
+                "gave up after 1 retries and 400s of waiting, asked to wait 30s more: GitHub HTTP status 403",
             ),
             (
                 vec![limited("10"), limited(&u64::MAX.to_string())],
+                None,
                 2,
                 10,
                 "gave up after 1 retries",
             ),
+            // The deadline: the second wait would pass it.
+            (
+                vec![graphql(); 2],
+                Some(90),
+                2,
+                60,
+                "backing off 120s more, past the time bound",
+            ),
             // Not a rate limit: today's errors, without a retry.
             (
-                vec![refused(403, None, None)],
+                vec![reply(403, None, None, PERMISSION)],
+                None,
                 1,
                 0,
                 "GitHub HTTP status 403",
             ),
-            (vec![refused(401, Some("5"), None)], 1, 0, "authentication"),
+            (
+                vec![reply(401, Some("5"), None, SECONDARY)],
+                None,
+                1,
+                0,
+                "authentication",
+            ),
         ] {
-            let api = Api::with_http(Scripted {
+            let mut api = Api::with_http(Scripted {
                 replies: RefCell::new(script.into()),
                 ..Default::default()
             });
             let start = tokio::time::Instant::now();
+            api.deadline = deadline.map(|d| start.into_std() + Duration::from_secs(d));
             let result = api.graphql("query", json!({})).await;
             let outcome = match &result {
                 Ok(data) => {
@@ -2228,8 +2649,15 @@ mod tests {
             };
             assert!(outcome.contains(expected), "{expected}: {outcome}");
             assert_eq!(
-                result.is_err_and(|e| e.is::<AuthenticationRequired>()),
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.is::<AuthenticationRequired>()),
                 expected == "authentication"
+            );
+            assert_eq!(
+                result.is_err_and(|e| e.is::<RateLimited>()),
+                outcome.contains("gave up"),
+                "{expected}"
             );
             assert_eq!(api.http.posts.get(), posts, "{expected}");
             // Each request takes a second of the paused clock.

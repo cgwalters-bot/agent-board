@@ -2286,7 +2286,7 @@ fn pass_replay_previews_without_credentials() {
     assert!(text.starts_with("pass: preview\n"), "{text}");
     assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
     assert!(
-        text.ends_with("\nsummary: dispatched 6, writes 0, held 0\n"),
+        text.ends_with("\nsummary: dispatched 6, writes 0, held 0, requests 50, points ~37\n"),
         "{text}"
     );
     for refused in [

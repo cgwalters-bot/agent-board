@@ -12,7 +12,7 @@ use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
 // `GraphQl` is named by path, not imported: `graphql` on a type of both
 // traits would be ambiguous.
-use crate::github::{API_ROOT, DEFAULT_HOST, Transport, is_github_login};
+use crate::github::{API_ROOT, DEFAULT_HOST, RateLimited, Transport, is_github_login};
 use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
 use crate::poll::{
@@ -63,6 +63,15 @@ const START_REQUESTS: usize = 64;
 /// Requests only writes may spend: a claim already posted is still sent or
 /// noted when its reads have spent the rest.
 const WRITE_RESERVE: usize = 4;
+/// GraphQL points a query and a mutation are taken to cost where the
+/// response does not say (`rateLimit { cost }`), as GitHub's secondary
+/// limits count them.
+const QUERY_POINTS: u64 = 1;
+const MUTATION_POINTS: u64 = 5;
+/// What the error of each request a pass stopped by a rate limit did not
+/// send says ([`Bounds::rate_limited`]); the lines that carry it are left
+/// out of the report for its one `rate-limited` line.
+const NOT_SENT: &str = "not sent: the pass stopped at a GitHub rate limit";
 /// Pages of an issue's closing pull requests read, 100 each, when the first
 /// ten are not all of them; more is unread, which holds the issue.
 const PULL_PAGES: usize = 3;
@@ -1074,23 +1083,89 @@ pub fn rank(options: &[String], epic: Option<&str>, own: Option<&str>, facts: &F
 // ---- The forge, bounded ----
 
 /// What a pass may still spend, in requests and in time, both stages
-/// together.
+/// together, and what it spent.
 struct Bounds {
+    limit: usize,
     left: Cell<usize>,
     /// No request is admitted after this, but those [`FINISH_SECONDS`] lets
     /// finish.
     admit_by: Instant,
     /// A start passed its last check before `admit_by` and is under way.
     finishing: Cell<bool>,
+    /// GraphQL points spent, and whether any of them are estimates.
+    points: Cell<u64>,
+    estimated: Cell<bool>,
+    /// The breaker: why a refusal under a rate limit outlasted its wait,
+    /// after which nothing more is sent, and how many requests were not.
+    rate_limited: RefCell<Option<String>>,
+    not_sent: Cell<usize>,
 }
 
 impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
+            limit,
             left: Cell::new(limit),
             admit_by,
             finishing: Cell::new(false),
+            points: Cell::new(0),
+            estimated: Cell::new(false),
+            rate_limited: RefCell::new(None),
+            not_sent: Cell::new(0),
         }
+    }
+
+    /// What the pass spent, for its summary line.
+    fn spent(&self) -> Spent {
+        Spent {
+            requests: self.limit.saturating_sub(self.left.get()),
+            points: self.points.get(),
+            estimated: self.estimated.get(),
+            rate_limited: self.rate_limited.borrow().is_some(),
+        }
+    }
+
+    /// `report` with its failures for requests the breaker did not send
+    /// replaced by one `rate-limited` line, still a failure: the operation
+    /// that tripped it says what it was, and the next pass carries on.
+    fn collapse(&self, report: &mut Report) {
+        let Some(why) = self.rate_limited.borrow().clone() else {
+            return;
+        };
+        let before = report.lines.len();
+        report.lines.retain(|line| !line.contains(NOT_SENT));
+        let dropped = before - report.lines.len();
+        report.failures = report.failures.saturating_sub(dropped).max(1);
+        report.lines.push(format!(
+            "rate-limited: {why}; {} more request(s) not sent, for the next pass",
+            self.not_sent.get()
+        ));
+    }
+}
+
+/// What a pass spent ([`Report::summary_line`]): its budgeted requests and
+/// GraphQL points, `~` where some are estimates (1 a query, 5 a mutation),
+/// and whether a rate limit stopped it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Spent {
+    pub requests: usize,
+    pub points: u64,
+    pub estimated: bool,
+    pub rate_limited: bool,
+}
+
+impl std::fmt::Display for Spent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let about = if self.estimated { "~" } else { "" };
+        write!(
+            f,
+            "requests {}, points {about}{}",
+            self.requests, self.points
+        )?;
+        if self.rate_limited {
+            f.write_str(", rate-limited")?;
+        }
+        Ok(())
     }
 }
 
@@ -1098,7 +1173,9 @@ impl Bounds {
 /// [`WRITE_RESERVE`] of it to writes. Past the time bound it admits only a
 /// write, or a request of a start under way, and for [`FINISH_SECONDS`]: a
 /// claim already written can still get its run or its note, and what is
-/// left is for the next pass to observe.
+/// left is for the next pass to observe. Once a request is refused under a
+/// rate limit past the client's retries ([`RateLimited`]), it sends nothing
+/// more: more requests would only prolong the limit.
 struct Budget<'a, C> {
     inner: &'a C,
     bounds: &'a Bounds,
@@ -1107,6 +1184,10 @@ struct Budget<'a, C> {
 impl<C> Budget<'_, C> {
     fn spend(&self, write: bool) -> Result<()> {
         let bounds = self.bounds;
+        if bounds.rate_limited.borrow().is_some() {
+            bounds.not_sent.set(bounds.not_sent.get() + 1);
+            return Err(RateLimited(NOT_SENT.into()).into());
+        }
         let now = Instant::now();
         let late = now > bounds.admit_by;
         let finishing = write || bounds.finishing.get();
@@ -1123,32 +1204,72 @@ impl<C> Budget<'_, C> {
         bounds.left.set(left - 1);
         Ok(())
     }
+
+    /// `result`, after tripping the breaker on a rate limit.
+    fn observe<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result
+            && error.is::<RateLimited>()
+        {
+            let mut tripped = self.bounds.rate_limited.borrow_mut();
+            tripped.get_or_insert_with(|| format!("{error:#}"));
+        }
+        result
+    }
+
+    /// `result` of a GraphQL request, after counting its points: its
+    /// `rateLimit { cost }` where it reads one, or else an estimate.
+    fn graphql_spent(&self, mutation: bool, result: Result<Value>) -> Result<Value> {
+        let bounds = self.bounds;
+        let cost = result
+            .as_ref()
+            .ok()
+            .and_then(|data| data.pointer("/rateLimit/cost").and_then(Value::as_u64));
+        let points = cost.unwrap_or_else(|| {
+            bounds.estimated.set(true);
+            if mutation {
+                MUTATION_POINTS
+            } else {
+                QUERY_POINTS
+            }
+        });
+        bounds
+            .points
+            .set(bounds.points.get().saturating_add(points));
+        self.observe(result)
+    }
+}
+
+fn is_mutation(query: &str) -> bool {
+    query.trim_start().starts_with("mutation")
 }
 
 impl<C: Rest> Rest for Budget<'_, C> {
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.spend(false)?;
-        self.inner.get(url, validator)
+        self.observe(self.inner.get(url, validator))
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         self.spend(true)?;
-        self.inner.send(method, url, body)
+        self.observe(self.inner.send(method, url, body))
     }
 }
 
 impl<C: Transport> Transport for Budget<'_, C> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        self.spend(query.trim_start().starts_with("mutation"))?;
-        self.inner.graphql(query, variables)
+        let mutation = is_mutation(query);
+        self.spend(mutation)?;
+        self.graphql_spent(mutation, self.inner.graphql(query, variables))
     }
 }
 
 /// The whole-board read of stage 5, the pass's one async read.
 impl<C: crate::github::GraphQl> crate::github::GraphQl for Budget<'_, C> {
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
-        self.spend(query.trim_start().starts_with("mutation"))?;
-        self.inner.graphql(query, variables).await
+        let mutation = is_mutation(query);
+        self.spend(mutation)?;
+        let result = self.inner.graphql(query, variables).await;
+        self.graphql_spent(mutation, result)
     }
 }
 
@@ -1166,16 +1287,25 @@ impl<C: Broker> Broker for Budget<'_, C> {
 // ---- One pass ----
 
 /// What a pass did: a line per decision, a summary of what it dispatched,
-/// wrote and held by its caps ([`Caps::summary`]), how many operations
-/// failed, the poll's state for the next applying pass, and stages 3 and
-/// 4's holds as data, whose lines are among `lines`.
+/// wrote and held by its caps ([`Caps::summary`]), what it spent, how many
+/// operations failed, the poll's state for the next applying pass, and
+/// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
     pub lines: Vec<String>,
     pub summary: String,
+    pub spent: Spent,
     pub failures: usize,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
+}
+
+impl Report {
+    /// The pass's last line: its caps' summary and what it spent, as
+    /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80, points ~95`.
+    pub fn summary_line(&self) -> String {
+        format!("{}, {}", self.summary, self.spent)
+    }
 }
 
 /// The workflow run an applying pass runs in. No two passes may start work
@@ -1247,7 +1377,9 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         &caps,
     )
     .await;
+    bounds.collapse(&mut report);
     report.summary = caps.summary();
+    report.spent = bounds.spent();
     Ok(report)
 }
 

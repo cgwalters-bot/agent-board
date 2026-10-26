@@ -5,6 +5,7 @@ use board_forge::github::Client;
 use board_forge::github::{GraphQl, Transport};
 use board_forge::pass::{self, Config, Mode, PassRun, Recorder, Replay, Report, Seeded};
 use board_forge::poll::{Rest, State, bounds::FixBounds};
+use std::time::{Duration, Instant};
 use std::{io::Write, path::PathBuf};
 use tokio::runtime::Runtime;
 
@@ -136,7 +137,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         }
         (seed, record) => {
             let now = time::OffsetDateTime::now_utc();
-            let client = Client::from_env()?;
+            // No wait under a rate limit outlasts the pass's time bound,
+            // which starts with it.
+            let deadline = Instant::now() + Duration::from_secs(pass::PASS_SECONDS_LIMIT);
+            let client = Client::from_env()?.retry_within(deadline);
             match (seed, record) {
                 (Some(seed), Some(path)) => {
                     let seeded = Seeded {
@@ -159,7 +163,8 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                         Some(Some(own)) => Mode::Actions(own),
                         Some(None) => Mode::Local,
                     };
-                    let dispatcher = Client::from_var("DISPATCH_TOKEN");
+                    let dispatcher = Client::from_var("DISPATCH_TOKEN")
+                        .map(|dispatcher| dispatcher.retry_within(deadline));
                     let dispatcher = dispatcher.as_ref().unwrap_or(&client);
                     let pass = pass::run(&client, dispatcher, &config, state, (mode, limits), now);
                     let report = runtime.block_on(pass)?;
@@ -177,7 +182,7 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     for line in &report.lines {
         writeln!(out, "{line}")?;
     }
-    writeln!(out, "{}", report.summary)?;
+    writeln!(out, "{}", report.summary_line())?;
     ensure!(
         report.failures == 0,
         "{} operation(s) of the pass failed",
