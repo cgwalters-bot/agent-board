@@ -13,7 +13,8 @@ fn configured_with(generated_by: Option<&str>) -> Settings {
     }
     let mut cfg = supervisor();
     cfg["agent"]["dailyCaps"] = json!({"comment": 2, "create_issue": 1, "close": 1,
-        "remove_needs_human": 1, "replace_state": 1, "status_update": 1, "file_bug": 1});
+        "remove_needs_human": 1, "replace_state": 1, "status_update": 1, "file_bug": 1,
+        "clear_needs_human": 1});
     cfg["agent"]["tracker"] = json!("example/control");
     cfg["agent"]["state"] = json!({"repository": "example/control", "issue": 8});
     cfg["agent"]["project"] = json!("PVT_project");
@@ -65,6 +66,10 @@ fn actions_signed(footer: &Footer) -> Vec<Value> {
         action(
             "file_bug",
             json!({"title": "Runs time out", "body": format!("Three runs timed out.\n\n{footer}")}),
+        ),
+        action(
+            "clear_needs_human",
+            json!({"repository": "example/project", "item": 6, "evidence": "operator_comment", "comment": 31}),
         ),
     ]
 }
@@ -151,6 +156,22 @@ fn evidence(fake: &mut Fake) {
         "/repos/example/project/rules/branches/main?per_page=100&page=1".into(),
         json!([]),
     );
+    // A question held twice, the operator's release after the second hold.
+    fake.issue(6, json!({"rest": {"labels": [{"name": "Needs-Human"}]}}));
+    fake.objects.insert(
+        "/repos/example/project/issues/comments/31".into(),
+        json!({"user": {"login": "owner"}, "created_at": "2026-10-16T10:00:00Z", "updated_at": "2026-10-16T10:05:00Z",
+            "issue_url": "https://api.github.com/repos/example/project/issues/6", "body": " /release\n"}),
+    );
+    fake.objects.insert(
+        "/repos/example/project/issues/6/events?per_page=100&page=1".into(),
+        json!([
+            {"event": "labeled", "label": {"name": "needs-human"}, "actor": {"login": "worker"}, "created_at": "2026-10-15T09:00:00Z"},
+            {"event": "unlabeled", "label": {"name": "needs-human"}, "actor": {"login": "owner"}, "created_at": "2026-10-15T10:00:00Z"},
+            {"event": "labeled", "label": {"name": "needs-human"}, "actor": {"login": "worker"}, "created_at": "2026-10-16T09:00:00Z"},
+            {"event": "labeled", "label": {"name": "bug"}, "actor": {"login": "worker"}, "created_at": "2026-10-16T11:00:00Z"}
+        ]),
+    );
 }
 
 #[test]
@@ -233,6 +254,15 @@ fn signs_with(generated_by: Option<&str>) {
                 assert_eq!(method, "DELETE");
                 assert_eq!(path, "/repos/example/project/issues/4/labels/needs-human");
             }
+            "clear_needs_human" => {
+                assert_eq!(method, "DELETE");
+                assert_eq!(path, "/repos/example/project/issues/6/labels/needs-human");
+                // The log links the evidence.
+                assert_eq!(
+                    out.lines[0],
+                    "- `clear_needs_human` example/project #6: done, https://github.com/example/project/issues/6#issuecomment-31"
+                );
+            }
             "replace_state" => {
                 assert_eq!(path, "/repos/example/control/issues/8");
                 assert_eq!(body["body"], r["body"]);
@@ -293,6 +323,8 @@ fn status_updates_carry_a_summary_and_notes_on_read_changes() {
         json!({"summary": ""}),
         json!({"summary": "x".repeat(1001)}),
         json!({"summary": "```fence```"}),
+        // The next update would read its count from the agent's line.
+        json!({"summary": "Fine.\n**Needs human:** 0"}),
         json!({"notes": {"tracker#x": "Not an item number."}}),
         json!({"notes": {"example/project#0": "Not an item."}}),
         json!({"notes": {"example/project#3": "Two\nlines."}}),
@@ -340,6 +372,174 @@ fn status_updates_carry_a_summary_and_notes_on_read_changes() {
             **Also**\n- [example/control#2](https://github.com/example/control/issues/2) — Waiting.\n\n{footer}"
         )
     );
+}
+
+/// The status update's needs-human line: the pass's hold snapshot on the
+/// usage issue gives the queue, the newest update's own line the count it
+/// changed from.
+#[test]
+fn status_updates_report_the_needs_human_queue_from_the_hold_snapshot() {
+    use crate::pass::holds::{HOLDS_MARKER, HOLDS_SCHEMA};
+    let mut cfg = supervisor();
+    cfg["agent"]["dailyCaps"] = json!({"status_update": 1});
+    cfg["agent"]["project"] = json!("PVT_project");
+    let usage = json!({"repo": "example/ops", "issue": 9, "bot": "worker"});
+    let s = Settings::from_json(&board(), &cfg, Some(&usage)).unwrap();
+    let hold = |item: u64, kind: &str, priority: Value| {
+        json!({"item": format!("example/project#{item}"), "url": format!("https://github.com/example/project/issues/{item}"),
+            "epic": false, "kind": kind, "reason": "r", "operator": true, "priority": priority, "question": null})
+    };
+    let holds = json!([
+        {"item": null, "url": null, "epic": false, "kind": "wip", "reason": "r", "operator": false, "priority": null, "question": null},
+        hold(1, "needs-human", Value::Null),
+        hold(2, "needs-human", json!("P2")),
+        hold(3, "needs-design", json!("P0")),
+        hold(4, "needs-human", json!("P1")),
+        hold(5, "needs-human", json!("P2")),
+        hold(6, "needs-human", json!("P0")),
+        hold(7, "needs-human", json!("P1\n**Forged:** 1")),
+        hold(8, "needs-human", json!("P3")),
+    ]);
+    let snapshot = |author: &str, holds: &Value| {
+        let snap = json!({"schema": HOLDS_SCHEMA, "at": "2026-10-16T11:50:00Z", "truncated": 0, "holds": holds});
+        json!([{"user": {"login": author}, "body": format!("{HOLDS_MARKER}\nHolds.\n\n```json\n{snap}\n```\n")}])
+    };
+    let link =
+        |n: u64| format!("[example/project#{n}](https://github.com/example/project/issues/{n})");
+    let top = format!(
+        "First by priority: {} (P0), {} (P1), {} (P2), {} (P2), {} (P3).",
+        link(6),
+        link(4),
+        link(2),
+        link(5),
+        link(8)
+    );
+    let since = "2026-10-15T00:00:00Z";
+    let line =
+        |change: &str| format!("**Needs human:** 7{change}, as of 2026-10-16T11:50:00Z. {top}");
+    for (case, comments, previous, at, expected) in [
+        (
+            "first count",
+            snapshot("worker", &holds),
+            "No count.",
+            since,
+            Some(line("")),
+        ),
+        (
+            "grown",
+            snapshot("worker", &holds),
+            "Summary.\n\n**Needs human:** 4, as of then. First by priority: x.",
+            since,
+            Some(line(", 3 more than at the last update")),
+        ),
+        (
+            "shrunk",
+            snapshot("worker", &holds),
+            "**Needs human:** 12",
+            since,
+            Some(line(", 5 fewer than at the last update")),
+        ),
+        (
+            "unchanged",
+            snapshot("worker", &holds),
+            "**Needs human:** 7.",
+            since,
+            Some(line(", as at the last update")),
+        ),
+        // Not the update the changes start from: no count to compare.
+        (
+            "another update",
+            snapshot("worker", &holds),
+            "**Needs human:** 4",
+            "2026-10-13T00:00:00Z",
+            Some(line("")),
+        ),
+        (
+            "empty",
+            snapshot("worker", &json!([])),
+            "**Needs human:** 2",
+            since,
+            Some(
+                "**Needs human:** 0, 2 fewer than at the last update, as of 2026-10-16T11:50:00Z."
+                    .into(),
+            ),
+        ),
+        ("no snapshot", json!([]), "**Needs human:** 2", since, None),
+        (
+            "not the bot's",
+            snapshot("visitor", &holds),
+            "",
+            since,
+            None,
+        ),
+    ] {
+        let r = action(
+            "status_update",
+            json!({"status": "on-track", "summary": "Shipped."}),
+        );
+        let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
+        fake.objects.insert(
+            "/repos/example/ops/issues/9/comments?per_page=100&page=1".into(),
+            comments,
+        );
+        fake.objects.insert(
+            "statusUpdates".into(),
+            json!([{"createdAt": at, "body": previous}, {"createdAt": "2026-10-14T00:00:00Z"}]),
+        );
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert!(out.ok, "{case}: {out:?}");
+        let (_, _, body) = &fake.writes()[1];
+        let body = body["variables"]["body"].as_str().unwrap();
+        let queue = body.lines().find(|l| l.starts_with("**Needs human:**"));
+        assert_eq!(queue, expected.as_deref(), "{case}: {body}");
+        assert!(body.starts_with("Shipped.\n"), "{case}: {body}");
+    }
+    // The board's option order ranks, not the names' alphabetical one; a
+    // Priority the board no longer has ranks with none.
+    let named = json!([
+        hold(1, "needs-human", json!("Normal")),
+        hold(2, "needs-human", json!("Gone")),
+        hold(3, "needs-human", json!("High")),
+        hold(4, "needs-human", Value::Null),
+        hold(5, "needs-human", json!("Urgent")),
+    ]);
+    let r = action(
+        "status_update",
+        json!({"status": "on-track", "summary": "Shipped."}),
+    );
+    let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
+    fake.objects.insert(
+        "/repos/example/ops/issues/9/comments?per_page=100&page=1".into(),
+        snapshot("worker", &named),
+    );
+    fake.objects
+        .insert("options".into(), json!(["Urgent", "High", "Normal"]));
+    let out = run(&fake, &s, RESULT_URL, 1);
+    assert!(out.ok, "{out:?}");
+    let (_, _, body) = &fake.writes()[1];
+    let body = body["variables"]["body"].as_str().unwrap();
+    let expected = format!(
+        "First by priority: {} (Urgent), {} (High), {} (Normal), {} (Gone), {}.",
+        link(5),
+        link(3),
+        link(1),
+        link(2),
+        link(4)
+    );
+    assert!(body.contains(&expected), "{body}");
+    // A snapshot the executor cannot read refuses the update alone.
+    let mut broken = holds.clone();
+    broken[1]["item"] = Value::Null;
+    let mut fake = Fake::new(&block(&[action(
+        "status_update",
+        json!({"status": "on-track", "summary": "Shipped."}),
+    )]));
+    fake.objects.insert(
+        "/repos/example/ops/issues/9/comments?per_page=100&page=1".into(),
+        snapshot("worker", &broken),
+    );
+    let out = run(&fake, &s, RESULT_URL, 1);
+    assert!(!out.ok && out.lines[0].contains("names no item"), "{out:?}");
 }
 
 #[test]
@@ -960,6 +1160,311 @@ fn a_human_hold_or_any_other_pull_problem_cannot_be_cleared() {
             json!([]),
         );
     });
+}
+
+/// `needs-human` comes off only on the operator's release or the item's
+/// closure after the newest hold; never on the agent's reading of either.
+#[test]
+fn a_needs_human_hold_clears_only_on_the_operators_release_or_a_closed_item() {
+    let s = configured();
+    let answered = actions()[7].clone();
+    let closed = action(
+        "clear_needs_human",
+        json!({"repository": "example/project", "item": 6, "evidence": "closed"}),
+    );
+    let issue = "/repos/example/project/issues/6";
+    let comment = "/repos/example/project/issues/comments/31";
+    let events = "/repos/example/project/issues/6/events?per_page=100&page=1";
+    let labeled =
+        |at: &str| json!({"event": "labeled", "label": {"name": "needs-human"}, "created_at": at});
+    type Change = Box<dyn Fn(&mut Fake)>;
+    let set = |path: &'static str, field: &'static str, value: Value| -> Change {
+        Box::new(move |f: &mut Fake| f.objects.get_mut(path).unwrap()[field] = value.clone())
+    };
+    // Item 6 in `state`, closed by `by` after its newest hold, a pull
+    // request where `pull` is set.
+    let state = move |state: &'static str, by: Value, pull: Value| -> Change {
+        Box::new(move |f: &mut Fake| {
+            let i = f.objects.get_mut(issue).unwrap();
+            i["state"] = json!(state);
+            i["closed_by"] = by.clone();
+            i["closed_at"] = json!("2026-10-16T12:00:00Z");
+            i["pull_request"] = pull.clone();
+        })
+    };
+    let then = |first: Change, second: Change| -> Change {
+        Box::new(move |f: &mut Fake| {
+            first(f);
+            second(f);
+        })
+    };
+    let held_again = move |at: &'static str| -> Change {
+        Box::new(move |f: &mut Fake| {
+            f.objects
+                .get_mut(events)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(labeled(at));
+        })
+    };
+    let login = |l: &str| json!({"login": l});
+    let merged = json!({"merged_at": "2026-10-16T12:00:00Z"});
+    let unmerged = json!({"merged_at": null});
+    let cases: Vec<(&str, &Value, Change, bool)> = vec![
+        (
+            "the operator's release",
+            &answered,
+            Box::new(|_: &mut Fake| ()),
+            true,
+        ),
+        (
+            "an issue the operator closed",
+            &closed,
+            state("closed", login("owner"), Value::Null),
+            true,
+        ),
+        (
+            "an issue the bot closed",
+            &closed,
+            state("closed", login("worker"), Value::Null),
+            true,
+        ),
+        (
+            "a merged pull request",
+            &closed,
+            state("closed", login("helper"), merged.clone()),
+            true,
+        ),
+        (
+            "a pull request the operator closed",
+            &closed,
+            state("closed", login("owner"), unmerged.clone()),
+            true,
+        ),
+        // Its author could reopen it, unheld.
+        (
+            "an issue its author closed",
+            &closed,
+            state("closed", login("visitor"), Value::Null),
+            false,
+        ),
+        (
+            "a pull request its author closed",
+            &closed,
+            state("closed", login("visitor"), unmerged),
+            false,
+        ),
+        (
+            "a closed issue of unknown closer",
+            &closed,
+            state("closed", Value::Null, Value::Null),
+            false,
+        ),
+        ("an open item", &closed, Box::new(|_: &mut Fake| ()), false),
+        (
+            "an open item the operator once closed",
+            &closed,
+            state("open", login("owner"), Value::Null),
+            false,
+        ),
+        // A hold put on a closed item is newer than its closure.
+        (
+            "a hold added after the operator closed it",
+            &closed,
+            then(
+                state("closed", login("owner"), Value::Null),
+                held_again("2026-10-16T12:30:00Z"),
+            ),
+            false,
+        ),
+        (
+            "a pull request merged before its newest hold",
+            &closed,
+            then(
+                state("closed", login("helper"), merged.clone()),
+                held_again("2026-10-16T13:00:00Z"),
+            ),
+            false,
+        ),
+        (
+            "a closure of unknown time",
+            &closed,
+            then(
+                state("closed", login("owner"), Value::Null),
+                set(issue, "closed_at", Value::Null),
+            ),
+            false,
+        ),
+        // The poll's hold: taking it off starts the fix rounds again.
+        (
+            "the operator's comment on a pull request",
+            &answered,
+            state("open", Value::Null, json!({"merged_at": null})),
+            false,
+        ),
+        (
+            "an item no longer held",
+            &answered,
+            set(issue, "labels", json!([{"name": "bug"}])),
+            false,
+        ),
+        (
+            "a closed item no longer held",
+            &closed,
+            Box::new(move |f: &mut Fake| {
+                let i = f.objects.get_mut(issue).unwrap();
+                i["state"] = json!("closed");
+                i["closed_by"] = json!({"login": "owner"});
+                i["labels"] = json!([]);
+            }),
+            false,
+        ),
+        (
+            "someone else's comment",
+            &answered,
+            set(comment, "user", json!({"login": "helper"})),
+            false,
+        ),
+        (
+            "the bot's comment",
+            &answered,
+            set(comment, "user", json!({"login": "worker"})),
+            false,
+        ),
+        (
+            "a comment on another item",
+            &answered,
+            set(
+                comment,
+                "issue_url",
+                json!("https://api.github.com/repos/example/project/issues/3"),
+            ),
+            false,
+        ),
+        // Only the release command releases: not an answer, nor a comment
+        // that keeps the hold.
+        (
+            "the operator's comment that restates the hold",
+            &answered,
+            set(comment, "body", json!("Waiting on legal; do not proceed.")),
+            false,
+        ),
+        (
+            "the operator's answer",
+            &answered,
+            set(comment, "body", json!("Go with the first.")),
+            false,
+        ),
+        (
+            "a release after other text",
+            &answered,
+            set(comment, "body", json!("Go with the first.\n\n/release")),
+            false,
+        ),
+        (
+            "a quoted release",
+            &answered,
+            set(comment, "body", json!("> /release")),
+            false,
+        ),
+        (
+            "a comment without a body",
+            &answered,
+            set(comment, "body", Value::Null),
+            false,
+        ),
+        (
+            "a release before the newest hold",
+            &answered,
+            held_again("2026-10-16T10:30:00Z"),
+            false,
+        ),
+        (
+            "a comment in the same second as the hold",
+            &answered,
+            Box::new(move |f: &mut Fake| {
+                f.objects
+                    .insert(events.into(), json!([labeled("2026-10-16T10:00:00Z")]));
+            }),
+            false,
+        ),
+        (
+            "no hold in the events",
+            &answered,
+            Box::new(move |f: &mut Fake| {
+                f.objects.insert(events.into(), json!([]));
+            }),
+            false,
+        ),
+        (
+            "a hold of unknown time",
+            &answered,
+            Box::new(move |f: &mut Fake| {
+                f.objects
+                    .get_mut(events)
+                    .unwrap()
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"event": "labeled", "label": {"name": "needs-human"}}));
+            }),
+            false,
+        ),
+        (
+            "events that cannot be read",
+            &answered,
+            Box::new(move |f: &mut Fake| {
+                f.objects.remove(events);
+            }),
+            false,
+        ),
+    ];
+    for (case, r, change, accepted) in cases {
+        let mut fake = Fake::new(&block(std::slice::from_ref(r)));
+        evidence(&mut fake);
+        change(&mut fake);
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert_eq!(out.ok, accepted, "{case}: {out:?}");
+        let deleted: Vec<_> = fake
+            .writes()
+            .into_iter()
+            .filter(|(m, _, _)| m == "DELETE")
+            .map(|(_, path, _)| path)
+            .collect();
+        match accepted {
+            true => assert_eq!(
+                deleted,
+                ["/repos/example/project/issues/6/labels/needs-human"],
+                "{case}"
+            ),
+            false => assert!(fake.writes().is_empty(), "{case}"),
+        }
+        if accepted && r["evidence"] == "closed" {
+            assert!(
+                out.lines[0].ends_with("done, https://github.com/example/project/issues/6"),
+                "{case}: {out:?}"
+            );
+        }
+    }
+    // The evidence is named, and an operator comment's ID only with it.
+    for fields in [
+        json!({"evidence": "answered"}),
+        json!({"evidence": "operator_comment", "comment": null}),
+        json!({"evidence": "operator_comment", "comment": 0}),
+        json!({"evidence": "closed", "comment": 31}),
+        json!({"evidence": null}),
+        json!({"body": "Answered: go with the first."}),
+        json!({"priority": "P0"}),
+    ] {
+        let mut r = answered.clone();
+        for (k, v) in fields.as_object().unwrap() {
+            match v.is_null() {
+                true => r.as_object_mut().unwrap().remove(k),
+                false => r.as_object_mut().unwrap().insert(k.clone(), v.clone()),
+            };
+        }
+        refuses(&s, r, |_| {});
+    }
 }
 
 #[test]

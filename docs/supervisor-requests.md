@@ -45,7 +45,8 @@ tracker's execute job does with its own concurrency group. Explicitly enabled
 implement dispatches additionally require native membership under an open,
 epic-labeled plan. Judgment writes (comments, operator-assigned tracker issues,
 tracker bug issues, triage-proven closure, conflict-only poll hold removal,
-state replacement and a daily project update) have separate trusted-config
+evidence-bound `needs-human` removal, state replacement and a daily project
+update) have separate trusted-config
 daily caps, all off by default. The [request protocol](#requests) below gives
 the evidence each needs, and [accounting](#accounting-and-limits) what it never
 does. Its settings are the poll's agent-board.json (`--config`, which for the
@@ -151,6 +152,7 @@ A complete supervisor file:
       "file_bug": 2,
       "close": 2,
       "remove_needs_human": 1,
+      "clear_needs_human": 4,
       "replace_state": 4,
       "status_update": 1
     },
@@ -229,6 +231,8 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"file_bug","title":"Failure class","body":"Failure and evidence."}
 {"type":"supervisor_action","action":"close","repository":"OWNER/repo","item":1,"triage_run":"https://github.com/OWNER/tracker/actions/runs/456","triage_comment":789}
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
+{"type":"supervisor_action","action":"clear_needs_human","repository":"OWNER/repo","item":5,"evidence":"operator_comment","comment":901}
+{"type":"supervisor_action","action":"clear_needs_human","repository":"OWNER/repo","item":6,"evidence":"closed"}
 {"type":"supervisor_action","action":"replace_state","body":"Arbitrary memory, including structured state."}
 {"type":"supervisor_action","action":"status_update","status":"on-track","summary":"What it means.","notes":{"OWNER/repo#1":"Why it matters."}}
 ```
@@ -276,6 +280,21 @@ start to now, in percentages only; the sections are trimmed to make room for
 it under the bound. A split that cannot be read leaves out only
 its line, with the reason on the update's line in the log. Absent, off.
 
+With `--usage-config`, the executor also reads the pass's hold snapshot
+(`agent-board/holds/v1`, the usage bot's comment on the usage issue starting
+`<!-- agent-board-holds v1 -->`; see [pass](pass.md)) and adds one line under
+the summary: `**Needs human:** N`, how many more or fewer than the newest
+status update's own such line counted, the snapshot's time, and its first
+five `needs-human` holds by board Priority (in the order of the project's
+`Priority` field options, as the pass ranks; those without one, or with one
+the field no longer has, last), each a linked ref. The count is what the snapshot lists, which is the
+items the pass considered, not a search of every repository. Without a usage
+config or a snapshot there is no line, and the next update has no count to
+compare with; an update by another tool, or one without the line, gives none
+either. A snapshot that names no item for a hold refuses the update as an
+unreadable body does. The agent's summary cannot contain `**Needs human:**`,
+so the count the next update reads is the executor's.
+
 A comment or new issue is the agent's text posted as the bot, so the executor appends the
 fixed visible note, an `agent-board-supervisor-note` fenced JSON block (the
 agent's text cannot hold a fence, so it cannot write one). Readers still
@@ -321,7 +340,7 @@ have read an outsider's body or comment text does not close the issue.
 not a done finding. The old exact-body `Triage found this issue done: URL`
 receipt is no longer accepted.
 
-Removing `needs-human` is only for an open pull request of the bot's: the newest
+`remove_needs_human` is only for an open pull request of the bot's: the newest
 label-add event must be the bot's, preceding its newest unedited poll stop
 marker on the same head. Current review must be approved, checks successful,
 the pull request not a draft, and its mergeability conflicting. Missing facts,
@@ -331,6 +350,32 @@ without that evidence remain ineligible. Check contexts must be complete, and
 the poll's required-check evaluation also reads both rulesets and classic branch
 protection, including missing required checks and expected integrations.
 Provenance and current facts are reread immediately before removal.
+
+`clear_needs_human` removes `needs-human` from an issue or pull request the
+operator has already settled, so that the queue holds only what still waits
+on them (agent-board#350). It takes one of two kinds of evidence, which the
+executor reads itself, and the log line links it:
+
+- `operator_comment`, with `comment` the ID of a comment by the configured
+  `operator` on this issue whose whole text, trimmed, is `/release`, created
+  after the newest `labeled needs-human` event. An answer, a comment that
+  restates the hold ("waiting on legal"), or `/release` quoted or among other
+  text releases nothing. A label added again after it, an event without a
+  time, no such event, or events past the page limit refuse. Not on a pull
+  request: taking the poll's hold off one starts its fix rounds again, and
+  the poll's own `operatorAnswers` reads the operator's answer there.
+- `closed`: the item is a merged pull request, or closed by the operator or
+  the bot, and its `closed_at` is after the newest `labeled needs-human`
+  event, so that a hold put on a closed item survives its reopening. An
+  issue or pull request its author closed is refused, because its author
+  could reopen it with the hold gone.
+
+The item must still carry the label. The facts are read again immediately
+before removal. The agent's own reading (an answer in someone else's comment,
+a decision made elsewhere) is not evidence: without this rule, a
+prompt-injected agent could release any of the operator's holds and so get
+the work dispatched. The action has no text and sets no project field: it never answers a
+question for the operator nor writes Priority.
 No other label change is supported.
 
 ## Accounting and limits

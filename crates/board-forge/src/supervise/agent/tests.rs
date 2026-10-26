@@ -342,6 +342,15 @@ impl Api for Fake {
         if query.contains("viewer{") {
             return Ok(json!({"viewer": {"login": "worker"}}));
         }
+        // The Priority options, P0 to P3 unless a test sets them.
+        if query.contains("field(name:") {
+            let options =
+                (self.objects.get("options").cloned()).unwrap_or(json!(["P0", "P1", "P2", "P3"]));
+            let options: Vec<Value> = (options.as_array().unwrap().iter())
+                .map(|name| json!({"name": name}))
+                .collect();
+            return Ok(json!({"node": {"field": {"options": options}}}));
+        }
         if query.contains("search(") {
             // The spend split's search for the bot's comments, or the changes'.
             let name = if variables["q"].as_str().unwrap().starts_with("commenter:") {
