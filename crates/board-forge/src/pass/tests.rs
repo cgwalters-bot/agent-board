@@ -2766,14 +2766,9 @@ fn body_plan_forge(priority: &str, body: &str, author: &str, editor: Option<&str
     let mut forge = Forge::new(None, false);
     only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
     unpathed(&mut forge.replay);
-    for entry in &mut forge.replay.requests {
-        let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
-        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
-            if node["content"]["number"] == 446 {
-                node["priority"] = json!({"name": priority});
-            }
-        }
-    }
+    on_446(&mut forge, |node| {
+        node["priority"] = json!({"name": priority})
+    });
     let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
     let issue = json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446",
         "body": body, "createdAt": "2026-10-20T00:00:00Z",
@@ -2786,6 +2781,55 @@ fn body_plan_forge(priority: &str, body: &str, author: &str, editor: Option<&str
         .push(json!({"request": graphql_key(BODY_QUERY, &variables),
         "answer": {"data": {"repository": {"issue": issue}}}}));
     forge
+}
+
+/// Applies `edit` to tracker#446's board item in every recorded board page.
+fn on_446(forge: &mut Forge, edit: impl Fn(&mut Value)) {
+    for entry in &mut forge.replay.requests {
+        let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+            if node["content"]["number"] == 446 {
+                edit(node);
+            }
+        }
+    }
+}
+
+/// With `bodyPlans`, a held P0 issue whose body holds the bot's plan stays
+/// held: the holds come before its body is read, so nothing is written.
+#[test]
+fn body_plans_leave_a_held_issue_held() {
+    fn label(node: &mut Value, name: &str) {
+        let labels = &mut node["content"]["labels"];
+        labels["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": name}));
+        labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+    }
+    type Edit = fn(&mut Value);
+    let cases: Vec<(&str, Edit)> = vec![
+        ("labelled needs-human", |n| label(n, "needs-human")),
+        ("labelled needs-design", |n| label(n, "needs-design")),
+        ("board Status is Blocked", |n| {
+            n["status"] = json!({"name": "Blocked"})
+        }),
+    ];
+    for (why, edit) in cases {
+        let mut forge = body_plan_forge("P0", &body_plan_block(), "cgwalters-bot", None);
+        on_446(&mut forge, edit);
+        // Reading the body fails the issue, so a hold checked only later
+        // (as the start's recheck also does) fails the test.
+        *forge.fail.borrow_mut() = Some(BODY_QUERY.into());
+        let report = apply(&forge, &config(json!({"bodyPlans": true})));
+        let expected = format!("hold cgwalters-forge/tracker#446: {why}");
+        assert!(
+            report.lines.contains(&expected),
+            "{why}: no line {expected:?} in {:#?}",
+            report.lines
+        );
+        assert!(forge.writes.borrow().is_empty(), "{why}");
+    }
 }
 
 /// A body plan is copied only as it was read, with still no plan comment,
