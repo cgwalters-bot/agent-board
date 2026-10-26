@@ -1,0 +1,124 @@
+{
+  "graphql": {
+    "repositoryOwner": {
+      "projectV2": {
+        "field": {"name": "Priority"},
+        "items": {
+          "nodes": [
+            {"priority": {"name": "P1"}, "content": {"__typename": "Issue", "number": 2, "repository": {"nameWithOwner": "example/tracker"}}},
+            {"priority": {"name": "P2"}, "content": {"__typename": "Issue", "number": 3, "repository": {"nameWithOwner": "example/tracker"}}},
+            {"priority": {"name": "P2"}, "content": {"__typename": "Issue", "number": 20, "repository": {"nameWithOwner": "example/app"}}},
+            {"priority": null, "content": {"__typename": "Issue", "number": 21, "repository": {"nameWithOwner": "example/app"}}},
+            {"priority": {"name": "P0"}, "content": {"__typename": "PullRequest"}}
+          ],
+          "pageInfo": {"hasNextPage": false, "endCursor": "Y3Vyc29y"}
+        }
+      }
+    }
+  },
+  "closing": {
+    "example/tracker#3": [{"url": "https://github.com/example/app/pull/40", "merged": true, "repository": {"nameWithOwner": "example/app"}}],
+    "example/tracker#11": [
+      {"url": "https://github.com/elsewhere/repo/pull/45", "merged": true, "repository": {"nameWithOwner": "elsewhere/repo"}},
+      {"url": "https://github.com/example/app/pull/43", "merged": false, "repository": {"nameWithOwner": "example/app"}}
+    ]
+  },
+  "rest": {
+    "https://api.github.com/repos/example/tracker/issues?state=open&sort=created&direction=asc&per_page=100": {
+      "etag": "W/\"tracker-1\"",
+      "link": "<https://api.github.com/repositories/1/issues?state=open&sort=created&direction=asc&per_page=100&page=2>; rel=\"next\"",
+      "body": [
+        {"number": 7, "title": "Epic: big plan", "html_url": "https://github.com/example/tracker/issues/7", "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-10-25T00:00:00Z", "user": {"login": "alice", "type": "User", "id": 1}, "labels": [{"name": "epic", "color": "ffffff"}], "body": "Sub-issues hold the work.", "sub_issues_summary": {"total": 3, "completed": 1, "percent_completed": 33}, "issue_dependencies_summary": {"blocked_by": 0, "total_blocked_by": 0, "blocking": 0, "total_blocking": 0}},
+        {"number": 1, "title": "Fix the widget", "html_url": "https://github.com/example/tracker/issues/1", "created_at": "2026-08-01T00:00:00Z", "updated_at": "2026-10-20T00:00:00Z", "user": {"login": "alice", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 2, "title": "Add the frobnicator", "html_url": "https://github.com/example/tracker/issues/2", "created_at": "2026-08-02T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 3, "title": "Docs: describe the widget", "html_url": "https://github.com/example/tracker/issues/3", "created_at": "2026-10-01T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 4, "title": "fix the widget!", "html_url": "https://github.com/example/tracker/issues/4", "created_at": "2026-10-20T00:00:00Z", "user": {"login": "alice", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 5, "title": "An old idea", "html_url": "https://github.com/example/tracker/issues/5", "created_at": "2026-07-01T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [{"name": "Keep"}], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}}
+      ]
+    },
+    "https://api.github.com/repositories/1/issues?state=open&sort=created&direction=asc&per_page=100&page=2": {
+      "etag": "W/\"tracker-2\"",
+      "body": [
+        {"number": 6, "title": "Refactor the loader", "html_url": "https://github.com/example/tracker/issues/6", "created_at": "2026-10-12T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 8, "title": "Speed up the loader", "html_url": "https://github.com/example/tracker/issues/8", "created_at": "2026-10-12T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 9, "title": "Fix the widget", "html_url": "https://github.com/example/tracker/pull/9", "created_at": "2026-10-21T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "pull_request": {"url": "https://api.github.com/repos/example/tracker/pulls/9"}},
+        {"number": 10, "title": "Cache the loader", "html_url": "https://github.com/example/tracker/issues/10", "created_at": "2026-10-12T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 11, "title": "Log the loader", "html_url": "https://github.com/example/tracker/issues/11", "created_at": "2026-10-12T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 12, "title": "Unread summaries", "html_url": "https://github.com/example/tracker/issues/12", "created_at": "2026-06-01T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": []},
+        {"number": 13, "title": "Blocks another", "html_url": "https://github.com/example/tracker/issues/13", "created_at": "2026-06-01T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 1}}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/1/timeline?per_page=100": {
+      "etag": "W/\"t1\"",
+      "body": [
+        {"event": "commented", "created_at": "2026-10-20T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/1#issuecomment-101", "user": {"login": "example-bot", "type": "User"}, "actor": {"login": "example-bot", "type": "User"}, "body": "Board pass: still queued."},
+        {"event": "labeled", "created_at": "2026-10-21T00:00:00Z", "actor": {"login": "example-bot", "type": "User"}, "label": {"name": "P2"}},
+        {"event": "commented", "created_at": "2026-10-22T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/1#issuecomment-102", "user": {"login": "github-actions[bot]", "type": "Bot"}, "actor": {"login": "github-actions[bot]", "type": "Bot"}, "body": "Status."},
+        {"event": "commented", "created_at": "2026-10-23T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/1#issuecomment-103", "user": {"login": "example-bot", "type": "User"}, "actor": {"login": "example-bot", "type": "User"}, "body": "@alice, still wanted?"},
+        {"event": "mentioned", "created_at": "2026-10-23T00:00:00Z", "actor": {"login": "alice", "type": "User"}},
+        {"event": "subscribed", "created_at": "2026-10-23T00:00:00Z", "actor": {"login": "alice", "type": "User"}}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/2/timeline?per_page=100": {"etag": "W/\"t2\"", "body": []},
+    "https://api.github.com/repos/example/tracker/issues/3/timeline?per_page=100": {
+      "etag": "W/\"t3\"",
+      "body": [
+        {"event": "cross-referenced", "created_at": "2026-10-10T00:00:00Z", "actor": {"login": "example-bot", "type": "User"}, "source": {"type": "issue", "issue": {"number": 40, "html_url": "https://github.com/example/app/pull/40", "state": "closed", "state_reason": null, "title": "Describe the widget", "pull_request": {"merged_at": "2026-10-11T00:00:00Z", "url": "https://api.github.com/repos/example/app/pulls/40"}, "repository": {"full_name": "example/app"}}}}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/4/timeline?per_page=100": {"etag": "W/\"t4\"", "body": []},
+    "https://api.github.com/repos/example/tracker/issues/6/timeline?per_page=100": {
+      "etag": "W/\"t6\"",
+      "body": [
+        {"event": "commented", "created_at": "2026-10-14T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/6#issuecomment-601", "user": {"login": "example-bot", "type": "User"}, "body": "Partial.\n```schedule-triage\n{\"verdict\":\"partly\"}\n```\n"},
+        {"event": "commented", "created_at": "2026-10-15T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/6#issuecomment-602", "user": {"login": "example-bot", "type": "User"}, "body": "Completed in example/app#40.\n```schedule-triage\n{\"verdict\":\"done\"}\n```\n"},
+        {"event": "commented", "created_at": "2026-10-16T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/6#issuecomment-603", "user": {"login": "example-bot", "type": "User"}, "body": "Board pass: holding."}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/7/timeline?per_page=100": {"etag": "W/\"t7\"", "body": []},
+    "https://api.github.com/repos/example/tracker/issues/8/timeline?per_page=100": {
+      "etag": "W/\"t8\"",
+      "body": [
+        {"event": "commented", "created_at": "2026-10-15T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/8#issuecomment-801", "user": {"login": "example-bot", "type": "User"}, "body": "```schedule-triage\n{\"verdict\":\"done\"}\n```\n"},
+        {"event": "commented", "created_at": "2026-10-16T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/8#issuecomment-802", "user": {"login": "alice", "type": "User"}, "body": "Not quite: the cold path is still slow."}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/10/timeline?per_page=100": {
+      "etag": "W/\"t10\"",
+      "body": [
+        {"event": "commented", "created_at": "2026-10-15T00:00:00Z", "html_url": "https://github.com/example/tracker/issues/10#issuecomment-1001", "user": {"login": "mallory", "type": "User"}, "body": "```schedule-triage\n{\"verdict\":\"done\"}\n```\n"}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/11/timeline?per_page=100": {
+      "etag": "W/\"t11\"",
+      "body": [
+        {"event": "cross-referenced", "created_at": "2026-10-13T00:00:00Z", "actor": {"login": "alice", "type": "User"}, "source": {"type": "issue", "issue": {"number": 41, "html_url": "https://github.com/example/app/issues/41", "state": "closed", "state_reason": "completed"}}},
+        {"event": "cross-referenced", "created_at": "2026-10-14T00:00:00Z", "actor": {"login": "alice", "type": "User"}, "source": {"type": "issue", "issue": {"number": 42, "html_url": "https://github.com/example/app/issues/42", "state": "closed", "state_reason": "not_planned"}}},
+        {"event": "cross-referenced", "created_at": "2026-10-14T00:00:00Z", "actor": {"login": "alice", "type": "User"}, "source": {"type": "issue", "issue": {"number": 43, "html_url": "https://github.com/example/app/pull/43", "state": "closed", "pull_request": {"merged_at": null}}}},
+        {"event": "cross-referenced", "created_at": "2026-10-14T00:00:00Z", "actor": {"login": "alice", "type": "User"}, "source": {"type": "issue", "issue": {"number": 44, "html_url": "https://github.com/example/app/pull/44", "state": "closed", "body": "This does not fix example/tracker#11.", "pull_request": {"merged_at": "2026-10-15T00:00:00Z"}}}},
+        {"event": "cross-referenced", "created_at": "2026-10-14T00:00:00Z", "actor": {"login": "mallory", "type": "User"}, "source": {"type": "issue", "issue": {"number": 45, "html_url": "https://github.com/elsewhere/repo/pull/45", "state": "closed", "pull_request": {"merged_at": "2026-10-15T00:00:00Z"}}}}
+      ]
+    },
+    "https://api.github.com/repos/example/tracker/issues/12/timeline?per_page=100": {"etag": "W/\"t12\"", "body": []},
+    "https://api.github.com/repos/example/tracker/issues/13/timeline?per_page=100": {"etag": "W/\"t13\"", "body": []},
+    "https://api.github.com/repos/example/app/issues?state=open&sort=created&direction=asc&per_page=100": {
+      "last_modified": "Sun, 25 Oct 2026 00:00:00 GMT",
+      "body": [
+        {"number": 20, "title": "App crash", "html_url": "https://github.com/example/app/issues/20", "created_at": "2026-09-01T00:00:00Z", "user": {"login": "alice", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 21, "title": "App: crash", "html_url": "https://github.com/example/app/issues/21", "created_at": "2026-09-02T00:00:00Z", "user": {"login": "example-bot", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 1, "completed": 1}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 22, "title": "🚀", "html_url": "https://github.com/example/app/issues/22", "created_at": "2026-10-20T00:00:00Z", "user": {"login": "alice", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}},
+        {"number": 23, "title": "🐛!", "html_url": "https://github.com/example/app/issues/23", "created_at": "2026-10-21T00:00:00Z", "user": {"login": "alice", "type": "User"}, "labels": [], "sub_issues_summary": {"total": 0, "completed": 0}, "issue_dependencies_summary": {"blocking": 0}}
+      ]
+    },
+    "https://api.github.com/repos/example/app/issues/22/timeline?per_page=100": {"etag": "W/\"t22\"", "body": []},
+    "https://api.github.com/repos/example/app/issues/23/timeline?per_page=100": {"etag": "W/\"t23\"", "body": []},
+    "https://api.github.com/repos/example/app/issues/20/timeline?per_page=100": {
+      "etag": "W/\"t20\"",
+      "body": [
+        {"event": "commented", "created_at": "2026-09-10T00:00:00Z", "html_url": "https://github.com/example/app/issues/20#issuecomment-2001", "user": {"login": "alice", "type": "User"}, "actor": {"login": "alice", "type": "User"}, "body": "Seen again."},
+        {"event": "commented", "created_at": "2026-10-25T00:00:00Z", "html_url": "https://github.com/example/app/issues/20#issuecomment-2002", "user": {"login": "example-bot", "type": "User"}, "actor": {"login": "example-bot", "type": "User"}, "body": "Board pass: P2."}
+      ]
+    },
+    "https://api.github.com/repos/example/app/issues/21/timeline?per_page=100": {"etag": "W/\"t21\"", "body": []}
+  }
+}

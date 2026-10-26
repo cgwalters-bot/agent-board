@@ -2308,6 +2308,62 @@ fn pass_replay_previews_without_credentials() {
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
 }
 
+/// `prune` checks its configuration, options and cache before any token is
+/// read; past them, the next refusal is the missing token.
+#[test]
+fn prune_cli_refusals() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let dir = std::env::temp_dir().join(format!("agent-board-prune-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let boardless = dir.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    config.as_object_mut().unwrap().remove("board");
+    config["wip"] = 0.into();
+    std::fs::write(&boardless, config.to_string()).unwrap();
+    let pass = "fixtures/pass/config.json";
+    for (args, code, reason) in [
+        (vec!["--config", pass, "--json", "x"], 1, "--format json"),
+        (vec!["--config", pass, "--owner", "x"], 1, "--config only"),
+        (
+            vec!["--config", pass, "--stale-days", "0"],
+            1,
+            "invalid value",
+        ),
+        (
+            vec!["--config", pass, "--format", "html"],
+            1,
+            "invalid value",
+        ),
+        (
+            vec!["--config", pass, "--cache", "fixtures/board.json"],
+            1,
+            "unsupported prune cache schema",
+        ),
+        (
+            vec!["--config", boardless.to_str().unwrap()],
+            1,
+            "needs the configuration's board",
+        ),
+        (vec!["--config", pass], 4, "GH_TOKEN"),
+    ] {
+        let output = command()
+            .arg("prune")
+            .args(&args)
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(reason), "{args:?}: {error}");
+        assert!(output.stdout.is_empty());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// Outside GitHub Actions, `pass --apply` needs both caps, and is refused
 /// before any token is read without them; with them, it warns that it is
 /// not serialized. Inside Actions it still needs its run.

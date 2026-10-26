@@ -30,6 +30,7 @@ Commands:
 - [`poll`](#agent-board-poll): One pass of the pull request poll, previewed or applied; says when the next is due
 - [`pass`](#agent-board-pass): One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
 - [`budget`](#agent-board-budget): What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree)
+- [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -611,6 +612,21 @@ Options:
 - `--split`: Instead of the tree, print the share of the window's public spend on upstream work and on the harness (`budget.harnessRepositories`), in percentages only
 - `--since <TIME>`: Start of the --split window, RFC 3339 (such as 2026-10-19T00:00:00Z)
 - `--until <TIME>`: End of the --split window, RFC 3339; without it, the window runs to now
+
+## agent-board prune
+
+Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
+
+```text
+agent-board prune [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: its `workRepositories` are read, `board` gives each issue's Priority and `bot` names the bot whose activity does not count. GH_TOKEN reads; nothing is written to the forge
+- `--stale-days <DAYS>`: Days without activity by a person or a pull request after which an issue at neither P0 nor P1 is stale (1 to 365) (default: `21`)
+- `--cache <FILE>`: The response cache: read if it exists, so unchanged pages are revalidated and cost no rate budget, then replaced by the responses this read used
+- `--format <FORMAT>`: Output format (possible values: `text`, `json`) (default: `text`)
 
 ## agent-board supervise
 

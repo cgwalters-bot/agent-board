@@ -12,6 +12,7 @@ mod live;
 mod org_status;
 mod pass;
 mod poll;
+mod prune;
 mod release_train;
 mod review;
 mod supervise;
@@ -159,6 +160,8 @@ enum Command {
     Pass(pass::Pass),
     /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree).
     Budget(budget::Budget),
+    /// Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md).
+    Prune(prune::Prune),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
     /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
@@ -1043,6 +1046,26 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 "unsupported GitHub host"
             );
             budget::run(
+                args,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Prune(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "prune reads its settings from --config only, and takes --format json, not --json"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            prune::run(
                 args,
                 board_forge::github::Client::from_env,
                 &mut io::stdout().lock(),
