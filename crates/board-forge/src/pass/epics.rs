@@ -51,7 +51,7 @@ const ACTION_REQUESTS: usize = 8;
 const NAMED: usize = 3;
 
 /// The open epics of a repository, with their sub-issues and the board's
-/// Priority and Status of each.
+/// Priority, Status and Why of each.
 pub(super) const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!, $field: String!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     issues(first: 20, after: $cursor, states: OPEN, labels: [$label], orderBy: {field: CREATED_AT, direction: ASC}) {
@@ -77,6 +77,7 @@ fragment Fields on ProjectV2Item {
   project { number owner { ... on Organization { login } ... on User { login } } }
   priority: fieldValueByName(name: $field) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
   status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+  why: fieldValueByName(name: "Why") { ... on ProjectV2ItemFieldTextValue { text } }
 }"#;
 
 /// The board's node id and its Priority field's, with the options in board
@@ -131,9 +132,10 @@ pub struct EpicFacts {
     pub labels_complete: bool,
     /// When its text was last edited.
     pub edited: Option<OffsetDateTime>,
-    /// Its board Priority and Status.
+    /// Its board Priority, Status and Why.
     pub priority: Option<String>,
     pub status: Option<String>,
+    pub why: Option<String>,
     /// Its sub-issues, open and closed, as an apply reads them.
     pub census: Epic,
     /// When each sub-issue's text was last edited, by lower-case key.
@@ -143,10 +145,18 @@ pub struct EpicFacts {
     pub priorities: BTreeMap<String, String>,
 }
 
-/// The board's Priority and Status of an item, from its `projectItems`, or
-/// an error when not all of its boards were read: a board missing from a
-/// partial read would look like no Status, and so no hold.
-fn board_fields(node: &Value, board: Option<&Board>) -> Result<(Option<String>, Option<String>)> {
+/// An item's fields on the board.
+#[derive(Debug, Default)]
+pub(super) struct BoardFields {
+    pub priority: Option<String>,
+    pub status: Option<String>,
+    pub why: Option<String>,
+}
+
+/// The board's fields of an item, from its `projectItems`, or an error when
+/// not all of its boards were read: a board missing from a partial read
+/// would look like no Status, and so no hold.
+fn board_fields(node: &Value, board: Option<&Board>) -> Result<BoardFields> {
     let items = node["projectItems"]["nodes"]
         .as_array()
         .context("no project items")?;
@@ -155,11 +165,13 @@ fn board_fields(node: &Value, board: Option<&Board>) -> Result<(Option<String>, 
         "not all of its boards could be read"
     );
     let item = board.and_then(|b| board_item(items, b));
-    let name = |field: &str| {
-        item.and_then(|i| i[field]["name"].as_str())
-            .map(str::to_owned)
-    };
-    Ok((name("priority"), name("status")))
+    let value =
+        |field: &str, key: &str| item.and_then(|i| i[field][key].as_str()).map(str::to_owned);
+    Ok(BoardFields {
+        priority: value("priority", "name"),
+        status: value("status", "name"),
+        why: value("why", "text"),
+    })
 }
 
 fn time(node: &Value, key: &str) -> Option<OffsetDateTime> {
@@ -172,8 +184,11 @@ impl EpicFacts {
     fn from_node(node: &Value, board: Option<&Board>) -> Result<Self> {
         let issue = issue_ref(node)?;
         let (labels, labels_complete) = labels(node)?;
-        let (priority, status) =
-            board_fields(node, board).with_context(|| format!("epic {}", issue.display()))?;
+        let BoardFields {
+            priority,
+            status,
+            why,
+        } = board_fields(node, board).with_context(|| format!("epic {}", issue.display()))?;
         let subs = &node["subIssues"];
         let nodes = subs["nodes"]
             .as_array()
@@ -208,7 +223,11 @@ impl EpicFacts {
             }
             // A sub-issue whose boards were not all read shows no Priority,
             // as one the board does not show to the bot.
-            if let Ok((Some(priority), _)) = board_fields(sub, board) {
+            if let Ok(BoardFields {
+                priority: Some(priority),
+                ..
+            }) = board_fields(sub, board)
+            {
                 priorities.insert(name, priority);
             }
             match sub["state"].as_str() {
@@ -224,6 +243,7 @@ impl EpicFacts {
             labels_complete,
             priority,
             status,
+            why,
             census,
             edits,
             priorities,
@@ -271,7 +291,7 @@ fn changed(before: &[(String, String)], after: &[(String, String)]) -> Option<St
 pub(super) enum Next {
     /// Nothing to do, and why.
     Idle(String),
-    Hold(String),
+    Hold(Hold),
     /// Its newest accepted plan has no receipt: apply it. `direction`: the
     /// operator commented since, which plans it again if it cannot apply.
     Apply {
@@ -304,7 +324,8 @@ impl Next {
     /// What it would be, for the line of an epic a person holds.
     fn otherwise(&self) -> String {
         match self {
-            Self::Idle(why) | Self::Hold(why) => why.clone(),
+            Self::Idle(why) => why.clone(),
+            Self::Hold(hold) => hold.reason.clone(),
             Self::Apply { id, .. } => format!("plan {id} waits to be applied"),
             Self::Recover { receipt, .. } => {
                 format!("the apply of plan {} was cut short", receipt.detail.plan)
@@ -370,10 +391,11 @@ pub(super) fn decide(i: &Inputs) -> Next {
     let writers = [i.operator, i.bot];
     let (receipts, unread) = epic_apply::receipts(i.comments, &writers);
     if !unread.is_empty() {
-        return Next::Hold(format!(
+        let why = format!(
             "{} looks like an apply receipt but cannot be read; no plan is applied past it, a person inspects it",
             unread.join(", ")
-        ));
+        );
+        return Next::Hold(Hold::new(HoldKind::NeedsOperator, why));
     }
     let marker = format!("<!-- {DISPATCH_MARKER}: ");
     let record = |c: &Comment| is(c.author.as_deref(), &writers) && c.body.starts_with(&marker);
@@ -425,8 +447,11 @@ pub(super) fn decide(i: &Inputs) -> Next {
                     .max();
                 return match newest.is_some_and(anew) {
                     true => Next::Plan("operator direction since its invalid epic plan".into()),
-                    false => Next::Hold(format!(
-                        "its newest epic plan is invalid: {error:#}; a person replaces it or comments"
+                    false => Next::Hold(Hold::new(
+                        HoldKind::NeedsOperator,
+                        format!(
+                            "its newest epic plan is invalid: {error:#}; a person replaces it or comments"
+                        ),
                     )),
                 };
             }
@@ -462,7 +487,8 @@ pub(super) fn decide(i: &Inputs) -> Next {
         && answered.is_none_or(|a| q.changed > a)
     {
         if let Some(run) = i.busy {
-            return Next::Hold(format!("its planning run is in flight, {run}"));
+            let why = format!("its planning run is in flight, {run}");
+            return Next::Hold(Hold::new(HoldKind::InFlight, why));
         }
         if since(q.changed) {
             return Next::Plan("operator direction since its last planning request".into());
@@ -475,7 +501,8 @@ pub(super) fn decide(i: &Inputs) -> Next {
         };
     }
     if let Some(run) = i.busy {
-        return Next::Hold(format!("a run is in flight for it, {run}"));
+        let why = format!("a run is in flight for it, {run}");
+        return Next::Hold(Hold::new(HoldKind::InFlight, why));
     }
     let Some((at, receipt, id)) = baseline else {
         return Next::Plan("it has never been planned".into());
@@ -530,10 +557,11 @@ pub(super) fn decide(i: &Inputs) -> Next {
     let why = why.join("; ");
     let until = last + time::Duration::seconds(COALESCE_SECONDS);
     if i.now < until {
-        return Next::Hold(format!(
+        let why = format!(
             "{why}; planned again from {}, three hours after its last request",
             stamp(until)
-        ));
+        );
+        return Next::Hold(Hold::new(HoldKind::TriageCooldown, why));
     }
     Next::Plan(why)
 }
@@ -557,6 +585,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let mut turn = Turn::default();
         if let Err(error) = self.epics_within(&epics.repository, earlier, git_ref, &mut turn) {
+            self.holds_whole = false;
             self.report.failures += 1;
             self.line(format!("epics error: {error:#}"));
         }
@@ -577,7 +606,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let facts = match facts {
                 Ok(facts) => facts,
                 Err((issue, error)) => {
-                    self.line(format!("hold epic {}: {error:#}", issue.display()));
+                    self.record(Entry {
+                        scope: Scope::Epic(issue),
+                        hold: Hold::new(HoldKind::Unreadable, format!("{error:#}")),
+                        priority: None,
+                        why: None,
+                    });
                     continue;
                 }
             };
@@ -590,7 +624,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match self.live(&parent) {
                 Ok(true) => live.push(facts),
                 Ok(false) => {}
-                Err(why) => self.line(format!("hold epic {}: {why}", facts.issue.display())),
+                Err(why) => self.epic_held(&facts, Hold::new(HoldKind::Unreadable, why)),
             }
         }
         self.line(format!(
@@ -635,6 +669,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         for (n, facts) in live.iter().enumerate() {
             let bounds = self.client.bounds;
             if bounds.left.get() < START_REQUESTS || Instant::now() > bounds.admit_by {
+                self.holds_whole = false;
                 self.report.failures += 1;
                 self.line(format!(
                     "epics: the pass's request or time budget is low; {} live epic(s) deferred",
@@ -736,6 +771,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
+    /// Says an epic's hold, and records it for the hold snapshot.
+    fn epic_held(&mut self, facts: &EpicFacts, hold: Hold) {
+        let entry = self.epic_entry(facts, hold);
+        self.record(entry);
+    }
+
+    fn epic_entry(&self, facts: &EpicFacts, hold: Hold) -> Entry {
+        Entry {
+            scope: Scope::Epic(facts.issue.clone()),
+            hold,
+            priority: facts.priority.clone(),
+            why: facts.why.clone(),
+        }
+    }
+
     /// The trusted epic-apply configuration: the pass's writers, its work
     /// repositories and the board's Priority options, new sub-issues taking
     /// the last (the lowest).
@@ -787,21 +837,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             busy: busy.map(String::as_str),
             now: self.now,
         });
-        if let Some((_, held)) = person_hold(
+        if let Some(held) = person_hold(
             &facts.labels,
             facts.labels_complete,
             facts.status.as_deref(),
         ) {
-            let line = match next {
-                Next::Idle(why) => format!("epic {name}: {why}"),
-                next => format!("hold epic {name}: {held}; otherwise {}", next.otherwise()),
-            };
-            self.line(line);
+            match next {
+                Next::Idle(why) => self.line(format!("epic {name}: {why}")),
+                next => {
+                    let why = format!("{}; otherwise {}", held.reason, next.otherwise());
+                    self.epic_held(facts, Hold::new(held.kind, why));
+                }
+            }
             return;
         }
         match next {
             Next::Idle(why) => self.line(format!("epic {name}: {why}")),
-            Next::Hold(why) => self.line(format!("hold epic {name}: {why}")),
+            Next::Hold(hold) => self.epic_held(facts, hold),
             Next::Apply {
                 id,
                 url,
@@ -856,11 +908,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     let why = "operator direction since its apply was cut short";
                     self.plan_epic(facts, (why, None), project, slots, target, turn);
                 } else {
-                    self.line(format!(
-                        "hold epic {name}: the apply of plan {id} was {outcome}, and is not proved: {}; it is never replayed: a person inspects {}, then replaces the plan or comments",
+                    let why = format!(
+                        "the apply of plan {id} was {outcome}, and is not proved: {}; it is never replayed: a person inspects {}, then replaces the plan or comments",
                         missing.join("; "),
                         receipt.url
-                    ));
+                    );
+                    self.epic_held(facts, Hold::new(HoldKind::NeedsOperator, why));
                 }
             }
             Next::Unanswered {
@@ -881,17 +934,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         Ok(None) => None,
                         Err(error) => {
                             self.report.failures += 1;
-                            self.line(format!(
-                                "hold epic {name}: its planning run {run} could not be read: {error:#}"
-                            ));
+                            let why =
+                                format!("its planning run {run} could not be read: {error:#}");
+                            self.epic_held(facts, Hold::new(HoldKind::Unreadable, why));
                             return;
                         }
                     },
                 };
                 let Some((from, how)) = ended else {
-                    self.line(format!(
-                        "hold epic {name}: its planning request {record} waits for its plan"
-                    ));
+                    let why = format!("its planning request {record} waits for its plan");
+                    self.epic_held(facts, Hold::new(HoldKind::Dispatched, why));
                     return;
                 };
                 let none = format!("its planning request {record} got no plan");
@@ -912,10 +964,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         Some(_) => "its run ended",
                         None => "its request",
                     };
-                    self.line(format!(
-                        "hold epic {name}: {none}; planned once more from {}, six hours after {after}",
+                    let why = format!(
+                        "{none}; planned once more from {}, six hours after {after}",
                         stamp(until)
-                    ));
+                    );
+                    // The pass retries it by itself: not the operator's yet.
+                    let hold = Hold::new(HoldKind::EpicUnplanned, why).operator(false);
+                    self.epic_held(facts, hold);
                     return;
                 }
                 let why = format!("{none}, retried once");
@@ -960,20 +1015,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         turn: &mut Turn,
     ) -> bool {
         let name = facts.issue.display();
+        let wait = |why: &str| Hold::new(HoldKind::Other, format!("plan {id} waits; {why}"));
         if turn.applied {
-            self.line(format!(
-                "hold epic {name}: plan {id} waits; one epic plan is applied a pass"
-            ));
+            self.epic_held(facts, wait("one epic plan is applied a pass"));
             return false;
         }
         let Some(project) = project else {
-            self.line(format!(
-                "hold epic {name}: plan {id} waits; there is no board to set Priority on"
-            ));
+            self.epic_held(facts, wait("there is no board to set Priority on"));
             return false;
         };
         if let Some(why) = self.other_holds() {
-            self.line(format!("hold epic {name}: plan {id} waits; {why}"));
+            self.epic_held(facts, wait(&why));
             return false;
         }
         let config = match self.apply_config(project) {
@@ -990,21 +1042,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             updated_at: Some(changed),
         };
         let changed_since = || {
-            format!(
-                "hold epic {name}: plan {id} changed since it was read; the next pass reads it again"
-            )
+            let why = format!("plan {id} changed since it was read; the next pass reads it again");
+            Hold::new(HoldKind::Other, why)
         };
         turn.applied = true;
         let planned = match epic_apply::planned(&self.client, &facts.issue, &config, &expected) {
             Ok(planned) => planned,
             Err(error) if error.downcast_ref::<epic_apply::PlanChanged>().is_some() => {
-                self.line(changed_since());
+                self.epic_held(facts, changed_since());
                 return false;
             }
             Err(error) if error.downcast_ref::<epic_apply::Refused>().is_some() => {
-                self.line(format!(
-                    "hold epic {name}: plan {id} is not applied: {error:#}; a person replaces it"
-                ));
+                let why = format!("plan {id} is not applied: {error:#}; a person replaces it");
+                self.epic_held(facts, Hold::new(HoldKind::NeedsOperator, why));
                 return true;
             }
             Err(error) => {
@@ -1032,10 +1082,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let needed = APPLY_REQUESTS + 3 * pages + ACTION_REQUESTS * planned.actions + WRITE_RESERVE;
         if bounds.left.get() < needed || Instant::now() > bounds.admit_by {
             self.report.failures += 1;
-            self.line(format!(
-                "hold epic {name}: plan {id} waits; the pass has {} requests left, fewer than its apply may take ({needed}), or ran out of time",
+            let why = format!(
+                "the pass has {} requests left, fewer than its apply may take ({needed}), or ran out of time",
                 bounds.left.get()
-            ));
+            );
+            self.epic_held(facts, wait(&why));
             return false;
         }
         // Its reads were in time, so its writes may finish past the bound.
@@ -1045,9 +1096,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         bounds.finishing.set(false);
         match result {
             Ok(lines) if lines.iter().any(|l| l == epic_apply::ALREADY_CLAIMED) => {
-                self.line(format!(
-                    "hold epic {name}: plan {id} was claimed since it was read"
-                ));
+                let why = format!("plan {id} was claimed since it was read");
+                self.epic_held(facts, Hold::new(HoldKind::Other, why));
             }
             Ok(lines) => {
                 self.caps.count_many(Kind::Write, planned.writes);
@@ -1066,7 +1116,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.line(format!("apply epic {name} plan={id}: {done}{receipt}"));
             }
             Err(error) if error.downcast_ref::<epic_apply::PlanChanged>().is_some() => {
-                self.line(changed_since());
+                self.epic_held(facts, changed_since());
             }
             Err(error) => {
                 // What it wrote is on its receipt; count it all against the cap.
@@ -1118,25 +1168,28 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// for a person, who sees it: labelled [`NEEDS_HUMAN`], and with a board
     /// its Why set to `question`. One write step each, taken whole.
     fn ask_epic(&mut self, facts: &EpicFacts, held: &str, question: &str) {
-        let name = facts.issue.display();
         let board = self.config.board.as_ref();
-        let mut line = format!("hold epic {name}: {held}; label {NEEDS_HUMAN}");
+        let mut why = format!("{held}; label {NEEDS_HUMAN}");
         if board.is_some() {
-            line.push_str(&format!(", {WHY_FIELD} {question}"));
+            why.push_str(&format!(", {WHY_FIELD} {question}"));
         }
+        // Held for the operator whether or not the label is written yet.
+        let hold = |why: String| Hold::new(HoldKind::EpicUnplanned, why);
         let writes = 1 + usize::from(board.is_some());
         if let Some(cap) = self.caps.check_many(Kind::Write, writes) {
-            self.line(format!("{cap}: {line}"));
+            let entry = self.epic_entry(facts, hold(why));
+            self.line(format!("{cap}: {}", entry.line()));
+            self.report.holds.push(entry);
             return;
         }
-        if let Some(why) = self.other_holds() {
-            self.line(format!("{line}; {why}"));
+        if let Some(other) = self.other_holds() {
+            self.epic_held(facts, hold(format!("{why}; {other}")));
             return;
         }
         // Counted once sent, whether or not its answer comes back.
         self.caps.count_many(Kind::Write, writes);
         if !self.apply {
-            self.line(line);
+            self.epic_held(facts, hold(why));
             return;
         }
         let issue = &facts.issue;
@@ -1153,10 +1206,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         )
         .and_then(|_| board.map_or(Ok(()), |b| self.set_why(issue, b, question)));
         match sent {
-            Ok(()) => self.line(line),
+            Ok(()) => self.epic_held(facts, hold(why)),
             Err(error) => {
                 self.report.failures += 1;
-                self.line(format!("{line} failed: {error:#}"));
+                self.epic_held(facts, hold(format!("{why} failed: {error:#}")));
             }
         }
     }
@@ -1213,28 +1266,29 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     ) {
         let config = self.config;
         let name = facts.issue.display();
-        let due = format!("hold epic {name}: due ({why})");
+        let due = |kind: HoldKind, then: &str| Hold::new(kind, format!("due ({why}); {then}"));
         if turn.planned {
-            self.line(format!("{due}; one epic is planned a pass"));
+            self.epic_held(facts, due(HoldKind::Other, "one epic is planned a pass"));
             return;
         }
         if !config.work() {
-            self.line(format!(
-                "{due}; new work is off (wip 0 or no workRepositories)"
-            ));
+            let then = "new work is off (wip 0 or no workRepositories)";
+            self.epic_held(facts, due(HoldKind::Other, then));
             return;
         }
         let Some((runs, slots)) = slots else {
-            self.line(format!("{due}; the runs in flight are unknown"));
+            let then = "the runs in flight are unknown";
+            self.epic_held(facts, due(HoldKind::Unreadable, then));
             return;
         };
-        if let Some(why) = self.other_holds() {
-            self.line(format!("{due}; {why}"));
+        if let Some(then) = self.other_holds() {
+            self.epic_held(facts, due(HoldKind::Other, &then));
             return;
         }
         let active = slots.active(runs) + turn.starts;
         if active >= slots.wip {
-            self.line(format!("{due}; wip: {active} of {} runs active", slots.wip));
+            let then = format!("wip: {active} of {} runs active", slots.wip);
+            self.epic_held(facts, due(HoldKind::Wip, &then));
             return;
         }
         let snapshot = self.snapshot();
@@ -1246,12 +1300,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         ) {
             Ok(pool) => pool,
             Err(no) => {
-                self.line(format!("{due}; no pool for planning: {no}"));
+                let then = format!("no pool for planning: {no}");
+                self.epic_held(facts, due(HoldKind::Pools, &then));
                 return;
             }
         };
-        if let Some(why) = self.budget_hold(1.0) {
-            self.line(format!("{due}; {why}"));
+        if let Some(then) = self.budget_hold(1.0) {
+            self.epic_held(facts, due(HoldKind::Other, &then));
             return;
         }
         turn.planned = true;
@@ -1278,7 +1333,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.report.failures += 1;
         }
         match step {
-            Step::Hold(_, why) => self.line(format!("hold epic {name}: {why}")),
+            Step::Hold(hold) => self.epic_held(facts, hold),
             Step::Stop(why, halt) => {
                 // Stage 4's candidates come after: none was considered.
                 self.report.failures += usize::from(halt.failed(false));

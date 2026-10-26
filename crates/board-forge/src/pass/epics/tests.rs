@@ -222,16 +222,19 @@ fn replay_plans_one_epic_and_recreates_nothing() {
 }
 
 type Edit = Box<dyn Fn(&mut Replay)>;
+/// A hold's kind, and whether it waits on the operator.
+type Held = Option<(HoldKind, bool)>;
 
-/// Each edit of the recording, and the line stage 3 must then print for
-/// an epic (the start of it), and how many operations fail.
+/// Each edit of the recording, the line stage 3 must then print for an
+/// epic (the start of it), how many operations fail, and the kind of hold
+/// that line is and whether it waits on the operator, where it is one.
 #[test]
 fn replay_epic_scenarios() {
     let receipt_890 = |replay: &mut Replay, body: &dyn Fn(&str) -> String| {
         let receipt = comment(replay, COMMENTS_890, RECEIPT_890);
         receipt["body"] = body(text(receipt, "/body")).into();
     };
-    let cases: Vec<(&str, Edit, &str, usize)> = vec![
+    let cases: Vec<(&str, Edit, &str, usize, Held)> = vec![
         (
             "a receipt that stopped, its writes all listed, is recovered and not replayed",
             Box::new(move |r| {
@@ -241,6 +244,7 @@ fn replay_epic_scenarios() {
             }),
             "recover epic cgwalters-forge/tracker#890 plan=6366132099@2026-10-23T13:34:49Z: its apply was stopped after a failed request, and its receipt and the epic confirm every action's effect; would record that on https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-6366266811",
             0,
+            None,
         ),
         (
             "a claim that confirms nothing is left for a person, never replayed",
@@ -254,12 +258,14 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#890: the apply of plan 6366132099@2026-10-23T13:34:49Z was claimed and never finished, and is not proved: action 1 (create_sub_issue): no confirmed issue for its sub-issue in cgwalters-forge/tracker; ",
             0,
+            Some((HoldKind::NeedsOperator, true)),
         ),
         (
             "without its receipt, the plan would be applied: the receipt is what stops it",
             Box::new(unapplied),
             "apply epic cgwalters-forge/tracker#890 plan=6366132099@2026-10-23T13:34:49Z: Create a sub-issue in cgwalters-forge/tracker (P0); Create a sub-issue in cgwalters-forge/agent-board (P0); Create a sub-issue in cgwalters-forge/tracker (P0); Create a sub-issue in cgwalters-forge/tracker (P0); Create a sub-issue in cgwalters-forge/agent-board (P1); Create a sub-issue in cgwalters-forge/agent-board (P2); ",
             0,
+            None,
         ),
         (
             "the operator's comment is direction; the bot's own are not",
@@ -276,6 +282,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#890: due (operator direction since it was last planned); one epic is planned a pass",
             0,
+            Some((HoldKind::Other, false)),
         ),
         (
             "a planning request whose run finished a minute ago waits for its plan",
@@ -285,6 +292,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 waits for its plan",
             0,
+            Some((HoldKind::Dispatched, false)),
         ),
         (
             "a planning request whose run finished without a plan is retried after a cooldown",
@@ -294,6 +302,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan; planned once more from 2026-10-24T02:54:10Z, six hours after its run ended",
             0,
+            Some((HoldKind::EpicUnplanned, false)),
         ),
         (
             "and once the cooldown has passed, retried once",
@@ -303,12 +312,14 @@ fn replay_epic_scenarios() {
             }),
             "start planning cgwalters-forge/tracker#596 pool=claude: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, retried once",
             0,
+            None,
         ),
         (
             "a retry that got no plan either is held and asks the operator",
             Box::new(retried),
             "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, nor did https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6999999999 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (its run 77 ended failure). What should change?",
             0,
+            Some((HoldKind::EpicUnplanned, true)),
         ),
         (
             "with what the planner said, where it said something",
@@ -326,6 +337,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#596: its planning request https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000001 got no plan, nor did https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6999999999 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (The brief is too large to plan in one run.). What should change?",
             0,
+            Some((HoldKind::EpicUnplanned, true)),
         ),
         (
             "a planning run in flight holds its epic",
@@ -338,6 +350,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#596: its planning run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/77",
             0,
+            Some((HoldKind::InFlight, false)),
         ),
         (
             "a newest plan that is not JSON holds, and is never read as no plan",
@@ -354,6 +367,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#596: its newest epic plan is invalid: newest epic plan https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000003: plan is not valid JSON",
             0,
+            Some((HoldKind::NeedsOperator, true)),
         ),
         (
             "a newest plan apply refuses holds for a person",
@@ -362,6 +376,7 @@ fn replay_epic_scenarios() {
             }),
             "hold epic cgwalters-forge/tracker#596: plan 7000000003@2026-10-23T20:59:10.085106014Z is not applied: the plan cannot be applied: unsupported epic plan schema",
             0,
+            Some((HoldKind::NeedsOperator, true)),
         ),
         (
             "and the operator's direction since plans it again",
@@ -372,15 +387,17 @@ fn replay_epic_scenarios() {
             }),
             "start planning cgwalters-forge/tracker#596 pool=claude: operator direction since its plan, which cannot be applied",
             0,
+            None,
         ),
         (
             "no planning while new work is off",
             Box::new(|_| {}),
             "hold epic cgwalters-forge/tracker#596: due (its sub-issues changed",
             0,
+            Some((HoldKind::Other, false)),
         ),
     ];
-    for (name, edit, expected, failures) in cases {
+    for (name, edit, expected, failures, kind) in cases {
         let mut replay = replay();
         edit(&mut replay);
         let settings = match name.starts_with("no planning") {
@@ -394,6 +411,9 @@ fn replay_epic_scenarios() {
             "{name}: no line {expected:?} in {lines:#?}"
         );
         assert_eq!(report.failures, failures, "{name}: {:#?}", report.lines);
+        let held = (report.holds.iter()).find(|h| h.line().starts_with(expected));
+        let held = held.map(|h| (h.hold.kind, h.hold.operator));
+        assert_eq!(held, kind, "{name}");
     }
 }
 
@@ -792,14 +812,14 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![],
             "2026-10-23T15:00:00Z",
-            "Hold(\"its sub-issues changed",
+            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
         ),
         (
             &facts,
             &recorded,
             vec![say("cgwalters-bot", "2026-10-23T14:50:00Z")],
             "2026-10-23T15:00:00Z",
-            "Hold(\"its sub-issues changed",
+            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
         ),
         (
             &facts,
@@ -855,7 +875,7 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![invalid, say("cgwalters", "2026-10-23T15:10:00Z"), asked],
             "2026-10-23T15:30:00Z",
-            "Hold(\"its newest epic plan is invalid",
+            "Hold(Hold { kind: NeedsOperator, reason: \"its newest epic plan is invalid",
         ),
     ];
     for (facts, base, extra, now, expected) in cases {
@@ -897,7 +917,7 @@ fn board_fields_refuse_a_partial_membership_read() {
     ] {
         let node = json!({"projectItems": {"nodes": nodes, "totalCount": total}});
         let got = match board_fields(&node, Some(&board)) {
-            Ok((_, status)) => status,
+            Ok(fields) => fields.status,
             Err(_) => Some("error".into()),
         };
         assert_eq!(got.as_deref(), want, "{total} boards");
