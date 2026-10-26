@@ -46,6 +46,35 @@ its start. Its requests give the next pass a reading. A pool with requests and
 still no reading, or without a count, stays held, and the published snapshot
 holds it either way (`no-reading`).
 
+With `usage.holds` (off unless set; agent-board#307), the pass also publishes
+stage 4's holds, so that the review app shows the pass's verdicts rather than
+deriving its own. Each candidate stage 4 holds is one entry,
+`{"item": "OWNER/REPO#N", "kind": K, "reason": R, "priority": P}`: R is the
+text after `hold OWNER/REPO#N: ` on its line, P the item's board Priority or
+null, and K one of `closed`, `person` (a `needs-human` or `needs-design` label,
+or board Blocked), `dependencies` (open dependencies, or a lower stacked slice
+not yet open), `pull-request` (the bot's or the operator's), `in-flight`,
+`dispatched` (its plan's run has ended, awaiting a follow-up or re-plan),
+`overlap`, `unreadable` (labels, pull requests, a parent epic or a plan's
+target not read whole) or `other`. A hold of every new run, `hold wip|pools: R`,
+is an entry `{"kind": "wip"|"pools", "reason": R}` without an item. Entries
+are sorted by item as text, these first; a candidate whose consideration
+failed (`fail …`) or that the pass did not reach has none, a budget stop
+(`budget: …; new runs wait`) is not one, and stage 3's epics are left out.
+After stage 5, unless stage 4 failed (`schedule error: …`), the snapshot
+`{"schema": "agent-board/pass-holds/v1", "at": T, "holds": […]}`, T the clock
+of the pass that last changed them, goes to the bot's own comment on the usage issue, found
+again by its first line `<!-- agent-board-pass-holds v1 -->`, under the same
+checks as the usage comment's: a private repository, and a new comment only
+as the bot. It is one write step (`holds: published URL`); where the comment
+already has the same holds the line is `holds: unchanged` and nothing is
+written, and a preview prints
+`holds: publish to OWNER/REPO#N; a preview does not write it`. An applying
+pass that waited for another in progress, or that has spent its request
+budget or time bound, publishes nothing (`holds: not published; why`). A
+failure is one line, `holds error: …`, counted as a failure, and the pass
+goes on.
+
 With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
 broker's `spend.runs`, the trailing week's cost of runs' requests at API list
 prices in dollars ([praxis-credential-broker#38][spend]), in the snapshot's
@@ -176,7 +205,7 @@ agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board
 ```
 
 Each decision is one line: `start triage|implement|planning OWNER/REPO#N … pool=P`,
-`apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`,
+`apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
@@ -536,6 +565,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
+| `usage.holds` | Publish stage 4's holds to their own bot comment on the usage issue for the review app (`agent-board/pass-holds/v1`); `false` |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |

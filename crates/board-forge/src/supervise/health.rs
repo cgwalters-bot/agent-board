@@ -471,6 +471,11 @@ fn checkpoint(comments: &[Value], bot: &str) -> Result<Option<Value>> {
 
 /// The JSON of the usage snapshot comment, if it holds one of its schema.
 pub(crate) fn usage_snapshot(body: &str) -> Option<Value> {
+    json_block(body).filter(|snap| snap["schema"] == USAGE_SCHEMA)
+}
+
+/// The JSON of a snapshot comment's ```` ```json ```` block.
+pub(crate) fn json_block(body: &str) -> Option<Value> {
     let start = if body.starts_with("```json\n") {
         0
     } else {
@@ -486,8 +491,7 @@ pub(crate) fn usage_snapshot(body: &str) -> Option<Value> {
         }
         from = at + 1;
     };
-    let snap: Value = serde_json::from_str(json).ok()?;
-    (snap["schema"] == USAGE_SCHEMA).then_some(snap)
+    serde_json::from_str(json).ok()
 }
 
 /// The scheduler's line after the runner's timestamp: `^\S+Z (\[dry-run\] )?(.*)$`.

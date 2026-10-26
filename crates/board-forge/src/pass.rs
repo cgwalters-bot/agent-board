@@ -19,7 +19,7 @@ use crate::poll::{
     self, POLL_REPOSITORY_LIMIT, PollPolicy, Rest, RestResponse, State, next_link,
     stale::STALE_DAYS_LIMIT, text, validate_repository, validate_workflow,
 };
-use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
+use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, json_block, usage_snapshot};
 use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{ItemRef, NEEDS_HUMAN_LABEL as NEEDS_HUMAN};
@@ -67,6 +67,16 @@ const WRITE_RESERVE: usize = 4;
 const PULL_PAGES: usize = 3;
 /// Comment pages of the usage issue read to find the bot's snapshot.
 const USAGE_PAGES: usize = 10;
+/// The schema of the hold snapshot ([`Usage::holds`]).
+pub const HOLDS_SCHEMA: &str = "agent-board/pass-holds/v1";
+/// The first line of the bot's hold snapshot comment, by which the pass
+/// finds it again: not the usage comment's ([`USAGE_MARKER`]).
+const HOLDS_MARKER: &str = "<!-- agent-board-pass-holds v1 -->";
+/// The reads before the hold snapshot's write: its comment's first page,
+/// the repository and the account.
+const HOLDS_READS: usize = 3;
+/// The start of a line that holds every new run on the WIP limit.
+const WIP_HOLD: &str = "hold wip: ";
 /// Pages of open board issues read, 100 each; a larger board is incomplete.
 const BOARD_PAGES: usize = 20;
 const DEFAULT_TARGET: f64 = 0.95;
@@ -322,6 +332,11 @@ pub struct Usage {
     /// none is in flight on it, so that its requests give a reading.
     #[serde(default)]
     pub probe: bool,
+    /// Off unless set: an applying pass publishes stage 4's holds
+    /// ([`HOLDS_SCHEMA`]) to their own bot comment on `issue`, for the
+    /// review app.
+    #[serde(default)]
+    pub holds: bool,
 }
 
 /// The board's budget: by default its spend over the trailing week, at API
@@ -951,20 +966,67 @@ fn is(login: Option<&str>, who: &[&str]) -> bool {
     login.is_some_and(|l| who.iter().any(|w| w.eq_ignore_ascii_case(l)))
 }
 
+/// What keeps the pass off an item, or off new runs (`Wip`, `Pools`): the
+/// `kind` of an entry in the hold snapshot ([`HOLDS_SCHEMA`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldKind {
+    Closed,
+    /// A person's hold label, or board Blocked ([`person_hold`]).
+    Person,
+    Dependencies,
+    PullRequest,
+    InFlight,
+    /// Its plan was dispatched already.
+    Dispatched,
+    Overlap,
+    /// Something it depends on could not be read.
+    Unreadable,
+    Other,
+    Wip,
+    Pools,
+}
+
+impl HoldKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            HoldKind::Closed => "closed",
+            HoldKind::Person => "person",
+            HoldKind::Dependencies => "dependencies",
+            HoldKind::PullRequest => "pull-request",
+            HoldKind::InFlight => "in-flight",
+            HoldKind::Dispatched => "dispatched",
+            HoldKind::Overlap => "overlap",
+            HoldKind::Unreadable => "unreadable",
+            HoldKind::Other => "other",
+            HoldKind::Wip => "wip",
+            HoldKind::Pools => "pools",
+        }
+    }
+}
+
+/// A hold's kind and the reason its line gives.
+pub type Held = (HoldKind, String);
+
 /// Why a person keeps the pass off an item: its labels unread, a hold label,
 /// or board Blocked.
-fn person_hold(labels: &[String], complete: bool, status: Option<&str>) -> Option<String> {
+fn person_hold(labels: &[String], complete: bool, status: Option<&str>) -> Option<Held> {
     if !complete {
-        return Some("its labels could not all be read".into());
+        let why = "its labels could not all be read".into();
+        return Some((HoldKind::Unreadable, why));
     }
     if let Some(label) =
         (HOLD_LABELS.iter()).find(|l| labels.iter().any(|n| n.eq_ignore_ascii_case(l)))
     {
-        return Some(format!("labelled {label}"));
+        return Some((HoldKind::Person, format!("labelled {label}")));
     }
     status
         .filter(|s| s.eq_ignore_ascii_case(BLOCKED_STATUS))
-        .map(|_| format!("board Status is {BLOCKED_STATUS}"))
+        .map(|_| {
+            (
+                HoldKind::Person,
+                format!("board Status is {BLOCKED_STATUS}"),
+            )
+        })
 }
 
 /// The item of an issue's `projectItems` nodes on `board`.
@@ -979,9 +1041,9 @@ pub(crate) fn board_item<'a>(items: &'a [Value], board: &Board) -> Option<&'a Va
 /// operator's pull requests hold an issue: a visitor's pull request that
 /// says it closes one must not keep work off it. Pull requests left unread
 /// hold it, so the scheduler reads them all first ([`PULL_PAGES`]).
-pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<String> {
+pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Held> {
     if !facts.open {
-        return Some("closed".into());
+        return Some((HoldKind::Closed, "closed".into()));
     }
     let held = person_hold(
         &facts.labels,
@@ -992,20 +1054,23 @@ pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> 
         return held;
     }
     if facts.blocked_by > 0 {
-        return Some(format!("{} open dependencies", facts.blocked_by));
+        let why = format!("{} open dependencies", facts.blocked_by);
+        return Some((HoldKind::Dependencies, why));
     }
     if let Some((number, repo, _)) = facts
         .pulls
         .iter()
         .find(|(_, _, author)| is(author.as_deref(), people))
     {
-        return Some(format!("pull request {repo}#{number} is open"));
+        let why = format!("pull request {repo}#{number} is open");
+        return Some((HoldKind::PullRequest, why));
     }
     if !facts.pulls_complete {
-        return Some("its pull requests could not all be read".into());
+        let why = "its pull requests could not all be read".into();
+        return Some((HoldKind::Unreadable, why));
     }
     busy.get(&key(&facts.issue))
-        .map(|run| format!("a run is in flight, {run}"))
+        .map(|run| (HoldKind::InFlight, format!("a run is in flight, {run}")))
 }
 
 /// A candidate's place in line: its epic's Priority, its own, its age, then
@@ -1264,6 +1329,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         epic_starts: Vec::new(),
         considered: false,
         probes: BTreeMap::new(),
+        holds: Vec::new(),
     };
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
@@ -1274,7 +1340,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // starts take their slots before stage 4's.
     earlier += scheduler.epics(earlier, &git_ref);
     // Stage 4: choose and start work.
-    if let Err(error) = scheduler.schedule(earlier, &git_ref) {
+    let scheduled = scheduler.schedule(earlier, &git_ref);
+    let whole = scheduled.is_ok();
+    if let Err(error) = scheduled {
         scheduler.report.failures += 1;
         scheduler.line(format!("schedule error: {error:#}"));
     }
@@ -1282,6 +1350,10 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
         scheduler.line(format!("status error: {error:#}"));
+    }
+    // Stage 4's holds, unless it failed outright: they would be partial.
+    if whole {
+        scheduler.publish_holds();
     }
     report
 }
@@ -1299,7 +1371,7 @@ fn default_branch(client: &impl Rest, repo: &str) -> Result<String> {
 
 /// What one candidate came to.
 enum Step {
-    Hold(String),
+    Hold(HoldKind, String),
     /// Nothing more starts in this pass: why, and what stopped it.
     Stop(String, Halt),
     /// A run started, or was sent and may have started: its slot is taken.
@@ -1414,11 +1486,29 @@ struct Scheduler<'a, C> {
     /// The pools stage 1 found may take a run to get a reading
     /// ([`usage::unasked`]), where [`Usage::probe`] is set.
     probes: BTreeMap<String, String>,
+    /// Stage 4's holds, as the hold snapshot's entries ([`HOLDS_SCHEMA`]).
+    holds: Vec<Value>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn line(&mut self, line: String) {
         self.report.lines.push(line);
+    }
+
+    /// Says a candidate's hold, and records it for the hold snapshot.
+    fn held(&mut self, facts: &Facts, kind: HoldKind, why: &str) {
+        let item = facts.issue.display();
+        self.line(format!("hold {item}: {why}"));
+        let hold = json!({"item": item, "kind": kind.name(), "reason": why,
+            "priority": facts.priority});
+        self.holds.push(hold);
+    }
+
+    /// Says a hold of every new run, `hold wip|pools: why`, and records it.
+    fn pass_held(&mut self, kind: HoldKind, why: &str) {
+        self.line(format!("hold {}: {why}", kind.name()));
+        let hold = json!({"kind": kind.name(), "reason": why});
+        self.holds.push(hold);
     }
 
     fn writers(&self) -> [&'a str; 2] {
@@ -1495,9 +1585,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // A local apply is not serialized; the CLI caps it instead.
         if let Some(other) = self.other_pass()? {
-            self.line(format!(
-                "hold wip: another pass is in progress, {other}; it takes the free slots"
-            ));
+            let why = format!("another pass is in progress, {other}; it takes the free slots");
+            self.pass_held(HoldKind::Wip, &why);
             return Ok(());
         }
         let target = config.target(git_ref);
@@ -1530,7 +1619,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let active = slots.active(&runs);
         if active >= wip {
-            self.line(format!("hold wip: {active} of {wip} runs active"));
+            self.pass_held(HoldKind::Wip, &format!("{active} of {wip} runs active"));
             return Ok(());
         }
         let snapshot = self.snapshot();
@@ -1539,7 +1628,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Err(why) = choose(snapshot.as_ref(), &config.pools, &all, self.now)
             && slots.probes.is_empty()
         {
-            self.line(format!("hold pools: {why}; new runs wait"));
+            self.pass_held(HoldKind::Pools, &format!("{why}; new runs wait"));
             return Ok(());
         }
         if let Some(why) = self.budget_hold(1.0) {
@@ -1582,7 +1671,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 && slots.probes.is_empty()
             {
                 let left = candidates.len() - n;
-                self.line(format!("hold pools: {why}; {left} more candidate(s) wait"));
+                let why = format!("{why}; {left} more candidate(s) wait");
+                self.pass_held(HoldKind::Pools, &why);
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
@@ -1607,14 +1697,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             };
             let (line, holds, failed) = match step {
-                Step::Hold(why) => {
-                    self.line(format!("hold {issue}: {why}"));
+                Step::Hold(kind, why) => {
+                    self.held(facts, kind, &why);
                     continue;
                 }
                 Step::Stop(why, halt) => {
                     self.report.failures += usize::from(halt.failed(earlier));
                     let left = candidates.len() - n;
-                    self.line(format!("{why}; {left} more candidate(s) wait"));
+                    let line = format!("{why}; {left} more candidate(s) wait");
+                    // A recheck that finds every slot taken holds new runs.
+                    match line.strip_prefix(WIP_HOLD) {
+                        Some(why) if matches!(halt, Halt::Full) => {
+                            self.pass_held(HoldKind::Wip, why)
+                        }
+                        _ => self.line(line),
+                    }
                     free = 0;
                     break;
                 }
@@ -1796,12 +1893,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// The bot's usage snapshot from the configured issue, if `usage` is set.
     fn usage(&self) -> Result<Option<Value>> {
-        let comment = self.usage_comment()?;
+        let comment = self.usage_comment(USAGE_MARKER, "usage snapshot")?;
         Ok(comment.and_then(|c| usage_snapshot(text(&c, "/body"))))
     }
 
-    /// The bot's usage comment on the configured issue, if `usage` is set.
-    fn usage_comment(&self) -> Result<Option<Value>> {
+    /// The bot's comment on the configured usage issue that starts with
+    /// `marker`, the `what` an error names, if `usage` is set.
+    fn usage_comment(&self, marker: &str, what: &str) -> Result<Option<Value>> {
         let Some(usage) = &self.config.usage else {
             return Ok(None);
         };
@@ -1813,7 +1911,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let response = self.client.get(&url, None)?;
             ensure!(
                 response.status == 200,
-                "reading the usage snapshot: GitHub HTTP status {}",
+                "reading the {what}: GitHub HTTP status {}",
                 response.status
             );
             let comments = response
@@ -1822,7 +1920,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .context("comments are not a list")?;
             let found = comments.iter().find(|c| {
                 text(c, "/user/login").eq_ignore_ascii_case(&self.config.bot)
-                    && text(c, "/body").starts_with(USAGE_MARKER)
+                    && text(c, "/body").starts_with(marker)
             });
             if let Some(comment) = found {
                 return Ok(Some(comment.clone()));
@@ -1918,10 +2016,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 continue;
             }
             if !facts.labels_complete {
-                self.line(format!(
-                    "hold {}: its labels could not all be read",
-                    facts.issue.display()
-                ));
+                let why = "its labels could not all be read";
+                self.held(facts, HoldKind::Unreadable, why);
                 continue;
             }
             if EXCLUDED_LABELS.iter().any(|l| facts.labelled(l)) {
@@ -1940,8 +2036,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         continue;
                     }
                     Err(why) => {
-                        let issue = facts.issue.display();
-                        self.line(format!("hold {issue}: {why}"));
+                        self.held(facts, HoldKind::Unreadable, &why);
                         continue;
                     }
                 },
@@ -2096,7 +2191,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let (listed, mut busy) = self.runs(target)?;
         let active = slots.active(&listed);
         if active >= slots.wip {
-            let why = format!("hold wip: {active} of {} runs active", slots.wip);
+            let why = format!("{WIP_HOLD}{active} of {} runs active", slots.wip);
             return Ok(Some(Step::Stop(why, Halt::Full)));
         }
         busy.extend(slots.busy.clone());
@@ -2107,8 +2202,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         for (at, of) in read {
             let facts = self.fresh(at)?;
-            if let Some(why) = hold(&facts, &busy, &writers) {
-                return Ok(Some(Step::Hold(format!("{of}{why}"))));
+            if let Some((kind, why)) = hold(&facts, &busy, &writers) {
+                return Ok(Some(Step::Hold(kind, format!("{of}{why}"))));
             }
         }
         let bounds = self.client.bounds;
@@ -2141,12 +2236,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let busy = &slots.busy;
         let mut facts = facts.clone();
         if let Err(error) = self.complete_pulls(&mut facts) {
-            return Ok(Step::Hold(format!(
-                "its pull requests could not all be read: {error:#}"
-            )));
+            return Ok(Step::Hold(
+                HoldKind::Unreadable,
+                format!("its pull requests could not all be read: {error:#}"),
+            ));
         }
-        if let Some(why) = hold(&facts, busy, &writers) {
-            return Ok(Step::Hold(why));
+        if let Some((kind, why)) = hold(&facts, busy, &writers) {
+            return Ok(Step::Hold(kind, why));
         }
         let issue = &facts.issue;
         let comments = plan::issue_comments(&self.client, issue)?;
@@ -2158,14 +2254,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     let intro = "The board pass asks a triage run to plan this issue.";
                     return self.triage(issue, intro, (snapshot, target, slots));
                 }
-                Some(Err(why)) => return Ok(Step::Hold(why)),
+                Some(Err(why)) => return Ok(Step::Hold(HoldKind::Other, why)),
                 Some(Ok((plan, block, read))) => (plan, "body".to_owned(), Some((block, read))),
             }
         } else {
             let (plan, from) = match plan::newest_plan(&comments, &writers) {
                 Ok(found) => found,
                 Err(error) => {
-                    return Ok(Step::Hold(format!("its newest plan is invalid: {error:#}")));
+                    let why = format!("its newest plan is invalid: {error:#}");
+                    return Ok(Step::Hold(HoldKind::Other, why));
                 }
             };
             let id = plan::plan_id(from)?;
@@ -2178,18 +2275,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 if plan.kind == "implement" && config.replan_after_days > 0 {
                     return self.replan(issue, &id, record, (snapshot, target, slots));
                 }
-                return Ok(Step::Hold(format!(
-                    "plan {id} was dispatched already, {}",
-                    record.url
-                )));
+                let why = format!("plan {id} was dispatched already, {}", record.url);
+                return Ok(Step::Hold(HoldKind::Dispatched, why));
             }
             (plan, id, None)
         };
         if plan.kind != "implement" {
-            return Ok(Step::Hold(format!(
+            let why = format!(
                 "plan {id} is for {}, which is dispatched by hand",
                 plan.kind
-            )));
+            );
+            return Ok(Step::Hold(HoldKind::Other, why));
         }
         let dest = ItemRef {
             repository: plan.repo.clone(),
@@ -2197,23 +2293,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ..issue.clone()
         };
         if !config.works_in(&dest.repository) {
-            return Ok(Step::Hold(format!(
-                "its plan's {} is not in a work repository",
-                dest.display()
-            )));
+            let dest = dest.display();
+            let why = format!("its plan's {dest} is not in a work repository");
+            return Ok(Step::Hold(HoldKind::Other, why));
         }
         if dest != *issue {
             let target_facts = match self.facts(&dest, board) {
                 Ok(facts) => facts,
                 Err(error) => {
                     let dest = dest.display();
-                    return Ok(Step::Hold(format!(
-                        "its plan's {dest} could not be read: {error:#}"
-                    )));
+                    let why = format!("its plan's {dest} could not be read: {error:#}");
+                    return Ok(Step::Hold(HoldKind::Unreadable, why));
                 }
             };
-            if let Some(why) = hold(&target_facts, busy, &writers) {
-                return Ok(Step::Hold(format!("its plan's {}: {why}", dest.display())));
+            if let Some((kind, why)) = hold(&target_facts, busy, &writers) {
+                let why = format!("its plan's {}: {why}", dest.display());
+                return Ok(Step::Hold(kind, why));
             }
         }
         let names: Vec<String> = match plan.pool.is_empty() {
@@ -2222,7 +2317,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let pool = match self.pool(snapshot, &names, slots) {
             Ok(pool) => pool,
-            Err(why) => return Ok(Step::Hold(format!("no pool: {why}"))),
+            Err(why) => return Ok(Step::Hold(HoldKind::Other, format!("no pool: {why}"))),
         };
         let on = match dest == *issue {
             true => String::new(),
@@ -2240,7 +2335,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let bot = Some(config.bot.as_str());
             let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
                 Ok(stacked) => stacked,
-                Err(wait) => return Ok(Step::Hold(wait.sentence())),
+                // The slice it stacks on is neither open nor closed yet.
+                Err(wait) => return Ok(Step::Hold(HoldKind::Dependencies, wait.sentence())),
             };
             if base.is_none() {
                 let decision = overlap::decide_strict(
@@ -2252,7 +2348,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     target,
                 );
                 if let Decision::Wait(_) = decision {
-                    return Ok(Step::Hold(decision.sentence()));
+                    return Ok(Step::Hold(HoldKind::Overlap, decision.sentence()));
                 }
             }
             return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
@@ -2266,7 +2362,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => id,
             Some((block, read)) => {
                 if let Some(why) = self.body_moved(issue, read)? {
-                    return Ok(Step::Hold(why));
+                    return Ok(Step::Hold(HoldKind::Other, why));
                 }
                 match self.post_plan(issue, BODY_PLAN, block) {
                     Ok(posted) => posted,
@@ -2336,7 +2432,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 record: None,
                 overlap,
                 ..
-            }) => Step::Hold(overlap.map_or("the dispatch waited".into(), |d| d.sentence())),
+            }) => match overlap {
+                Some(decision) => Step::Hold(HoldKind::Overlap, decision.sentence()),
+                None => Step::Hold(HoldKind::Other, "the dispatch waited".into()),
+            },
             Ok(done) => {
                 let run = done.run.as_deref().unwrap_or("unnamed");
                 let record = done.record.unwrap_or_default();
@@ -2361,11 +2460,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     ) -> Result<Step> {
         let config = self.config;
         if !config.triage {
-            return Ok(Step::Hold("no plan, and triage is off".into()));
+            return Ok(Step::Hold(
+                HoldKind::Other,
+                "no plan, and triage is off".into(),
+            ));
         }
         let pool = match self.pool(snapshot, config.triage_pools(), slots) {
             Ok(pool) => pool,
-            Err(why) => return Ok(Step::Hold(format!("no plan; no pool for triage: {why}"))),
+            Err(why) => {
+                let why = format!("no plan; no pool for triage: {why}");
+                return Ok(Step::Hold(HoldKind::Other, why));
+            }
         };
         let line = format!("start triage {} pool={pool}", issue.display());
         let url = format!(
@@ -2435,7 +2540,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             && ASK_VERDICTS.contains(&verdict.as_str())
         {
             if let Some(held) = self.caps.check(Kind::Write) {
-                return Ok(Step::Hold(format!("{said}; {held}: label {NEEDS_HUMAN}")));
+                let why = format!("{said}; {held}: label {NEEDS_HUMAN}");
+                return Ok(Step::Hold(HoldKind::Person, why));
             }
             // Counted once sent, whether or not its answer comes back.
             self.caps.count(Kind::Write);
@@ -2452,17 +2558,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     0,
                 )?;
             }
-            return Ok(Step::Hold(format!("{said}; label {NEEDS_HUMAN}")));
+            let why = format!("{said}; label {NEEDS_HUMAN}");
+            return Ok(Step::Hold(HoldKind::Person, why));
         }
         let due = since.changed + time::Duration::days(config.triage_follow_up_days as i64);
         if self.now >= due {
             return self.triage(issue, AGAIN, (snapshot, target, slots));
         }
         let due = due.format(&Rfc3339).unwrap_or_default();
-        Ok(Step::Hold(format!(
+        let why = format!(
             "{said}; triaged again from {due}, or once {} comments",
             config.operator
-        )))
+        );
+        Ok(Step::Hold(HoldKind::Dispatched, why))
     }
 
     /// An implement plan `id` dispatched already, on an issue still open
@@ -2483,10 +2591,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return self.triage(issue, REPLAN, context);
         }
         let due = due.format(&Rfc3339).unwrap_or_default();
-        Ok(Step::Hold(format!(
+        let why = format!(
             "plan {id} was dispatched already, {}; re-planned from {due}",
             record.url
-        )))
+        );
+        Ok(Step::Hold(HoldKind::Dispatched, why))
     }
 
     /// A triage run on `issue` in `pool` with `brief`, its line `line`:

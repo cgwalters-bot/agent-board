@@ -658,7 +658,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// For an applying pass, why another pass in progress keeps a step from
     /// being taken, as the end of its line.
-    fn other_holds(&mut self) -> Option<String> {
+    pub(super) fn other_holds(&mut self) -> Option<String> {
         match self.apply.then(|| self.other_pass())? {
             Ok(None) => None,
             Ok(Some(other)) => Some(format!("another pass is in progress, {other}")),
@@ -719,7 +719,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             busy: busy.map(String::as_str),
             now: self.now,
         });
-        if let Some(held) = person_hold(
+        if let Some((_, held)) = person_hold(
             &facts.labels,
             facts.labels_complete,
             facts.status.as_deref(),
@@ -1082,7 +1082,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.report.failures += 1;
         }
         match step {
-            Step::Hold(why) => self.line(format!("hold epic {name}: {why}")),
+            Step::Hold(_, why) => self.line(format!("hold epic {name}: {why}")),
             Step::Stop(why, halt) => {
                 // Stage 4's candidates come after: none was considered.
                 self.report.failures += usize::from(halt.failed(false));

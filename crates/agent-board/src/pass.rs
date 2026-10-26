@@ -16,13 +16,13 @@ pub struct Pass {
     /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos`, or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase or continuation round and is left to the operator. The policy step stays the boundary.
     #[arg(long, value_name = "FILE")]
     pub fix_bounds: Option<PathBuf>,
-    /// Take the steps: follow up pull requests, publish the usage snapshot, apply epic plans, start the chosen runs and write board Status as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow.
+    /// Take the steps: follow up pull requests, publish the usage snapshot, apply epic plans, start the chosen runs, write board Status and, with usage.holds, publish the hold snapshot as GH_TOKEN's bot, starting runs with DISPATCH_TOKEN if set. Without it the pass previews and writes nothing. In a GitHub Actions run (GITHUB_REPOSITORY, GITHUB_RUN_ID), work starts only while no other run of its workflow is in progress. Outside one, it needs both --max-dispatch and --max-writes, and is not serialized against the scheduled workflow.
     #[arg(long)]
     pub apply: bool,
     /// Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, an epic's planning run, and scheduled starts. The rest are held, each line saying so.
     #[arg(long, value_name = "N")]
     pub max_dispatch: Option<usize>,
-    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage snapshot, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage comment's edit, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together.
+    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage and hold snapshots, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage and hold comments' edits, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together.
     #[arg(long, value_name = "N")]
     pub max_writes: Option<usize>,
     /// Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through.
