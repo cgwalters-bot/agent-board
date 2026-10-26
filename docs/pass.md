@@ -31,10 +31,13 @@ so `--max-writes 1` spends it there. A failed read is one line,
 back to the published snapshot under the staleness rules below. Without
 `usage.url` the line says pacing reads the published snapshot. Unlike
 `usage.cjs`, a pool the broker has no current week for (after a broker
-restart) is null, so held, not carried from the previous snapshot; and the
-snapshot has no `windows`, `workers` or Mistral allowance (the review app
-reads that from the pools file). A recording keeps the broker's answer under
-no address.
+restart) is held (`no-reading`), not carried from the previous snapshot; and
+the snapshot has no `windows`, `workers` or Mistral allowance (the review app
+reads that from the pools file). Every pool's entry carries the pass's
+decision, `hold` and a `reason` (null unless held), and a paced one its
+`limit_percent`, `min(allowed_percent + burst, target_percent)`, past which it
+holds, so the review app shows that rather than its own. A recording keeps the
+broker's answer under no address.
 
 The broker learns a pool's windows only from the responses to requests made
 through it, so after a restart a held pool would never get a reading. With

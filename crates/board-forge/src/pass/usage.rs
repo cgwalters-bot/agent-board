@@ -141,10 +141,12 @@ fn pace(
     }
     let (goal, burst) = (settings.target * 100.0, settings.burst);
     let allowed = allowed(settings.target, paced.minutes, resets, now);
+    // Published, so the review app shows the pass's limit, not its own.
+    let limit = (allowed + burst).min(goal);
     let window = paced.minutes * 60.0;
     let mut reason = None;
     let mut next = None;
-    if paced.used > (allowed + burst).min(goal) {
+    if paced.used > limit {
         reason = Some("pace");
         next = Some(match paced.used > goal {
             true => paced.resets,
@@ -170,6 +172,7 @@ fn pace(
         "target_percent": goal,
         "burst": burst,
         "allowed_percent": allowed,
+        "limit_percent": limit,
         "ahead": paced.used - allowed,
         "hold": reason.is_some(),
         "reason": reason,
@@ -922,6 +925,7 @@ pub(super) mod tests {
             }
             let mut snap = snapshot(&cold, &pools(), now()).unwrap();
             grants(&mut snap, Some(&grant), &budget, now()).unwrap();
+            decided(name, &snap);
             let probed: BTreeMap<String, String> =
                 [("claude", claude, "anthropic"), ("openai", openai, "codex")]
                     .into_iter()
@@ -941,12 +945,31 @@ pub(super) mod tests {
         }
         let mut snap = snapshot(&broker(), &pools(), now()).unwrap();
         grants(&mut snap, None, &budget, now()).unwrap();
+        decided("no grant", &snap);
         let openai = &snap["pools"]["openai"];
         assert_eq!(
             (&openai["hold"], &openai["reason"]),
             (&json!(true), &json!(NO_GRANT))
         );
         assert_eq!(openai["grant_pool"], "codex");
+    }
+
+    /// Every entry, paced, unread or granted, carries the pass's decision:
+    /// a boolean `hold` and a `reason` exactly when held; a paced one its
+    /// `limit_percent` too, past which it holds for pace.
+    fn decided(name: &str, snap: &Value) {
+        for (pool, e) in snap["pools"].as_object().unwrap() {
+            assert!(e.get("reason").is_some(), "{name}: {pool} {e}");
+            let hold = e["hold"].as_bool();
+            assert_eq!(hold, Some(e["reason"].is_string()), "{name}: {pool} {e}");
+            if e["source"] != SOURCE || e["reason"] == NO_READING {
+                assert!(e.get("limit_percent").is_none(), "{name}: {pool} {e}");
+                continue;
+            }
+            let (used, limit) = (e["used_percent"].as_f64(), e["limit_percent"].as_f64());
+            let over = used.unwrap() > limit.unwrap();
+            assert_eq!(over, e["reason"] == "pace", "{name}: {pool} {e}");
+        }
     }
 
     pub(in crate::pass) fn now() -> OffsetDateTime {
@@ -1057,6 +1080,7 @@ pub(super) mod tests {
                 *broker.pointer_mut(pointer).unwrap() = value;
             }
             let snap = snapshot(&broker, &pools(), now()).unwrap();
+            decided(name, &snap);
             let got = |pool: &str| {
                 let e = &snap["pools"][pool];
                 let hold = (
@@ -1176,6 +1200,11 @@ pub(super) mod tests {
         let allowed = snap["pools"]["claude"]["allowed_percent"].as_f64().unwrap();
         // usage.cjs: 49.90491557539683, at the millisecond.
         assert!((allowed - 49.904_915_575).abs() < 1e-6, "{allowed}");
+        // openai's burst of 3 is its limit's margin over its pace.
+        let openai = &snap["pools"]["openai"];
+        let margin =
+            openai["limit_percent"].as_f64().unwrap() - openai["allowed_percent"].as_f64().unwrap();
+        assert!((margin - 3.0).abs() < 1e-9, "{openai}");
         let mut claude = snap["pools"]["claude"].clone();
         claude["allowed_percent"] = json!(0);
         claude["ahead"] = json!(0);
@@ -1184,7 +1213,8 @@ pub(super) mod tests {
             json!({"source": "praxis", "observed_at": "2026-10-23T15:06:40Z",
                 "computed_at": "2026-10-23T15:15:10.452Z", "used_percent": 18.0,
                 "window_minutes": 10080.0, "resets_at": "2026-10-26T23:00:00Z",
-                "target_percent": 95.0, "burst": 95.0, "allowed_percent": 0, "ahead": 0,
+                "target_percent": 95.0, "burst": 95.0, "allowed_percent": 0,
+                "limit_percent": 95.0, "ahead": 0,
                 "hold": false, "reason": null, "next_dispatch_at": null})
         );
         assert_eq!(
