@@ -8,6 +8,7 @@ use crate::supervise::health::json_block;
 use anyhow::{Context, Result};
 use board_core::ItemRef;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 /// The schema of the hold snapshot ([`super::Config::holds`]).
@@ -177,6 +178,29 @@ impl Entry {
     }
 }
 
+/// The WIP limit and the runs holding a slot once stage 4 scheduled, its
+/// own starts included; `in_flight` is null where it did not count them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Wip {
+    pub limit: u64,
+    pub in_flight: Option<usize>,
+}
+
+/// What the pass did besides its holds, as its lines say.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PassSummary {
+    /// `preview`, `actions` or `local` ([`super::Mode`]).
+    pub mode: &'static str,
+    /// Stage 4's candidates (`candidates: N …`); null where it did not
+    /// read the board.
+    pub candidates: Option<usize>,
+    /// The runs stages 2 to 4 started, or in a preview would start.
+    pub started: usize,
+    /// Stage 3's live epics (`epics: N live …`); null where it did not
+    /// list them.
+    pub live_epics: Option<usize>,
+}
+
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
 #[derive(Debug, PartialEq, Serialize)]
 pub struct Snapshot {
@@ -185,6 +209,8 @@ pub struct Snapshot {
     pub at: String,
     /// How many holds [`fit`] left out.
     pub truncated: usize,
+    pub wip: Wip,
+    pub pass: PassSummary,
     pub holds: Vec<Published>,
 }
 
@@ -214,9 +240,10 @@ pub fn question(why: &str) -> Option<String> {
     (!asked.is_empty()).then(|| asked.to_owned())
 }
 
-/// The snapshot of `entries` at `at`: the holds of every new run first, in
-/// the order decided, then by repository and number.
-pub fn snapshot(entries: &[Entry], at: String) -> Snapshot {
+/// The snapshot of `entries` at `at`, with the pass's `wip` and `pass`: the
+/// holds of every new run first, in the order decided, then by repository
+/// and number.
+pub fn snapshot(entries: &[Entry], at: String, (wip, pass): (Wip, PassSummary)) -> Snapshot {
     let mut sorted: Vec<&Entry> = entries.iter().collect();
     sorted.sort_by_key(|e| {
         e.item()
@@ -226,6 +253,8 @@ pub fn snapshot(entries: &[Entry], at: String) -> Snapshot {
         schema: HOLDS_SCHEMA,
         at,
         truncated: 0,
+        wip,
+        pass,
         holds: sorted.into_iter().map(Entry::published).collect(),
     }
 }
@@ -233,11 +262,15 @@ pub fn snapshot(entries: &[Entry], at: String) -> Snapshot {
 /// Whether `snapshot` says something other than the published comment
 /// `body`, if any: its time alone is no change.
 pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
-    let holds = serde_json::to_value(&snapshot.holds)?;
+    let mut now = serde_json::to_value(snapshot)?;
     let published = body
         .and_then(json_block)
         .filter(|s| s["schema"] == HOLDS_SCHEMA);
-    Ok(published.is_none_or(|s| s["holds"] != holds || s["truncated"] != snapshot.truncated))
+    Ok(published.is_none_or(|mut s| {
+        s["at"] = Value::Null;
+        now["at"] = Value::Null;
+        s != now
+    }))
 }
 
 /// The hold snapshot's comment: its marker, then the JSON the review app
@@ -251,11 +284,13 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         false => format!("\n{}", holds.join(",\n")),
     };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
         snapshot.truncated,
+        serde_json::to_string(&snapshot.wip)?,
+        serde_json::to_string(&snapshot.pass)?,
     ))
 }
 
@@ -296,6 +331,8 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
             schema: snapshot.schema,
             at: snapshot.at.clone(),
             truncated: dropped.len(),
+            wip: snapshot.wip.clone(),
+            pass: snapshot.pass.clone(),
             holds: kept,
         };
         let body = render(&fitted)?;
@@ -373,6 +410,26 @@ mod tests {
         ]
     }
 
+    /// A pass that found 2 of 2 slots taken after starting one run.
+    fn tally() -> (Wip, PassSummary) {
+        let wip = Wip {
+            limit: 2,
+            in_flight: Some(2),
+        };
+        let pass = PassSummary {
+            mode: "actions",
+            candidates: Some(3),
+            started: 1,
+            live_epics: None,
+        };
+        (wip, pass)
+    }
+
+    /// The snapshot of `entries` with no clock, WIP count or summary.
+    fn bare(entries: &[Entry]) -> Snapshot {
+        snapshot(entries, String::new(), Default::default())
+    }
+
     #[test]
     fn lines() {
         let lines: Vec<String> = entries().iter().map(Entry::line).collect();
@@ -389,14 +446,17 @@ mod tests {
 
     /// The pass's holds first, then by repository and number (tracker#596
     /// before #1000), each with its URL, whether it waits on the operator,
-    /// its Priority and its Why's question.
+    /// its Priority and its Why's question; after the WIP limit and the
+    /// pass's summary, null where unknown.
     #[test]
     fn snapshot_of_holds() {
-        let snapshot = snapshot(&entries(), "2026-10-26T00:00:00Z".into());
+        let snapshot = snapshot(&entries(), "2026-10-26T00:00:00Z".into(), tally());
         let expected = json!({
             "schema": HOLDS_SCHEMA,
             "at": "2026-10-26T00:00:00Z",
             "truncated": 0,
+            "wip": {"limit": 2, "in_flight": 2},
+            "pass": {"mode": "actions", "candidates": 3, "started": 1, "live_epics": null},
             "holds": [
                 {"item": null, "url": null, "epic": false, "kind": "wip",
                  "reason": "2 of 2 runs active", "operator": false, "priority": null, "question": null},
@@ -425,7 +485,7 @@ mod tests {
         // A hold may wait on the operator otherwise than its kind does.
         let mut cooling = entries();
         cooling[2].hold = cooling[2].hold.clone().operator(false);
-        let cooling = super::snapshot(&cooling, String::new());
+        let cooling = bare(&cooling);
         assert!(!cooling.holds[2].operator);
     }
 
@@ -470,11 +530,11 @@ mod tests {
     /// order: one without a Priority.
     #[test]
     fn fit_at_the_limit() {
-        let whole = |pad| render(&snapshot(&board(59, pad), String::new())).unwrap();
+        let whole = |pad| render(&bare(&board(59, pad))).unwrap();
         let pad = MAX_COMMENT_CHARS - chars(&whole(0));
-        let (fitted, body) = fit(snapshot(&board(59, pad), String::new())).unwrap();
+        let (fitted, body) = fit(bare(&board(59, pad))).unwrap();
         assert_eq!((fitted.truncated, chars(&body)), (0, MAX_COMMENT_CHARS));
-        let (fitted, body) = fit(snapshot(&board(59, pad + 1), String::new())).unwrap();
+        let (fitted, body) = fit(bare(&board(59, pad + 1))).unwrap();
         assert_eq!(fitted.truncated, 1);
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         assert_eq!(parse(&body).unwrap()["truncated"], 1);
@@ -491,9 +551,9 @@ mod tests {
     /// first, and no more than needed.
     #[test]
     fn fit_far_past_the_limit() {
-        let full = snapshot(&board(240, 0), String::new());
+        let full = bare(&board(240, 0));
         assert!(chars(&render(&full).unwrap()) > 65_536);
-        let (fitted, body) = fit(snapshot(&board(240, 0), String::new())).unwrap();
+        let (fitted, body) = fit(bare(&board(240, 0))).unwrap();
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         assert!(fitted.truncated > 0);
         assert_eq!(fitted.holds.len() + fitted.truncated, full.holds.len());
@@ -528,25 +588,39 @@ mod tests {
         for hold in &mut asked[1..] {
             hold.why = Some(format!("Q: {}", "q".repeat(4000)));
         }
-        assert!(fit(snapshot(&asked, String::new())).is_err());
+        assert!(fit(bare(&asked)).is_err());
     }
 
-    /// Only a change of the holds publishes: not a later clock, nor the
-    /// order the pass decided them in.
+    /// Only a change of the holds, the WIP count or the pass's summary
+    /// publishes: not a later clock, nor the order the pass decided them in.
+    /// A comment from before the WIP count and summary is republished.
     #[test]
     fn unchanged_is_not_republished() {
-        let published = render(&snapshot(&entries(), "2026-10-26T00:00:00Z".into())).unwrap();
+        let at = "2026-10-26T00:00:00Z";
+        let published = render(&snapshot(&entries(), at.into(), tally())).unwrap();
         let mut reordered = entries();
         reordered.reverse();
-        let later = snapshot(&reordered, "2026-10-26T00:10:00Z".into());
+        let later = snapshot(&reordered, "2026-10-26T00:10:00Z".into(), tally());
         assert!(!changed(Some(&published), &later).unwrap());
         let mut fewer = entries();
         fewer.pop();
-        let fewer = snapshot(&fewer, "2026-10-26T00:10:00Z".into());
+        let fewer = snapshot(&fewer, "2026-10-26T00:10:00Z".into(), tally());
         assert!(changed(Some(&published), &fewer).unwrap());
+        let (mut wip, mut pass) = tally();
+        wip.in_flight = Some(1);
+        let freed = snapshot(&entries(), at.into(), (wip, tally().1));
+        assert!(changed(Some(&published), &freed).unwrap());
+        pass.started = 0;
+        let idle = snapshot(&entries(), at.into(), (tally().0, pass));
+        assert!(changed(Some(&published), &idle).unwrap());
         assert!(changed(None, &later).unwrap());
         let other = published.replace(HOLDS_SCHEMA, "agent-board/pass-holds/v1");
         assert!(changed(Some(&other), &later).unwrap());
+        let start = published.find(",\"wip\"").unwrap();
+        let end = published.find(",\"holds\"").unwrap();
+        let older = format!("{}{}", &published[..start], &published[end..]);
+        assert!(parse(&older).is_some(), "{older}");
+        assert!(changed(Some(&older), &later).unwrap());
     }
 
     #[test]

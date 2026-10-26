@@ -87,8 +87,8 @@ reach has none, and a budget stop (`budget: …; new runs wait`) is not one.
 After stage 5, unless stage 3 or 4 failed or stopped early (`epics error: …`,
 `schedule error: …`, `epics: the pass's request or time budget is low`), the
 snapshot `{"schema": "agent-board/holds/v1", "at": T, "truncated": N,
-"holds": […]}`, T the clock of the pass that last changed them, goes to the
-bot's own comment on
+"wip": {…}, "pass": {…}, "holds": […]}`, T the clock of the pass that last
+changed them, goes to the bot's own comment on
 `holds.repository`'s issue `holds.issue`, found again by its first line
 `<!-- agent-board-holds v1 -->`, under the same checks as the usage
 comment's: a private repository, and a new comment only as the bot. It is one
@@ -100,6 +100,17 @@ pass that waited for another in progress, or that has spent its request
 budget or time bound, publishes nothing (`holds: not published; why`). A
 failure is one line, `holds error: …`, counted as a failure, and the pass
 goes on. The holds issue, like the usage issue, is never a candidate.
+
+`wip` is `{"limit", "in_flight"}`: the `wip` setting, and the runs holding
+a slot once stage 4 counted them, its own starts included (null where it
+did not get that far). `pass` is `{"mode", "candidates", "started",
+"live_epics"}`: `preview`, `actions` or `local`; stage 4's
+`candidates: N …`; the runs stages 2 to 4 started, or in a preview would
+start; and the sum of stage 3's `epics: N live …`. `candidates` and
+`live_epics` are null where their stage did not get that far. `wip` and
+`pass` were added to v1 later, so a reader treats them as absent in an
+older comment, and a change in either publishes as a change of the holds
+does.
 
 The JSON is compact, one entry a line, so that a board of a few hundred holds
 fits GitHub's 65,536-character comment. The comment is also capped at 60,000

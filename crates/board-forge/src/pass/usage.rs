@@ -639,7 +639,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let on = (at.repository.as_str(), at.issue);
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let said = format!("holds: publish to {}#{}", at.repository, at.issue);
-        let fitted = holds::fit(holds::snapshot(&self.report.holds, stamp));
+        let tally = self.report.tally.clone();
+        let fitted = holds::fit(holds::snapshot(&self.report.holds, stamp, tally));
         let comment = fitted.and_then(|fitted| {
             let comment = self.bot_comment(on, holds::HOLDS_MARKER, "hold snapshot")?;
             Ok((fitted, comment))

@@ -1632,7 +1632,7 @@ fn apply_publishes_the_holds() {
         let comment = match found {
             Some("same") => first.clone(),
             Some(_) => {
-                let old = holds::snapshot(&[], "2026-10-22T00:00:00Z".into());
+                let old = holds::snapshot(&[], "2026-10-22T00:00:00Z".into(), Default::default());
                 Some(holds::render(&old).unwrap())
             }
             None => None,
@@ -1677,6 +1677,25 @@ fn apply_publishes_the_holds() {
         assert!(body.starts_with(holds::HOLDS_MARKER), "{body}");
         let snapshot = holds::parse(&body).unwrap();
         assert_eq!(snapshot["at"], now.format(&Rfc3339).unwrap());
+        // The WIP limit and count and the pass's summary, as its lines say.
+        let (in_flight, candidates, started) = match wip {
+            2 => (2, Value::Null, 0),
+            _ => (7, json!(9), 5),
+        };
+        if let Some(n) = candidates.as_u64() {
+            let said = format!("candidates: {n} (");
+            assert!(report.lines.iter().any(|l| l.starts_with(&said)), "{said}");
+        }
+        let tally = json!({
+            "wip": {"limit": wip, "in_flight": in_flight},
+            "pass": {"mode": "actions", "candidates": candidates, "started": started,
+                     "live_epics": 0},
+        });
+        assert_eq!(
+            json!({"wip": snapshot["wip"], "pass": snapshot["pass"]}),
+            tally,
+            "{line}"
+        );
         // Each entry's reason is what its line says.
         let mut kinds = vec![];
         for hold in snapshot["holds"].as_array().unwrap() {
@@ -1743,7 +1762,15 @@ fn apply_publishes_the_holds() {
     let report = preview(&config(json!({"holds": at})), &replay());
     let line = format!("{publish}; a preview does not write it");
     assert!(report.lines.contains(&line), "{:#?}", report.lines);
-    let snapshot = holds::snapshot(&report.holds, String::new());
+    let snapshot = holds::snapshot(&report.holds, String::new(), report.tally.clone());
+    assert_eq!(snapshot.pass.mode, "preview");
+    assert_eq!(snapshot.pass.live_epics, Some(3));
+    let said = "epics: 3 live of ";
+    assert!(
+        report.lines.iter().any(|l| l.starts_with(said)),
+        "{:#?}",
+        report.lines
+    );
     let epics: Vec<Value> = (snapshot.holds.iter())
         .filter(|h| h.epic)
         .map(|h| json!([h.item, h.kind, h.operator, h.priority]))

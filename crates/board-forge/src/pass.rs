@@ -23,7 +23,7 @@ use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{ItemRef, NEEDS_HUMAN_LABEL as NEEDS_HUMAN};
-use holds::{Entry, Hold, HoldKind, Scope};
+use holds::{Entry, Hold, HoldKind, PassSummary, Scope, Wip};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::{Value, json};
@@ -1332,6 +1332,9 @@ pub struct Report {
     pub failures: usize,
     pub state: Option<State>,
     pub holds: Vec<Entry>,
+    /// The WIP limit and count and the pass's summary, published with
+    /// the holds.
+    pub tally: (Wip, PassSummary),
 }
 
 impl Report {
@@ -1425,12 +1428,14 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds: &Bounds,
     caps: &Caps,
 ) -> Report {
-    let (apply, own) = match mode {
-        Mode::Preview => (false, None),
-        Mode::Actions(own) => (true, Some(own)),
-        Mode::Local => (true, None),
+    let (apply, own, name) = match mode {
+        Mode::Preview => (false, None, "preview"),
+        Mode::Actions(own) => (true, Some(own), "actions"),
+        Mode::Local => (true, None, "local"),
     };
     let mut report = Report::default();
+    report.tally.0.limit = config.wip;
+    report.tally.1.mode = name;
     let client = Budget {
         inner: client,
         bounds,
@@ -1720,6 +1725,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     fn schedule(&mut self, earlier: usize, git_ref: &str) -> Result<()> {
         let config = self.config;
+        self.report.tally.1.started = earlier;
         if !config.work() {
             self.line("schedule: off (wip 0 or no workRepositories)".into());
             return Ok(());
@@ -1770,6 +1776,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             probes,
         };
         let active = slots.active(&runs);
+        self.report.tally.0.in_flight = Some(active);
         if active >= wip {
             self.pass_held(HoldKind::Wip, format!("{active} of {wip} runs active"));
             return Ok(());
@@ -1794,6 +1801,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let (free, taken) = self.start(&board, slots, (wip - active, &target, snapshot.as_ref()));
         self.board = Some(Some(board));
+        self.report.tally.0.in_flight = Some(active + taken);
+        self.report.tally.1.started += taken;
         if taken == 0 && free > 0 {
             self.line(format!("idle: {free} slot(s) free and nothing started"));
         }
@@ -2199,6 +2208,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ranked.push((rank, facts));
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
+        self.report.tally.1.candidates = Some(ranked.len());
         self.line(format!(
             "candidates: {} ({visitors} opened by others, {outside} outside a live epic)",
             ranked.len()

@@ -627,6 +627,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Err(why) => self.epic_held(&facts, Hold::new(HoldKind::Unreadable, why)),
             }
         }
+        *self.report.tally.1.live_epics.get_or_insert(0) += live.len();
         self.line(format!(
             "epics: {} live of {open} open in {repository}",
             live.len()
