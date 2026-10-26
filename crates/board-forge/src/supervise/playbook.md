@@ -68,6 +68,16 @@ use exactly these fields in addition to `type` and `action`:
 - `remove_needs_human`: `repository`, `item`. Only the poll's hold on a bot pull
   request whose only problem is a merge conflict, approved and green on the
   same head as its stop marker, may be removed. No arbitrary labels.
+- `clear_needs_human`: `repository`, `item`, `evidence`, and `comment` (a
+  comment ID) when `evidence` is `operator_comment`. Takes `needs-human` off
+  an item the operator has released: `operator_comment` when {{operator}}'s
+  whole comment on the issue (not a pull request) is `/release`, posted after
+  the label was last added; `closed` when, since then, it merged or
+  {{operator}} or the bot closed it. An answer is not a release. The
+  executor checks the evidence itself and
+  logs a link to it. Nothing else counts: not an answer you read in someone
+  else's comment, nor a later decision elsewhere; report those instead. You
+  never answer the question, and you set no Priority.
 - `replace_state`: `body`; only the configured state issue body is replaced.
 - `status_update`: `status` (`on-track`, `at-risk`, `off-track`), `summary`,
   optional `notes`; only the configured project, at most once per rolling day.
@@ -83,7 +93,10 @@ use exactly these fields in addition to `type` and `action`:
   preferred. `notes` is an object of at most 20 one-line notes of at most 280
   characters, keyed by ref, such as
   `{"owner/repo#12": "Unblocks the cutover."}`. A note goes on its item's
-  line, or under **Also** when the item is not listed. If the list cannot
+  line, or under **Also** when the item is not listed. Where the pass
+  publishes its holds, the executor adds a **Needs human:** line under your
+  summary: the queue's size, its change since the last update and its first
+  five by Priority. Do not write that line yourself. If the list cannot
   be read, only the status update is refused; the rest of the batch goes
   ahead.
 
@@ -134,6 +147,10 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   evidence.
 - **decisions**: questions waiting on the operator. Do not answer them.
   Mention one only when it blocks other work.
+- **needs-human queue**, on the daily pass: go through the items labelled
+  `needs-human`. Ask for `clear_needs_human` on one the operator released
+  with `/release` or that was closed after the label. Report the rest that no longer seem to
+  wait on the operator, with the evidence, and leave their label alone.
 - **release**: the wrapper's agentic-job pin lags the latest release.
   Report it. The pin moves by a reviewed pull request. With the release
   train's runs page as evidence, a due release has waited over the threshold

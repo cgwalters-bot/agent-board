@@ -6,6 +6,7 @@ use crate::changes;
 use crate::dispatch::{GitHub, Start, StartOutcome};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 pub const ACTIONS: &[&str] = &[
     "comment",
@@ -13,9 +14,24 @@ pub const ACTIONS: &[&str] = &[
     "file_bug",
     "close",
     "remove_needs_human",
+    "clear_needs_human",
     "replace_state",
     "status_update",
 ];
+
+/// What shows that the operator no longer waits on an item held
+/// `needs-human`: facts the executor reads, never the agent's reading of
+/// the conversation.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Evidence {
+    /// The operator commented [`RELEASE_COMMAND`] after the newest
+    /// `needs-human` label was added.
+    OperatorComment,
+    /// The item was closed after the newest `needs-human` label was added; a
+    /// merged pull request is.
+    Closed,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -47,6 +63,17 @@ pub enum Write {
         repository: String,
         item: u64,
     },
+    /// Takes `needs-human` off an issue or pull request the operator has
+    /// settled, on [`Evidence`]; `comment` is the operator's comment ID.
+    /// Without it, a compromised agent could release any of the operator's
+    /// holds to get the work dispatched.
+    ClearNeedsHuman {
+        repository: String,
+        item: u64,
+        evidence: Evidence,
+        #[serde(default)]
+        comment: Option<u64>,
+    },
     ReplaceState {
         body: String,
     },
@@ -73,6 +100,23 @@ pub enum Write {
 const SUMMARY_LIMIT: usize = 1_000;
 const NOTE_LIMIT: usize = 280;
 const MAX_NOTES: usize = 20;
+/// How the status update's line on the needs-human queue starts, by which
+/// the next update reads the count it gave.
+const QUEUE_LINE: &str = "**Needs human:**";
+/// How many of the queue's items the status update names.
+const QUEUE_TOP: usize = 5;
+/// The longest board Priority the status update shows; a longer one, or
+/// one with other than letters, digits, spaces or dashes, is left out.
+const PRIORITY_LIMIT: usize = 20;
+/// The project's newest status update, which the queue's count is read from.
+const NEWEST_UPDATE: &str = "query($id:ID!){node(id:$id){... on ProjectV2{statusUpdates(first:1,orderBy:{field:CREATED_AT,direction:DESC}){nodes{createdAt body}}}}}";
+/// The project field whose option order ranks the queue, as the pass's
+/// default `priorityField`.
+const PRIORITY_FIELD: &str = "Priority";
+/// The options of the project's [`PRIORITY_FIELD`], in the board's order.
+const PRIORITY_OPTIONS: &str = "query($id:ID!,$field:String!){node(id:$id){... on ProjectV2{field(name:$field){... on ProjectV2SingleSelectField{options{name}}}}}}";
+/// The whole of the operator's comment that releases a `needs-human` hold.
+const RELEASE_COMMAND: &str = "/release";
 
 pub enum Checked {
     Dispatch(Request),
@@ -228,6 +272,7 @@ impl Checked {
                 Write::FileBug { .. } => "file_bug",
                 Write::Close { .. } => "close",
                 Write::RemoveNeedsHuman { .. } => "remove_needs_human",
+                Write::ClearNeedsHuman { .. } => "clear_needs_human",
                 Write::ReplaceState { .. } => "replace_state",
                 Write::StatusUpdate { .. } => "status_update",
             },
@@ -244,7 +289,10 @@ impl Checked {
                 | Write::Close {
                     repository, item, ..
                 }
-                | Write::RemoveNeedsHuman { repository, item },
+                | Write::RemoveNeedsHuman { repository, item }
+                | Write::ClearNeedsHuman {
+                    repository, item, ..
+                },
             ) => Some((repository, *item)),
             _ => None,
         }
@@ -295,6 +343,11 @@ impl Checked {
                         "Unknown project status"
                     );
                     text(summary, SUMMARY_LIMIT, true, &p.settings.footer)?;
+                    // The next update reads the queue's count from this line.
+                    ensure!(
+                        !summary.contains(QUEUE_LINE),
+                        "The summary cannot hold the queue's line"
+                    );
                     ensure!(notes.len() <= MAX_NOTES, "Too many status notes");
                     for (reference, note) in notes {
                         ensure!(
@@ -314,6 +367,15 @@ impl Checked {
                     ensure!(*triage_comment > 0, "Missing triage receipt");
                 }
                 Write::RemoveNeedsHuman { .. } => (),
+                Write::ClearNeedsHuman {
+                    evidence, comment, ..
+                } => ensure!(
+                    match evidence {
+                        Evidence::OperatorComment => comment.is_some_and(|c| c > 0),
+                        Evidence::Closed => comment.is_none(),
+                    },
+                    "An operator comment's evidence is its ID, and only it"
+                ),
             }
         }
         Ok(())
@@ -342,6 +404,16 @@ impl Checked {
     /// The issue the log line links to. `receipt` is the write's API answer;
     /// a created issue is only addressable through the number it reports.
     pub fn link(&self, p: &Policy, receipt: Option<&Value>) -> String {
+        // A cleared hold links its evidence: the comment, or the closed item.
+        if let Self::Write(Write::ClearNeedsHuman {
+            repository,
+            item,
+            comment: Some(id),
+            ..
+        }) = self
+        {
+            return format!("https://github.com/{repository}/issues/{item}#issuecomment-{id}");
+        }
         let target = self.issue().or_else(|| match self {
             Self::Write(Write::CreateIssue { .. } | Write::FileBug { .. }) => p
                 .agent
@@ -426,6 +498,9 @@ impl Checked {
                         "Not a held open pull request"
                     );
                     conflict_only(api, p, repo, item)?;
+                }
+                Self::Write(Write::ClearNeedsHuman { comment, .. }) => {
+                    settled(api, p, repo, item, *comment)?;
                 }
                 _ => (),
             }
@@ -530,6 +605,20 @@ impl Checked {
                         json!({}),
                     )
                 }
+                Write::ClearNeedsHuman {
+                    repository,
+                    item,
+                    comment,
+                    ..
+                } => {
+                    // The operator may have held it again since the check.
+                    settled(api, p, repository, *item, *comment)?;
+                    (
+                        "DELETE",
+                        format!("/repos/{repository}/issues/{item}/labels/needs-human"),
+                        json!({}),
+                    )
+                }
                 Write::ReplaceState { body } => {
                     let s = p.agent.state.as_ref().context("No state issue")?;
                     (
@@ -586,11 +675,21 @@ fn status_body(
         .context("No configured project")?;
     let forge = super::super::Graphql(api);
     let now = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(now) * 1_000_000)?;
-    let since = match changes::last_update(&forge, project)? {
+    let last = changes::last_update(&forge, project)?;
+    let since = match last {
         Some(since) => since,
         None => now - changes::FIRST_WINDOW,
     };
     let footer = &p.settings.footer;
+    let summary = unsigned(summary, footer);
+    let previous = match last {
+        Some(at) => previous_queue(api, project, at)?,
+        None => None,
+    };
+    let summary = match queue_line(api, p, project, previous)? {
+        Some(queue) => format!("{summary}\n\n{queue}"),
+        None => summary.to_owned(),
+    };
     // Room for the attribution [`signed`] appends.
     let limit = crate::github::STATUS_BODY_LIMIT - footer.as_str().chars().count() - 2;
     let changes = changes::read(
@@ -607,7 +706,7 @@ fn status_body(
         let split = crate::budget::split::read(&forge, &config, since, now)?;
         anyhow::Ok(crate::budget::split::line(&split))
     });
-    let summary = Some(unsigned(summary, footer));
+    let summary = Some(summary.as_str());
     let (body, no_split) = match split {
         Some(Ok(line)) => {
             let room = limit.saturating_sub(line.chars().count() + 2);
@@ -628,6 +727,185 @@ fn status_body(
         None => (changes.status_body(summary, notes, limit)?, None),
     };
     Ok((signed(&body, None, footer), no_split))
+}
+
+/// The needs-human count the project's newest status update, posted `at`,
+/// gave on its [`QUEUE_LINE`], if it gave one. The agent's summary cannot
+/// hold that line, so the last one is the executor's.
+fn previous_queue(api: &dyn Api, project: &str, at: time::OffsetDateTime) -> Result<Option<u64>> {
+    let read = api.graphql(NEWEST_UPDATE, json!({"id": project}))?;
+    let newest = &read["node"]["statusUpdates"]["nodes"][0];
+    let created = newest["createdAt"].as_str().map(changes::parse_time);
+    // An update that is not the one the changes start from says nothing.
+    if !matches!(created, Some(Ok(t)) if t == at) {
+        return Ok(None);
+    }
+    Ok(newest["body"]
+        .as_str()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix(QUEUE_LINE))
+        .next_back()
+        .and_then(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..digits].parse().ok()
+        }))
+}
+
+/// The status update's line on the needs-human queue, from the pass's hold
+/// snapshot on the usage issue: its size, its change from `previous`, and
+/// its first [`QUEUE_TOP`] by the order of `project`'s Priority options.
+/// None without a usage config or a snapshot there.
+fn queue_line(
+    api: &dyn Api,
+    p: &Policy,
+    project: &str,
+    previous: Option<u64>,
+) -> Result<Option<String>> {
+    use crate::pass::holds::{HOLDS_MARKER, HOLDS_SCHEMA};
+    let Some(usage) = &p.settings.usage else {
+        return Ok(None);
+    };
+    let comments = paged(api, &usage.issue.repository, usage.issue.issue, "comments")?;
+    let Some(snapshot) = comments
+        .iter()
+        .find(|c| {
+            c["user"]["login"]
+                .as_str()
+                .is_some_and(|l| l.eq_ignore_ascii_case(&usage.bot))
+                && c["body"]
+                    .as_str()
+                    .is_some_and(|b| b.starts_with(HOLDS_MARKER))
+        })
+        .and_then(|c| super::super::health::json_block(c["body"].as_str()?))
+        .filter(|s| s["schema"] == HOLDS_SCHEMA)
+    else {
+        return Ok(None);
+    };
+    let at = snapshot["at"]
+        .as_str()
+        .filter(|at| changes::parse_time(at).is_ok())
+        .context("The hold snapshot has no time")?;
+    let mut queue = vec![];
+    for hold in snapshot["holds"]
+        .as_array()
+        .context("The hold snapshot has no holds")?
+        .iter()
+        .filter(|h| h["kind"] == "needs-human")
+    {
+        let item = hold["item"]
+            .as_str()
+            .filter(|i| i.contains('/') && changes::is_ref(i))
+            .context("A needs-human hold names no item")?;
+        let priority = hold["priority"].as_str().filter(|p| {
+            p.len() <= PRIORITY_LIMIT
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-')
+        });
+        queue.push((priority, item));
+    }
+    // As the pass ranks: by option index, unset or unknown last. Stable: the
+    // snapshot's order, by repository and number, within a Priority.
+    let read = api.graphql(
+        PRIORITY_OPTIONS,
+        json!({"id": project, "field": PRIORITY_FIELD}),
+    )?;
+    let options: Vec<&str> = read["node"]["field"]["options"]
+        .as_array()
+        .map(|o| o.iter().filter_map(|o| o["name"].as_str()).collect())
+        .unwrap_or_default();
+    queue.sort_by_key(|(priority, _)| {
+        priority
+            .and_then(|p| options.iter().position(|o| *o == p))
+            .unwrap_or(options.len())
+    });
+    let size = queue.len() as u64;
+    let mut line = format!("{QUEUE_LINE} {size}");
+    if let Some(previous) = previous {
+        let _ = match size.cmp(&previous) {
+            std::cmp::Ordering::Greater => {
+                write!(line, ", {} more than at the last update", size - previous)
+            }
+            std::cmp::Ordering::Less => {
+                write!(line, ", {} fewer than at the last update", previous - size)
+            }
+            std::cmp::Ordering::Equal => write!(line, ", as at the last update"),
+        };
+    }
+    let _ = write!(line, ", as of {at}.");
+    if !queue.is_empty() {
+        let first: Vec<String> = queue
+            .iter()
+            .take(QUEUE_TOP)
+            .map(|(priority, item)| match priority {
+                Some(priority) => format!("{item} ({priority})"),
+                None => (*item).to_owned(),
+            })
+            .collect();
+        let _ = write!(line, " First by priority: {}.", first.join(", "));
+    }
+    Ok(Some(line))
+}
+
+/// That the operator has settled `item`'s `needs-human` hold, which it
+/// still has, after the label's newest addition: with `comment`, the
+/// operator's [`RELEASE_COMMAND`] on the issue; without, the item merged,
+/// or closed by the operator or the bot, so that its author cannot reopen
+/// it unheld.
+fn settled(api: &dyn Api, p: &Policy, repo: &str, item: u64, comment: Option<u64>) -> Result<()> {
+    let issue = api.get(&format!("/repos/{repo}/issues/{item}"))?;
+    ensure!(
+        issue["labels"].is_array() && has_label(&issue, "needs-human"),
+        "The item is not held needs-human"
+    );
+    // Evidence older than the newest hold says nothing of it.
+    let mut held = None;
+    for e in paged(api, repo, item, "events")? {
+        let label = e["label"]["name"].as_str();
+        if e["event"] == "labeled" && label.is_some_and(|n| n.eq_ignore_ascii_case("needs-human")) {
+            let t = millis(&e["created_at"]).context("Label timestamp")?;
+            held = held.max(Some(t));
+        }
+    }
+    let held = held.context("No label provenance")?;
+    let Some(id) = comment else {
+        let closer = issue["closed_by"]["login"].as_str();
+        ensure!(
+            issue["state"] == "closed"
+                && (issue["pull_request"]["merged_at"].is_string()
+                    || closer.is_some_and(|l| l == p.settings.operator || l == p.settings.bot)),
+            "The item is neither merged nor closed by the operator or the bot"
+        );
+        let closed = millis(&issue["closed_at"]).context("Closure timestamp")?;
+        ensure!(held < closed, "The item was held again after it was closed");
+        return Ok(());
+    };
+    // Taking the poll's hold off a pull request starts its fix rounds again
+    // (`MAX_FIX_ROUNDS`); the poll's own `operatorAnswers` reads an answer there.
+    ensure!(
+        issue.get("pull_request").is_none_or(Value::is_null),
+        "An operator comment settles an issue's hold, not a pull request's"
+    );
+    let c = api.get(&format!("/repos/{repo}/issues/comments/{id}"))?;
+    ensure!(
+        c["user"]["login"] == p.settings.operator.as_str()
+            && c["issue_url"] == format!("https://api.github.com/repos/{repo}/issues/{item}"),
+        "Not the operator's comment on this item"
+    );
+    // The whole comment, as a review's `/send`: an answer, or a comment that
+    // restates the hold, releases nothing.
+    ensure!(
+        c["body"]
+            .as_str()
+            .is_some_and(|b| b.trim() == RELEASE_COMMAND),
+        "The operator's comment is not {RELEASE_COMMAND}"
+    );
+    let at = millis(&c["created_at"]).context("Operator comment timestamp")?;
+    ensure!(held < at, "The operator has not released it since the hold");
+    Ok(())
 }
 
 fn run_id(url: &str, p: &Policy) -> Result<u64> {
