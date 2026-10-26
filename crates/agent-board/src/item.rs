@@ -1,13 +1,19 @@
 //! `item add` and `item edit`. Both print a validated `update_project` proposal unless
 //! `--apply` is given; only then do they write, with the operator's own token, as
 //! `project init` does. No workflow here passes `--apply`, and an agent holds no token.
+//! Beside them, the read-only `item search` and `item list --off-board`.
 use crate::ask::print_proposals;
 use anyhow::{Context, Result, ensure};
 use board_core::{ItemRef, Snapshot};
 use board_forge::github::{DEFAULT_HOST, FieldWrite, GitHub, Transport, field_writes};
+use board_forge::items::{self, ITEM_CACHE_SCHEMA, ITEM_REQUEST_LIMIT, Select};
+use board_forge::pass::Config;
+use board_forge::poll::Rest;
+use board_forge::prune::Cache;
 use clap::Args;
 use serde_json::{Value, json};
 use std::io::Write;
+use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct Add {
@@ -34,6 +40,65 @@ pub struct Edit {
     /// Write to the live board with your token; without it, only print the proposal.
     #[arg(long)]
     pub apply: bool,
+}
+
+/// Where `item search` and `item list --off-board` read.
+#[derive(Args)]
+pub struct Read {
+    /// The pass configuration (docs/pass.md), from a trusted default-branch checkout: the open issues of its `workRepositories` are read beside its `board`'s. GH_TOKEN reads; nothing is written.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+    /// The response cache: read if it exists, so unchanged pages are revalidated and cost no rate budget, then replaced by the responses this read used.
+    #[arg(long, value_name = "FILE")]
+    pub cache: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub struct Search {
+    /// Text to find in a title or body, ignoring case.
+    pub text: String,
+    #[command(flatten)]
+    pub read: Read,
+    /// Maximum number of items to display.
+    #[arg(short = 'L', long, default_value_t = 30)]
+    pub limit: usize,
+}
+
+/// List the open issues `select` picks, as `item list` does but with only
+/// a title. The configuration and cache are parsed before a token is read;
+/// the cache is written only after a whole read.
+pub fn list_issues<C: Rest + Transport>(
+    args: &Read,
+    select: &Select,
+    limit: usize,
+    client: impl FnOnce() -> Result<C>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let read = |path: &PathBuf| {
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+    };
+    let path = args.config.as_ref().context("this read needs --config")?;
+    let config = Config::parse(&read(path)?).with_context(|| format!("{}", path.display()))?;
+    let cache = match &args.cache {
+        Some(path) if path.exists() => {
+            let value = serde_json::from_str(&read(path)?)
+                .with_context(|| format!("parse {}", path.display()))?;
+            Cache::from_json_as(&value, ITEM_CACHE_SCHEMA)
+                .with_context(|| format!("{}", path.display()))?
+        }
+        _ => Cache::default(),
+    };
+    let (issues, used) = items::read(&client()?, &config, cache, select, ITEM_REQUEST_LIMIT)?;
+    if let Some(path) = &args.cache {
+        let json = serde_json::to_string(&used.to_json_as(ITEM_CACHE_SCHEMA))?;
+        std::fs::write(path, json).with_context(|| format!("write {}", path.display()))?;
+    }
+    writeln!(out, "ITEM\tTITLE")?;
+    for issue in issues.iter().take(limit) {
+        let item = format!("{}#{}", issue.repository, issue.number);
+        writeln!(out, "{item}\t{}", issue.title)?;
+    }
+    Ok(())
 }
 
 impl Add {

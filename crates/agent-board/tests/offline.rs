@@ -2338,7 +2338,7 @@ fn prune_cli_refusals() {
         (
             vec!["--config", pass, "--cache", "fixtures/board.json"],
             1,
-            "unsupported prune cache schema",
+            "unsupported cache schema",
         ),
         (
             vec!["--config", boardless.to_str().unwrap()],
@@ -2362,6 +2362,52 @@ fn prune_cli_refusals() {
         assert!(output.stdout.is_empty());
     }
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// `item search` and `item list --off-board` check their options, configuration
+/// and cache before any token is read, as prune does.
+#[test]
+fn item_read_cli_refusals() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let pass = "fixtures/pass/config.json";
+    let off_board = ["item", "list", "--off-board", "--config", pass];
+    let search = ["item", "search", "widget", "--config", pass];
+    for (args, extra, code, reason) in [
+        (&off_board[..], &["--json", "x"][..], 1, "--config only"),
+        (
+            &off_board,
+            &["--snapshot", "fixtures/board.json"],
+            1,
+            "--config only",
+        ),
+        (&off_board, &["--status", "Todo"], 1, "cannot be used with"),
+        (&off_board, &["--state", "open"], 1, "cannot be used with"),
+        (&off_board[..3], &[], 1, "needs --config"),
+        (&["item", "list"], &["--cache", "x"], 1, "for --off-board"),
+        (
+            &search,
+            &["--cache", "fixtures/board.json"],
+            1,
+            "unsupported cache schema",
+        ),
+        (&search, &["-R", "example/app"], 1, "--config only"),
+        (&off_board, &[], 4, "GH_TOKEN"),
+        (&search, &[], 4, "GH_TOKEN"),
+    ] {
+        let output = command()
+            .args(args)
+            .args(extra)
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(reason), "{args:?} {extra:?}: {error}");
+        assert!(output.stdout.is_empty());
+    }
 }
 
 /// Outside GitHub Actions, `pass --apply` needs both caps, and is refused

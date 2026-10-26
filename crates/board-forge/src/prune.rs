@@ -177,28 +177,31 @@ pub struct Cache(pub BTreeMap<String, Value>);
 
 impl Cache {
     pub fn from_json(value: &Value) -> Result<Self> {
-        let object = value.as_object().context("prune cache is not an object")?;
+        Self::from_json_as(value, PRUNE_CACHE_SCHEMA)
+    }
+
+    /// A cache of `schema`: each reader slims its bodies its own way, so one
+    /// never revalidates against another's.
+    pub fn from_json_as(value: &Value, schema: &str) -> Result<Self> {
+        let object = value.as_object().context("cache is not an object")?;
         ensure!(
-            object.get("schema").and_then(Value::as_str) == Some(PRUNE_CACHE_SCHEMA),
-            "unsupported prune cache schema (expected {PRUNE_CACHE_SCHEMA}); the file is a cache and may be deleted"
+            object.get("schema").and_then(Value::as_str) == Some(schema),
+            "unsupported cache schema (expected {schema}); the file is a cache and may be deleted"
         );
         for key in object.keys() {
             ensure!(
                 ["schema", "responses"].contains(&key.as_str()),
-                "unknown prune cache field {key}"
+                "unknown cache field {key}"
             );
         }
         let responses = object
             .get("responses")
             .and_then(Value::as_object)
-            .context("prune cache responses is not an object")?
+            .context("cache responses is not an object")?
             .iter()
             .map(|(url, entry)| {
-                ensure!(url.starts_with(API_ROOT), "prune cache URL outside the API");
-                ensure!(
-                    entry.get("body").is_some(),
-                    "prune cache response has no body"
-                );
+                ensure!(url.starts_with(API_ROOT), "cache URL outside the API");
+                ensure!(entry.get("body").is_some(), "cache response has no body");
                 Ok((url.clone(), entry.clone()))
             })
             .collect::<Result<_>>()?;
@@ -206,25 +209,40 @@ impl Cache {
     }
 
     pub fn to_json(&self) -> Value {
-        json!({"schema": PRUNE_CACHE_SCHEMA, "responses": self.0})
+        self.to_json_as(PRUNE_CACHE_SCHEMA)
+    }
+
+    pub fn to_json_as(&self, schema: &str) -> Value {
+        json!({"schema": schema, "responses": self.0})
     }
 }
 
 /// Reads through one request budget and the cache, keeping what it used.
-struct Reader<'a, C> {
+pub(crate) struct Reader<'a, C> {
     client: &'a C,
     previous: Cache,
-    used: Cache,
+    pub(crate) used: Cache,
     limit: usize,
     requests: usize,
     not_modified: usize,
 }
 
-impl<C: Rest + Transport> Reader<'_, C> {
+impl<'a, C: Rest + Transport> Reader<'a, C> {
+    pub(crate) fn new(client: &'a C, previous: Cache, limit: usize) -> Self {
+        Self {
+            client,
+            previous,
+            used: Cache::default(),
+            limit,
+            requests: 0,
+            not_modified: 0,
+        }
+    }
+
     fn spend(&mut self) -> Result<()> {
         ensure!(
             self.requests < self.limit,
-            "prune request budget ({}) exhausted; nothing was listed",
+            "request budget ({}) exhausted; nothing was listed",
             self.limit
         );
         self.requests += 1;
@@ -278,7 +296,7 @@ impl<C: Rest + Transport> Reader<'_, C> {
     }
 
     /// Every page of a list, following `Link` within the API only.
-    fn list(&mut self, path: &str, slim: fn(&Value) -> Value) -> Result<Vec<Value>> {
+    pub(crate) fn list(&mut self, path: &str, slim: fn(&Value) -> Value) -> Result<Vec<Value>> {
         let mut url = Some(format!("{API_ROOT}{path}"));
         let mut all = Vec::new();
         while let Some(page) = url {
@@ -290,7 +308,10 @@ impl<C: Rest + Transport> Reader<'_, C> {
     }
 
     /// The board's open issues' Priority, by [`key`]; null for none.
-    fn priorities(&mut self, config: &Config) -> Result<BTreeMap<String, Option<String>>> {
+    pub(crate) fn priorities(
+        &mut self,
+        config: &Config,
+    ) -> Result<BTreeMap<String, Option<String>>> {
         let board = config.board.as_ref().context("no board")?;
         let mut cursor = Value::Null;
         let mut priorities = BTreeMap::new();
@@ -378,12 +399,12 @@ impl<C: Rest + Transport> Reader<'_, C> {
     }
 }
 
-fn key(repository: &str, number: u64) -> String {
+pub(crate) fn key(repository: &str, number: u64) -> String {
     format!("{repository}#{number}").to_ascii_lowercase()
 }
 
 /// Copies the `keys` that `value` has, so a missing fact stays missing.
-fn pick(value: &Value, keys: &[&str]) -> Value {
+pub(crate) fn pick(value: &Value, keys: &[&str]) -> Value {
     let picked: Map<String, Value> = keys
         .iter()
         .filter_map(|k| Some(((*k).to_owned(), value.get(*k)?.clone())))
@@ -589,14 +610,7 @@ pub fn read<C: Rest + Transport>(
     now: OffsetDateTime,
 ) -> Result<(Report, Cache)> {
     check(config, stale_days)?;
-    let mut reader = Reader {
-        client,
-        previous: cache,
-        used: Cache::default(),
-        limit,
-        requests: 0,
-        not_modified: 0,
-    };
+    let mut reader = Reader::new(client, cache, limit);
     let priorities = reader.priorities(config)?;
     let judge = Judge {
         bot: &config.bot,
@@ -705,4 +719,4 @@ pub fn read<C: Rest + Transport>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
