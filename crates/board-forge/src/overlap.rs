@@ -162,7 +162,7 @@ pub fn decide<C: Transport + Rest>(
     bot: &str,
     target: &Target,
 ) -> Decision {
-    match check(client, source, dest, brief, bot, target) {
+    match check(client, source, dest, brief, bot, target, &BTreeSet::new()) {
         Ok(decision) => decision,
         // Without the check every run is independent; failing to read leaves that.
         Err(error) => {
@@ -173,7 +173,8 @@ pub fn decide<C: Transport + Rest>(
 
 /// [`decide`] for a scheduler that starts runs on its own (`agent-board
 /// pass`): a check that cannot read waits rather than runs, as nobody chose
-/// this issue by hand to run beside whatever it may overlap.
+/// this issue by hand to run beside whatever it may overlap. The runs by id
+/// in `ended` are not in flight, whatever GitHub says (agent-board#376).
 pub fn decide_strict<C: Transport + Rest>(
     client: &C,
     source: &ItemRef,
@@ -181,8 +182,9 @@ pub fn decide_strict<C: Transport + Rest>(
     brief: &str,
     bot: &str,
     target: &Target,
+    ended: &BTreeSet<u64>,
 ) -> Decision {
-    check(client, source, dest, brief, bot, target).unwrap_or_else(|error| {
+    check(client, source, dest, brief, bot, target, ended).unwrap_or_else(|error| {
         Decision::Wait(format!("the overlap check could not read ({error:#})"))
     })
 }
@@ -194,6 +196,7 @@ fn check<C: Transport + Rest>(
     brief: &str,
     bot: &str,
     target: &Target,
+    ended: &BTreeSet<u64>,
 ) -> Result<Decision> {
     let mut named = paths(brief);
     named.extend(paths(&text(client, source)?));
@@ -202,7 +205,10 @@ fn check<C: Transport + Rest>(
     }
     // A run in flight has not pushed, and a batch cannot join a run that
     // started, so an overlap waits for its pull request.
-    for running in in_flight(client, dest, target)?.iter().take(RUN_READS) {
+    for running in in_flight(client, dest, target, ended)?
+        .iter()
+        .take(RUN_READS)
+    {
         // Text against text, the same bare `.name` in both is as often an
         // extension as a file: agentic-job#636 waited on #882 only because
         // both said `.patch`. Against a path with a directory, or a pull
@@ -305,8 +311,13 @@ fn open_pulls<T: Transport>(
 /// The other issues of `dest`'s repository with an implement run of the
 /// caller's workflow queued or in progress. The caller names each run
 /// `KIND OWNER/REPO#N` with an optional ` (POOL)` (its `run-name`), from the
-/// plan's `repo` and `item`.
-fn in_flight<C: Rest>(client: &C, dest: &ItemRef, target: &Target) -> Result<Vec<ItemRef>> {
+/// plan's `repo` and `item`. The runs in `ended` are left out.
+fn in_flight<C: Rest>(
+    client: &C,
+    dest: &ItemRef,
+    target: &Target,
+    ended: &BTreeSet<u64>,
+) -> Result<Vec<ItemRef>> {
     target.validate()?;
     let mut out = Vec::new();
     for status in ["in_progress", "queued"] {
@@ -324,6 +335,9 @@ fn in_flight<C: Rest>(client: &C, dest: &ItemRef, target: &Target) -> Result<Vec
             .as_array()
             .context("run list has no workflow_runs")?;
         for run in runs {
+            if run["id"].as_u64().is_some_and(|id| ended.contains(&id)) {
+                continue;
+            }
             let title = run["display_title"].as_str().unwrap_or_default();
             let Some(named) = title.strip_prefix("implement ") else {
                 continue;
@@ -446,9 +460,9 @@ mod tests {
     impl Rest for Forge {
         fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
             let runs: Vec<Value> = if url.contains("status=in_progress") {
-                self.runs
-                    .iter()
-                    .map(|t| json!({"display_title": t}))
+                (1..)
+                    .zip(&self.runs)
+                    .map(|(id, t)| json!({"id": id, "display_title": t}))
                     .collect()
             } else {
                 assert!(url.contains("status=queued"), "{url}");
@@ -709,6 +723,20 @@ mod tests {
             why.contains("could not read (GitHub transport failed)"),
             "{why}"
         );
+        // A run the pass took as ended (agent-board#376) is not waited for.
+        let forge = Forge {
+            runs: vec!["implement example/work#11"],
+            pulls: json!([]),
+            tracker_pulls: json!([]),
+            texts: texts("Fix src/a.rs."),
+            fail: false,
+        };
+        let strict = |ended: &BTreeSet<u64>| {
+            decide_strict(&forge, &issue, &issue, "Do it.", bot, &target, ended)
+        };
+        let running = wait("the run for example/work#11 in flight names `a.rs`");
+        assert_eq!(strict(&BTreeSet::new()), running);
+        assert_eq!(strict(&BTreeSet::from([1])), independent(none));
         let many = format!(
             "open pull request example/work#5 changes {}",
             shown(&["a/1.rs", "a/2.rs", "a/3.rs", "a/4.rs"].map(String::from))

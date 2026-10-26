@@ -429,10 +429,11 @@ mod tests {
         crate::pass::tests::config(json!({"wip": 0}))
     }
 
+    /// The recording, its stuck run young, as [`crate::pass::tests::replay`]'s.
     fn replay() -> Replay {
-        crate::pass::tests::without_epics(
-            Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap(),
-        )
+        let mut replay = Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap();
+        crate::pass::tests::started(&mut replay, "2026-10-23T19:20:00Z");
+        crate::pass::tests::without_epics(replay)
     }
 
     /// The Status stage's lines of a pass.

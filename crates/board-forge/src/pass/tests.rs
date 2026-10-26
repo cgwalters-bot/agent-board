@@ -12,9 +12,29 @@ fn at(stamp: &str) -> OffsetDateTime {
     OffsetDateTime::parse(stamp, &Rfc3339).unwrap()
 }
 
+/// The recording, its second run in progress started minutes before it
+/// was read. That run, tracker's 39698121265, was the stuck run of
+/// agent-board#376, which the pass now takes as ended ([`replay_scenarios`]);
+/// the recording's other tests see it in flight.
 pub(super) fn replay() -> Replay {
-    Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap()
+    let mut replay = Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap();
+    started(&mut replay, "2026-10-23T15:03:00Z");
+    replay
 }
+
+/// The recording's stuck run (see [`replay`]), started at `at`.
+pub(super) fn started(replay: &mut Replay, at: &str) {
+    let runs = &mut answer(replay, "status=in_progress")["body"]["workflow_runs"];
+    let mut runs = runs.as_array_mut().unwrap().iter_mut();
+    let stuck = runs.find(|r| r["id"] == STUCK_RUN).unwrap();
+    stuck["run_started_at"] = at.into();
+    stuck["created_at"] = at.into();
+}
+
+const STUCK_RUN: u64 = 39698121265;
+
+/// When a job of the stuck run completed, well before the recording's clock.
+const LONG_DONE: &str = "2026-10-23T13:30:00Z";
 
 /// `replay` with no open epic for stage 3 to read, for tests of the other
 /// stages; the board's children still qualify through their epics.
@@ -310,6 +330,21 @@ fn runs(n: u64) -> Vec<Value> {
         .collect()
 }
 
+/// The recording's stuck run's jobs on one page: each job's status and when
+/// it completed.
+fn jobs(replay: &mut Replay, jobs: &[(&str, Option<&str>)]) {
+    let url = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/{STUCK_RUN}/jobs?per_page={JOBS_PER_PAGE}"
+    );
+    let jobs: Vec<Value> = (jobs.iter())
+        .map(|(status, at)| json!({"status": status, "completed_at": at}))
+        .collect();
+    let body = json!({"total_count": jobs.len(), "jobs": jobs});
+    replay
+        .requests
+        .push(json!({"request": {"get": url}, "answer": {"status": 200, "body": body}}));
+}
+
 /// Puts `run` on a second page of the in-progress runs, after the two
 /// recorded; that page links to `next`, where there is one.
 fn second_page(replay: &mut Replay, run: Value, next: Option<&str>) {
@@ -411,6 +446,73 @@ fn replay_scenarios() {
         (
             "full WIP: eight runs with the two in progress",
             Box::new(|r, _| in_flight(r, runs(6))),
+            vec!["hold wip: 8 of 8 runs active"],
+            0,
+            0,
+        ),
+        (
+            "a young in_progress run stays in flight, its jobs unread",
+            Box::new(|r, _| {
+                in_flight(r, runs(6));
+                jobs(
+                    r,
+                    &[
+                        ("completed", Some(LONG_DONE)),
+                        ("completed", Some(LONG_DONE)),
+                    ],
+                );
+            }),
+            vec!["hold wip: 8 of 8 runs active"],
+            0,
+            0,
+        ),
+        (
+            "an in_progress run over an hour old with a job running stays in flight",
+            Box::new(|r, _| {
+                in_flight(r, runs(6));
+                started(r, "2026-10-23T13:00:00Z");
+                jobs(r, &[("completed", Some(LONG_DONE)), ("in_progress", None)]);
+            }),
+            vec!["hold wip: 8 of 8 runs active"],
+            0,
+            0,
+        ),
+        (
+            "an in_progress run whose last job completed minutes ago stays in flight",
+            Box::new(|r, _| {
+                in_flight(r, runs(6));
+                started(r, "2026-10-23T13:00:00Z");
+                let just = Some("2026-10-23T15:10:00Z");
+                jobs(r, &[("completed", Some(LONG_DONE)), ("completed", just)]);
+            }),
+            vec!["hold wip: 8 of 8 runs active"],
+            0,
+            0,
+        ),
+        (
+            "an in_progress run whose jobs have all completed has ended",
+            Box::new(|r, _| {
+                in_flight(r, runs(6));
+                started(r, "2026-10-23T13:00:00Z");
+                jobs(
+                    r,
+                    &[
+                        ("completed", Some(LONG_DONE)),
+                        ("completed", Some(LONG_DONE)),
+                    ],
+                );
+            }),
+            vec!["start triage cgwalters-forge/tracker#446 pool=claude"],
+            1,
+            0,
+        ),
+        (
+            "a 25h-old in_progress run with a job running stays in flight",
+            Box::new(|r, _| {
+                in_flight(r, runs(6));
+                started(r, "2026-10-22T14:00:00Z");
+                jobs(r, &[("completed", Some(LONG_DONE)), ("in_progress", None)]);
+            }),
             vec!["hold wip: 8 of 8 runs active"],
             0,
             0,

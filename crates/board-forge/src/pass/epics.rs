@@ -982,16 +982,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// When the caller's run `id` finished and how, or `None` while it runs.
-    /// A run deleted since is finished.
+    /// A run deleted since is finished, and one [`Self::ended`] while
+    /// `in_progress` is finished with no conclusion.
     fn finished(&self, id: u64) -> Result<Option<(OffsetDateTime, String)>> {
-        let url = format!(
-            "{API_ROOT}repos/{}/actions/runs/{id}",
-            self.config.dispatch_repo
-        );
+        let repo = &self.config.dispatch_repo;
+        let url = format!("{API_ROOT}repos/{repo}/actions/runs/{id}");
         let response = self.client.get(&url, None)?;
+        let ended = |run: &Value| run["status"] == "completed" || self.ended(repo, run);
         match response.status {
             404 => Ok(Some((OffsetDateTime::UNIX_EPOCH, "was deleted".into()))),
-            200 if response.body["status"] == "completed" => Ok(Some((
+            200 if ended(&response.body) => Ok(Some((
                 time(&response.body, "updated_at").context("the run has no update time")?,
                 match response.body["conclusion"].as_str() {
                     Some(conclusion) => format!("ended {conclusion}"),

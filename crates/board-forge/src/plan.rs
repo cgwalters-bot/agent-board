@@ -9,7 +9,7 @@ use crate::batch::{BATCH_LIMIT, batch_line, held};
 pub use crate::dispatch::Target;
 use crate::dispatch::{GitHub, Start, StartOutcome};
 use crate::github::{API_ROOT, Transport, is_github_login};
-use crate::overlap::{Decision, owner_name};
+use crate::overlap::{self, Decision, owner_name};
 use crate::poll::pace::is_tier;
 use crate::poll::{Rest, validate_repository};
 use anyhow::{Context, Result, bail, ensure};
@@ -746,6 +746,9 @@ pub struct Scheduled<'a> {
     pub pool: Option<&'a str>,
     /// Wait when the overlap check cannot read ([`crate::overlap::decide_strict`]).
     pub strict: bool,
+    /// The runs the pass took as ended though GitHub says they are in
+    /// progress, which the strict check leaves out.
+    pub ended: Option<&'a std::collections::BTreeSet<u64>>,
 }
 
 /// [`dispatch`] with its batch, bot, collaborator rule and [`Scheduled`] checks.
@@ -823,13 +826,13 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     };
     // A stacked run shares the files of the stack below it by design: its
     // plan, not a guess from paths, decided how it runs.
-    let decide = match scheduled.strict {
-        true => crate::overlap::decide_strict,
-        false => crate::overlap::decide,
+    let none = std::collections::BTreeSet::new();
+    let ended = scheduled.ended.unwrap_or(&none);
+    let check = |bot| match scheduled.strict {
+        true => overlap::decide_strict(client, issue, &dest, &plan.brief, bot, target, ended),
+        false => overlap::decide(client, issue, &dest, &plan.brief, bot, target),
     };
-    let overlap = bot
-        .filter(|_| base.is_none())
-        .map(|bot| decide(client, issue, &dest, &plan.brief, bot, target));
+    let overlap = bot.filter(|_| base.is_none()).map(check);
     if let Some(Decision::Wait(_)) = overlap {
         // Unrecorded, so the next pass decides again on fresh state.
         return Ok(Dispatched {
