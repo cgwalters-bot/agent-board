@@ -31,6 +31,111 @@ This page describes the interface as it exists.
 Every route, identity and pool allowlist comes from the caller's trusted
 configuration, never from a plan, an issue or a dispatcher's inputs.
 
+## Opt-in operator routing (first slice)
+
+`dispatch ISSUE --dispatch-routing FILE` adds **one** trusted namespace route
+to operator plan dispatch, in both `--dry-run` and `--apply`. Without the flag,
+behavior is unchanged. This is not a production cutover or complete bootc-dev
+routing. The file must be deployment-owned, not supplied by an agent or taken
+from the target checkout. The [test fixture](../fixtures/dispatch-routing.json)
+shows the current sandbox contract; it is not loaded automatically.
+
+The concrete threats and the corresponding bounds are:
+
+* A plan targeting a different repository than its tracking issue could choose
+  the wrong caller. Selection uses the plan's actual `repo`, not `ISSUE`.
+* A namespace match could accidentally grant every repository in an organization.
+  The route also requires an exact, case-insensitive `repositories` allowlist
+  (1–10 entries), kept within the selected `namespace`. Deployment must keep it
+  no broader than the caller's independently enforced bounds.
+* Agent text could choose an expensive runner or unsupported caller inputs.
+  Only trusted JSON supplies `target` (`caller`, `workflow`, `gitRef`),
+  `runnerConfig` and `cores`. Cores defaults to **4** and only 4 is accepted in
+  this slice, even though the sandbox also offers 16 and 64. Supported kinds are
+  research/triage/implement; fix/review, stacked/base and batched work are refused
+  rather than sent to tracker. Routed pools are openai/claude/mistral; an omitted
+  plan pool becomes openai. Nonmatching namespaces keep their existing route
+  and pool behavior. Job-plan fields and admission are not expanded.
+* A new caller could hide old active work and start overlapping jobs. Before a
+  routed dispatch, and again before each POST, read both the legacy and selected
+  workflow's active runs. Any active run targeting the same repository holds the
+  dispatch, conservatively including other items and kinds. The sandbox title
+  suffix `(openai, 4c)` is accepted. Each check reads at most ten pages: five
+  pages of at most 100 runs per workflow, **without a status filter** so a run
+  moving between active states cannot disappear between filtered queries.
+  Completed runs do not hold work. An unavailable, malformed, changing or
+  incomplete inventory fails closed, as does more than 500 historical runs on
+  either workflow. This conservative bound can block the deployed tracker route;
+  it must not be raised or bypassed as an activation workaround. A scalable
+  consistent active-run inventory is a follow-up before adopting crowded callers.
+  This is a bounded admission check, **not an atomic cross-workflow
+  lock**: the operator must serialize invocations across both callers. The
+  caller must keep `cancel-in-progress: false`.
+
+The existing plan claim/read-back protocol still records an ambiguous or failed
+POST and never automatically retries it. The selected caller's repository is
+used in the returned run URL and dispatch receipt. Subsequent invocations poll
+both workflows for active work; no cancellation, migration or redispatch is
+performed. A receipt remains a receipt when routing configuration changes.
+For manual board joins use `run record --run URL` with the selected receipt;
+automatic `run record --caller` discovery still assumes `dispatch.yml` and is
+not supported for the sandbox's `agent.yml`.
+
+### Audited coverage and remaining callers
+
+Audited default branches on 2026-10-26: agent-board
+`c75baf11ad9ae28db701ecded66deb705bdd1f54`, tracker
+`1fcad43b7c653bbd116f9f880abf6828479fd6f5`, sandbox
+`b486c06ff82e22013cf888caa66dd39117197797`, forge-infra
+`9896d511523f5cbbeb3e9f20b5ef71bb0ed85d23`. Tracker still contains the deployed
+Rust pass/poll/supervisor configuration; forge-infra does not yet contain those
+callers. No obsolete JavaScript scheduler was changed.
+
+| Path | This slice |
+|---|---|
+| CLI `dispatch ISSUE`, `dispatch::from_plan` → `plan::dispatch_with` | Opt-in routing, preview/apply, dual-workflow admission and selected receipt |
+| `request dispatch`, `run record` | Unchanged operator joins; use explicit selected run URL |
+| Scheduled Rust pass, stages 3/4 (epics, implement, triage/revisit) | Not wired to routing; needs dual-workflow WIP/pool/overlap/Status reads and caller-aware completion reads before adoption |
+| Pass stage 2 and standalone poll (fix/rebase/continuation, comments/notifications) | Not wired; needs selected caller in round marker lookup, in-flight checks and follow-up dispatch, plus sandbox fix support |
+| Supervisor execute/judgment and health/status | Not wired; needs policy routing, daily caps/receipts, dual-workflow duplicate detection, health and org-status accounting |
+
+Do not add bootc-dev work to these automatic callers or call them a routed path
+until those follow-ups land. They have no new routing option in this slice;
+they must not be used as a workaround for an operator route refusal. Independent
+review of their eventual wiring must check old tracker receipts remain visible
+and WIP/probe accounting cannot count a newly listed run twice.
+
+### Dependent sandbox support (separate change)
+
+Sandbox main currently admits exactly `bootc-dev/bootc` and
+`bootc-dev/cgwalters-devspace-sandbox` in
+`.github/agentic-job/dispatch.toml`. It has no `fix.toml`, and `agent.yml` exposes
+only research/triage/implement. A dependent change must add fix/review workflow
+inputs and their corresponding bounds/profiles, not merely expand the choice
+list. Match the existing fix caller contract (including PR identity and the
+bot-owned head branch, expected head SHA/lease and round marker inputs) and the
+review caller contract. Preserve safe-output branch ownership checks, guarded
+lease updates, independent review and check/apply, named token handoff and
+protected apply environment; do not give the agent a direct write path. Test
+foreign branches, stale leases, disallowed repositories, rejected review/apply
+and ambiguous dispatches. Then separately teach agent-board those supported
+input contracts; this route deliberately continues to reject fix/review until
+that work is reviewed. Existing bootc#2531 tracker run 40404019996 is untouched.
+
+### Production activation prerequisites
+
+No live sandbox/CNCF run was started by this implementation. Before enabling
+even the operator route, independently review the deployment-owned route file,
+token access to both workflows, exact caller bounds and serialization policy.
+Run a separately approved **no-mutation research smoke** through sandbox
+`agent.yml`, with `pool=openai`, `cores=4`, `config=rhel10`: verify actual CNCF
+RHEL runner selection, pool → agent/model/budget resolution, selected run receipt,
+queued/in-progress/completed status accounting, and no safe-output mutation.
+Use neither a live rebase nor an existing active job as that smoke. Keep all
+current jobs visible through completion. Automatic production activation also
+requires the remaining caller integrations above; fix/review requires the
+separate sandbox support and its review first.
+
 ## The request
 
 Each of them sends `POST /repos/{caller}/actions/workflows/{workflow}/dispatches`

@@ -2867,6 +2867,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let ended = self.ended_runs();
         let scheduled = Scheduled {
+            routing: None,
             plan: Some(&chosen),
             pool: Some(&pool),
             strict: true,
@@ -3215,6 +3216,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // No overlap check: a triage run changes no files.
         let scheduled = Scheduled {
+            routing: None,
             plan: None,
             pool: Some(pool),
             strict: true,

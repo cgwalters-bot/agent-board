@@ -47,6 +47,9 @@ pub struct FromPlan {
     /// Ref of the caller to run --workflow from.
     #[arg(long = "ref", default_value = "main")]
     git_ref: String,
+    /// Trusted namespace routing JSON. Off without it; never read from a job plan.
+    #[arg(long, value_name = "FILE")]
+    dispatch_routing: Option<std::path::PathBuf>,
     /// Login whose plans count: the operator.
     #[arg(long, value_name = "LOGIN")]
     operator: String,
@@ -424,21 +427,39 @@ pub fn from_plan<T: Transport + Rest>(
         git_ref: args.git_ref.clone(),
     };
     target.validate()?;
+    let routing: Option<board_forge::dispatch::Routing> = args
+        .dispatch_routing
+        .as_ref()
+        .map(|path| {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading routing {}", path.display()))?;
+            let routing: board_forge::dispatch::Routing =
+                serde_json::from_slice(&bytes).context("invalid dispatch routing")?;
+            routing.validate()?;
+            anyhow::Ok(routing)
+        })
+        .transpose()?;
     let client = transport()?;
     let collaborators = args.collaborators_only.then_some(input::Rule {
         status_app: args.status_app_id,
     });
     if args.apply {
         let dispatcher = dispatcher();
-        let done = plan::dispatch(
+        let done = plan::dispatch_with(
             &client,
             dispatcher.as_ref().unwrap_or(&client),
             &issue,
             &writers,
             &target,
-            args.batch.into(),
-            args.bot.as_deref(),
-            collaborators,
+            (
+                args.batch.into(),
+                args.bot.as_deref(),
+                collaborators,
+                plan::Scheduled {
+                    routing: routing.as_ref(),
+                    ..Default::default()
+                },
+            ),
         )?;
         for note in &done.notes {
             eprintln!("Not batched: {note}");
@@ -466,6 +487,39 @@ pub fn from_plan<T: Transport + Rest>(
     }
     let comments = plan::issue_comments(&client, &issue)?;
     let (plan, from) = plan::newest_plan(&comments, &writers)?;
+    let routed = routing
+        .as_ref()
+        .map(|route| {
+            route.select(&board_forge::dispatch::Start {
+                repository: &plan.repo,
+                item: plan.item,
+                kind: &plan.kind,
+                brief: &plan.brief,
+                pool: Some(&plan.pool),
+                runner: Some(&plan.runner),
+                base: None,
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if routed {
+        ensure!(
+            plan.stacks_on.is_none(),
+            "route does not support stacked plans/base input"
+        );
+        ensure!(
+            args.batch == 0,
+            "routed dispatch does not support batching yet"
+        );
+        if let Some(route) = &routing {
+            route.check_idle(&client, &target, &plan.repo)?;
+        }
+    }
+    let selected = routing
+        .as_ref()
+        .filter(|_| routed)
+        .map(|route| &route.target)
+        .unwrap_or(&target);
     let dest = ItemRef {
         repository: plan.repo.clone(),
         number: plan.item,
@@ -489,7 +543,7 @@ pub fn from_plan<T: Transport + Rest>(
         .bot
         .as_deref()
         .filter(|_| base.is_none())
-        .map(|bot| overlap::decide(&client, &issue, &dest, &plan.brief, bot, &target));
+        .map(|bot| overlap::decide(&client, &issue, &dest, &plan.brief, bot, selected));
     if let Some(decision) = &overlap {
         eprintln!("{}", decision.sentence());
     }
@@ -519,7 +573,11 @@ pub fn from_plan<T: Transport + Rest>(
         brief: batch::brief(&plan, &chosen.extras.iter().collect::<Vec<_>>()),
         ..plan
     }
-    .dispatch_request(&target, base.as_ref().map(|b| b.branch.as_str()))?;
+    .routed_request(
+        &target,
+        base.as_ref().map(|b| b.branch.as_str()),
+        routing.as_ref(),
+    )?;
     serde_json::to_writer(&mut *out, &request)?;
     writeln!(out)?;
     eprintln!(
@@ -1221,6 +1279,119 @@ mod tests {
     }
 
     #[test]
+    fn routed_preview_matches_caller_inputs_and_refuses_without_writes() {
+        struct Preview {
+            plan: Value,
+            active: bool,
+            unavailable: bool,
+            reads: std::cell::Cell<usize>,
+        }
+        impl Transport for &Preview {
+            fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+                Ok(json!({"repository": {"issue": {"comments": {"nodes": [{
+                    "url": "https://github.com/example/tracker/issues/7#issuecomment-1",
+                    "body": format!("```{}\n{}\n```", plan::PLAN_FENCE, self.plan),
+                    "createdAt": "2026-10-13T10:00:00Z", "lastEditedAt": null,
+                    "author": {"login": "cgwalters"}, "editor": null
+                }], "pageInfo": {"hasNextPage": false}}}}}))
+            }
+        }
+        impl Rest for &Preview {
+            fn get(
+                &self,
+                _: &str,
+                _: Option<(&str, &str)>,
+            ) -> Result<board_forge::poll::RestResponse> {
+                self.reads.set(self.reads.get() + 1);
+                let runs = if self.active {
+                    vec![
+                        json!({"id": 99, "status": "queued", "display_title": "implement bootc-dev/bootc#2531 (openai)"}),
+                    ]
+                } else {
+                    vec![]
+                };
+                Ok(board_forge::poll::RestResponse {
+                    status: if self.unavailable { 404 } else { 200 },
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body: json!({"total_count": runs.len(), "workflow_runs": runs}),
+                })
+            }
+            fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+                panic!("preview must not write")
+            }
+        }
+        for (active, unavailable, stacked, batch, expected) in [
+            (false, false, false, 0, None),
+            (true, false, false, 0, Some("route held")),
+            (false, true, false, 0, Some("route unavailable")),
+            (false, false, true, 0, Some("stacked plans")),
+            (false, false, false, 1, Some("batching")),
+        ] {
+            let args = FromPlan {
+                issue: "example/tracker#7".into(),
+                dry_run: true,
+                apply: false,
+                caller: "example/tracker".into(),
+                workflow: "dispatch.yml".into(),
+                git_ref: "main".into(),
+                dispatch_routing: Some(
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../fixtures/dispatch-routing.json"
+                    )
+                    .into(),
+                ),
+                operator: "cgwalters".into(),
+                planner: None,
+                batch,
+                bot: None,
+                collaborators_only: false,
+                status_app_id: None,
+            };
+            let mut block = json!({"schema": plan::JOB_PLAN_SCHEMA, "repo": "bootc-dev/bootc", "item": 8,
+                "kind": "research", "runner": "hosted", "brief": "No mutation."});
+            if stacked {
+                block["stacks_on"] = 6.into();
+                block["kind"] = "implement".into();
+            }
+            let preview = Preview {
+                plan: block,
+                active,
+                unavailable,
+                reads: Default::default(),
+            };
+            let mut out = Vec::new();
+            let result = from_plan(
+                &args,
+                None,
+                "github.com",
+                || Ok(&preview),
+                || panic!("preview must not load dispatcher"),
+                &mut out,
+            );
+            if let Some(expected) = expected {
+                let error = result.unwrap_err();
+                assert!(format!("{error:#}").contains(expected), "{error:#}");
+                assert!(out.is_empty());
+            } else {
+                result.unwrap();
+                let request: Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(
+                    request["url"],
+                    "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/workflows/agent.yml/dispatches"
+                );
+                assert_eq!(
+                    request["body"]["inputs"],
+                    json!({"task": "No mutation.", "repo": "bootc-dev/bootc", "item": "8", "kind": "research", "pool": "openai", "cores": "4", "config": "rhel10"})
+                );
+                assert_eq!(preview.reads.get(), 2);
+            }
+        }
+    }
+
+    #[test]
     fn dispatch_from_plan_reads_only_after_checks() {
         /// One page of comments; counts the reads.
         struct Comments(Value, std::cell::Cell<usize>);
@@ -1258,6 +1429,7 @@ mod tests {
             caller: caller.into(),
             workflow: "dispatch.yml".into(),
             git_ref: "main".into(),
+            dispatch_routing: None,
             operator: "cgwalters".into(),
             planner: planner.map(Into::into),
             batch: 0,
@@ -1269,6 +1441,30 @@ mod tests {
         let tracker = "cgwalters-forge/tracker";
         // Arguments, comment author, reads made, then output inputs or error.
         for (args, author, reads, expected) in [
+            (
+                FromPlan {
+                    dispatch_routing: Some(
+                        concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../../fixtures/dispatch-routing.json"
+                        )
+                        .into(),
+                    ),
+                    ..args(issue, true, tracker, None)
+                },
+                "cgwalters",
+                1,
+                Ok("research"),
+            ),
+            (
+                FromPlan {
+                    dispatch_routing: Some("nonexistent-routing.json".into()),
+                    ..args(issue, true, tracker, None)
+                },
+                "cgwalters",
+                0,
+                Err("reading routing"),
+            ),
             (
                 args(issue, true, tracker, Some("cgwalters-bot")),
                 "cgwalters-bot",

@@ -1,0 +1,11 @@
+{
+  "namespace": "bootc-dev",
+  "repositories": ["bootc-dev/bootc", "bootc-dev/cgwalters-devspace-sandbox"],
+  "target": {
+    "caller": "bootc-dev/cgwalters-devspace-sandbox",
+    "workflow": "agent.yml",
+    "gitRef": "main"
+  },
+  "runnerConfig": "rhel10",
+  "cores": 4
+}
