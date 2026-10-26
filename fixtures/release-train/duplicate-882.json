@@ -46,6 +46,22 @@
  },
  "responses": {
   "/repos/cgwalters-forge/tracker/issues?state=open&labels=release-train&creator=cgwalters-bot&per_page=100": [],
+  "/repos/cgwalters-forge/tracker/issues?state=open&labels=release-train&per_page=100": [
+   {
+    "number": 772,
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/772",
+    "title": "agentic-job v0.6.3 release train",
+    "state": "open",
+    "user": {
+     "login": "cgwalters-bot"
+    },
+    "labels": [
+     {
+      "name": "release-train"
+     }
+    ]
+   }
+  ],
   "/repos/cgwalters-forge/agentic-job/releases/latest": {
    "tag_name": "v0.6.3",
    "published_at": "2026-10-19T15:04:26Z",

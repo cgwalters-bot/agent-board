@@ -6,9 +6,11 @@ use std::cell::RefCell;
 /// 1a550cc, which printed the `.txt` beside each: tracker#880 halted as it
 /// is; the same with `needs-human` removed, which stalls on the wrappers'
 /// commit pins (tracker#887); and 2026-10-22T16:31:43Z, when the listing of
-/// open trains came back empty and the pass opened a second train
-/// (tracker#882). Responses are trimmed to the fields the train reads,
-/// keyed by path with the query decoded; null is a 404.
+/// open trains by creator came back empty and the pass opened a second train
+/// (tracker#882). That case adds the listing without creator, which then
+/// returned tracker#772, and the `.txt` is this pass's: it opens nothing.
+/// Responses are trimmed to the fields the train reads, keyed by path with
+/// the query decoded; null is a 404.
 const CASES: &[(&str, &str, &str)] = &[
     (
         "halted",
@@ -133,22 +135,14 @@ fn applied_passes_write_what_train_cjs_wrote() {
                 "POST /repos/cgwalters-forge/tracker/issues/880/comments".into(),
             ],
         ),
-        // tracker#882: with tracker#772 open, a second train and its bump.
+        // tracker#882: with tracker#772 open, train.cjs opened a second train
+        // and its bump; the listing without creator finds #772, so nothing.
         (
             "duplicate-882",
             vec![
                 "not following v0.6.3: no single pin of cgwalters-forge/agentic-job with its version".into(),
                 "due: 49 pull requests merged since v0.6.3; next is v0.6.4".into(),
-                "open the tracking issue \"agentic-job v0.6.4 release train\"".into(),
-                "https://example/1 v0.6.4: bump".into(),
-                "open a PR on cgwalters-forge/agentic-job from cgwalters-bot/agentic-job:release-train/v0.6.4 changing Cargo.toml, Cargo.lock: release: Prepare 0.6.4".into(),
-                "comment on https://example/1: Opened the version bump: https://example/5".into(),
-                "POST /repos/cgwalters-forge/tracker/issues".into(),
-                "POST /repos/cgwalters-bot/agentic-job/git/trees".into(),
-                "POST /repos/cgwalters-bot/agentic-job/git/commits".into(),
-                "POST /repos/cgwalters-bot/agentic-job/git/refs".into(),
-                "POST /repos/cgwalters-forge/agentic-job/pulls".into(),
-                "POST /repos/cgwalters-forge/tracker/issues/7/comments".into(),
+                "https://github.com/cgwalters-forge/tracker/issues/772 is open but the open trains listed by creator miss it: the listings disagree, not starting".into(),
             ],
         ),
     ] {
@@ -169,6 +163,8 @@ fn edited(name: &str, edits: &[(&str, Value)]) -> Value {
 #[test]
 fn boundaries_hold_on_recorded_state() {
     let open = "/repos/cgwalters-forge/tracker/issues?state=open&labels=release-train&creator=cgwalters-bot&per_page=100";
+    let all = "/repos/cgwalters-forge/tracker/issues?state=open&labels=release-train&per_page=100";
+    let opens = "would: open the tracking issue \"agentic-job v0.6.4 release train\"";
     let train = |login: &str| {
         json!({"number": 9, "html_url": "https://github.com/cgwalters-forge/tracker/issues/9",
             "title": "agentic-job v0.6.4 release train", "user": {"login": login}, "labels": [],
@@ -201,6 +197,16 @@ fn boundaries_hold_on_recorded_state() {
                 )],
             ),
             Err("more than one open release train"),
+        ),
+        // A train is opened only when the listing without creator agrees
+        // that none of the bot's is open.
+        (
+            edited("duplicate-882", &[(all, json!([]))]),
+            Ok(opens.to_owned()),
+        ),
+        (
+            edited("duplicate-882", &[(all, json!([train("someone")]))]),
+            Ok(opens.to_owned()),
         ),
         // A fork of another repository could take the branch but never be its PR.
         (
@@ -250,10 +256,13 @@ fn boundaries_hold_on_recorded_state() {
         (
             edited(
                 "duplicate-882",
-                &[(
-                    "/repos/cgwalters-forge/agentic-job/pulls?state=open&head=cgwalters-bot:release-train/v0.6.4&per_page=100",
-                    json!([{"html_url": "https://example/old"}]),
-                )],
+                &[
+                    (all, json!([])),
+                    (
+                        "/repos/cgwalters-forge/agentic-job/pulls?state=open&head=cgwalters-bot:release-train/v0.6.4&per_page=100",
+                        json!([{"html_url": "https://example/old"}]),
+                    ),
+                ],
             ),
             Ok(halted(
                 "(new tracking issue)",

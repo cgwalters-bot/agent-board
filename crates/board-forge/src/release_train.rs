@@ -914,14 +914,19 @@ impl Pass<'_> {
     }
 
     /// The bot's tracking issues in `state`; anyone may open one with this
-    /// title, so only the bot's count.
-    fn trains(&mut self, state: &str) -> Result<Vec<Value>> {
+    /// title, so only the bot's count. `by_creator` has GitHub filter the
+    /// listing by the bot too; without it only the author check does.
+    fn trains(&mut self, state: &str, by_creator: bool) -> Result<Vec<Value>> {
         let c = self.config;
+        let creator = if by_creator {
+            format!("&creator={}", encode(&c.bot))
+        } else {
+            String::new()
+        };
         let path = format!(
-            "/repos/{}/issues?state={state}&labels={}&creator={}&per_page={PAGE_SIZE}",
+            "/repos/{}/issues?state={state}&labels={}{creator}&per_page={PAGE_SIZE}",
             c.tracking,
-            encode(&c.labels.tracking),
-            encode(&c.bot)
+            encode(&c.labels.tracking)
         );
         Ok(list(&self.get(&path)?)?
             .iter()
@@ -929,6 +934,27 @@ impl Pass<'_> {
             .filter(|i| i["user"]["login"].as_str() == Some(c.bot.as_str()))
             .cloned()
             .collect())
+    }
+
+    /// Whether an open train is listed once the listing is not filtered by
+    /// creator, logging it if so. The filtered listing has come back empty
+    /// with a train open (tracker#882), so before opening one a second,
+    /// independent read must agree; otherwise this pass ends and the next
+    /// decides again.
+    fn missed_train(&mut self) -> Result<bool> {
+        let open = self.trains("open", false)?;
+        let Some(train) = open.iter().find(|i| {
+            i["title"]
+                .as_str()
+                .is_some_and(|t| self.titled(t).is_some())
+        }) else {
+            return Ok(false);
+        };
+        let url = string(train, "/html_url")?;
+        self.log(&format!(
+            "{url} is open but the open trains listed by creator miss it: the listings disagree, not starting"
+        ))?;
+        Ok(true)
     }
 
     /// The PR on `branch` from `target`'s fork, opened since this train
@@ -1249,7 +1275,11 @@ impl Pass<'_> {
         }
         self.reviewed(tag)?;
         let title = self.title(current);
-        if self.trains("closed")?.iter().any(|i| i["title"] == *title) {
+        if self
+            .trains("closed", true)?
+            .iter()
+            .any(|i| i["title"] == *title)
+        {
             self.log(&format!(
                 "the wrappers pin v{pinned}, behind {tag}, whose train was closed: not following"
             ))?;
@@ -1260,7 +1290,7 @@ impl Pass<'_> {
 
     fn run(&mut self) -> Result<()> {
         let c = self.config;
-        let open = self.trains("open")?;
+        let open = self.trains("open", true)?;
         let trains: Vec<&Value> = open
             .iter()
             .filter(|i| {
@@ -1303,6 +1333,9 @@ impl Pass<'_> {
                     "The release train's steps following {} {tag}, released outside the train, with the pin bumps (agent-board release-train). The wrappers pin v{pinned}. {halt}; close it to drop it.",
                     c.release.repository
                 );
+                if self.missed_train()? {
+                    return Ok(());
+                }
                 issue = Some(self.open_issue(self.title(&current), body)?);
             }
         }
@@ -1331,6 +1364,9 @@ impl Pass<'_> {
                     "The release train's steps for {} v{version}, one comment each (agent-board release-train). Due: {reason} since {tag}. {halt}; close it to drop this release.",
                     c.release.repository
                 );
+                if self.missed_train()? {
+                    return Ok(());
+                }
                 self.open_issue(self.title(&version), body)?
             }
         };
