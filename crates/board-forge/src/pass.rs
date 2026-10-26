@@ -104,6 +104,14 @@ const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
 const BLOCKED_STATUS: &str = "Blocked";
 /// The run statuses that hold a slot, as the Actions API names them.
 const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
+/// How long a run may say `in_progress` before the pass reads its jobs:
+/// GitHub can leave a run so after every job has completed (agent-board#376).
+const STUCK_CHECK_SECONDS: i64 = 60 * 60;
+/// How long ago its last job must have completed: a run's next job, behind
+/// `needs` or in a reusable workflow, is not listed until it is due.
+const JOBS_SETTLED_SECONDS: i64 = 10 * 60;
+/// The jobs one page holds; a run with more stays in flight.
+const JOBS_PER_PAGE: u64 = 100;
 /// The most runs GitHub lists for one status filter; a longer list cannot
 /// be read whole.
 const RUN_LIST_LIMIT: u64 = 1000;
@@ -1512,6 +1520,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         considered: false,
         probes: BTreeMap::new(),
         holds_whole: true,
+        ended: RefCell::new(BTreeMap::new()),
     };
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
@@ -1671,6 +1680,8 @@ struct Scheduler<'a, C> {
     /// Whether stages 3 and 4 decided every hold they would have, so that
     /// the holds may be published.
     holds_whole: bool,
+    /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
+    ended: RefCell<BTreeMap<u64, bool>>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2055,6 +2066,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 target.caller, target.workflow
             );
             for run in self.workflow_runs(&url, &format!("{status} runs"))? {
+                if self.ended(&target.caller, &run) {
+                    continue;
+                }
                 ids.insert(run["id"].as_u64().context("run has no id")?);
                 let title = run["display_title"].as_str().unwrap_or_default();
                 if let Some((_, repo, number)) = run_title(title) {
@@ -2069,6 +2083,56 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         }
         Ok((ids, busy, pools))
+    }
+
+    /// Whether `run` on `repo`, which GitHub says is `in_progress`, has
+    /// ended all the same: past [`STUCK_CHECK_SECONDS`] with every job
+    /// completed, the last over [`JOBS_SETTLED_SECONDS`] ago. Age alone is
+    /// no evidence, as a run may legitimately take days. Younger runs cost no
+    /// request, and each run's jobs are read once a pass; jobs that cannot be
+    /// read, or not on one page, leave the run in flight, as before.
+    fn ended(&self, repo: &str, run: &Value) -> bool {
+        let Some(id) = run["id"]
+            .as_u64()
+            .filter(|_| run["status"] == "in_progress")
+        else {
+            return false;
+        };
+        if let Some(&ended) = self.ended.borrow().get(&id) {
+            return ended;
+        }
+        let since = |at: Option<OffsetDateTime>| at.map(|at| (self.now - at).whole_seconds());
+        let started = at(&run["run_started_at"]).or_else(|| at(&run["created_at"]));
+        let ended = match since(started) {
+            None => false,
+            Some(age) if age <= STUCK_CHECK_SECONDS => false,
+            Some(_) => {
+                let url = format!(
+                    "{API_ROOT}repos/{repo}/actions/runs/{id}/jobs?per_page={JOBS_PER_PAGE}"
+                );
+                let response = self.client.get(&url, None).ok().filter(|r| r.status == 200);
+                let body = response.map_or(Value::Null, |r| r.body);
+                let jobs = body["jobs"].as_array().map_or(&[][..], Vec::as_slice);
+                let last = jobs.iter().map(|j| at(&j["completed_at"])).max().flatten();
+                !jobs.is_empty()
+                    && body["total_count"].as_u64() == Some(jobs.len() as u64)
+                    && jobs.iter().all(|j| j["status"] == "completed")
+                    && since(last).is_some_and(|s| s > JOBS_SETTLED_SECONDS)
+            }
+        };
+        self.ended.borrow_mut().insert(id, ended);
+        ended
+    }
+
+    /// The runs [`Self::ended`] took as ended in this pass, for the overlap
+    /// check's own listing.
+    fn ended_runs(&self) -> BTreeSet<u64> {
+        let ended = self.ended.borrow();
+        ended
+            .iter()
+            .filter(|(_, e)| **e)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// [`Scheduler::usage`], read once a pass; a failure to read it is
@@ -2563,6 +2627,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     &plan.brief,
                     &config.bot,
                     target,
+                    &self.ended_runs(),
                 );
                 if let Decision::Wait(_) = decision {
                     return Ok(Step::Hold(Hold::new(
@@ -2592,10 +2657,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         };
+        let ended = self.ended_runs();
         let scheduled = Scheduled {
             plan: Some(&chosen),
             pool: Some(&pool),
             strict: true,
+            ended: Some(&ended),
         };
         let options = (0, Some(config.bot.as_str()), None, scheduled);
         let done = plan::dispatch_with(
@@ -2862,6 +2929,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             plan: None,
             pool: Some(pool),
             strict: true,
+            ended: None,
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);

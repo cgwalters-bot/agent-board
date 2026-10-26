@@ -440,6 +440,15 @@ waiting, planning, triage, implement, review and fix runs. Include starts earlie
 in this pass even if the API has not listed them. A pre-existing excess is not
 cancelled; it leaves no new slots. PR repair retains its own existing bounds;
 if it consumes/exceeds WIP, later stages start nothing. No planning exemption.
+GitHub can leave a run `in_progress` after every job has completed
+(agent-board#376). Such a run is not in flight, for the slot count, the
+run-in-flight and overlap holds, the Status stage and an epic's planning run
+alike, once it is over an hour old and its jobs have all completed, the last
+over ten minutes ago (a run's next job is not listed until it is due). Age
+alone never ends a run. It is then handled as a finished run with no
+conclusion. A younger run costs no extra request, an older one's jobs are read
+once a pass, and a jobs read that fails or does not fit one page leaves the
+run in flight.
 
 Respect `needs-human`, `needs-design`, board Blocked, open dependencies, an open
 PR for the issue or plan target, a run in flight, and the existing bot-PR/path
