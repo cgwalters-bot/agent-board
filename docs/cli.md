@@ -174,6 +174,7 @@ Commands:
 
 - [`list`](#agent-board-item-list): List board items, including closed issues by default
 - [`view`](#agent-board-item-view): Inspect an item by URL, OWNER/REPO#N, or N with --repo
+- [`search`](#agent-board-item-search): Find open board issues of --config's workRepositories by title or body text (read-only)
 - [`add`](#agent-board-item-add): Add an issue to the board, optionally setting Priority (writes with --apply)
 - [`edit`](#agent-board-item-edit): Set single-select or text fields on a board issue (writes with --apply)
 
@@ -192,6 +193,9 @@ Options:
 - `--turn <TURN>`: Filter by whose turn it is (for example Coordinator)
 - `--state <STATE>`: Filter by issue state (possible values: `open`, `closed`, `all`) (default: `all`)
 - `-L, --limit <LIMIT>`: Maximum number of items to display (default: `30`)
+- `--off-board`: List the open issues of --config's workRepositories that are not on its board instead, without filters
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: the open issues of its `workRepositories` are read beside its `board`'s. GH_TOKEN reads; nothing is written
+- `--cache <FILE>`: The response cache: read if it exists, so unchanged pages are revalidated and cost no rate budget, then replaced by the responses this read used
 
 ## agent-board item view
 
@@ -204,6 +208,24 @@ agent-board item view [OPTIONS] <ITEM>
 Arguments:
 
 - `<ITEM>`: Item URL, OWNER/REPO#N, or N with --repo
+
+## agent-board item search
+
+Find open board issues of --config's workRepositories by title or body text (read-only)
+
+```text
+agent-board item search [OPTIONS] <TEXT>
+```
+
+Arguments:
+
+- `<TEXT>`: Text to find in a title or body, ignoring case
+
+Options:
+
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: the open issues of its `workRepositories` are read beside its `board`'s. GH_TOKEN reads; nothing is written
+- `--cache <FILE>`: The response cache: read if it exists, so unchanged pages are revalidated and cost no rate budget, then replaced by the responses this read used
+- `-L, --limit <LIMIT>`: Maximum number of items to display (default: `30`)
 
 ## agent-board item add
 

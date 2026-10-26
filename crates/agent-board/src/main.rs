@@ -240,6 +240,8 @@ enum Item {
         /// Item URL, OWNER/REPO#N, or N with --repo.
         item: String,
     },
+    /// Find open board issues of --config's workRepositories by title or body text (read-only).
+    Search(item::Search),
     /// Add an issue to the board, optionally setting Priority (writes with --apply).
     Add(item::Add),
     #[command(hide = true)]
@@ -267,6 +269,11 @@ struct List {
     /// Maximum number of items to display.
     #[arg(short = 'L', long, default_value_t = 30)]
     limit: usize,
+    /// List the open issues of --config's workRepositories that are not on its board instead, without filters.
+    #[arg(long, conflicts_with_all = ["status", "priority", "turn", "state"])]
+    off_board: bool,
+    #[command(flatten)]
+    read: item::Read,
 }
 
 #[derive(Subcommand)]
@@ -745,8 +752,34 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             Ok(())
         }
         Command::Item {
+            command: Item::Search(args),
+        } => {
+            item_read_check(&cli)?;
+            item::list_issues(
+                &args.read,
+                &board_forge::items::Select::Search(&args.text),
+                args.limit,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Item {
             command: Item::List(args),
         } => {
+            if args.off_board {
+                item_read_check(&cli)?;
+                return item::list_issues(
+                    &args.read,
+                    &board_forge::items::Select::OffBoard,
+                    args.limit,
+                    board_forge::github::Client::from_env,
+                    &mut io::stdout().lock(),
+                );
+            }
+            ensure!(
+                args.read.config.is_none() && args.read.cache.is_none(),
+                "--config and --cache are for --off-board"
+            );
             ensure!(
                 ["open", "closed", "all"].contains(&args.state.as_str()),
                 "--state must be open, closed or all"
@@ -1184,6 +1217,25 @@ fn item_write(
         &mut None,
         &mut out,
     )
+}
+
+/// `item search` and `item list --off-board` read the board and repositories
+/// --config names, as prune does, and print text only.
+fn item_read_check(cli: &Cli) -> Result<()> {
+    ensure!(
+        cli.json.is_none()
+            && cli.repo.is_none()
+            && cli.snapshot.is_none()
+            && cli.owner.is_none()
+            && cli.project.is_none()
+            && cli.board_config.is_none(),
+        "this item read takes its board and repositories from --config only, and prints text, not --json"
+    );
+    ensure!(
+        cli.hostname == board_forge::github::DEFAULT_HOST,
+        "unsupported GitHub host"
+    );
+    Ok(())
 }
 
 fn print_items(cli: &Cli, mut items: Vec<&board_core::Item>, limit: usize) -> Result<()> {

@@ -7,15 +7,15 @@ const NOW: &str = "2026-10-26T00:00:00Z";
 
 /// The recorded forge: a GET answers 304 to the validator its entry names,
 /// and nothing may be written.
-struct Fake {
+pub(crate) struct Fake {
     forge: Value,
     /// Each GET's URL and the validator sent.
-    gets: RefCell<Vec<(String, Option<String>)>>,
-    sends: RefCell<Vec<String>>,
+    pub(crate) gets: RefCell<Vec<(String, Option<String>)>>,
+    pub(crate) sends: RefCell<Vec<String>>,
 }
 
 impl Fake {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             forge: serde_json::from_str(FORGE).unwrap(),
             gets: RefCell::default(),
@@ -118,7 +118,7 @@ impl Rest for Fake {
     }
 }
 
-fn config() -> Config {
+pub(crate) fn config() -> Config {
     Config::parse(
         &json!({
             "operator": "alice",
@@ -263,7 +263,7 @@ fn reads_are_bounded_and_refused_whole() {
         let error = run(&Fake::new(), Cache::default(), limit).unwrap_err();
         assert_eq!(
             format!("{error:#}"),
-            format!("prune request budget ({limit}) exhausted; nothing was listed")
+            format!("request budget ({limit}) exhausted; nothing was listed")
         );
     }
     let error = read(&Fake::new(), &config(), Cache::default(), (10, 0), now()).unwrap_err();
@@ -274,22 +274,27 @@ fn reads_are_bounded_and_refused_whole() {
 fn the_cache_is_checked() {
     let entry = json!({"etag": "x", "body": []});
     for (cache, error) in [
-        (json!([]), "prune cache is not an object"),
+        (json!([]), "cache is not an object"),
         (
             json!({"schema": "agent-board/poll-state/v1", "responses": {}}),
-            "unsupported prune cache schema",
+            "unsupported cache schema",
+        ),
+        // Item reads keep other facts of the same pages.
+        (
+            json!({"schema": crate::items::ITEM_CACHE_SCHEMA, "responses": {}}),
+            "unsupported cache schema (expected agent-board/prune-cache/v1)",
         ),
         (
             json!({"schema": PRUNE_CACHE_SCHEMA, "responses": {}, "extra": 1}),
-            "unknown prune cache field extra",
+            "unknown cache field extra",
         ),
         (
             json!({"schema": PRUNE_CACHE_SCHEMA, "responses": {"https://example.com/": entry}}),
-            "prune cache URL outside the API",
+            "cache URL outside the API",
         ),
         (
             json!({"schema": PRUNE_CACHE_SCHEMA, "responses": {"https://api.github.com/x": {}}}),
-            "prune cache response has no body",
+            "cache response has no body",
         ),
     ] {
         let found = Cache::from_json(&cache).unwrap_err().to_string();
