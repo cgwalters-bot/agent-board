@@ -2252,6 +2252,181 @@ fn apply_replans_an_open_issue_after_its_run() {
     }
 }
 
+/// The board as a pass with `revisit` reads it: each recorded page again
+/// under [`board_query`]'s query with `updatedAt`, an item `days` (by
+/// `OWNER/REPO#N`) before the recording and the rest a day before, and
+/// the items of `held` labelled `needs-human` on every page.
+fn silent(replay: &mut Replay, days: &[(&str, i64)], held: &[&str]) {
+    let plain = fnv(&board_query(false));
+    let now = replay.now;
+    let mut pages = Vec::new();
+    for entry in &mut replay.requests {
+        let nodes = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut);
+        for node in nodes.into_iter().flatten() {
+            let content = &mut node["content"];
+            let name = format!(
+                "{}#{}",
+                text(content, "/repository/nameWithOwner"),
+                content["number"]
+            );
+            if held.contains(&name.as_str()) {
+                let labels = content["labels"]["nodes"].as_array_mut().unwrap();
+                labels.push(json!({"name": NEEDS_HUMAN}));
+                content["labels"]["totalCount"] = labels.len().into();
+            }
+            let ago = days.iter().find(|(n, _)| *n == name).map_or(1, |(_, d)| *d);
+            let at = now - time::Duration::days(ago);
+            content["updatedAt"] = at.format(&Rfc3339).unwrap().into();
+        }
+        if entry["request"]["graphql"] == plain.as_str() {
+            let mut page = entry.clone();
+            page["request"]["graphql"] = fnv(&board_query(true)).into();
+            pages.push(page);
+        }
+    }
+    replay.requests.extend(pages);
+}
+
+/// Revisits with a slot spare after stage 4's starts: of the recorded
+/// candidates left held, agentic-job#188 untouched for 20 days and
+/// tracker#468 labelled needs-human for 4 are due, by `afterDays` and
+/// `heldAfterDays`; tracker#527, untouched for 4 days and not held, is not.
+/// Each gets one revisit, recorded by its plan comment, which the next
+/// pass reads and skips. Without a free slot or a pool with room, nothing
+/// is revisited.
+#[test]
+fn apply_revisits_a_sample_with_spare_capacity() {
+    let section = json!({"perPass": 3, "afterDays": 14, "heldAfterDays": 3});
+    let mut forge = Forge::new(None, false);
+    let days = [
+        ("cgwalters-forge/agentic-job#188", 20),
+        ("cgwalters-forge/tracker#468", 4),
+        ("cgwalters-forge/tracker#527", 4),
+    ];
+    silent(&mut forge.replay, &days, &["cgwalters-forge/tracker#468"]);
+    let spare = config(json!({"wip": 12, "revisit": section}));
+    let first = apply(&forge, &spare);
+    assert_eq!(first.failures, 0, "{:#?}", first.lines);
+    let revisits: Vec<&str> = (first.lines.iter())
+        .filter(|l| l.contains("revisit"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(revisits.len(), 3, "{revisits:#?}");
+    assert_eq!(
+        revisits[0],
+        "revisit: 2 due, seed 4242, drawn: cgwalters-forge/agentic-job#188 (weight 4), cgwalters-forge/tracker#468 (weight 4)"
+    );
+    for (line, item) in revisits[1..].iter().zip(["agentic-job#188", "tracker#468"]) {
+        let start = format!("start revisit cgwalters-forge/{item} pool=claude record=");
+        assert!(line.starts_with(&start), "{line}");
+    }
+    assert_eq!(first.tally.1.revisited, Some(Some(2)));
+    assert_eq!(first.tally.1.started, 8);
+    for (repo, number) in [("agentic-job", 188), ("tracker", 468)] {
+        let repo = format!("cgwalters-forge/{repo}");
+        let posted = forge.comments_on(&repo, number);
+        assert!(posted[0].starts_with(revisit::REVISIT), "{posted:#?}");
+        let item = format!("{repo}#{number}");
+        assert_eq!(forge.dispatches().iter().filter(|d| **d == item).count(), 1);
+    }
+    let brief = &forge.comments_on("cgwalters-forge/tracker", 468)[0];
+    let held = "nobody has touched it for 4 days, and it is held (labelled needs-human)";
+    assert!(brief.contains(held), "{brief}");
+    // The next pass reads each revisit's record and leaves the issue alone.
+    let second = apply(&forge, &spare);
+    assert_eq!(second.failures, 0, "{:#?}", second.lines);
+    // Again three days after a held issue's revisit, 14 after another's.
+    for (item, again) in [("tracker#468", "10-26"), ("agentic-job#188", "11-06")] {
+        let line = (second.lines.iter())
+            .find(|l| l.starts_with(&format!("revisit cgwalters-forge/{item}: revisited ")));
+        let line = line.unwrap_or_else(|| panic!("{item}: {:#?}", second.lines));
+        assert!(
+            line.contains(&format!("; again from 2026-{again}T15:")),
+            "{line}"
+        );
+    }
+    assert_eq!(second.tally.1.revisited, Some(Some(0)));
+    assert_eq!(forge.dispatches().len(), 8);
+    // No slot left after stage 4's starts, or no room on the revisit pool.
+    for (settings, expected) in [
+        (json!({"revisit": section}), "revisit: no slot free"),
+        (
+            json!({"wip": 12, "revisit": {"perPass": 3, "afterDays": 14, "pools": ["openai"]}}),
+            "revisit: no pool: ",
+        ),
+    ] {
+        let mut forge = Forge::new(None, false);
+        silent(&mut forge.replay, &days, &["cgwalters-forge/tracker#468"]);
+        let report = apply(&forge, &config(settings));
+        let line = report.lines.iter().find(|l| l.starts_with(expected));
+        assert!(line.is_some(), "{expected}: {:#?}", report.lines);
+        let writes = forge.writes.borrow();
+        let revisited = writes
+            .iter()
+            .any(|(_, _, b)| text(b, "/body").starts_with(revisit::REVISIT));
+        assert!(!revisited);
+        assert_eq!(report.tally.1.revisited, Some(Some(0)));
+    }
+}
+
+/// Focus first: tracker#446, a child of the live P0 epic tracker#528,
+/// weighs 5⁴ × 4 (P0 of three options) × 1, and agentic-job#188, outside
+/// any epic, 1 × 4 × 4, though both are P0 and #188 has been silent four
+/// times its days; #446 is drawn first and takes the one revisit.
+#[test]
+fn revisit_draws_by_focus_first() {
+    let mut forge = Forge::new(None, false);
+    let days = [
+        ("cgwalters-forge/agentic-job#188", 60),
+        ("cgwalters-forge/tracker#446", 4),
+    ];
+    silent(&mut forge.replay, &days, &["cgwalters-forge/tracker#446"]);
+    let section = json!({"perPass": 1, "afterDays": 14, "heldAfterDays": 3});
+    let report = apply(&forge, &config(json!({"wip": 12, "revisit": section})));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let revisits: Vec<&str> = (report.lines.iter())
+        .filter(|l| l.contains("revisit"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        revisits[0],
+        "revisit: 2 due, seed 4242, drawn: cgwalters-forge/tracker#446 (weight 2500), cgwalters-forge/agentic-job#188 (weight 16)"
+    );
+    let start = "start revisit cgwalters-forge/tracker#446 pool=claude record=";
+    assert!(revisits[1].starts_with(start), "{revisits:#?}");
+    assert_eq!(revisits.len(), 2, "{revisits:#?}");
+}
+
+/// Without `revisit` the pass reads the board as it always did and its
+/// lines are the same; with it, its stages but the revisits are too.
+#[test]
+fn revisit_off_changes_nothing() {
+    let mut plain = without_epics(replay());
+    only(&mut plain, FIRST);
+    let mut edited = without_epics(replay());
+    only(&mut edited, FIRST);
+    silent(&mut edited, &[("cgwalters-forge/agentic-job#188", 20)], &[]);
+    let off = config(json!({"wip": 12}));
+    let before = preview(&off, &plain);
+    assert_eq!(before.lines, preview(&off, &edited).lines);
+    assert!(!before.lines.iter().any(|l| l.contains("revisit")));
+    assert_eq!(before.tally.1.revisited, None);
+    let on = config(json!({"wip": 12, "revisit": {"perPass": 1, "afterDays": 14}}));
+    let report = preview(&on, &edited);
+    let rest: Vec<&String> = (report.lines.iter())
+        .filter(|l| !l.contains("revisit"))
+        .collect();
+    assert_eq!(rest, before.lines.iter().collect::<Vec<_>>());
+    let started = "start revisit cgwalters-forge/agentic-job#188 pool=claude";
+    assert!(
+        report.lines.iter().any(|l| l == started),
+        "{:#?}",
+        report.lines
+    );
+}
+
 /// `--max-dispatch` starts the first runs the pass would and holds the rest,
 /// a line each, writing nothing for them; a preview of the recorded board
 /// plans what a local apply over it starts. A start is a dispatch, not a
@@ -2929,6 +3104,12 @@ fn body_plans_refuse_a_plan_changed_while_read() {
 
 // ---- Pure logic ----
 
+/// The keys a `revisit` section needs beside it: triage, on pool `a`.
+fn revisit(section: Value) -> Value {
+    json!({"triage": true, "planPools": ["a"], "pools": {"a": {}},
+        "usage": {"repository": "o/ops", "issue": 1}, "revisit": section})
+}
+
 #[test]
 fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
@@ -3002,6 +3183,39 @@ fn config_table() {
         (
             json!({"replanAfterDays": 1}),
             "replanAfterDays needs triage",
+        ),
+        (
+            json!({"revisit": {"perPass": 1, "afterDays": 14}}),
+            "revisit needs triage",
+        ),
+        (
+            revisit(json!({"perPass": 0, "afterDays": 14})),
+            "revisit perPass is not 1 to 5",
+        ),
+        (
+            revisit(json!({"perPass": 6, "afterDays": 14})),
+            "revisit perPass is not 1 to 5",
+        ),
+        (
+            revisit(json!({"perPass": 1, "afterDays": 0})),
+            "revisit afterDays is not 1 to 90",
+        ),
+        (
+            revisit(json!({"perPass": 1, "afterDays": 14, "heldAfterDays": 91})),
+            "revisit heldAfterDays is not 1 to 90",
+        ),
+        (
+            revisit(json!({"perPass": 1, "afterDays": 14, "pools": []})),
+            "revisit pools is empty",
+        ),
+        (
+            revisit(json!({"perPass": 1, "afterDays": 14, "pools": ["b"]})),
+            "revisit pools names b, which is not in pools",
+        ),
+        (revisit(json!({"perPass": 1})), "missing field `afterDays`"),
+        (
+            revisit(json!({"perPass": 1, "afterDays": 14, "every": 1})),
+            "unknown field `every`",
         ),
         (
             json!({"epics": {"repository": "o/r", "inAnyRepository": true}}),
@@ -3139,6 +3353,18 @@ fn config_table() {
         let got = format!("{:#}", Config::parse(&value.to_string()).unwrap_err());
         assert!(got.contains(error), "{edit}: {got}");
     }
+    // A held item waits afterDays unless heldAfterDays is set; a revisit
+    // runs on the triage pools unless its own are named.
+    let mut value = minimal.clone();
+    let section = revisit(json!({"perPass": 2, "afterDays": 14}));
+    value
+        .as_object_mut()
+        .unwrap()
+        .extend(section.as_object().unwrap().clone());
+    let parsed = Config::parse(&value.to_string()).unwrap();
+    let section = parsed.revisit.as_ref().unwrap();
+    assert_eq!(section.held_after_days, None);
+    assert!(section.pools.is_none());
     let duplicate = r#"{"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml",
         "pools": {"a": {}, "a": {}}, "usage": {"repository": "o/ops", "issue": 1}}"#;
     assert!(
@@ -3323,6 +3549,7 @@ fn facts(repo: &str, number: u64, created: &str) -> Facts {
         },
         open: true,
         created: at(created),
+        updated: None,
         author: Some("op".into()),
         labels: vec![],
         labels_complete: true,

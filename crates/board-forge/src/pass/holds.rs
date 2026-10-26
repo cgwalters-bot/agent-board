@@ -199,6 +199,11 @@ pub struct PassSummary {
     /// Stage 3's live epics (`epics: N live …`); null where it did not
     /// list them.
     pub live_epics: Option<usize>,
+    /// The revisit runs stage 4 started, or in a preview would start;
+    /// absent without [`super::Config::revisit`] and null where stage 4 did
+    /// not get that far, so that a pass without it publishes what it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revisited: Option<Option<usize>>,
 }
 
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
@@ -421,8 +426,25 @@ mod tests {
             candidates: Some(3),
             started: 1,
             live_epics: None,
+            revisited: None,
         };
         (wip, pass)
+    }
+
+    /// `revisited` is absent without `revisit`, as `tally` has it, and
+    /// otherwise null or a count.
+    #[test]
+    fn revisited_in_the_summary() {
+        for (revisited, expected) in [
+            (None, None),
+            (Some(None), Some(json!(null))),
+            (Some(Some(2)), Some(json!(2))),
+        ] {
+            let (wip, mut pass) = tally();
+            pass.revisited = revisited;
+            let value = serde_json::to_value(snapshot(&[], String::new(), (wip, pass))).unwrap();
+            assert_eq!(value["pass"].get("revisited"), expected.as_ref());
+        }
     }
 
     /// The snapshot of `entries` with no clock, WIP count or summary.

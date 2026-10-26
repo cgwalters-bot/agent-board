@@ -1320,7 +1320,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Some(record) => format!("{RETRY_INTRO}{record} got no plan."),
             None => "The board pass asks a triage run to plan this epic.".into(),
         };
-        let step = self.start_triage(&facts.issue, (&pool, brief, &intro), line, slots, target);
+        let context = (slots, target, hold as HoldRule);
+        let step = self.start_triage(&facts.issue, (&pool, brief, &intro), line, context);
         self.client.bounds.finishing.set(false);
         let step = match step {
             Ok(step) => step,
