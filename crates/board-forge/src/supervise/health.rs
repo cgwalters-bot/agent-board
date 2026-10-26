@@ -104,6 +104,10 @@ const COMMENT_PAGES: usize = 20;
 /// A scheduled workflow fails the check once this many of its runs in the
 /// lookback ended and every one failed: one failure may be a flake.
 const SCHEDULED_FAILURES: u64 = 2;
+/// The scheduler's passes are looked for in at most this many completed poll
+/// runs, newest first: a burst of runs cancelled before their pass is skipped
+/// over, but a listing of nothing else costs a bounded number of reads.
+const PASS_RUNS: usize = 20;
 /// Conclusions that count as a failed run; cancelled and skipped runs
 /// neither pass nor fail.
 const FAILED: &[&str] = &["failure", "timed_out", "startup_failure"];
@@ -845,9 +849,13 @@ impl Collector<'_> {
         Ok(all)
     }
 
-    /// The scheduler's newest passes: the job's log of each completed poll
-    /// run that ran it, colour codes taken out. A run cancelled while waiting
-    /// for the previous pass ran no scheduler and is passed over.
+    /// The scheduler's newest `idle_passes` passes: the job's log of each
+    /// completed poll run whose scheduler job succeeded or failed, colour
+    /// codes taken out, looked for in at most `PASS_RUNS` runs. A run cancelled
+    /// while waiting for the previous pass ran no scheduler and is passed over
+    /// without using up the window; a run cancelled after its pass (a later
+    /// job's concurrency group) still counts, so cancelled runs' jobs are read.
+    /// A skipped run ran no jobs and is dropped unread.
     fn passes(&self, poll: Option<&Vec<Value>>) -> Result<Vec<Value>> {
         let poll = poll.context("poll runs unavailable")?;
         let scheduler_job = self
@@ -860,8 +868,8 @@ impl Collector<'_> {
             let limits = &self.s.limits;
             for run in poll
                 .iter()
-                .filter(|r| r["status"] == "completed")
-                .take(limits.idle_passes + 3)
+                .filter(|r| r["status"] == "completed" && r["conclusion"] != "skipped")
+                .take(PASS_RUNS)
             {
                 let id = run["id"].as_u64().context("run id")?;
                 let jobs = self.api.get(&format!(

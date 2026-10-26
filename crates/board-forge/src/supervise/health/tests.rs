@@ -773,6 +773,112 @@ fn collector_reads_scheduler_logs_records_runs_annotations_and_pull_requests() {
 }
 
 #[test]
+fn passes_are_counted_past_runs_cancelled_before_their_pass() {
+    let (_, now) = recorded();
+    let s = project_settings();
+    let root = format!("/repos/{}", s.dispatch_repo);
+    let burst = s.limits.idle_passes as u64 + 3;
+    let cancelled = |ids: std::ops::Range<u64>| ids.map(|id| (id, "cancelled", "cancelled"));
+    // Poll runs newest first, as (id, run conclusion, scheduler job
+    // conclusion); then the idle evidence and the runs whose jobs are read.
+    type Case<'a> = (
+        &'a str,
+        Vec<(u64, &'a str, &'a str)>,
+        Option<Vec<u64>>,
+        Vec<u64>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "a burst of cancelled runs ahead of two passes",
+            [(1, "skipped", "skipped")]
+                .into_iter()
+                .chain(cancelled(10..10 + burst))
+                .chain([(20, "success", "success"), (21, "failure", "failure")])
+                .collect(),
+            Some(vec![20, 21]),
+            (10..10 + burst).chain([20, 21]).collect(),
+        ),
+        (
+            "a run cancelled after its pass",
+            vec![
+                (30, "cancelled", "success"),
+                (31, "success", "success"),
+                (32, "success", "success"),
+            ],
+            Some(vec![30, 31]),
+            vec![30, 31],
+        ),
+        (
+            "nothing but cancelled runs",
+            cancelled(100..100 + PASS_RUNS as u64 + 5).collect(),
+            None,
+            (100..100 + PASS_RUNS as u64).collect(),
+        ),
+    ];
+    let log = "2026-10-15T11:50:41.4Z idle: 7 slot(s) free and nothing started";
+    for (name, runs, idle, read) in cases {
+        let fake = Fake::new(|kind: &str, path: &str, _: &Value| -> Result<Value> {
+            if kind == "DOWNLOAD" {
+                return Ok(log.into());
+            }
+            if path.starts_with(&format!("{root}/actions/workflows/poll.yml/runs")) {
+                let runs: Vec<Value> = runs
+                    .iter()
+                    .map(|(id, conclusion, _)| {
+                        json!({"id": id, "status": "completed", "conclusion": conclusion,
+                            "html_url": format!("https://github.com/example/control/actions/runs/{id}")})
+                    })
+                    .collect();
+                return Ok(json!({"workflow_runs": runs}));
+            }
+            for (id, _, job) in &runs {
+                if path.starts_with(&format!("{root}/actions/runs/{id}/jobs")) {
+                    return Ok(
+                        json!({"jobs": [{"id": id, "name": "board", "status": "completed", "conclusion": job}]}),
+                    );
+                }
+            }
+            if path.contains("/actions/") {
+                return Ok(json!({"workflow_runs": []}));
+            }
+            Ok(json!([]))
+        });
+        let snapshot = collect(&fake, &s, "main", now, None);
+        let checks: BTreeMap<String, Value> = evaluate(&snapshot, now, &s.limits)
+            .into_iter()
+            .map(|c| (c["id"].as_str().unwrap().to_owned(), c))
+            .collect();
+        // `idle` and `stuck` share the passes: each run's jobs are read once.
+        let mut jobs: Vec<u64> = fake
+            .calls
+            .borrow()
+            .iter()
+            .filter_map(|c| {
+                let id = c.strip_prefix(&format!("GET {root}/actions/runs/"))?;
+                id.split_once("/jobs")?.0.parse().ok()
+            })
+            .collect();
+        jobs.sort();
+        assert_eq!(jobs, read, "{name}");
+        match idle {
+            Some(ids) => {
+                let urls: Vec<String> = ids
+                    .iter()
+                    .map(|id| format!("https://github.com/example/control/actions/runs/{id}"))
+                    .collect();
+                assert_eq!(checks["idle"]["status"], "fail", "{name}");
+                assert_eq!(checks["idle"]["evidence"], json!(urls), "{name}");
+                assert_eq!(snapshot.observations["stuck"], Some(vec![]), "{name}");
+            }
+            None => {
+                assert_eq!(checks["idle"]["status"], "ok", "{name}");
+                assert_eq!(snapshot.observations["stuck"], None, "{name}");
+            }
+        }
+    }
+}
+
+#[test]
 fn successful_snapshot_skips_old_pull_request_detail_and_keeps_commented_approval() {
     let (_, now) = recorded();
     let s = project_settings();
