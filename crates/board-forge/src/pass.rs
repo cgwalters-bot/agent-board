@@ -162,6 +162,17 @@ fragment Board on ProjectV2 {
 }
 "#;
 
+/// [`BOARD_QUERY`] with its facts, and with `updatedAt` where `revisit`
+/// needs it: a pass without [`Config::revisit`] sends the query it always
+/// did, which recorded boards replay.
+fn board_query(revisit: bool) -> String {
+    let facts = match revisit {
+        true => FACTS.replacen("createdAt", "createdAt updatedAt", 1),
+        false => FACTS.to_owned(),
+    };
+    format!("{BOARD_QUERY}{facts}")
+}
+
 const ISSUE_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) { ...Facts } }
 }
@@ -247,6 +258,9 @@ pub struct Config {
     /// ([`Scheduler::body_plan`]).
     #[serde(default)]
     pub body_plans: bool,
+    /// Off unless set: spare slots after stage 4's starts revisit a sample
+    /// of old issues ([`Scheduler::revisit`]).
+    pub revisit: Option<revisit::Revisit>,
     #[serde(default)]
     pub pools: Pools,
     pub usage: Option<Usage>,
@@ -572,6 +586,9 @@ impl Config {
             self.replan_after_days == 0 || self.triage,
             "replanAfterDays needs triage"
         );
+        if let Some(revisit) = &self.revisit {
+            revisit.check(self)?;
+        }
         if !self.pools.0.is_empty() {
             ensure!(self.usage.is_some(), "pools need usage");
         }
@@ -891,6 +908,9 @@ pub struct Facts {
     pub issue: ItemRef,
     pub open: bool,
     pub created: OffsetDateTime,
+    /// When anything about it last changed, read only where
+    /// [`Config::revisit`] is set ([`board_query`]).
+    pub updated: Option<OffsetDateTime>,
     pub author: Option<String>,
     pub labels: Vec<String>,
     pub labels_complete: bool,
@@ -985,9 +1005,14 @@ impl Facts {
         };
         let created = OffsetDateTime::parse(text(node, "/createdAt"), &Rfc3339)
             .with_context(|| format!("{} has no creation time", issue.display()))?;
+        let updated = (node["updatedAt"].as_str())
+            .map(|at| OffsetDateTime::parse(at, &Rfc3339))
+            .transpose()
+            .with_context(|| format!("{} has an invalid updatedAt", issue.display()))?;
         Ok(Self {
             open: node["state"] == "OPEN",
             created,
+            updated,
             author: node
                 .pointer("/author/login")
                 .and_then(Value::as_str)
@@ -1072,6 +1097,13 @@ pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> 
         let why = format!("{} open dependencies", facts.blocked_by);
         return Some(Hold::new(HoldKind::WaitingOn, why));
     }
+    under_way(facts, busy, people)
+}
+
+/// The part of [`hold`] that says work on an open issue is under way, or may
+/// be: a trusted open pull request, pull requests left unread, or a run in
+/// flight.
+fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Hold> {
     if let Some((number, repo, _)) = facts
         .pulls
         .iter()
@@ -1093,6 +1125,10 @@ pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> 
 /// ranks. A Priority is its option's index on the project; unset or unknown
 /// is last.
 pub type Rank = (usize, usize, OffsetDateTime, String, u64);
+
+/// What decides, just before a start, whether an issue is held: [`hold`],
+/// or for a revisit [`revisit::revisit_hold`].
+type HoldRule = fn(&Facts, &BTreeMap<String, String>, &[&str]) -> Option<Hold>;
 
 pub fn rank(options: &[String], epic: Option<&str>, own: Option<&str>, facts: &Facts) -> Rank {
     let index = |value: Option<&str>| {
@@ -1436,6 +1472,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     let mut report = Report::default();
     report.tally.0.limit = config.wip;
     report.tally.1.mode = name;
+    report.tally.1.revisited = config.revisit.as_ref().map(|_| None);
     let client = Budget {
         inner: client,
         bounds,
@@ -1768,7 +1805,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .map(|(pool, on)| (pool.clone(), on.clone()))
             .collect();
         let wip = config.wip as usize;
-        let slots = Slots {
+        let mut slots = Slots {
             wip,
             earlier,
             mine: Vec::new(),
@@ -1799,7 +1836,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.board = Some(None);
             return board.map(|_| ());
         };
-        let (free, taken) = self.start(&board, slots, (wip - active, &target, snapshot.as_ref()));
+        let candidates = self.candidates(&board);
+        let context = (&target, snapshot.as_ref());
+        let (free, started) = self.start(&candidates, &board, &mut slots, wip - active, context);
+        let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
+        let taken = started + revisited;
+        drop(candidates);
         self.board = Some(Some(board));
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
@@ -1813,15 +1855,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// many slots are left free, and how many runs it took.
     fn start(
         &mut self,
+        candidates: &[(Rank, &Facts)],
         board: &BoardRead,
-        mut slots: Slots,
-        (mut free, target, snapshot): (usize, &Target, Option<&Value>),
+        slots: &mut Slots,
+        mut free: usize,
+        (target, snapshot): (&Target, Option<&Value>),
     ) -> (usize, usize) {
-        let candidates = self.candidates(board);
         let mut taken = 0;
         let pools = &self.config.pools;
         let all: Vec<String> = pools.0.iter().map(|(n, _)| n.clone()).collect();
-        for (n, facts) in candidates.iter().enumerate() {
+        for (n, (_, facts)) in candidates.iter().enumerate() {
             if free == 0 {
                 let left = candidates.len() - n;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
@@ -1845,7 +1888,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             let issue = facts.issue.display();
-            let step = self.consider(facts, board, &slots, snapshot, target);
+            let step = self.consider(facts, board, slots, snapshot, target);
             let earlier = std::mem::replace(&mut self.considered, true);
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.finishing.set(false);
@@ -1888,27 +1931,33 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Step::Started(line, holds) => (line, holds, false),
                 Step::Failed(line, holds) => (line, holds, true),
             };
-            self.probed(&mut slots, &line);
-            // Sent or planned: a failed start may have dispatched.
-            self.caps.count(Kind::Dispatch);
-            if failed {
-                self.report.failures += 1;
-            }
-            for held in holds {
-                let started = || "started in this pass".to_owned();
-                slots.busy.insert(key(&held), started());
-                if let Some(Some(busy)) = &mut self.busy {
-                    busy.insert(key(&held), started());
-                }
-            }
-            if self.apply {
-                slots.mine.push(run_id(&line));
-            }
-            self.line(line);
+            self.took(slots, line, holds, failed);
             free -= 1;
             taken += 1;
         }
         (free, taken)
+    }
+
+    /// A run started, or sent and perhaps started, by its `line`: its slot
+    /// and the issues it `holds` are taken for the rest of the pass.
+    fn took(&mut self, slots: &mut Slots, line: String, holds: Vec<ItemRef>, failed: bool) {
+        self.probed(slots, &line);
+        // Sent or planned: a failed start may have dispatched.
+        self.caps.count(Kind::Dispatch);
+        if failed {
+            self.report.failures += 1;
+        }
+        for held in holds {
+            let started = || "started in this pass".to_owned();
+            slots.busy.insert(key(&held), started());
+            if let Some(Some(busy)) = &mut self.busy {
+                busy.insert(key(&held), started());
+            }
+        }
+        if self.apply {
+            slots.mine.push(run_id(&line));
+        }
+        self.line(line);
     }
 
     /// Another run of `own`'s workflow in progress, by its URL ([`PassRun`]).
@@ -2097,7 +2146,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// part of the board would start the wrong work.
     fn board(&self) -> Result<BoardRead> {
         let board = self.config.board.as_ref().context("no board")?;
-        let query = format!("{BOARD_QUERY}{FACTS}");
+        let query = board_query(self.config.revisit.is_some());
         let mut cursor = Value::Null;
         let mut options = None;
         let mut items = BTreeMap::new();
@@ -2159,8 +2208,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// The board issues that qualify, in order: open, in a work repository,
     /// not an epic, question or the usage or holds issue; a child of a live epic, or
-    /// opened by the operator or the bot. Says how many were left out.
-    fn candidates<'b>(&mut self, board: &'b BoardRead) -> Vec<&'b Facts> {
+    /// opened by the operator or the bot, each with its [`Rank`]. Says how
+    /// many were left out.
+    fn candidates<'b>(&mut self, board: &'b BoardRead) -> Vec<(Rank, &'b Facts)> {
         let config = self.config;
         let people = self.writers();
         let usage = (config.usage.as_ref()).map(|u| (&u.repository, u.issue));
@@ -2213,7 +2263,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "candidates: {} ({visitors} opened by others, {outside} outside a live epic)",
             ranked.len()
         ));
-        ranked.into_iter().map(|(_, facts)| facts).collect()
+        ranked
     }
 
     /// Whether `parent` is a live epic: open, in the epics repository (or,
@@ -2343,13 +2393,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Read again just before a start's first write, since the board and
     /// the runs were read when the pass began: the runs listed now, with
     /// this pass's starts, must leave a slot; `issue` and its plan's `dest`
-    /// must not be held now; and the budget must cover the whole start.
+    /// must not be held now by `rule`; and the budget must cover the whole start.
     fn recheck(
         &self,
         slots: &Slots,
-        issue: &ItemRef,
-        dest: &ItemRef,
+        (issue, dest): (&ItemRef, &ItemRef),
         target: &Target,
+        rule: HoldRule,
     ) -> Result<Option<Step>> {
         let (listed, mut busy) = self.runs(target)?;
         let active = slots.active(&listed);
@@ -2365,7 +2415,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         for (at, of) in read {
             let facts = self.fresh(at)?;
-            if let Some(held) = hold(&facts, &busy, &writers) {
+            if let Some(held) = rule(&facts, &busy, &writers) {
                 let why = format!("{of}{}", held.reason);
                 return Ok(Some(Step::Hold(Hold::new(held.kind, why))));
             }
@@ -2523,7 +2573,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
         }
-        if let Some(step) = self.recheck(slots, issue, &dest, target)? {
+        if let Some(step) = self.recheck(slots, (issue, &dest), target, hold)? {
             return Ok(step);
         }
         // A body plan is dispatched as the copy just posted, and only while
@@ -2650,14 +2700,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              If it can be done, post one accepted implement job plan for it (agent-board's docs/job-plans.md). \
              Otherwise say on the issue what design or decision it needs. Do not close the issue."
         );
-        if config.triage_follow_up_days > 0 {
-            brief.push_str(&format!(
-                " If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
-                 {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
-                 needs-design, needs-operator, partly or not-done."
-            ));
+        brief.push_str(&self.verdict_ask());
+        let context = (slots, target, hold as HoldRule);
+        self.start_triage(issue, (&pool, brief, intro), line, context)
+    }
+
+    /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
+    /// verdict [`Self::follow_up`] reads. Nothing without it.
+    fn verdict_ask(&self) -> String {
+        if self.config.triage_follow_up_days == 0 {
+            return String::new();
         }
-        self.start_triage(issue, (&pool, brief, intro), line, slots, target)
+        format!(
+            " If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
+             {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
+             needs-design, needs-operator, partly or not-done."
+        )
     }
 
     /// A triage plan dispatched already, whose run has ended (one in flight
@@ -2767,16 +2825,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// A triage run on `issue` in `pool` with `brief`, its line `line`:
-    /// held by `--max-dispatch`, planned in a preview, else checked again,
-    /// its plan posted as the bot's after `intro` and dispatched by the plan
-    /// protocol, whose record keeps it from running twice.
+    /// held by `--max-dispatch`, planned in a preview, else checked again
+    /// under `rule`, its plan posted as the bot's after `intro` and
+    /// dispatched by the plan protocol, whose record keeps it from running twice.
     fn start_triage(
         &self,
         issue: &ItemRef,
         (pool, brief, intro): (&str, String, &str),
         line: String,
-        slots: &Slots,
-        target: &Target,
+        (slots, target, rule): (&Slots, &Target, HoldRule),
     ) -> Result<Step> {
         let holds = vec![issue.clone()];
         if let Some(step) = self.capped(&line) {
@@ -2785,7 +2842,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !self.apply {
             return Ok(Step::Started(line, holds));
         }
-        if let Some(step) = self.recheck(slots, issue, issue, target)? {
+        if let Some(step) = self.recheck(slots, (issue, issue), target, rule)? {
             return Ok(step);
         }
         let plan = json!({
@@ -3198,6 +3255,7 @@ impl crate::github::GraphQl for Replay {
 
 mod epics;
 pub mod holds;
+pub mod revisit;
 mod status;
 mod usage;
 

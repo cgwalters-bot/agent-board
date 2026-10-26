@@ -110,7 +110,10 @@ did not get that far). `pass` is `{"mode", "candidates", "started",
 "live_epics"}`: `preview`, `actions` or `local`; stage 4's
 `candidates: N …`; the runs stages 2 to 4 started, or in a preview would
 start; and the sum of stage 3's `epics: N live …`. `candidates` and
-`live_epics` are null where their stage did not get that far. `wip` and
+`live_epics` are null where their stage did not get that far. With
+`revisit` set, `pass` also has `revisited`, the [revisits](#revisits) among
+`started` (null where stage 4 did not get that far); without it the key is
+absent, so a pass without it publishes what it did before. `wip` and
 `pass` were added to v1 later, so a reader treats them as absent in an
 older comment, and a change in either publishes as a change of the holds
 does.
@@ -262,7 +265,8 @@ Try a pass without credentials, against the recorded board:
 agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json
 ```
 
-Each decision is one line: `start triage|implement|planning OWNER/REPO#N … pool=P`,
+Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N … pool=P`,
+`revisit: …` and `revisit OWNER/REPO#N: why`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
@@ -514,6 +518,62 @@ respected, not silently replaced, and must pass the same checks. Pacing applies
 to planning and triage too. Capacity is filled by this same rule whether under
 or over pace; there is no fill mode, retry pool or shortened planning interval.
 
+## Revisits
+
+Triage runs once per plan, and `prune` only lists heuristic close
+candidates, so an old issue done or overtaken elsewhere, or a held question
+that answered itself, is otherwise never looked at again (agent-board#374).
+With `revisit` set (off unless set), stage 4 ends by spending the slots its
+starts left free on a sample of old candidates:
+
+1. It does nothing with no slot free (`revisit: no slot free`), no room on
+   a revisit pool, `revisit.pools` or else `triagePools`, by the rule of
+   [scheduling](#scheduling) (`revisit: no pool: why`), or past the pass's
+   time bound. A pass that held every new run earlier (WIP, pools, budget,
+   another pass) never gets here.
+2. Of stage 4's candidates, an issue is due once nobody has touched it (its
+   `updatedAt`, which the board read asks for only with `revisit`) for
+   `revisit.afterDays`, or for `revisit.heldAfterDays` where a person holds
+   it (`needs-human`, `needs-design`, board Blocked). A closed issue, one
+   whose labels or pull requests could not all be read, one with an open
+   pull request of the bot's or the operator's and one with a run in
+   flight, this pass's starts included, are not; a person's hold and open
+   dependencies do not keep it off.
+3. Three times `revisit.perPass` of them are drawn in order without
+   replacement, each by weight: focus, times its own Priority, times its
+   silence. With N Priority options, focus is (N + 2) to the power of its
+   live epic's Priority counted down from the board's first option (with
+   P0 to P3: 6⁵ for P0 down to 6¹ for unset), so at equal silence one step
+   of the epic's Priority outweighs any difference of its own; an issue outside a live
+   epic has focus 1, the least, but stays eligible. Its own Priority counts
+   down likewise (5 to 1 with P0 to P3), and silence is how many of its days
+   it has been untouched, 1 to 4. The draw is seeded by the pass's run id
+   (the clock outside Actions) with a generator in the code, and logged as
+   `revisit: 9 due, seed 4242, drawn: OWNER/REPO#N (weight 38880), …`, so
+   the seed and the board the pass read (`--record`) reproduce it.
+4. Each drawn issue in turn, until `revisit.perPass` are revisited or no
+   slot is left, reads its comments and is left alone
+   (`revisit OWNER/REPO#N: why`) where a writer's revisit plan comment
+   changed less than its days ago, where its newest plan has not been
+   dispatched (a revisit's plan would replace it) or is invalid, or where no
+   revisit pool has room. Otherwise it gets a triage run as
+   [scheduling](#scheduling) starts one, `start revisit OWNER/REPO#N
+   pool=P`: rechecked just before (with the same holds as step 2), its plan
+   posted after `The board pass asks a triage run to revisit this issue`
+   and dispatched by the plan protocol, within `--max-dispatch`, WIP and
+   pacing. That comment is the record of the revisit; the dispatch record
+   keeps it from running twice.
+
+The run's brief asks it to check the issue against today's code and board
+and do one of: close it as done or obsolete, citing the evidence; post an
+implement plan for what is left; or, for a held issue, restate its question
+with today's facts, or say how the evidence answers it. Its outputs go
+through agentic-job's check and apply like any triage run's, so a close
+happens only where the caller's bounds for its triage runs allow one; the
+pass itself still closes nothing. With `triageFollowUpDays` the brief also
+asks for a verdict, and the revisit's plan is then followed up as any triage
+plan is.
+
 ## Epic planning and recovery
 
 A live, unheld epic is due initially, after changed intent/operator direction
@@ -650,6 +710,8 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again after this many days (0–30), see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
+| `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
+| `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
