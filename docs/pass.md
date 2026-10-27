@@ -15,7 +15,8 @@ authority for their operations. The differences below are intentional.
 The pass implements the configuration below and stages 1 to 5, except
 that there is no infrastructure rerun, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
-The [maintain](#maintain) digest is planned and recorded but not dispatched.
+The [maintain](#maintain) digest is dispatched only where its repository is
+public; elsewhere it is planned and recorded but not dispatched.
 
 Stage 1 reads `usage.url`, the broker's `/usage`, without the forge token or
 an environment proxy (plain HTTP is allowed for a broker on a private network
@@ -645,7 +646,10 @@ is due, and plans its run:
    the operator, the bot, or the owner of `dispatchRepo` or of the digest
    repository, or it is in `repos.exclude`. `repos.include` comes first,
    then the rest by count, most first and ties by name, up to `repos.max` in
-   all.
+   all. Before printing names or listing pull requests, it checks every
+   source repository's current visibility, including explicit includes and
+   cached repositories. Anything nonpublic or unreadable fails the stage
+   without naming it; a public search result alone is not sufficient.
 2. The pass then reads its own plan comment on the digest issue: the URL
    retained in the local poll cache from its successful creation, with bot
    authorship and the `<!-- agent-board-maintain-plan v1 -->` marker (below).
@@ -688,14 +692,45 @@ is due, and plans its run:
    all passed at that head, with a reason that says so), closer (the
    concern, file and line links at that head, and minutes), waiting (a reply
    drafted, never sent) or stale (with the reason).
-6. An applying pass records the plan in its plan comment, editing it, or
-   adding it on the first day, as one write within `--max-writes`, and only
-   on a private repository (`maintain: recorded the plan in URL`). With it
-   go the heads it was planned for, from the pass's own listing: the
-   unchanged pull requests' and the reviewed ones', not those left waiting.
-   That ends the day. A preview records nothing (`maintain: record the plan
-   on OWNER/REPO#N; a preview records nothing`).
-7. Until the day ends, every later stage's pool choice, stage 2's fix
+6. The pass reads the digest repository. Where GitHub says it is public
+   (`private` false and `visibility` `public`), it starts the run as stage 4
+   starts a triage run: unless the weekly budget holds new runs, `wip` runs
+   are active (`maintain: wip: A of W runs active; the digest waits`), or
+   `--max-dispatch` or `--max-writes` leaves no room for the start and the
+   record after it, it posts the plan on the digest issue and dispatches it
+   by the plan protocol (`maintain: start research OWNER/REPO#N pool=P
+   record=URL run=URL`); a preview says `maintain: start research
+   OWNER/REPO#N pool=P`. The run takes a slot that the later stages count.
+   Before posting, an existing writer-authored `research` plan changed
+   since today's due time vetoes a new start, even without the poll cache.
+   This is only a recovery hold, never evidence of reviewed heads: a run
+   can forge a plan and delay work until tomorrow, but cannot mark heads
+   reviewed. Keep the digest issue dedicated to maintain. Deleting or
+   editing away its plans loses this duplicate-start protection; the daily
+   bound assumes those comments remain available. Before posting a plan, an
+   applying Actions pass also checks the existing overlapping-pass gate:
+   another pass in progress, or an unreadable overlap check, holds the digest.
+   Outside Actions, capped local applies still require caller serialization.
+   Where it is private, or its visibility cannot be read, the stage prints
+   the plan, brief included, and starts nothing (`maintain: plan only;
+   OWNER/REPO is not public: PLAN`, or `maintain: plan only; cannot read
+   whether OWNER/REPO is public: ERROR: PLAN`).
+7. An applying pass then records the plan in its plan comment, editing it,
+   or adding it on the first day, as one write within `--max-writes`, on a
+   private repository or one the previous step read as public (`maintain:
+   recorded the plan in URL`). With it go the heads it was planned for,
+   from the pass's own listing: the unchanged pull requests' and the
+   reviewed ones', not those left waiting. That ends the day, as does a
+   dispatch whose record fails, so that the run is not started twice. A
+   start that waits records nothing, and a later pass tries again. A
+   failure before the dispatch transport is called, or a confirmed dispatch
+   refusal (a 4xx response, including a final 422), also records no heads;
+   if a plan was already posted, the recovery hold defers it until tomorrow.
+   Once a dispatch request is attempted, a lost response may hide a start,
+   so its heads are conservatively recorded and the day ends. A
+   preview records nothing (`maintain: record the plan on OWNER/REPO#N; a
+   preview records nothing`).
+8. Until the day ends, every later stage's pool choice, stage 2's fix
    rounds included, reads a copy of the usage snapshot in which a pool that
    has used more than `1 − share` of its allowance is held, where its entry
    gives both figures and does not hold already (`claude has used
@@ -717,22 +752,19 @@ and configuration changes, but is never used for a different digest issue.
 Losing the cache loses that receipt too: the next pass searches and lists
 again without trusting an existing comment's heads or day.
 
-**Not built: the digest is planned, never dispatched.** The stage prints its
-plan, brief included, as `maintain: plan only; no run kind publishes only the
-digest: PLAN`, in a preview and an applying pass alike, and records it, but
-dispatches nothing. So in an applying pass the recorded heads count as
+**Why only a public digest is dispatched.** The run is the caller's
+`research` run, which may add one comment, but on any item of its
+repository, and whose logs, step summary and artifacts, which hold the
+comment's text, are public in the caller's public repository. So the digest
+is public in any case, and is dispatched only where its own issue is too:
+the operator chose a public digest on the public tracker, already a dispatch
+target ([tracker#965](https://github.com/cgwalters-forge/tracker/issues/965)).
+The check reads the repository's visibility, not its name. A private digest
+would need a dispatch workflow in its repository, whose bounds allow
+`add_comment` there alone
+([tracker#963](https://github.com/cgwalters-forge/tracker/issues/963)); until
+then it stays a dry run, and in an applying pass its recorded heads count as
 reviewed though no run reviewed them.
-No existing run kind can publish one comment to the digest issue and nothing
-else. The caller's `triage` and `research` runs may each add one comment,
-but on any item of their repository. Their logs, step summary and artifacts,
-which hold the comment's text, are public in the caller's public repository.
-The digest belongs on a private issue, which the caller's bounds therefore
-leave out ([tracker#963](https://github.com/cgwalters-forge/tracker/issues/963)).
-Closing the gap needs a dispatch workflow in the private digest repository,
-whose bounds allow `add_comment` there alone. Until then `maintain` stays
-unset in a deployment. Once a run can publish it, the plan is dispatched
-through the plan protocol like any other, taking a slot within `wip` and
-`--max-dispatch`, when the pass records it.
 
 The pass's plan comment starts with its marker, then one fenced block with
 the info string `agent-board-maintain-plan` holding one JSON object,
@@ -922,7 +954,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `maintain.repos.sinceDays`, `maintain.repos.min`, `maintain.repos.max` | The repositories whose incoming pull requests a daily digest assesses: those with at least `min` (≥ 1) of the operator's opened or reviewed pull requests updated in `sinceDays` (1–365) days, the `max` (1–20) most active, derived once a day, see [maintain](#maintain); required |
 | `maintain.repos.include`, `maintain.repos.exclude` | Repositories always kept (at most `max`) and never kept, no duplicates across both; `[]`, `[]` |
 | `maintain.share` | The share (0 < share < 1) of each pool's allowance the digest keeps while due; needs `pools`; section absent (off) |
-| `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, private, outside `maintain.repos.include`; required |
+| `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, outside `maintain.repos.include`; its run is dispatched where the repository is public, else only planned; required |
 | `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
@@ -972,8 +1004,11 @@ not listed here go with it at the cutover unless a need adds them.
 Credentials and transport-specific provider normalization are not
 per-deployment config keys. The caller enables new work by setting
 `workRepositories`, `wip`, pools and usage; triage additionally needs
-`triage: true`, epic planning `epics.repository`. The cutover PR must supply
-those settings explicitly; merely upgrading the binary enables none of them.
+`triage: true`, epic planning `epics.repository`, and the daily maintain
+digest a `maintain` section, whose run is dispatched only where
+`maintain.digest.repository` is public and `wip` leaves a slot. The cutover
+PR must supply those settings explicitly; merely upgrading the binary
+enables none of them.
 
 ## Replay and release gate
 

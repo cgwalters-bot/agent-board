@@ -1570,7 +1570,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // Every stage that starts runs starts them from the same ref.
     let git_ref = match &config.dispatch_ref {
         Some(git_ref) => git_ref.clone(),
-        None if config.follow.is_empty() && !config.work() => String::new(),
+        None if config.follow.is_empty() && !config.work() && config.maintain.is_none() => {
+            String::new()
+        }
         None => match default_branch(&client, &config.dispatch_repo) {
             Ok(branch) => branch,
             Err(error) => {
@@ -1609,11 +1611,11 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
-    scheduler.maintain(state.maintain.take());
+    let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
     // Without stage 2's state, the incoming one keeps the maintain stage's.
     let kept = scheduler.report.maintain.is_some().then(|| state.clone());
     // Stage 2: pull request follow-up, today's poll.
-    let mut earlier = scheduler.follow(state, &git_ref);
+    let mut earlier = maintained + scheduler.follow(state, &git_ref);
     if let Some(day) = scheduler.report.maintain.clone() {
         let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
         state.maintain = Some(day);
