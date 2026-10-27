@@ -233,7 +233,7 @@ fn last_scheduled(report: &Report) -> &str {
 pub(super) const EPIC_LINES: &[&str] = &[
     "epics: 3 live of 3 open in cgwalters-forge/tracker",
     "start planning cgwalters-forge/tracker#596 pool=claude: its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 3 more)",
-    "hold epic cgwalters-forge/tracker#890: its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); cgwalters-forge/agent-board#284 edited; cgwalters-forge/agent-board#289's Priority is P0, not P2; planned again from 2026-10-23T16:34:49Z, three hours after its last request",
+    "hold epic cgwalters-forge/tracker#890: its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); cgwalters-forge/agent-board#284 edited; cgwalters-forge/agent-board#289's Priority is P0, not P2; planned again from 2026-10-23T16:34:49Z, 3 hours after its last request",
     "hold epic cgwalters-forge/tracker#766: labelled needs-human; otherwise due to be planned (its sub-issues changed (cgwalters-forge/actions#83 closed, cgwalters-forge/agent-board#167 closed, cgwalters-forge/agent-board#168 closed and 2 more))",
 ];
 
@@ -1524,7 +1524,17 @@ impl Transport for Forge {
             self.late(&variables.to_string(), &mut data);
             return Ok(data);
         }
-        let mut data = self.replay.graphql(query, variables.clone())?;
+        let mut data = match self.replay.graphql(query, variables.clone()) {
+            // An issue whose body was not recorded: the operator's, unedited.
+            Err(_) if query == BODY_QUERY => {
+                let (repo, number) = (text(&variables, "/name"), &variables["number"]);
+                json!({"repository": {"issue": {
+                    "url": format!("https://github.com/cgwalters-forge/{repo}/issues/{number}"),
+                    "title": "Work", "body": "Work.", "createdAt": "2026-10-01T00:00:00Z", "lastEditedAt": null,
+                    "author": {"login": "cgwalters"}, "editor": null}}})
+            }
+            data => data?,
+        };
         if let Some(nodes) = data
             .pointer_mut("/repository/issue/comments/nodes")
             .and_then(Value::as_array_mut)
@@ -2044,8 +2054,9 @@ fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, d
 
 /// With `triageFollowUpDays`, a triage that ended without a plan is acted on
 /// by its verdict, read only from the bot's answer after the run's record:
-/// one for the operator labels the issue, any other waits the days, and the
-/// operator's comment triages it again at once. Each case: its answers
+/// one for the operator labels the issue, any other waits a day and then
+/// triages it again only if something but the bot's comments changed, and
+/// the operator's comment triages it again at once. Each case: its answers
 /// (author, editor, verdict or body, days from now), `--max-writes`, the
 /// line for tracker#446 (`{record}`, `{answer}` and `{due}` filled in),
 /// whether it was triaged again and whether it was labelled.
@@ -2088,16 +2099,43 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             false,
         ),
         (
-            "partly waits its days",
+            "partly waits a day",
             vec![(bot, None, "partly", 0)],
             None,
-            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; triaged again from {due}, or once cgwalters comments",
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; triaged again from {due} if anything changed, or once cgwalters comments",
             false,
             false,
         ),
         (
-            "partly, its days past, is triaged again",
+            "partly, its day past and nothing changed, is not triaged again",
             vec![(bot, None, "partly", -4)],
+            None,
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; nothing changed since its triage",
+            false,
+            false,
+        ),
+        (
+            "a plan posted before fingerprints is triaged again after the days, changed or not",
+            vec![("", None, "unmarked", 0), (bot, None, "partly", -4)],
+            None,
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            false,
+        ),
+        (
+            "nor after the bot's own comment",
+            vec![(bot, None, "partly", -4), (bot, None, "Still partly.", -3)],
+            None,
+            "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; nothing changed since its triage",
+            false,
+            false,
+        ),
+        (
+            "a comment by anyone else since makes it due",
+            vec![
+                (bot, None, "partly", -4),
+                ("visitor", None, "Fixed by #9?", -3),
+            ],
             None,
             "start triage cgwalters-forge/tracker#446 pool=claude record=",
             true,
@@ -2160,12 +2198,27 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             comments[0].contains("schedule-triage fenced JSON block"),
             "{name}"
         );
+        assert!(
+            comments[0].contains("\n\n<!-- agent-board-inputs: "),
+            "{name}"
+        );
         let record = (first.lines.iter())
             .find_map(|l| l.strip_prefix("start triage cgwalters-forge/tracker#446 "))
             .and_then(|l| l.split(" record=").nth(1)?.split(' ').next())
             .unwrap()
             .to_owned();
         for (author, editor, said, days) in answers {
+            // A plan posted before fingerprints, without its marker line.
+            if said == "unmarked" {
+                let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                let mut added = forge.added.borrow_mut();
+                let plan = &mut added.get_mut(&key).unwrap()[0]["body"];
+                let body: String = (plan.as_str().unwrap().split_inclusive('\n'))
+                    .filter(|l| !l.starts_with("<!-- agent-board-inputs: "))
+                    .collect();
+                *plan = body.into();
+                continue;
+            }
             let body = match said {
                 "two" => verdict("done").repeat(2),
                 "done" | "needs-design" | "partly" => verdict(said),
@@ -2175,7 +2228,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         }
         let added = forge.added.borrow()[&("cgwalters-forge/tracker".to_owned(), 446)].clone();
         let answer = text(&added[2], "/url").to_owned();
-        let due = (forge.replay.now + time::Duration::days(3))
+        let due = (forge.replay.now + time::Duration::days(1))
             .format(&Rfc3339)
             .unwrap();
         let expected = expected
@@ -2222,6 +2275,41 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "{name}"
         );
     }
+}
+
+/// A follow-up triage that had nothing to do either waits twice as long,
+/// two days, before the next, even with a new comment; then a third
+/// triage starts. Each case: days from now of the second verdict, and
+/// whether the third pass triages again.
+#[test]
+fn apply_doubles_the_wait_after_each_follow_up() {
+    let partly = format!("```{TRIAGE_FENCE}\n{{\"verdict\": \"partly\"}}\n```\n");
+    let config = config(json!({"triageFollowUpDays": 3}));
+    for (days, again) in [(-1, false), (-2, true)] {
+        let forge = Forge::new(None, false);
+        apply(&forge, &config);
+        answered(&forge, ("cgwalters-bot", None), &partly, -4);
+        answered(&forge, ("visitor", None), "Fixed by #9?", -4);
+        let second = apply(&forge, &config);
+        let start = "start triage cgwalters-forge/tracker#446 ";
+        let started = |report: &Report| report.lines.iter().any(|l| l.starts_with(start));
+        assert!(started(&second), "{:#?}", second.lines);
+        answered(&forge, ("cgwalters-bot", None), &partly, days);
+        answered(&forge, ("visitor", None), "Or by #10?", days);
+        let third = apply(&forge, &config);
+        assert_eq!(third.failures, 0, "{:#?}", third.lines);
+        assert_eq!(started(&third), again, "{days}: {:#?}", third.lines);
+        if !again {
+            let due = forge.replay.now + time::Duration::days(1);
+            let due = format!("triaged again from {} ", due.format(&Rfc3339).unwrap());
+            let line = third.lines.iter().find(|l| l.contains(&due));
+            assert!(line.is_some(), "{due}: {:#?}", third.lines);
+        }
+    }
+    let day = FOLLOW_UP_SECONDS;
+    assert_eq!(backoff(day, 0, 3 * day), day);
+    assert_eq!(backoff(day, 5, 3 * day), 3 * day);
+    assert_eq!(backoff(day, 99, i64::MAX), day << 30);
 }
 
 /// Gives `repo#number` on the board one open pull request by `author`.
@@ -2457,6 +2545,65 @@ fn apply_revisits_a_sample_with_spare_capacity() {
     }
     assert_eq!(second.tally.1.revisited, Some(Some(0)));
     assert_eq!(forge.dispatches().len(), 8);
+    // Its days past (all of tracker#468's comments that many days old), a
+    // revisit that gave a verdict on an issue nothing but the bot changed
+    // since is left alone for up to 90 days. One with no verdict (its run
+    // may have failed), or since anyone else's comment or a new title, is
+    // due. Each step: days old, (author, comment) added, title, held.
+    let key = ("cgwalters-forge/tracker".to_owned(), 468);
+    let partly = format!("```{TRIAGE_FENCE}\n{{\"verdict\": \"partly\"}}\n```\n");
+    let (bot, visitor) = (
+        Some(("cgwalters-bot", partly.as_str())),
+        Some(("visitor", "Done in #9?")),
+    );
+    let steps = [
+        (4, None, None, false),
+        (4, bot, None, true),
+        (91, None, None, false),
+        (4, bot, None, true),
+        (4, visitor, None, false),
+        (4, bot, None, true),
+        (4, None, Some("Work, renamed"), false),
+    ];
+    let item = "revisit cgwalters-forge/tracker#468";
+    for (step, (days, said, title, held)) in steps.into_iter().enumerate() {
+        let earlier = forge.replay.now - time::Duration::days(days);
+        for node in forge.added.borrow_mut().get_mut(&key).unwrap() {
+            node["createdAt"] = earlier.format(&Rfc3339).unwrap().into();
+        }
+        if let Some((author, body)) = said {
+            let id = forge.ids.get() + 1;
+            forge.ids.set(id);
+            let comment = json!({"id": id, "url": format!("https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-{id}"),
+                "body": body, "createdAt": earlier.format(&Rfc3339).unwrap(), "lastEditedAt": null,
+                "author": {"login": author}, "editor": null});
+            forge
+                .added
+                .borrow_mut()
+                .get_mut(&key)
+                .unwrap()
+                .push(comment);
+        }
+        if let Some(title) = title {
+            let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468});
+            let issue = json!({"url": "https://github.com/cgwalters-forge/tracker/issues/468",
+                "title": title, "body": "Work.", "createdAt": "2026-10-01T00:00:00Z",
+                "lastEditedAt": null, "author": {"login": "cgwalters"}, "editor": null});
+            forge
+                .replay
+                .requests
+                .push(json!({"request": graphql_key(BODY_QUERY, &variables),
+                "answer": {"data": {"repository": {"issue": issue}}}}));
+        }
+        let report = apply(&forge, &spare);
+        assert_eq!(report.failures, 0, "{step}: {:#?}", report.lines);
+        let expected = match held {
+            true => format!("{item}: nothing changed since its revisit, "),
+            false => format!("start {item} pool=claude record="),
+        };
+        let line = report.lines.iter().find(|l| l.starts_with(&expected));
+        assert!(line.is_some(), "{step}: {expected}: {:#?}", report.lines);
+    }
     // No slot left after stage 4's starts, or no room on the revisit pool.
     for (settings, expected) in [
         (json!({"revisit": section}), "revisit: no slot free"),
@@ -3143,7 +3290,7 @@ fn body_plan_forge(priority: &str, body: &str, author: &str, editor: Option<&str
     });
     let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
     let issue = json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446",
-        "body": body, "createdAt": "2026-10-20T00:00:00Z",
+        "title": "Work", "body": body, "createdAt": "2026-10-20T00:00:00Z",
         "lastEditedAt": editor.map(|_| "2026-10-21T00:00:00Z"),
         "author": {"login": author},
         "editor": editor.filter(|e| !e.is_empty()).map(|e| json!({"login": e}))});

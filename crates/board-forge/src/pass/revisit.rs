@@ -17,6 +17,9 @@ const PER_PASS_LIMIT: u64 = 5;
 /// The most `revisit.afterDays` and `revisit.heldAfterDays` may be; at
 /// least one, so that no issue is revisited on every pass.
 const DAYS_LIMIT: u64 = 90;
+/// The most days an issue nothing changed on waits between revisits: the
+/// code and board it is checked against may move on without touching it.
+const UNCHANGED_DAYS: u64 = DAYS_LIMIT;
 /// How many `afterDays` (or `heldAfterDays`) of silence count towards an
 /// item's weight; longer is no heavier.
 const SILENCE_STEPS: i64 = 4;
@@ -317,7 +320,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
 
     /// One drawn candidate revisited, unless its last revisit is more recent
     /// than its days, or a plan of its own waits to start (a revisit's plan
-    /// would replace it), or no revisit pool has room.
+    /// would replace it), or nothing changed since its last revisit gave a
+    /// verdict (its [`fingerprint`] is the one that revisit's plan carries)
+    /// within [`UNCHANGED_DAYS`], or no revisit pool has room.
     fn revisit_one(
         &self,
         due: &Due,
@@ -331,9 +336,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let comments = plan::issue_comments(&self.client, issue)?;
         let last = (comments.iter())
             .filter(|c| is(c.author.as_deref(), &writers) && c.body.starts_with(REVISIT))
-            .map(|c| c.changed)
-            .max();
-        if let Some(last) = last {
+            .max_by_key(|c| c.changed);
+        if let Some(last) = last.map(|c| c.changed) {
             let again = last + time::Duration::days(due.days as i64);
             if self.now < again {
                 let (last, again) = (last.format(&Rfc3339)?, again.format(&Rfc3339)?);
@@ -352,6 +356,34 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             let id = plan::plan_id(from)?;
             if batch::held(&self.client, &comments, &writers, &id, issue)?.is_empty() {
                 let why = format!("plan {id} waits to start");
+                return Ok(Step::Hold(Hold::new(HoldKind::Other, why)));
+            }
+        }
+        // Without a verdict since, the revisit may have failed: retried.
+        let bot = [config.bot.as_str()];
+        let answered = |last: &plan::Comment| {
+            let after = comments.iter().position(|c| c.url == last.url);
+            comments[after.map_or(comments.len(), |n| n + 1)..]
+                .iter()
+                .any(|c| {
+                    let unedited =
+                        (!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers);
+                    is(c.author.as_deref(), &bot)
+                        && unedited
+                        && plan::triage_verdict(&c.body).is_some()
+                })
+        };
+        if let Some(last) = last
+            && let Some(carried) = carried(&last.body)
+            && answered(last)
+        {
+            let again = last.changed + time::Duration::days(UNCHANGED_DAYS as i64);
+            if self.now < again && self.inputs(due.facts, &comments)? == carried {
+                let why = format!(
+                    "nothing changed since its revisit, {}; again from {} regardless",
+                    last.url,
+                    again.format(&Rfc3339)?
+                );
                 return Ok(Step::Hold(Hold::new(HoldKind::Other, why)));
             }
         }
@@ -382,7 +414,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         );
         brief.push_str(&self.verdict_ask());
         let context = (slots, target, revisit_hold as HoldRule);
-        self.start_triage(issue, (&pool, brief, REVISIT), line, context)
+        let read = Some((due.facts, comments.as_slice()));
+        self.start_triage(issue, (&pool, brief, REVISIT), read, line, context)
     }
 }
 

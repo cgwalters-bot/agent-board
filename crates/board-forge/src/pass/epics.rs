@@ -18,11 +18,9 @@ use crate::plan::{
 
 /// Pages of open epics read, 20 each; more is an error.
 const EPIC_PAGES: usize = 5;
-/// An epic is planned again a day after its last plan, changed or not,
-/// unless it has nothing open.
-const REPLAN_SECONDS: i64 = 24 * 60 * 60;
 /// Automatic changes within this long of a planning request wait, so that
-/// the pass's own writes and a run's churn do not spend a run each.
+/// the pass's own writes and a run's churn do not spend a run each; each
+/// plan in a row that had nothing to do doubles it ([`backoff`]).
 const COALESCE_SECONDS: i64 = 3 * 60 * 60;
 /// How long a finished planning run's plan may take to show.
 const ANSWER_SECONDS: i64 = 5 * 60;
@@ -345,6 +343,8 @@ pub(super) struct Inputs<'a> {
     /// A run in flight for the epic.
     pub busy: Option<&'a str>,
     pub now: OffsetDateTime,
+    /// `triageFollowUpDays`: the most the back-off waits, in days; 0, none.
+    pub follow_up_days: u64,
 }
 
 /// The run a dispatch record names, `…/actions/runs/ID`.
@@ -540,26 +540,25 @@ pub(super) fn decide(i: &Inputs) -> Next {
         }
     }
     if why.is_empty() {
-        if (i.now - at).whole_seconds() < REPLAN_SECONDS {
-            return Next::Idle(format!(
-                "plan {id} applied; nothing changed since {}",
-                stamp(at)
-            ));
-        }
-        if epic.census.sub_issues.is_empty() {
-            return Next::Idle(format!(
-                "plan {id} applied; nothing is open and nothing changed since {}",
-                stamp(at)
-            ));
-        }
-        why.push(format!("planned last {}", stamp(at)));
+        return Next::Idle(format!(
+            "plan {id} applied; nothing changed since {}",
+            stamp(at)
+        ));
     }
     let why = why.join("; ");
-    let until = last + time::Duration::seconds(COALESCE_SECONDS);
+    // The applied plans in a row, newest first, that had nothing to do.
+    let empty = (receipts.iter().rev())
+        .filter(|r| r.detail.outcome.applied())
+        .take_while(|r| r.detail.actions.is_empty())
+        .count();
+    let cap = COALESCE_SECONDS.max(i.follow_up_days as i64 * 24 * 60 * 60);
+    let wait = backoff(COALESCE_SECONDS, empty, cap);
+    let until = last + time::Duration::seconds(wait);
     if i.now < until {
         let why = format!(
-            "{why}; planned again from {}, three hours after its last request",
-            stamp(until)
+            "{why}; planned again from {}, {} hours after its last request",
+            stamp(until),
+            wait / 3600
         );
         return Next::Hold(Hold::new(HoldKind::TriageCooldown, why));
     }
@@ -837,6 +836,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             bot: &self.config.bot,
             busy: busy.map(String::as_str),
             now: self.now,
+            follow_up_days: self.config.triage_follow_up_days,
         });
         if let Some(held) = person_hold(
             &facts.labels,
@@ -1321,7 +1321,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => "The board pass asks a triage run to plan this epic.".into(),
         };
         let context = (slots, target, hold as HoldRule);
-        let step = self.start_triage(&facts.issue, (&pool, brief, &intro), line, context);
+        let step = self.start_triage(&facts.issue, (&pool, brief, &intro), None, line, context);
         self.client.bounds.finishing.set(false);
         let step = match step {
             Ok(step) => step,

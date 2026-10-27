@@ -225,9 +225,11 @@ otherwise, once three hours have passed since its last request (its record,
 or for an epic planned before this stage, its plan), when the epic's text was
 edited, a sub-issue was added, removed, closed or reopened against the
 receipt's fingerprint, a sub-issue's text was edited, or a Priority the
-apply set differs now; and a day after its last plan, unless nothing is open.
-Not yet noticed: a Priority change of a sub-issue the apply did not set,
-until that day's replan.
+apply set differs now. That wait doubles for each applied plan in a row
+that had no actions, up to `triageFollowUpDays`. An unchanged epic is not
+planned again (agent-board#383). Not noticed: a Priority change of a
+sub-issue the apply did not set, and a comment by anyone but the operator,
+whose word alone decides an epic's plan.
 
 Stage 5 reads the whole board (closed issues and pull requests included, in
 about one request per hundred items) besides the runs and open issues that
@@ -473,9 +475,27 @@ a writer; a visitor's comment is never a verdict. A comment by the operator
 after it (or after the record, with no verdict) triages the issue again.
 Otherwise `done`, `needs-design` and `needs-operator` label it `needs-human`,
 one write step, so it shows as the operator's ask; the pass never closes an
-issue on a verdict, since no review follows a close. Any other verdict, or
-none, triages the issue again `triageFollowUpDays` after the verdict (or the
-record): at most one triage run per issue in that many days.
+issue on a verdict, since no review follows a close. Any other verdict had
+nothing to do, and the issue is triaged again only once its inputs changed
+(agent-board#383), and no sooner than a day after the verdict, doubled for
+each follow-up triage in a row before it (one the operator's comment
+started included), up to `triageFollowUpDays`. An unchanged issue waits
+for a change or the operator. With no verdict, where the run may have
+failed, the issue is triaged again `triageFollowUpDays` after the record,
+changed or not, as is one whose triage plan predates this and carries no
+fingerprint.
+
+The inputs are a fingerprint of what the pass reads of the issue: its title
+and body, the comments of anyone but the bot, its labels, Priority, open dependencies
+and open closing pull requests. The bot's own comments (plans, dispatch
+records, verdicts) are left out, so they never make an issue due; its other
+writes, such as a Priority an epic's apply sets, do. With
+`triageFollowUpDays` or `revisit`, each triage plan comment the pass posts
+carries the fingerprint as read just before its start, on a hidden line
+`<!-- agent-board-inputs: HASH -->` after its intro; the forge stays the only
+state. A pass compares it with a fresh read only once the wait is over, at
+the cost of a request for the body each pass while such an issue stays
+unchanged. The sub-issues of an issue outside an epic are not read for it.
 
 With `replanAfterDays` (agent-board#347), an issue whose newest plan is an
 implement plan that was dispatched, whose run is no longer in flight, and that
@@ -579,8 +599,12 @@ starts left free on a sample of old candidates:
    slot is left, reads its comments and is left alone
    (`revisit OWNER/REPO#N: why`) where a writer's revisit plan comment
    changed less than its days ago, where its newest plan has not been
-   dispatched (a revisit's plan would replace it) or is invalid, or where no
-   revisit pool has room. Otherwise it gets a triage run as
+   dispatched (a revisit's plan would replace it) or is invalid, where its
+   last revisit gave a verdict less than 90 days ago and its inputs are
+   those that revisit's plan carries (`nothing changed since its revisit`,
+   see [scheduling](#scheduling); the code it is checked against may have
+   changed, so not for longer), or where no revisit pool
+   has room. Otherwise it gets a triage run as
    [scheduling](#scheduling) starts one, `start revisit OWNER/REPO#N
    pool=P`: rechecked just before (with the same holds as step 2), its plan
    posted after `The board pass asks a triage run to revisit this issue`
@@ -601,9 +625,11 @@ plan is.
 ## Epic planning and recovery
 
 A live, unheld epic is due initially, after changed intent/operator direction
-or membership/state, body or Priority changes in its children, or after 24 hours
-since its last resolved planning request. Coalesce automatic changes for three
-hours after a request; new operator direction may bypass that interval. Ignore
+or membership/state, body or Priority changes in its children, and never on
+a timer alone (agent-board#383). Coalesce automatic changes for three
+hours after a request, doubled for each applied plan in a row with no
+actions, up to `triageFollowUpDays` (none without it); new operator
+direction may bypass that interval. Ignore
 the controller's own comments/timestamps as change triggers. Do not repeatedly
 plan an unchanged empty epic. A planning run in flight holds that epic. A plan
 must still match its requested intent and target preconditions; drift requires
@@ -731,7 +757,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage; `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
-| `triageFollowUpDays` | Act on an ended triage's verdict and triage again after this many days (0–30), see [scheduling](#scheduling); needs `triage`; `0` (off) |
+| `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
