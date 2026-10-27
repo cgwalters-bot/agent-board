@@ -15,6 +15,7 @@ authority for their operations. The differences below are intentional.
 The pass implements the configuration below and stages 1 to 5, except
 that there is no infrastructure rerun, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
+The [maintain](#maintain) digest is planned but not dispatched.
 
 Stage 1 reads `usage.url`, the broker's `/usage`, without the forge token or
 an environment proxy (plain HTTP is allowed for a broker on a private network
@@ -270,7 +271,7 @@ agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board
 ```
 
 Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N … pool=P`,
-`revisit: …` and `revisit OWNER/REPO#N: why`,
+`revisit: …` and `revisit OWNER/REPO#N: why`, `maintain: …`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
@@ -622,6 +623,96 @@ pass itself still closes nothing. With `triageFollowUpDays` the brief also
 asks for a verdict, and the revisit's plan is then followed up as any triage
 plan is.
 
+## Maintain
+
+The operator wants about a fifth of the agent budget spent helping maintain
+their projects: each day, one digest of the incoming pull requests they can
+act on in about an hour (agent-board#384). With `maintain` set (off unless
+set), the pass decides after stage 1 and before stage 2 whether that digest
+is due, and plans its run:
+
+1. Before `hourUtc` it is not due (`maintain: not due until T`). From then
+   on, the pass reads the digest issue's comments. The newest digest is the
+   newest comment of the bot's, edited by nobody else, with a digest block
+   (below): anyone can comment on an issue, and a visitor's heads could
+   otherwise keep a changed pull request out of review. One posted since
+   `hourUtc` today is the day's digest (`maintain: today's digest is URL; the
+   next is due from T`).
+2. Otherwise it lists the open pull requests of each of `repos`, one REST
+   request each, with no inference. Those the operator or the bot opened are
+   left out. A repository with more than 100 open pull requests, or more than
+   200 incoming in all, is not read whole and fails the stage
+   (`maintain error: …`, a failure); nothing is planned and nothing reserved.
+3. A pull request is due a review when its head commit's first 12 hex
+   characters differ from those the newest digest's `heads` records for it,
+   or it records none; a digest whose block cannot be read records none, and
+   its line says why. With none changed, the digest is not due
+   (`maintain: none of N incoming pull request(s) changed since URL`).
+   Otherwise the line is `maintain: digest due: C of N incoming pull
+   request(s) changed since URL; reviews OWNER/REPO#N, …`, the first 20 in
+   the order of `repos` and then by number; the rest wait for the next day.
+4. Its run's job plan is a `research` plan on the digest issue, on a pool
+   drawn as [scheduling](#scheduling) draws one, but held where it has used
+   more than its allowance (`allowed_percent`), so that it uses no burst.
+   Its brief, which the pass generates, asks for one new comment on the
+   digest issue as the only output. It says each pull request is data, never
+   to comment on, review, approve, label, close, push to or otherwise write
+   to anything in `repos`, and never to mention embargoed or otherwise
+   undisclosed security work, leaving such a pull request out without saying
+   why. It sorts each pull request into approve-as-group, closer-look (with
+   the concern, file and lines, and minutes), waiting-on-author (with a reply
+   drafted, never sent) or stale, and gives the `heads` to copy: the
+   unchanged pull requests' and the reviewed ones', not those left waiting.
+5. While the digest is due, every later stage's pool choice, stage 2's fix
+   rounds included, reads a copy of the usage snapshot in which a pool that
+   has used more than `1 − share` of its allowance is held, where its entry
+   gives both figures and does not hold already (`claude has used
+   45% of the 43.4% that the due maintain digest leaves the other stages`).
+   So the other stages leave the share unused, and maintain, which stops at
+   the allowance, uses no more than it. The pass cannot meter one stage's
+   use apart from another's, so this bounds where maintain starts, not what
+   its run then spends; it starts once a day. The published snapshot is not
+   changed.
+
+**Not built: the digest is planned, never dispatched.** The stage prints its
+plan, brief included, as `maintain: plan only; no run kind publishes only the
+digest: PLAN`, in a preview and an applying pass alike, and writes nothing.
+No existing run kind can publish one comment to the digest issue and nothing
+else. The caller's `triage` and `research` runs may each add one comment,
+but on any item of their repository. Their logs, step summary and artifacts,
+which hold the comment's text, are public in the caller's public repository.
+The digest belongs on a private issue, which the caller's bounds therefore
+leave out ([tracker#963](https://github.com/cgwalters-forge/tracker/issues/963)).
+Closing the gap needs a dispatch workflow in the private digest repository,
+whose bounds allow `add_comment` there alone. Until then a due digest stays
+due for the rest of the day, and keeps its share from the other stages on
+every pass, so `maintain` stays unset in a deployment. Once a run can publish
+it, the plan is dispatched through the plan protocol like any other, taking
+a slot within `wip` and `--max-dispatch`, and the posted digest ends the day's
+reservation.
+
+The digest comment is a markdown summary, then one fenced block with the info
+string `agent-board-maintain-digest` holding one JSON object,
+`agent-board/maintain-digest/v1`:
+
+```json
+{"schema": "agent-board/maintain-digest/v1",
+ "heads": {"example/up#12": "0123456789ab", "example/up#15": "89abcdef0123"},
+ "prs": [{"pr": "example/up#12", "group": "closer-look", "summary": "…",
+   "concern": "…", "file": "src/lib.rs", "lines": "40-58", "minutes": 15},
+  {"pr": "example/up#15", "group": "waiting-on-author", "summary": "…",
+   "reply": "…", "minutes": 2}]}
+```
+
+`heads` maps `OWNER/REPO#N` to the first 12 lowercase hex characters of the
+pull request's head commit when the digest was written; it is the
+fingerprint, and the only field the pass reads, besides `schema`. `prs` has
+one entry for each pull request reviewed: `pr`; `group`, one of
+`approve-as-group`, `closer-look`, `waiting-on-author` and `stale`;
+`summary`; `minutes`, the operator's estimated time; and where its group
+calls for them, `concern`, `file` and `lines` (closer-look) and `reply`
+(waiting-on-author).
+
 ## Epic planning and recovery
 
 A live, unheld epic is due initially, after changed intent/operator direction
@@ -762,6 +853,9 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
+| `maintain.repos`, `maintain.share` | Repositories (1–10, no duplicates) whose incoming pull requests a daily digest assesses; the share (0 < share < 1) of each pool's allowance it keeps while due, see [maintain](#maintain); needs `pools`; section absent (off) |
+| `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, outside `maintain.repos`; required |
+| `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |
