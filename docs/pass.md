@@ -682,9 +682,12 @@ is due, and plans its run:
    to comment on, review, approve, label, close, push to or otherwise write
    to anything in those repositories, and never to mention embargoed or
    otherwise undisclosed security work, leaving such a pull request out
-   without saying why. It sorts each pull request into approve-as-group,
-   closer-look (with the concern, file and lines, and minutes),
-   waiting-on-author (with a reply drafted, never sent) or stale.
+   without saying why. It lists each pull request with its full head commit
+   and asks for the [digest](#the-digest) of that day, showing an example,
+   which sorts each into approve (only a small, low-risk change whose checks
+   all passed at that head, with a reason that says so), closer (the
+   concern, file and line links at that head, and minutes), waiting (a reply
+   drafted, never sent) or stale (with the reason).
 6. An applying pass records the plan in its plan comment, editing it, or
    adding it on the first day, as one write within `--max-writes`, and only
    on a private repository (`maintain: recorded the plan in URL`). With it
@@ -745,23 +748,36 @@ the info string `agent-board-maintain-plan` holding one JSON object,
 maps `OWNER/REPO#N` to the first 12 lowercase hex characters of the pull
 request's head commit when the pass listed it; `plan` is the job plan.
 
+### The digest
+
 The digest comment is a markdown summary, then one fenced block with the info
 string `agent-board-maintain-digest` holding one JSON object,
-`agent-board/maintain-digest/v1`, which the pass does not read:
+`agent-board/maintain-digest/v1`. The pass does not read it; review's Maintain
+view does ([review#186](https://github.com/cgwalters-forge/review/pull/186),
+`src/github/maintain.ts`), and this is its schema.
+`fixtures/pass/maintain-digest.md` is the example the brief shows, for
+2026-10-23; in part:
 
 ```json
-{"schema": "agent-board/maintain-digest/v1",
- "prs": [{"pr": "example/up#12", "group": "closer-look", "summary": "…",
-   "concern": "…", "file": "src/lib.rs", "lines": "40-58", "minutes": 15},
-  {"pr": "example/up#15", "group": "waiting-on-author", "summary": "…",
-   "reply": "…", "minutes": 2}]}
+{"schema": "agent-board/maintain-digest/v1", "date": "2026-10-23",
+ "approve": [{"pr": "up/proj#7", "head": "1111111111111111111111111111111111111111",
+   "reason": "Dependency bump, lockfile only; all checks green at this head."}],
+ "closer": [{"pr": "up/proj#9", "head": "3333333333333333333333333333333333333333",
+   "concern": "Changes the lock order.", "minutes": 40,
+   "links": [{"path": "src/lock.rs", "start": 12, "end": 30}]}],
+ "waiting": [{"pr": "up/proj#10", "reply": "Thanks! Could you rebase on main and add a test?"}],
+ "stale": [{"pr": "up/proj#3", "reason": "No activity in 90 days."}]}
 ```
 
-`prs` has one entry for each pull request reviewed: `pr`; `group`, one of
-`approve-as-group`, `closer-look`, `waiting-on-author` and `stale`;
-`summary`; `minutes`, the operator's estimated time; and where its group
-calls for them, `concern`, `file` and `lines` (closer-look) and `reply`
-(waiting-on-author).
+`date` is the day assessed, `YYYY-MM-DD`. Each list holds at most 100
+entries, and each pull request reviewed is in one: `pr` is `OWNER/REPO#N`;
+`head`, in `approve` and `closer`, is the full 40-character lowercase head
+commit the brief listed, at which the operator approves and the links open;
+`minutes` is 1 to 480; a link's `path` is relative to the repository root,
+with `start` and an optional `end` line from 1. The view refuses a digest
+that breaks these rules, and skips approving a pull request whose head has
+moved since. Unlike the 12 characters of the pass's own `heads`, these are
+the run's output, never read back for scheduling.
 
 ## Epic planning and recovery
 

@@ -198,12 +198,13 @@ impl Day {
     }
 }
 
-/// An incoming pull request: `OWNER/REPO#N`, its address and the start of
-/// its head commit.
+/// An incoming pull request: `OWNER/REPO#N`, its address, its head commit
+/// as the run assesses it, and the start of it the pass records.
 #[derive(Debug, PartialEq)]
 pub(super) struct Pull {
     key: String,
     url: String,
+    sha: String,
     head: String,
 }
 
@@ -283,6 +284,7 @@ pub(super) fn reserve(snapshot: &Value, keep: f64, why: &str) -> Value {
 fn brief(
     config: &Config,
     maintain: &Maintain,
+    date: time::Date,
     repos: &[String],
     review: &[&Pull],
     more: usize,
@@ -297,10 +299,11 @@ fn brief(
          item. Your only output is one new comment on {digest_repo}#{digest_issue}. Never mention embargoed \
          or otherwise undisclosed security work: leave out entirely, without saying why, a pull request that \
          appears to fix a vulnerability that is not public.\n\n\
-         Sort each pull request into one group: approve-as-group (small, correct and ready, so that {operator} \
-         can approve the group together); closer-look (with the concern, the file and lines, and the minutes it \
-         needs); waiting-on-author (with a reply to the author drafted for {operator}, which is never sent); or \
-         stale (no activity for weeks, or superseded).\n\n\
+         Sort each pull request into exactly one group: approve (to approve as a group: only a small, \
+         low-risk change whose checks all passed at the head listed below, with a reason that says so; \
+         anything else belongs in another group); closer (with the concern, links to the files and lines \
+         at that head, and the minutes it needs); waiting (on the author, with a reply drafted for \
+         {operator}, which is never sent); or stale (no activity for weeks, or superseded, with the reason).\n\n\
          Review these pull requests, whose heads changed since the last digest:\n",
         operator = config.operator,
         repos = repos.join(", "),
@@ -308,7 +311,10 @@ fn brief(
         digest_issue = digest.issue,
     );
     for pull in review {
-        brief.push_str(&format!("- {} (head {})\n", pull.url, pull.head));
+        brief.push_str(&format!(
+            "- {} ({}, head {})\n",
+            pull.url, pull.key, pull.sha
+        ));
     }
     if more > 0 {
         brief.push_str(&format!(
@@ -316,14 +322,47 @@ fn brief(
         ));
     }
     brief.push_str(&format!(
-        "\nThe comment is a markdown summary, the groups in that order, each pull request linked with its \
-         minutes, then one fenced block whose info string is `{DIGEST_FENCE}`, holding one JSON object: \
-         {{\"schema\": \"{DIGEST_SCHEMA}\", \"prs\": [{{\"pr\": \"OWNER/REPO#N\", \
-         \"group\": \"approve-as-group\", \"summary\": \"...\", \"concern\": \"...\", \"file\": \"...\", \
-         \"lines\": \"...\", \"minutes\": 5, \"reply\": \"...\"}}]}}, one entry for each pull request \
-         reviewed, leaving out the fields that do not apply to its group.\n"
+        "\nThe comment is a markdown summary, the groups in that order, each pull request linked, then one \
+         fenced block whose info string is `{DIGEST_FENCE}`, holding one JSON object, as in this example of \
+         made-up pull requests:\n\n```{DIGEST_FENCE}\n{example:#}\n```\n\n\
+         `date` is {date}. Each pull request reviewed is in one list, a list with none is `[]`, and no \
+         other field is read. `pr` is OWNER/REPO#N. `head`, in approve and closer, is the full head listed \
+         above, copied exactly: {operator} approves at it, and the links open the files there. `minutes` is \
+         1 to 480. A link's `path` is relative to the repository root, and `start` and the optional `end` \
+         are line numbers from 1.\n",
+        example = example(date),
+        operator = config.operator,
     ));
     brief
+}
+
+/// The digest of made-up pull requests the brief shows for the day `date`:
+/// the schema review's Maintain view reads (cgwalters-forge/review#186),
+/// with each of its four groups.
+fn example(date: time::Date) -> Value {
+    let head = |digit: char| digit.to_string().repeat(40);
+    json!({
+        "schema": DIGEST_SCHEMA,
+        "date": date.to_string(),
+        "approve": [
+            {"pr": "up/proj#7", "head": head('1'),
+             "reason": "Dependency bump, lockfile only; all checks green at this head."},
+            {"pr": "up/proj#8", "head": head('2'),
+             "reason": "Typo fix in docs; all checks green at this head."},
+        ],
+        "closer": [
+            {"pr": "up/proj#9", "head": head('3'), "concern": "Changes the lock order.",
+             "minutes": 40, "links": [{"path": "src/lock.rs", "start": 12, "end": 30}]},
+            {"pr": "other/lib#2", "head": head('4'), "concern": "New public API.",
+             "minutes": 25, "links": [{"path": "src/lib.rs", "start": 5}]},
+        ],
+        "waiting": [
+            {"pr": "up/proj#10", "reply": "Thanks! Could you rebase on main and add a test?"},
+        ],
+        "stale": [
+            {"pr": "up/proj#3", "reason": "No activity in 90 days."},
+        ],
+    })
 }
 
 impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
@@ -464,7 +503,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 let plan = json!({
                     "schema": JOB_PLAN_SCHEMA, "repo": on.0, "item": on.1,
                     "kind": DIGEST_KIND, "runner": TRIAGE_RUNNER, "pool": pool,
-                    "brief": brief(config, maintain, &repos, review, more),
+                    "brief": brief(config, maintain, from.date(), &repos, review, more),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
                 self.line(format!(
@@ -669,10 +708,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
                     "{repo}#{number} has no head commit"
                 );
+                let sha = sha.to_ascii_lowercase();
                 pulls.push(Pull {
                     key: format!("{repo}#{number}"),
                     url: format!("https://github.com/{repo}/pull/{number}"),
-                    head: sha[..HEAD_CHARS].to_ascii_lowercase(),
+                    head: sha[..HEAD_CHARS].to_owned(),
+                    sha,
                 });
             }
             ensure!(
