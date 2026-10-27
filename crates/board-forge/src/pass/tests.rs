@@ -2690,23 +2690,83 @@ fn head(start: &str) -> String {
     format!("{start:0<40}")
 }
 
-/// A digest comment on the digest issue: by `author`, edited by `editor`,
-/// `hours` before the recording's clock, recording `heads`.
-fn digest(id: u64, (author, editor): (&str, Option<&str>), hours: i64, heads: Value) -> Value {
-    let block = json!({"schema": maintain::DIGEST_SCHEMA, "heads": heads, "prs": []});
-    let created = at("2026-10-23T15:15:10Z") - time::Duration::hours(hours);
-    let created = created.format(&Rfc3339).unwrap();
-    json!({"url": format!("{DIGEST}#issuecomment-{id}"),
-        "body": format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE),
-        "createdAt": created, "lastEditedAt": editor.map(|_| created.clone()),
-        "author": {"login": author}, "editor": editor.map(|login| json!({"login": login}))})
+/// The bot's comment `id` on the digest issue: the pass's recorded plan
+/// for the day from `from`, recording `heads`, where `from` is some, or else
+/// a digest whose block records `heads`, as a run could write one.
+fn on_digest(id: u64, from: Option<&str>, heads: Value) -> Value {
+    let body = match from {
+        Some(from) => {
+            let block = json!({"schema": maintain::PLAN_SCHEMA, "from": from, "heads": heads});
+            let fence = maintain::PLAN_BLOCK;
+            format!(
+                "{}\nPlan.\n\n```{fence}\n{block}\n```\n",
+                maintain::PLAN_MARKER
+            )
+        }
+        None => {
+            let block = json!({"schema": maintain::DIGEST_SCHEMA, "heads": heads, "prs": []});
+            format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE)
+        }
+    };
+    json!({"url": format!("{DIGEST}#issuecomment-{id}"), "body": body,
+        "createdAt": "2026-10-01T00:00:00Z", "lastEditedAt": null,
+        "author": {"login": "cgwalters-bot"}, "editor": null})
 }
 
-/// The recording with `maintain` on (repository `up/a`, due from `hour`
-/// UTC, a share of 0.2), its digest issue holding `comments`, `up/a`'s open
-/// pull requests #1 and #2 at heads `aa…` and `bb…` and the operator's #3,
-/// and claude having used `used` percent of its 54.3% allowance.
-fn maintained(hour: u8, comments: Vec<Value>, used: f64) -> (Config, Replay) {
+/// `comment` edited by `editor`, or by an account GitHub does not name.
+fn edited_by(mut comment: Value, editor: Option<&str>) -> Value {
+    comment["lastEditedAt"] = json!("2026-10-23T09:30:00Z");
+    comment["editor"] = editor.map_or(Value::Null, |login| json!({"login": login}));
+    comment
+}
+
+/// The address of the search for the operator's pull requests by
+/// `qualifier`, updated in the 90 days before the recording's clock.
+fn operator_search(qualifier: &str) -> String {
+    let query = format!("is:pr is:public {qualifier}:cgwalters updated:>=2026-07-25");
+    let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    format!("{API_ROOT}search/issues?q={query}&sort=updated&order=desc&per_page=100&page=1")
+}
+
+/// The repositories the searches find, with how many of the operator's pull
+/// requests each: up/a 3 (#2 found by both), up/c 3, up/b 2, low/d 1, and
+/// 2 each in the operator's own account and the forge organization.
+const SEARCHED: &[(&str, &[(&str, u64)])] = &[
+    (
+        "author",
+        &[
+            ("up/a", 1),
+            ("up/a", 2),
+            ("up/b", 1),
+            ("cgwalters-forge/x", 1),
+            ("cgwalters-forge/x", 2),
+            ("cgwalters/y", 1),
+            ("cgwalters/y", 2),
+        ],
+    ),
+    (
+        "reviewed-by",
+        &[
+            ("up/a", 2),
+            ("up/a", 3),
+            ("up/b", 2),
+            ("up/c", 1),
+            ("up/c", 2),
+            ("up/c", 3),
+            ("low/d", 1),
+        ],
+    ),
+];
+
+/// The repositories the open pull requests are listed of: `up/a`'s are #1
+/// and #2 at heads `aa…` and `bb…` and the operator's #3; the others have none.
+const LISTED: &[&str] = &["up/a", "up/b", "up/c", "inc/z"];
+
+/// The recording with `maintain` on (repositories derived as `repos` says
+/// from [`SEARCHED`] and [`LISTED`], due from `hour` UTC, a share of 0.2),
+/// its digest issue holding `comments`, and claude having used `used`
+/// percent of its 54.3% allowance.
+fn maintained_with(hour: u8, comments: Vec<Value>, used: f64, repos: Value) -> (Config, Replay) {
     let mut replay = without_epics(replay());
     only(&mut replay, FIRST);
     let variables =
@@ -2716,22 +2776,120 @@ fn maintained(hour: u8, comments: Vec<Value>, used: f64) -> (Config, Replay) {
         "answer": {"data": {"repository": {"issue": {"comments": {"nodes": comments,
             "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}},
     }));
+    let mut get = |url: String, body: Value| {
+        replay.requests.push(json!({
+            "request": {"get": url},
+            "answer": {"status": 200, "link": null, "body": body},
+        }));
+    };
+    for (qualifier, found) in SEARCHED {
+        let items: Vec<Value> = (found.iter())
+            .map(|(repo, number)| json!({"number": number, "repository_url": format!("{API_ROOT}repos/{repo}")}))
+            .collect();
+        get(operator_search(qualifier), json!({"items": items}));
+    }
     let pull = |number: u64, login: &str, sha: &str| json!({"number": number, "user": {"login": login}, "head": {"sha": head(sha)}});
-    let pulls = [
-        pull(1, "visitor", "aa"),
-        pull(2, "contributor", "bb"),
-        pull(3, "cgwalters", "cc"),
-    ];
-    replay.requests.push(json!({
-        "request": {"get": format!("{API_ROOT}repos/up/a/pulls?state=open&per_page=100")},
-        "answer": {"status": 200, "link": null, "body": pulls},
-    }));
+    for repo in LISTED {
+        let pulls = match *repo {
+            "up/a" => json!([
+                pull(1, "visitor", "aa"),
+                pull(2, "contributor", "bb"),
+                pull(3, "cgwalters", "cc"),
+            ]),
+            _ => json!([]),
+        };
+        get(
+            format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100"),
+            pulls,
+        );
+    }
     let mut snapshot = usage(&mut replay);
     snapshot["pools"]["claude"]["used_percent"] = used.into();
     set_usage(&mut replay, &snapshot);
-    let section = json!({"repos": ["up/a"], "share": 0.2, "hourUtc": hour,
+    let section = json!({"repos": repos, "share": 0.2, "hourUtc": hour,
         "digest": {"repository": "cgwalters-forge/bot-ops", "issue": 9}});
     (config(json!({"maintain": section})), replay)
+}
+
+/// [`maintained_with`] up/a alone: at least 3 pull requests, up/c left out.
+fn maintained(hour: u8, comments: Vec<Value>, used: f64) -> (Config, Replay) {
+    let repos = json!({"sinceDays": 90, "min": 3, "max": 2, "exclude": ["up/c"]});
+    maintained_with(hour, comments, used, repos)
+}
+
+/// The repositories are those with at least `min` of the operator's pull
+/// requests, never in the operator's, the bot's or the forge's own
+/// organizations, `include` first, `exclude` left out, the `max` most
+/// active kept, ties by name.
+#[test]
+fn maintain_derives_its_repositories() {
+    let cases = [
+        (json!({}), "up/a, up/c, up/b"),
+        (json!({"min": 3}), "up/a, up/c"),
+        (json!({"max": 1}), "up/a"),
+        (json!({"min": 1, "max": 20}), "up/a, up/c, up/b, low/d"),
+        (json!({"include": ["inc/z"], "max": 2}), "inc/z, up/a"),
+        (json!({"exclude": ["UP/A"]}), "up/c, up/b"),
+    ];
+    for (edit, expected) in cases {
+        let mut repos = json!({"sinceDays": 90, "min": 2, "max": 3});
+        repos
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        let (config, mut replay) = maintained_with(9, vec![], 40.0, repos);
+        let low = format!("{API_ROOT}repos/low/d/pulls?state=open&per_page=100");
+        replay.requests.push(json!({"request": {"get": low},
+            "answer": {"status": 200, "link": null, "body": []}}));
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 0, "{edit}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        assert_eq!(
+            lines[0],
+            format!("maintain: repositories: {expected}"),
+            "{edit}"
+        );
+        let day = report.maintain.unwrap();
+        assert_eq!(day.repos.join(", "), expected, "{edit}");
+    }
+}
+
+/// A search GitHub says is incomplete, or one that reaches its 1,000
+/// results, is an error, not a ranking the day settles on.
+#[test]
+fn maintain_refuses_a_partial_search() {
+    let cases = [
+        (
+            "incomplete",
+            1,
+            "maintain error: searching the operator's pull requests (author): GitHub's results are incomplete",
+        ),
+        (
+            "capped",
+            10,
+            "maintain error: searching the operator's pull requests (author): reaches GitHub's 1000 results; \
+             lower maintain repos sinceDays",
+        ),
+    ];
+    for (name, pages, expected) in cases {
+        let (config, mut replay) = maintained(9, vec![], 40.0);
+        let first = operator_search("author");
+        let item = json!({"number": 1, "repository_url": format!("{API_ROOT}repos/up/a")});
+        let body = match pages {
+            1 => json!({"incomplete_results": true, "items": []}),
+            _ => json!({"incomplete_results": false, "items": vec![item; 100]}),
+        };
+        answer(&mut replay, &first)["body"] = body.clone();
+        for page in 2..=pages {
+            let url = first.replace("&page=1", &format!("&page={page}"));
+            replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 1, "{name}: {:#?}", report.lines);
+        assert_eq!(maintain_lines(&report), [expected], "{name}");
+        assert_eq!(report.maintain, None, "{name}");
+    }
 }
 
 /// Its lines that start with `maintain`.
@@ -2740,18 +2898,39 @@ fn maintain_lines(report: &Report) -> Vec<&str> {
     lines.filter(|l| l.starts_with("maintain")).collect()
 }
 
+/// The start of the recording's day's due time, and of the next day's.
+const TODAY: &str = "2026-10-23T09:00:00Z";
+const NEXT: &str = "2026-10-24T09:00:00Z";
+
+/// A locally retained creation receipt, not a marker discovered on GitHub.
+fn maintain_receipt() -> State {
+    State {
+        maintain: Some(maintain::Day {
+            from: "2026-10-22T09:00:00Z".into(),
+            repos: vec![],
+            done: false,
+            configuration: None,
+            comment: Some(format!("{DIGEST}#issuecomment-5")),
+        }),
+        ..State::default()
+    }
+}
+
 /// A day's digest is due once, from `hourUtc`, for the pull requests whose
-/// head changed since the last digest, the operator's and the bot's left
-/// out. Only the bot's digest, edited by nobody else, counts.
+/// head changed since the pass last recorded a plan, the operator's and the
+/// bot's left out. Only the pass's own plan comment, with its locally kept
+/// creation receipt, is read, and only while nobody else edited it: heads a run
+/// or a collaborator wrote, in a digest, a later comment like the pass's or
+/// an edit of it, are not.
 #[test]
 fn maintain_is_due_once_a_day_for_changed_heads() {
     let both = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
     let one = json!({"up/a#1": "aa0000000000", "up/a#2": "b10000000000"});
-    let bot = ("cgwalters-bot", None);
-    let today = format!(
-        "maintain: today's digest is {DIGEST}#issuecomment-5; the next is due from 2026-10-24T09:00:00Z"
+    let yesterday = Some("2026-10-22T09:00:00Z");
+    let all_due = "maintain: digest due: 2 of 2 incoming pull request(s) changed since no plan; reviews up/a#1, up/a#2";
+    let one_due = format!(
+        "maintain: digest due: 1 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5; reviews up/a#2"
     );
-    let all_due = "maintain: digest due: 2 of 2 incoming pull request(s) changed since no digest; reviews up/a#1, up/a#2";
     let cases = [
         (
             "before the hour",
@@ -2759,26 +2938,19 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
             vec![],
             "maintain: not due until 2026-10-23T16:00:00Z".to_owned(),
         ),
-        ("no digest yet", 9, vec![], all_due.to_owned()),
+        ("no plan yet", 9, vec![], all_due.to_owned()),
         (
-            "posted today",
+            "recorded today",
             9,
-            vec![digest(5, bot, 2, both.clone())],
-            today.clone(),
-        ),
-        (
-            "the newest posted today",
-            9,
-            vec![
-                digest(4, bot, 30, json!({})),
-                digest(5, bot, 2, both.clone()),
-            ],
-            today,
+            vec![on_digest(5, Some(TODAY), both.clone())],
+            format!(
+                "maintain: today's plan is {DIGEST}#issuecomment-5; the next is due from {NEXT}"
+            ),
         ),
         (
             "unchanged since yesterday's",
             9,
-            vec![digest(5, bot, 24, both.clone())],
+            vec![on_digest(5, yesterday, both.clone())],
             format!(
                 "maintain: none of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5"
             ),
@@ -2786,49 +2958,127 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
         (
             "one head changed",
             9,
-            vec![digest(5, bot, 24, one)],
+            vec![on_digest(5, yesterday, one.clone())],
+            one_due.clone(),
+        ),
+        (
+            "a run's digest records heads",
+            9,
+            vec![on_digest(5, None, both.clone())],
+            all_due.to_owned(),
+        ),
+        (
+            "a run's later comment like the pass's",
+            9,
+            vec![
+                on_digest(5, yesterday, one),
+                on_digest(6, Some(TODAY), both.clone()),
+            ],
+            one_due,
+        ),
+        (
+            "another account's comment like the pass's",
+            9,
+            vec![{
+                let mut comment = on_digest(5, Some(TODAY), both.clone());
+                comment["author"] = json!({"login": "collaborator"});
+                comment
+            }],
+            all_due.to_owned(),
+        ),
+        (
+            "the bot's edit",
+            9,
+            vec![edited_by(
+                on_digest(5, yesterday, both.clone()),
+                Some("cgwalters-bot"),
+            )],
             format!(
-                "maintain: digest due: 1 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5; reviews up/a#2"
+                "maintain: none of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5"
             ),
         ),
         (
-            "a visitor's digest",
+            "another account's edit",
             9,
-            vec![digest(5, ("visitor", None), 2, both.clone())],
-            all_due.to_owned(),
+            vec![edited_by(
+                on_digest(5, Some(TODAY), both.clone()),
+                Some("collaborator"),
+            )],
+            format!(
+                "maintain: digest due: 2 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5, whose heads are unreadable: it was last edited by collaborator, not the bot; reviews up/a#1, up/a#2"
+            ),
         ),
         (
-            "the bot's, edited by a visitor",
+            "an unnamed account's edit",
             9,
-            vec![digest(5, ("cgwalters-bot", Some("visitor")), 2, both)],
-            all_due.to_owned(),
+            vec![edited_by(on_digest(5, yesterday, both.clone()), None)],
+            format!(
+                "maintain: digest due: 2 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5, whose heads are unreadable: it was last edited by an unknown account, not the bot; reviews up/a#1, up/a#2"
+            ),
+        ),
+        (
+            "unreadable",
+            9,
+            vec![on_digest(5, yesterday, json!(["aa"]))],
+            format!(
+                "maintain: digest due: 2 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5, whose heads are unreadable: it has no heads; reviews up/a#1, up/a#2"
+            ),
         ),
     ];
     for (name, hour, comments, expected) in cases {
         let (config, replay) = maintained(hour, comments, 40.0);
-        let report = preview(&config, &replay);
+        let state = if hour == 9 {
+            maintain_receipt()
+        } else {
+            State::default()
+        };
+        let report = block(run(
+            &replay,
+            &replay,
+            &config,
+            state,
+            (Mode::Preview, Limits::default()),
+            replay.now,
+        ))
+        .unwrap();
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         let lines = maintain_lines(&report);
-        assert_eq!(lines[0], expected, "{name}");
-        let planned = lines.len() == 2;
+        let due = hour == 9;
+        if due {
+            assert_eq!(lines[0], "maintain: repositories: up/a", "{name}");
+        }
+        assert_eq!(lines[usize::from(due)], expected, "{name}");
+        let planned = lines.len() == 4;
         assert_eq!(
             planned,
             expected.contains("digest due"),
             "{name}: {lines:#?}"
+        );
+        // A preview records no plan: the day is not done.
+        let done = !planned && due;
+        assert_eq!(
+            report.maintain.map(|d| d.done),
+            due.then_some(done),
+            "{name}"
         );
     }
 }
 
 /// The plan names the digest issue as its item, asks for a run that hands
 /// back a comment, forbids any write to the pull requests' repositories and
-/// any mention of embargoed work, and carries the heads the digest records.
+/// any mention of embargoed work, and leaves the heads out: the pass
+/// records them itself.
 #[test]
 fn maintain_plans_a_read_only_digest() {
     let (config, replay) = maintained(9, vec![], 40.0);
     let report = preview(&config, &replay);
     let lines = maintain_lines(&report);
+    assert_eq!(
+        lines[3],
+        "maintain: record the plan on cgwalters-forge/bot-ops#9; a preview records nothing"
+    );
     let prefix = "maintain: plan only; no run kind publishes only the digest: ";
-    let plan: Value = serde_json::from_str(lines[1].strip_prefix(prefix).unwrap()).unwrap();
+    let plan: Value = serde_json::from_str(lines[2].strip_prefix(prefix).unwrap()).unwrap();
     let parsed = plan::JobPlan::from_json(&plan).unwrap();
     assert_eq!(
         (parsed.repo.as_str(), parsed.item, parsed.kind.as_str()),
@@ -2841,33 +3091,324 @@ fn maintain_plans_a_read_only_digest() {
         "Your only output is one new comment on cgwalters-forge/bot-ops#9",
         "Never mention embargoed",
         "- https://github.com/up/a/pull/1 (head aa0000000000)",
-        r#"{"up/a#1":"aa0000000000","up/a#2":"bb0000000000"}"#,
         maintain::DIGEST_SCHEMA,
     ] {
         assert!(parsed.brief.contains(needle), "{needle}: {}", parsed.brief);
     }
-    assert!(!parsed.brief.contains("up/a#3"), "{}", parsed.brief);
-    // Nothing is posted or dispatched, in an applying pass either.
+    for needle in ["up/a#3", "\"up/a#1\"", "heads\""] {
+        assert!(!parsed.brief.contains(needle), "{needle}: {}", parsed.brief);
+    }
+}
+
+/// An applying pass records the plan and the heads it was planned for in
+/// its own comment on the digest issue, and writes nothing else; nothing
+/// is dispatched. Later passes the same day read its state and search, read
+/// and list nothing; one whose state was lost trusts no existing marker.
+/// Before it records a plan, a pass reuses the day's
+/// repositories and does not search again.
+#[test]
+fn maintain_records_its_plan_and_lists_once_a_day() {
+    let (config, _) = maintained(9, vec![], 40.0);
+    let recording = || {
+        let (_, mut replay) = maintained(9, vec![], 40.0);
+        for (url, body) in [
+            ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+            ("user", json!({"login": "cgwalters-bot"})),
+        ] {
+            replay
+                .requests
+                .push(json!({"request": {"get": format!("{API_ROOT}{url}")},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        replay
+    };
     let forge = Forge {
-        replay,
+        replay: recording(),
         ..Forge::new(None, false)
     };
     let report = apply(&forge, &config);
-    assert!(maintain_lines(&report)[1].starts_with(prefix));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = maintain_lines(&report);
+    let recorded = "maintain: recorded the plan in https://github.com/cgwalters-forge/bot-ops/issues/9#issuecomment-";
+    assert!(lines[3].starts_with(recorded), "{lines:#?}");
     let writes = forge.writes.borrow();
-    assert!(
-        !writes
-            .iter()
-            .any(|(_, url, _)| url.contains("bot-ops/issues/9"))
+    let posted: Vec<&Value> = (writes.iter())
+        .filter(|(m, url, _)| m == "POST" && url.ends_with("bot-ops/issues/9/comments"))
+        .map(|(_, _, body)| body)
+        .collect();
+    let [posted] = posted[..] else {
+        panic!("{writes:#?}")
+    };
+    let body = text(posted, "/body");
+    assert!(body.starts_with(maintain::PLAN_MARKER), "{body}");
+    let record = plan::fenced_json(body, maintain::PLAN_BLOCK)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (&record["from"], &record["heads"]),
+        (
+            &json!(TODAY),
+            &json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"})
+        )
     );
+    assert_eq!(record["plan"]["item"], 9);
     assert!(!writes.iter().any(|(_, url, _)| url.contains("up/a")));
+    assert!(!forge.dispatches().iter().any(|d| d.contains("bot-ops")));
+    let day = report.maintain.clone().unwrap();
+    let expected = day.clone();
+    assert_eq!(day.from, TODAY);
+    assert_eq!(day.repos, ["up/a"]);
+    assert!(day.done);
+    assert!(day.configuration.is_some());
+    assert!(
+        day.comment
+            .as_ref()
+            .unwrap()
+            .starts_with(&format!("{DIGEST}#issuecomment-"))
+    );
+    // Kept in the state, though no pull request is followed.
+    let kept = report.state.as_ref().and_then(|s| s.maintain.as_ref());
+    assert_eq!(kept, Some(&expected));
+    let state = State::from_json(&report.state.as_ref().unwrap().to_json()).unwrap();
+    assert_eq!(state.maintain.as_ref(), Some(&expected));
+    // The recording without the requests that contain any of `needles`,
+    // which a pass over it must not make.
+    let without = |needles: &[&str]| {
+        let mut replay = recording();
+        replay.requests.retain(|e| {
+            let request = e["request"].to_string();
+            !needles.iter().any(|n| request.contains(n))
+        });
+        replay
+    };
+    let (search, comments, list) = ("search/issues", r#""name":"bot-ops","number":9"#, "/pulls?");
+    let quiet = without(&[search, comments, list]);
+    let later = |replay: &Replay, state: State| {
+        block(run(
+            replay,
+            replay,
+            &config,
+            state,
+            (Mode::Preview, Limits::default()),
+            replay.now,
+        ))
+        .unwrap()
+    };
+    let report = later(&quiet, state);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        maintain_lines(&report),
+        [format!(
+            "maintain: done for today; the next is due from {NEXT}"
+        )]
+    );
+    // The state lost, it searches and lists again, ignoring even an older
+    // forged marker claiming today's plan and matching heads.
+    let mut lost = recording();
+    answer(&mut lost, comments)["data"]["repository"]["issue"]["comments"]["nodes"] =
+        json!([on_digest(5, Some(TODAY), json!({}))]);
+    let report = later(&lost, State::default());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert!(
+        maintain_lines(&report)[1]
+            .contains("2 of 2 incoming pull request(s) changed since no plan")
+    );
+    // A day not done yet keeps its repositories: no search.
+    let unsearched = without(&[search]);
+    let state = State {
+        maintain: Some(maintain::Day {
+            done: false,
+            ..expected
+        }),
+        ..State::default()
+    };
+    let report = later(&unsearched, state);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = maintain_lines(&report);
+    assert!(
+        lines[0].starts_with("maintain: digest due: 2 of 2"),
+        "{lines:#?}"
+    );
+}
+
+/// Neither an older forged marker at bootstrap nor a surviving forged
+/// marker after deletion/marker removal can supply a day or heads. A receipt
+/// from another digest issue cannot authorize the matching comment ID.
+#[test]
+fn maintain_requires_its_creation_receipt() {
+    let heads = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
+    let forged = on_digest(6, Some(TODAY), heads.clone());
+    let cases = [
+        (
+            "bootstrap",
+            State::default(),
+            vec![on_digest(5, Some(TODAY), heads)],
+        ),
+        ("deleted", maintain_receipt(), vec![forged.clone()]),
+        (
+            "marker removed",
+            maintain_receipt(),
+            vec![on_digest(5, None, json!({})), forged.clone()],
+        ),
+        (
+            "different issue",
+            {
+                let mut state = maintain_receipt();
+                state.maintain.as_mut().unwrap().comment =
+                    Some(format!("{DIGEST}0#issuecomment-6"));
+                state
+            },
+            vec![forged],
+        ),
+    ];
+    for (name, state, comments) in cases {
+        let (config, mut replay) = maintained(9, comments, 40.0);
+        for (url, body) in [
+            ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+            ("user", json!({"login": "cgwalters-bot"})),
+        ] {
+            replay
+                .requests
+                .push(json!({"request": {"get": format!("{API_ROOT}{url}")},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        let forge = Forge {
+            replay,
+            ..Forge::new(None, false)
+        };
+        let report = block(run(
+            &forge,
+            &forge,
+            &config,
+            state,
+            (Mode::Local, Limits::default()),
+            forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert!(
+            maintain_lines(&report)[1]
+                .contains("2 of 2 incoming pull request(s) changed since no plan"),
+            "{name}: {:#?}",
+            report.lines
+        );
+        let writes = forge.writes.borrow();
+        assert!(
+            writes
+                .iter()
+                .any(|(m, url, _)| m == "POST" && url.ends_with("bot-ops/issues/9/comments")),
+            "{name}: {writes:#?}"
+        );
+        assert!(
+            !writes
+                .iter()
+                .any(|(m, url, _)| m == "PATCH" && url.contains("bot-ops/issues/comments/")),
+            "{name}: {writes:#?}"
+        );
+        let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+        assert!(state.maintain.unwrap().done, "{name}");
+    }
+}
+
+/// Even a pending same-day cache must be re-derived with new selection or
+/// digest settings, and a done day cannot bypass this invalidation either.
+#[test]
+fn maintain_invalidates_changed_configuration() {
+    let (config, replay) = maintained(9, vec![], 40.0);
+    let cached = preview(&config, &replay).state.unwrap();
+    let cases = [
+        (json!({"exclude": ["up/a", "up/c"]}), "", false),
+        (json!({"include": ["inc/z"]}), "inc/z, up/a", false),
+        (json!({"max": 1}), "up/a", false),
+        (json!({"min": 2}), "up/a, up/b", false),
+        (json!({"sinceDays": 89}), "up/a", false),
+        (json!({}), "", true),
+    ];
+    for (edit, expected, digest_changed) in cases {
+        let mut repos = json!({"sinceDays": 90, "min": 3, "max": 2, "exclude": ["up/c"]});
+        repos
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        let (mut config, mut replay) = maintained_with(9, vec![], 40.0, repos);
+        if digest_changed {
+            config.maintain.as_mut().unwrap().digest.repository = "up/digest".into();
+        }
+        if edit.get("sinceDays").is_some() {
+            for request in &mut replay.requests {
+                if let Some(url) = request["request"]["get"].as_str() {
+                    request["request"]["get"] = url.replace("2026-07-25", "2026-07-26").into();
+                }
+            }
+        }
+        // An excluded repository must never even be listed.
+        if expected.is_empty() {
+            replay
+                .requests
+                .retain(|e| !e["request"].to_string().contains("/pulls?"));
+        }
+        for done in [false, true] {
+            let mut state = cached.clone();
+            state.maintain.as_mut().unwrap().done = done;
+            let report = block(run(
+                &replay,
+                &replay,
+                &config,
+                state,
+                (Mode::Preview, Limits::default()),
+                replay.now,
+            ))
+            .unwrap();
+            assert_eq!(
+                report.failures, 0,
+                "{edit}, digest={digest_changed}, done={done}: {:#?}",
+                report.lines
+            );
+            assert_eq!(
+                maintain_lines(&report)[0],
+                format!("maintain: repositories: {expected}")
+            );
+            assert_eq!(report.maintain.unwrap().repos.join(", "), expected);
+        }
+    }
+}
+
+/// A pre-due pass and a search failure must preserve the receipt for a later
+/// day, even though neither produces a new daily decision.
+#[test]
+fn maintain_preserves_receipt_without_a_new_day() {
+    for hour in [9, 16] {
+        let (config, mut replay) = maintained(hour, vec![], 40.0);
+        if hour == 9 {
+            answer(&mut replay, &operator_search("author"))["status"] = 503.into();
+        }
+        let state = maintain_receipt();
+        let expected = state.maintain.clone();
+        let report = block(run(
+            &replay,
+            &replay,
+            &config,
+            state,
+            (Mode::Preview, Limits::default()),
+            replay.now,
+        ))
+        .unwrap();
+        assert_eq!(
+            report.failures,
+            usize::from(hour == 9),
+            "{:#?}",
+            report.lines
+        );
+        let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+        assert_eq!(state.maintain, expected);
+    }
 }
 
 /// While a digest is due, the other stages leave its share of each pool's
 /// allowance: claude, allowed 54.3%, holds them past 43.4% used, and stage 4
 /// starts nothing. Maintain may use the share and no more: past the
 /// allowance, which claude's burst would let the others go beyond, it waits
-/// too. A digest posted today leaves the whole allowance to the others.
+/// too. A plan recorded today leaves the whole allowance to the others.
 #[test]
 fn maintain_share_is_left_while_a_digest_is_due() {
     let openai = "openai is held until 2026-10-24T11:15:10Z";
@@ -2877,7 +3418,7 @@ fn maintain_share_is_left_while_a_digest_is_due() {
             "hold pools: claude has used {used}% of the 43.4% that the due maintain digest leaves the other stages; {openai}; new runs wait"
         )
     };
-    let posted = vec![digest(5, ("cgwalters-bot", None), 2, json!({}))];
+    let posted = vec![on_digest(5, Some(TODAY), json!({}))];
     let cases = [
         (
             "well under",
@@ -2899,22 +3440,30 @@ fn maintain_share_is_left_while_a_digest_is_due() {
     for (name, comments, used, pool, expected) in cases {
         let due = comments.is_empty();
         let (config, replay) = maintained(9, comments, used);
-        let report = preview(&config, &replay);
+        let report = block(run(
+            &replay,
+            &replay,
+            &config,
+            maintain_receipt(),
+            (Mode::Preview, Limits::default()),
+            replay.now,
+        ))
+        .unwrap();
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         let lines = maintain_lines(&report);
         match (due, pool) {
             (true, Some(pool)) => assert!(
-                lines[1].contains(&format!(r#""pool":"{pool}""#)),
+                lines[2].contains(&format!(r#""pool":"{pool}""#)),
                 "{name}: {lines:#?}"
             ),
             (true, None) => assert_eq!(
-                lines[1],
+                lines[2],
                 format!(
                     "maintain: no pool: claude has used {used}% of the 54.3% of its allowance, past which maintain does not start; {openai}"
                 ),
                 "{name}"
             ),
-            (false, _) => assert_eq!(lines.len(), 1, "{name}: {lines:#?}"),
+            (false, _) => assert_eq!(lines.len(), 2, "{name}: {lines:#?}"),
         }
         assert!(
             report.lines.contains(&expected),
@@ -3671,7 +4220,8 @@ fn revisit(section: Value) -> Value {
 
 /// A `maintain` section, its keys replaced by `edit`'s.
 fn maintain_section(edit: Value) -> Value {
-    let mut section = json!({"repos": ["up/a", "up/b"], "share": 0.2,
+    let repos = json!({"sinceDays": 90, "min": 5, "max": 15});
+    let mut section = json!({"repos": repos, "share": 0.2,
         "digest": {"repository": "o/ops", "issue": 7}, "hourUtc": 9});
     section
         .as_object_mut()
@@ -3797,15 +4347,41 @@ fn config_table() {
             json!({"maintain": maintain_section(json!({}))}),
             "maintain needs pools",
         ),
+        (maintain(json!({"repos": "up/a"})), "invalid type: string"),
         (
-            maintain(json!({"repos": []})),
-            "maintain repos does not name 1 to 10 repositories",
+            maintain(json!({"repos": {"sinceDays": 90, "min": 5}})),
+            "missing field `max`",
         ),
         (
-            maintain(json!({"repos": ["up/a", "UP/A"]})),
+            maintain(json!({"repos": {"sinceDays": 0, "min": 5, "max": 15}})),
+            "maintain repos sinceDays is not 1 to 365",
+        ),
+        (
+            maintain(json!({"repos": {"sinceDays": 90, "min": 0, "max": 15}})),
+            "maintain repos min is not at least 1",
+        ),
+        (
+            maintain(json!({"repos": {"sinceDays": 90, "min": 5, "max": 21}})),
+            "maintain repos max is not 1 to 20",
+        ),
+        (
+            maintain(json!({"repos": {"sinceDays": 90, "min": 5, "max": 1,
+                "include": ["up/a", "up/b"]}})),
+            "maintain repos include names more than max repositories",
+        ),
+        (
+            maintain(json!({"repos": {"sinceDays": 90, "min": 5, "max": 15,
+                "include": ["up/a"], "exclude": ["UP/A"]}})),
             "maintain repos names UP/A twice",
         ),
-        (maintain(json!({"repos": ["up"]})), "invalid repository"),
+        (
+            maintain(json!({"repos": {"sinceDays": 90, "min": 5, "max": 15, "exclude": ["up"]}})),
+            "invalid repository",
+        ),
+        (
+            maintain(json!({"repos": {"sinceDays": 90, "min": 5, "max": 15, "other": 1}})),
+            "unknown field `other`",
+        ),
         (
             maintain(json!({"share": 0})),
             "maintain share is not above 0 and below 1",
@@ -3819,8 +4395,9 @@ fn config_table() {
             "maintain hourUtc is not 0 to 23",
         ),
         (
-            maintain(json!({"digest": {"repository": "up/a", "issue": 1}})),
-            "maintain digest repository is one of maintain repos",
+            maintain(json!({"digest": {"repository": "up/a", "issue": 1},
+                "repos": {"sinceDays": 90, "min": 5, "max": 15, "include": ["UP/A"]}})),
+            "maintain digest repository is in maintain repos include",
         ),
         (
             maintain(json!({"digest": {"repository": "o/ops", "issue": 0}})),

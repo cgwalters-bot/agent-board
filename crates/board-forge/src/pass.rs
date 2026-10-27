@@ -6,8 +6,8 @@
 //! Built so far: the configuration, stage 1 (the usage refresh, in
 //! [`usage`]), stage 2 (pull request follow-up), stage 3 (epic apply,
 //! recovery and planning, in [`epics`]), stage 4 (scheduling) and stage 5
-//! (board Status, in [`status`]), and the maintain digest's plan, not yet
-//! its run ([`maintain`]).
+//! (board Status, in [`status`]), and the maintain digest's plan, recorded
+//! but not yet run ([`maintain`]).
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -1455,6 +1455,8 @@ pub struct Report {
     /// The WIP limit and count and the pass's summary, published with
     /// the holds.
     pub tally: (Wip, PassSummary),
+    /// What the maintain stage decided today, kept in `state`.
+    pub maintain: Option<maintain::Day>,
 }
 
 impl Report {
@@ -1603,9 +1605,19 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     scheduler.refresh();
     // The maintain digest, planned while it is due, which the later stages
     // leave its share for.
-    scheduler.maintain();
+    let mut state = state;
+    if state.interval_seconds == 0 {
+        state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
+    }
+    scheduler.maintain(state.maintain.take());
+    // Without stage 2's state, the incoming one keeps the maintain stage's.
+    let kept = scheduler.report.maintain.is_some().then(|| state.clone());
     // Stage 2: pull request follow-up, today's poll.
     let mut earlier = scheduler.follow(state, &git_ref);
+    if let Some(day) = scheduler.report.maintain.clone() {
+        let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
+        state.maintain = Some(day);
+    }
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
     // starts take their slots before stage 4's.
     earlier += scheduler.epics(earlier, &git_ref);

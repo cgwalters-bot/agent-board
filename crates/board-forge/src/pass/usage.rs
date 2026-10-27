@@ -566,9 +566,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// Write `body` to the bot's `name` comment on issue `on` (repository
     /// and number), `comment`, or a new one, only on a private repository:
     /// the usage snapshot says what the subscriptions are used for, and
-    /// when, and the hold snapshot what the board's private issues wait on.
-    /// Its URL.
-    fn publish(
+    /// when, the hold snapshot what the board's private issues wait on, and
+    /// the maintain plan what the digest reviews. Its URL.
+    pub(in crate::pass) fn publish(
         &self,
         on: (&str, u64),
         comment: Option<&Value>,
