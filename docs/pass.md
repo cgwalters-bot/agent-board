@@ -15,7 +15,9 @@ authority for their operations. The differences below are intentional.
 The pass implements the configuration below and stages 1 to 5, except
 that there is no infrastructure rerun, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
-The [maintain](#maintain) digest is planned and recorded but not dispatched.
+The [maintain](#maintain) digest is dispatched only with `maintain.caller`,
+a workflow in the private digest repository; deployments leave it unset until
+that caller is installed and approved, and the digest is then only planned.
 
 Stage 1 reads `usage.url`, the broker's `/usage`, without the forge token or
 an environment proxy (plain HTTP is allowed for a broker on a private network
@@ -646,35 +648,48 @@ is due, and plans its run:
    repository, or it is in `repos.exclude`. `repos.include` comes first,
    then the rest by count, most first and ties by name, up to `repos.max` in
    all.
-2. The pass then reads its own plan comment on the digest issue: the URL
+2. The pass then reads its own record comment on the digest issue: the URL
    retained in the local poll cache from its successful creation, with bot
    authorship and the `<!-- agent-board-maintain-plan v1 -->` marker (below).
    It reads no other. Without that creation receipt, or if the comment is
    missing or has lost its marker, it trusts no heads and creates a new
-   comment when recording the next plan. A run
+   comment when recording the next dispatch. A run
    can only add comments, and the bot posts the run's digest, so heads a
    prompt injection wrote in a run's comment, digest or not, are never read.
    It is read through GraphQL, which names its last editor: edited by
    anyone but the bot, or by an account GitHub cannot name, it records
    neither a day nor heads, as whoever may edit comments on the issue could
    otherwise keep pull requests out of review, and the pass's next record
-   replaces it. A plan recorded for today ends the day (`maintain: today's plan is URL;
-   the next is due from T`).
-3. Otherwise it lists the open pull requests of each repository, one REST
+   replaces it. A record of today's dispatch ends the day (`maintain: today's
+   digest was dispatched, URL; the next is due from T`), as does, with
+   `caller`, a writer's dispatch record on the digest issue since `hourUtc`
+   that the record does not name (`maintain: URL recorded a dispatch today
+   that the pass's record does not name; …`): the cache, and with it the
+   receipt, was lost after a dispatch. A run could post such a comment too;
+   it only holds the day, and every head stays due. Both end the day before
+   anything is searched or listed.
+3. With `caller`, before listing anything, the digest waits (`maintain: WHY;
+   the digest waits`) while another pass is in progress, `--max-dispatch` or
+   `--max-writes` holds it, a run of the caller's workflow is in flight
+   (perhaps one whose record was lost), or the dispatch caller's runs in
+   flight take every `wip` slot, so with `wip` 0 it never starts. A wait
+   does not end the day.
+4. Otherwise it lists the open pull requests of each repository, one REST
    request each, with no inference. Those the operator or the bot opened are
    left out. A repository with more than 100 open pull requests, or more than
    200 incoming in all, is not read whole and fails the stage
    (`maintain error: …`, a failure); nothing is planned and nothing reserved.
-4. A pull request is due a review when its head commit's first 12 hex
-   characters differ from those the plan comment's `heads` records for it,
-   or it records none; a plan comment whose block cannot be read records
-   none, and its line says why. With none changed, the day is done
+5. A pull request is due a review when its head commit's first 12 hex
+   characters differ from those the record's `heads` holds for it, which
+   only a digest that assessed it there sets (below), or it holds none; a
+   record whose block cannot be read holds none, and its line says why.
+   With none changed, the day is done
    (`maintain: none of N incoming pull request(s) changed since URL`).
    Otherwise the line is `maintain: digest due: C of N incoming pull
    request(s) changed since URL; reviews OWNER/REPO#N, …`, the first 20 in
    the order of the repositories and then by number; the rest wait for the
    next day.
-5. Its run's job plan is a `research` plan on the digest issue, on a pool
+6. Its run's job plan is a `research` plan on the digest issue, on a pool
    drawn as [scheduling](#scheduling) draws one, but held where it has used
    more than its allowance (`allowed_percent`), so that it uses no burst.
    Its brief, which the pass generates, asks for one new comment on the
@@ -688,72 +703,126 @@ is due, and plans its run:
    all passed at that head, with a reason that says so), closer (the
    concern, file and line links at that head, and minutes), waiting (a reply
    drafted, never sent) or stale (with the reason).
-6. An applying pass records the plan in its plan comment, editing it, or
-   adding it on the first day, as one write within `--max-writes`, and only
-   on a private repository (`maintain: recorded the plan in URL`). With it
-   go the heads it was planned for, from the pass's own listing: the
-   unchanged pull requests' and the reviewed ones', not those left waiting.
-   That ends the day. A preview records nothing (`maintain: record the plan
-   on OWNER/REPO#N; a preview records nothing`).
-7. Until the day ends, every later stage's pool choice, stage 2's fix
+7. Without `caller` the stage prints the plan, brief included, as
+   `maintain: plan only; maintain caller is not set: PLAN`, writes and
+   dispatches nothing, and an applying pass ends the day. With it, an
+   applying pass starts the run (`maintain: start the digest on
+   OWNER/REPO#N in OWNER/REPO WORKFLOW pool=POOL plan=ID record=URL
+   run=URL`): after checking that the digest repository is private, it
+   posts the plan on the digest issue as the bot, then writes the record
+   with that plan pending and the full heads the brief lists, the one write
+   counted within `--max-writes` (the plan and its dispatch record are the
+   plan protocol's, uncounted as stage 4's are), then dispatches the plan to
+   the caller through the [plan protocol](job-plans.md), whose dispatch
+   record on the digest issue keeps it from starting twice and names the
+   run. That takes a slot, within `wip` and `--max-dispatch` (the dispatch
+   counts once sent). A start ends the day once begun, so a failure part way
+   posts no second plan. A failed or ambiguous dispatch is recorded as the
+   protocol records one and never tried again; its pull requests stay due. A
+   preview writes and dispatches nothing (`…; a preview writes and
+   dispatches nothing: PLAN`).
+8. Until the day ends, every later stage's pool choice, stage 2's fix
    rounds included, reads a copy of the usage snapshot in which a pool that
    has used more than `1 − share` of its allowance is held, where its entry
    gives both figures and does not hold already (`claude has used
    45% of the 43.4% that the due maintain digest leaves the other stages`).
    So the other stages leave the share unused, and maintain, which stops at
-   the allowance, uses no more than it. The pass cannot meter one stage's
-   use apart from another's, so this bounds where maintain starts, not what
-   its run then spends; it starts once a day. The published snapshot is not
-   changed.
+   the allowance, uses no more than it. This is a reservation at start
+   time, not metering: the pass cannot meter one stage's use apart from
+   another's, so it bounds where maintain starts, not what its run then
+   spends. Once the run starts the day ends and the share is released,
+   though the run may go on spending; it starts at most once a day. The
+   published snapshot is not changed.
+
+### A dispatched digest
+
+While the poll cache says a dispatch is pending, every pass reads the digest
+issue first, the day done or not. A pass that reads the record on a day not
+done and finds a dispatch pending, as after a pass cut short before it saved
+the cache, does the same: the record decides. Either settles it:
+
+- The plan's first dispatch record by a writer names the run; a later one,
+  which a run could post, does not count. The digest is the first comment
+  after that record that only the bot wrote, whose block is
+  `agent-board/maintain-digest/v1` for the pending dispatch's day. Its
+  entries acknowledge only the pull requests the brief listed, matched by
+  `pr`, and in `approve` and `closer` only at the full head listed; an entry
+  in `waiting` or `stale` names no head and counts at the listed one. Any
+  other pull request, and any field such as a run's own `heads` map, is
+  never read. The record then keeps the first 12 characters of each
+  acknowledged head, drops the pending dispatch, and leaves the rest due:
+  `maintain: the digest URL assessed A of P pull request(s); due again:
+  OWNER/REPO#N, …`. A pull request whose head moved after it was listed is
+  due again at its new head.
+- With no digest, a named run still in flight (or not yet ended by the
+  stuck-run check) is awaited and holds its slot, and nothing else of the
+  stage runs (`maintain: awaiting the digest: its run URL is STATUS`). A
+  run that ended without one, or that GitHub no longer has, releases the
+  dispatch (`maintain: no digest: its run URL ended without one; its P pull
+  request(s) stay due`). A dispatch record that names no run, after a
+  failed, ambiguous or interrupted dispatch, is awaited, holding its slot,
+  until the next day's due time and then released, even where GitHub
+  refused the dispatch outright; a plan with no dispatch record, cut short
+  before its dispatch, is released at once. A released dispatch is never sent again: its pull
+  requests are due in the next day's digest.
+- Settling is one write of the record, within `--max-writes`; a preview
+  says what it would record and writes nothing. A record that cannot be
+  read, or a lost receipt, leaves nothing to settle: every head it would
+  have acknowledged stays due.
 
 The day's repositories, and whether the day is done, are kept in the poll
 cache, `state`, which an applying pass writes, with `follow` set or not. A later
 pass the same day with the same maintain configuration, operator, bot and
 dispatch repository reuses the repositories without searching, and once the
-day is done neither reads the digest issue nor lists anything (`maintain:
-done for today; the next is due from T`). Configuration changes invalidate
-the day's cache. The plan comment's creation receipt survives across days
-and configuration changes, but is never used for a different digest issue.
-Losing the cache loses that receipt too: the next pass searches and lists
-again without trusting an existing comment's heads or day.
+day is done neither searches nor lists anything (`maintain: done for today;
+the next is due from T`); it reads the digest issue only while a dispatch is
+pending. Configuration changes invalidate the day's cache. The record's
+creation receipt survives across days and configuration changes, but is
+never used for a different digest issue. Losing the cache loses that receipt
+and the pending flag too: the next pass trusts no existing comment's heads,
+day or pending dispatch, so every head is due again, and a dispatch it can
+no longer name is kept from starting twice only by its dispatch record
+(above) and the caller's runs in flight.
 
-**Not built: the digest is planned, never dispatched.** The stage prints its
-plan, brief included, as `maintain: plan only; no run kind publishes only the
-digest: PLAN`, in a preview and an applying pass alike, and records it, but
-dispatches nothing. So in an applying pass the recorded heads count as
-reviewed though no run reviewed them.
-No existing run kind can publish one comment to the digest issue and nothing
-else. The caller's `triage` and `research` runs may each add one comment,
-but on any item of their repository. Their logs, step summary and artifacts,
-which hold the comment's text, are public in the caller's public repository.
-The digest belongs on a private issue, which the caller's bounds therefore
-leave out ([tracker#963](https://github.com/cgwalters-forge/tracker/issues/963)).
-Closing the gap needs a dispatch workflow in the private digest repository,
-whose bounds allow `add_comment` there alone. Until then `maintain` stays
-unset in a deployment. Once a run can publish it, the plan is dispatched
-through the plan protocol like any other, taking a slot within `wip` and
-`--max-dispatch`, when the pass records it.
+**Deployment stays off until the private caller is installed and
+approved.** The caller's public `triage` and `research` runs cannot run the
+digest: they may each add one comment, but on any item of their repository,
+and their logs, step summary and artifacts, which hold the comment's text,
+are public ([tracker#963](https://github.com/cgwalters-forge/tracker/issues/963)).
+`maintain.caller` names a dispatch workflow in the private digest repository
+itself, whose bounds allow `add_comment` on the digest issue alone. The
+configuration is the only place it is named: a plan or an issue cannot route
+the run, and the pass refuses a caller outside the digest repository or in
+`dispatchRepo`. That workflow's deployment contract is agentic-job's; until
+it is installed and approved, a deployment leaves `maintain` unset, or sets
+it without `caller` to see the plan. Tests run it only against a fake forge.
 
-The pass's plan comment starts with its marker, then one fenced block with
-the info string `agent-board-maintain-plan` holding one JSON object,
-`agent-board/maintain-plan/v1`:
+The pass's record comment starts with its marker, then one fenced block
+with the info string `agent-board-maintain-plan` holding one JSON object,
+`agent-board/maintain-plan/v2`:
 
 ```json
-{"schema": "agent-board/maintain-plan/v1", "from": "2026-10-27T09:00:00Z",
- "heads": {"example/up#12": "0123456789ab", "example/up#15": "89abcdef0123"},
- "plan": {"schema": "agent-board/job-plan/v1", "…": "…"}}
+{"schema": "agent-board/maintain-plan/v2", "from": "2026-10-27T09:00:00Z",
+ "heads": {"example/up#12": "0123456789ab"},
+ "pending": {"plan": "6400000001@2026-10-27T09:05:00Z",
+   "heads": {"example/up#15": "89abcdef0123456789abcdef0123456789abcdef"}}}
 ```
 
-`from` is the start of the day it was planned for, from `hourUtc`; `heads`
-maps `OWNER/REPO#N` to the first 12 lowercase hex characters of the pull
-request's head commit when the pass listed it; `plan` is the job plan.
+`from` is the start of the day whose digest the pass last dispatched, from
+`hourUtc`; `heads` maps `OWNER/REPO#N` to the first 12 lowercase hex
+characters of the head commit at which a digest assessed it; `pending`, while
+a dispatch awaits its digest, is the plan's id on the digest issue and the
+full heads its brief listed. A v1 block, whose heads were recorded when a
+plan was rather than when a digest assessed it, is unreadable: its heads are
+due again.
 
 ### The digest
 
 The digest comment is a markdown summary, then one fenced block with the info
 string `agent-board-maintain-digest` holding one JSON object,
-`agent-board/maintain-digest/v1`. The pass does not read it; review's Maintain
-view does ([review#186](https://github.com/cgwalters-forge/review/pull/186),
+`agent-board/maintain-digest/v1`. The pass reads only which pull requests it
+assessed at which head ([above](#a-dispatched-digest)); review's Maintain
+view reads the rest ([review#186](https://github.com/cgwalters-forge/review/pull/186),
 `src/github/maintain.ts`), and this is its schema.
 `fixtures/pass/maintain-digest.md` is the example the brief shows, for
 2026-10-23; in part:
@@ -924,6 +993,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `maintain.share` | The share (0 < share < 1) of each pool's allowance the digest keeps while due; needs `pools`; section absent (off) |
 | `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, private, outside `maintain.repos.include`; required |
 | `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
+| `maintain.caller.repository`, `maintain.caller.workflow`, `maintain.caller.ref` | The workflow that runs the digest, in the digest repository and never `dispatchRepo`, at that ref; needs `state`, and starts only with `wip` above 0; see [maintain](#maintain); unset (the digest is only planned) |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |

@@ -576,16 +576,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         body: String,
     ) -> Result<String> {
         let (repo, issue) = on;
-        let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
-        ensure!(
-            response.status == 200,
-            "reading {repo}: GitHub HTTP status {}",
-            response.status
-        );
-        ensure!(
-            response.body["private"] == true,
-            "{repo} is not private; the {name} snapshot is not written there"
-        );
+        self.private(repo, name)?;
         let body = json!({"body": body});
         let (method, url) = match comment {
             Some(comment) => {
@@ -618,6 +609,22 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             "{method} the {name} comment: GitHub HTTP status {status}"
         );
         Ok(text(&answer, "/html_url").to_owned())
+    }
+
+    /// Refuses `repo` unless GitHub says it is private, before the `name`
+    /// snapshot is written there.
+    pub(in crate::pass) fn private(&self, repo: &str, name: &str) -> Result<()> {
+        let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
+        ensure!(
+            response.status == 200,
+            "reading {repo}: GitHub HTTP status {}",
+            response.status
+        );
+        ensure!(
+            response.body["private"] == true,
+            "{repo} is not private; the {name} snapshot is not written there"
+        );
+        Ok(())
     }
 
     /// Publishes stages 3 and 4's holds where [`Config::holds`] is set: one

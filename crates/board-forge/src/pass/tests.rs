@@ -2690,31 +2690,44 @@ fn head(start: &str) -> String {
     format!("{start:0<40}")
 }
 
-/// The bot's comment `id` on the digest issue: the pass's recorded plan
-/// for the day from `from`, recording `heads`, where `from` is some, or else
-/// a digest whose block records `heads`, as a run could write one.
+/// The bot's comment `id` on the digest issue: the pass's record for the
+/// day from `from`, of the assessed `heads`, where `from` is some, or else a
+/// digest whose block records `heads`, as a run could write one.
 fn on_digest(id: u64, from: Option<&str>, heads: Value) -> Value {
-    let body = match from {
-        Some(from) => {
-            let block = json!({"schema": maintain::PLAN_SCHEMA, "from": from, "heads": heads});
-            let fence = maintain::PLAN_BLOCK;
-            format!(
-                "{}\nPlan.\n\n```{fence}\n{block}\n```\n",
-                maintain::PLAN_MARKER
-            )
-        }
+    match from {
+        Some(from) => record(id, from, heads, None),
         None => {
             let approve: Vec<Value> = (heads.as_object().into_iter().flatten())
                 .map(|(pr, head)| json!({"pr": pr, "head": head, "reason": "Small; CI green."}))
                 .collect();
             let block = json!({"schema": maintain::DIGEST_SCHEMA, "date": "2026-10-22",
                 "heads": heads, "approve": approve, "closer": [], "waiting": [], "stale": []});
-            format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE)
+            let body = format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE);
+            bot_comment(id, &body)
         }
-    };
+    }
+}
+
+/// The bot's comment `id` on the digest issue, saying `body`.
+fn bot_comment(id: u64, body: &str) -> Value {
     json!({"url": format!("{DIGEST}#issuecomment-{id}"), "body": body,
         "createdAt": "2026-10-01T00:00:00Z", "lastEditedAt": null,
         "author": {"login": "cgwalters-bot"}, "editor": null})
+}
+
+/// The pass's record, comment `id`, as of the day from `from`: the assessed
+/// `heads`, and the dispatch `pending` where there is one.
+fn record(id: u64, from: &str, heads: Value, pending: Option<Value>) -> Value {
+    let mut block = json!({"schema": maintain::PLAN_SCHEMA, "from": from, "heads": heads});
+    if let Some(pending) = pending {
+        block["pending"] = pending;
+    }
+    let fence = maintain::PLAN_BLOCK;
+    let marker = maintain::PLAN_MARKER;
+    bot_comment(
+        id,
+        &format!("{marker}\nRecord.\n\n```{fence}\n{block}\n```\n"),
+    )
 }
 
 /// `comment` edited by `editor`, or by an account GitHub does not name.
@@ -2915,6 +2928,7 @@ fn maintain_receipt() -> State {
             done: false,
             configuration: None,
             comment: Some(format!("{DIGEST}#issuecomment-5")),
+            pending: false,
         }),
         ..State::default()
     }
@@ -2931,7 +2945,7 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
     let both = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
     let one = json!({"up/a#1": "aa0000000000", "up/a#2": "b10000000000"});
     let yesterday = Some("2026-10-22T09:00:00Z");
-    let all_due = "maintain: digest due: 2 of 2 incoming pull request(s) changed since no plan; reviews up/a#1, up/a#2";
+    let all_due = "maintain: digest due: 2 of 2 incoming pull request(s) changed since no record; reviews up/a#1, up/a#2";
     let one_due = format!(
         "maintain: digest due: 1 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5; reviews up/a#2"
     );
@@ -2948,7 +2962,7 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
             9,
             vec![on_digest(5, Some(TODAY), both.clone())],
             format!(
-                "maintain: today's plan is {DIGEST}#issuecomment-5; the next is due from {NEXT}"
+                "maintain: today's digest was dispatched, {DIGEST}#issuecomment-5; the next is due from {NEXT}"
             ),
         ),
         (
@@ -3025,7 +3039,22 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
             9,
             vec![on_digest(5, yesterday, json!(["aa"]))],
             format!(
-                "maintain: digest due: 2 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5, whose heads are unreadable: it has no heads; reviews up/a#1, up/a#2"
+                "maintain: digest due: 2 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5, whose heads are unreadable: its block: invalid type: sequence, expected a map; reviews up/a#1, up/a#2"
+            ),
+        ),
+        // A v1 plan recorded its heads when it planned, not when a digest
+        // assessed them: they are due again.
+        (
+            "a v1 plan",
+            9,
+            vec![{
+                let mut comment = on_digest(5, yesterday, both.clone());
+                let body = text(&comment, "/body").replace("maintain-plan/v2", "maintain-plan/v1");
+                comment["body"] = body.into();
+                comment
+            }],
+            format!(
+                "maintain: digest due: 2 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5, whose heads are unreadable: its schema is not agent-board/maintain-plan/v2; reviews up/a#1, up/a#2"
             ),
         ),
     ];
@@ -3048,17 +3077,19 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         let lines = maintain_lines(&report);
         let due = hour == 9;
-        if due {
+        // Today's digest dispatched, the pass derives no repositories.
+        let derived = due && !expected.contains("today's digest");
+        if derived {
             assert_eq!(lines[0], "maintain: repositories: up/a", "{name}");
         }
-        assert_eq!(lines[usize::from(due)], expected, "{name}");
-        let planned = lines.len() == 4;
+        assert_eq!(lines[usize::from(derived)], expected, "{name}");
+        let planned = lines.len() == 3;
         assert_eq!(
             planned,
             expected.contains("digest due"),
             "{name}: {lines:#?}"
         );
-        // A preview records no plan: the day is not done.
+        // A preview settles no plan: the day is not done.
         let done = !planned && due;
         assert_eq!(
             report.maintain.map(|d| d.done),
@@ -3079,11 +3110,8 @@ fn maintain_plans_a_read_only_digest() {
     let (config, replay) = maintained(9, vec![], 40.0);
     let report = preview(&config, &replay);
     let lines = maintain_lines(&report);
-    assert_eq!(
-        lines[3],
-        "maintain: record the plan on cgwalters-forge/bot-ops#9; a preview records nothing"
-    );
-    let prefix = "maintain: plan only; no run kind publishes only the digest: ";
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    let prefix = "maintain: plan only; maintain caller is not set: ";
     let plan: Value = serde_json::from_str(lines[2].strip_prefix(prefix).unwrap()).unwrap();
     let parsed = plan::JobPlan::from_json(&plan).unwrap();
     assert_eq!(
@@ -3124,150 +3152,722 @@ fn maintain_plans_a_read_only_digest() {
     }
 }
 
-/// An applying pass records the plan and the heads it was planned for in
-/// its own comment on the digest issue, and writes nothing else; nothing
-/// is dispatched. Later passes the same day read its state and search, read
-/// and list nothing; one whose state was lost trusts no existing marker.
-/// Before it records a plan, a pass reuses the day's
-/// repositories and does not search again.
-#[test]
-fn maintain_records_its_plan_and_lists_once_a_day() {
-    let (config, _) = maintained(9, vec![], 40.0);
-    let recording = || {
-        let (_, mut replay) = maintained(9, vec![], 40.0);
-        for (url, body) in [
-            ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
-            ("user", json!({"login": "cgwalters-bot"})),
-        ] {
-            replay
-                .requests
-                .push(json!({"request": {"get": format!("{API_ROOT}{url}")},
-                "answer": {"status": 200, "link": null, "body": body}}));
-        }
+/// The digest's caller workflow in the private digest repository.
+const CALLER: &str = "cgwalters-forge/bot-ops/actions/workflows/digest.yml";
+
+/// The address of a run of the digest's caller, by `id`.
+fn digest_run(id: u64) -> String {
+    format!("https://github.com/cgwalters-forge/bot-ops/actions/runs/{id}")
+}
+
+/// [`maintained`] at 9 with `maintain.caller` set and `settings` added, its
+/// digest issue holding `comments`, the caller's runs in flight `flying`,
+/// and the private repository and the bot's account an applying pass reads.
+fn dispatching(comments: Vec<Value>, flying: Vec<Value>, settings: Value) -> (Config, Forge) {
+    let (_, mut replay) = maintained(9, comments, 40.0);
+    let mut get = |url: String, body: Value| {
         replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}{url}")},
+            "answer": {"status": 200, "link": null, "body": body}}));
     };
+    get(
+        "repos/cgwalters-forge/bot-ops".into(),
+        json!({"private": true}),
+    );
+    get("user".into(), json!({"login": "cgwalters-bot"}));
+    for status in ACTIVE_RUNS {
+        let runs = match *status {
+            "in_progress" => flying.clone(),
+            _ => vec![],
+        };
+        get(
+            format!("repos/{CALLER}/runs?status={status}&per_page=100"),
+            json!({"total_count": runs.len(), "workflow_runs": runs}),
+        );
+    }
+    let repos = json!({"sinceDays": 90, "min": 3, "max": 2, "exclude": ["up/c"]});
+    let caller =
+        json!({"repository": "cgwalters-forge/bot-ops", "workflow": "digest.yml", "ref": "main"});
+    let section = json!({"repos": repos, "share": 0.2, "hourUtc": 9, "caller": caller,
+        "digest": {"repository": "cgwalters-forge/bot-ops", "issue": 9}});
+    let mut settings = settings;
+    settings["maintain"] = section;
+    settings["state"] = "state.json".into();
     let forge = Forge {
-        replay: recording(),
+        replay,
         ..Forge::new(None, false)
     };
-    let report = apply(&forge, &config);
+    (config(settings), forge)
+}
+
+/// The digest's run `id` as GitHub reads it, `status`, started at the
+/// recording's clock, or deleted where `status` is `gone`.
+fn run_status(forge: &mut Forge, id: u64, status: &str) {
+    let url = format!("{API_ROOT}repos/cgwalters-forge/bot-ops/actions/runs/{id}");
+    let at = forge.replay.now.format(&Rfc3339).unwrap();
+    let (code, body) = match status {
+        "gone" => (404, json!({"message": "Not Found"})),
+        _ => (
+            200,
+            json!({"id": id, "status": status, "run_started_at": at}),
+        ),
+    };
+    forge.replay.requests.retain(|e| e["request"]["get"] != url);
+    forge.replay.requests.push(json!({"request": {"get": url},
+        "answer": {"status": code, "link": null, "body": body}}));
+}
+
+/// A pass over `forge` in `mode` from `state`.
+fn pass_over(forge: &Forge, config: &Config, state: State, mode: Mode, limits: Limits) -> Report {
+    let now = forge.replay.now;
+    block(run(forge, forge, config, state, (mode, limits), now)).unwrap()
+}
+
+/// `forge`'s writes to the digest repository, `METHOD PATH`, with bodies.
+fn digest_writes(forge: &Forge) -> Vec<(String, Value)> {
+    (forge.writes.borrow().iter())
+        .filter(|(_, url, _)| {
+            url.contains("cgwalters-forge/bot-ops/") && !url.contains("/issues/1/")
+        })
+        .map(|(m, url, body)| {
+            (
+                format!("{m} {}", url.trim_start_matches(API_ROOT)),
+                body.clone(),
+            )
+        })
+        .collect()
+}
+
+/// How many runs `forge` dispatched on the digest issue.
+fn digests(forge: &Forge) -> usize {
+    let dispatches = forge.dispatches();
+    (dispatches.iter())
+        .filter(|d| *d == "cgwalters-forge/bot-ops#9")
+        .count()
+}
+
+/// The pass's record in a write's `body`.
+fn written_record(body: &Value) -> Value {
+    plan::fenced_json(text(body, "/body"), maintain::PLAN_BLOCK)
+        .unwrap()
+        .unwrap()
+}
+
+/// With a caller, an applying pass posts the digest's plan on the digest
+/// issue, records it as pending with nothing acknowledged, and dispatches
+/// it once to the private caller through the plan protocol. While its run
+/// is in flight, later passes await it and list nothing. Its digest then
+/// acknowledges only what it assessed, at the listed head, and the day
+/// stays done. A pass that lost its cache trusts no record and finds
+/// today's dispatch record: it neither lists nor dispatches again.
+#[test]
+fn maintain_dispatches_the_digest_once_and_reads_it_back() {
+    let (config, mut forge) = dispatching(vec![], vec![], json!({}));
+    let actions = own();
+    let mode = Mode::Actions(&actions);
+    let report = pass_over(&forge, &config, State::default(), mode, Limits::default());
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     let lines = maintain_lines(&report);
-    let recorded = "maintain: recorded the plan in https://github.com/cgwalters-forge/bot-ops/issues/9#issuecomment-";
-    assert!(lines[3].starts_with(recorded), "{lines:#?}");
-    let writes = forge.writes.borrow();
-    let posted: Vec<&Value> = (writes.iter())
-        .filter(|(m, url, _)| m == "POST" && url.ends_with("bot-ops/issues/9/comments"))
-        .map(|(_, _, body)| body)
-        .collect();
-    let [posted] = posted[..] else {
-        panic!("{writes:#?}")
-    };
-    let body = text(posted, "/body");
-    assert!(body.starts_with(maintain::PLAN_MARKER), "{body}");
-    // The brief's example stays inside a JSON string: the bot's plan comment
-    // holds no digest block that review's Maintain view could show.
+    let start = "maintain: start the digest on cgwalters-forge/bot-ops#9 in cgwalters-forge/bot-ops digest.yml pool=claude plan=";
+    assert!(lines[2].starts_with(start), "{lines:#?}");
+    let run = lines[2].rsplit_once(" run=").unwrap().1.to_owned();
+    let id: u64 = run
+        .strip_prefix(&digest_run(0)[..digest_run(0).len() - 1])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let writes = digest_writes(&forge);
+    let methods: Vec<&str> = writes.iter().map(|(w, _)| w.as_str()).collect();
+    let comments = "POST repos/cgwalters-forge/bot-ops/issues/9/comments";
     assert_eq!(
-        plan::fenced_json(body, maintain::DIGEST_FENCE).unwrap(),
+        methods[..4],
+        [
+            comments,
+            comments,
+            comments,
+            &format!("POST repos/{CALLER}/dispatches"),
+        ],
+        "{methods:#?}"
+    );
+    assert!(methods[4].starts_with("PATCH repos/cgwalters-forge/bot-ops/issues/comments/"));
+    assert_eq!(methods.len(), 5, "{methods:#?}");
+    // The plan, whose brief's example stays inside a JSON string: it holds
+    // no digest block that review's Maintain view could show.
+    let posted = text(&writes[0].1, "/body");
+    let job = plan::JobPlan::from_comment(posted).unwrap().unwrap();
+    assert_eq!(
+        (job.repo.as_str(), job.item),
+        ("cgwalters-forge/bot-ops", 9)
+    );
+    assert_eq!(
+        plan::fenced_json(posted, maintain::DIGEST_FENCE).unwrap(),
         None
     );
-    let record = plan::fenced_json(body, maintain::PLAN_BLOCK)
-        .unwrap()
-        .unwrap();
+    // Recorded pending, nothing acknowledged yet.
+    let record = written_record(&writes[1].1);
     assert_eq!(
         (&record["from"], &record["heads"]),
-        (
-            &json!(TODAY),
-            &json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"})
-        )
+        (&json!(TODAY), &json!({}))
     );
-    assert_eq!(record["plan"]["item"], 9);
-    assert!(!writes.iter().any(|(_, url, _)| url.contains("up/a")));
-    assert!(!forge.dispatches().iter().any(|d| d.contains("bot-ops")));
+    assert_eq!(
+        record["pending"]["heads"],
+        json!({"up/a#1": head("aa"), "up/a#2": head("bb")})
+    );
+    let plan_id = text(&record, "/pending/plan").to_owned();
+    assert!(lines[2].contains(&format!("plan={plan_id} ")), "{lines:#?}");
+    let body = &writes[3].1;
+    assert_eq!(
+        (text(body, "/ref"), text(body, "/inputs/repo")),
+        ("main", "cgwalters-forge/bot-ops")
+    );
+    assert_eq!(digests(&forge), 1);
     let day = report.maintain.clone().unwrap();
-    let expected = day.clone();
-    assert_eq!(day.from, TODAY);
-    assert_eq!(day.repos, ["up/a"]);
-    assert!(day.done);
-    assert!(day.configuration.is_some());
-    assert!(
-        day.comment
-            .as_ref()
-            .unwrap()
-            .starts_with(&format!("{DIGEST}#issuecomment-"))
-    );
-    // Kept in the state, though no pull request is followed.
-    let kept = report.state.as_ref().and_then(|s| s.maintain.as_ref());
-    assert_eq!(kept, Some(&expected));
-    let state = State::from_json(&report.state.as_ref().unwrap().to_json()).unwrap();
-    assert_eq!(state.maintain.as_ref(), Some(&expected));
-    // The recording without the requests that contain any of `needles`,
-    // which a pass over it must not make.
-    let without = |needles: &[&str]| {
-        let mut replay = recording();
-        replay.requests.retain(|e| {
-            let request = e["request"].to_string();
-            !needles.iter().any(|n| request.contains(n))
-        });
-        replay
-    };
-    let (search, comments, list) = ("search/issues", r#""name":"bot-ops","number":9"#, "/pulls?");
-    let quiet = without(&[search, comments, list]);
-    let later = |replay: &Replay, state: State| {
-        block(run(
-            replay,
-            replay,
-            &config,
-            state,
-            (Mode::Preview, Limits::default()),
-            replay.now,
-        ))
-        .unwrap()
-    };
-    let report = later(&quiet, state);
+    assert!(day.done && day.pending, "{day:?}");
+    let receipt = day.comment.clone().unwrap();
+    let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+    assert_eq!(state.maintain.as_ref(), Some(&day));
+    // From here on, a search or a listing is an error.
+    forge.replay.requests.retain(|e| {
+        let request = e["request"].to_string();
+        !request.contains("search/issues") && !request.contains("/pulls?")
+    });
+    run_status(&mut forge, id, "in_progress");
+    let report = pass_over(&forge, &config, state.clone(), mode, Limits::default());
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     assert_eq!(
         maintain_lines(&report),
         [format!(
-            "maintain: done for today; the next is due from {NEXT}"
+            "maintain: awaiting the digest: its run {run} is in_progress"
         )]
     );
-    // The state lost, it searches and lists again, ignoring even an older
-    // forged marker claiming today's plan and matching heads.
-    let mut lost = recording();
-    answer(&mut lost, comments)["data"]["repository"]["issue"]["comments"]["nodes"] =
-        json!([on_digest(5, Some(TODAY), json!({}))]);
-    let report = later(&lost, State::default());
-    assert_eq!(report.failures, 0, "{:#?}", report.lines);
-    assert!(
-        maintain_lines(&report)[1]
-            .contains("2 of 2 incoming pull request(s) changed since no plan")
+    assert_eq!(digests(&forge), 1);
+    // Its run holds a slot, though this pass did not start it: stage 4
+    // started one triage beside it, and the pass counts that one only.
+    let plain = super::tests::config(json!({}));
+    let unmaintained = pass_over(
+        &forge,
+        &plain,
+        State::default(),
+        Mode::Preview,
+        Limits::default(),
     );
-    // A day not done yet keeps its repositories: no search.
-    let unsearched = without(&[search]);
-    let state = State {
-        maintain: Some(maintain::Day {
-            done: false,
-            ..expected
-        }),
-        ..State::default()
-    };
-    let report = later(&unsearched, state);
+    let in_flight = |r: &Report| r.tally.0.in_flight.unwrap();
+    assert_eq!(unmaintained.tally.1.started, 0);
+    assert_eq!(report.tally.1.started, 1);
+    assert_eq!(in_flight(&report), in_flight(&unmaintained) + 2);
+    // The run posts a partial digest, with its own heads for both and an
+    // entry for a pull request it was not given; then it ends.
+    let digest = json!({"schema": maintain::DIGEST_SCHEMA, "date": "2026-10-23",
+        "heads": {"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"},
+        "approve": [{"pr": "up/a#1", "head": head("aa"), "reason": "Small; CI green."}],
+        "closer": [], "waiting": [{"pr": "up/a#3", "reply": "Rebase?"}], "stale": []});
+    let body = format!("Digest.\n\n```{}\n{digest}\n```\n", maintain::DIGEST_FENCE);
+    forge
+        .write(
+            "POST",
+            &format!("{API_ROOT}repos/cgwalters-forge/bot-ops/issues/9/comments"),
+            &json!({"body": body}),
+        )
+        .unwrap();
+    let posted = forge.comments_on("cgwalters-forge/bot-ops", 9).len();
+    run_status(&mut forge, id, "completed");
+    let before = forge.writes.borrow().len();
+    let report = pass_over(&forge, &config, state, mode, Limits::default());
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     let lines = maintain_lines(&report);
     assert!(
-        lines[0].starts_with("maintain: digest due: 2 of 2"),
+        lines[0].starts_with(
+            "maintain: the digest https://github.com/cgwalters-forge/bot-ops/issues/9#issuecomment-"
+        ) && lines[0].ends_with(" assessed 1 of 2 pull request(s); due again: up/a#2"),
         "{lines:#?}"
     );
+    assert_eq!(
+        lines[1],
+        format!("maintain: done for today; the next is due from {NEXT}")
+    );
+    let writes = forge.writes.borrow()[before..].to_vec();
+    let edits: Vec<&(String, String, Value)> = writes
+        .iter()
+        .filter(|(_, url, _)| url.contains("bot-ops/issues/comments/"))
+        .collect();
+    let [(_, url, body)] = edits[..] else {
+        panic!("{writes:#?}")
+    };
+    assert!(url.ends_with(receipt.rsplit_once('-').unwrap().1), "{url}");
+    let record = written_record(body);
+    assert_eq!(record["heads"], json!({"up/a#1": "aa0000000000"}));
+    assert_eq!(record.get("pending"), None);
+    let day = report.maintain.clone().unwrap();
+    assert!(day.done && !day.pending, "{day:?}");
+    assert_eq!(
+        forge.comments_on("cgwalters-forge/bot-ops", 9).len(),
+        posted
+    );
+    // The cache lost: no receipt, so no record, but today's dispatch record.
+    let report = pass_over(&forge, &config, State::default(), mode, Limits::default());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = maintain_lines(&report);
+    assert!(
+        lines.len() == 1
+            && lines[0].ends_with(&format!(
+                " recorded a dispatch today that the pass's record does not name; the next is due from {NEXT}"
+            )),
+        "{lines:#?}"
+    );
+    assert_eq!(digests(&forge), 1);
+    assert!(report.maintain.unwrap().done);
+}
+
+/// A pending dispatch is settled by what the digest issue and its run show:
+/// only the bot's unedited digest, after the plan's first dispatch record,
+/// for that day, acknowledges heads, and only those of the pull requests it
+/// was given at the head listed; any `heads` it writes are not read. A run
+/// in flight, or an unnamed one before the next day's due time, is awaited;
+/// otherwise the dispatch is released with its pull requests still due, and
+/// never dispatched again. A preview says so and records nothing.
+#[test]
+fn maintain_settles_a_dispatch_by_what_it_observes() {
+    const PLAN: &str = "4@2026-10-22T09:05:00Z";
+    let yesterday = "2026-10-22T09:00:00Z";
+    let claim = |id: u64, author: &str, text: &str| {
+        let mut comment = bot_comment(
+            id,
+            &format!("<!-- agent-board-dispatch: {PLAN} -->\n{text}"),
+        );
+        comment["author"] = json!({"login": author});
+        comment
+    };
+    let named = |run: u64| {
+        format!(
+            "Dispatched the plan in {DIGEST}#issuecomment-4: [run]({}).",
+            digest_run(run)
+        )
+    };
+    let dispatched = claim(6, "cgwalters-bot", &named(77));
+    let digest = |id: u64, date: &str, groups: Value| {
+        let mut block = json!({"schema": maintain::DIGEST_SCHEMA, "date": date,
+            "approve": [], "closer": [], "waiting": [], "stale": []});
+        block
+            .as_object_mut()
+            .unwrap()
+            .extend(groups.as_object().unwrap().clone());
+        bot_comment(
+            id,
+            &format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE),
+        )
+    };
+    let day = "2026-10-22";
+    let both = json!({"approve": [{"pr": "up/a#1", "head": head("aa"), "reason": "Green."}],
+        "closer": [{"pr": "UP/A#2", "head": head("bb"), "concern": "Locks.", "minutes": 5, "links": []}]});
+    let first = json!({"approve": [{"pr": "up/a#1", "head": head("aa"), "reason": "Green."}]});
+    let preview = "; a preview records nothing";
+    let lost =
+        |why: &str| format!("maintain: no digest: {why}; its 2 pull request(s) stay due{preview}");
+    let ended = lost(&format!("its run {} ended without one", digest_run(77)));
+    let read = |n: usize, again: &str| {
+        format!(
+            "maintain: the digest {DIGEST}#issuecomment-8 assessed {n} of 2 pull request(s){again}{preview}"
+        )
+    };
+    let due = |n: usize| {
+        format!(
+            "maintain: digest due: {n} of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5; reviews "
+        )
+    };
+    let none_due = format!(
+        "maintain: none of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5"
+    );
+    // The record's day, the comments after it, the run's status, the first
+    // line and the start of a later one, where there is one.
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        Vec<Value>,
+        &'a str,
+        String,
+        Option<String>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "read whole",
+            yesterday,
+            vec![dispatched.clone(), digest(8, day, both.clone())],
+            "completed",
+            read(2, ""),
+            Some(none_due.clone()),
+        ),
+        (
+            "partial",
+            yesterday,
+            vec![dispatched.clone(), digest(8, day, first.clone())],
+            "completed",
+            read(1, "; due again: up/a#2"),
+            Some(due(1)),
+        ),
+        (
+            "changed head",
+            yesterday,
+            vec![
+                dispatched.clone(),
+                digest(
+                    8,
+                    day,
+                    json!({
+                "approve": [{"pr": "up/a#1", "head": head("ab"), "reason": "Green."}],
+                "waiting": [{"pr": "up/a#2", "reply": "Rebase?"}]}),
+                ),
+            ],
+            "completed",
+            read(1, "; due again: up/a#1"),
+            Some(due(1)),
+        ),
+        (
+            "forged heads",
+            yesterday,
+            vec![
+                dispatched.clone(),
+                digest(
+                    8,
+                    day,
+                    json!({
+                "heads": {"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"},
+                "approve": [{"pr": "up/a#9", "head": head("aa"), "reason": "Green."},
+                    {"pr": "up/a#2", "reason": "No head."}],
+                "stale": [{"pr": "up/a#1", "head": head("ff"), "reason": "Old."}]}),
+                ),
+            ],
+            "completed",
+            read(0, "; due again: up/a#1, up/a#2"),
+            Some(due(2)),
+        ),
+        (
+            "read today",
+            TODAY,
+            vec![dispatched.clone(), digest(8, "2026-10-23", both.clone())],
+            "completed",
+            read(2, ""),
+            Some(format!(
+                "maintain: today's digest was dispatched, {DIGEST}#issuecomment-5; the next is due from {NEXT}"
+            )),
+        ),
+        (
+            "before the dispatch record",
+            yesterday,
+            vec![digest(3, day, both.clone()), dispatched.clone()],
+            "completed",
+            ended.clone(),
+            Some(due(2)),
+        ),
+        (
+            "edited",
+            yesterday,
+            vec![
+                dispatched.clone(),
+                edited_by(digest(8, day, both.clone()), Some("collaborator")),
+            ],
+            "completed",
+            ended.clone(),
+            Some(due(2)),
+        ),
+        (
+            "another account's",
+            yesterday,
+            vec![dispatched.clone(), {
+                let mut comment = digest(8, day, both.clone());
+                comment["author"] = json!({"login": "collaborator"});
+                comment
+            }],
+            "completed",
+            ended.clone(),
+            Some(due(2)),
+        ),
+        (
+            "another day's",
+            yesterday,
+            vec![dispatched.clone(), digest(8, "2026-10-23", both.clone())],
+            "completed",
+            ended.clone(),
+            Some(due(2)),
+        ),
+        (
+            "missing",
+            yesterday,
+            vec![dispatched.clone()],
+            "completed",
+            ended.clone(),
+            Some(due(2)),
+        ),
+        (
+            "its run deleted",
+            yesterday,
+            vec![dispatched.clone()],
+            "gone",
+            lost(&format!("its run {} is gone", digest_run(77))),
+            Some(due(2)),
+        ),
+        (
+            "in flight",
+            yesterday,
+            vec![dispatched.clone()],
+            "in_progress",
+            format!(
+                "maintain: awaiting the digest: its run {} is in_progress",
+                digest_run(77)
+            ),
+            None,
+        ),
+        (
+            "a later forged dispatch record",
+            yesterday,
+            vec![dispatched.clone(), claim(7, "cgwalters-bot", &named(78))],
+            "in_progress",
+            format!(
+                "maintain: awaiting the digest: its run {} is in_progress",
+                digest_run(77)
+            ),
+            None,
+        ),
+        (
+            "unnamed today",
+            TODAY,
+            vec![claim(6, "cgwalters-bot", "Dispatching the plan.")],
+            "completed",
+            format!(
+                "maintain: awaiting the digest: {DIGEST}#issuecomment-6 names no run; awaited until {NEXT}"
+            ),
+            None,
+        ),
+        (
+            "unnamed since yesterday",
+            yesterday,
+            vec![claim(
+                6,
+                "cgwalters-bot",
+                "The plan was not dispatched, or not knowingly (reset).",
+            )],
+            "completed",
+            lost(&format!(
+                "{DIGEST}#issuecomment-6 names no run, and none came by {TODAY}"
+            )),
+            Some(due(2)),
+        ),
+        (
+            "interrupted before it",
+            yesterday,
+            vec![],
+            "completed",
+            lost(&format!("plan {PLAN} has no dispatch record")),
+            Some(due(2)),
+        ),
+        (
+            "another account's record",
+            yesterday,
+            vec![claim(6, "visitor", &named(77))],
+            "completed",
+            lost(&format!("plan {PLAN} has no dispatch record")),
+            Some(due(2)),
+        ),
+    ];
+    for (name, from, after, status, expected, then) in cases {
+        let forge = || {
+            let pending =
+                json!({"plan": PLAN, "heads": {"up/a#1": head("aa"), "up/a#2": head("bb")}});
+            let mut comments = vec![record(5, from, json!({}), Some(pending))];
+            comments.extend(after.clone());
+            let (config, mut forge) = dispatching(comments, vec![], json!({}));
+            run_status(&mut forge, 77, status);
+            run_status(&mut forge, 78, "completed");
+            (config, forge)
+        };
+        let settled = expected.strip_suffix(preview);
+        // The cache's pending flag, which a pass cut short after its
+        // dispatch never saved: the record decides either way.
+        for cached in [true, false] {
+            let (config, forge) = forge();
+            let mut state = maintain_receipt();
+            state.maintain.as_mut().unwrap().pending = cached;
+            let report = pass_over(&forge, &config, state, Mode::Preview, Limits::default());
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+            let lines = maintain_lines(&report);
+            assert_eq!(lines[0], expected, "{name}, {cached}: {lines:#?}");
+            match &then {
+                Some(then) => assert!(
+                    lines[1..].iter().any(|l| l.starts_with(then.as_str())),
+                    "{name}, {cached}: {then}: {lines:#?}"
+                ),
+                None => assert_eq!(lines.len(), 1, "{name}, {cached}: {lines:#?}"),
+            }
+            assert!(forge.writes.borrow().is_empty(), "{name}");
+            assert!(report.maintain.unwrap().pending, "{name}");
+        }
+        let Some(settled) = settled else {
+            continue;
+        };
+        // Applying, the record is written without the dispatch, which
+        // `--max-writes` holds, and with it the rest of the stage.
+        let mut state = maintain_receipt();
+        state.maintain.as_mut().unwrap().pending = true;
+        for writes in [Some(0), None] {
+            let (config, forge) = forge();
+            let limits = Limits {
+                writes,
+                ..Limits::default()
+            };
+            let report = pass_over(&forge, &config, state.clone(), Mode::Local, limits);
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+            let lines = maintain_lines(&report);
+            let written = digest_writes(&forge);
+            if writes.is_some() {
+                let held = format!("held by --max-writes: {settled}");
+                assert!(report.lines.contains(&held), "{name}: {:#?}", report.lines);
+                assert!(lines.is_empty(), "{name}: {lines:#?}");
+                assert!(written.is_empty(), "{name}: {written:#?}");
+                assert!(report.maintain.unwrap().pending, "{name}");
+                continue;
+            }
+            assert_eq!(lines[0], settled, "{name}");
+            let (edit, body) = &written[0];
+            assert_eq!(
+                edit,
+                "PATCH repos/cgwalters-forge/bot-ops/issues/comments/5"
+            );
+            let record = written_record(body);
+            assert_eq!(record.get("pending"), None, "{name}");
+            let acknowledged = record["heads"].as_object().unwrap().len();
+            match settled.starts_with("maintain: no digest") {
+                true => assert_eq!(acknowledged, 0, "{name}"),
+                false => assert!(
+                    settled.contains(&format!(" assessed {acknowledged} of 2 ")),
+                    "{name}: {record}"
+                ),
+            }
+        }
+    }
+}
+
+/// The digest starts only within the pass's bounds, checked before any
+/// pull request is listed: another pass, `--max-dispatch`, `--max-writes`,
+/// a run of its caller in flight, and every slot taken each hold it, with
+/// nothing written. A preview writes and dispatches nothing. A dispatch
+/// whose answer is lost is recorded, takes its slot and is not tried again.
+#[test]
+fn maintain_starts_the_digest_only_within_bounds() {
+    let flying = json!({"id": 501, "status": "in_progress", "display_title": "digest",
+        "html_url": digest_run(501), "run_started_at": "2026-10-23T15:00:00Z"});
+    let limits = |dispatch, writes| Limits {
+        dispatch,
+        writes,
+        ..Limits::default()
+    };
+    // The settings, the caller's runs in flight, the limits, and why it
+    // waits, or none for a preview.
+    let cases = [
+        (
+            "max dispatch",
+            json!({}),
+            vec![],
+            limits(Some(0), None),
+            Some("held by --max-dispatch"),
+        ),
+        (
+            "max writes",
+            json!({}),
+            vec![],
+            limits(None, Some(0)),
+            Some("held by --max-writes"),
+        ),
+        (
+            "caller run in flight",
+            json!({}),
+            vec![flying],
+            Limits::default(),
+            Some("1 run(s) of cgwalters-forge/bot-ops digest.yml in flight"),
+        ),
+        (
+            "every slot taken",
+            json!({"wip": 1}),
+            vec![],
+            Limits::default(),
+            Some("wip: "),
+        ),
+        ("preview", json!({}), vec![], Limits::default(), None),
+    ];
+    for (name, settings, flying, limits, why) in cases {
+        let (config, mut forge) = dispatching(vec![], flying, settings);
+        // A wait lists no pull request.
+        if why.is_some() {
+            (forge.replay.requests).retain(|e| !e["request"].to_string().contains("/pulls?"));
+        }
+        let actions = own();
+        let mode = match why {
+            None => Mode::Preview,
+            Some(_) => Mode::Actions(&actions),
+        };
+        let report = pass_over(&forge, &config, State::default(), mode, limits);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        let last = lines.last().unwrap();
+        let ok = match why {
+            Some(why) => {
+                last.starts_with(&format!("maintain: {why}"))
+                    && last.ends_with("; the digest waits")
+            }
+            None => last.contains("; a preview writes and dispatches nothing: "),
+        };
+        assert!(ok, "{name}: {lines:#?}");
+        assert!(digest_writes(&forge).is_empty(), "{name}");
+        assert_eq!(digests(&forge), 0, "{name}");
+        let day = report.maintain.unwrap();
+        assert!(!day.done && !day.pending, "{name}");
+    }
+    // The dispatch's answer lost: recorded, its slot taken, never retried.
+    let (config, forge) = dispatching(vec![], vec![], json!({}));
+    *forge.fail.borrow_mut() = Some("/dispatches".into());
+    let actions = own();
+    let mode = Mode::Actions(&actions);
+    let report = pass_over(&forge, &config, State::default(), mode, Limits::default());
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    let lines = maintain_lines(&report);
+    assert!(
+        lines[2].contains(" failed: ")
+            && lines[2].ends_with(
+                "not tried again, and its pull requests stay due until a digest assesses them"
+            ),
+        "{lines:#?}"
+    );
+    let claim = forge
+        .comments_on("cgwalters-forge/bot-ops", 9)
+        .into_iter()
+        .find(|c| c.starts_with("<!-- agent-board-dispatch"))
+        .unwrap();
+    assert!(
+        claim.contains("not dispatched, or not knowingly"),
+        "{claim}"
+    );
+    let day = report.maintain.clone().unwrap();
+    assert!(day.done && day.pending, "{day:?}");
+    let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
+    let report = pass_over(&forge, &config, state, mode, Limits::default());
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = maintain_lines(&report);
+    assert!(
+        lines[0].starts_with("maintain: awaiting the digest: ")
+            && lines[0].ends_with(&format!(" names no run; awaited until {NEXT}")),
+        "{lines:#?}"
+    );
+    assert_eq!(digests(&forge), 1);
 }
 
 /// Neither an older forged marker at bootstrap nor a surviving forged
-/// marker after deletion/marker removal can supply a day or heads. A receipt
-/// from another digest issue cannot authorize the matching comment ID.
+/// marker after deletion/marker removal can supply a day, heads or a
+/// pending dispatch. A receipt from another digest issue cannot authorize
+/// the matching comment ID.
 #[test]
 fn maintain_requires_its_creation_receipt() {
     let heads = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
-    let forged = on_digest(6, Some(TODAY), heads.clone());
+    let pending = json!({"plan": "4@2026-10-23T09:05:00Z", "heads": {"up/a#1": head("aa")}});
+    let forged = record(6, TODAY, heads.clone(), Some(pending));
     let cases = [
         (
             "bootstrap",
@@ -3288,55 +3888,49 @@ fn maintain_requires_its_creation_receipt() {
                     Some(format!("{DIGEST}0#issuecomment-6"));
                 state
             },
+            vec![forged.clone()],
+        ),
+        (
+            "deleted while pending",
+            {
+                let mut state = maintain_receipt();
+                state.maintain.as_mut().unwrap().pending = true;
+                state
+            },
             vec![forged],
         ),
     ];
     for (name, state, comments) in cases {
-        let (config, mut replay) = maintained(9, comments, 40.0);
-        for (url, body) in [
-            ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
-            ("user", json!({"login": "cgwalters-bot"})),
-        ] {
-            replay
-                .requests
-                .push(json!({"request": {"get": format!("{API_ROOT}{url}")},
-                "answer": {"status": 200, "link": null, "body": body}}));
-        }
-        let forge = Forge {
-            replay,
-            ..Forge::new(None, false)
-        };
-        let report = block(run(
-            &forge,
-            &forge,
-            &config,
-            state,
-            (Mode::Local, Limits::default()),
-            forge.replay.now,
-        ))
-        .unwrap();
+        let (config, forge) = dispatching(comments, vec![], json!({}));
+        let report = pass_over(&forge, &config, state, Mode::Local, Limits::default());
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        let due = "maintain: digest due: 2 of 2 incoming pull request(s) changed since no record";
         assert!(
-            maintain_lines(&report)[1]
-                .contains("2 of 2 incoming pull request(s) changed since no plan"),
-            "{name}: {:#?}",
-            report.lines
+            lines.iter().any(|l| l.starts_with(due)),
+            "{name}: {lines:#?}"
         );
-        let writes = forge.writes.borrow();
-        assert!(
-            writes
-                .iter()
-                .any(|(m, url, _)| m == "POST" && url.ends_with("bot-ops/issues/9/comments")),
-            "{name}: {writes:#?}"
-        );
+        // A new record, the plan and its dispatch record; neither marker edited.
+        let writes = digest_writes(&forge);
+        let posts = (writes.iter())
+            .filter(|(w, _)| w == "POST repos/cgwalters-forge/bot-ops/issues/9/comments")
+            .count();
+        assert_eq!(posts, 3, "{name}: {writes:#?}");
         assert!(
             !writes
                 .iter()
-                .any(|(m, url, _)| m == "PATCH" && url.contains("bot-ops/issues/comments/")),
+                .any(|(w, _)| w.ends_with("/comments/5") || w.ends_with("/comments/6")),
             "{name}: {writes:#?}"
         );
+        assert_eq!(digests(&forge), 1, "{name}");
         let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
-        assert!(state.maintain.unwrap().done, "{name}");
+        let day = state.maintain.unwrap();
+        assert!(day.done && day.pending, "{name}");
+        assert_ne!(
+            day.comment,
+            maintain_receipt().maintain.unwrap().comment,
+            "{name}"
+        );
     }
 }
 
@@ -3493,7 +4087,7 @@ fn maintain_share_is_left_while_a_digest_is_due() {
                 ),
                 "{name}"
             ),
-            (false, _) => assert_eq!(lines.len(), 2, "{name}: {lines:#?}"),
+            (false, _) => assert_eq!(lines.len(), 1, "{name}: {lines:#?}"),
         }
         assert!(
             report.lines.contains(&expected),
@@ -4260,10 +4854,11 @@ fn maintain_section(edit: Value) -> Value {
     section
 }
 
-/// The keys a `maintain` section needs beside it: pool `a`, paced.
+/// The keys a `maintain` section needs beside it: pool `a`, paced, and the
+/// state a caller needs.
 fn maintain(edit: Value) -> Value {
     json!({"pools": {"a": {}}, "usage": {"repository": "o/ops", "issue": 1},
-        "maintain": maintain_section(edit)})
+        "state": "state.json", "maintain": maintain_section(edit)})
 }
 
 #[test]
@@ -4434,6 +5029,41 @@ fn config_table() {
             "maintain digest issue is not a positive number",
         ),
         (maintain(json!({"pools": ["a"]})), "unknown field `pools`"),
+        (
+            maintain(
+                json!({"caller": {"repository": "o/other", "workflow": "digest.yml", "ref": "main"}}),
+            ),
+            "maintain caller repository is not the digest repository",
+        ),
+        (
+            maintain(json!({"digest": {"repository": "o/caller", "issue": 7},
+                "caller": {"repository": "o/caller", "workflow": "digest.yml", "ref": "main"}})),
+            "maintain caller repository is dispatchRepo, whose runs are public",
+        ),
+        (
+            maintain(json!({"caller": {"repository": "o/ops", "workflow": "../x", "ref": "main"}})),
+            "maintain caller: invalid workflow",
+        ),
+        (
+            {
+                let mut config = maintain(
+                    json!({"caller": {"repository": "o/ops", "workflow": "digest.yml", "ref": "main"}}),
+                );
+                config.as_object_mut().unwrap().remove("state");
+                config
+            },
+            "maintain caller needs state, which keeps the record's receipt",
+        ),
+        (
+            maintain(
+                json!({"caller": {"repository": "o/ops", "workflow": "digest.yml", "ref": "a..b"}}),
+            ),
+            "maintain caller: invalid caller ref",
+        ),
+        (
+            maintain(json!({"caller": {"repository": "o/ops", "workflow": "digest.yml"}})),
+            "missing field `ref`",
+        ),
         (
             json!({"epics": {"repository": "o/r", "inAnyRepository": true}}),
             "unknown field `inAnyRepository`",

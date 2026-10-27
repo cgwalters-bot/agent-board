@@ -6,8 +6,9 @@
 //! Built so far: the configuration, stage 1 (the usage refresh, in
 //! [`usage`]), stage 2 (pull request follow-up), stage 3 (epic apply,
 //! recovery and planning, in [`epics`]), stage 4 (scheduling) and stage 5
-//! (board Status, in [`status`]), and the maintain digest's plan, recorded
-//! but not yet run ([`maintain`]).
+//! (board Status, in [`status`]), and the maintain digest, dispatched to a
+//! private caller where one is configured and else only planned
+//! ([`maintain`]).
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -1609,11 +1610,12 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
-    scheduler.maintain(state.maintain.take());
+    // Its run, started now or in flight, takes a slot from stages 3 and 4.
+    let (digest, flying) = scheduler.maintain(state.maintain.take());
     // Without stage 2's state, the incoming one keeps the maintain stage's.
     let kept = scheduler.report.maintain.is_some().then(|| state.clone());
     // Stage 2: pull request follow-up, today's poll.
-    let mut earlier = scheduler.follow(state, &git_ref);
+    let mut earlier = scheduler.follow(state, &git_ref) + digest + flying;
     if let Some(day) = scheduler.report.maintain.clone() {
         let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
         state.maintain = Some(day);
@@ -1627,6 +1629,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         scheduler.report.failures += 1;
         scheduler.line(format!("schedule error: {error:#}"));
     }
+    // A digest run in flight holds its slot, but an earlier pass started it.
+    let started = &mut scheduler.report.tally.1.started;
+    *started = started.saturating_sub(flying);
     // Stage 5: board Status from the facts read, this pass's starts included.
     if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
