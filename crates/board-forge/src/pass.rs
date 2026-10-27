@@ -6,7 +6,8 @@
 //! Built so far: the configuration, stage 1 (the usage refresh, in
 //! [`usage`]), stage 2 (pull request follow-up), stage 3 (epic apply,
 //! recovery and planning, in [`epics`]), stage 4 (scheduling) and stage 5
-//! (board Status, in [`status`]).
+//! (board Status, in [`status`]), and the maintain digest's plan, not yet
+//! its run ([`maintain`]).
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -280,6 +281,9 @@ pub struct Config {
     /// Off unless set: spare slots after stage 4's starts revisit a sample
     /// of old issues ([`Scheduler::revisit`]).
     pub revisit: Option<revisit::Revisit>,
+    /// Off unless set: a daily digest of incoming pull requests, planned
+    /// before stage 2 within a share of the pools ([`Scheduler::maintain`]).
+    pub maintain: Option<maintain::Maintain>,
     #[serde(default)]
     pub pools: Pools,
     pub usage: Option<Usage>,
@@ -608,6 +612,9 @@ impl Config {
         if let Some(revisit) = &self.revisit {
             revisit.check(self)?;
         }
+        if let Some(maintain) = &self.maintain {
+            maintain.check(self)?;
+        }
         if !self.pools.0.is_empty() {
             ensure!(self.usage.is_some(), "pools need usage");
         }
@@ -841,6 +848,9 @@ pub fn room(
     let entry = &snapshot["pools"][pool];
     if !entry.is_object() || entry["reason"] == usage::NO_READING {
         return Err(format!("{pool} has no reading"));
+    }
+    if entry["reason"] == maintain::MAINTAIN_HOLD {
+        return Err(text(entry, "/maintain").to_owned());
     }
     // A grant is paced, and its age judged, already: its room is what it
     // allows past what is used.
@@ -1591,6 +1601,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
     scheduler.refresh();
+    // The maintain digest, planned while it is due, which the later stages
+    // leave its share for.
+    scheduler.maintain();
     // Stage 2: pull request follow-up, today's poll.
     let mut earlier = scheduler.follow(state, &git_ref);
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
@@ -3459,6 +3472,7 @@ impl crate::github::GraphQl for Replay {
 
 mod epics;
 pub mod holds;
+pub mod maintain;
 pub mod revisit;
 mod status;
 mod usage;

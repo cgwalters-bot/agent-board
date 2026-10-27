@@ -61,7 +61,7 @@ fn valid_pool(pool: &str) -> bool {
         && pool.bytes().all(|c| name(c) || c == b'-' || c == b'_')
 }
 
-const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
+pub(crate) const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
       comments(first: 100, after: $after) {

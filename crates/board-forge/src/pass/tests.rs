@@ -2682,6 +2682,248 @@ fn revisit_off_changes_nothing() {
     );
 }
 
+/// The digest issue of [`maintained`]'s configuration.
+const DIGEST: &str = "https://github.com/cgwalters-forge/bot-ops/issues/9";
+
+/// A head commit of forty hex characters, starting with `start`.
+fn head(start: &str) -> String {
+    format!("{start:0<40}")
+}
+
+/// A digest comment on the digest issue: by `author`, edited by `editor`,
+/// `hours` before the recording's clock, recording `heads`.
+fn digest(id: u64, (author, editor): (&str, Option<&str>), hours: i64, heads: Value) -> Value {
+    let block = json!({"schema": maintain::DIGEST_SCHEMA, "heads": heads, "prs": []});
+    let created = at("2026-10-23T15:15:10Z") - time::Duration::hours(hours);
+    let created = created.format(&Rfc3339).unwrap();
+    json!({"url": format!("{DIGEST}#issuecomment-{id}"),
+        "body": format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE),
+        "createdAt": created, "lastEditedAt": editor.map(|_| created.clone()),
+        "author": {"login": author}, "editor": editor.map(|login| json!({"login": login}))})
+}
+
+/// The recording with `maintain` on (repository `up/a`, due from `hour`
+/// UTC, a share of 0.2), its digest issue holding `comments`, `up/a`'s open
+/// pull requests #1 and #2 at heads `aa…` and `bb…` and the operator's #3,
+/// and claude having used `used` percent of its 54.3% allowance.
+fn maintained(hour: u8, comments: Vec<Value>, used: f64) -> (Config, Replay) {
+    let mut replay = without_epics(replay());
+    only(&mut replay, FIRST);
+    let variables =
+        json!({"owner": "cgwalters-forge", "name": "bot-ops", "number": 9, "after": null});
+    replay.requests.push(json!({
+        "request": graphql_key(plan::COMMENTS_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"comments": {"nodes": comments,
+            "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}},
+    }));
+    let pull = |number: u64, login: &str, sha: &str| json!({"number": number, "user": {"login": login}, "head": {"sha": head(sha)}});
+    let pulls = [
+        pull(1, "visitor", "aa"),
+        pull(2, "contributor", "bb"),
+        pull(3, "cgwalters", "cc"),
+    ];
+    replay.requests.push(json!({
+        "request": {"get": format!("{API_ROOT}repos/up/a/pulls?state=open&per_page=100")},
+        "answer": {"status": 200, "link": null, "body": pulls},
+    }));
+    let mut snapshot = usage(&mut replay);
+    snapshot["pools"]["claude"]["used_percent"] = used.into();
+    set_usage(&mut replay, &snapshot);
+    let section = json!({"repos": ["up/a"], "share": 0.2, "hourUtc": hour,
+        "digest": {"repository": "cgwalters-forge/bot-ops", "issue": 9}});
+    (config(json!({"maintain": section})), replay)
+}
+
+/// Its lines that start with `maintain`.
+fn maintain_lines(report: &Report) -> Vec<&str> {
+    let lines = report.lines.iter().map(String::as_str);
+    lines.filter(|l| l.starts_with("maintain")).collect()
+}
+
+/// A day's digest is due once, from `hourUtc`, for the pull requests whose
+/// head changed since the last digest, the operator's and the bot's left
+/// out. Only the bot's digest, edited by nobody else, counts.
+#[test]
+fn maintain_is_due_once_a_day_for_changed_heads() {
+    let both = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
+    let one = json!({"up/a#1": "aa0000000000", "up/a#2": "b10000000000"});
+    let bot = ("cgwalters-bot", None);
+    let today = format!(
+        "maintain: today's digest is {DIGEST}#issuecomment-5; the next is due from 2026-10-24T09:00:00Z"
+    );
+    let all_due = "maintain: digest due: 2 of 2 incoming pull request(s) changed since no digest; reviews up/a#1, up/a#2";
+    let cases = [
+        (
+            "before the hour",
+            16,
+            vec![],
+            "maintain: not due until 2026-10-23T16:00:00Z".to_owned(),
+        ),
+        ("no digest yet", 9, vec![], all_due.to_owned()),
+        (
+            "posted today",
+            9,
+            vec![digest(5, bot, 2, both.clone())],
+            today.clone(),
+        ),
+        (
+            "the newest posted today",
+            9,
+            vec![
+                digest(4, bot, 30, json!({})),
+                digest(5, bot, 2, both.clone()),
+            ],
+            today,
+        ),
+        (
+            "unchanged since yesterday's",
+            9,
+            vec![digest(5, bot, 24, both.clone())],
+            format!(
+                "maintain: none of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5"
+            ),
+        ),
+        (
+            "one head changed",
+            9,
+            vec![digest(5, bot, 24, one)],
+            format!(
+                "maintain: digest due: 1 of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5; reviews up/a#2"
+            ),
+        ),
+        (
+            "a visitor's digest",
+            9,
+            vec![digest(5, ("visitor", None), 2, both.clone())],
+            all_due.to_owned(),
+        ),
+        (
+            "the bot's, edited by a visitor",
+            9,
+            vec![digest(5, ("cgwalters-bot", Some("visitor")), 2, both)],
+            all_due.to_owned(),
+        ),
+    ];
+    for (name, hour, comments, expected) in cases {
+        let (config, replay) = maintained(hour, comments, 40.0);
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        assert_eq!(lines[0], expected, "{name}");
+        let planned = lines.len() == 2;
+        assert_eq!(
+            planned,
+            expected.contains("digest due"),
+            "{name}: {lines:#?}"
+        );
+    }
+}
+
+/// The plan names the digest issue as its item, asks for a run that hands
+/// back a comment, forbids any write to the pull requests' repositories and
+/// any mention of embargoed work, and carries the heads the digest records.
+#[test]
+fn maintain_plans_a_read_only_digest() {
+    let (config, replay) = maintained(9, vec![], 40.0);
+    let report = preview(&config, &replay);
+    let lines = maintain_lines(&report);
+    let prefix = "maintain: plan only; no run kind publishes only the digest: ";
+    let plan: Value = serde_json::from_str(lines[1].strip_prefix(prefix).unwrap()).unwrap();
+    let parsed = plan::JobPlan::from_json(&plan).unwrap();
+    assert_eq!(
+        (parsed.repo.as_str(), parsed.item, parsed.kind.as_str()),
+        ("cgwalters-forge/bot-ops", 9, "research")
+    );
+    assert_eq!(parsed.pool, "claude");
+    for needle in [
+        "Never comment on, review, approve, label, close, push to or otherwise write to any pull request \
+         or anything else in those repositories",
+        "Your only output is one new comment on cgwalters-forge/bot-ops#9",
+        "Never mention embargoed",
+        "- https://github.com/up/a/pull/1 (head aa0000000000)",
+        r#"{"up/a#1":"aa0000000000","up/a#2":"bb0000000000"}"#,
+        maintain::DIGEST_SCHEMA,
+    ] {
+        assert!(parsed.brief.contains(needle), "{needle}: {}", parsed.brief);
+    }
+    assert!(!parsed.brief.contains("up/a#3"), "{}", parsed.brief);
+    // Nothing is posted or dispatched, in an applying pass either.
+    let forge = Forge {
+        replay,
+        ..Forge::new(None, false)
+    };
+    let report = apply(&forge, &config);
+    assert!(maintain_lines(&report)[1].starts_with(prefix));
+    let writes = forge.writes.borrow();
+    assert!(
+        !writes
+            .iter()
+            .any(|(_, url, _)| url.contains("bot-ops/issues/9"))
+    );
+    assert!(!writes.iter().any(|(_, url, _)| url.contains("up/a")));
+}
+
+/// While a digest is due, the other stages leave its share of each pool's
+/// allowance: claude, allowed 54.3%, holds them past 43.4% used, and stage 4
+/// starts nothing. Maintain may use the share and no more: past the
+/// allowance, which claude's burst would let the others go beyond, it waits
+/// too. A digest posted today leaves the whole allowance to the others.
+#[test]
+fn maintain_share_is_left_while_a_digest_is_due() {
+    let openai = "openai is held until 2026-10-24T11:15:10Z";
+    let started = "start triage cgwalters-forge/tracker#446 pool=claude";
+    let others = |used: &str| {
+        format!(
+            "hold pools: claude has used {used}% of the 43.4% that the due maintain digest leaves the other stages; {openai}; new runs wait"
+        )
+    };
+    let posted = vec![digest(5, ("cgwalters-bot", None), 2, json!({}))];
+    let cases = [
+        (
+            "well under",
+            vec![],
+            40.0,
+            Some("claude"),
+            started.to_owned(),
+        ),
+        (
+            "within the share",
+            vec![],
+            45.0,
+            Some("claude"),
+            others("45"),
+        ),
+        ("past the allowance", vec![], 56.0, None, others("56")),
+        ("not due", posted, 45.0, None, started.to_owned()),
+    ];
+    for (name, comments, used, pool, expected) in cases {
+        let due = comments.is_empty();
+        let (config, replay) = maintained(9, comments, used);
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        match (due, pool) {
+            (true, Some(pool)) => assert!(
+                lines[1].contains(&format!(r#""pool":"{pool}""#)),
+                "{name}: {lines:#?}"
+            ),
+            (true, None) => assert_eq!(
+                lines[1],
+                format!(
+                    "maintain: no pool: claude has used {used}% of the 54.3% of its allowance, past which maintain does not start; {openai}"
+                ),
+                "{name}"
+            ),
+            (false, _) => assert_eq!(lines.len(), 1, "{name}: {lines:#?}"),
+        }
+        assert!(
+            report.lines.contains(&expected),
+            "{name}: {expected}: {:#?}",
+            report.lines
+        );
+    }
+}
+
 /// `--max-dispatch` starts the first runs the pass would and holds the rest,
 /// a line each, writing nothing for them; a preview of the recorded board
 /// plans what a local apply over it starts. A start is a dispatch, not a
@@ -3427,6 +3669,23 @@ fn revisit(section: Value) -> Value {
         "usage": {"repository": "o/ops", "issue": 1}, "revisit": section})
 }
 
+/// A `maintain` section, its keys replaced by `edit`'s.
+fn maintain_section(edit: Value) -> Value {
+    let mut section = json!({"repos": ["up/a", "up/b"], "share": 0.2,
+        "digest": {"repository": "o/ops", "issue": 7}, "hourUtc": 9});
+    section
+        .as_object_mut()
+        .unwrap()
+        .extend(edit.as_object().unwrap().clone());
+    section
+}
+
+/// The keys a `maintain` section needs beside it: pool `a`, paced.
+fn maintain(edit: Value) -> Value {
+    json!({"pools": {"a": {}}, "usage": {"repository": "o/ops", "issue": 1},
+        "maintain": maintain_section(edit)})
+}
+
 #[test]
 fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
@@ -3534,6 +3793,40 @@ fn config_table() {
             revisit(json!({"perPass": 1, "afterDays": 14, "every": 1})),
             "unknown field `every`",
         ),
+        (
+            json!({"maintain": maintain_section(json!({}))}),
+            "maintain needs pools",
+        ),
+        (
+            maintain(json!({"repos": []})),
+            "maintain repos does not name 1 to 10 repositories",
+        ),
+        (
+            maintain(json!({"repos": ["up/a", "UP/A"]})),
+            "maintain repos names UP/A twice",
+        ),
+        (maintain(json!({"repos": ["up"]})), "invalid repository"),
+        (
+            maintain(json!({"share": 0})),
+            "maintain share is not above 0 and below 1",
+        ),
+        (
+            maintain(json!({"share": 1})),
+            "maintain share is not above 0 and below 1",
+        ),
+        (
+            maintain(json!({"hourUtc": 24})),
+            "maintain hourUtc is not 0 to 23",
+        ),
+        (
+            maintain(json!({"digest": {"repository": "up/a", "issue": 1}})),
+            "maintain digest repository is one of maintain repos",
+        ),
+        (
+            maintain(json!({"digest": {"repository": "o/ops", "issue": 0}})),
+            "maintain digest issue is not a positive number",
+        ),
+        (maintain(json!({"pools": ["a"]})), "unknown field `pools`"),
         (
             json!({"epics": {"repository": "o/r", "inAnyRepository": true}}),
             "unknown field `inAnyRepository`",
