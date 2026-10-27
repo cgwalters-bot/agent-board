@@ -2704,7 +2704,11 @@ fn on_digest(id: u64, from: Option<&str>, heads: Value) -> Value {
             )
         }
         None => {
-            let block = json!({"schema": maintain::DIGEST_SCHEMA, "heads": heads, "prs": []});
+            let approve: Vec<Value> = (heads.as_object().into_iter().flatten())
+                .map(|(pr, head)| json!({"pr": pr, "head": head, "reason": "Small; CI green."}))
+                .collect();
+            let block = json!({"schema": maintain::DIGEST_SCHEMA, "date": "2026-10-22",
+                "heads": heads, "approve": approve, "closer": [], "waiting": [], "stale": []});
             format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE)
         }
     };
@@ -3066,8 +3070,10 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
 
 /// The plan names the digest issue as its item, asks for a run that hands
 /// back a comment, forbids any write to the pull requests' repositories and
-/// any mention of embargoed work, and leaves the heads out: the pass
-/// records them itself.
+/// any mention of embargoed work, and leaves the recorded heads out: the
+/// pass records them itself. It gives each pull request's full head, the
+/// day's date, and an example of the digest review's Maintain view reads,
+/// which is the fixture checked against review's parser.
 #[test]
 fn maintain_plans_a_read_only_digest() {
     let (config, replay) = maintained(9, vec![], 40.0);
@@ -3090,13 +3096,31 @@ fn maintain_plans_a_read_only_digest() {
          or anything else in those repositories",
         "Your only output is one new comment on cgwalters-forge/bot-ops#9",
         "Never mention embargoed",
-        "- https://github.com/up/a/pull/1 (head aa0000000000)",
-        maintain::DIGEST_SCHEMA,
+        &format!(
+            "- https://github.com/up/a/pull/1 (up/a#1, head {})",
+            head("aa")
+        ),
+        &format!(
+            "- https://github.com/up/a/pull/2 (up/a#2, head {})",
+            head("bb")
+        ),
+        "whose checks all passed at the head listed below, with a reason that says so",
+        "`date` is 2026-10-23.",
+        "the full head listed above, copied exactly",
     ] {
         assert!(parsed.brief.contains(needle), "{needle}: {}", parsed.brief);
     }
-    for needle in ["up/a#3", "\"up/a#1\"", "heads\""] {
+    for needle in ["up/a#3", "\"up/a#1\"", "heads\"", "aa0000000000)"] {
         assert!(!parsed.brief.contains(needle), "{needle}: {}", parsed.brief);
+    }
+    let fixture = include_str!("../../../../fixtures/pass/maintain-digest.md");
+    let fixture = plan::fenced_json(fixture, maintain::DIGEST_FENCE).unwrap();
+    let shown = plan::fenced_json(&parsed.brief, maintain::DIGEST_FENCE).unwrap();
+    assert_eq!(shown, fixture);
+    let fixture = fixture.unwrap();
+    assert_eq!(fixture["schema"], maintain::DIGEST_SCHEMA);
+    for group in ["approve", "closer", "waiting", "stale"] {
+        assert!(!fixture[group].as_array().unwrap().is_empty(), "{group}");
     }
 }
 
@@ -3141,6 +3165,12 @@ fn maintain_records_its_plan_and_lists_once_a_day() {
     };
     let body = text(posted, "/body");
     assert!(body.starts_with(maintain::PLAN_MARKER), "{body}");
+    // The brief's example stays inside a JSON string: the bot's plan comment
+    // holds no digest block that review's Maintain view could show.
+    assert_eq!(
+        plan::fenced_json(body, maintain::DIGEST_FENCE).unwrap(),
+        None
+    );
     let record = plan::fenced_json(body, maintain::PLAN_BLOCK)
         .unwrap()
         .unwrap();
