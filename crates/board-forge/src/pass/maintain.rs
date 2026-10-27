@@ -10,13 +10,38 @@
 //! heads a prompt injection wrote there could keep a pull request out of
 //! review for good.
 //!
-//! No run kind can publish only that comment yet: the caller's `research`
-//! and `triage` runs may comment on any item of their repository, and their
-//! logs and artifacts are public, while the digest belongs on a private
-//! issue. So the stage stops at the run's plan, which it prints and records;
-//! it dispatches nothing.
+//! The run is a `research` run of the caller's, whose comment, logs and
+//! artifacts are public. So the stage dispatches the run's plan only where
+//! the digest repository is public, read as such; on a private one, or one
+//! whose visibility it cannot read, it stops at the plan, which it prints
+//! and records.
 use super::*;
 use serde::Serialize;
+use std::cell::Cell;
+
+/// Track the dispatch transport, not the plan protocol's preparatory writes.
+/// Once a request reaches this transport a lost response can hide a start.
+struct Attempt<'a, C> {
+    client: &'a C,
+    maybe_started: Cell<bool>,
+}
+
+impl<C: Rest> Rest for Attempt<'_, C> {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+        self.client.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        let response = self.client.send(method, url, body);
+        // Match dispatch::GitHub's refusal classification. A 422 fallback
+        // starts nothing; the next request, if any, supplies its own outcome.
+        self.maybe_started.set(match &response {
+            Ok((status, _)) => !(400..500).contains(status),
+            Err(_) => true,
+        });
+        response
+    }
+}
 
 /// The schema of the JSON block a digest comment carries.
 pub const DIGEST_SCHEMA: &str = "agent-board/maintain-digest/v1";
@@ -369,22 +394,27 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// With [`Config::maintain`], before stage 2: the day's digest, if it is
     /// due, planned, and while it is due the other stages left the rest of
     /// each pool's allowance. `cached` is what an earlier pass decided
-    /// ([`Day`]); what this one decided goes in [`Report::maintain`].
-    pub(super) fn maintain(&mut self, cached: Option<Day>) {
+    /// ([`Day`]); what this one decided goes in [`Report::maintain`]. How
+    /// many runs it started, on `git_ref`'s dispatch workflow.
+    pub(super) fn maintain(&mut self, cached: Option<Day>, git_ref: &str) -> usize {
         let config = self.config;
         let Some(maintain) = &config.maintain else {
-            return;
+            return 0;
         };
         // A failure before deriving the new day must not lose the creation
         // receipt, including when follow produces a replacement poll state.
         self.report.maintain = cached.clone();
-        if let Err(error) = self.digest(maintain, cached) {
-            self.report.failures += 1;
-            self.line(format!("maintain error: {error:#}"));
+        match self.digest(maintain, cached, git_ref) {
+            Ok(started) => started,
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("maintain error: {error:#}"));
+                0
+            }
         }
     }
 
-    fn digest(&mut self, maintain: &Maintain, cached: Option<Day>) -> Result<()> {
+    fn digest(&mut self, maintain: &Maintain, cached: Option<Day>, git_ref: &str) -> Result<usize> {
         let config = self.config;
         let from = due_from(self.now, maintain.hour_utc)?;
         if self.now < from {
@@ -392,7 +422,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 "maintain: not due until {}",
                 from.format(&Rfc3339)?
             ));
-            return Ok(());
+            return Ok(0);
         }
         let stamp = from.format(&Rfc3339)?;
         let next = (from + time::Duration::days(1)).format(&Rfc3339)?;
@@ -421,16 +451,19 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 "maintain: done for today; the next is due from {next}"
             ));
             self.report.maintain = Some(day.clone());
-            return Ok(());
+            return Ok(0);
         }
+        let fresh = cached.is_none();
         let repos = match cached {
             Some(day) => day.repos,
-            None => {
-                let repos = self.derive(maintain)?;
-                self.line(format!("maintain: repositories: {}", repos.join(", ")));
-                repos
-            }
+            None => self.derive(maintain)?,
         };
+        // Includes and cached rankings are not evidence of current visibility.
+        // Validate before listing pulls or emitting any repository names.
+        self.public_sources(&repos)?;
+        if fresh {
+            self.line(format!("maintain: repositories: {}", repos.join(", ")));
+        }
         self.report.maintain = Some(Day {
             from: stamp.clone(),
             repos: repos.clone(),
@@ -456,7 +489,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     "maintain: today's plan is {url}; the next is due from {next}"
                 ));
                 self.settle();
-                return Ok(());
+                return Ok(0);
             }
             Some((url, Ok((_, heads)))) => (heads.clone(), url.clone()),
             Some((url, Err(why))) => (
@@ -474,7 +507,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 "maintain: none of {n} incoming pull request(s) changed since {since}"
             ));
             self.settle();
-            return Ok(());
+            return Ok(0);
         }
         let review = &changed[..changed.len().min(REVIEW_LIMIT)];
         let names: Vec<&str> = review.iter().map(|p| p.key.as_str()).collect();
@@ -497,6 +530,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             )
         });
         let all: Vec<String> = config.pools.0.iter().map(|(n, _)| n.clone()).collect();
+        let mut started = 0;
         match choose(own.as_ref(), &config.pools, &all, self.now) {
             Ok(pool) => {
                 let more = changed.len() - review.len();
@@ -506,12 +540,31 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     "brief": brief(config, maintain, from.date(), &repos, review, more),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
-                self.line(format!(
-                    "maintain: plan only; no run kind publishes only the digest: {plan}"
-                ));
                 let record =
                     json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": carried, "plan": plan});
-                self.record_plan(on, comment.as_ref(), &record);
+                let issue = ItemRef {
+                    host: DEFAULT_HOST.into(),
+                    repository: on.0.into(),
+                    number: on.1,
+                };
+                let repo = on.0;
+                let dry = match self.public(repo) {
+                    Ok(true) => None,
+                    Ok(false) => Some(format!("{repo} is not public")),
+                    Err(error) => Some(format!("cannot read whether {repo} is public: {error:#}")),
+                };
+                if let Some(why) = dry {
+                    self.line(format!("maintain: plan only; {why}: {plan}"));
+                    self.record_plan(on, comment.as_ref(), &record, false);
+                } else if self.start_digest(&issue, &pool, &plan, git_ref)? {
+                    started = 1;
+                    self.record_plan(on, comment.as_ref(), &record, true);
+                    // Started, or sent and perhaps started: not again today,
+                    // its heads recorded or not.
+                    if self.apply {
+                        self.settle();
+                    }
+                }
             }
             Err(why) => self.line(format!("maintain: no pool: {why}")),
         }
@@ -520,7 +573,145 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             let why = "that the due maintain digest leaves the other stages";
             self.snapshot = Some(Some(reserve(&snapshot, 1.0 - maintain.share, why)));
         }
+        Ok(started)
+    }
+
+    /// Whether `repo` is public, as GitHub's `private` and `visibility`
+    /// both say; an error where it cannot read them.
+    fn public(&self, repo: &str) -> Result<bool> {
+        let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
+        ensure!(
+            response.status == 200,
+            "GitHub HTTP status {}",
+            response.status
+        );
+        let body = &response.body;
+        match (body["private"].as_bool(), body["visibility"].as_str()) {
+            (Some(private), Some(visibility)) => Ok(!private && visibility == "public"),
+            _ => bail!("GitHub names neither its private nor its visibility"),
+        }
+    }
+
+    fn public_sources(&self, repos: &[String]) -> Result<()> {
+        for repo in repos {
+            // Do not include the name or transport error in public diagnostics.
+            ensure!(
+                self.public(repo).unwrap_or(false),
+                "a maintain source repository is nonpublic or unreadable"
+            );
+        }
         Ok(())
+    }
+
+    /// Starts the digest's `plan` on `issue` in `pool` as stage 4 starts a
+    /// triage run: within WIP and the budget, and `--max-dispatch`, posted
+    /// as a writer's plan and dispatched by the plan protocol. The heads are
+    /// recorded after it, so `--max-writes` must leave that write too, or
+    /// the next pass would start it again. Whether it started, or was sent
+    /// and perhaps started; a preview says it would.
+    fn start_digest(
+        &mut self,
+        issue: &ItemRef,
+        pool: &str,
+        plan: &Value,
+        git_ref: &str,
+    ) -> Result<bool> {
+        let line = format!(
+            "maintain: start {DIGEST_KIND} {} pool={pool}",
+            issue.display()
+        );
+        if let Some(why) = self.budget_hold(1.0) {
+            self.line(format!("maintain: {why}; the digest waits"));
+            return Ok(false);
+        }
+        if let Some(why) = self.other_holds() {
+            self.line(format!("maintain: {why}; the digest waits"));
+            return Ok(false);
+        }
+        let target = self.config.target(git_ref);
+        target.validate()?;
+        let (active, _) = self.runs(&target)?;
+        let wip = self.config.wip as usize;
+        if active.len() >= wip {
+            self.line(format!(
+                "maintain: wip: {} of {wip} runs active; the digest waits",
+                active.len()
+            ));
+            return Ok(false);
+        }
+        for kind in [Kind::Dispatch, Kind::Write] {
+            if let Some(held) = self.caps.check(kind) {
+                self.line(format!("{held}: {line}"));
+                return Ok(false);
+            }
+        }
+        // Do not adopt heads or receipts from discovered comments. They may
+        // nevertheless veto a fresh start: after cache loss (or a failed
+        // head-record write), an existing research plan is evidence that a
+        // start might already have happened today. This can only deny work.
+        let from = due_from(
+            self.now,
+            self.config
+                .maintain
+                .as_ref()
+                .context("maintain disabled")?
+                .hour_utc,
+        )?;
+        let writers = self.writers();
+        let comments = plan::issue_comments(&self.client, issue)?;
+        if comments.iter().any(|c| {
+            is(c.author.as_deref(), &writers)
+                && c.changed >= from
+                && plan::JobPlan::from_comment(&c.body)
+                    .is_ok_and(|p| p.is_some_and(|p| p.kind == DIGEST_KIND))
+        }) {
+            self.line("maintain: a research plan already exists today; the digest waits".into());
+            return Ok(false);
+        }
+        self.caps.count(Kind::Dispatch);
+        if !self.apply {
+            self.line(line);
+            return Ok(true);
+        }
+        let intro = "The board pass's maintain digest for today: a read-only run, whose only \
+                     output is one comment on this issue.";
+        let id = self.post_plan(issue, intro, plan)?;
+        let scheduled = Scheduled {
+            plan: Some(&id),
+            pool: Some(pool),
+            strict: true,
+            ended: None,
+        };
+        let writers = self.writers();
+        let options = (0, None, None, scheduled);
+        let attempt = Attempt {
+            client: &self.dispatcher,
+            maybe_started: Cell::new(false),
+        };
+        let done = plan::dispatch_with(&self.client, &attempt, issue, &writers, &target, options);
+        let maybe_started = attempt.maybe_started.get();
+        match done {
+            Ok(plan::Dispatched {
+                record: Some(record),
+                run,
+                ..
+            }) => {
+                let run = run.as_deref().unwrap_or("unnamed");
+                self.line(format!("{line} record={record} run={run}"));
+                Ok(true)
+            }
+            Ok(_) => {
+                self.line(format!("{line}: the dispatch waited; the digest waits"));
+                Ok(false)
+            }
+            // Preparation failures and confirmed refusals leave heads pending.
+            // A lost response or server error might still hide a start.
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("{line} failed: {error:#}"));
+                Ok(maybe_started)
+            }
+        }
     }
 
     /// Today's stage is done: later passes today read and list nothing.
@@ -533,7 +724,15 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// Records `record`, the plan and the heads it was planned for, in the
     /// pass's own comment on the digest issue, editing `comment` where there
     /// is one: one write, which `--max-writes` holds and a preview leaves.
-    fn record_plan(&mut self, on: (&str, u64), comment: Option<&Value>, record: &Value) {
+    /// Only where `public`, read so just before, may the repository not be
+    /// private.
+    fn record_plan(
+        &mut self,
+        on: (&str, u64),
+        comment: Option<&Value>,
+        record: &Value,
+        public: bool,
+    ) {
         let said = format!("maintain: record the plan on {}#{}", on.0, on.1);
         if let Some(held) = self.caps.check(Kind::Write) {
             self.line(format!("{held}: {said}"));
@@ -550,7 +749,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
              only it.\n\n```{PLAN_BLOCK}\n{record:#}\n```\n",
             text(record, "/from")
         );
-        match self.publish(on, comment, "maintain plan", body) {
+        let written = if public {
+            self.write_comment(on, comment, "maintain plan", body)
+        } else {
+            self.publish(on, comment, "maintain plan", body)
+        };
+        match written {
             Ok(url) => {
                 self.line(format!("maintain: recorded the plan in {url}"));
                 if let Some(day) = self.report.maintain.as_mut() {

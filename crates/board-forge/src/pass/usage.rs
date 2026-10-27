@@ -567,7 +567,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// and number), `comment`, or a new one, only on a private repository:
     /// the usage snapshot says what the subscriptions are used for, and
     /// when, the hold snapshot what the board's private issues wait on, and
-    /// the maintain plan what the digest reviews. Its URL.
+    /// the maintain plan what a private digest reviews. Its URL.
     pub(in crate::pass) fn publish(
         &self,
         on: (&str, u64),
@@ -575,7 +575,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         name: &str,
         body: String,
     ) -> Result<String> {
-        let (repo, issue) = on;
+        let repo = on.0;
         let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
         ensure!(
             response.status == 200,
@@ -586,6 +586,18 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             response.body["private"] == true,
             "{repo} is not private; the {name} snapshot is not written there"
         );
+        self.write_comment(on, comment, name, body)
+    }
+
+    /// [`Self::publish`] without the private check, for what may be public.
+    pub(in crate::pass) fn write_comment(
+        &self,
+        on: (&str, u64),
+        comment: Option<&Value>,
+        name: &str,
+        body: String,
+    ) -> Result<String> {
+        let (repo, issue) = on;
         let body = json!({"body": body});
         let (method, url) = match comment {
             Some(comment) => {

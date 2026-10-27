@@ -1317,6 +1317,8 @@ struct Forge {
     racing: Option<Late>,
     /// Other runs of the pass's own workflow in progress ([`own`]).
     passes: Vec<Value>,
+    /// A confirmed response to workflow dispatch, instead of a successful start.
+    dispatch_status: Option<u16>,
 }
 
 /// The workflow run an applying pass runs in, a run of workflow 77.
@@ -1355,6 +1357,7 @@ impl Forge {
             late: None,
             racing: None,
             passes: vec![],
+            dispatch_status: None,
         }
     }
 
@@ -1463,6 +1466,9 @@ impl Forge {
             return Ok((200, json!({})));
         }
         if path.ends_with("/dispatches") {
+            if let Some(status) = self.dispatch_status {
+                return Ok((status, json!({"message": "dispatch refused"})));
+            }
             return Ok((200, json!({"workflow_run_id": id})));
         }
         if method == "POST" && path.ends_with("/labels") {
@@ -2794,6 +2800,7 @@ fn maintained_with(hour: u8, comments: Vec<Value>, used: f64, repos: Value) -> (
     }
     let pull = |number: u64, login: &str, sha: &str| json!({"number": number, "user": {"login": login}, "head": {"sha": head(sha)}});
     for repo in LISTED {
+        get(format!("{API_ROOT}repos/{repo}"), visible(true));
         let pulls = match *repo {
             "up/a" => json!([
                 pull(1, "visitor", "aa"),
@@ -2843,6 +2850,10 @@ fn maintain_derives_its_repositories() {
             .extend(edit.as_object().unwrap().clone());
         let (config, mut replay) = maintained_with(9, vec![], 40.0, repos);
         let low = format!("{API_ROOT}repos/low/d/pulls?state=open&per_page=100");
+        replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}repos/low/d")},
+            "answer": {"status": 200, "link": null, "body": visible(true)}}));
         replay.requests.push(json!({"request": {"get": low},
             "answer": {"status": 200, "link": null, "body": []}}));
         let report = preview(&config, &replay);
@@ -3074,17 +3085,48 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
 /// pass records them itself. It gives each pull request's full head, the
 /// day's date, and an example of the digest review's Maintain view reads,
 /// which is the fixture checked against review's parser.
+/// A preview prints it for a nonpublic digest, and otherwise previews a start.
 #[test]
 fn maintain_plans_a_read_only_digest() {
-    let (config, replay) = maintained(9, vec![], 40.0);
-    let report = preview(&config, &replay);
-    let lines = maintain_lines(&report);
-    assert_eq!(
-        lines[3],
-        "maintain: record the plan on cgwalters-forge/bot-ops#9; a preview records nothing"
-    );
-    let prefix = "maintain: plan only; no run kind publishes only the digest: ";
-    let plan: Value = serde_json::from_str(lines[2].strip_prefix(prefix).unwrap()).unwrap();
+    let not_public = "maintain: plan only; cgwalters-forge/bot-ops is not public: ";
+    let unread = "maintain: plan only; cannot read whether cgwalters-forge/bot-ops is public: ";
+    // The digest repository as GitHub answers it, if it does, and the start
+    // of the line the preview prints for the digest.
+    let cases = [
+        (Some(visible(false)), not_public),
+        (
+            Some(json!({"private": true, "visibility": "internal"})),
+            not_public,
+        ),
+        (None, unread),
+        (Some(json!({"private": false})), unread),
+        (
+            Some(visible(true)),
+            "maintain: start research cgwalters-forge/bot-ops#9 pool=claude",
+        ),
+    ];
+    let mut plans = vec![];
+    for (visibility, expected) in cases {
+        let (config, mut replay) = maintained(9, vec![], 40.0);
+        if let Some(body) = &visibility {
+            digest_visibility(&mut replay, body.clone());
+        }
+        let report = preview(&config, &replay);
+        let lines = maintain_lines(&report);
+        assert!(lines[2].starts_with(expected), "{visibility:?} {lines:#?}");
+        assert_eq!(
+            lines[3],
+            "maintain: record the plan on cgwalters-forge/bot-ops#9; a preview records nothing"
+        );
+        if let Some(at) = lines[2].find(": {\"") {
+            plans.push(lines[2][at + 2..].to_owned());
+        }
+    }
+    let [plan, ..] = &plans[..] else {
+        panic!("no plan printed")
+    };
+    assert_eq!(plans.len(), 4);
+    let plan: Value = serde_json::from_str(plan).unwrap();
     let parsed = plan::JobPlan::from_json(&plan).unwrap();
     assert_eq!(
         (parsed.repo.as_str(), parsed.item, parsed.kind.as_str()),
@@ -3124,9 +3166,255 @@ fn maintain_plans_a_read_only_digest() {
     }
 }
 
+/// A repository as GitHub names it: public, or private.
+fn visible(public: bool) -> Value {
+    let visibility = if public { "public" } else { "private" };
+    json!({"private": !public, "visibility": visibility})
+}
+
+/// The recording answering the read of the digest repository with `body`.
+fn digest_visibility(replay: &mut Replay, body: Value) {
+    replay.requests.push(json!({
+        "request": {"get": format!("{API_ROOT}repos/cgwalters-forge/bot-ops")},
+        "answer": {"status": 200, "link": null, "body": body},
+    }));
+}
+
+/// An applying pass starts the digest's run only where the digest
+/// repository is public and a WIP slot is free: it posts the plan on the
+/// digest issue, dispatches it and records the heads there, and the day is
+/// done. A private repository, or one whose visibility it cannot read, gets
+/// the recorded plan alone; with no slot free, nothing is written, and a
+/// later pass tries again.
+#[test]
+fn maintain_dispatches_only_a_public_digest() {
+    let started = "maintain: start research cgwalters-forge/bot-ops#9 pool=claude record=";
+    // The recording has 2 runs in flight.
+    let waits = "maintain: wip: 2 of 2 runs active; the digest waits";
+    let unread = "maintain: plan only; cannot read whether cgwalters-forge/bot-ops is public: ";
+    // The repository's answer, the WIP limit, and the line the pass says.
+    let cases = [
+        (visible(true), 8, started),
+        (
+            visible(false),
+            8,
+            "maintain: plan only; cgwalters-forge/bot-ops is not public: ",
+        ),
+        // Read without its visibility: private by `private`, so the plan
+        // is recorded, but it is not read as public.
+        (json!({"private": true}), 8, unread),
+        (visible(true), 2, waits),
+    ];
+    for (visibility, wip, expected) in cases {
+        let name = format!("{visibility} wip {wip}");
+        let (mut config, mut replay) = maintained(9, vec![], 40.0);
+        config.wip = wip;
+        digest_visibility(&mut replay, visibility);
+        replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}user")},
+            "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+        let forge = Forge {
+            replay,
+            ..Forge::new(None, false)
+        };
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines = maintain_lines(&report);
+        assert!(lines[2].starts_with(expected), "{name}: {lines:#?}");
+        let dispatched = expected == started;
+        let digests = (forge.dispatches().into_iter())
+            .filter(|d| d == "cgwalters-forge/bot-ops#9")
+            .count();
+        assert_eq!(digests, usize::from(dispatched), "{name}");
+        let comments = forge.comments_on("cgwalters-forge/bot-ops", 9);
+        let plans: Vec<Value> = (comments.iter())
+            .filter_map(|c| plan::fenced_json(c, PLAN_FENCE).unwrap())
+            .collect();
+        assert_eq!(plans.len(), usize::from(dispatched), "{name}");
+        if let [plan] = &plans[..] {
+            assert_eq!(
+                (&plan["kind"], &plan["item"]),
+                (&json!("research"), &json!(9))
+            );
+        }
+        let recorded = comments
+            .iter()
+            .any(|c| c.starts_with(maintain::PLAN_MARKER));
+        assert_eq!(recorded, expected != waits, "{name}");
+        assert_eq!(report.maintain.unwrap().done, expected != waits, "{name}");
+        let writes = forge.writes.borrow();
+        assert!(
+            !writes.iter().any(|(_, url, _)| url.contains("up/a")),
+            "{name}"
+        );
+    }
+}
+
+/// Includes and a reused ranking must both pass a fresh visibility read,
+/// before their names or pull request material reaches public output.
+#[test]
+fn maintain_rejects_nonpublic_sources() {
+    for cached in [false, true] {
+        for (status, body) in [
+            (200, visible(false)),
+            (200, json!({"private": false, "visibility": "internal"})),
+            (200, json!({"private": false})),
+            (404, json!({})),
+        ] {
+            let (mut config, mut replay) = maintained(9, vec![], 40.0);
+            config.maintain.as_mut().unwrap().repos.include = vec!["up/a".into()];
+            digest_visibility(&mut replay, visible(true));
+            let mut state = State::default();
+            if cached {
+                state.maintain = preview(&config, &replay).maintain;
+            }
+            let response = answer(&mut replay, &format!("{API_ROOT}repos/up/a"));
+            response["status"] = status.into();
+            response["body"] = body;
+            let forge = Forge {
+                replay,
+                ..Forge::new(None, false)
+            };
+            let report = block(run(
+                &forge,
+                &forge,
+                &config,
+                state,
+                (Mode::Actions(&own()), Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(report.failures, 1, "{:#?}", report.lines);
+            assert_eq!(
+                maintain_lines(&report),
+                ["maintain error: a maintain source repository is nonpublic or unreadable"]
+            );
+            assert!(forge.comments_on("cgwalters-forge/bot-ops", 9).is_empty());
+        }
+    }
+}
+
+#[test]
+fn maintain_resolves_a_ref_without_work_or_follow() {
+    let (mut config, mut replay) = maintained(9, vec![], 40.0);
+    config.work_repositories.clear();
+    config.follow.clear();
+    config.dispatch_ref = None;
+    digest_visibility(&mut replay, visible(true));
+    replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    replay.requests.push(
+        json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/tracker")},
+        "answer": {"status": 200, "link": null, "body": {"default_branch": "main"}}}),
+    );
+    let forge = Forge {
+        replay,
+        ..Forge::new(None, false)
+    };
+    let report = apply(&forge, &config);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(forge.dispatches(), ["cgwalters-forge/bot-ops#9"]);
+    let writes = forge.writes.borrow();
+    let (_, _, body) = writes
+        .iter()
+        .find(|(_, url, _)| url.ends_with("/dispatches"))
+        .unwrap();
+    assert_eq!(body["ref"], "main");
+}
+
+/// Maintain runs before stage 4, but must use the same admission gate before
+/// posting a plan: another pass may take the last free slot after our read.
+#[test]
+fn maintain_waits_for_an_overlapping_pass() {
+    for unreadable in [false, true] {
+        let (mut config, mut replay) = maintained(9, vec![], 40.0);
+        config.wip = 3; // Two dispatch runs are active; one slot is free.
+        config.work_repositories.clear();
+        digest_visibility(&mut replay, visible(true));
+        let forge = Forge {
+            replay,
+            passes: vec![json!({"id": 4243,
+                "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/4243"})],
+            ..Forge::new(unreadable.then_some("workflows/77/runs?"), false)
+        };
+        let report = apply(&forge, &config);
+        let why = if unreadable {
+            "whether another pass is in progress is unknown"
+        } else {
+            "another pass is in progress, https://github.com/cgwalters-forge/tracker/actions/runs/4243"
+        };
+        assert!(
+            maintain_lines(&report)
+                .iter()
+                .any(|l| l.starts_with(&format!("maintain: {why}"))),
+            "{:#?}",
+            report.lines
+        );
+        assert!(!report.maintain.unwrap().done);
+        assert!(forge.writes.borrow().is_empty());
+    }
+}
+
+/// Failed preparation must not mark heads reviewed; lost send responses
+/// still settle the day. Discovered plans only veto recovery, never supply
+/// trusted heads, including when the poll cache is lost after a public run.
+#[test]
+fn maintain_dispatch_failures_and_cache_loss() {
+    for case in ["writer", "readback", "403", "422", "500", "send", "success"] {
+        let (mut config, mut replay) = maintained(9, vec![], 40.0);
+        config.work_repositories.clear();
+        digest_visibility(&mut replay, visible(true));
+        let login = if case == "writer" {
+            "visitor"
+        } else {
+            "cgwalters-bot"
+        };
+        replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}user")},
+            "answer": {"status": 200, "link": null, "body": {"login": login}}}));
+        let forge = Forge {
+            replay,
+            login,
+            dispatch_status: case.parse().ok(),
+            ..Forge::new(
+                (case == "send").then_some("/dispatches"),
+                case == "readback",
+            )
+        };
+        let report = apply(&forge, &config);
+        let sent = matches!(case, "500" | "send" | "success");
+        assert_eq!(
+            report.failures,
+            usize::from(case != "success"),
+            "{case}: {:#?}",
+            report.lines
+        );
+        assert_eq!(report.maintain.as_ref().unwrap().done, sent, "{case}");
+        let recorded = forge
+            .comments_on("cgwalters-forge/bot-ops", 9)
+            .iter()
+            .any(|c| c.starts_with(maintain::PLAN_MARKER));
+        assert_eq!(recorded, sent, "{case}");
+        let before = forge.dispatches();
+        let retry = apply(&forge, &config);
+        assert_eq!(retry.failures, 0, "{case}: {:#?}", retry.lines);
+        assert!(
+            maintain_lines(&retry)
+                .contains(&"maintain: a research plan already exists today; the digest waits"),
+            "{case}: {:#?}",
+            retry.lines
+        );
+        assert_eq!(forge.dispatches(), before, "{case}");
+    }
+}
+
 /// An applying pass records the plan and the heads it was planned for in
-/// its own comment on the digest issue, and writes nothing else; nothing
-/// is dispatched. Later passes the same day read its state and search, read
+/// its own comment on a private digest issue, and writes nothing else;
+/// nothing is dispatched. Later passes the same day read its state and search, read
 /// and list nothing; one whose state was lost trusts no existing marker.
 /// Before it records a plan, a pass reuses the day's
 /// repositories and does not search again.
@@ -3136,7 +3424,7 @@ fn maintain_records_its_plan_and_lists_once_a_day() {
     let recording = || {
         let (_, mut replay) = maintained(9, vec![], 40.0);
         for (url, body) in [
-            ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+            ("repos/cgwalters-forge/bot-ops", visible(false)),
             ("user", json!({"login": "cgwalters-bot"})),
         ] {
             replay
@@ -3294,7 +3582,7 @@ fn maintain_requires_its_creation_receipt() {
     for (name, state, comments) in cases {
         let (config, mut replay) = maintained(9, comments, 40.0);
         for (url, body) in [
-            ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+            ("repos/cgwalters-forge/bot-ops", visible(false)),
             ("user", json!({"login": "cgwalters-bot"})),
         ] {
             replay
