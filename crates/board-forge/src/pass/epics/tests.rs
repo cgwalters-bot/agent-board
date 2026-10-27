@@ -726,10 +726,11 @@ fn second_empty_plan_labels_and_asks() {
 }
 
 /// [`decide`] on tracker#890's recorded facts at other times: changes wait
-/// three hours after the last plan unless the operator speaks; a day after
-/// it, an epic with nothing open and nothing changed is left alone; and the
-/// operator's word plans an epic whose plan is invalid once, not again after
-/// the request it led to.
+/// three hours after the last plan unless the operator speaks, twice as
+/// long for each apply in a row that had nothing to do; an unchanged epic
+/// is left alone however long after, the bot's comments notwithstanding;
+/// and the operator's word plans an epic whose plan is invalid once, not
+/// again after the request it led to.
 #[test]
 fn decide_coalesces_changes_but_not_direction() {
     let replay = replay();
@@ -797,8 +798,15 @@ fn decide_coalesces_changes_but_not_direction() {
     settled.priorities = receipt[0].detail.priorities();
     let mut empty = settled.clone();
     empty.census.closed.append(&mut empty.census.sub_issues);
+    // An apply after it that had nothing to do, the `n`th.
+    let nothing = |n: u64| {
+        let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": receipt[0].detail.plan,
+            "outcome": "applied", "actions": [], "fingerprint": baseline});
+        let body = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER);
+        note(20 + n, "cgwalters-bot", "2026-10-23T14:00:00Z", &body)
+    };
     // The facts, the recorded comments and more, the time, and the start
-    // of what comes of it.
+    // of what comes of it; a time after `3 ` sets `triageFollowUpDays` to 3.
     type Case<'a> = (
         &'a EpicFacts,
         &'a Vec<Comment>,
@@ -842,12 +850,27 @@ fn decide_coalesces_changes_but_not_direction() {
             "2026-10-23T20:00:00Z",
             "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z\")",
         ),
+        // Unchanged, it is not planned again a day or a week later.
         (
             &settled,
             &recorded,
             vec![],
             "2026-10-24T14:00:00Z",
-            "Plan(\"planned last 2026-10-23T13:42:20Z\")",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T13:42:20Z\")",
+        ),
+        (
+            &settled,
+            &recorded,
+            vec![say("cgwalters-bot", "2026-10-25T14:00:00Z")],
+            "2026-10-30T14:00:00Z",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since",
+        ),
+        (
+            &settled,
+            &recorded,
+            vec![say("cgwalters", "2026-10-25T14:00:00Z")],
+            "2026-10-30T14:00:00Z",
+            "Plan(\"operator direction since it was last planned\")",
         ),
         (
             &empty,
@@ -861,7 +884,44 @@ fn decide_coalesces_changes_but_not_direction() {
             &all_closed,
             vec![],
             "2026-10-24T14:00:00Z",
-            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing is open",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since",
+        ),
+        // Each apply in a row that had nothing to do doubles the three
+        // hours, up to `triageFollowUpDays`.
+        (
+            &facts,
+            &recorded,
+            vec![nothing(1)],
+            "3 2026-10-23T18:00:00Z",
+            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+        ),
+        (
+            &facts,
+            &recorded,
+            vec![nothing(1)],
+            "3 2026-10-23T20:00:00Z",
+            "Plan(\"its sub-issues changed",
+        ),
+        (
+            &facts,
+            &recorded,
+            vec![nothing(1), nothing(2)],
+            "3 2026-10-23T20:00:00Z",
+            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+        ),
+        (
+            &facts,
+            &recorded,
+            vec![nothing(1), nothing(2)],
+            "3 2026-10-24T02:00:00Z",
+            "Plan(\"its sub-issues changed",
+        ),
+        (
+            &facts,
+            &recorded,
+            vec![nothing(1), nothing(2)],
+            "2026-10-23T18:00:00Z",
+            "Plan(\"its sub-issues changed",
         ),
         (
             &facts,
@@ -881,6 +941,7 @@ fn decide_coalesces_changes_but_not_direction() {
     for (facts, base, extra, now, expected) in cases {
         let mut all = base.clone();
         all.extend(extra);
+        let (follow_up_days, now) = now.split_once(' ').unwrap_or(("0", now));
         let next = decide(&Inputs {
             epic: facts,
             comments: &all,
@@ -888,6 +949,7 @@ fn decide_coalesces_changes_but_not_direction() {
             bot: "cgwalters-bot",
             busy: None,
             now: at(now),
+            follow_up_days: follow_up_days.parse().unwrap(),
         });
         let got = format!("{next:?}");
         assert!(got.starts_with(expected), "{now}: {got}");

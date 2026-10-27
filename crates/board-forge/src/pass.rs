@@ -27,6 +27,7 @@ use holds::{Entry, Hold, HoldKind, PassSummary, Scope, Wip};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -127,6 +128,15 @@ const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 const ASK_VERDICTS: &[&str] = &["done", "needs-design", "needs-operator"];
 /// What a triage plan posted again by [`Scheduler::follow_up`] says first.
 const AGAIN: &str = "The board pass asks a triage run to plan this issue again.";
+/// The hidden line a triage plan comment carries after its intro, with
+/// `triageFollowUpDays` or `revisit`: the [`fingerprint`] of what its run
+/// read, `<!-- agent-board-inputs: HASH -->` (agent-board#383).
+const INPUTS_MARKER: &str = "agent-board-inputs";
+/// Hex characters of a [`fingerprint`] kept.
+const FINGERPRINT_CHARS: usize = 16;
+/// How long a triage that had nothing to do waits before a follow-up, at
+/// first; each follow-up in a row doubles it ([`backoff`]).
+const FOLLOW_UP_SECONDS: i64 = 24 * 60 * 60;
 /// What a triage plan posted by [`Scheduler::replan`] says first.
 const REPLAN: &str = "The board pass asks a triage run to plan the rest of this issue: \
                       its last planned run ended and the issue is still open.";
@@ -205,7 +215,7 @@ const FRESH_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
 /// plan in its body ([`Config::body_plans`]).
 const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
-    url body createdAt lastEditedAt author { login } editor { login }
+    url title body createdAt lastEditedAt author { login } editor { login }
   } }
 }
 "#;
@@ -252,8 +262,9 @@ pub struct Config {
     /// None: `planPools`.
     pub triage_pools: Option<Vec<String>>,
     /// Off at 0: else a triage that ended without a plan is followed up by
-    /// its verdict, and triaged again this many days after it
-    /// ([`Scheduler::follow_up`]).
+    /// its verdict, and triaged again once its inputs changed, waiting at
+    /// most this many days ([`Scheduler::follow_up`]); also the most an
+    /// epic's planning backs off.
     #[serde(default)]
     pub triage_follow_up_days: u64,
     /// Off at 0: else an issue still open after its implement plan's run
@@ -1063,6 +1074,51 @@ fn key(issue: &ItemRef) -> String {
 
 fn is(login: Option<&str>, who: &[&str]) -> bool {
     login.is_some_and(|l| who.iter().any(|w| w.eq_ignore_ascii_case(l)))
+}
+
+/// What a triage of `facts` reads, hashed: the issue's `title` and `body`,
+/// the `comments` of anyone but `bot`, its labels, Priority, open
+/// dependencies and open closing pull requests. The bot's own comments (its
+/// plans, records and verdicts) are left out, so that its own writes never
+/// make an issue due again.
+fn fingerprint(
+    facts: &Facts,
+    (title, body): (&str, &str),
+    comments: &[plan::Comment],
+    bot: &str,
+) -> String {
+    let said: Vec<(Option<&str>, &str)> = (comments.iter())
+        .filter(|c| !is(c.author.as_deref(), &[bot]))
+        .map(|c| (c.author.as_deref(), c.body.as_str()))
+        .collect();
+    let labels: BTreeSet<&str> = facts.labels.iter().map(String::as_str).collect();
+    let pulls: BTreeSet<String> = (facts.pulls.iter())
+        .map(|(number, repository, _)| format!("{repository}#{number}"))
+        .collect();
+    let read = json!([
+        title,
+        body,
+        said,
+        labels,
+        facts.priority,
+        facts.blocked_by,
+        pulls
+    ]);
+    let digest = format!("{:x}", Sha256::digest(read.to_string().as_bytes()));
+    digest[..FINGERPRINT_CHARS].to_owned()
+}
+
+/// The [`fingerprint`] a triage plan comment's [`INPUTS_MARKER`] line carries.
+fn carried(body: &str) -> Option<&str> {
+    let start = format!("<!-- {INPUTS_MARKER}: ");
+    let line = body.lines().find_map(|l| l.strip_prefix(start.as_str()))?;
+    line.strip_suffix(" -->")
+}
+
+/// `base` seconds doubled for each of the `empty` runs in a row that had
+/// nothing to do, up to `cap` (agent-board#383).
+fn backoff(base: i64, empty: usize, cap: i64) -> i64 {
+    base.saturating_mul(1 << empty.min(30)).min(cap)
 }
 
 /// Why a person keeps the pass off an item: its labels unread, a hold label,
@@ -2532,13 +2588,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let issue = &facts.issue;
         let comments = plan::issue_comments(&self.client, issue)?;
+        let read = (&facts, comments.as_slice());
         // The body's plan, posted as a comment at its start, which the plan
         // protocol then dispatches and records as any other.
         let (plan, id, body) = if plan::no_plan(&comments, &writers) {
             match self.body_plan(&facts, board)? {
                 None => {
                     let intro = "The board pass asks a triage run to plan this issue.";
-                    return self.triage(issue, intro, (snapshot, target, slots));
+                    return self.triage(read, intro, (snapshot, target, slots));
                 }
                 Some(Err(why)) => return Ok(Step::Hold(Hold::new(HoldKind::Other, why))),
                 Some(Ok((plan, block, read))) => (plan, "body".to_owned(), Some((block, read))),
@@ -2556,10 +2613,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 batch::held(&self.client, &comments, &writers, &id, issue)?.first()
             {
                 if plan.kind == "triage" && config.triage_follow_up_days > 0 {
-                    return self.follow_up(issue, &comments, record, (snapshot, target, slots));
+                    return self.follow_up(read, (from, record), (snapshot, target, slots));
                 }
                 if plan.kind == "implement" && config.replan_after_days > 0 {
-                    return self.replan(issue, &id, record, (snapshot, target, slots));
+                    return self.replan(read, &id, record, (snapshot, target, slots));
                 }
                 let why = format!("plan {id} was dispatched already, {}", record.url);
                 return Ok(Step::Hold(Hold::new(HoldKind::Dispatched, why)));
@@ -2748,14 +2805,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// room. Its plan is posted as the bot's after `intro` and dispatched by
     /// the plan protocol, whose record keeps it from running twice; a triage
     /// run that writes no usable plan leaves that record for a person, or
-    /// with `triageFollowUpDays` for [`Self::follow_up`].
+    /// with `triageFollowUpDays` for [`Self::follow_up`]. `read`: the
+    /// issue's facts and comments, whose [`fingerprint`] the plan carries.
     fn triage(
         &self,
-        issue: &ItemRef,
+        read: (&Facts, &[plan::Comment]),
         intro: &str,
         (snapshot, target, slots): (Option<&Value>, &Target, &Slots),
     ) -> Result<Step> {
         let config = self.config;
+        let issue = &read.0.issue;
         if !config.triage {
             let why = "no plan, and triage is off";
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
@@ -2779,7 +2838,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         );
         brief.push_str(&self.verdict_ask());
         let context = (slots, target, hold as HoldRule);
-        self.start_triage(issue, (&pool, brief, intro), line, context)
+        self.start_triage(issue, (&pool, brief, intro), Some(read), line, context)
     }
 
     /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
@@ -2802,16 +2861,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// cannot label or triage the issue. A comment by the operator after it
     /// triages the issue again: the issue changed. Else a verdict of
     /// [`ASK_VERDICTS`] labels the issue [`NEEDS_HUMAN`], which holds it until
-    /// a person removes the label, and any other verdict, or none, triages it
-    /// again [`Config::triage_follow_up_days`] after it, or after the record.
+    /// a person removes the label. Any other verdict had nothing to do: the
+    /// issue is triaged again once its [`fingerprint`] differs from the one
+    /// its plan `from` carries, a day after the verdict, doubled for each
+    /// follow-up in a row before it, up to
+    /// [`Config::triage_follow_up_days`]. No verdict, where the run may have
+    /// failed, or a plan posted before fingerprints, which carries none, is
+    /// triaged again that many days after the verdict or the record.
     fn follow_up(
         &self,
-        issue: &ItemRef,
-        comments: &[plan::Comment],
-        record: &plan::Comment,
+        read: (&Facts, &[plan::Comment]),
+        (from, record): (&plan::Comment, &plan::Comment),
         (snapshot, target, slots): (Option<&Value>, &Target, &Slots),
     ) -> Result<Step> {
         let config = self.config;
+        let (facts, comments) = read;
         let writers = self.writers();
         let bot = [config.bot.as_str()];
         let unedited = |c: &plan::Comment| {
@@ -2837,8 +2901,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let operator = [config.operator.as_str()];
         if rest.iter().any(|c| is(c.author.as_deref(), &operator)) {
-            return self.triage(issue, AGAIN, (snapshot, target, slots));
+            return self.triage(read, AGAIN, (snapshot, target, slots));
         }
+        let issue = &facts.issue;
         if let Some((_, _, verdict)) = &verdict
             && ASK_VERDICTS.contains(&verdict.as_str())
         {
@@ -2864,16 +2929,61 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!("{said}; label {NEEDS_HUMAN}");
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsHuman, why)));
         }
-        let due = since.changed + time::Duration::days(config.triage_follow_up_days as i64);
-        if self.now >= due {
-            return self.triage(issue, AGAIN, (snapshot, target, slots));
+        let days = time::Duration::days(config.triage_follow_up_days as i64);
+        // Without a verdict the run may have failed: retried after the days.
+        let carried = carried(&from.body).filter(|_| verdict.is_some());
+        let wait = match carried {
+            None => days,
+            Some(_) => {
+                let planned = |c: &&plan::Comment| {
+                    is(c.author.as_deref(), &writers) && plan::has_fence(&c.body, PLAN_FENCE)
+                };
+                let again = (comments.iter().rev())
+                    .filter(planned)
+                    .take_while(|c| c.body.starts_with(AGAIN))
+                    .count();
+                let wait = backoff(FOLLOW_UP_SECONDS, again, days.whole_seconds());
+                time::Duration::seconds(wait)
+            }
+        };
+        let due = since.changed + wait;
+        let from_due = due.format(&Rfc3339).unwrap_or_default();
+        let operator = &config.operator;
+        if self.now < due {
+            let changed = match carried {
+                Some(_) => " if anything changed",
+                None => "",
+            };
+            let why = format!(
+                "{said}; triaged again from {from_due}{changed}, or once {operator} comments"
+            );
+            return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
         }
-        let due = due.format(&Rfc3339).unwrap_or_default();
-        let why = format!(
-            "{said}; triaged again from {due}, or once {} comments",
-            config.operator
-        );
-        Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)))
+        if let Some(carried) = carried
+            && self.inputs(facts, comments)? == carried
+        {
+            let why = format!(
+                "{said}; nothing changed since its triage, triaged again once something does, or once {operator} comments"
+            );
+            return Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)));
+        }
+        self.triage(read, AGAIN, (snapshot, target, slots))
+    }
+
+    /// [`fingerprint`] of an issue as `facts` and `comments` read it, with
+    /// its body read and its closing pull requests completed.
+    fn inputs(&self, facts: &Facts, comments: &[plan::Comment]) -> Result<String> {
+        let mut facts = facts.clone();
+        self.complete_pulls(&mut facts)?;
+        let node = self.issue_node(&facts.issue)?;
+        let title = node["title"].as_str().context("issue has no title")?;
+        let body = plan::comment(&node)?;
+        Ok(fingerprint(
+            &facts,
+            (title, &body.body),
+            comments,
+            &self.config.bot,
+        ))
     }
 
     /// An implement plan `id` dispatched already, on an issue still open
@@ -2884,14 +2994,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// newest, with its own record, so each record is acted on once.
     fn replan(
         &self,
-        issue: &ItemRef,
+        read: (&Facts, &[plan::Comment]),
         id: &str,
         record: &plan::Comment,
         context: (Option<&Value>, &Target, &Slots),
     ) -> Result<Step> {
         let due = record.changed + time::Duration::days(self.config.replan_after_days as i64);
         if self.now >= due {
-            return self.triage(issue, REPLAN, context);
+            return self.triage(read, REPLAN, context);
         }
         let due = due.format(&Rfc3339).unwrap_or_default();
         let why = format!(
@@ -2905,10 +3015,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// held by `--max-dispatch`, planned in a preview, else checked again
     /// under `rule`, its plan posted as the bot's after `intro` and
     /// dispatched by the plan protocol, whose record keeps it from running twice.
+    /// With `triageFollowUpDays` or `revisit`, the plan carries the
+    /// [`fingerprint`] of `read`, the issue's facts and comments.
     fn start_triage(
         &self,
         issue: &ItemRef,
         (pool, brief, intro): (&str, String, &str),
+        read: Option<(&Facts, &[plan::Comment])>,
         line: String,
         (slots, target, rule): (&Slots, &Target, HoldRule),
     ) -> Result<Step> {
@@ -2931,7 +3044,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "pool": pool,
             "brief": brief,
         });
-        if let Err(error) = self.post_plan(issue, intro, &plan) {
+        let config = self.config;
+        let tracked = config.triage_follow_up_days > 0 || config.revisit.is_some();
+        let intro = match read.filter(|_| tracked) {
+            Some((facts, comments)) => {
+                let inputs = self.inputs(facts, comments)?;
+                format!("{intro}\n\n<!-- {INPUTS_MARKER}: {inputs} -->")
+            }
+            None => intro.to_owned(),
+        };
+        if let Err(error) = self.post_plan(issue, &intro, &plan) {
             return Ok(Step::Failed(format!("{line} failed: {error:#}"), holds));
         }
         // No overlap check: a triage run changes no files.
@@ -3014,16 +3136,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// `issue`'s own text, as [`plan::comment`] reads a comment.
     fn body(&self, issue: &ItemRef) -> Result<plan::Comment> {
+        plan::comment(&self.issue_node(issue)?)
+    }
+
+    /// `issue`'s title and own text, as [`BODY_QUERY`] reads them.
+    fn issue_node(&self, issue: &ItemRef) -> Result<Value> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
-        let data = self.client.graphql(
+        let mut data = self.client.graphql(
             BODY_QUERY,
             json!({"owner": owner, "name": name, "number": issue.number}),
         )?;
-        let node = data
-            .pointer("/repository/issue")
+        data.pointer_mut("/repository/issue")
             .filter(|n| n.is_object())
-            .with_context(|| format!("{} is not an issue", issue.display()))?;
-        plan::comment(node)
+            .map(Value::take)
+            .with_context(|| format!("{} is not an issue", issue.display()))
     }
 
     /// Why a body plan [`Self::body_plan`] read as `read` may no longer be
