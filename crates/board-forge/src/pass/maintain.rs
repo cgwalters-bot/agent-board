@@ -1,41 +1,65 @@
 //! The maintain stage (agent-board#384, docs/pass.md#maintain): once a day,
-//! after `hourUtc`, the incoming pull requests of `maintain.repos` whose head
-//! changed since the last digest are due one read-only run, which assesses
+//! after `hourUtc`, the incoming pull requests of the repositories where
+//! the operator opened or reviewed pull requests, whose head changed since
+//! the pass last planned a digest, are due one read-only run, which assesses
 //! them for the operator as one comment on the digest issue. While a digest
 //! is due, the other stages leave `share` of each pool's allowance to it.
+//!
+//! The pass records the heads it planned for in its own comment on the
+//! digest issue (agent-board#387): the run's comment is the bot's too, and
+//! heads a prompt injection wrote there could keep a pull request out of
+//! review for good.
 //!
 //! No run kind can publish only that comment yet: the caller's `research`
 //! and `triage` runs may comment on any item of their repository, and their
 //! logs and artifacts are public, while the digest belongs on a private
-//! issue. So the stage stops at the run's plan, which it prints; it
-//! dispatches nothing.
+//! issue. So the stage stops at the run's plan, which it prints and records;
+//! it dispatches nothing.
 use super::*;
+use serde::Serialize;
 
 /// The schema of the JSON block a digest comment carries.
 pub const DIGEST_SCHEMA: &str = "agent-board/maintain-digest/v1";
 /// The info string of that block's fence.
 pub const DIGEST_FENCE: &str = "agent-board-maintain-digest";
+/// The first line of the pass's own comment on the digest issue, by which
+/// it finds it again.
+pub const PLAN_MARKER: &str = "<!-- agent-board-maintain-plan v1 -->";
+/// The schema of that comment's block.
+pub const PLAN_SCHEMA: &str = "agent-board/maintain-plan/v1";
+/// The info string of that block's fence.
+pub const PLAN_BLOCK: &str = "agent-board-maintain-plan";
 /// The run kind the digest's plan asks for: its runs hand back one comment.
 const DIGEST_KIND: &str = "research";
-/// The most repositories `maintain.repos` may name: one request each on
-/// every pass from `hourUtc` until the day's digest is posted.
-const REPOS_LIMIT: usize = 10;
+/// The most repositories `maintain.repos.max` may keep: one listing request
+/// each, once a day.
+const REPOS_LIMIT: usize = 20;
+/// The most days `maintain.repos.sinceDays` may look back.
+const SINCE_DAYS_LIMIT: u64 = 365;
+/// Pages of 100 read of each search, the most GitHub's search returns; a
+/// search with more is refused, as its ranking would be partial.
+const SEARCH_PAGES: usize = 10;
+const SEARCH_PAGE_SIZE: usize = 100;
+/// The searches whose pull requests count for a repository, by the
+/// operator's login: those they opened and those they reviewed.
+const SEARCHES: &[&str] = &["author", "reviewed-by"];
 /// The most incoming pull requests read: their heads are copied into the
 /// brief, which [`plan::JobPlan`] bounds.
 const INCOMING_LIMIT: usize = 200;
 /// The most pull requests one digest reviews; the rest wait for the next.
 const REVIEW_LIMIT: usize = 20;
-/// Hex characters of a head commit kept in the digest's fingerprint.
+/// Hex characters of a head commit kept in the recorded heads.
 const HEAD_CHARS: usize = 12;
 /// The `reason` of a pool the stage holds in this pass's usage snapshot.
 pub(super) const MAINTAIN_HOLD: &str = "maintain";
 
 /// `maintain` in the configuration ([`Config::maintain`]).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Maintain {
-    /// The repositories whose incoming pull requests the digest assesses.
-    pub repos: Vec<String>,
+    /// How the repositories whose incoming pull requests the digest
+    /// assesses are found.
+    pub repos: Repos,
     /// The share of each pool's allowance the digest has while it is due.
     pub share: f64,
     /// Where the digest is published.
@@ -44,7 +68,22 @@ pub struct Maintain {
     pub hour_utc: u8,
 }
 
-#[derive(Debug, Deserialize)]
+/// `maintain.repos`: the repositories with at least `min` of the operator's
+/// opened or reviewed pull requests updated in the last `since_days` days,
+/// the most active `max` of them, `include` first and `exclude` left out.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Repos {
+    pub since_days: u64,
+    pub min: usize,
+    pub max: usize,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Digest {
     pub repository: String,
@@ -53,12 +92,22 @@ pub struct Digest {
 
 impl Maintain {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
+        let repos = &self.repos;
         ensure!(
-            (1..=REPOS_LIMIT).contains(&self.repos.len()),
-            "maintain repos does not name 1 to {REPOS_LIMIT} repositories"
+            (1..=SINCE_DAYS_LIMIT).contains(&repos.since_days),
+            "maintain repos sinceDays is not 1 to {SINCE_DAYS_LIMIT}"
+        );
+        ensure!(repos.min >= 1, "maintain repos min is not at least 1");
+        ensure!(
+            (1..=REPOS_LIMIT).contains(&repos.max),
+            "maintain repos max is not 1 to {REPOS_LIMIT}"
+        );
+        ensure!(
+            repos.include.len() <= repos.max,
+            "maintain repos include names more than max repositories"
         );
         let mut seen = BTreeSet::new();
-        for repo in &self.repos {
+        for repo in repos.include.iter().chain(&repos.exclude) {
             validate_repository(repo).context("maintain repos")?;
             ensure!(
                 seen.insert(repo.to_ascii_lowercase()),
@@ -77,16 +126,75 @@ impl Maintain {
             "maintain digest issue is not a positive number"
         );
         // The run's one comment may land on any item of its repository: the
-        // pull requests it assesses must not be among them.
+        // pull requests it assesses must not be among them. A derived one
+        // never is, as its owner's are left out ([`Maintain::own`]).
+        let digest_repo = digest.repository.to_ascii_lowercase();
         ensure!(
-            !seen.contains(&digest.repository.to_ascii_lowercase()),
-            "maintain digest repository is one of maintain repos, where the run may not write"
+            !repos
+                .include
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(&digest_repo)),
+            "maintain digest repository is in maintain repos include, where the run may not write"
         );
         ensure!(
             !config.pools.0.is_empty(),
             "maintain needs pools, whose allowance it shares"
         );
         Ok(())
+    }
+
+    /// The owners whose repositories are never derived: the operator's and
+    /// the bot's own accounts, and the organizations the pass dispatches to
+    /// and publishes the digest in.
+    fn own<'a>(&'a self, config: &'a Config) -> [&'a str; 4] {
+        let owner = |repo: &'a str| repo.split_once('/').map_or(repo, |(o, _)| o);
+        [
+            &config.operator,
+            &config.bot,
+            owner(&config.dispatch_repo),
+            owner(&self.digest.repository),
+        ]
+    }
+}
+
+/// What a day's stage decided, kept in the pass's state
+/// ([`crate::poll::State`]), so that later passes the same day neither
+/// search nor list again: the start of the day's due time, the repositories
+/// derived for it, and whether the day is done, its plan recorded or no
+/// pull request changed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Day {
+    pub from: String,
+    pub repos: Vec<String>,
+    pub done: bool,
+    /// The configuration that derived this day's repositories. Older caches
+    /// without it are re-derived, not reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<Value>,
+    /// Creation receipt from the pass's successful POST, scoped by the full
+    /// issue-comment URL. A marker and bot authorship alone prove nothing:
+    /// a run can post both. Losing this receipt re-bootstraps with no heads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+}
+
+impl Day {
+    pub fn from_json(value: &Value) -> Result<Self> {
+        let day: Self =
+            serde_json::from_value(value.clone()).context("poll state maintain is not valid")?;
+        ensure!(
+            OffsetDateTime::parse(&day.from, &Rfc3339).is_ok(),
+            "poll state maintain from is not a time"
+        );
+        ensure!(
+            day.repos.len() <= REPOS_LIMIT,
+            "poll state maintain names more than {REPOS_LIMIT} repositories"
+        );
+        for repo in &day.repos {
+            validate_repository(repo).context("poll state maintain")?;
+        }
+        Ok(day)
     }
 }
 
@@ -99,58 +207,50 @@ pub(super) struct Pull {
     head: String,
 }
 
-/// The newest digest: its address, when it last changed, and its heads by
-/// pull request, or why they could not be read.
-struct Last {
-    url: String,
-    changed: OffsetDateTime,
-    heads: std::result::Result<BTreeMap<String, String>, String>,
-}
-
 /// When `now`'s day's digest is due: that day at `hour` UTC.
 fn due_from(now: OffsetDateTime, hour: u8) -> Result<OffsetDateTime> {
     let time = time::Time::from_hms(hour, 0, 0).context("maintain hourUtc")?;
     Ok(now.to_offset(time::UtcOffset::UTC).replace_time(time))
 }
 
-/// The newest digest among `comments`: the bot's, with a digest block, and
-/// edited by nobody else, as anyone could otherwise write the heads that
-/// keep a changed pull request out of review.
-fn last_digest(comments: &[plan::Comment], bot: &str) -> Option<Last> {
-    let bot = [bot];
-    let last = comments
-        .iter()
-        .filter(|c| {
-            let unedited = (!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &bot);
-            is(c.author.as_deref(), &bot)
-                && unedited
-                && !plan::fence_spans(&c.body, DIGEST_FENCE).is_empty()
-        })
-        .max_by_key(|c| c.changed)?;
-    Some(Last {
-        url: last.url.clone(),
-        changed: last.changed,
-        heads: heads(&last.body).map_err(|error| format!("{error:#}")),
-    })
-}
-
-/// The heads a digest's block records.
-fn heads(body: &str) -> Result<BTreeMap<String, String>> {
-    let value = plan::fenced_json(body, DIGEST_FENCE)
-        .context("its digest block")?
-        .context("no digest block")?;
+/// The pass's recorded plan: the day it was for, and the heads it recorded.
+fn recorded(body: &str) -> Result<(String, BTreeMap<String, String>)> {
+    let value = plan::fenced_json(body, PLAN_BLOCK)
+        .context("its block")?
+        .context("no block")?;
     ensure!(
-        value["schema"] == DIGEST_SCHEMA,
-        "its schema is not {DIGEST_SCHEMA}"
+        value["schema"] == PLAN_SCHEMA,
+        "its schema is not {PLAN_SCHEMA}"
     );
+    let from = value["from"].as_str().context("it has no from")?;
     let heads = value["heads"].as_object().context("it has no heads")?;
-    heads
+    let heads = heads
         .iter()
         .map(|(key, head)| {
             let head = head.as_str().context("a head is not a string")?;
             Ok((key.clone(), head.to_owned()))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok((from.to_owned(), heads))
+}
+
+/// The plan `comment` records, if only `bot` wrote it: whoever may edit
+/// comments on the digest issue could otherwise set its day or its heads,
+/// and so keep pull requests out of review. A comment edited by another
+/// account, or by one GitHub cannot name, is unreadable, and the pass's
+/// next record replaces it.
+fn trusted(
+    comment: &plan::Comment,
+    bot: &str,
+) -> Result<(String, BTreeMap<String, String>), String> {
+    let editor = comment.editor.as_deref();
+    if (comment.edited || editor.is_some()) && !is(editor, &[bot]) {
+        return Err(format!(
+            "it was last edited by {}, not the bot",
+            editor.unwrap_or("an unknown account")
+        ));
+    }
+    recorded(&comment.body).map_err(|e| format!("{e:#}"))
 }
 
 /// Each pool of `snapshot` that has used more than `keep` of its allowance
@@ -179,14 +279,13 @@ pub(super) fn reserve(snapshot: &Value, keep: f64, why: &str) -> Value {
     snapshot
 }
 
-/// The brief of the digest's run: the pull requests to review, and the heads
-/// its digest must record, `heads`, as JSON.
+/// The brief of the digest's run: the pull requests of `repos` to review.
 fn brief(
     config: &Config,
     maintain: &Maintain,
+    repos: &[String],
     review: &[&Pull],
     more: usize,
-    heads: &str,
 ) -> String {
     let digest = &maintain.digest;
     let mut brief = format!(
@@ -204,7 +303,7 @@ fn brief(
          stale (no activity for weeks, or superseded).\n\n\
          Review these pull requests, whose heads changed since the last digest:\n",
         operator = config.operator,
-        repos = maintain.repos.join(", "),
+        repos = repos.join(", "),
         digest_repo = digest.repository,
         digest_issue = digest.issue,
     );
@@ -219,31 +318,34 @@ fn brief(
     brief.push_str(&format!(
         "\nThe comment is a markdown summary, the groups in that order, each pull request linked with its \
          minutes, then one fenced block whose info string is `{DIGEST_FENCE}`, holding one JSON object: \
-         {{\"schema\": \"{DIGEST_SCHEMA}\", \"heads\": HEADS, \"prs\": [{{\"pr\": \"OWNER/REPO#N\", \
+         {{\"schema\": \"{DIGEST_SCHEMA}\", \"prs\": [{{\"pr\": \"OWNER/REPO#N\", \
          \"group\": \"approve-as-group\", \"summary\": \"...\", \"concern\": \"...\", \"file\": \"...\", \
          \"lines\": \"...\", \"minutes\": 5, \"reply\": \"...\"}}]}}, one entry for each pull request \
-         reviewed, leaving out the fields that do not apply to its group. HEADS tells the next digest what \
-         changed; copy it exactly:\n{heads}\n"
+         reviewed, leaving out the fields that do not apply to its group.\n"
     ));
     brief
 }
 
-impl<C: Rest + Transport> Scheduler<'_, C> {
+impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// With [`Config::maintain`], before stage 2: the day's digest, if it is
     /// due, planned, and while it is due the other stages left the rest of
-    /// each pool's allowance.
-    pub(super) fn maintain(&mut self) {
+    /// each pool's allowance. `cached` is what an earlier pass decided
+    /// ([`Day`]); what this one decided goes in [`Report::maintain`].
+    pub(super) fn maintain(&mut self, cached: Option<Day>) {
         let config = self.config;
         let Some(maintain) = &config.maintain else {
             return;
         };
-        if let Err(error) = self.digest(maintain) {
+        // A failure before deriving the new day must not lose the creation
+        // receipt, including when follow produces a replacement poll state.
+        self.report.maintain = cached.clone();
+        if let Err(error) = self.digest(maintain, cached) {
             self.report.failures += 1;
             self.line(format!("maintain error: {error:#}"));
         }
     }
 
-    fn digest(&mut self, maintain: &Maintain) -> Result<()> {
+    fn digest(&mut self, maintain: &Maintain, cached: Option<Day>) -> Result<()> {
         let config = self.config;
         let from = due_from(self.now, maintain.hour_utc)?;
         if self.now < from {
@@ -253,38 +355,77 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             ));
             return Ok(());
         }
-        let issue = ItemRef {
-            host: DEFAULT_HOST.into(),
-            repository: maintain.digest.repository.clone(),
-            number: maintain.digest.issue,
-        };
-        let comments = plan::issue_comments(&self.client, &issue)?;
-        let last = last_digest(&comments, &config.bot);
-        if let Some(last) = last.as_ref().filter(|l| l.changed >= from) {
-            let next = (from + time::Duration::days(1)).format(&Rfc3339)?;
+        let stamp = from.format(&Rfc3339)?;
+        let next = (from + time::Duration::days(1)).format(&Rfc3339)?;
+        // Keep the creation receipt across days and configuration changes,
+        // but never carry it to a different digest issue.
+        let on = (maintain.digest.repository.as_str(), maintain.digest.issue);
+        let receipt = cached
+            .as_ref()
+            .and_then(|day| day.comment.clone())
+            .filter(|url| {
+                plan::comment_id(url).is_some_and(|id| {
+                    *url == format!(
+                        "https://github.com/{}/issues/{}#issuecomment-{id}",
+                        on.0, on.1
+                    )
+                })
+            });
+        let configuration = json!({
+            "maintain": maintain, "operator": config.operator,
+            "bot": config.bot, "dispatch_repo": config.dispatch_repo,
+        });
+        let cached = cached
+            .filter(|day| day.from == stamp && day.configuration.as_ref() == Some(&configuration));
+        if let Some(day) = cached.as_ref().filter(|day| day.done) {
             self.line(format!(
-                "maintain: today's digest is {}; the next is due from {next}",
-                last.url
+                "maintain: done for today; the next is due from {next}"
             ));
+            self.report.maintain = Some(day.clone());
             return Ok(());
         }
-        let pulls = self.incoming(maintain)?;
+        let repos = match cached {
+            Some(day) => day.repos,
+            None => {
+                let repos = self.derive(maintain)?;
+                self.line(format!("maintain: repositories: {}", repos.join(", ")));
+                repos
+            }
+        };
+        self.report.maintain = Some(Day {
+            from: stamp.clone(),
+            repos: repos.clone(),
+            done: false,
+            configuration: Some(configuration),
+            comment: receipt.clone(),
+        });
+        let comment = self.plan_comment(on, receipt.as_deref())?;
+        let last = comment
+            .as_ref()
+            .map(|c| (c.url.clone(), trusted(c, &config.bot)));
+        // What [`Scheduler::publish`] edits: the comment's id.
+        let comment = match &comment {
+            Some(c) => Some(json!({
+                "id": plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?
+            })),
+            None => None,
+        };
         let (heads, since) = match &last {
-            None => (BTreeMap::new(), "no digest".to_owned()),
-            Some(Last {
-                url,
-                heads: Ok(heads),
-                ..
-            }) => (heads.clone(), url.clone()),
-            Some(Last {
-                url,
-                heads: Err(why),
-                ..
-            }) => (
+            None => (BTreeMap::new(), "no plan".to_owned()),
+            Some((url, Ok((day, _)))) if *day == stamp => {
+                self.line(format!(
+                    "maintain: today's plan is {url}; the next is due from {next}"
+                ));
+                self.settle();
+                return Ok(());
+            }
+            Some((url, Ok((_, heads)))) => (heads.clone(), url.clone()),
+            Some((url, Err(why))) => (
                 BTreeMap::new(),
                 format!("{url}, whose heads are unreadable: {why}"),
             ),
         };
+        let pulls = self.incoming(&repos)?;
         let changed: Vec<&Pull> = (pulls.iter())
             .filter(|p| heads.get(&p.key) != Some(&p.head))
             .collect();
@@ -293,6 +434,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             self.line(format!(
                 "maintain: none of {n} incoming pull request(s) changed since {since}"
             ));
+            self.settle();
             return Ok(());
         }
         let review = &changed[..changed.len().min(REVIEW_LIMIT)];
@@ -319,32 +461,186 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         match choose(own.as_ref(), &config.pools, &all, self.now) {
             Ok(pool) => {
                 let more = changed.len() - review.len();
-                let heads = serde_json::to_string(&carried)?;
                 let plan = json!({
-                    "schema": JOB_PLAN_SCHEMA, "repo": issue.repository, "item": issue.number,
+                    "schema": JOB_PLAN_SCHEMA, "repo": on.0, "item": on.1,
                     "kind": DIGEST_KIND, "runner": TRIAGE_RUNNER, "pool": pool,
-                    "brief": brief(config, maintain, review, more, &heads),
+                    "brief": brief(config, maintain, &repos, review, more),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
                 self.line(format!(
                     "maintain: plan only; no run kind publishes only the digest: {plan}"
                 ));
+                let record =
+                    json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": carried, "plan": plan});
+                self.record_plan(on, comment.as_ref(), &record);
             }
             Err(why) => self.line(format!("maintain: no pool: {why}")),
         }
-        if let Some(snapshot) = snapshot {
+        let done = self.report.maintain.as_ref().is_some_and(|d| d.done);
+        if let (Some(snapshot), false) = (snapshot, done) {
             let why = "that the due maintain digest leaves the other stages";
             self.snapshot = Some(Some(reserve(&snapshot, 1.0 - maintain.share, why)));
         }
         Ok(())
     }
 
-    /// The open pull requests of `maintain.repos` that neither the operator
-    /// nor the bot opened, in the configured order, each read whole.
-    fn incoming(&self, maintain: &Maintain) -> Result<Vec<Pull>> {
+    /// Today's stage is done: later passes today read and list nothing.
+    fn settle(&mut self) {
+        if let Some(day) = self.report.maintain.as_mut() {
+            day.done = true;
+        }
+    }
+
+    /// Records `record`, the plan and the heads it was planned for, in the
+    /// pass's own comment on the digest issue, editing `comment` where there
+    /// is one: one write, which `--max-writes` holds and a preview leaves.
+    fn record_plan(&mut self, on: (&str, u64), comment: Option<&Value>, record: &Value) {
+        let said = format!("maintain: record the plan on {}#{}", on.0, on.1);
+        if let Some(held) = self.caps.check(Kind::Write) {
+            self.line(format!("{held}: {said}"));
+            return;
+        }
+        if !self.apply {
+            self.caps.count(Kind::Write);
+            self.line(format!("{said}; a preview records nothing"));
+            return;
+        }
+        let body = format!(
+            "{PLAN_MARKER}\nThe board pass's maintain plan for the day from {}, and the heads it was \
+             planned for. Written by `agent-board pass`, which edits this comment each day and reads \
+             only it.\n\n```{PLAN_BLOCK}\n{record:#}\n```\n",
+            text(record, "/from")
+        );
+        match self.publish(on, comment, "maintain plan", body) {
+            Ok(url) => {
+                self.line(format!("maintain: recorded the plan in {url}"));
+                if let Some(day) = self.report.maintain.as_mut() {
+                    day.comment = Some(url);
+                }
+                self.settle();
+            }
+            Err(error) => {
+                self.report.failures += 1;
+                self.line(format!("maintain error: {said}: {error:#}"));
+            }
+        }
+    }
+
+    /// Only the comment whose creation the pass recorded locally may supply
+    /// heads. If it disappeared or lost its marker, bootstrap a new comment
+    /// without adopting any other bot-authored marker. Edit metadata still
+    /// guards the recorded comment's current contents ([`trusted`]).
+    fn plan_comment(
+        &self,
+        on: (&str, u64),
+        receipt: Option<&str>,
+    ) -> Result<Option<plan::Comment>> {
+        let Some(receipt) = receipt else {
+            return Ok(None);
+        };
+        let issue = ItemRef {
+            host: DEFAULT_HOST.into(),
+            repository: on.0.into(),
+            number: on.1,
+        };
+        let comments = plan::issue_comments(&self.client, &issue)?;
+        let bot = [self.config.bot.as_str()];
+        Ok(comments.into_iter().find(|c| {
+            c.url == receipt && is(c.author.as_deref(), &bot) && c.body.starts_with(PLAN_MARKER)
+        }))
+    }
+
+    /// The repositories of [`Repos`]: those of the operator's pull requests
+    /// that two searches find, by their count, the most first.
+    fn derive(&self, maintain: &Maintain) -> Result<Vec<String>> {
+        let config = self.config;
+        let repos = &maintain.repos;
+        let since = (self.now - time::Duration::days(repos.since_days as i64)).date();
+        // Each repository's pull requests, by its lowercase name: its
+        // spelling, and the numbers found.
+        let mut found: BTreeMap<String, (String, BTreeSet<u64>)> = BTreeMap::new();
+        for qualifier in SEARCHES {
+            // Public only: the pass's lines, which name the repositories and
+            // their pull requests, may be public, and the token reads more.
+            let query = format!(
+                "is:pr is:public {qualifier}:{} updated:>={since}",
+                config.operator
+            );
+            let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+            // A partial ranking could drop a repository below `min`, and the
+            // day would settle on it: an incomplete search is an error.
+            let mut whole = false;
+            for page in 1..=SEARCH_PAGES {
+                let url = format!(
+                    "{API_ROOT}search/issues?q={query}&sort=updated&order=desc&per_page={SEARCH_PAGE_SIZE}&page={page}"
+                );
+                let response = self.client.get(&url, None)?;
+                ensure!(
+                    response.status == 200,
+                    "searching the operator's pull requests: GitHub HTTP status {}",
+                    response.status
+                );
+                ensure!(
+                    response.body["incomplete_results"] != true,
+                    "searching the operator's pull requests ({qualifier}): GitHub's results are incomplete"
+                );
+                let items = response.body["items"]
+                    .as_array()
+                    .context("search results are not a list")?;
+                for item in items {
+                    let repo = text(item, "/repository_url")
+                        .strip_prefix(&format!("{API_ROOT}repos/"))
+                        .unwrap_or("");
+                    let number = item["number"].as_u64();
+                    let (Ok(()), Some(number)) = (validate_repository(repo), number) else {
+                        continue;
+                    };
+                    let entry = found.entry(repo.to_ascii_lowercase());
+                    let entry = entry.or_insert_with(|| (repo.to_owned(), BTreeSet::new()));
+                    entry.1.insert(number);
+                }
+                if items.len() < SEARCH_PAGE_SIZE {
+                    whole = true;
+                    break;
+                }
+            }
+            ensure!(
+                whole,
+                "searching the operator's pull requests ({qualifier}): reaches GitHub's {} results; \
+                 lower maintain repos sinceDays",
+                SEARCH_PAGES * SEARCH_PAGE_SIZE
+            );
+        }
+        let own = maintain.own(config);
+        let listed =
+            |list: &[String], repo: &str| list.iter().any(|r| r.eq_ignore_ascii_case(repo));
+        let mut ranked: Vec<(usize, &String)> = (found.values())
+            .filter(|(repo, numbers)| {
+                let owner = repo.split_once('/').map_or("", |(o, _)| o);
+                numbers.len() >= repos.min
+                    && !own.iter().any(|o| o.eq_ignore_ascii_case(owner))
+                    && !listed(&repos.include, repo)
+                    && !listed(&repos.exclude, repo)
+            })
+            .map(|(repo, numbers)| (numbers.len(), repo))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        let derived = ranked.into_iter().map(|(_, repo)| repo.clone());
+        let left = repos.max - repos.include.len();
+        Ok(repos
+            .include
+            .iter()
+            .cloned()
+            .chain(derived.take(left))
+            .collect())
+    }
+
+    /// The open pull requests of `repos` that neither the operator nor the
+    /// bot opened, in the given order, each read whole.
+    fn incoming(&self, repos: &[String]) -> Result<Vec<Pull>> {
         let writers = self.writers();
         let mut pulls = Vec::new();
-        for repo in &maintain.repos {
+        for repo in repos {
             let url = format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100");
             let response = self.client.get(&url, None)?;
             ensure!(

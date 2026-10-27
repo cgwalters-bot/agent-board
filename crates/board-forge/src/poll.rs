@@ -857,7 +857,7 @@ pub fn next_link(link: &str) -> Option<String> {
 }
 
 /// What a pass keeps for the next one.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct State {
     pub interval_seconds: i64,
     /// Responses by URL: `etag`, `last_modified`, `next` and `body`.
@@ -885,6 +885,10 @@ pub struct State {
     /// twice.
     pub notify_since: Option<String>,
     pub notify_before: Option<String>,
+    /// The pass's maintain stage today ([`crate::pass::maintain::Day`]),
+    /// which the pass, not the poll, keeps. Losing it costs a day's
+    /// searches and listings again.
+    pub maintain: Option<crate::pass::maintain::Day>,
 }
 
 impl State {
@@ -905,7 +909,8 @@ impl State {
                     "lock_refused",
                     "follow_cursor",
                     "notify_since",
-                    "notify_before"
+                    "notify_before",
+                    "maintain"
                 ]
                 .contains(&key.as_str()),
                 "unknown poll state field {key}"
@@ -980,6 +985,9 @@ impl State {
             .transpose()?;
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
+        let maintain = (object.get("maintain"))
+            .map(crate::pass::maintain::Day::from_json)
+            .transpose()?;
         Ok(Self {
             interval_seconds,
             responses,
@@ -989,6 +997,7 @@ impl State {
             follow_cursor,
             notify_since,
             notify_before,
+            maintain,
         })
     }
 
@@ -1015,6 +1024,9 @@ impl State {
         }
         if let Some(before) = &self.notify_before {
             state["notify_before"] = before.as_str().into();
+        }
+        if let Some(day) = &self.maintain {
+            state["maintain"] = json!(day);
         }
         state
     }
@@ -5143,6 +5155,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         follow_cursor,
         notify_since,
         notify_before,
+        maintain: None,
     };
     Ok(outcome)
 }
@@ -7838,6 +7851,12 @@ mod tests {
             (Some("2026-10-16T11:50:00Z"), Some("2026-10-16T08:00:00Z"))
         );
         assert_eq!(state.to_json(), with_notify);
+        let mut with_maintain = good.clone();
+        let day = json!({"from": "2026-10-16T09:00:00Z", "repos": ["o/r"], "done": true});
+        with_maintain["maintain"] = day.clone();
+        let state = State::from_json(&with_maintain).unwrap();
+        assert_eq!(state.maintain.as_ref().map(|d| d.done), Some(true));
+        assert_eq!(state.to_json(), with_maintain);
         for (field, value) in [
             ("schema", json!("agent-board/poll-state/v0")),
             ("follow_cursor", json!("not a repository")),
@@ -7847,6 +7866,18 @@ mod tests {
             ("notify_before", json!(true)),
             ("notify_before", json!("yesterday")),
             ("notify_more", json!(true)),
+            (
+                "maintain",
+                json!({"from": "today", "repos": [], "done": true}),
+            ),
+            (
+                "maintain",
+                json!({"from": "2026-10-16T09:00:00Z", "repos": ["o"], "done": true}),
+            ),
+            (
+                "maintain",
+                json!({"from": "2026-10-16T09:00:00Z", "repos": []}),
+            ),
             ("interval_seconds", json!(60)),
             ("interval_seconds", json!(MAX_INTERVAL_SECONDS + 1)),
             ("responses", json!({"https://evil.example/": {"body": []}})),
