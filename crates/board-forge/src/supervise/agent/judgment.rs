@@ -4,6 +4,7 @@ use super::*;
 use crate::Footer;
 use crate::changes;
 use crate::dispatch::{GitHub, Start, StartOutcome};
+use board_core::NEEDS_HUMAN_LABEL as NEEDS_HUMAN;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -483,12 +484,15 @@ impl Checked {
                     );
                     // The labels are read now, so a hold the operator added
                     // after the triage receipt still stops the close, as it
-                    // stops a dispatch.
+                    // stops a dispatch; `triage_done` admits only the pass's
+                    // own hold of this receipt.
+                    let held = has_label(&issue, NEEDS_HUMAN);
                     ensure!(
-                        !super::HELD_LABELS.iter().any(|h| has_label(&issue, h)),
+                        !(super::HELD_LABELS.iter())
+                            .any(|h| *h != NEEDS_HUMAN && has_label(&issue, h)),
                         "The issue is the operator's or held"
                     );
-                    triage_done(api, p, repo, item, triage_run, *triage_comment)?;
+                    triage_done(api, p, (repo, item, held), triage_run, *triage_comment)?;
                 }
                 Self::Write(Write::RemoveNeedsHuman { .. }) => {
                     ensure!(
@@ -1006,11 +1010,13 @@ fn triage_answer_done(body: &str) -> bool {
     answer.flatten().is_some_and(|v| v.verdict == "done")
 }
 
+/// That triage run `url` found `item` done in its receipt `comment`, and
+/// nothing since outdates it. `held`: the issue has `needs-human`, which
+/// only the pass's own hold of this receipt may have put there.
 fn triage_done(
     api: &dyn Api,
     p: &Policy,
-    repo: &str,
-    item: u64,
+    (repo, item, held): (&str, u64, bool),
     url: &str,
     comment: u64,
 ) -> Result<()> {
@@ -1061,6 +1067,8 @@ fn triage_done(
     // now, so that no one else could add, edit or delete any, and written
     // only by collaborators (agent-board#155 left that check to closure).
     let (mut locked, mut unlocked) = (None, None);
+    // The `needs-human` labels added since the run ended, and by whom.
+    let mut labels = vec![];
     for e in paged(api, repo, item, "events")? {
         let newest = match e["event"].as_str() {
             Some("locked") => Some(&mut locked),
@@ -1071,6 +1079,13 @@ fn triage_done(
             let t = millis(&e["created_at"]).context("Lock timestamp")?;
             *newest = (*newest).max(Some(t));
         }
+        let label = e["label"]["name"].as_str();
+        if e["event"] == "labeled" && label.is_some_and(|n| n.eq_ignore_ascii_case(NEEDS_HUMAN)) {
+            let t = millis(&e["created_at"]).context("Label timestamp")?;
+            if t > end {
+                labels.push(e["actor"]["login"].clone());
+            }
+        }
         if e["event"] == "reopened" || e["event"] == "renamed" {
             ensure!(
                 millis(&e["created_at"]).is_some_and(|t| t < at),
@@ -1078,13 +1093,37 @@ fn triage_done(
             );
         }
     }
+    // The pass's hold of this receipt. `ask create --apply` must comment on
+    // the blocked item before opening its question: adding the same label
+    // again emits no event and cannot invalidate an existing pass marker.
+    let marker = crate::pass::hold_marker(comment);
+    let mut marked = false;
     for later in paged(api, repo, item, "comments")? {
         let created = millis(&later["created_at"]).context("Comment timestamp")?;
+        let bot = later["user"]["login"] == p.settings.bot;
+        if held
+            && !marked
+            && bot
+            && created > end
+            && later["updated_at"] == later["created_at"]
+            && later["body"].as_str().and_then(|b| b.lines().next()) == Some(marker.as_str())
+        {
+            marked = true;
+            continue;
+        }
         ensure!(
-            created <= at || (later["user"]["login"] == p.settings.bot && created <= end),
+            created <= at || (bot && created <= end),
             "The issue was discussed after its triage"
         );
     }
+    // Added once since the run ended, by the bot: none before it (a hold
+    // the triage could not answer), none by the operator, and not taken off
+    // and put back since. A later ask invalidates the receipt via its comment,
+    // even when its additive labeling leaves this event list unchanged.
+    ensure!(
+        !held || (marked && labels == [json!(p.settings.bot)]),
+        "The issue is held, and not by the pass for this triage"
+    );
     ensure!(
         locked.is_some_and(|t| t < start && unlocked < Some(t)),
         "The issue was not locked throughout its triage"

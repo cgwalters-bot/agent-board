@@ -928,6 +928,211 @@ fn closure_needs_a_successful_targeted_triage_and_its_unedited_done_finding() {
     }
 }
 
+/// A `needs-human` hold closes only as the pass's own of this receipt
+/// (agent-board#363): added once by the bot after the run ended (11:00),
+/// with the bot's unedited marker comment naming receipt 23 as the only
+/// comment since. Each case: the label as written, its event's actor and
+/// time, the receipt the marker names (none: no marker comment), any other
+/// change, and whether the close is admitted.
+#[test]
+fn closure_takes_needs_human_only_as_the_pass_s_hold_of_its_receipt() {
+    type Change = fn(&mut Fake);
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<u64>,
+        Change,
+        bool,
+    );
+    let s = configured();
+    let comments = "/repos/example/project/issues/3/comments?per_page=100&page=1";
+    let events = "/repos/example/project/issues/3/events?per_page=100&page=1";
+    let push = |f: &mut Fake, path: &str, entry: Value| {
+        let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+        list.push(entry);
+    };
+    let nothing: Change = |_| ();
+    let cases: Vec<Case> = vec![
+        (
+            "the pass's hold",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            nothing,
+            true,
+        ),
+        (
+            "matched in any case",
+            "Needs-Human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            nothing,
+            true,
+        ),
+        (
+            "a marker naming a later verdict",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(27),
+            nothing,
+            false,
+        ),
+        (
+            "a label without a marker, as an ask's",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            None,
+            nothing,
+            false,
+        ),
+        (
+            "a label the operator added",
+            "needs-human",
+            "owner",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            nothing,
+            false,
+        ),
+        (
+            "a label added before the run ended",
+            "needs-human",
+            "worker",
+            "2026-10-16T10:59:00Z",
+            Some(23),
+            nothing,
+            false,
+        ),
+        (
+            "the operator's comment after the marker",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            |f| {
+                let path = "/repos/example/project/issues/3/comments?per_page=100&page=1";
+                let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+                list.push(json!({"id": 28, "user": {"login": "owner"}, "created_at": "2026-10-16T11:20:00Z"}));
+            },
+            false,
+        ),
+        (
+            "an edited marker",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            |f| {
+                let path = "/repos/example/project/issues/3/comments?per_page=100&page=1";
+                let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+                list.last_mut().unwrap()["updated_at"] = json!("2026-10-16T11:30:00Z");
+            },
+            false,
+        ),
+        (
+            "a later ask while the pass's label is already present",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            |f| {
+                // ask create comments before opening its question, even if
+                // adding needs-human will not produce another labeled event.
+                let path = "/repos/example/project/issues/3/comments?per_page=100&page=1";
+                let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+                list.push(json!({"id": 28, "user": {"login": "worker"},
+                    "body": "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.",
+                    "created_at": "2026-10-16T11:20:00Z", "updated_at": "2026-10-16T11:20:00Z"}));
+            },
+            false,
+        ),
+        (
+            "taken off and put back by the bot",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            |f| {
+                let path = "/repos/example/project/issues/3/events?per_page=100&page=1";
+                let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+                list.push(json!({"event": "labeled", "label": {"name": "needs-human"},
+                    "actor": {"login": "worker"}, "created_at": "2026-10-16T12:00:00Z"}));
+            },
+            false,
+        ),
+        (
+            "a marker someone else posted",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            |f| {
+                let path = "/repos/example/project/issues/3/comments?per_page=100&page=1";
+                let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+                list.last_mut().unwrap()["user"] = json!({"login": "helper"});
+            },
+            false,
+        ),
+        (
+            "a marker posted before the run ended, as the triage run could",
+            "needs-human",
+            "worker",
+            "2026-10-16T11:10:00Z",
+            Some(23),
+            |f| {
+                let path = "/repos/example/project/issues/3/comments?per_page=100&page=1";
+                let list = f.objects.get_mut(path).unwrap().as_array_mut().unwrap();
+                let marker = list.last_mut().unwrap();
+                marker["created_at"] = json!("2026-10-16T10:59:30Z");
+                marker["updated_at"] = json!("2026-10-16T10:59:30Z");
+            },
+            false,
+        ),
+    ];
+    for (case, label, actor, at, marker, change, admitted) in cases {
+        let mut fake = Fake::new(&block(std::slice::from_ref(&actions()[2])));
+        evidence(&mut fake);
+        fake.objects
+            .get_mut("/repos/example/project/issues/3")
+            .unwrap()["labels"] = json!([{"name": label}]);
+        push(
+            &mut fake,
+            events,
+            json!({"event": "labeled", "label": {"name": label},
+                "actor": {"login": actor}, "created_at": at}),
+        );
+        if let Some(id) = marker {
+            let body = format!(
+                "{}\nThe board pass held this triage verdict.",
+                crate::pass::hold_marker(id)
+            );
+            push(
+                &mut fake,
+                comments,
+                json!({"id": 27, "user": {"login": "worker"}, "body": body,
+                    "created_at": "2026-10-16T11:10:01Z", "updated_at": "2026-10-16T11:10:01Z"}),
+            );
+        }
+        change(&mut fake);
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert_eq!(out.ok, admitted, "{case}: {out:?}");
+        let closed: Vec<_> = (fake.writes().into_iter())
+            .map(|(m, path, _)| format!("{m} {path}"))
+            .filter(|w| w.contains("/example/project/"))
+            .collect();
+        match admitted {
+            true => assert_eq!(closed, ["PATCH /repos/example/project/issues/3"], "{case}"),
+            false => assert!(fake.writes().is_empty(), "{case}: {closed:?}"),
+        }
+    }
+}
+
 #[test]
 fn closure_takes_no_verdict_from_a_triage_that_could_read_outsiders() {
     // Dispatch admits anyone's text (agent-board#155), so an outsider could

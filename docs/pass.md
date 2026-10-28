@@ -499,8 +499,18 @@ reads the newest one the bot posted after the dispatch record, unedited but by
 a writer; a visitor's comment is never a verdict. A comment by the operator
 after it (or after the record, with no verdict) triages the issue again.
 Otherwise `done`, `needs-design` and `needs-operator` label it `needs-human`,
-one write step, so it shows as the operator's ask; the pass never closes an
-issue on a verdict, since no review follows a close. Any other verdict had
+so it shows as the operator's ask, and post one comment whose hidden first
+line, `<!-- agent-board-hold: verdict COMMENT-ID -->`, names the verdict
+comment it holds, then a sentence saying so: one step of two writes under
+`--max-writes`, neither made in a preview. The label then keeps the issue out
+of the follow-up; taken off with no operator comment, the same verdict labels
+it and posts the comment again. The pass never closes an
+issue on a verdict, since no review follows a close; the supervisor's `close`
+may, and takes the label as the pass's hold of a `done` verdict only with that
+comment. Before opening a question, `ask create --apply` comments on the
+blocked item to invalidate any earlier verdict, even if its additive labeling
+leaves the pass's existing label and event unchanged
+([supervisor requests](supervisor-requests.md)). Any other verdict had
 nothing to do, and the issue is triaged again only once its inputs changed
 (agent-board#383), and no sooner than a day after the verdict, doubled for
 each follow-up triage in a row before it (one the operator's comment

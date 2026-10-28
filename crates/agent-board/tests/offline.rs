@@ -1623,6 +1623,8 @@ fn ask_preview_and_list_table() {
             vec!["ask", "create", "Ok?", "--item", "example/intake#1", "--assignee", "op", "-R", "example/tracker"],
             0,
             concat!(
+                r#"{"body":"An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.","item_number":1,"target_repo":"example/intake","type":"add_comment"}"#,
+                "\n",
                 r#"{"assignees":["op"],"body":"Blocks: `https://github.com/example/intake/issues/1`\n\nQ: Ok?\n\nReply with your answer in free text. Only comments by @op count.\n","labels":["question","needs-human"],"target_repo":"example/tracker","title":"Ok?","type":"create_issue"}"#,
                 "\n",
                 r#"{"item_number":1,"labels":["needs-human"],"target_repo":"example/intake","type":"add_labels"}"#,
