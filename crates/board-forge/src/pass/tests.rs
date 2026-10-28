@@ -1500,12 +1500,18 @@ impl Forge {
         }
         if method == "PATCH" {
             let edited: u64 = path.rsplit('/').next().unwrap_or_default().parse()?;
+            let at =
+                (self.replay.now + time::Duration::seconds((id % 1000) as i64)).format(&Rfc3339)?;
+            let mut html_url = Value::Null;
             for nodes in self.added.borrow_mut().values_mut() {
                 for node in nodes.iter_mut().filter(|n| n["id"] == edited) {
                     node["body"] = body["body"].clone();
+                    node["lastEditedAt"] = at.clone().into();
+                    node["editor"] = json!({"login": self.login});
+                    html_url = node["url"].clone();
                 }
             }
-            return Ok((200, json!({})));
+            return Ok((200, json!({"html_url": html_url})));
         }
         if path.ends_with("/dispatches") {
             if let Some(status) = self.dispatch_status {
@@ -3056,8 +3062,9 @@ fn head(start: &str) -> String {
 }
 
 /// The bot's comment `id` on the digest issue: the pass's recorded plan
-/// for the day from `from`, recording `heads`, where `from` is some, or else
-/// a digest whose block records `heads`, as a run could write one.
+/// for the day from `from`, recording `heads`, edited by the bot as the
+/// pass leaves it, where `from` is some, or else a digest whose block
+/// records `heads`, as a run could write one.
 fn on_digest(id: u64, from: Option<&str>, heads: Value) -> Value {
     let body = match from {
         Some(from) => {
@@ -3077,9 +3084,13 @@ fn on_digest(id: u64, from: Option<&str>, heads: Value) -> Value {
             format!("Digest.\n\n```{}\n{block}\n```\n", maintain::DIGEST_FENCE)
         }
     };
-    json!({"url": format!("{DIGEST}#issuecomment-{id}"), "body": body,
+    let comment = json!({"url": format!("{DIGEST}#issuecomment-{id}"), "body": body,
         "createdAt": "2026-10-01T00:00:00Z", "lastEditedAt": null,
-        "author": {"login": "cgwalters-bot"}, "editor": null})
+        "author": {"login": "cgwalters-bot"}, "editor": null});
+    match from {
+        Some(_) => edited_by(comment, Some("cgwalters-bot")),
+        None => comment,
+    }
 }
 
 /// The pass's plan `comment` as the first schema recorded it.
@@ -3283,26 +3294,33 @@ fn maintain_lines(report: &Report) -> Vec<&str> {
 const TODAY: &str = "2026-10-23T09:00:00Z";
 const NEXT: &str = "2026-10-24T09:00:00Z";
 
-/// A locally retained creation receipt, not a marker discovered on GitHub.
-fn maintain_receipt() -> State {
+/// A state holding the day before the recording's, done.
+fn yesterdays_day() -> State {
     State {
         maintain: Some(maintain::Day {
             from: "2026-10-22T09:00:00Z".into(),
             repos: vec![],
-            done: false,
+            done: true,
             configuration: None,
-            comment: Some(format!("{DIGEST}#issuecomment-5")),
+            comment: None,
         }),
         ..State::default()
     }
 }
 
+/// `comment` as GitHub shows it never edited: as a run adds one.
+fn unedited(mut comment: Value) -> Value {
+    comment["lastEditedAt"] = Value::Null;
+    comment["editor"] = Value::Null;
+    comment
+}
+
 /// A day's digest is due once, from `hourUtc`, for the pull requests whose
 /// head changed since the pass last recorded a plan, the operator's and the
-/// bot's left out. Only the pass's own plan comment, with its locally kept
-/// creation receipt, is read, and only while nobody else edited it: heads a run
-/// or a collaborator wrote, in a digest, a later comment like the pass's or
-/// an edit of it, are not.
+/// bot's left out, with no state of the pass's. Only the pass's own plan
+/// comment, which the bot edited last, is read: heads a run or a
+/// collaborator wrote, in a digest, a comment like the pass's never edited
+/// or an edit of the pass's, are not.
 #[test]
 fn maintain_is_due_once_a_day_for_changed_heads() {
     let both = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
@@ -3349,11 +3367,17 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
             all_due.to_owned(),
         ),
         (
+            "a run's comment like the pass's",
+            9,
+            vec![unedited(on_digest(5, Some(TODAY), both.clone()))],
+            all_due.to_owned(),
+        ),
+        (
             "a run's later comment like the pass's",
             9,
             vec![
                 on_digest(5, yesterday, one),
-                on_digest(6, Some(TODAY), both.clone()),
+                unedited(on_digest(6, Some(TODAY), both.clone())),
             ],
             one_due,
         ),
@@ -3368,12 +3392,16 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
             all_due.to_owned(),
         ),
         (
-            "the bot's edit",
+            "an older comment of the pass's",
             9,
-            vec![edited_by(
+            vec![
+                {
+                    let mut older = on_digest(4, Some("2026-10-21T09:00:00Z"), json!({}));
+                    older["lastEditedAt"] = json!("2026-10-21T09:30:00Z");
+                    older
+                },
                 on_digest(5, yesterday, both.clone()),
-                Some("cgwalters-bot"),
-            )],
+            ],
             format!(
                 "maintain: none of 2 incoming pull request(s) changed since {DIGEST}#issuecomment-5"
             ),
@@ -3424,16 +3452,11 @@ fn maintain_is_due_once_a_day_for_changed_heads() {
     ];
     for (name, hour, comments, expected) in cases {
         let (config, replay) = maintained(hour, comments, 40.0);
-        let state = if hour == 9 {
-            maintain_receipt()
-        } else {
-            State::default()
-        };
         let report = block(run(
             &replay,
             &replay,
             &config,
-            state,
+            State::default(),
             (Mode::Preview, Limits::default()),
             replay.now,
         ))
@@ -3741,8 +3764,8 @@ fn maintain_waits_for_an_overlapping_pass() {
 }
 
 /// Failed preparation must not mark heads reviewed; lost send responses
-/// still settle the day. Discovered plans only veto recovery, never supply
-/// trusted heads, including when the poll cache is lost after a public run.
+/// still settle the day, and a pass with no state finds that record.
+/// Discovered job plans only veto recovery, never supply trusted heads.
 #[test]
 fn maintain_dispatch_failures_and_cache_loss() {
     for case in ["writer", "readback", "403", "422", "500", "send", "success"] {
@@ -3781,12 +3804,18 @@ fn maintain_dispatch_failures_and_cache_loss() {
             .iter()
             .any(|c| c.starts_with(maintain::PLAN_MARKER));
         assert_eq!(recorded, sent, "{case}");
+        // A pass with no state finds the recorded plan, or else the posted
+        // plan holds the day.
         let before = forge.dispatches();
         let retry = apply(&forge, &config);
         assert_eq!(retry.failures, 0, "{case}: {:#?}", retry.lines);
+        let held = if sent {
+            "maintain: today's plan is "
+        } else {
+            "maintain: a research plan already exists today; the digest waits"
+        };
         assert!(
-            maintain_lines(&retry)
-                .contains(&"maintain: a research plan already exists today; the digest waits"),
+            maintain_lines(&retry).iter().any(|l| l.starts_with(held)),
             "{case}: {:#?}",
             retry.lines
         );
@@ -3797,7 +3826,7 @@ fn maintain_dispatch_failures_and_cache_loss() {
 /// An applying pass records the plan and the heads it was planned for in
 /// its own comment on a private digest issue, and writes nothing else;
 /// nothing is dispatched. Later passes the same day read its state and search, read
-/// and list nothing; one whose state was lost trusts no existing marker.
+/// and list nothing; one whose state was lost trusts no marker never edited.
 /// Before it records a plan, a pass reuses the day's
 /// repositories and does not search again.
 #[test]
@@ -3825,15 +3854,18 @@ fn maintain_records_its_plan_and_lists_once_a_day() {
     let lines = maintain_lines(&report);
     let recorded = "maintain: recorded the plan in https://github.com/cgwalters-forge/bot-ops/issues/9#issuecomment-";
     assert!(lines[3].starts_with(recorded), "{lines:#?}");
+    // It adds its comment without the marker, then edits the plan in.
     let writes = forge.writes.borrow();
-    let posted: Vec<&Value> = (writes.iter())
-        .filter(|(m, url, _)| m == "POST" && url.ends_with("bot-ops/issues/9/comments"))
-        .map(|(_, _, body)| body)
+    let on_issue: Vec<(&str, &str, &str)> = (writes.iter())
+        .filter(|(_, url, _)| url.contains("bot-ops/issues/"))
+        .map(|(m, url, body)| (m.as_str(), url.as_str(), text(body, "/body")))
         .collect();
-    let [posted] = posted[..] else {
+    let [("POST", _, added), ("PATCH", edit, body)] = on_issue[..] else {
         panic!("{writes:#?}")
     };
-    let body = text(posted, "/body");
+    assert!(!added.contains(maintain::PLAN_MARKER), "{added}");
+    let id = forge.added.borrow()[&("cgwalters-forge/bot-ops".to_owned(), 9)][0]["id"].clone();
+    assert!(edit.ends_with(&format!("/issues/comments/{id}")), "{edit}");
     assert!(body.starts_with(maintain::PLAN_MARKER), "{body}");
     // The brief's example stays inside a JSON string: the bot's plan comment
     // holds no digest block that review's Maintain view could show.
@@ -3862,12 +3894,7 @@ fn maintain_records_its_plan_and_lists_once_a_day() {
     assert_eq!(day.repos, ["up/a"]);
     assert!(day.done);
     assert!(day.configuration.is_some());
-    assert!(
-        day.comment
-            .as_ref()
-            .unwrap()
-            .starts_with(&format!("{DIGEST}#issuecomment-"))
-    );
+    assert_eq!(day.comment, None);
     // Kept in the state, though no pull request is followed.
     let kept = report.state.as_ref().and_then(|s| s.maintain.as_ref());
     assert_eq!(kept, Some(&expected));
@@ -3904,11 +3931,11 @@ fn maintain_records_its_plan_and_lists_once_a_day() {
             "maintain: done for today; the next is due from {NEXT}"
         )]
     );
-    // The state lost, it searches and lists again, ignoring even an older
-    // forged marker claiming today's plan and matching heads.
+    // The state lost, it searches and lists again, ignoring a marker never
+    // edited, as a run could post, claiming today's plan.
     let mut lost = recording();
     answer(&mut lost, comments)["data"]["repository"]["issue"]["comments"]["nodes"] =
-        json!([on_digest(5, Some(TODAY), json!({}))]);
+        json!([unedited(on_digest(5, Some(TODAY), json!({})))]);
     let report = later(&lost, State::default());
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
     assert!(
@@ -3968,10 +3995,11 @@ fn digest_of(approve: &[(&str, String)], waiting: &[&str]) -> String {
 
 /// An applying pass records the dispatched pull requests' full heads as
 /// pending, none acknowledged, and a second pass the same day starts
-/// nothing. The next day's pass acknowledges only those the bot's digest
-/// after the plan's dispatch record lists at the planned head: unlisted
-/// and changed-head entries, a failed or missing digest, one by another
-/// account and a lost cache leave them due. Its preview writes nothing.
+/// nothing, its state kept or not. The next day's pass, its state kept or
+/// not, acknowledges only those the bot's digest after the plan's dispatch
+/// record lists at the planned head: unlisted and changed-head entries, a
+/// failed or missing digest and one by another account leave them due. Its
+/// preview writes nothing.
 #[test]
 fn maintain_acknowledges_only_what_the_digest_assessed() {
     let (aa, bb) = (head("aa"), head("bb"));
@@ -3984,33 +4012,36 @@ fn maintain_acknowledges_only_what_the_digest_assessed() {
              reviews {reviews}"
         )
     };
-    // The comment a run adds after the dispatch, by whom, whether the poll
-    // cache is kept, and the next day's lines after its repositories, in
-    // order, each with all of its parts between `*`.
+    // The comment a run adds after the dispatch, by whom, and the next
+    // day's lines after its repositories, in order, each with all of its
+    // parts between `*`.
     let cases = [
         (
             "full",
             Some(("cgwalters-bot", full.clone())),
-            true,
             vec![
-                format!("maintain: the digest {DIGEST}#issuecomment-*assessed 2 of 2 planned pull request(s)"),
+                format!(
+                    "maintain: the digest {DIGEST}#issuecomment-*assessed 2 of 2 planned pull request(s)"
+                ),
                 "maintain: none of 2 incoming pull request(s) changed since".to_owned(),
             ],
         ),
         (
             "partial",
             Some(("cgwalters-bot", digest_of(&[("up/a#1", aa.clone())], &[]))),
-            true,
             vec![
                 "assessed 1 of 2 planned pull request(s); due again: up/a#2".to_owned(),
                 due(1, "up/a#2"),
             ],
         ),
-        ("no digest", None, true, vec![missing.to_owned(), due(2, "up/a#1, up/a#2")]),
+        (
+            "no digest",
+            None,
+            vec![missing.to_owned(), due(2, "up/a#1, up/a#2")],
+        ),
         (
             "failed run",
             Some(("cgwalters-bot", "The run failed.".to_owned())),
-            true,
             vec![missing.to_owned(), due(2, "up/a#1, up/a#2")],
         ),
         (
@@ -4020,7 +4051,6 @@ fn maintain_acknowledges_only_what_the_digest_assessed() {
                 "cgwalters-bot",
                 digest_of(&[("up/a#1", head("a1")), ("up/a#2", bb)], &["up/a#1"]),
             )),
-            true,
             vec![
                 "assessed 1 of 2 planned pull request(s); due again: up/a#1".to_owned(),
                 due(1, "up/a#1"),
@@ -4028,43 +4058,12 @@ fn maintain_acknowledges_only_what_the_digest_assessed() {
         ),
         (
             "forged by another author",
-            Some(("collaborator", full.clone())),
-            true,
+            Some(("collaborator", full)),
             vec![missing.to_owned(), due(2, "up/a#1, up/a#2")],
         ),
-        (
-            "lost cache",
-            Some(("cgwalters-bot", full)),
-            false,
-            vec![
-                "maintain: digest due: 2 of 2 incoming pull request(s) changed since no plan; reviews up/a#1, up/a#2"
-                    .to_owned(),
-            ],
-        ),
     ];
-    for (name, comment, kept, expected) in cases {
-        let (mut config, mut replay) = maintained(9, vec![], 40.0);
-        config.work_repositories.clear();
-        digest_visibility(&mut replay, visible(true));
-        replay
-            .requests
-            .push(json!({"request": {"get": format!("{API_ROOT}user")},
-            "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
-        // The next day's searches look back from it.
-        let searches: Vec<Value> = (replay.requests.iter())
-            .filter(|e| text(e, "/request/get").contains("updated%3A%3E%3D2026-07-25"))
-            .map(|e| {
-                let mut e = e.clone();
-                let url = text(&e, "/request/get").replace("2026-07-25", "2026-07-26");
-                e["request"]["get"] = url.into();
-                e
-            })
-            .collect();
-        replay.requests.extend(searches);
-        let forge = Forge {
-            replay,
-            ..Forge::new(None, false)
-        };
+    for (name, comment, expected) in cases {
+        let (config, forge) = two_days(maintained(9, vec![], 40.0));
         let report = apply(&forge, &config);
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
         assert_eq!(forge.dispatches(), ["cgwalters-forge/bot-ops#9"], "{name}");
@@ -4103,59 +4102,160 @@ fn maintain_acknowledges_only_what_the_digest_assessed() {
             again.lines
         );
         assert_eq!(forge.dispatches().len(), 1, "{name}");
-        let writes = forge.writes.borrow().len();
-        let state = if kept { state } else { State::default() };
-        let next = block(run(
+        // So does a pass that lost the state, by the recorded plan.
+        let again = block(run(
             &forge,
             &forge,
             &config,
-            state,
-            (Mode::Preview, Limits::default()),
-            forge.replay.now + time::Duration::days(1),
+            State::default(),
+            (Mode::Actions(&own()), Limits::default()),
+            forge.replay.now,
         ))
         .unwrap();
-        assert_eq!(next.failures, 0, "{name}: {:#?}", next.lines);
-        let lines = maintain_lines(&next);
-        assert_eq!(lines[0], "maintain: repositories: up/a", "{name}");
-        let matches = |line: &str, expected: &str| expected.split('*').all(|p| line.contains(p));
-        // What follows, the day's start, is the other tests'.
-        assert!(lines.len() > expected.len(), "{name}: {lines:#?}");
-        for (line, expected) in lines[1..].iter().zip(&expected) {
-            assert!(matches(line, expected), "{name}: {expected}: {lines:#?}");
-        }
-        assert_eq!(forge.writes.borrow().len(), writes, "{name}: preview wrote");
+        assert_eq!(again.failures, 0, "{name}: {:#?}", again.lines);
+        assert!(
+            maintain_lines(&again)
+                .iter()
+                .any(|l| l.starts_with(&format!("maintain: today's plan is {DIGEST}"))),
+            "{name}: {:#?}",
+            again.lines
+        );
         assert_eq!(forge.dispatches().len(), 1, "{name}");
+        let writes = forge.writes.borrow().len();
+        // The next day reads the same with the state kept or lost.
+        for state in [state, State::default()] {
+            let lines = next_day(&forge, &config, state, name);
+            let matches =
+                |line: &str, expected: &str| expected.split('*').all(|p| line.contains(p));
+            // What follows, the day's start, is the other tests'.
+            assert!(lines.len() >= expected.len(), "{name}: {lines:#?}");
+            for (line, expected) in lines.iter().zip(&expected) {
+                assert!(matches(line, expected), "{name}: {expected}: {lines:#?}");
+            }
+            assert_eq!(forge.writes.borrow().len(), writes, "{name}: preview wrote");
+            assert_eq!(forge.dispatches().len(), 1, "{name}");
+        }
     }
 }
 
-/// Neither an older forged marker at bootstrap nor a surviving forged
-/// marker after deletion/marker removal can supply a day or heads. A receipt
-/// from another digest issue cannot authorize the matching comment ID.
+/// The recording of `maintained`, whose digest repository is public, as a
+/// forge an applying pass writes to, and that answers the next day's searches.
+fn two_days((mut config, mut replay): (Config, Replay)) -> (Config, Forge) {
+    config.work_repositories.clear();
+    digest_visibility(&mut replay, visible(true));
+    replay
+        .requests
+        .push(json!({"request": {"get": format!("{API_ROOT}user")},
+        "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+    // The next day's searches look back from it.
+    let searches: Vec<Value> = (replay.requests.iter())
+        .filter(|e| text(e, "/request/get").contains("updated%3A%3E%3D2026-07-25"))
+        .map(|e| {
+            let mut e = e.clone();
+            let url = text(&e, "/request/get").replace("2026-07-25", "2026-07-26");
+            e["request"]["get"] = url.into();
+            e
+        })
+        .collect();
+    replay.requests.extend(searches);
+    let forge = Forge {
+        replay,
+        ..Forge::new(None, false)
+    };
+    (config, forge)
+}
+
+/// The maintain lines of a preview over `forge` the next day, from `state`,
+/// after its repositories.
+fn next_day(forge: &Forge, config: &Config, state: State, name: &str) -> Vec<String> {
+    let next = block(run(
+        forge,
+        forge,
+        config,
+        state,
+        (Mode::Preview, Limits::default()),
+        forge.replay.now + time::Duration::days(1),
+    ))
+    .unwrap();
+    assert_eq!(next.failures, 0, "{name}: {:#?}", next.lines);
+    let lines = maintain_lines(&next);
+    assert_eq!(lines[0], "maintain: repositories: up/a", "{name}");
+    lines[1..].iter().map(|l| l.to_string()).collect()
+}
+
+/// With more incoming pull requests than one digest reviews, and no state
+/// kept, the next day skips those the digest assessed at unchanged heads and
+/// reviews the rest: the first day's overflow, one the digest left out and
+/// one whose head moved.
 #[test]
-fn maintain_requires_its_creation_receipt() {
+fn maintain_advances_through_more_than_a_digest() {
+    let (config, mut replay) = maintained(9, vec![], 40.0);
+    let listing = format!("{API_ROOT}repos/up/a/pulls?state=open&per_page=100");
+    let sha = |n: u32| head(&format!("{n:02}"));
+    let pulls: Vec<Value> = (1..=25)
+        .map(|n| json!({"number": n, "user": {"login": "visitor"}, "head": {"sha": sha(n)}}))
+        .collect();
+    answer(&mut replay, &listing)["body"] = pulls.into();
+    let (config, mut forge) = two_days((config, replay));
+    // #3's head moves once the first day's run is dispatched.
+    forge.late = Some(Box::new(move |request, answer| {
+        if request == listing {
+            answer[2]["head"]["sha"] = head("f3").into();
+        }
+    }));
+    let keys =
+        |numbers: &[u32]| -> Vec<String> { numbers.iter().map(|n| format!("up/a#{n}")).collect() };
+    let report = apply(&forge, &config);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let first: Vec<u32> = (1..=20).collect();
+    let due = "maintain: digest due: 25 of 25 incoming pull request(s) changed since no plan";
+    let due = format!("{due}; reviews {}", keys(&first).join(", "));
+    assert!(
+        maintain_lines(&report).contains(&due.as_str()),
+        "{:#?}",
+        report.lines
+    );
+    // The digest assesses all it was given but #5, at the heads listed.
+    let assessed: Vec<u32> = first.into_iter().filter(|n| *n != 5).collect();
+    let assessed: Vec<(String, String)> = (keys(&assessed).into_iter())
+        .zip(assessed.iter().map(|n| sha(*n)))
+        .collect();
+    let assessed: Vec<(&str, String)> = (assessed.iter())
+        .map(|(pr, head)| (pr.as_str(), head.clone()))
+        .collect();
+    post_on_digest(&forge, "cgwalters-bot", digest_of(&assessed, &[]));
+    let lines = next_day(&forge, &config, State::default(), "day 2");
+    let assessed = "assessed 19 of 20 planned pull request(s); due again: up/a#5";
+    assert!(lines[0].contains(assessed), "{lines:#?}");
+    let due = "maintain: digest due: 7 of 25 incoming pull request(s) changed since";
+    let reviews = format!("; reviews {}", keys(&[3, 5, 21, 22, 23, 24, 25]).join(", "));
+    assert!(lines[1].starts_with(due), "{lines:#?}");
+    assert!(lines[1].ends_with(&reviews), "{lines:#?}");
+}
+
+/// A marker the bot never edited, as a run can post one, supplies no day or
+/// heads, at bootstrap, after the pass's comment was deleted or lost its
+/// marker, or named by an older state's creation receipt: the pass adds a
+/// comment of its own and edits the plan into it, and edits no other.
+#[test]
+fn maintain_reads_only_the_comment_it_edited() {
     let heads = json!({"up/a#1": "aa0000000000", "up/a#2": "bb0000000000"});
-    let forged = on_digest(6, Some(TODAY), heads.clone());
+    let forged = unedited(on_digest(6, Some(TODAY), heads.clone()));
+    let receipt = || {
+        let mut state = yesterdays_day();
+        state.maintain.as_mut().unwrap().comment = Some(format!("{DIGEST}#issuecomment-6"));
+        state
+    };
     let cases = [
-        (
-            "bootstrap",
-            State::default(),
-            vec![on_digest(5, Some(TODAY), heads)],
-        ),
-        ("deleted", maintain_receipt(), vec![forged.clone()]),
+        ("bootstrap", State::default(), vec![forged.clone()]),
+        ("receipt", receipt(), vec![forged.clone()]),
         (
             "marker removed",
-            maintain_receipt(),
-            vec![on_digest(5, None, json!({})), forged.clone()],
-        ),
-        (
-            "different issue",
-            {
-                let mut state = maintain_receipt();
-                state.maintain.as_mut().unwrap().comment =
-                    Some(format!("{DIGEST}0#issuecomment-6"));
-                state
-            },
-            vec![forged],
+            State::default(),
+            vec![
+                edited_by(on_digest(5, None, json!({})), Some("cgwalters-bot")),
+                forged,
+            ],
         ),
     ];
     for (name, state, comments) in cases {
@@ -4190,17 +4290,19 @@ fn maintain_requires_its_creation_receipt() {
             report.lines
         );
         let writes = forge.writes.borrow();
-        assert!(
-            writes
-                .iter()
-                .any(|(m, url, _)| m == "POST" && url.ends_with("bot-ops/issues/9/comments")),
-            "{name}: {writes:#?}"
-        );
-        assert!(
-            !writes
-                .iter()
-                .any(|(m, url, _)| m == "PATCH" && url.contains("bot-ops/issues/comments/")),
-            "{name}: {writes:#?}"
+        let on_issue: Vec<(&str, &str)> = (writes.iter())
+            .filter(|(_, url, _)| url.contains("bot-ops/issues/"))
+            .map(|(m, url, _)| (m.as_str(), url.as_str()))
+            .collect();
+        let key = ("cgwalters-forge/bot-ops".to_owned(), 9);
+        let id = forge.added.borrow()[&key][0]["id"].clone();
+        let issues = format!("{API_ROOT}repos/cgwalters-forge/bot-ops/issues");
+        let added = format!("{issues}/9/comments");
+        let edited = format!("{issues}/comments/{id}");
+        assert_eq!(
+            on_issue,
+            [("POST", added.as_str()), ("PATCH", edited.as_str())],
+            "{name}"
         );
         let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
         assert!(state.maintain.unwrap().done, "{name}");
@@ -4230,6 +4332,12 @@ fn maintain_invalidates_changed_configuration() {
         let (mut config, mut replay) = maintained_with(9, vec![], 40.0, repos);
         if digest_changed {
             config.maintain.as_mut().unwrap().digest.repository = "up/digest".into();
+            let variables = json!({"owner": "up", "name": "digest", "number": 9, "after": null});
+            replay.requests.push(json!({
+                "request": graphql_key(plan::COMMENTS_QUERY, &variables),
+                "answer": {"data": {"repository": {"issue": {"comments": {"nodes": [],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}},
+            }));
         }
         if edit.get("sinceDays").is_some() {
             for request in &mut replay.requests {
@@ -4270,16 +4378,16 @@ fn maintain_invalidates_changed_configuration() {
     }
 }
 
-/// A pre-due pass and a search failure must preserve the receipt for a later
-/// day, even though neither produces a new daily decision.
+/// A pre-due pass and a search failure keep the cached day, even though
+/// neither produces a new daily decision.
 #[test]
-fn maintain_preserves_receipt_without_a_new_day() {
+fn maintain_keeps_its_day_without_a_new_one() {
     for hour in [9, 16] {
         let (config, mut replay) = maintained(hour, vec![], 40.0);
         if hour == 9 {
             answer(&mut replay, &operator_search("author"))["status"] = 503.into();
         }
-        let state = maintain_receipt();
+        let state = yesterdays_day();
         let expected = state.maintain.clone();
         let report = block(run(
             &replay,
@@ -4341,7 +4449,7 @@ fn maintain_share_is_left_while_a_digest_is_due() {
             &replay,
             &replay,
             &config,
-            maintain_receipt(),
+            State::default(),
             (Mode::Preview, Limits::default()),
             replay.now,
         ))

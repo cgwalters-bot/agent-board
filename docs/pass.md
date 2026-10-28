@@ -747,19 +747,29 @@ is due, and plans its run:
    source repository's current visibility, including explicit includes and
    cached repositories. Anything nonpublic or unreadable fails the stage
    without naming it; a public search result alone is not sufficient.
-2. The pass then reads its own plan comment on the digest issue: the URL
-   retained in the local poll cache from its successful creation, with bot
-   authorship and the `<!-- agent-board-maintain-plan v1 -->` marker (below).
-   It reads no other. Without that creation receipt, or if the comment is
-   missing or has lost its marker, it trusts no heads and creates a new
-   comment when recording the next plan. A run
-   can only add comments, and the bot posts the run's digest, so heads a
-   prompt injection wrote in a run's comment, digest or not, are never read.
-   It is read through GraphQL, which names its last editor: edited by
-   anyone but the bot, or by an account GitHub cannot name, it records
-   neither a day nor heads, as whoever may edit comments on the issue could
-   otherwise keep pull requests out of review, and the pass's next record
-   replaces it. A plan recorded for today ends the day (`maintain: today's plan is URL;
+2. The pass then reads its own plan comment on the digest issue, found on
+   the forge each day, not in its state, so that a hosted pass with no
+   cache advances as one with it: of the bot's comments that start with the
+   `<!-- agent-board-maintain-plan v1 -->` marker (below) and were edited,
+   the one changed last, read through GraphQL, which names the last editor.
+   A run posts as the bot, marker and all, but can only add comments, and
+   every edit made with the bot's token (the pass's records, dispatch
+   records and status comments, agentic-job's run-status comment) replaces
+   a comment's whole text with that writer's own, of which only the pass's
+   plan starts with the marker. So a marked comment the bot edited last
+   holds text the pass wrote; this rests on those writers, and on the
+   digest issue being kept dedicated to maintain (step 6), not on anything
+   a run says. The pass therefore adds its comment without the
+   marker and then edits the plan in (step 7), and never reads a comment
+   nobody edited, however much like its own. So heads a prompt injection
+   wrote in a run's comment, digest, forged plan comment or not, are never
+   read. Edited by anyone but the bot, or by an account GitHub cannot name,
+   the comment records neither a day nor heads, as whoever may edit
+   comments on the issue could otherwise keep pull requests out of review,
+   and the pass's next record replaces it. With no such comment, because
+   it was deleted, lost its marker or was never edited, the pass trusts no
+   heads, all pull requests are due, and it adds a new comment when
+   recording the next plan. A plan recorded for today ends the day (`maintain: today's plan is URL;
    the next is due from T`), whether or not its digest has come: a pending
    dispatch is never started again the same day.
    An older plan's pending pull requests are then acknowledged only where
@@ -819,7 +829,7 @@ is due, and plans its run:
    record=URL run=URL`); a preview says `maintain: start research
    OWNER/REPO#N pool=P`. The run takes a slot that the later stages count.
    Before posting, an existing writer-authored `research` plan changed
-   since today's due time vetoes a new start, even without the poll cache.
+   since today's due time vetoes a new start, even with no plan recorded.
    This is only a recovery hold, never evidence of reviewed heads: a run
    can forge a plan and delay work until tomorrow, but cannot mark heads
    reviewed. Keep the digest issue dedicated to maintain. Deleting or
@@ -833,9 +843,11 @@ is due, and plans its run:
    OWNER/REPO is not public: PLAN`, or `maintain: plan only; cannot read
    whether OWNER/REPO is public: ERROR: PLAN`).
 7. An applying pass then records the plan in its plan comment, editing it,
-   or adding it on the first day, as one write within `--max-writes`, on a
-   private repository or one the previous step read as public (`maintain:
-   recorded the plan in URL`). With it go, from the pass's own listing,
+   as one write within `--max-writes`, or, where step 2 found none, adding
+   a comment without the marker and editing the plan into it, two writes
+   taken together, so that the bot is its last editor; one whose edit
+   failed is never read. It does so on a private repository or one the
+   previous step read as public (`maintain: recorded the plan in URL`). With it go, from the pass's own listing,
    the unchanged pull requests' acknowledged heads, and, as pending, the
    posted plan's id and the full heads of those it reviews, which only its
    digest can acknowledge (step 2); those left waiting are in neither.
@@ -866,10 +878,13 @@ pass the same day with the same maintain configuration, operator, bot and
 dispatch repository reuses the repositories without searching, and once the
 day is done neither reads the digest issue nor lists anything (`maintain:
 done for today; the next is due from T`). Configuration changes invalidate
-the day's cache. The plan comment's creation receipt survives across days
-and configuration changes, but is never used for a different digest issue.
-Losing the cache loses that receipt too: the next pass searches and lists
-again without trusting an existing comment's heads or day.
+the day's cache. The cache only saves requests: which pull requests a
+digest assessed, and whether today's plan was recorded, come from the
+digest issue (step 2), so a pass that lost the cache, or never had one,
+searches and lists again and then advances as one that kept it. An older
+cache's creation receipt of the plan comment is accepted and ignored, and
+a plan comment an older pass added but never edited is not read, so its
+pull requests are due once more.
 
 **Why only a public digest is dispatched.** The run is the caller's
 `research` run, which may add one comment, but on any item of its

@@ -11,7 +11,11 @@
 //! injection wrote there could keep a pull request out of review for good.
 //! So a later day's pass acknowledges only the pull requests the digest
 //! after the plan's dispatch record lists at the planned head, and reads no
-//! heads of the run's.
+//! heads of the run's. It finds its comment again on the forge, not in
+//! local state: a run can only add comments, and every edit with the bot's
+//! token replaces a comment's text with the editor's own, so a marked
+//! comment the bot edited last is the pass's. The pass adds its comment and
+//! then edits it ([`Scheduler::plan_comment`]).
 //!
 //! The run is a `research` run of the caller's, whose comment, logs and
 //! artifacts are public. So the stage dispatches the run's plan only where
@@ -60,6 +64,9 @@ const DIGEST_GROUPS: &[(&str, bool)] = &[
 /// The first line of the pass's own comment on the digest issue, by which
 /// it finds it again.
 pub const PLAN_MARKER: &str = "<!-- agent-board-maintain-plan v1 -->";
+/// The body the pass adds its comment with, before editing in the plan:
+/// without the marker, so that one the edit never reached is not read.
+const PLAN_PLACEHOLDER: &str = "The board pass is recording its maintain plan here.";
 /// The schema of that comment's block.
 pub const PLAN_SCHEMA: &str = "agent-board/maintain-plan/v2";
 /// The info string of that block's fence.
@@ -210,10 +217,10 @@ pub struct Day {
     /// without it are re-derived, not reused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<Value>,
-    /// Creation receipt from the pass's successful POST, scoped by the full
-    /// issue-comment URL. A marker and bot authorship alone prove nothing:
-    /// a run can post both. Losing this receipt re-bootstraps with no heads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// An older pass's creation receipt of its plan comment, still accepted
+    /// in a state but never used or saved: the comment is found on the
+    /// forge ([`Scheduler::plan_comment`]).
+    #[serde(default, skip_serializing)]
     pub comment: Option<String>,
 }
 
@@ -250,6 +257,12 @@ pub(super) struct Pull {
 fn due_from(now: OffsetDateTime, hour: u8) -> Result<OffsetDateTime> {
     let time = time::Time::from_hms(hour, 0, 0).context("maintain hourUtc")?;
     Ok(now.to_offset(time::UtcOffset::UTC).replace_time(time))
+}
+
+/// The writes recording a plan takes: an edit of the pass's `comment`, or
+/// adding one and then editing it.
+fn record_writes(comment: Option<&Value>) -> usize {
+    if comment.is_some() { 1 } else { 2 }
 }
 
 /// The pass's recorded plan.
@@ -329,11 +342,12 @@ fn unedited(comment: &plan::Comment, bot: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The plan `comment` records, if only `bot` wrote it: whoever may edit
+/// The plan `comment` records, if the bot last edited it: whoever may edit
 /// comments on the digest issue could otherwise set its day or its heads,
 /// and so keep pull requests out of review. A comment edited by another
 /// account, or by one GitHub cannot name, is unreadable, and the pass's
-/// next record replaces it.
+/// next record replaces it. Only an edited comment is offered
+/// ([`Scheduler::plan_comment`]).
 fn trusted(comment: &plan::Comment, bot: &str) -> Result<Record, String> {
     unedited(comment, bot)?;
     recorded(&comment.body).map_err(|e| format!("{e:#}"))
@@ -491,8 +505,8 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         let Some(maintain) = &config.maintain else {
             return 0;
         };
-        // A failure before deriving the new day must not lose the creation
-        // receipt, including when follow produces a replacement poll state.
+        // A failure before deriving the new day keeps the cached one,
+        // including when follow produces a replacement poll state.
         self.report.maintain = cached.clone();
         match self.digest(maintain, cached, git_ref) {
             Ok(started) => started,
@@ -516,20 +530,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }
         let stamp = from.format(&Rfc3339)?;
         let next = (from + time::Duration::days(1)).format(&Rfc3339)?;
-        // Keep the creation receipt across days and configuration changes,
-        // but never carry it to a different digest issue.
         let on = (maintain.digest.repository.as_str(), maintain.digest.issue);
-        let receipt = cached
-            .as_ref()
-            .and_then(|day| day.comment.clone())
-            .filter(|url| {
-                plan::comment_id(url).is_some_and(|id| {
-                    *url == format!(
-                        "https://github.com/{}/issues/{}#issuecomment-{id}",
-                        on.0, on.1
-                    )
-                })
-            });
         let configuration = json!({
             "maintain": maintain, "operator": config.operator,
             "bot": config.bot, "dispatch_repo": config.dispatch_repo,
@@ -559,9 +560,9 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             repos: repos.clone(),
             done: false,
             configuration: Some(configuration),
-            comment: receipt.clone(),
+            comment: None,
         });
-        let (comments, comment) = self.plan_comment(on, receipt.as_deref())?;
+        let (comments, comment) = self.plan_comment(on)?;
         let last = comment
             .as_ref()
             .map(|c| (c.url.clone(), trusted(c, &config.bot)));
@@ -653,7 +654,10 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                         self.line(format!("maintain: plan only; {why}: {plan}"));
                         Some(None)
                     }
-                    None => self.start_digest(&issue, &pool, &plan, git_ref)?,
+                    None => {
+                        let writes = record_writes(comment.as_ref());
+                        self.start_digest(&issue, &pool, &plan, git_ref, writes)?
+                    }
                 };
                 if let Some(id) = posted {
                     let record = json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": acknowledged,
@@ -707,16 +711,17 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// Starts the digest's `plan` on `issue` in `pool` as stage 4 starts a
     /// triage run: within WIP and the budget, and `--max-dispatch`, posted
     /// as a writer's plan and dispatched by the plan protocol. The heads are
-    /// recorded after it, so `--max-writes` must leave that write too, or
-    /// the next pass would start it again. Whether it started, or was sent
-    /// and perhaps started, with the posted plan's id; a preview says it
-    /// would, and posts none.
+    /// recorded after it, so `--max-writes` must leave those `writes` too,
+    /// or the next pass would start it again. Whether it started, or was
+    /// sent and perhaps started, with the posted plan's id; a preview says
+    /// it would, and posts none.
     fn start_digest(
         &mut self,
         issue: &ItemRef,
         pool: &str,
         plan: &Value,
         git_ref: &str,
+        writes: usize,
     ) -> Result<Option<Option<String>>> {
         let line = format!(
             "maintain: start {DIGEST_KIND} {} pool={pool}",
@@ -741,16 +746,16 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             ));
             return Ok(None);
         }
-        for kind in [Kind::Dispatch, Kind::Write] {
-            if let Some(held) = self.caps.check(kind) {
+        for (kind, n) in [(Kind::Dispatch, 1), (Kind::Write, writes)] {
+            if let Some(held) = self.caps.check_many(kind, n) {
                 self.line(format!("{held}: {line}"));
                 return Ok(None);
             }
         }
-        // Do not adopt heads or receipts from discovered comments. They may
-        // nevertheless veto a fresh start: after cache loss (or a failed
-        // head-record write), an existing research plan is evidence that a
-        // start might already have happened today. This can only deny work.
+        // Do not adopt heads from discovered plans, which a run can forge.
+        // They may nevertheless veto a fresh start: after a failed record
+        // write, an existing research plan is evidence that a start might
+        // already have happened today. This can only deny work.
         let from = due_from(
             self.now,
             self.config
@@ -828,7 +833,9 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
 
     /// Records `record`, the plan, the heads it was planned for and those
     /// acknowledged, in the pass's own comment on the digest issue, editing
-    /// `comment` where there is one: one write, which `--max-writes` holds
+    /// `comment` where there is one, else adding one and then editing it,
+    /// so that the bot is its last editor ([`Scheduler::plan_comment`]):
+    /// the writes of [`record_writes`], which `--max-writes` holds together
     /// and a preview leaves.
     /// Only where `public`, read so just before, may the repository not be
     /// private.
@@ -840,12 +847,13 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         public: bool,
     ) {
         let said = format!("maintain: record the plan on {}#{}", on.0, on.1);
-        if let Some(held) = self.caps.check(Kind::Write) {
+        let writes = record_writes(comment);
+        if let Some(held) = self.caps.check_many(Kind::Write, writes) {
             self.line(format!("{held}: {said}"));
             return;
         }
         if !self.apply {
-            self.caps.count(Kind::Write);
+            self.caps.count_many(Kind::Write, writes);
             self.line(format!("{said}; a preview records nothing"));
             return;
         }
@@ -855,17 +863,32 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
              this comment each day and reads only it.\n\n```{PLAN_BLOCK}\n{record:#}\n```\n",
             text(record, "/from")
         );
-        let written = if public {
-            self.write_comment(on, comment, "maintain plan", body)
-        } else {
-            self.publish(on, comment, "maintain plan", body)
-        };
+        let name = "maintain plan";
+        let written = (|| {
+            // Whether the repository may be written as it is: public, or
+            // read as private just before.
+            let (comment, checked) = match comment {
+                Some(comment) => (comment.clone(), public),
+                None => {
+                    let added = if public {
+                        self.write_comment(on, None, name, PLAN_PLACEHOLDER.into())?
+                    } else {
+                        self.publish(on, None, name, PLAN_PLACEHOLDER.into())?
+                    };
+                    let id = plan::comment_id(&added)
+                        .with_context(|| format!("the added {name} comment {added} has no id"))?;
+                    (json!({"id": id}), true)
+                }
+            };
+            if checked {
+                self.write_comment(on, Some(&comment), name, body)
+            } else {
+                self.publish(on, Some(&comment), name, body)
+            }
+        })();
         match written {
             Ok(url) => {
                 self.line(format!("maintain: recorded the plan in {url}"));
-                if let Some(day) = self.report.maintain.as_mut() {
-                    day.comment = Some(url);
-                }
                 self.settle();
             }
             Err(error) => {
@@ -875,19 +898,17 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }
     }
 
-    /// Only the comment whose creation the pass recorded locally may supply
-    /// heads. If it disappeared or lost its marker, bootstrap a new comment
-    /// without adopting any other bot-authored marker. Edit metadata still
-    /// guards the recorded comment's current contents ([`trusted`]). With
-    /// it, the digest issue's comments, where the digest is looked for.
-    fn plan_comment(
-        &self,
-        on: (&str, u64),
-        receipt: Option<&str>,
-    ) -> Result<(Vec<plan::Comment>, Option<plan::Comment>)> {
-        let Some(receipt) = receipt else {
-            return Ok((vec![], None));
-        };
+    /// The pass's own plan comment on the digest issue, if any, with the
+    /// issue's comments, where the digest is looked for. A run posts as the
+    /// bot, marker and all, but can only add comments, never edit one, and
+    /// no other edit with the bot's token keeps a comment's text: so only
+    /// the bot's marked comments that were edited are the pass's, the
+    /// most recently changed of them, and a comment never edited is not
+    /// read, however much like the pass's it looks. The pass adds its
+    /// comment and then edits it ([`Scheduler::record_plan`]). One edited
+    /// last by another account is still offered, so that [`trusted`] says
+    /// why it is unreadable and the next record replaces it.
+    fn plan_comment(&self, on: (&str, u64)) -> Result<(Vec<plan::Comment>, Option<plan::Comment>)> {
         let issue = ItemRef {
             host: DEFAULT_HOST.into(),
             repository: on.0.into(),
@@ -895,9 +916,13 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         };
         let comments = plan::issue_comments(&self.client, &issue)?;
         let bot = [self.config.bot.as_str()];
-        let own = comments.iter().find(|c| {
-            c.url == receipt && is(c.author.as_deref(), &bot) && c.body.starts_with(PLAN_MARKER)
-        });
+        let own = (comments.iter())
+            .filter(|c| {
+                is(c.author.as_deref(), &bot)
+                    && c.body.starts_with(PLAN_MARKER)
+                    && (c.edited || c.editor.is_some())
+            })
+            .max_by_key(|c| (c.changed, plan::comment_id(&c.url)));
         let own = own.cloned();
         Ok((comments, own))
     }
