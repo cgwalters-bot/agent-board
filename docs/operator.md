@@ -16,6 +16,10 @@ issue `ask create` opens, which `ask resolve` closes and unlabels. The
 label, never set by hand, and holds labelled work. The decisions document of
 `ask add` and `ask read` is superseded by it.
 
+The [pass](pass.md)'s hold snapshot marks `needs-human`,
+`needs-operator` and unplanned-epic holds as the operator's. A `needs-design`
+hold still keeps the pass off the work but is not an operator decision.
+
 ## Operator actions
 
 An operator action is a proposal, not permission to write. The schema in

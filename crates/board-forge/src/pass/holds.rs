@@ -93,11 +93,12 @@ impl HoldKind {
 
     /// Whether only the operator's action releases a hold of this kind, as
     /// a rule ([`Hold::operator`] may say otherwise). Board Blocked is a
-    /// person's hold too, but on whatever they named, so it is not.
+    /// person's hold too, but on whatever they named, so it is not; nor is
+    /// `needs-design`, a parked design that asks the operator nothing.
     pub fn operator(self) -> bool {
         matches!(
             self,
-            Self::NeedsHuman | Self::NeedsDesign | Self::EpicUnplanned | Self::NeedsOperator
+            Self::NeedsHuman | Self::EpicUnplanned | Self::NeedsOperator
         )
     }
 }
@@ -730,12 +731,7 @@ mod tests {
         .collect();
         assert_eq!(
             operator,
-            [
-                "needs-human",
-                "needs-design",
-                "epic-unplanned",
-                "needs-operator"
-            ]
+            ["needs-human", "epic-unplanned", "needs-operator"]
         );
     }
 }

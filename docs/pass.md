@@ -73,7 +73,7 @@ Priority and `question` what its board Why asks after a leading `Q:`, each null
 where there is none; a hold of every new run has a null `item`, `url`,
 `priority` and `question`. `operator` is true for the kinds only the operator
 releases: `needs-human` (labelled so, by a person or a triage verdict),
-`needs-design`, `epic-unplanned` (an epic's planning request got no plan) and
+`epic-unplanned` (an epic's planning request got no plan) and
 `needs-operator` (an invalid or refused plan, an apply cut short and not
 proved, a plan dispatched by hand, no plan with triage off, or a run that
 failed again after its [rerun](#reruns)). The one
@@ -83,7 +83,9 @@ more from T`): `epic-unplanned` with `operator` false. When the retry gets no
 plan either, the hold is `epic-unplanned` with `operator` true; once its
 `needs-human` label is on, it is `needs-human`, its Why's question in
 `question`.
-The other kinds are `closed`, `blocked` (board Blocked), `waiting-on` (open
+The other kinds are `closed`, `needs-design` (labelled so: a parked design,
+which still blocks dispatch but asks the operator nothing), `blocked`
+(board Blocked), `waiting-on` (open
 dependencies, or a lower stacked slice not yet open), `pr-open` (the bot's or
 the operator's), `in-flight`, `dispatched` (its plan's run has ended, or an
 epic's planning request waits for its plan), `triage-cooldown` (triaged or
