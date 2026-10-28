@@ -186,6 +186,27 @@ const OUTAGE_CLOSED_SECONDS: i64 = 2 * 24 * 60 * 60;
 /// flight when the broker went down started at most a run's timeout before.
 const OUTAGE_LEAD_LIMIT: u64 = FIX_RUN_TIMEOUT_SECONDS as u64;
 const FAILED_RUNS: &[&str] = &["failure", "timed_out"];
+/// The conclusion of an agent run whose failed jobs [`PollPolicy::reruns`]
+/// runs once more. Not `cancelled`: cancelling is how a person stops one.
+pub const RERUN_CONCLUSION: &str = "failure";
+/// The review job's, which pushes nothing, so a cancelled one too.
+const REVIEW_RERUN_CONCLUSIONS: &[&str] = &[RERUN_CONCLUSION, "cancelled"];
+/// How long after a run was created [`PollPolicy::reruns`] still re-runs it,
+/// so it ended in that time too: so that switching it on re-runs no old
+/// failure, a refused rerun is not asked for past it, and the workflow a
+/// rerun runs, as its first event had it, is at most this old.
+pub const RERUN_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+/// The review job's runs of one head read, newest first, for whether one
+/// was re-run already ([`Pass::review_rerun`]).
+const REVIEW_RUN_READS: u64 = 10;
+/// The step that re-runs the review job's failed run ([`Pass::review_rerun`]).
+const REVIEW_RERUN: &str = "review rerun";
+/// The step that re-runs a round's failed run ([`started`]).
+const RUN_RERUN: &str = "run rerun";
+/// What a rerun's line ends with once its failed jobs were asked for again.
+const RE_RUN: &str = "re-run";
+/// Why a head with no verdict waits, which [`Pass::review_rerun`] looks behind.
+const NO_REVIEW: &str = "no approving review of the head yet";
 
 // Both writes admit only the head we approved. A queue is required by the base
 // branch's rules, not an auto-merge fallback; GitHub owns revalidation after
@@ -446,6 +467,10 @@ pub struct PollPolicy {
     /// many days, gets a fix round or is closed ([`stale`]). 0 (the default)
     /// leaves it labelled for good, as before.
     pub stale_days: u64,
+    /// The pass's `reruns`: the failed jobs of a round's failed run, and of
+    /// the review job's failed run of a head with no review, run once more
+    /// before a person is asked. Off (the default) asks the person at once.
+    pub reruns: bool,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -730,6 +755,7 @@ impl PollPolicy {
             fix_bounds: None,
             // The pass's only.
             stale_days: 0,
+            reruns: false,
         })
     }
 
@@ -1079,6 +1105,13 @@ fn timestamp(value: Option<&str>) -> Option<OffsetDateTime> {
 /// Whether `then` is more than `seconds` before `now`; never for no time.
 fn older_than(now: OffsetDateTime, then: Option<&str>, seconds: i64) -> bool {
     timestamp(then).is_some_and(|then| (now - then).whole_seconds() > seconds)
+}
+
+/// Whether `run` may still be re-run, by when it was created
+/// ([`RERUN_WINDOW_SECONDS`]); not where that time cannot be read.
+fn rerun_window(now: OffsetDateTime, run: &Value) -> bool {
+    timestamp(run["created_at"].as_str())
+        .is_some_and(|at| (now - at).whole_seconds() <= RERUN_WINDOW_SECONDS)
 }
 
 /// A base branch's required checks: its rulesets' (`GET rules/branches/{b}`)
@@ -2462,8 +2495,9 @@ pub fn fix_task(
 
 #[derive(Debug, PartialEq)]
 pub struct Decision {
-    /// skip, wait, continue, fix, rebase, refund, retitle, merge, needs-human or
-    /// answer (the operator's answer to `needs-human`, [`comments`]).
+    /// skip, wait, continue, fix, rebase, refund, retitle, merge, update,
+    /// needs-human, answer (the operator's answer to `needs-human`,
+    /// [`comments`]), review rerun or run rerun.
     pub action: &'static str,
     pub reason: String,
     pub round: Option<u64>,
@@ -2478,8 +2512,8 @@ pub struct Decision {
 fn step_kind(action: &str) -> Option<Kind> {
     match action {
         "skip" | "wait" => None,
-        "fix" | "continue" | "rebase" | "answer" => Some(Kind::Dispatch),
-        // merge, refund, needs-human and retitle.
+        "fix" | "continue" | "rebase" | "answer" | RUN_RERUN => Some(Kind::Dispatch),
+        // merge, update, refund, needs-human, retitle and a review rerun.
         _ => Some(Kind::Write),
     }
 }
@@ -2630,14 +2664,33 @@ fn started(
                 }
                 Outages::Off => {}
             }
+            // Its first attempt only, so a run that fails again is the
+            // person's ([`PollPolicy::reruns`]).
+            if config.policy.reruns
+                && conclusion == RERUN_CONCLUSION
+                && run["run_attempt"].as_u64() == Some(1)
+                && rerun_window(now, run)
+            {
+                return step(
+                    RUN_RERUN,
+                    format!(
+                        "{round}'s run {url} ended ({conclusion}) and pushed no new head for {}, so its failed jobs run once more ({why})",
+                        short(head)
+                    ),
+                );
+            }
         }
         if conclusion != "success"
             || older_than(now, run["updated_at"].as_str(), FIX_RUN_GRACE_SECONDS)
         {
+            let again = match run["run_attempt"].as_u64() {
+                Some(attempt) if attempt > 1 => " again after a rerun",
+                _ => "",
+            };
             return step(
                 "needs-human",
                 format!(
-                    "{round} is blocked: its run {url} ended ({conclusion}) and pushed no new head for {} ({why}){charged}",
+                    "{round} is blocked: its run {url} ended ({conclusion}){again} and pushed no new head for {} ({why}){charged}",
                     short(head)
                 ),
             );
@@ -2896,7 +2949,7 @@ pub fn decide(
                 "the review withheld its approval of the head; it needs a human approval",
             );
         }
-        _ => return step("wait", "no approving review of the head yet"),
+        _ => return step("wait", NO_REVIEW),
     }
     // Every merge and re-queue ([`queue_step`]) is this step's, so none passes
     // the label on the review job's approval alone.
@@ -2938,11 +2991,17 @@ pub fn decide(
             format!("its base {base} is not the default branch {default}; merged only into that"),
         );
     }
-    // Nothing asks the review job to run again for a new base, so a person
-    // reviews it rather than the poll waiting on it for good.
+    // With `reruns`, a head behind its new base, as a stacked one is once the
+    // one below it merged, is rebased onto it ([`UPDATE`]), and the new head's
+    // push asks the review job for a review against it. Otherwise nothing
+    // asks it to run again, so a person reviews it rather than the poll
+    // waiting for good.
     if !reviewed_on_base(pull, config, review_run) {
         let why =
             format!("approved before its base became {base}; the head needs a review against it");
+        if harness && config.policy.reruns && pull["mergeStateStatus"] == BEHIND {
+            return step("update", format!("{why}, so it is rebased onto {base}"));
+        }
         return step(if harness { "needs-human" } else { "wait" }, why);
     }
     step("merge", "review approved and checks green")
@@ -2977,6 +3036,22 @@ fn slim_run(run: &Value) -> Value {
         "updated_at": run["updated_at"],
         "repository": {"full_name": run["repository"]["full_name"]},
     })
+}
+
+/// A run list's runs, each [`slim_run`] and what [`Pass::review_rerun`]
+/// reads besides.
+fn slim_runs(list: &Value) -> Value {
+    let runs = list["workflow_runs"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let slim = |run: &Value| {
+        let mut slim = slim_run(run);
+        for key in ["conclusion", "run_attempt", "created_at"] {
+            slim[key] = run[key].clone();
+        }
+        slim
+    };
+    json!({"workflow_runs": runs.iter().map(slim).collect::<Vec<_>>()})
 }
 
 fn events_url(repo: &str) -> String {
@@ -3735,16 +3810,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     // Only the bot's own: a `mergeAuthors` one is a skip
                     // before it gets here. The approval was of the old head
                     // and does not carry over.
-                    let base = text(pull, "/baseRefName");
-                    if !self.updated.insert((repo.to_owned(), base.to_owned())) {
-                        return Ok(Some(format!(
-                            "not merged: behind {base}; another pull request was brought up to date with it this pass, so this one waits"
-                        )));
-                    }
-                    self.mutate(UPDATE, json!({"id": id, "head": head}))?;
-                    Ok(Some(format!(
-                        "brought up to date with {base}; waits for the review of the new head"
-                    )))
+                    self.update(repo, pull, "not merged: ").map(Some)
                 } else {
                     let repo_settings = self.get(&format!("repos/{repo}"))?;
                     let method = [
@@ -3805,6 +3871,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 )?;
                 Ok(Some("round given back".into()))
             }
+            "update" => self.update(repo, pull, "not rebased: ").map(Some),
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
                 self.needs_human(repo, number, marker, head, &decision.reason, excerpt)?;
@@ -3846,6 +3913,136 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Rebases the bot's `pull` onto its base, pinned to the head read, once
+    /// a pass for each base; the new head waits for its review. `not` starts
+    /// the line of one that waits for another pass.
+    fn update(&mut self, repo: &str, pull: &Value, not: &str) -> Result<String> {
+        let id = text(pull, "/id");
+        ensure!(!id.is_empty(), "pull request has no id");
+        let head = text(pull, "/headRefOid");
+        let base = text(pull, "/baseRefName");
+        if !self.updated.insert((repo.to_owned(), base.to_owned())) {
+            return Ok(format!(
+                "{not}behind {base}; another pull request was brought up to date with it this pass, so this one waits"
+            ));
+        }
+        self.mutate(UPDATE, json!({"id": id, "head": head}))?;
+        Ok(format!(
+            "brought up to date with {base}; waits for the review of the new head"
+        ))
+    }
+
+    /// With [`PollPolicy::reruns`], for the bot's `pull` that waits for a
+    /// review ([`NO_REVIEW`]): the step for the review job's newest run on
+    /// `pull_request_target` for its head, where that ended in failure or
+    /// was cancelled, was created in the last [`RERUN_WINDOW_SECONDS`] and
+    /// no review cites it, and the run. It is re-run once a head: where one
+    /// of the head's runs read was re-run already, at any age, or a full
+    /// read may have left one out, it is a person's. None where there is no
+    /// such run, or it started before the base last changed: re-run, it would
+    /// run the old base's workflow ([`reviewed_on_base`]).
+    fn review_rerun(&mut self, repo: &str, pull: &Value) -> Result<Option<(Decision, u64)>> {
+        let Some(workflow) = &self.config.review_workflow else {
+            return Ok(None);
+        };
+        let head = text(pull, "/headRefOid");
+        let url = format!(
+            "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?head_sha={head}&event={REVIEW_EVENT}&per_page={REVIEW_RUN_READS}"
+        );
+        let list = self.get_url(&url, slim_runs, false)?.0;
+        let runs = nodes(&list, "/workflow_runs");
+        let Some(run) = runs.first() else {
+            return Ok(None);
+        };
+        let rerun_before = runs
+            .iter()
+            .any(|r| text(r, "/head_sha") == head && r["run_attempt"].as_u64() != Some(1));
+        let conclusion = text(run, "/conclusion");
+        let id = run["id"].as_u64().context("review run has no id")?;
+        let cited = nodes(pull, "/reviews/nodes").iter().any(|r| {
+            text(r, "/commit/oid") == head
+                && cited_run(text(r, "/body")).is_some_and(|(at, cited)| at == repo && cited == id)
+        });
+        let since_base = match nodes(pull, "/baseChange/nodes").last() {
+            None => true,
+            Some(change) => timestamp(change["createdAt"].as_str())
+                .zip(timestamp(run["created_at"].as_str()))
+                .is_some_and(|(changed, created)| created > changed),
+        };
+        if head.is_empty()
+            || run["status"] != "completed"
+            || !REVIEW_RERUN_CONCLUSIONS.contains(&conclusion)
+            || text(run, "/head_sha") != head
+            || text(run, "/repository/full_name") != repo
+            || text(run, "/path") != format!("{WORKFLOWS_DIR}{workflow}")
+            || cited
+            || !since_base
+        {
+            return Ok(None);
+        }
+        let url = format!("https://github.com/{repo}/actions/runs/{id}");
+        let ended = format!("the review job's run {url} ended ({conclusion})");
+        // A full read may leave out an older run that was re-run.
+        let unread = runs.len() as u64 >= REVIEW_RUN_READS;
+        let window = rerun_window(self.now, run);
+        let decision = if rerun_before {
+            step(
+                "needs-human",
+                format!(
+                    "{ended} again after a rerun, with no review of {}; re-run or review it",
+                    short(head)
+                ),
+            )
+        } else if window && unread {
+            step(
+                "needs-human",
+                format!(
+                    "{ended} with no review of {}, which has more runs than the {REVIEW_RUN_READS} read for an earlier rerun; re-run or review it",
+                    short(head)
+                ),
+            )
+        } else if window {
+            step(
+                REVIEW_RERUN,
+                format!("{ended} with no review of the head, so its failed jobs run once more"),
+            )
+        } else {
+            return Ok(None);
+        };
+        Ok(Some((decision, id)))
+    }
+
+    /// Runs the failed jobs of `repo`'s run `id` once more as `client`, paced
+    /// as a round on `pool`, or where it names none, on the fix pools. A
+    /// refusal, such as of a run too old to re-run, is said on its line and
+    /// asked again only within [`RERUN_WINDOW_SECONDS`].
+    fn rerun(
+        &mut self,
+        client: &R,
+        (repo, id): (&str, u64),
+        pool: Option<String>,
+        fix: &[String],
+    ) -> Result<String> {
+        let candidates = match &pool {
+            Some(pool) => vec![pool.clone()],
+            None => fix_pools(fix, self.config),
+        };
+        if let Err(why) = self.paced(pool, &candidates) {
+            return Ok(format!("not re-run: {why}"));
+        }
+        self.spend()?;
+        self.writes += 1;
+        let url = format!("{API_ROOT}repos/{repo}/actions/runs/{id}/rerun-failed-jobs");
+        let (status, body) = client.send("POST", &url, &json!({}))?;
+        if !(200..300).contains(&status) {
+            let message = body["message"].as_str().unwrap_or("message unavailable");
+            return Ok(format!(
+                "not re-run: GitHub HTTP status {status}: {message}"
+            ));
+        }
+        Ok(RE_RUN.into())
     }
 
     /// One conditional GET, or a plain one where `fresh`; `slim` is applied to
@@ -4756,13 +4953,32 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             };
             retarget = onto;
         }
+        // Read only where the head waits for its review and nothing else.
+        let mut review_rerun = None;
+        if self.config.policy.reruns
+            && !merge_only
+            && retarget.is_none()
+            && decision.action == "wait"
+            && decision.reason == NO_REVIEW
+            && is_harness(&pull, &self.config.bot)
+            && let Some((step, run)) = self.review_rerun(repo, &pull)?
+        {
+            review_rerun = Some(run);
+            decision = Decision {
+                queue: decision.queue.take(),
+                ..step
+            };
+        }
         // Every round here is dispatched as the `fix` kind, so one outside
         // the caller's fix bounds would only be refused by its policy step
         // (agent-board#264). Nothing is written; the operator takes it.
-        let left = matches!(decision.action, "fix" | "continue" | "rebase" | "answer")
-            .then(|| self.config.policy.fix_bounds.as_ref())
-            .flatten()
-            .and_then(|b| b.refusal(repo, text(&pull, "/headRefName")));
+        let left = matches!(
+            decision.action,
+            "fix" | "continue" | "rebase" | "answer" | RUN_RERUN
+        )
+        .then(|| self.config.policy.fix_bounds.as_ref())
+        .flatten()
+        .and_then(|b| b.refusal(repo, text(&pull, "/headRefName")));
         if let Some(why) = &left {
             answer.clear();
             decision = step("skip", format!("left to the operator: {why}"));
@@ -4829,6 +5045,28 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 )
                 .map(|_| Some(format!("retargeted to {onto}")))
             }
+            // The review job runs in the pull request's repository, and the
+            // round's run in the caller's, as each was started.
+            (Some(apply), None, _) if decision.action == REVIEW_RERUN => {
+                let (rest, fix) = (self.rest, apply.pools.clone());
+                let run = review_rerun.context("a review rerun without its run")?;
+                self.rerun(rest, (repo, run), None, &fix).map(Some)
+            }
+            (Some(apply), None, _) if decision.action == RUN_RERUN => {
+                let (dispatcher, fix) = (apply.dispatcher, apply.pools.clone());
+                let run = marker.run.context("a run rerun without its run")?;
+                let caller = self.config.dispatch_repo.clone();
+                let pool = marker.pool.clone().filter(|p| !p.is_empty());
+                if self.dispatched >= POLL_DISPATCH_LIMIT {
+                    Ok(Some(format!(
+                        "not re-run: this pass started {POLL_DISPATCH_LIMIT} fix runs already"
+                    )))
+                } else {
+                    let done = self.rerun(dispatcher, (&caller, run), pool, &fix)?;
+                    self.dispatched += usize::from(done == RE_RUN);
+                    Ok(Some(done))
+                }
+            }
             (Some(_), None, _) => self.take(
                 repo,
                 &pull,
@@ -4845,14 +5083,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         {
             caps.count(kind);
         }
-        let done = done?;
-        let line = format!(
-            "{repo}#{number} {} {}: {}{}",
-            short(head),
-            decision.action,
-            decision.reason,
-            done.map(|d| format!(" -> {d}")).unwrap_or_default()
-        );
+        let done = done?.map(|d| format!(" -> {d}")).unwrap_or_default();
+        let (action, reason) = (decision.action, &decision.reason);
+        // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
+        let line = if matches!(action, REVIEW_RERUN | RUN_RERUN) {
+            format!("{action} {repo}#{number} {}: {reason}{done}", short(head))
+        } else {
+            format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
+        };
         Ok((
             line,
             text(&pull, "/author/login") == self.config.bot
@@ -5410,6 +5648,15 @@ mod tests {
             changed
         };
         let refunded = json!({"rounds": 0, "pool": "claude"});
+        // A run's attempt `n`, created an hour ago unless it says when.
+        let attempt = |run: &Value, n: u64| {
+            let mut run = run.clone();
+            run["run_attempt"] = n.into();
+            if run.get("created_at").is_none() {
+                run["created_at"] = "2026-10-12T01:00:00Z".into();
+            }
+            run
+        };
         #[rustfmt::skip]
         // Name, fixture, change (with the head commit's `message`, the
         // `policy`, and the `outage` issues read or why they were not), marker,
@@ -6829,6 +7076,109 @@ mod tests {
                 "fix",
                 Some(1),
             ),
+            // With the pass's `reruns`, a round's run that failed or was
+            // cancelled on its first attempt runs its failed jobs once more.
+            (
+                "a round's failed run is re-run once",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(&failed_run, 1),
+                RUN_RERUN,
+                None,
+            ),
+            // Cancelling is how a person stops a run.
+            (
+                "a round's cancelled run is not re-run",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(
+                    &json!({"status": "completed", "conclusion": "cancelled", "updated_at": "2026-10-12T01:59:30Z"}),
+                    1,
+                ),
+                "needs-human",
+                None,
+            ),
+            (
+                "a round's run that failed over a day ago is not re-run",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(
+                    &json!({"status": "completed", "conclusion": "failure", "created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:59:30Z"}),
+                    1,
+                ),
+                "needs-human",
+                None,
+            ),
+            // Re-run, it would run a workflow over a day old.
+            (
+                "a round's run created over a day ago that failed just now is not re-run",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(
+                    &json!({"status": "completed", "conclusion": "failure", "created_at": "2026-10-11T01:59:59Z", "updated_at": "2026-10-12T01:59:30Z"}),
+                    1,
+                ),
+                "needs-human",
+                None,
+            ),
+            (
+                "a round's run created just within a day is re-run",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(
+                    &json!({"status": "completed", "conclusion": "failure", "created_at": "2026-10-11T02:00:00Z", "updated_at": "2026-10-12T01:59:30Z"}),
+                    1,
+                ),
+                RUN_RERUN,
+                None,
+            ),
+            (
+                "a round's run that failed again after its rerun goes to a human",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(&failed_run, 2),
+                "needs-human",
+                None,
+            ),
+            (
+                "a round's run that timed out is not re-run",
+                "pull-470",
+                json!({"contexts": changes, "reruns": true}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(
+                    &json!({"status": "completed", "conclusion": "timed_out", "updated_at": "2026-10-12T01:59:30Z"}),
+                    1,
+                ),
+                "needs-human",
+                None,
+            ),
+            (
+                "without reruns a round's failed run goes to a human",
+                "pull-470",
+                json!({"contexts": changes}),
+                json!({"rounds": 1, "sha": HEAD, "run": 7}),
+                attempt(&failed_run, 1),
+                "needs-human",
+                None,
+            ),
+            // With `reruns`, a stacked pull request retargeted after its
+            // approval, and behind its new base, is rebased onto it for a new
+            // review.
+            (
+                "a head approved before its base changed and behind it is rebased",
+                "pull-470",
+                json!({"baseChange": {"nodes": [{"createdAt": "2026-10-12T00:55:00Z"}]}, "mergeStateStatus": BEHIND, "reruns": true}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "update",
+                None,
+            ),
         ];
         for (name, fixture, mut change, state, fix_run, action, round) in cases {
             let mut cfg = config();
@@ -6836,6 +7186,7 @@ mod tests {
             if let Some(policy) = fields.remove("policy") {
                 cfg.policy = PollPolicy::from_json(&policy).unwrap();
             }
+            cfg.policy.reruns = fields.remove("reruns").is_some();
             let message = fields.remove("message");
             let outages = match (fields.remove("outage"), &cfg.policy.broker_outage) {
                 (Some(Value::String(error)), Some(_)) => Outages::Unread(error),
@@ -9575,6 +9926,246 @@ mod tests {
             assert!(got.ends_with(line), "{got}");
             assert!(fake.lower_reads.borrow().is_empty());
         }
+        // Retargeted onto main, which moved on with the merge below it: with
+        // `reruns`, the head is rebased onto main, and its push asks the
+        // review job for a review against it, which the table above merges
+        // on once it is newer than the change. Without, a person reviews it.
+        let stale = "approved before its base became main; the head needs a review against it";
+        let labelled = [
+            format!("POST repos/{REPO}/labels"),
+            format!("POST repos/{REPO}/issues/470/labels"),
+            format!("POST repos/{REPO}/issues/470/comments"),
+        ];
+        for (reruns, line, writes) in [
+            (
+                true,
+                format!(
+                    "update: {stale}, so it is rebased onto main -> brought up to date with main; waits for the review of the new head"
+                ),
+                vec!["updatePullRequestBranch".to_owned()],
+            ),
+            (
+                false,
+                format!("needs-human: {stale} -> labelled {LABEL}"),
+                labelled.to_vec(),
+            ),
+        ] {
+            let mut fake = github();
+            let mut p = pull("pull-470", json!({"mergeStateStatus": BEHIND}));
+            p["baseChange"] = json!({"nodes": [{"createdAt": "2026-10-12T00:55:00Z"}]});
+            fake.pulls.insert(470, p);
+            fake.answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{REPO}/labels"),
+                vec![(422, json!({}))],
+            );
+            let mut cfg = config();
+            cfg.policy.reruns = reruns;
+            let dispatcher = Fake::default();
+            let follow = [REPO.to_owned()];
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &follow),
+                applying(&dispatcher),
+                None,
+                now(),
+            )
+            .unwrap();
+            let got = outcome.lines.last().unwrap();
+            assert!(got.ends_with(&line), "{got}");
+            assert_eq!(written(&fake.writes), writes);
+        }
+    }
+
+    #[test]
+    fn failed_runs_are_re_run_once() {
+        let head = text(&fixture("pull-470"), "/headRefOid").to_owned();
+        let runs = format!(
+            "repos/{REPO}/actions/workflows/review.yml/runs?head_sha={head}&event=pull_request_target&per_page={REVIEW_RUN_READS}"
+        );
+        let rerun = format!("POST repos/{REPO}/actions/runs/77/rerun-failed-jobs");
+        let labelled = vec![
+            format!("POST repos/{REPO}/labels"),
+            format!("POST repos/{REPO}/issues/470/labels"),
+            format!("POST repos/{REPO}/issues/470/comments"),
+        ];
+        let ended = |conclusion: &str, done: &str| {
+            format!(
+                "review rerun {REPO}#470 {}: the review job's run https://github.com/{REPO}/actions/runs/77 ended ({conclusion}) with no review of the head, so its failed jobs run once more -> {done}",
+                short(&head)
+            )
+        };
+        let refused = "not re-run: GitHub HTTP status 403: Unable to retry this workflow run";
+        let wait = format!("{REPO}#470 {} wait: {NO_REVIEW}", short(&head));
+        let again = format!(
+            "{REPO}#470 {} needs-human: the review job's run https://github.com/{REPO}/actions/runs/77 ended (failure) again after a rerun, with no review of {}; re-run or review it -> labelled {LABEL}",
+            short(&head),
+            short(&head)
+        );
+        let unread = format!(
+            "{REPO}#470 {} needs-human: the review job's run https://github.com/{REPO}/actions/runs/77 ended (failure) with no review of {}, which has more runs than the {REVIEW_RUN_READS} read for an earlier rerun; re-run or review it -> labelled {LABEL}",
+            short(&head),
+            short(&head)
+        );
+        // The job's comment on the head, which cites run 77 and is no verdict.
+        let cited = review("COMMENTED", job(), &head, "VERDICT: NONE")["body"]
+            .as_str()
+            .unwrap()
+            .replace(&REVIEW_RUN.to_string(), "77");
+        let commented = json!({"nodes": [{"state": "COMMENTED", "body": cited, "submittedAt": "2026-10-12T01:10:00Z",
+            "author": job(), "commit": {"oid": head}}]});
+        #[rustfmt::skip]
+        // Name, `reruns`, the head's runs listed, newest first, each as its
+        // fields changed (one object: one run; null: none), the pull
+        // request's changed fields, then the line and the writes. A run
+        // `refused` is refused its rerun.
+        type Case<'a> = (&'a str, bool, Value, Value, String, Vec<String>);
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            ("a failed review run is re-run", true, json!({}), json!({}), ended("failure", RE_RUN), vec![rerun.clone()]),
+            ("a cancelled one too", true, json!({"conclusion": "cancelled"}), json!({}), ended("cancelled", RE_RUN), vec![rerun.clone()]),
+            ("a refused rerun is said", true, json!({"refused": true}), json!({}), ended("failure", refused), vec![rerun.clone()]),
+            ("one that failed again goes to a person", true, json!({"run_attempt": 2}), json!({}), again.clone(), labelled.clone()),
+            // Once a head: a newer run after one re-run is not re-run.
+            ("so does one after a run re-run at the head", true, json!([{}, {"id": 76, "run_attempt": 2}]), json!({}), again.clone(), labelled.clone()),
+            // Whatever its age: only a new rerun is bounded by it.
+            ("and one that failed again over a day ago", true, json!({"run_attempt": 2, "created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:30:00Z"}),
+                json!({}), again, labelled.clone()),
+            // A full read may leave out an older run that was re-run.
+            ("so does one of a head with more runs than read", true, Value::Array((0..REVIEW_RUN_READS).map(|n| json!({"id": 77 - n})).collect()),
+                json!({}), unread, labelled),
+            ("one that failed over a day ago is waited on", true, json!({"created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:30:00Z"}), json!({}), wait.clone(), vec![]),
+            // Re-run, it would run a workflow over a day old.
+            ("so is one created over a day ago that failed just now", true, json!({"created_at": "2026-10-11T01:59:59Z"}), json!({}), wait.clone(), vec![]),
+            ("one created just within a day is re-run", true, json!({"created_at": "2026-10-11T02:00:00Z"}), json!({}), ended("failure", RE_RUN), vec![rerun.clone()]),
+            ("without reruns it waits", false, json!({}), json!({}), wait.clone(), vec![]),
+            ("a green run is waited on", true, json!({"conclusion": "success"}), json!({}), wait.clone(), vec![]),
+            ("so is one still running", true, json!({"status": "in_progress", "conclusion": null}), json!({}), wait.clone(), vec![]),
+            ("no run is waited on", true, Value::Null, json!({}), wait.clone(), vec![]),
+            ("another head's run is not re-run", true, json!({"head_sha": "f".repeat(40)}), json!({}), wait.clone(), vec![]),
+            // Re-run, it would run the old base's workflow.
+            ("a run from before the base changed is not", true, json!({}),
+                json!({"baseChange": {"nodes": [{"createdAt": "2026-10-12T01:30:00Z"}]}}), wait.clone(), vec![]),
+            ("a run that reviewed the head is not", true, json!({}), json!({"reviews": commented}), wait, vec![]),
+        ];
+        for (name, reruns, run, change, line, writes) in cases {
+            let mut fake = github();
+            let mut change = change;
+            if change.get("reviews").is_none() {
+                change["reviews"] = json!({"nodes": []});
+            }
+            fake.pulls.insert(470, pull("pull-470", change));
+            let base = json!({"id": 77, "path": ".github/workflows/review.yml", "event": "pull_request_target",
+                "head_sha": head, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                "created_at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:30:00Z",
+                "repository": {"full_name": REPO}});
+            let changes = match run {
+                Value::Null => vec![],
+                Value::Array(runs) => runs,
+                one => vec![one],
+            };
+            let mut listed = Vec::new();
+            for mut fields in changes {
+                if fields.as_object_mut().unwrap().remove("refused").is_some() {
+                    let message = json!({"message": "Unable to retry this workflow run"});
+                    fake.answers.borrow_mut().insert(
+                        format!("{API_ROOT}repos/{REPO}/actions/runs/77/rerun-failed-jobs"),
+                        vec![(403, message)],
+                    );
+                }
+                let mut run = base.clone();
+                for (key, value) in fields.as_object().unwrap() {
+                    run[key] = value.clone();
+                }
+                listed.push(run);
+            }
+            fake.page(&runs, None, None, json!({"workflow_runs": listed}));
+            fake.answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{REPO}/labels"),
+                vec![(422, json!({}))],
+            );
+            let mut cfg = config();
+            cfg.policy.reruns = reruns;
+            let dispatcher = Fake::default();
+            let follow = [REPO.to_owned()];
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &follow),
+                applying(&dispatcher),
+                None,
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.lines.last().unwrap(), &line, "{name}");
+            assert_eq!(written(&fake.writes), writes, "{name}");
+            assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            let read = fake
+                .sent
+                .borrow()
+                .iter()
+                .any(|(url, _)| url.contains("review.yml/runs"));
+            assert_eq!(read, reruns, "{name}");
+        }
+        // A fix round's run that failed on its first attempt, as the caller's
+        // token started it: its failed jobs run once more, as a dispatch.
+        let mut fake = github();
+        let marker = json!({"rounds": 1, "sha": head, "run": 7});
+        let comment =
+            json!({"id": 1, "user": {"login": BOT}, "body": marker_body(&marker, "Fix round.")});
+        fake.page(
+            &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+            None,
+            None,
+            json!([comment]),
+        );
+        fake.pulls.insert(
+            470,
+            pull(
+                "pull-470",
+                json!({"contexts": {"review": {"state": "FAILURE"}}}),
+            ),
+        );
+        fake.page(
+            "repos/cgwalters-forge/tracker/actions/runs/7",
+            None,
+            None,
+            json!({"status": "completed", "conclusion": "failure", "run_attempt": 1,
+                "created_at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:59:30Z"}),
+        );
+        let mut cfg = config();
+        cfg.policy.reruns = true;
+        let dispatcher = Fake::default();
+        let follow = [REPO.to_owned()];
+        let caps = caps::Caps::new(caps::Limits {
+            dispatch: Some(1),
+            writes: Some(0),
+            status_changes: None,
+        });
+        let outcome = run_capped(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            (&[], &follow),
+            applying(&dispatcher),
+            Some(&caps),
+            now(),
+        )
+        .unwrap();
+        let got = outcome.lines.last().unwrap();
+        assert!(got.starts_with(&format!("run rerun {REPO}#470 {}: fix round 1's run https://github.com/cgwalters-forge/tracker/actions/runs/7 ended (failure)", short(&head))), "{got}");
+        assert!(got.ends_with(" -> re-run"), "{got}");
+        assert_eq!(outcome.dispatched, 1);
+        assert!(fake.writes.borrow().is_empty());
+        assert_eq!(
+            written(&dispatcher.writes),
+            ["POST repos/cgwalters-forge/tracker/actions/runs/7/rerun-failed-jobs"]
+        );
     }
 
     #[test]

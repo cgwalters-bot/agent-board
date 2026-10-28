@@ -17,8 +17,9 @@ use crate::github::{API_ROOT, DEFAULT_HOST, RateLimited, Transport, is_github_lo
 use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
 use crate::poll::{
-    self, POLL_REPOSITORY_LIMIT, PollPolicy, Rest, RestResponse, State, next_link,
-    stale::STALE_DAYS_LIMIT, text, validate_repository, validate_workflow,
+    self, POLL_REPOSITORY_LIMIT, PollPolicy, RERUN_CONCLUSION, RERUN_WINDOW_SECONDS, Rest,
+    RestResponse, State, next_link, stale::STALE_DAYS_LIMIT, text, validate_repository,
+    validate_workflow,
 };
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
@@ -296,6 +297,11 @@ pub struct Config {
     /// the rest toward `wip` ([`lease`]).
     #[serde(default)]
     pub leases: bool,
+    /// Off unless set: a failed run is re-run once before a person is
+    /// asked: stage 2's review job and fix rounds ([`PollPolicy::reruns`]),
+    /// and stage 4's triage and implement runs ([`Scheduler::rerun`]).
+    #[serde(default)]
+    pub reruns: bool,
     /// None: no hold on spend.
     pub budget: Option<WeeklyBudget>,
     /// The poll's response cache, which only an applying pass writes.
@@ -790,6 +796,7 @@ impl Config {
             }),
             fix_bounds: self.fix_bounds.clone(),
             stale_days: self.pr.stale_days,
+            reruns: self.reruns,
             ..PollPolicy::default()
         };
         poll::Config {
@@ -1628,6 +1635,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         probes: BTreeMap::new(),
         holds_whole: true,
         ended: RefCell::new(BTreeMap::new()),
+        failed: BTreeMap::new(),
     };
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
@@ -1887,6 +1895,9 @@ struct Scheduler<'a, C> {
     holds_whole: bool,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
+    /// The caller's runs that failed in the last day, by id, where
+    /// [`Config::reruns`] is set ([`Self::failed_runs`]).
+    failed: BTreeMap<u64, Value>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2058,6 +2069,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.board = Some(None);
             return board.map(|_| ());
         };
+        if config.reruns {
+            match self.failed_runs(&target) {
+                Ok(failed) => self.failed = failed,
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("rerun error: {error:#}; no run is re-run"));
+                }
+            }
+        }
         let candidates = self.candidates(&board);
         let context = (&target, snapshot.as_ref());
         let (free, started) = self.start(&candidates, &board, &mut slots, wip - active, context);
@@ -2732,14 +2752,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let read = (&facts, comments.as_slice());
         // The body's plan, posted as a comment at its start, which the plan
         // protocol then dispatches and records as any other.
-        let (plan, id, body) = if plan::no_plan(&comments, &writers) {
+        let (plan, id, body, failed) = if plan::no_plan(&comments, &writers) {
             match self.body_plan(&facts, board)? {
                 None => {
                     let intro = "The board pass asks a triage run to plan this issue.";
                     return self.triage(read, intro, (snapshot, target, slots));
                 }
                 Some(Err(why)) => return Ok(Step::Hold(Hold::new(HoldKind::Other, why))),
-                Some(Ok((plan, block, read))) => (plan, "body".to_owned(), Some((block, read))),
+                Some(Ok((plan, block, read))) => {
+                    (plan, "body".to_owned(), Some((block, read)), None)
+                }
             }
         } else {
             let (plan, from) = match plan::newest_plan(&comments, &writers) {
@@ -2750,21 +2772,33 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             };
             let id = plan::plan_id(from)?;
-            if let Some((_, record)) =
-                batch::held(&self.client, &comments, &writers, &id, issue)?.first()
-            {
-                if plan.kind == "triage" && config.triage_follow_up_days > 0 {
-                    return self.follow_up(read, (from, record), (snapshot, target, slots));
+            match batch::held(&self.client, &comments, &writers, &id, issue)?.first() {
+                None => (plan, id, None, None),
+                Some((_, record)) => {
+                    // The run this plan's record names, where it failed: re-run
+                    // once its plan's item passes a start's checks below.
+                    let Some(run) =
+                        epics::record_run(&record.body).and_then(|r| self.failed.get(&r))
+                    else {
+                        if plan.kind == "triage" && config.triage_follow_up_days > 0 {
+                            return self.follow_up(read, (from, record), (snapshot, target, slots));
+                        }
+                        if plan.kind == "implement" && config.replan_after_days > 0 {
+                            return self.replan(read, &id, record, (snapshot, target, slots));
+                        }
+                        let why = format!("plan {id} was dispatched already, {}", record.url);
+                        return Ok(Step::Hold(Hold::new(HoldKind::Dispatched, why)));
+                    };
+                    // An extra's run is its batch's, whose other issues are not read.
+                    if record.body.contains(batch::BATCH_MARKER) {
+                        let why = format!("plan {id}'s batched run failed; it is re-run by hand");
+                        return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+                    }
+                    (plan, id, None, Some(run))
                 }
-                if plan.kind == "implement" && config.replan_after_days > 0 {
-                    return self.replan(read, &id, record, (snapshot, target, slots));
-                }
-                let why = format!("plan {id} was dispatched already, {}", record.url);
-                return Ok(Step::Hold(Hold::new(HoldKind::Dispatched, why)));
             }
-            (plan, id, None)
         };
-        if plan.kind != "implement" {
+        if plan.kind != "implement" && failed.is_none() {
             let why = format!(
                 "plan {id} is for {}, which is dispatched by hand",
                 plan.kind
@@ -2776,6 +2810,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             number: plan.item,
             ..issue.clone()
         };
+        // A triage run changes no files, and is checked as a triage start.
+        if let Some(run) = failed.filter(|_| plan.kind != "implement") {
+            if plan.kind != "triage" || dest != *issue {
+                let why = format!(
+                    "plan {id}'s {} run for {} failed; it is re-run by hand",
+                    plan.kind,
+                    dest.display()
+                );
+                return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+            }
+            return self.rerun((issue, issue), &plan, run, slots, (snapshot, target));
+        }
         if !config.works_in(&dest.repository) {
             let dest = dest.display();
             let why = format!("its plan's {dest} is not in a work repository");
@@ -2794,6 +2840,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let why = format!("its plan's {}: {}", dest.display(), held.reason);
                 return Ok(Step::Hold(Hold::new(held.kind, why)));
             }
+        }
+        if let Some(run) = failed {
+            return self.rerun((issue, &dest), &plan, run, slots, (snapshot, target));
         }
         let names: Vec<String> = match plan.pool.is_empty() {
             true => config.pools.0.iter().map(|(n, _)| n.clone()).collect(),
@@ -2879,6 +2928,125 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(self.dispatched(line, holds, done))
     }
 
+    /// The step for `issue`, whose `plan`'s dispatched `run` failed
+    /// ([`Config::reruns`]), and whose plan's item `dest` passed a start's
+    /// checks: its failed jobs run once more as a start does, within WIP,
+    /// pacing on the pool its title names, `--max-dispatch`, an implement
+    /// plan's overlap check and a lease. A run that failed again after that,
+    /// or a stacked plan's, whose base may have moved, holds the issue for a
+    /// person.
+    fn rerun(
+        &self,
+        (issue, dest): (&ItemRef, &ItemRef),
+        plan: &plan::JobPlan,
+        run: &Value,
+        slots: &Slots,
+        (snapshot, target): (Option<&Value>, &Target),
+    ) -> Result<Step> {
+        let id = run["id"].as_u64().context("run has no id")?;
+        let title = text(run, "/display_title");
+        let kind = run_title(title).map_or("dispatched", |(kind, _, _)| kind);
+        let url = format!("https://{DEFAULT_HOST}/{}/actions/runs/{id}", target.caller);
+        let ended = format!("its {kind} run {url} ended ({})", text(run, "/conclusion"));
+        if run["run_attempt"].as_u64() != Some(1) {
+            let why = format!("{ended} again after a rerun, so it waits for a person");
+            return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+        }
+        if plan.stacks_on.is_some() {
+            let why = format!("{ended}; a stacked plan's run is re-run by hand");
+            return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+        }
+        let names: Vec<String> = match title.rsplit_once(" (") {
+            Some((_, pool)) if pool.ends_with(')') => vec![pool.trim_end_matches(')').into()],
+            _ => self.config.pools.0.iter().map(|(n, _)| n.clone()).collect(),
+        };
+        let pool = match self.pool(snapshot, &names, slots) {
+            Ok(pool) => pool,
+            Err(why) => {
+                let why = format!("{ended}; its rerun has no pool: {why}");
+                return Ok(Step::Hold(Hold::new(HoldKind::Pools, why)));
+            }
+        };
+        // As a start would decide now: another issue's pull request or run
+        // may have come to overlap it since the run failed.
+        if plan.kind == "implement" {
+            let done = self.ended_runs();
+            let bot = &self.config.bot;
+            let decision =
+                overlap::decide_strict(&self.client, issue, dest, &plan.brief, bot, target, &done);
+            if let Decision::Wait(_) = decision {
+                return Ok(Step::Hold(Hold::new(
+                    HoldKind::Overlap,
+                    decision.sentence(),
+                )));
+            }
+        }
+        let on = match dest == issue {
+            true => String::new(),
+            false => format!(" target={}", dest.display()),
+        };
+        let line = format!(
+            "run rerun {}: {ended}, so its failed jobs run once more{on} pool={pool} run={url}",
+            issue.display()
+        );
+        let holds = vec![issue.clone(), dest.clone()];
+        if !self.apply || self.caps.full(Kind::Dispatch) {
+            return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
+        }
+        if let Some(step) = self.recheck(slots, (issue, dest), target, hold)? {
+            return Ok(step);
+        }
+        let path = format!(
+            "{API_ROOT}repos/{}/actions/runs/{id}/rerun-failed-jobs",
+            target.caller
+        );
+        // The lease is reserved at the send, as a dispatch's, and bound to
+        // the run once GitHub accepts its rerun.
+        let dispatcher = lease::Dispatch {
+            rerun: Some(id),
+            ..self.lease_dispatch(dest, &pool)
+        };
+        Ok(match dispatcher.send("POST", &path, &json!({})) {
+            Ok((status, _)) if (200..300).contains(&status) => Step::Started(line, holds),
+            // Refused, so nothing runs: the issue waits as it would have.
+            Ok((status, body)) => {
+                let message = body["message"].as_str().unwrap_or("message unavailable");
+                let why = format!("{ended}; its rerun was refused: HTTP {status}: {message}");
+                Step::Hold(Hold::new(HoldKind::Other, why))
+            }
+            Err(error) if error.is::<plan::Refused>() => {
+                Step::Hold(Hold::new(HoldKind::Other, error.to_string()))
+            }
+            Err(error) => Step::Failed(format!("{line} failed: {error:#}"), holds),
+        })
+    }
+
+    /// The caller workflow's runs created in the last [`RERUN_WINDOW_SECONDS`]
+    /// that failed, by id: the newest page, which on a busy day leaves the
+    /// oldest out. A cancelled run is not among them: a person stopped it.
+    fn failed_runs(&self, target: &Target) -> Result<BTreeMap<u64, Value>> {
+        let since = self.now - time::Duration::seconds(RERUN_WINDOW_SECONDS);
+        let since = since.format(&Rfc3339)?;
+        let url = format!(
+            "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={RERUN_CONCLUSION}&created=%3E%3D{since}&per_page={RUNS_PER_PAGE}",
+            target.caller, target.workflow
+        );
+        let response = self.client.get(&url, None)?;
+        ensure!(
+            response.status == 200,
+            "listing failed runs: GitHub HTTP status {}",
+            response.status
+        );
+        let runs = response.body["workflow_runs"]
+            .as_array()
+            .context("run list has no workflow_runs")?;
+        let mut failed = BTreeMap::new();
+        for run in runs {
+            failed.insert(run["id"].as_u64().context("run has no id")?, run.clone());
+        }
+        Ok(failed)
+    }
+
     /// `line`'s start held by `--max-dispatch`, checked before anything of
     /// it is written; none where it may go ahead.
     fn capped(&self, line: &str) -> Option<Step> {
@@ -2900,6 +3068,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             now: self.now,
             sent: Cell::new(false),
             reserved: RefCell::new(None),
+            rerun: None,
         }
     }
 

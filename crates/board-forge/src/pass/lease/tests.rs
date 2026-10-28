@@ -235,9 +235,10 @@ impl Forge {
     }
 }
 
+/// Answers a dispatch with `answer`'s body, or none for a lost answer.
 struct Starter {
     calls: Cell<usize>,
-    answer: Option<u64>,
+    answer: Option<Value>,
 }
 
 impl Rest for Starter {
@@ -247,7 +248,7 @@ impl Rest for Starter {
     fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
         self.calls.set(self.calls.get() + 1);
         match self.answer {
-            Some(run) => Ok((200, json!({"workflow_run_id": run}))),
+            Some(ref body) => Ok((200, body.clone())),
             None => bail!("connection reset"),
         }
     }
@@ -255,13 +256,23 @@ impl Rest for Starter {
 
 #[test]
 fn pass_reservations_race_with_admission_and_bind_only_the_named_run() {
-    for raced in [false, true] {
+    // Whether a peer takes the slot first, and the run a rerun restarts,
+    // whose accepted answer names none.
+    for (raced, rerun) in [
+        (false, None),
+        (true, None),
+        (false, Some(11)),
+        (true, Some(11)),
+    ] {
         let config = Rc::new(config(json!({"leases": true, "wip": 1})));
         let forge = forge(BOT, &[]);
         let won = raced.then(|| racing(&forge, &config, 12));
         let starter = Starter {
             calls: Cell::new(0),
-            answer: Some(11),
+            answer: Some(match rerun {
+                None => json!({"workflow_run_id": 11}),
+                Some(_) => json!({}),
+            }),
         };
         let item = item();
         let dispatch = Dispatch {
@@ -273,6 +284,7 @@ fn pass_reservations_race_with_admission_and_bind_only_the_named_run() {
             now: now(),
             sent: Cell::new(false),
             reserved: RefCell::new(None),
+            rerun,
         };
         let answer = dispatch.send("POST", "dispatch", &json!({}));
         if let Some(won) = won {
@@ -309,6 +321,7 @@ fn ambiguous_dispatch_keeps_its_reservation() {
         now: now(),
         sent: Cell::new(false),
         reserved: RefCell::new(None),
+        rerun: None,
     };
     assert!(dispatch.send("POST", "dispatch", &json!({})).is_err());
     assert_eq!(

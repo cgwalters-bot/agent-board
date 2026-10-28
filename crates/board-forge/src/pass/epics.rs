@@ -348,7 +348,7 @@ pub(super) struct Inputs<'a> {
 }
 
 /// The run a dispatch record names, `…/actions/runs/ID`.
-fn record_run(body: &str) -> Option<u64> {
+pub(super) fn record_run(body: &str) -> Option<u64> {
     let (_, rest) = body.split_once("/actions/runs/")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()

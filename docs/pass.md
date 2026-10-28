@@ -13,7 +13,8 @@ authority for their operations. The differences below are intentional.
 ## What is built
 
 The pass implements the configuration below and stages 1 to 5, except
-that there is no infrastructure rerun, and stage 2 still writes poll's claim
+that the one rerun is the plain [`reruns`](#reruns) rather than one only of
+infrastructure failures, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
 The [maintain](#maintain) digest is dispatched only where its repository is
 public; elsewhere it is planned and recorded but not dispatched.
@@ -74,7 +75,8 @@ where there is none; a hold of every new run has a null `item`, `url`,
 releases: `needs-human` (labelled so, by a person or a triage verdict),
 `needs-design`, `epic-unplanned` (an epic's planning request got no plan) and
 `needs-operator` (an invalid or refused plan, an apply cut short and not
-proved, a plan dispatched by hand, or no plan with triage off). The one
+proved, a plan dispatched by hand, no plan with triage off, or a run that
+failed again after its [rerun](#reruns)). The one
 exception is an epic whose first planning request got no plan and that the
 pass retries once by itself after the cooldown (`… got no plan; planned once
 more from T`): `epic-unplanned` with `operator` false. When the retry gets no
@@ -289,6 +291,7 @@ Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N
 `revisit: …` and `revisit OWNER/REPO#N: why`, `maintain: …`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools|budget: why`,
+`review rerun|run rerun OWNER/REPO#N …`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
 step that a cap held ends `-> held by --max-dispatch` or
@@ -337,11 +340,11 @@ of forge facts, not agent output, so they do not go through agentic-job's
 check and apply; that boundary is for what agents produce. Their guards are
 preview by default, caps per pass, and the replay gate below. The caps are
 two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
-starts, stage 2's fix, rebase, continuation and answer rounds, stage 3's
-planning run and stage 4's starts together, and `--max-writes N` bounds its
+starts, stage 2's fix, rebase, continuation and answer rounds and their
+reruns, stage 3's planning run and stage 4's starts and reruns together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
 1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues,
-merges and branch updates, stage 3's
+merges, branch updates and review reruns, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
 and its recovery, and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
@@ -394,8 +397,8 @@ A pass captures one clock and performs these stages in order:
    set Priority, rescope or close children and post plans/receipts within the
    existing epic bounds; planning itself only dispatches a triage run. Refresh
    affected board/issue facts after an apply before scheduling.
-4. Rerun, once, each scheduled run that failed for an infrastructure reason,
-   then choose and dispatch work by the rule below. Dispatch writes the existing
+4. With [`reruns`](#reruns), rerun once a candidate's failed run, then
+   choose and dispatch work by the rule below. Dispatch writes the existing
    plan claim and run link, and the existing board Run update where supported;
    it does not close issues from guessed outcomes.
 5. Derive Status for every board item, closed issues and merged pull
@@ -539,18 +542,16 @@ body with no such block, or another author's, leaves the issue to triage. A
 body plan that is invalid, or that someone else edited last, holds the issue.
 An epic plan may not put a plan block in a body it writes.
 
-The one automatic rerun is for infrastructure: a scheduled run that failed
-before the agent's work could succeed or fail on its own (runner lost, setup
-or checkout failed, broker or forge outage; the exact rule is an
-[open question](architecture.md#open-questions)) is dispatched again once,
-with the same plan and pool choice rules, counted against WIP and pacing like
-any start. The rerun is recorded on the same dispatch record, so a second
-infrastructure failure, or any failure of the agent's own work, is left for a
-person.
+The one automatic rerun is meant for infrastructure: a scheduled run that
+failed before the agent's work could succeed or fail on its own (runner lost,
+setup or checkout failed, broker or forge outage; the exact rule is an
+[open question](architecture.md#open-questions)). Until that rule exists,
+[`reruns`](#reruns) re-runs any failed run once, and a second failure is left
+for a person.
 
 With an accepted implement plan, dispatch precisely that plan once. An invalid
 newest plan does not mean “no plan”; report it, never fall back. Recorded plans
-do not run again, except the infrastructure rerun above; an operator/planner
+do not run again, except by the rerun above; an operator/planner
 edit or replacement is needed. Research or
 triage plans explicitly posted on issues remain manual dispatches.
 
@@ -637,6 +638,82 @@ happens only where the caller's bounds for its triage runs allow one; the
 pass itself still closes nothing. With `triageFollowUpDays` the brief also
 asks for a verdict, and the revisit's plan is then followed up as any triage
 plan is.
+
+## Reruns
+
+A run that failed for a reason outside the work waited for a person: a
+review job failed during a usage outage left a green pull request at review
+required for three hours, and two failed triage runs waited 17 hours for the
+operator's “Rerun failed jobs” (agent-board#396). With `reruns: true` (off
+unless set), the pass asks GitHub to run a failed run's failed jobs once
+more (`POST …/actions/runs/ID/rerun-failed-jobs`): the same run, inputs and
+event. It does not tell an outage from the agent's own failure, so it does
+this once, on the run's first attempt (`run_attempt` 1), and a run that failed
+again is a person's; the attempt number on the forge is the only record. Only
+a run created in the last day, and so ended in it, is re-run: switching
+`reruns` on re-runs no old failure, a refused rerun (`-> not re-run: GitHub
+HTTP status 403: …`, such as for a run too old) is not asked for again after
+that day, and the workflow a rerun runs, as its first event had it, is at
+most a day old. A run created earlier that failed only now, after waiting for
+a runner, is a person's. A second failure is a person's at any age.
+An agent run is re-run only on the conclusion `failure`: cancelling a run is
+how a person stops one. The review job, which pushes nothing, is re-run when
+cancelled too.
+
+* **Review job, stage 2.** For the bot's pull request from its fork whose
+  head waits with no verdict (`wait: no approving review of the head yet`),
+  the pass reads the newest ten `pr.reviewWorkflow` runs on
+  `pull_request_target` for the head, one request. Where the newest failed,
+  no review at the head cites it, and it was created after the base last
+  changed (re-run, an older one would run the old base's workflow), it is
+  re-run as the bot:
+  `review rerun OWNER/REPO#N SHA: the review job's run URL ended (failure)
+  with no review of the head, so its failed jobs run once more -> re-run`.
+  That is a write step within `--max-writes`, paced as a fix round on the fix
+  pools (`-> not re-run: why`). Once a head: where any run read was re-run
+  already, it is `needs-human: the review job's run URL ended (failure) again
+  after a rerun, …`, and where ten were read, so that an older one re-run may
+  have been left out, `needs-human: … which has more runs than the 10 read
+  for an earlier rerun; …`.
+* **Fix, rebase and continuation rounds, stage 2.** A round whose run failed
+  and pushed no new head is re-run with the dispatch token that started it,
+  paced on the round's pool and within the fix bounds, before the poll would
+  label it `needs-human`:
+  `run rerun OWNER/REPO#N SHA: fix round 1's run URL ended (failure) and
+  pushed no new head for SHA, so its failed jobs run once more (why) ->
+  re-run`. That is a dispatch within `--max-dispatch` and the poll's three a
+  pass, so it takes a WIP slot from stages 3 and 4. A round a broker outage
+  failed is still given back first; one that failed again is `needs-human`
+  (`… ended (failure) again after a rerun …`).
+* **Triage and implement runs, stage 4.** Stage 4 lists the caller
+  workflow's runs created in the last day that failed, the newest page (one
+  request). A candidate with no person's hold or run in
+  flight, whose newest plan's dispatch record names one of them, gets
+  `run rerun OWNER/REPO#N: its implement run URL ended (failure), so its
+  failed jobs run once more pool=P run=URL` in its turn, checked as a start
+  of its plan is now: the plan's item in a work repository and not held,
+  the overlap check, a WIP slot, the pool its run's title names under the
+  rule of [scheduling](#scheduling), `--max-dispatch`, the recheck of the
+  candidate and the plan's item, and with `leases` a lease taken at the
+  request and bound to the run once GitHub accepts it. A triage plan's run
+  is re-run only where the plan is the candidate's own; any other plan's, a
+  stacked plan's, whose base may have moved, and a batch's extra's are held
+  for a person (`needs-operator`). A refused rerun holds it (`other`, `…;
+  its rerun was refused: HTTP 403: …`). One that failed again holds the
+  candidate for that day (`needs-operator`, `hold OWNER/REPO#N: its
+  implement run URL ended (failure) again after a rerun, so it waits for a
+  person`); after that it is held or followed up as before. An epic's
+  planning run keeps stage 3's own retry.
+
+`reruns` also lets a stacked pull request go on once the one below it merged
+and it was retargeted: an approval from before its base changed does not
+merge it, and where GitHub reports its head behind the new base
+(`mergeStateStatus` `BEHIND`, which it does where the base requires branches
+to be up to date), stage 2 rebases it onto the base (`update: approved before its base
+became main; …, so it is rebased onto main -> brought up to date with
+main; …`, one write step, one pull request a base each pass), whose push asks
+the review job for a review against the new base. A conflict is a rebase or
+fix round as before; a head not behind still goes to `needs-human`.
 
 ## Maintain
 
@@ -1086,6 +1163,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
+| `reruns` | Re-run a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |

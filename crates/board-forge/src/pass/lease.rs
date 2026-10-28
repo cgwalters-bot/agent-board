@@ -486,7 +486,8 @@ fn deduplicate(
 /// Dispatch with the same atomic slot claim as `admit`. Kept at the actual
 /// send boundary so a peer admission after the pass's recheck still races
 /// for the slot, not for a cached capacity count. On an ambiguous answer the
-/// reservation stays. Only a named dispatch response can bind it to a run.
+/// reservation stays. Only a named dispatch response can bind it to a run,
+/// or an accepted rerun of `rerun`, the run it restarts.
 pub(super) struct Dispatch<'a, C, D> {
     pub client: &'a C,
     pub dispatcher: &'a D,
@@ -496,6 +497,7 @@ pub(super) struct Dispatch<'a, C, D> {
     pub now: OffsetDateTime,
     pub sent: Cell<bool>,
     pub reserved: RefCell<Option<Held>>,
+    pub rerun: Option<u64>,
 }
 
 impl<C: Rest, D: Rest> Rest for Dispatch<'_, C, D> {
@@ -527,8 +529,8 @@ impl<C: Rest, D: Rest> Rest for Dispatch<'_, C, D> {
         }
         self.sent.set(true);
         let answer = self.dispatcher.send(method, url, body)?;
-        if let Some(run) = answer.1["workflow_run_id"]
-            .as_u64()
+        if let Some(run) = (answer.1["workflow_run_id"].as_u64())
+            .or(self.rerun)
             .filter(|_| answer.0 < 300)
         {
             let reserved = self.reserved.borrow();
