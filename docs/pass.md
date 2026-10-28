@@ -637,8 +637,9 @@ opened, still runs an accepted plan (its own plan comment, or with
 operator's; an ended triage's verdict is still acted on: it labels the
 issue, or with `triageClose` may close it.
 The `candidates:` line then counts these issues too (`, N unparented: run
-only with a plan`). The scope `all`, or `triage: true` as before scopes,
-triages every candidate.
+only with a plan`), and with `sweep` set the hold adds `; the weekly sweep
+lists it`: the [weekly sweep](#the-weekly-sweep) looks at them as one batch.
+The scope `all`, or `triage: true` as before scopes, triages every candidate.
 
 The inputs are a fingerprint of what the pass reads of the issue: its title
 and body, the comments of anyone but the bot, its labels, Priority, open dependencies
@@ -775,6 +776,102 @@ happens only where the caller's bounds for its triage runs allow one; the
 pass itself closes nothing for it but on a verdict with `triageClose`. With
 `triageFollowUpDays` the brief also asks for a verdict, and the revisit's
 plan is then followed up as any triage plan is.
+
+## The weekly sweep
+
+Under the triage scope `epics` no issue outside every live epic is triaged
+on its own (see [scheduling](#scheduling)), so one sweep a week looks at
+them together (agent-board#431). With `sweep` set (off unless set), stage 4
+ends, after its starts and revisits, with the sweep. Where stage 4 starts
+nothing (every slot taken, no pool, the weekly budget reached), an open
+sweep is still applied, finished or labelled (step 4), which takes
+no run, on a board read for it; its run is not started, no new sweep is
+filed, and an epic its reply names is read as stage 4 would read it, where
+it is a parent on the board:
+
+1. Before stage 4 reads its candidates, the pass looks in
+   `sweep.repository` for the newest issue of the bot's whose body starts
+   with `<!-- agent-board-sweep v1 -->`: among its open issues first, else
+   among those filed since this week's due time, open or closed, each up
+   to three pages of 100, pull requests included. It leaves that issue out
+   of the candidates: its run is the sweep's to start. A list that cannot
+   be read, or that goes on past three pages, fails the stage's sweep
+   (`sweep error: …`): no sweep is filed or started, and the issue is then
+   not left out.
+2. With none open, a sweep is due from `sweep.weekday` at `sweep.hourUtc`
+   each week, unless one was filed since (`sweep: this week's, URL, is
+   closed; the next is due from T`). It then files one issue in
+   `sweep.repository`, `Weekly sweep: N issues outside the epics`, one
+   write within `--max-writes`, nothing in a preview (`sweep: file …; a
+   preview files nothing`). It lists the candidates outside every live
+   epic, those nobody touched for longest first (the board's `updatedAt`,
+   which the board read then asks for, else when they were opened), at
+   most `sweep.max`, each as a link and in one `agent-board-sweep` JSON
+   block, `{"schema": "agent-board/sweep/v1", "due": T, "issues":
+   ["OWNER/REPO#N", …]}`. It lists only issues of `sweep.repository` and
+   of repositories read as public: an issue of another, private or of
+   unread visibility, is left out (`sweep: N issue(s) outside the epics
+   are in repositories not read as public, …`), since the sweep issue and
+   its run's reply would show it to other readers. Only the bot's token
+   files it, as only the bot's issues are found again. The pass does not
+   put the issue on the board and gives it no parent; its marker, not its
+   Priority, keeps it apart. So at most one sweep is filed in each weekly
+   window, and none while one is open.
+3. While it is open and has no plan, its one triage run starts below all
+   other work, unless it lists an issue of another repository not read as
+   public (`it lists an issue of OWNER/REPO, not read as public; no run
+   starts`, labelled `needs-human`): with a slot left (`sweep URL: no slot free; it waits`),
+   every pool of `triagePools` under its pace, room above zero by the rule
+   of [scheduling](#scheduling) (`sweep URL: waits for every pool to be
+   under its pace: …`), and the weekly budget not reached. It is started
+   as stage 4 starts a triage run, within `--max-dispatch`, WIP and
+   pacing, its plan posted after `The board pass asks a triage run to
+   sweep the issues outside the epics listed here.` and recorded by the
+   plan protocol (`start sweep OWNER/REPO#N pool=P`). Its brief asks for
+   exactly one comment on the sweep issue, with a line per listed issue
+   and one `agent-board-sweep-verdicts` JSON block, `{"schema":
+   "agent-board/sweep-verdicts/v1", "items": [{"issue": "OWNER/REPO#N",
+   "verdict": "done|obsolete|attach|question", "epic": …, "reason": …,
+   "question": …}]}`, naming the live epics the pass read of
+   `sweep.repository` and of repositories read as public (the plan is
+   posted on the sweep issue), and no write to the listed issues.
+4. Once its run is no longer in flight, the pass reads the newest comment
+   after its dispatch record that the bot wrote, edited by nobody else,
+   holding that block; a body somebody else edited, or no such reply, is
+   left for a person (`sweep URL: …; a person …; label needs-human`), as
+   are comments that cannot be read (past their page bound, say), a plan
+   that cannot be used (invalid, or edited by another account), one with
+   no dispatch record and a reply that cannot be read: the
+   label, one write, is how the operator learns it is stuck. Only listed
+   issues count, the first item for each, and a listed issue the reply
+   has none for is a question (`the sweep gave it no verdict`). `attach` to a live epic the brief named
+   attaches the issue, still open and without a parent on the board, to
+   it through the sub-issue API (one that is a sub-issue of that epic
+   already counts as attached); an `attach` to anything else, and an
+   unknown verdict, become questions. `done` and `obsolete` are not
+   closed by the pass: they are listed for the operator to close, with
+   their reasons, as are the questions. A closed issue is left out; as the
+   board holds open issues only, the pass reads the state of one it does
+   not hold, and lists one not read as closed with its verdict, unapplied.
+   The visibility of each listed issue's repository is read again: one no
+   longer read as public is listed without its verdict, which may hold
+   what the run read there after it turned private, and not attached.
+   Then one comment on the sweep issue, whose hidden first line
+   `<!-- agent-board-sweep-applied: ID N -->` names the reply and counts
+   what is left, says what was attached and what is left. The pass adds
+   it and then edits it, and reads only one the bot edited last: the run
+   posts as the bot too, but cannot edit a comment, so a marked comment of
+   its own is not taken for the pass's. With
+   something left the sweep issue is labelled `needs-human`, else it is
+   closed as completed. The attaches, the comment's two writes and the
+   label or close are taken together within `--max-writes`, or none of
+   them, and only with the bot's token; a preview writes nothing (`sweep:
+   attach …; a preview writes nothing`). The
+   comment ends the sweep: later passes only say it waits for the operator
+   to close the issue, after labelling or closing it where a pass stopped
+   between the comment and that write, and no new sweep is filed while it
+   is open. The live epics are those stage 3 read in `epics.repository`
+   and the parents stage 4 read.
 
 ## Reruns
 
@@ -1363,6 +1460,8 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
+| `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs the triage scope `epics`; section absent (off) |
+| `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
 | `maintain.repos.sinceDays`, `maintain.repos.min`, `maintain.repos.max` | The repositories whose incoming pull requests a daily digest assesses: those with at least `min` (≥ 1) of the operator's opened or reviewed pull requests updated in `sinceDays` (1–365) days, the `max` (1–20) most active, derived once a day, see [maintain](#maintain); required |
 | `maintain.repos.include`, `maintain.repos.exclude` | Repositories always kept (at most `max`) and never kept, no duplicates across both; `[]`, `[]` |

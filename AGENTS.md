@@ -111,7 +111,10 @@ is a proposal until agentic-job's independent check and apply accepts it, and
 that check is **not implemented here** (the CLI's `output check` and `output
 apply` are unsupported). Do not give agents credentials or a direct mutation
 path around it; see [the bounds contract](docs/design.md#3-agentic-job-bounds-and-delegated-operations).
-Sweeping is deliberately disabled pending authenticated creation receipts.
+Sweeping (cleanup of the test projects and scratch issues the CLI creates) is
+deliberately disabled pending authenticated creation receipts; the pass's
+weekly sweep of issues outside the epics ([pass](docs/pass.md#the-weekly-sweep))
+is unrelated.
 
 Keep changes task-scoped: no generated artifacts, credential material, live board
 state, unrelated formatting or dependency/lockfile churn. Do not change production

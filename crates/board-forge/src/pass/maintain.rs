@@ -680,10 +680,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }
         Ok(started)
     }
+}
 
+impl<C: Rest + Transport> Scheduler<'_, C> {
     /// Whether `repo` is public, as GitHub's `private` and `visibility`
     /// both say; an error where it cannot read them.
-    fn public(&self, repo: &str) -> Result<bool> {
+    pub(super) fn public(&self, repo: &str) -> Result<bool> {
         let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
         ensure!(
             response.status == 200,
@@ -696,7 +698,9 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             _ => bail!("GitHub names neither its private nor its visibility"),
         }
     }
+}
 
+impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     fn public_sources(&self, repos: &[String]) -> Result<()> {
         for repo in repos {
             // Do not include the name or transport error in public diagnostics.
