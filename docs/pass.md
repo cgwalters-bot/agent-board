@@ -663,16 +663,36 @@ is due, and plans its run:
    neither a day nor heads, as whoever may edit comments on the issue could
    otherwise keep pull requests out of review, and the pass's next record
    replaces it. A plan recorded for today ends the day (`maintain: today's plan is URL;
-   the next is due from T`).
+   the next is due from T`), whether or not its digest has come: a pending
+   dispatch is never started again the same day.
+   An older plan's pending pull requests are then acknowledged only where
+   its digest assessed them (agent-board#400). The digest is the first
+   comment the bot wrote, edited by nobody else, after the plan's first
+   dispatch record by a writer, whose `agent-board-maintain-digest` block
+   has the digest's schema and the plan's day. A run posts as the bot but
+   cannot post before its own dispatch, and a later dispatch record, which
+   a run could forge, does not count. A pull request it lists, in any
+   group, counts at the full head the plan listed, which `approve` and
+   `closer` must give; one it leaves out, or lists anywhere at another
+   head, stays due, and no other field, such as heads a run wrote, is read
+   (`maintain: the digest URL
+   assessed A of P planned pull request(s); due again: OWNER/REPO#N, …`).
+   With no such digest, because the run failed, posted none, posted one by
+   another account or for another day, or the plan was not dispatched,
+   all of them stay due (`maintain: no digest for DATE followed its
+   dispatch; its P pull request(s) stay due`, `maintain: plan ID for DATE
+   has no dispatch record; …`, `maintain: the plan for DATE was not
+   dispatched; …`). Nothing is dispatched again that day; the next day's
+   plan lists them again.
 3. Otherwise it lists the open pull requests of each repository, one REST
    request each, with no inference. Those the operator or the bot opened are
    left out. A repository with more than 100 open pull requests, or more than
    200 incoming in all, is not read whole and fails the stage
    (`maintain error: …`, a failure); nothing is planned and nothing reserved.
 4. A pull request is due a review when its head commit's first 12 hex
-   characters differ from those the plan comment's `heads` records for it,
-   or it records none; a plan comment whose block cannot be read records
-   none, and its line says why. With none changed, the day is done
+   characters differ from those acknowledged for it, or none are; a plan
+   comment whose block cannot be read acknowledges none, and its line says
+   why. With none changed, the day is done
    (`maintain: none of N incoming pull request(s) changed since URL`).
    Otherwise the line is `maintain: digest due: C of N incoming pull
    request(s) changed since URL; reviews OWNER/REPO#N, …`, the first 20 in
@@ -718,16 +738,18 @@ is due, and plans its run:
 7. An applying pass then records the plan in its plan comment, editing it,
    or adding it on the first day, as one write within `--max-writes`, on a
    private repository or one the previous step read as public (`maintain:
-   recorded the plan in URL`). With it go the heads it was planned for,
-   from the pass's own listing: the unchanged pull requests' and the
-   reviewed ones', not those left waiting. That ends the day, as does a
-   dispatch whose record fails, so that the run is not started twice. A
-   start that waits records nothing, and a later pass tries again. A
-   failure before the dispatch transport is called, or a confirmed dispatch
-   refusal (a 4xx response, including a final 422), also records no heads;
-   if a plan was already posted, the recovery hold defers it until tomorrow.
-   Once a dispatch request is attempted, a lost response may hide a start,
-   so its heads are conservatively recorded and the day ends. A
+   recorded the plan in URL`). With it go, from the pass's own listing,
+   the unchanged pull requests' acknowledged heads, and, as pending, the
+   posted plan's id and the full heads of those it reviews, which only its
+   digest can acknowledge (step 2); those left waiting are in neither.
+   That ends the day, as does a dispatch whose record fails, so that the
+   run is not started twice. A start that waits records nothing, and a
+   later pass tries again. A failure before the dispatch transport is
+   called, or a confirmed dispatch refusal (a 4xx response, including a
+   final 422), also records nothing; if a plan was already posted, the
+   recovery hold defers it until tomorrow. Once a dispatch request is
+   attempted, a lost response may hide a start, so the plan is recorded as
+   pending and the day ends. A
    preview records nothing (`maintain: record the plan on OWNER/REPO#N; a
    preview records nothing`).
 8. Until the day ends, every later stage's pool choice, stage 2's fix
@@ -763,29 +785,36 @@ The check reads the repository's visibility, not its name. A private digest
 would need a dispatch workflow in its repository, whose bounds allow
 `add_comment` there alone
 ([tracker#963](https://github.com/cgwalters-forge/tracker/issues/963)); until
-then it stays a dry run, and in an applying pass its recorded heads count as
-reviewed though no run reviewed them.
+then it stays a dry run, recorded once a day with no plan id, so that its
+pull requests stay due and the plan is printed again each day.
 
 The pass's plan comment starts with its marker, then one fenced block with
 the info string `agent-board-maintain-plan` holding one JSON object,
-`agent-board/maintain-plan/v1`:
+`agent-board/maintain-plan/v2`:
 
 ```json
-{"schema": "agent-board/maintain-plan/v1", "from": "2026-10-27T09:00:00Z",
- "heads": {"example/up#12": "0123456789ab", "example/up#15": "89abcdef0123"},
+{"schema": "agent-board/maintain-plan/v2", "from": "2026-10-27T09:00:00Z",
+ "heads": {"example/up#12": "0123456789ab"},
+ "pending": {"plan": "4011223344@2026-10-27T09:12:00Z",
+   "heads": {"example/up#15": "89abcdef0123456789abcdef0123456789abcdef"}},
  "plan": {"schema": "agent-board/job-plan/v1", "…": "…"}}
 ```
 
 `from` is the start of the day it was planned for, from `hourUtc`; `heads`
-maps `OWNER/REPO#N` to the first 12 lowercase hex characters of the pull
-request's head commit when the pass listed it; `plan` is the job plan.
+maps `OWNER/REPO#N` to the first 12 lowercase hex characters of the head
+commit a digest acknowledged; `pending` holds the posted plan's id (its
+comment's id and time), or null where none was posted, and the full head
+commit of each pull request the plan lists; `plan` is the job plan. A
+`agent-board/maintain-plan/v1` record, which kept planned heads as if
+reviewed, still counts for its day, but acknowledges no heads.
 
 ### The digest
 
 The digest comment is a markdown summary, then one fenced block with the info
 string `agent-board-maintain-digest` holding one JSON object,
-`agent-board/maintain-digest/v1`. The pass does not read it; review's Maintain
-view does ([review#186](https://github.com/cgwalters-forge/review/pull/186),
+`agent-board/maintain-digest/v1`. The pass reads only its `schema`, `date`
+and each group's `pr` and `head`, to acknowledge heads ([step 2](#maintain)); review's Maintain
+view reads it all ([review#186](https://github.com/cgwalters-forge/review/pull/186),
 `src/github/maintain.ts`), and this is its schema.
 `fixtures/pass/maintain-digest.md` is the example the brief shows, for
 2026-10-23; in part:
@@ -808,8 +837,8 @@ commit the brief listed, at which the operator approves and the links open;
 `minutes` is 1 to 480; a link's `path` is relative to the repository root,
 with `start` and an optional `end` line from 1. The view refuses a digest
 that breaks these rules, and skips approving a pull request whose head has
-moved since. Unlike the 12 characters of the pass's own `heads`, these are
-the run's output, never read back for scheduling.
+moved since. These are the run's output: the pass compares them with the
+heads it planned, and never records one the run chose.
 
 ## Epic planning and recovery
 
