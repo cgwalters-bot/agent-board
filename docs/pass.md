@@ -412,12 +412,16 @@ A pass captures one clock and performs these stages in order:
      item itself, or one that says it closes the issue, in any repository and
      by any author; draft or not): **In Progress**;
    * otherwise, a derived value that no longer holds (Needs human, In
-     Progress, or Done on an issue open again) goes back to **Todo**;
+     Progress, or Done on an issue open again), or no Status at all, goes
+     to **Todo**;
    * otherwise the Status stays. **Blocked** and **Backlog** are a person's
      holds: only Done replaces them, so neither the label, a run nor a pull
      request moves them (the label still holds scheduling). The legacy
      columns (Triage, Draft, In Review, Cancelled) give way to any rule
-     above; a person's **Todo** stays.
+     above; a person's **Todo** stays. An item added to the board without a
+     Status, by `gh project item-add` or by the pass when it files one,
+     thus becomes Todo on the next pass that reads its runs and pull
+     requests whole.
 
    The rules' precedence is shared with poll's `statusReconcile` preview.
    No person or agent sets the derived values, `agent-board ask` included,

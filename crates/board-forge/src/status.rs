@@ -259,6 +259,7 @@ mod tests {
             ("other_reviewer", None),
             ("active_run", Some(Status::InProgress)),
             ("finished_run", Some(Status::Todo)),
+            ("unset_finished_run", Some(Status::Todo)),
             ("unknown_run", None),
             ("merged_links", Some(Status::Done)),
             ("open_link", None),
@@ -305,8 +306,11 @@ mod tests {
                         .into(),
                     );
                 }
-                "active_run" | "finished_run" | "unknown_run" => {
+                "active_run" | "finished_run" | "unset_finished_run" | "unknown_run" => {
                     item.status = Some(Status::InProgress);
+                    if case == "unset_finished_run" {
+                        item.status = None;
+                    }
                     if case != "unknown_run" {
                         item.fields.insert(
                             "Run".into(),
@@ -316,7 +320,7 @@ mod tests {
                     if case == "active_run" {
                         item.status = Some(Status::Todo);
                     }
-                    if case == "finished_run" {
+                    if case != "active_run" {
                         offline.run["status"] = json!("completed");
                     }
                 }

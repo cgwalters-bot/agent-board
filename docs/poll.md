@@ -535,7 +535,8 @@ assignment exemptions: closed/merged content or a nonempty set of all-merged
 linked PRs becomes Done; an open `needs-human` label (any case) or an outstanding
 operator review request becomes Needs human; otherwise a draft PR or active
 recorded Run becomes In Progress. A completed recorded Run releases In Progress
-or Needs human to Todo. Terminal facts win, then human asks, then active work.
+or Needs human to Todo, and sets an unset Status to Todo; without one, the
+default rules still propose Triage for an unset Status. Terminal facts win, then human asks, then active work.
 Missing run data is unknown, not proof that no live job exists. Linked PR facts
 come from complete native PR-valued project fields. Coverage and status schema
 checks still block incomplete or ambiguous repairs. This mode maps all closed
