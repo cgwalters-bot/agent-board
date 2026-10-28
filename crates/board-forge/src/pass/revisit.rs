@@ -48,7 +48,7 @@ pub struct Revisit {
 
 impl Revisit {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
-        ensure!(config.triage, "revisit needs triage");
+        ensure!(config.triage.is_some(), "revisit needs triage");
         ensure!(
             (1..=PER_PASS_LIMIT).contains(&self.per_pass),
             "revisit perPass is not 1 to {PER_PASS_LIMIT}"
@@ -212,7 +212,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             let Some(updated) = facts.updated else {
                 continue;
             };
-            if revisit_hold(facts, &slots.busy, &writers).is_some() {
+            if revisit_hold(facts, &slots.busy, &writers).is_some()
+                || self.outside_epics(facts).is_some()
+            {
                 continue;
             }
             let status = facts.status.as_deref();

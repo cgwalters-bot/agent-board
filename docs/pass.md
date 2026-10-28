@@ -103,7 +103,8 @@ on the operator's approval; the pass reads the issue's labels, not the pull
 request's, nor whether the review job has approved yet),
 `in-flight`, `dispatched` (its plan's run has ended, or an
 epic's planning request waits for its plan), `triage-cooldown` (triaged or
-planned too recently to ask again), `overlap`, `overlap-ignored` (not a hold:
+planned too recently to ask again), `outside-epics` (no triage under the
+triage scope `epics`, see [Scheduling](#scheduling)), `overlap`, `overlap-ignored` (not a hold:
 an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),
 `unreadable` (labels, pull
 requests, a parent epic, a plan's target or the runs not read whole), `wip`,
@@ -531,8 +532,9 @@ a start's request reservation covers; any past those, and one that cannot
 read, holds the start, as any unreadable overlap check does.
 
 With no accepted plan, start one triage run if enabled and a slot/pool is
-available. It proposes an implement plan, or explains a needs-design/human hold;
-it does not close the issue on a `done` verdict. Record the question using the
+available, for an issue in the triage scope (below). It proposes an
+implement plan, or explains a needs-design/human hold; it does not close
+the issue on a `done` verdict. Record the question using the
 existing dispatch claim protocol, not another scheduler marker. A completed run
 without a usable plan remains visible for a person; do not automatically retry,
 unless `triageFollowUpDays` is set. Then the triage brief asks for a
@@ -561,6 +563,18 @@ for a change or the operator. With no verdict, where the run may have
 failed, the issue is triaged again `triageFollowUpDays` after the record,
 changed or not, as is one whose triage plan predates this and carries no
 fingerprint.
+
+Work starts from the epics (agent-board#431). Under the triage scope
+`epics`, triage, its follow-ups above, re-planning below, a triage's rerun
+and [revisits](#revisits) are only for the children of live epics. An
+issue outside every live epic, an unparented one the operator or the bot
+opened, still runs an accepted plan (its own plan comment, or with
+`bodyPlans` its body's), but is otherwise held as `outside-epics`
+(`outside every live epic, so not triaged (triage scope epics)`), not the
+operator's; an ended triage's verdict for the operator still labels it.
+The `candidates:` line then counts these issues too (`, N unparented: run
+only with a plan`). The scope `all`, or `triage: true` as before scopes,
+triages every candidate.
 
 The inputs are a fingerprint of what the pass reads of the issue: its title
 and body, the comments of anyone but the bot, its labels, Priority, open dependencies
@@ -664,7 +678,8 @@ starts left free on a sample of old candidates:
    live epic's Priority counted down from the board's first option (with
    P0 to P3: 6⁵ for P0 down to 6¹ for unset), so at equal silence one step
    of the epic's Priority outweighs any difference of its own; an issue outside a live
-   epic has focus 1, the least, but stays eligible. Its own Priority counts
+   epic has focus 1, the least, but stays eligible (not under the triage
+   scope `epics`, which revisits only the children of live epics). Its own Priority counts
    down likewise (5 to 1 with P0 to P3), and silence is how many of its days
    it has been untouched, 1 to 4. The draw is seeded by the pass's run id
    (the clock outside Actions) with a generator in the code, and logged as
@@ -1274,7 +1289,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `epics.repository` | Repository containing live epics; absent disables epic planning |
 | `epics.inWorkRepositories` | Also take operator-labelled epics in every work repository as live, for candidates only; `false` |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
-| `triage` | Permit no-plan triage; `false` |
+| `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
@@ -1338,7 +1353,7 @@ not listed here go with it at the cutover unless a need adds them.
 Credentials and transport-specific provider normalization are not
 per-deployment config keys. The caller enables new work by setting
 `workRepositories`, `wip`, pools and usage; triage additionally needs
-`triage: true`, epic planning `epics.repository`, and the daily maintain
+`triage`, epic planning `epics.repository`, and the daily maintain
 digest a `maintain` section, whose run is dispatched only where
 `maintain.digest.repository` is public and `wip` leaves a slot. The cutover
 PR must supply those settings explicitly; merely upgrading the binary
