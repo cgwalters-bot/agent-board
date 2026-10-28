@@ -76,8 +76,9 @@ releases: `needs-human` (labelled so, by a person or a triage verdict),
 `epic-unplanned` (an epic's planning request got no plan) and
 `needs-operator` (an invalid or refused plan, an apply cut short and not
 proved, a plan dispatched by hand, no plan with triage off, or a run that
-failed again after its [rerun](#reruns)). The one
-exception is an epic whose first planning request got no plan and that the
+failed again after its [rerun](#reruns)), and `pr-open` on an issue labelled
+`needs-operator-approval` (below). The one
+exception the other way is an epic whose first planning request got no plan and that the
 pass retries once by itself after the cooldown (`… got no plan; planned once
 more from T`): `epic-unplanned` with `operator` false. When the retry gets no
 plan either, the hold is `epic-unplanned` with `operator` true; once its
@@ -95,7 +96,12 @@ The other kinds are `closed`, `needs-design` (labelled so: a parked design,
 which still blocks dispatch but asks the operator nothing), `blocked`
 (board Blocked), `waiting-on` (open
 dependencies, or a lower stacked slice not yet open), `pr-open` (the bot's or
-the operator's), `in-flight`, `dispatched` (its plan's run has ended, or an
+the operator's; on an issue labelled `needs-operator-approval`, read
+case-insensitively, its reason is `approve pull request REPO#N to merge` and
+`operator` is true, since the poll merges the bot's pull request for it only
+on the operator's approval; the pass reads the issue's labels, not the pull
+request's, nor whether the review job has approved yet),
+`in-flight`, `dispatched` (its plan's run has ended, or an
 epic's planning request waits for its plan), `triage-cooldown` (triaged or
 planned too recently to ask again), `overlap`, `overlap-ignored` (not a hold:
 an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),

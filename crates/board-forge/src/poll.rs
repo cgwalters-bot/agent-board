@@ -53,7 +53,7 @@ pub(crate) use tests::conflict_stop_fixture;
 const CLAIM: &str = "agent-board-fix-claim";
 /// On a pull request or an issue it closes: the review job's approval alone
 /// does not merge it, the operator's of the head does (agent-board#293).
-const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
+pub(crate) const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
 const MAX_FIX_ROUNDS: u64 = 2;
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";

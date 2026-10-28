@@ -17,9 +17,9 @@ use crate::github::{API_ROOT, DEFAULT_HOST, RateLimited, Transport, is_github_lo
 use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
 use crate::poll::{
-    self, POLL_REPOSITORY_LIMIT, PollPolicy, RERUN_CONCLUSION, RERUN_WINDOW_SECONDS, Rest,
-    RestResponse, State, next_link, stale::STALE_DAYS_LIMIT, text, validate_repository,
-    validate_workflow,
+    self, OPERATOR_APPROVAL_LABEL, POLL_REPOSITORY_LIMIT, PollPolicy, RERUN_CONCLUSION,
+    RERUN_WINDOW_SECONDS, Rest, RestResponse, State, next_link, stale::STALE_DAYS_LIMIT, text,
+    validate_repository, validate_workflow,
 };
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
@@ -1299,13 +1299,24 @@ pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> 
 
 /// The part of [`hold`] that says work on an open issue is under way, or may
 /// be: a trusted open pull request, pull requests left unread, or a run in
-/// flight.
+/// flight. An issue labelled [`OPERATOR_APPROVAL_LABEL`] waits on the
+/// operator's approval of its pull request, as the poll's merge gate does;
+/// labels not all read say nothing.
 fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Hold> {
     if let Some((number, repo, _)) = facts
         .pulls
         .iter()
         .find(|(_, _, author)| is(author.as_deref(), people))
     {
+        let approval = facts.labels_complete
+            && facts
+                .labels
+                .iter()
+                .any(|l| l.eq_ignore_ascii_case(OPERATOR_APPROVAL_LABEL));
+        if approval {
+            let why = format!("approve pull request {repo}#{number} to merge");
+            return Some(Hold::new(HoldKind::PrOpen, why).operator(true));
+        }
         let why = format!("pull request {repo}#{number} is open");
         return Some(Hold::new(HoldKind::PrOpen, why));
     }

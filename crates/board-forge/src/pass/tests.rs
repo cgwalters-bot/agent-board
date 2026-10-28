@@ -6361,37 +6361,65 @@ fn hold_table() {
         (
             "closed",
             |f| f.open = false,
-            Some((HoldKind::Closed, "closed")),
+            Some((HoldKind::Closed, "closed", false)),
         ),
         (
             "needs-human",
             |f| f.labels = vec!["Needs-Human".into()],
-            Some((HoldKind::NeedsHuman, "labelled needs-human")),
+            Some((HoldKind::NeedsHuman, "labelled needs-human", true)),
         ),
         (
             "needs-design",
             |f| f.labels = vec!["needs-design".into()],
-            Some((HoldKind::NeedsDesign, "labelled needs-design")),
+            Some((HoldKind::NeedsDesign, "labelled needs-design", false)),
         ),
         (
             "unread labels",
             |f| f.labels_complete = false,
-            Some((HoldKind::Unreadable, "its labels could not all be read")),
+            Some((
+                HoldKind::Unreadable,
+                "its labels could not all be read",
+                false,
+            )),
         ),
         (
             "board Blocked",
             |f| f.status = Some("Blocked".into()),
-            Some((HoldKind::Blocked, "board Status is Blocked")),
+            Some((HoldKind::Blocked, "board Status is Blocked", false)),
         ),
         (
             "dependency",
             |f| f.blocked_by = 2,
-            Some((HoldKind::WaitingOn, "2 open dependencies")),
+            Some((HoldKind::WaitingOn, "2 open dependencies", false)),
         ),
         (
             "bot pull request",
             |f| f.pulls = vec![(9, "o/r".into(), Some("bot".into()))],
-            Some((HoldKind::PrOpen, "pull request o/r#9 is open")),
+            Some((HoldKind::PrOpen, "pull request o/r#9 is open", false)),
+        ),
+        (
+            "bot pull request awaiting approval",
+            |f| {
+                f.labels = vec![OPERATOR_APPROVAL_LABEL.into()];
+                f.pulls = vec![(9, "o/r".into(), Some("bot".into()))];
+            },
+            Some((
+                HoldKind::PrOpen,
+                "approve pull request o/r#9 to merge",
+                true,
+            )),
+        ),
+        (
+            "approval label in another case",
+            |f| {
+                f.labels = vec!["Needs-Operator-Approval".into()];
+                f.pulls = vec![(9, "o/r".into(), Some("bot".into()))];
+            },
+            Some((
+                HoldKind::PrOpen,
+                "approve pull request o/r#9 to merge",
+                true,
+            )),
         ),
         (
             "visitor pull request",
@@ -6404,6 +6432,7 @@ fn hold_table() {
             Some((
                 HoldKind::Unreadable,
                 "its pull requests could not all be read",
+                false,
             )),
         ),
         (
@@ -6412,15 +6441,25 @@ fn hold_table() {
                 f.pulls = vec![(9, "o/r".into(), Some("op".into()))];
                 f.pulls_complete = false;
             },
-            Some((HoldKind::PrOpen, "pull request o/r#9 is open")),
+            Some((HoldKind::PrOpen, "pull request o/r#9 is open", false)),
         ),
     ] {
         let mut f = base.clone();
         change(&mut f);
         let held = hold(&f, &BTreeMap::new(), &people);
-        let held = held.as_ref().map(|h| (h.kind, h.reason.as_str()));
+        let held = held
+            .as_ref()
+            .map(|h| (h.kind, h.reason.as_str(), h.operator));
         assert_eq!(held, expected, "{name}");
     }
+    // With labels not all read, `under_way` (which the revisit also uses)
+    // does not guess at the approval label.
+    let mut f = base.clone();
+    f.labels = vec![OPERATOR_APPROVAL_LABEL.into()];
+    f.labels_complete = false;
+    f.pulls = vec![(9, "o/r".into(), Some("bot".into()))];
+    let open = Hold::new(HoldKind::PrOpen, "pull request o/r#9 is open");
+    assert_eq!(under_way(&f, &BTreeMap::new(), &people), Some(open));
     let why = "a run is in flight, https://run";
     let held = Some(Hold::new(HoldKind::InFlight, why));
     assert_eq!(hold(&base, &busy, &people), held);
