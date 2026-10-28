@@ -53,8 +53,16 @@ pub struct Routing {
 
 pub const ROUTED_CORES: u8 = 4;
 pub const ROUTED_REPOSITORIES: usize = 10;
-const ROUTE_RUN_PAGES: u64 = 5;
+/// The largest listing of active runs in one status that admission reads.
 const ROUTE_RUN_PAGE_SIZE: u64 = 100;
+
+/// Every run status but `completed`, in lifecycle order.
+const ROUTE_ACTIVE_STATUSES: [&str; 5] =
+    ["requested", "pending", "waiting", "queued", "in_progress"];
+
+/// Passes over `ROUTE_ACTIVE_STATUSES`: one more than the backward status
+/// changes a run may make during the reads and still be seen.
+const ROUTE_PASSES: usize = 2;
 
 fn small_cores() -> u8 {
     ROUTED_CORES
@@ -141,9 +149,16 @@ impl Routing {
         Ok(true)
     }
 
-    /// Bound reads to five pages per workflow, preserving old tracker visibility.
-    /// Refuse incomplete/unavailable listings rather than spend elsewhere. The
-    /// operator must serialize dispatches; this is admission, not a remote lock.
+    /// List each workflow's active runs by status, whatever its history's
+    /// length, preserving old tracker visibility. Neither an unfiltered
+    /// history nor a filtered `total_count` (capped at 2500) bounds a busy
+    /// caller, so each active status is listed in `ROUTE_ACTIVE_STATUSES`
+    /// order, twice: the first pass sees every run that only moves forward
+    /// in that order between its reads, the second also one that moves back
+    /// once (a gate taking it from queued or in_progress to waiting). Refuse
+    /// unavailable, malformed or oversized
+    /// listings rather than spend elsewhere. The operator must serialize
+    /// dispatches; this is admission, not a remote lock.
     pub fn check_idle(
         &self,
         client: &impl crate::poll::Rest,
@@ -154,64 +169,29 @@ impl Routing {
         legacy.validate()?;
         validate_repository(repository)?;
         for target in [legacy, &self.target] {
-            let mut ids = std::collections::BTreeSet::new();
-            let mut expected = None;
-            for page in 1..=ROUTE_RUN_PAGES {
-                // Do not discover by mutable status: a queued -> in_progress
-                // transition between filtered queries could disappear from both.
-                let path = format!(
-                    "{}repos/{}/actions/workflows/{}/runs?per_page={ROUTE_RUN_PAGE_SIZE}&page={page}",
-                    crate::github::API_ROOT,
-                    target.caller,
-                    target.workflow
-                );
-                let response = client.get(&path, None).with_context(|| {
-                    format!("route unavailable: {}/{}", target.caller, target.workflow)
-                })?;
+            for status in std::iter::repeat_n(ROUTE_ACTIVE_STATUSES, ROUTE_PASSES).flatten() {
+                let (total, runs) = route_runs(
+                    client,
+                    target,
+                    &format!("status={status}&per_page={ROUTE_RUN_PAGE_SIZE}"),
+                )?;
                 ensure!(
-                    response.status == 200,
-                    "route unavailable: {}/{}: HTTP {}",
+                    total <= ROUTE_RUN_PAGE_SIZE && runs.len() as u64 == total,
+                    "route has {total} {status} runs on {}/{}, listed {}; dispatch held",
                     target.caller,
                     target.workflow,
-                    response.status
-                );
-                let total = response.body["total_count"]
-                    .as_u64()
-                    .context("route run listing missing total_count")?;
-                let runs = response.body["workflow_runs"]
-                    .as_array()
-                    .context("route run listing missing workflow_runs")?;
-                ensure!(
-                    total <= ROUTE_RUN_PAGES * ROUTE_RUN_PAGE_SIZE,
-                    "route run history exceeds bounded inventory; dispatch held"
-                );
-                ensure!(
-                    expected.is_none_or(|previous| previous == total),
-                    "route run listing changed during inventory; dispatch held"
-                );
-                expected = Some(total);
-                ensure!(
-                    runs.len() as u64 <= ROUTE_RUN_PAGE_SIZE,
-                    "route run page exceeds bound"
+                    runs.len()
                 );
                 for run in runs {
-                    let id = run["id"].as_u64().context("route run missing id")?;
-                    ensure!(
-                        ids.insert(id),
-                        "route run listing repeated an id; dispatch held"
-                    );
+                    // A run listed under a status it has since left is
+                    // judged by its current one.
                     if run["status"] == "completed" {
                         continue;
                     }
                     ensure!(
-                        run["status"].as_str().is_some_and(|s| [
-                            "queued",
-                            "in_progress",
-                            "waiting",
-                            "pending",
-                            "requested"
-                        ]
-                        .contains(&s)),
+                        run["status"]
+                            .as_str()
+                            .is_some_and(|s| ROUTE_ACTIVE_STATUSES.contains(&s)),
                         "route run has unknown status; dispatch held"
                     );
                     let title = run["display_title"]
@@ -236,21 +216,41 @@ impl Routing {
                         );
                     }
                 }
-                ensure!(
-                    ids.len() as u64 <= total,
-                    "route run listing exceeds total_count"
-                );
-                if ids.len() as u64 == total {
-                    break;
-                }
-                ensure!(
-                    runs.len() as u64 == ROUTE_RUN_PAGE_SIZE && page < ROUTE_RUN_PAGES,
-                    "route run listing incomplete; dispatch held"
-                );
             }
         }
         Ok(())
     }
+}
+
+/// One listing of the workflow's runs: its `total_count` and the runs on it.
+fn route_runs(
+    client: &impl crate::poll::Rest,
+    target: &Target,
+    query: &str,
+) -> Result<(u64, Vec<Value>)> {
+    let path = format!(
+        "{}repos/{}/actions/workflows/{}/runs?{query}",
+        crate::github::API_ROOT,
+        target.caller,
+        target.workflow
+    );
+    let response = client
+        .get(&path, None)
+        .with_context(|| format!("route unavailable: {}/{}", target.caller, target.workflow))?;
+    ensure!(
+        response.status == 200,
+        "route unavailable: {}/{}: HTTP {}",
+        target.caller,
+        target.workflow,
+        response.status
+    );
+    let total = response.body["total_count"]
+        .as_u64()
+        .context("route run listing missing total_count")?;
+    let runs = response.body["workflow_runs"]
+        .as_array()
+        .context("route run listing missing workflow_runs")?;
+    Ok((total, runs.clone()))
 }
 
 impl Target {
@@ -546,141 +546,268 @@ mod tests {
         }
     }
 
-    #[test]
-    fn routing_preserves_mixed_inflight_and_fails_closed() {
-        use crate::poll::{Rest, RestResponse};
-        use std::cell::RefCell;
-        struct Runs {
-            active: Option<(&'static str, &'static str)>,
-            status: u16,
-            total: u64,
-            seen: RefCell<Vec<String>>,
+    /// A fake caller's run: caller repository, id, status and display title.
+    type Run = (&'static str, u64, &'static str, &'static str);
+
+    const TRACKER: &str = "cgwalters-forge/tracker";
+
+    const SANDBOX: &str = "bootc-dev/cgwalters-devspace-sandbox";
+
+    /// Both callers' runs. Before the numbered read, each of `moves` sets a
+    /// run's status. `index` lists one run under a stale status, as a lagging
+    /// run index would.
+    struct Runs {
+        runs: std::cell::RefCell<Vec<Run>>,
+        http: u16,
+        moves: Vec<(usize, u64, &'static str)>,
+        index: Option<(u64, &'static str)>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl crate::poll::Rest for Runs {
+        fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<crate::poll::RestResponse> {
+            let read = self.reads.get();
+            self.reads.set(read + 1);
+            let mut runs = self.runs.borrow_mut();
+            for &(_, id, status) in self.moves.iter().filter(|m| m.0 == read) {
+                runs.iter_mut().find(|run| run.1 == id).unwrap().2 = status;
+            }
+            let caller = [TRACKER, SANDBOX]
+                .into_iter()
+                .find(|caller| url.contains(&format!("/repos/{caller}/actions/")))
+                .unwrap();
+            let (filter, per_page) = url
+                .split_once("?status=")
+                .and_then(|(_, query)| query.split_once("&per_page="))
+                .unwrap();
+            let per_page: usize = per_page.parse().unwrap();
+            let listed: Vec<Value> = runs
+                .iter()
+                .filter(|run| run.0 == caller)
+                .filter(|run| self.index.filter(|i| i.0 == run.1).map_or(run.2, |i| i.1) == filter)
+                .map(|run| json!({"id": run.1, "status": run.2, "display_title": run.3}))
+                .collect();
+            Ok(crate::poll::RestResponse {
+                status: self.http,
+                etag: None,
+                last_modified: None,
+                link: None,
+                body: json!({
+                    "total_count": listed.len(),
+                    "workflow_runs": listed[..listed.len().min(per_page)],
+                }),
+            })
         }
-        impl Rest for Runs {
-            fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
-                self.seen.borrow_mut().push(url.into());
-                assert!(!url.contains("status="));
-                let runs = if self.active.is_some_and(|(caller, _)| url.contains(caller)) {
-                    vec![
-                        json!({"id": 99, "status": self.active.unwrap().1, "display_title": "implement bootc-dev/bootc#2531 (openai, 4c)", "html_url": "https://github.com/example/caller/actions/runs/99"}),
-                    ]
-                } else {
-                    vec![]
-                };
-                Ok(RestResponse {
-                    status: self.status,
-                    etag: None,
-                    last_modified: None,
-                    link: None,
-                    body: json!({"total_count": self.total.max(runs.len() as u64), "workflow_runs": runs}),
-                })
-            }
-            fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
-                panic!("routing check must not mutate")
-            }
-        }
-        let legacy = Target {
-            caller: "cgwalters-forge/tracker".into(),
-            workflow: "dispatch.yml".into(),
-            git_ref: "main".into(),
-        };
-        for (active, status, total, error) in [
-            (None, 200, 0, None),
-            (
-                Some(("cgwalters-forge/tracker", "in_progress")),
-                200,
-                0,
-                Some("route held"),
-            ),
-            (
-                Some(("bootc-dev/cgwalters-devspace-sandbox", "queued")),
-                200,
-                0,
-                Some("route held"),
-            ),
-            (
-                Some(("bootc-dev/cgwalters-devspace-sandbox", "waiting")),
-                200,
-                0,
-                Some("route held"),
-            ),
-            (None, 404, 0, Some("route unavailable")),
-            (None, 200, 501, Some("exceeds bounded inventory")),
-            (None, 200, 1, Some("incomplete")),
-        ] {
-            let runs = Runs {
-                active,
-                status,
-                total,
-                seen: Default::default(),
-            };
-            let result = route().check_idle(&runs, &legacy, "bootc-dev/bootc");
-            if let Some(error) = error {
-                assert!(result.unwrap_err().to_string().contains(error));
-            } else {
-                result.unwrap();
-                assert_eq!(runs.seen.borrow().len(), 2);
-            }
+
+        fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+            panic!("routing check must not mutate")
         }
     }
 
+    /// Reads per workflow: each active status, twice.
+    const INVENTORY_READS: usize = ROUTE_PASSES * ROUTE_ACTIVE_STATUSES.len();
+
     #[test]
-    fn routing_status_transitions_and_malformed_titles_never_authorize_dispatch() {
-        use crate::poll::{Rest, RestResponse};
-        use std::cell::Cell;
-        struct Moving {
-            reads: Cell<usize>,
-            title: &'static str,
-        }
-        impl Rest for Moving {
-            fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
-                let read = self.reads.get();
-                self.reads.set(read + 1);
-                // During initial admission waiting -> queued; before POST queued
-                // -> in_progress. Discovery must not filter away either state.
-                let status = if read == 0 { "queued" } else { "in_progress" };
-                let runs = if !url.contains("status=") || url.contains(&format!("status={status}&"))
-                {
-                    vec![json!({"id": 99, "status": status, "display_title": self.title})]
-                } else {
-                    vec![]
-                };
-                Ok(RestResponse {
-                    status: 200,
-                    etag: None,
-                    last_modified: None,
-                    link: None,
-                    body: json!({"total_count": runs.len(), "workflow_runs": runs}),
-                })
-            }
-            fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
-                panic!("must not dispatch")
-            }
-        }
+    fn routing_inventory_table() {
         let legacy = Target {
-            caller: "example/tracker".into(),
+            caller: TRACKER.into(),
             workflow: "dispatch.yml".into(),
             git_ref: "main".into(),
         };
-        for (title, error) in [
-            ("implement bootc-dev/bootc#2531 (openai)", "route held"),
-            ("research bootc-dev/bootc#7 (openai, 4c)", "route held"),
-            ("", "no target identity"),
-            ("agent", "no target identity"),
-            ("implement bootc-dev/bootc#oops", "invalid item"),
-            ("implement not-a-repo#1", "invalid repository"),
+        let other = "fix cgwalters-forge/agent-board#381 (claude)";
+        let bootc = "implement bootc-dev/bootc#2531 (openai, 4c)";
+        let crowded: Vec<Run> = (1..=101)
+            .map(|id| (TRACKER, id, "in_progress", other))
+            .collect();
+        // The tracker's reads are requested, pending, waiting (2), queued (3)
+        // and in_progress (4), then again from 5: waiting is 7, queued 8 and
+        // in_progress 9. The sandbox's follow from 10.
+        for (name, runs, http, moves, index, expected) in [
+            ("idle", vec![], 200, vec![], None, Ok(())),
+            (
+                "other active work, completed work",
+                vec![
+                    (TRACKER, 1, "in_progress", other),
+                    (SANDBOX, 2, "completed", bootc),
+                ],
+                200,
+                vec![],
+                None,
+                Ok(()),
+            ),
+            (
+                "old tracker run",
+                vec![(TRACKER, 1, "in_progress", bootc)],
+                200,
+                vec![],
+                None,
+                Err("route held"),
+            ),
+            (
+                "sandbox queued",
+                vec![(SANDBOX, 1, "queued", bootc)],
+                200,
+                vec![],
+                None,
+                Err("route held"),
+            ),
+            (
+                "sandbox waiting",
+                vec![(SANDBOX, 1, "waiting", bootc)],
+                200,
+                vec![],
+                None,
+                Err("route held"),
+            ),
+            (
+                "case-insensitive target",
+                vec![(
+                    SANDBOX,
+                    1,
+                    "requested",
+                    "research BOOTC-DEV/bootc#7 (openai, 4c)",
+                )],
+                200,
+                vec![],
+                None,
+                Err("route held"),
+            ),
+            (
+                "unavailable",
+                vec![],
+                404,
+                vec![],
+                None,
+                Err("route unavailable"),
+            ),
+            (
+                "crowded status",
+                crowded,
+                200,
+                vec![],
+                None,
+                Err("101 in_progress runs"),
+            ),
+            (
+                "started between reads",
+                vec![(TRACKER, 1, "queued", bootc)],
+                200,
+                vec![(4, 1, "in_progress")],
+                None,
+                Err("route held"),
+            ),
+            (
+                "moved forward before each read",
+                vec![(SANDBOX, 1, "requested", bootc)],
+                200,
+                vec![
+                    (10, 1, "pending"),
+                    (11, 1, "waiting"),
+                    (12, 1, "queued"),
+                    (13, 1, "in_progress"),
+                ],
+                None,
+                Err("route held"),
+            ),
+            (
+                "gated between reads",
+                vec![(TRACKER, 1, "in_progress", bootc)],
+                200,
+                vec![(3, 1, "waiting")],
+                None,
+                Err("route held"),
+            ),
+            // The documented limit: two backward changes during the reads.
+            (
+                "gated twice between reads",
+                vec![(TRACKER, 1, "in_progress", bootc)],
+                200,
+                vec![(3, 1, "waiting"), (7, 1, "in_progress"), (9, 1, "waiting")],
+                None,
+                Ok(()),
+            ),
+            (
+                "completed before its status is read",
+                vec![(TRACKER, 1, "in_progress", bootc)],
+                200,
+                vec![(4, 1, "completed")],
+                None,
+                Ok(()),
+            ),
+            (
+                "lagging index, completed",
+                vec![(TRACKER, 1, "completed", bootc)],
+                200,
+                vec![],
+                Some((1, "in_progress")),
+                Ok(()),
+            ),
+            (
+                "lagging index, started",
+                vec![(TRACKER, 1, "in_progress", bootc)],
+                200,
+                vec![],
+                Some((1, "queued")),
+                Err("route held"),
+            ),
+            (
+                "unknown status",
+                vec![(TRACKER, 1, "action_required", other)],
+                200,
+                vec![],
+                Some((1, "queued")),
+                Err("unknown status"),
+            ),
+            (
+                "empty title",
+                vec![(TRACKER, 1, "queued", "")],
+                200,
+                vec![],
+                None,
+                Err("no target identity"),
+            ),
+            (
+                "bare title",
+                vec![(TRACKER, 1, "queued", "agent")],
+                200,
+                vec![],
+                None,
+                Err("no target identity"),
+            ),
+            (
+                "bad item",
+                vec![(TRACKER, 1, "queued", "implement bootc-dev/bootc#oops")],
+                200,
+                vec![],
+                None,
+                Err("invalid item"),
+            ),
+            (
+                "bad repository",
+                vec![(TRACKER, 1, "queued", "implement not-a-repo#1")],
+                200,
+                vec![],
+                None,
+                Err("invalid repository"),
+            ),
         ] {
-            let moving = Moving {
-                reads: Cell::new(0),
-                title,
+            let runs = Runs {
+                runs: runs.into(),
+                http,
+                moves,
+                index,
+                reads: Default::default(),
             };
-            for _ in 0..2 {
-                let refusal = route()
-                    .check_idle(&moving, &legacy, "bootc-dev/bootc")
-                    .unwrap_err();
-                assert!(format!("{refusal:#}").contains(error), "{refusal:#}");
+            match (
+                route().check_idle(&runs, &legacy, "bootc-dev/bootc"),
+                expected,
+            ) {
+                (Ok(()), Ok(())) => assert_eq!(runs.reads.get(), 2 * INVENTORY_READS, "{name}"),
+                (Err(error), Err(want)) => {
+                    assert!(format!("{error:#}").contains(want), "{name}: {error:#}")
+                }
+                (got, want) => panic!("{name}: {got:?} != {want:?}"),
             }
-            assert_eq!(moving.reads.get(), 2);
         }
     }
 

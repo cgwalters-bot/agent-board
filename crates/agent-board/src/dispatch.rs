@@ -1386,7 +1386,8 @@ mod tests {
                     request["body"]["inputs"],
                     json!({"task": "No mutation.", "repo": "bootc-dev/bootc", "item": "8", "kind": "research", "pool": "openai", "cores": "4", "config": "rhel10"})
                 );
-                assert_eq!(preview.reads.get(), 2);
+                // Each active status, twice, on both workflows.
+                assert_eq!(preview.reads.get(), 20);
             }
         }
     }
