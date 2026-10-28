@@ -196,11 +196,18 @@ const REVIEW_RERUN_CONCLUSIONS: &[&str] = &[RERUN_CONCLUSION, "cancelled"];
 /// failure, a refused rerun is not asked for past it, and the workflow a
 /// rerun runs, as its first event had it, is at most this old.
 pub const RERUN_WINDOW_SECONDS: i64 = 24 * 60 * 60;
+
+/// Give an accepted rerun time to become visible without retrying its POST.
+const CHECK_RERUN_START_SECONDS: i64 = 10 * 60;
+
 /// The review job's runs of one head read, newest first, for whether one
 /// was re-run already ([`Pass::review_rerun`]).
 const REVIEW_RUN_READS: u64 = 10;
 /// The step that re-runs the review job's failed run ([`Pass::review_rerun`]).
 const REVIEW_RERUN: &str = "review rerun";
+
+const CHECK_RERUN: &str = "check rerun";
+
 /// The step that re-runs a round's failed run ([`started`]).
 const RUN_RERUN: &str = "run rerun";
 /// What a rerun's line ends with once its failed jobs were asked for again.
@@ -467,9 +474,9 @@ pub struct PollPolicy {
     /// many days, gets a fix round or is closed ([`stale`]). 0 (the default)
     /// leaves it labelled for good, as before.
     pub stale_days: u64,
-    /// The pass's `reruns`: the failed jobs of a round's failed run, and of
-    /// the review job's failed run of a head with no review, run once more
-    /// before a person is asked. Off (the default) asks the person at once.
+    /// The pass's `reruns`: failed checks once per head, and the failed jobs
+    /// of a round's failed run or the review job's run with no review, run
+    /// once more before a person is asked. Off by default.
     pub reruns: bool,
 }
 
@@ -1565,6 +1572,15 @@ pub struct Marker {
     pub rebased: u64,
     /// Whether the run `sha` and `run` name is a rebase round.
     pub rebasing: bool,
+
+    /// The head whose failed checks were already offered one rerun.
+    pub checks_rerun: Option<String>,
+
+    /// Runs reserved for that head and the reservation time. Kept even when
+    /// a request is refused: an ambiguous POST must never be repeated.
+    pub checks_runs: Vec<u64>,
+
+    pub checks_at: Option<String>,
 }
 
 /// The merge queue as the marker records it: every removal the poll acted on
@@ -1702,6 +1718,11 @@ impl Marker {
         if self.rebasing {
             state["rebasing"] = true.into();
         }
+        if let Some(head) = &self.checks_rerun {
+            state["checks_rerun"] = plain(head).into();
+            state["checks_runs"] = json!(self.checks_runs);
+            state["checks_at"] = json!(self.checks_at);
+        }
         state
     }
 
@@ -1826,6 +1847,12 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
                 .as_u64()
                 .map_or(0, |r| r.min(REBASE_ROUNDS_LIMIT)),
             rebasing: state["rebasing"].as_bool().unwrap_or(false),
+            checks_rerun: state["checks_rerun"].as_str().map(str::to_owned),
+            checks_runs: state["checks_runs"]
+                .as_array()
+                .map(|runs| runs.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default(),
+            checks_at: state["checks_at"].as_str().map(str::to_owned),
             comments: nodes(&state, "/comments")
                 .iter()
                 .filter_map(Value::as_str)
@@ -3388,6 +3415,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Of the queue keep only the removal, which a reset does not redo.
         let mut stop = Marker {
             rounds: marker.rounds,
+            checks_rerun: marker.checks_rerun.clone(),
+            checks_runs: marker.checks_runs.clone(),
+            checks_at: marker.checks_at.clone(),
             sha: Some(head.to_owned()),
             stopped: true,
             queue: marker.queue.as_ref().map(|q| QueueState {
@@ -3689,6 +3719,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             answering: false,
             rebased: if rebasing { round } else { carried.rebased },
             rebasing,
+            checks_rerun: marker.checks_rerun.clone(),
+            checks_runs: marker.checks_runs.clone(),
+            checks_at: marker.checks_at.clone(),
         };
         self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let task = match &checkpoint {
@@ -3936,6 +3969,174 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(format!(
             "brought up to date with {base}; waits for the review of the new head"
         ))
+    }
+
+    /// Resolve failed Actions jobs to their runs. Check URLs are untrusted:
+    /// only this repository's jobs and runs of this head may be restarted.
+    /// Reads are bounded by the already bounded check rollup and pass budget.
+    fn check_reruns(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        checks: &Checks,
+    ) -> Result<BTreeMap<u64, String>> {
+        let mut runs = BTreeMap::new();
+        for (name, url) in &checks.failed {
+            let Some(id) = url.as_deref().and_then(|url| job_id(repo, url)) else {
+                continue;
+            };
+            let job = self.get(&format!("repos/{repo}/actions/jobs/{id}"))?;
+            let Some(run) = job["run_id"].as_u64().filter(|id| *id > 0) else {
+                continue;
+            };
+            if runs.contains_key(&run) {
+                continue;
+            }
+            let data = self.get(&format!("repos/{repo}/actions/runs/{run}"))?;
+            if text(&data, "/repository/full_name") == repo
+                && text(&data, "/head_sha") == text(pull, "/headRefOid")
+                && data["status"] == "completed"
+                && data["conclusion"] == RERUN_CONCLUSION
+                && data["run_attempt"].as_u64() == Some(1)
+                && rerun_window(self.now, &data)
+            {
+                runs.insert(run, plain(name));
+            }
+        }
+        Ok(runs)
+    }
+
+    /// Reconcile the durable reservation, not the possibly stale check rollup.
+    /// A missing request/claim is never retried: after a bounded grace period
+    /// it is handed to a person. A completed failed second attempt may be fixed.
+    fn check_retry_wait(
+        &mut self,
+        repo: &str,
+        head: &str,
+        comments: &[Value],
+        failed_checks: bool,
+    ) -> Result<Option<Decision>> {
+        let receipt = comments
+            .iter()
+            .filter(|c| text(c, "/user/login") == self.config.bot)
+            .filter_map(|c| parse_marker(MARKER, text(c, "/body")))
+            .find(|m| m["checks_rerun"] == head);
+        let age = |at: Option<&str>| timestamp(at).map(|at| (self.now - at).whole_seconds());
+        let Some(receipt) = receipt else {
+            return Ok(earliest_claim(comments, &self.config.bot, &format!("check-rerun:{head}"))
+                .map(|(_, at)| {
+                    if age(at.as_deref()).is_some_and(|age| age < CHECK_RERUN_START_SECONDS) {
+                        step("wait", "check rerun claim is awaiting its reservation")
+                    } else {
+                        step("needs-human", "check rerun claim was interrupted; inspect the runs before retrying")
+                    }
+                }));
+        };
+        let runs: Vec<u64> = receipt["checks_runs"]
+            .as_array()
+            .map(|runs| runs.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default();
+        if runs.is_empty() {
+            // Legacy receipts have no progress evidence. Do not retry or infer
+            // a second failure from the original check rollup.
+            return Ok(Some(step(
+                "needs-human",
+                "check rerun receipt has no run IDs; inspect the runs",
+            )));
+        }
+        let elapsed = age(receipt["checks_at"].as_str());
+        let mut waiting = false;
+        let mut unstarted = false;
+        let mut failed = false;
+        for run in runs {
+            let data = self.get(&format!("repos/{repo}/actions/runs/{run}"))?;
+            if text(&data, "/repository/full_name") != repo || text(&data, "/head_sha") != head {
+                return Ok(Some(step(
+                    "needs-human",
+                    "check rerun no longer matches its repository and head",
+                )));
+            }
+            if data["run_attempt"].as_u64().unwrap_or(0) < 2 {
+                unstarted = true;
+                waiting = true;
+            } else if data["status"] != "completed" {
+                waiting = true;
+            } else if data["conclusion"] != "success" {
+                failed = true;
+            }
+        }
+        // The run API may show success before replacement check contexts appear.
+        waiting |= !failed && failed_checks;
+        if !waiting {
+            return Ok(None);
+        }
+        let limit = if unstarted {
+            CHECK_RERUN_START_SECONDS
+        } else {
+            RERUN_WINDOW_SECONDS
+        };
+        Ok(Some(if elapsed.is_some_and(|age| age < limit) {
+            step("wait", "reserved check rerun has not finished")
+        } else {
+            step(
+                "needs-human",
+                "reserved check rerun did not finish within its recovery window; inspect the runs",
+            )
+        }))
+    }
+
+    /// Record before restarting: an interruption or ambiguous POST must not
+    /// buy another rerun. The existing claim fences overlapping passes too.
+    fn rerun_checks(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        marker: &Marker,
+        read: &[Value],
+        runs: &BTreeMap<u64, String>,
+    ) -> Result<String> {
+        let number = pull["number"]
+            .as_u64()
+            .context("pull request has no number")?;
+        let head = text(pull, "/headRefOid");
+        let from = format!("check-rerun:{head}");
+        let claim = match self.claim(
+            repo,
+            number,
+            marker,
+            read,
+            (json!({"from": from}), CHECK_RERUN),
+        )? {
+            Ok(claim) => claim,
+            Err((id, _)) => {
+                return Ok(format!(
+                    "not re-run: another pass claimed it in comment {id}"
+                ));
+            }
+        };
+        let mut recorded = Marker {
+            checks_rerun: Some(head.to_owned()),
+            checks_runs: runs.keys().copied().collect(),
+            checks_at: Some(self.now.format(&Rfc3339)?),
+            ..marker.clone()
+        };
+        self.mark_claim(
+            repo,
+            claim,
+            &mut recorded,
+            "Failed checks: one rerun reserved for this head.",
+        )?;
+        let rest = self.rest;
+        for run in runs.keys() {
+            self.send(
+                rest,
+                "POST",
+                &format!("repos/{repo}/actions/runs/{run}/rerun-failed-jobs"),
+                json!({}),
+                0,
+            )?;
+        }
+        Ok(RE_RUN.into())
     }
 
     /// With [`PollPolicy::reruns`], for the bot's `pull` that waits for a
@@ -4827,6 +5028,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
             _ => None,
         };
+        let queue_stop = removal
+            .as_ref()
+            .is_some_and(|(removal, _)| matches!(removal, Removal::Stop(_)));
         // Not for a labelled pull request or a stop, which do not read it: an
         // unreadable run must not keep a person from taking the label off.
         let fix_run = match marker.run {
@@ -4949,6 +5153,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Whatever its checks say of the old base, a broken or moved stack
         // comes first: a round started against a merged branch is wasted.
         let mut retarget = None;
+        let stack_step = stacked.is_some();
         if let Some((step, onto)) = stacked {
             // A removal the queue step saw is still recorded with a stop.
             decision = Decision {
@@ -4971,6 +5176,56 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             decision = Decision {
                 queue: decision.queue.take(),
                 ..step
+            };
+        }
+        // Retry CI before charging a fix round or stopping, but never replace
+        // a stack operation, an operator answer, or an in-flight round.
+        let retry_scope = self.config.policy.reruns
+            && !merge_only
+            && !stack_step
+            && !queue_stop
+            && answer.is_empty()
+            && !labelled(&pull)
+            && is_harness(&pull, &self.config.bot);
+        let retry_wait =
+            if retry_scope && matches!(decision.action, "fix" | "needs-human" | "merge" | "wait") {
+                self.check_retry_wait(repo, head, &comments, !checks.failed.is_empty())?
+            } else {
+                None
+            };
+        let check_reruns = if retry_scope
+            && retry_wait.is_none()
+            && matches!(decision.action, "fix" | "needs-human")
+            && marker.checks_rerun.as_deref() != Some(head)
+            // A reset or a return to an older head must not buy another
+            // attempt. Older authenticated markers remain its receipts.
+            && !comments.iter().any(|c| text(c, "/user/login") == self.config.bot
+                && parse_marker(MARKER, text(c, "/body")).is_some_and(|m| m["checks_rerun"] == head))
+        {
+            self.check_reruns(repo, &pull, &checks)?
+        } else {
+            BTreeMap::new()
+        };
+        if let Some(wait) = retry_wait {
+            decision = Decision {
+                queue: decision.queue.take(),
+                ..wait
+            };
+        }
+        if !check_reruns.is_empty() {
+            decision = Decision {
+                queue: decision.queue.take(),
+                ..step(
+                    CHECK_RERUN,
+                    format!(
+                        "failed jobs {} at head {head}, so their failed jobs run once more before a fix round or stop",
+                        check_reruns
+                            .iter()
+                            .map(|(run, job)| format!("{job} (run {run})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
             };
         }
         // Every round here is dispatched as the `fix` kind, so one outside
@@ -5056,6 +5311,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let run = review_rerun.context("a review rerun without its run")?;
                 self.rerun(rest, (repo, run), None, &fix).map(Some)
             }
+            (Some(_), None, _) if decision.action == CHECK_RERUN => self
+                .rerun_checks(repo, &pull, &marker, &comments, &check_reruns)
+                .map(Some),
             (Some(apply), None, _) if decision.action == RUN_RERUN => {
                 let (dispatcher, fix) = (apply.dispatcher, apply.pools.clone());
                 let run = marker.run.context("a run rerun without its run")?;
@@ -5092,7 +5350,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
         let line = if action == "merge" && reason.starts_with("approved by the operator at ") {
             format!("merge {repo}#{number}: {reason}{done}")
-        } else if matches!(action, REVIEW_RERUN | RUN_RERUN) {
+        } else if matches!(action, REVIEW_RERUN | RUN_RERUN | CHECK_RERUN) {
             format!("{action} {repo}#{number} {}: {reason}{done}", short(head))
         } else {
             format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
@@ -10044,6 +10302,416 @@ mod tests {
             let got = outcome.lines.last().unwrap();
             assert!(got.ends_with(&line), "{got}");
             assert_eq!(written(&fake.writes), writes);
+        }
+    }
+
+    fn failed_check_github() -> Fake {
+        let mut fake = github();
+        let p = fake.pulls.get_mut(&470).unwrap();
+        let check =
+            &mut p["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][0];
+        check["name"] = "ci".into();
+        check["isRequired"] = true.into();
+        check["conclusion"] = "FAILURE".into();
+        check["detailsUrl"] = format!("https://github.com/{REPO}/actions/runs/77/job/88").into();
+        fake.page(
+            &format!("repos/{REPO}/actions/jobs/88"),
+            None,
+            None,
+            json!({"run_id": 77}),
+        );
+        fake.page(
+            &format!("repos/{REPO}/actions/runs/77"),
+            None,
+            None,
+            json!({
+                "repository": {"full_name": REPO}, "head_sha": HEAD,
+                "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                "created_at": "2026-10-12T01:00:00Z"
+            }),
+        );
+        fake
+    }
+
+    #[test]
+    fn failed_checks_are_re_run_once_per_head_before_fixing_or_stopping() {
+        let follow = [REPO.to_owned()];
+        for rounds in [0, MAX_FIX_ROUNDS] {
+            let mut fake = failed_check_github();
+            let dispatcher = Fake::default();
+            let mut cfg = config();
+            cfg.policy.reruns = true;
+            let comments = format!("repos/{REPO}/issues/470/comments?per_page=100");
+            fake.page(
+                &comments,
+                None,
+                None,
+                json!([{
+                    "id": 5, "user": {"login": BOT},
+                    "body": marker_body(&json!({"rounds": rounds, "sha": "older"}), "Old round.")
+                }]),
+            );
+            let caps = caps::Caps::new(caps::Limits {
+                writes: Some(0),
+                ..Default::default()
+            });
+            let held = run_capped(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &follow),
+                applying(&dispatcher),
+                Some(&caps),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(held.errors, 0, "{:?}", held.lines);
+            assert!(
+                held.lines
+                    .iter()
+                    .any(|l| l.contains("check rerun") && l.contains("held by --max-writes")),
+                "{:?}",
+                held.lines
+            );
+            assert!(fake.writes.borrow().is_empty());
+
+            let caps = caps::Caps::new(caps::Limits {
+                writes: Some(1),
+                ..Default::default()
+            });
+            let first = run_capped(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                (&[], &follow),
+                applying(&dispatcher),
+                Some(&caps),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(first.errors, 0, "{:?}", first.lines);
+            assert!(
+                first.lines.iter().any(|l| l.contains("check rerun")
+                    && l.contains("ci (run 77)")
+                    && l.contains(HEAD)
+                    && l.ends_with("-> re-run")),
+                "{:?}",
+                first.lines
+            );
+            assert_eq!(first.dispatched, 0);
+            assert!(dispatcher.writes.borrow().is_empty());
+            let writes = fake.writes.borrow();
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|(w, _)| w.ends_with("/rerun-failed-jobs"))
+                    .count(),
+                1
+            );
+            let body = writes
+                .iter()
+                .find(|(w, _)| w.contains("PATCH") && w.ends_with("/comments/99"))
+                .unwrap()
+                .1["body"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let state = parse_marker(MARKER, &body).unwrap();
+            assert_eq!(state["rounds"], rounds);
+            assert_eq!(state["checks_rerun"], HEAD);
+            drop(writes);
+            fake.page(
+                &comments,
+                None,
+                None,
+                json!([{"id": 99, "user": {"login": BOT}, "body": body}]),
+            );
+
+            // A stale first attempt and an in-progress second attempt must
+            // not dispatch a fix or label the PR, even at the round limit.
+            fake.writes.borrow_mut().clear();
+            for (attempt, status, conclusion, wait) in [
+                (1, "completed", "failure", true),
+                (2, "in_progress", "failure", true),
+                (2, "completed", "success", true), // rollup still stale
+                (2, "completed", "failure", false),
+            ] {
+                let url = format!("{API_ROOT}repos/{REPO}/actions/runs/77");
+                let data = &mut fake.rest.get_mut(&url).unwrap().3;
+                data["run_attempt"] = attempt.into();
+                data["status"] = status.into();
+                data["conclusion"] = conclusion.into();
+                let second = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &follow,
+                    None,
+                    now(),
+                )
+                .unwrap();
+                assert_eq!(second.errors, 0, "{:?}", second.lines);
+                let action = if wait {
+                    " wait:"
+                } else if rounds == 0 {
+                    " fix:"
+                } else {
+                    " needs-human:"
+                };
+                assert!(
+                    second.lines.iter().any(|l| l.contains(action)),
+                    "{:?}",
+                    second.lines
+                );
+                assert!(!second.lines.iter().any(|l| l.starts_with("check rerun")));
+                assert!(fake.writes.borrow().is_empty());
+            }
+
+            // The rerun succeeds without changing the head: normal approval
+            // and required-check gates merge it, without a fix round.
+            fake.pulls.get_mut(&470).unwrap()["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                ["contexts"]["nodes"][0]["conclusion"] = "SUCCESS".into();
+            fake.rest
+                .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/runs/77"))
+                .unwrap()
+                .3["conclusion"] = "success".into();
+            let success = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &follow,
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(success.errors, 0, "{:?}", success.lines);
+            assert!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .any(|(w, _)| w.contains("mergePullRequest")),
+                "{:?}",
+                success.lines
+            );
+            assert!(dispatcher.writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn check_retry_recovery_is_bounded_without_repeating_posts() {
+        for (claim, at, attempt, status, expected) in [
+            (true, Some("2026-10-12T01:59:00Z"), 1, "completed", " wait:"),
+            (
+                true,
+                Some("2026-10-12T01:00:00Z"),
+                1,
+                "completed",
+                " needs-human:",
+            ),
+            (true, None, 1, "completed", " needs-human:"),
+            (
+                false,
+                Some("2026-10-12T01:00:00Z"),
+                1,
+                "completed",
+                " needs-human:",
+            ),
+            (
+                false,
+                Some("2026-10-10T01:00:00Z"),
+                2,
+                "in_progress",
+                " needs-human:",
+            ),
+        ] {
+            let mut fake = failed_check_github();
+            let body = if claim {
+                format!(
+                    "<!-- {CLAIM}: {} -->",
+                    json!({"from": format!("check-rerun:{HEAD}")})
+                )
+            } else {
+                marker_body(
+                    &json!({"checks_rerun": HEAD, "checks_runs": [77], "checks_at": at}),
+                    "Reserved.",
+                )
+            };
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id": 99, "user": {"login": BOT}, "created_at": at, "body": body}]),
+            );
+            let data = &mut fake
+                .rest
+                .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/runs/77"))
+                .unwrap()
+                .3;
+            data["run_attempt"] = attempt.into();
+            data["status"] = status.into();
+            let mut cfg = config();
+            cfg.policy.reruns = true;
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(
+                outcome.lines.iter().any(|l| l.contains(expected)),
+                "{:?}",
+                outcome.lines
+            );
+            assert!(
+                !fake
+                    .writes
+                    .borrow()
+                    .iter()
+                    .any(|(w, _)| w.ends_with("/rerun-failed-jobs"))
+            );
+            assert!(dispatcher.writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn queue_removal_stop_precedes_an_eligible_check_retry() {
+        let mut fake = failed_check_github();
+        fake.pulls.get_mut(&470).unwrap()["timelineItems"] = json!({"nodes": [{
+            "id": "R1", "createdAt": "2026-10-12T01:30:00Z", "reason": "manually_removed",
+            "beforeCommit": {"oid": HEAD}
+        }]});
+        let mut cfg = config();
+        cfg.policy.reruns = true;
+        cfg.policy.merge_queue = Some(3);
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[REPO.to_owned()],
+            None,
+            now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|l| l.contains("needs-human:") && l.contains("which the poll does not retry")),
+            "{:?}",
+            outcome.lines
+        );
+        assert!(!outcome.lines.iter().any(|l| l.starts_with("check rerun")));
+    }
+
+    #[test]
+    fn check_reruns_respect_scope_attempts_and_authenticated_head_receipts() {
+        for (name, enabled, change, author, receipt, expected) in [
+            ("off", false, json!({}), BOT, "older", false),
+            ("eligible", true, json!({}), BOT, "older", true),
+            (
+                "wrong head",
+                true,
+                json!({"head_sha": "other"}),
+                BOT,
+                "older",
+                false,
+            ),
+            (
+                "wrong repository",
+                true,
+                json!({"repository": {"full_name": "other/repo"}}),
+                BOT,
+                "older",
+                false,
+            ),
+            (
+                "already attempted",
+                true,
+                json!({"run_attempt": 2}),
+                BOT,
+                "older",
+                false,
+            ),
+            (
+                "still running",
+                true,
+                json!({"status": "in_progress"}),
+                BOT,
+                "older",
+                false,
+            ),
+            (
+                "cancelled",
+                true,
+                json!({"conclusion": "cancelled"}),
+                BOT,
+                "older",
+                false,
+            ),
+            (
+                "old",
+                true,
+                json!({"created_at": "2026-10-10T01:00:00Z"}),
+                BOT,
+                "older",
+                false,
+            ),
+            ("old marker still counts", true, json!({}), BOT, HEAD, false),
+            (
+                "visitor marker ignored",
+                true,
+                json!({}),
+                "visitor",
+                HEAD,
+                true,
+            ),
+        ] {
+            let mut fake = failed_check_github();
+            let url = format!("{API_ROOT}repos/{REPO}/actions/runs/77");
+            for (key, value) in change.as_object().unwrap() {
+                fake.rest.get_mut(&url).unwrap().3[key] = value.clone();
+            }
+            fake.page(&format!("repos/{REPO}/issues/470/comments?per_page=100"), None, None, json!([
+                {"id": 4, "user": {"login": author}, "body": marker_body(&json!({"rounds": 0, "checks_rerun": receipt}), "Receipt.")},
+                {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 0}), "Reset.")}
+            ]));
+            let mut cfg = config();
+            cfg.policy.reruns = enabled;
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                None,
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            assert_eq!(
+                outcome.lines.iter().any(|l| l.starts_with("check rerun")),
+                expected,
+                "{name}: {:?}",
+                outcome.lines
+            );
+            assert!(fake.writes.borrow().is_empty());
         }
     }
 
