@@ -15,13 +15,14 @@ can say anything.
 
 ## Hand back
 
-Post one comment. It holds at most one fenced block whose info string is
-`supervisor-actions`, with at most ten JSON Lines, one
-request each. After the block, write a short paragraph for each check you
-looked into: what you found, with links, and what the operator has to
-decide. The executor's log on the operator's log issue links to this
-comment, so it is your report. Leave out the block, or leave it empty, to
-ask for nothing.
+Hand back one comment (an `add_comment` safe output). It holds at most one
+fenced block whose info string is `supervisor-actions`, with at most ten
+JSON Lines, one request each. After the block, write a short paragraph for
+each check you looked into: what you found, with links, and what the
+operator has to decide. It is your report: the executor's log on the
+operator's log issue links to it, or to your run where your comment is
+read from the run rather than posted. Leave out the block, or leave it
+empty, to ask for nothing.
 
 Each request is exactly:
 

@@ -740,7 +740,7 @@ Options:
 Perform the agent's validated dispatch requests and log them (writes with GH_TOKEN, the bot's)
 
 ```text
-agent-board supervise execute [OPTIONS] --config <FILE> --supervisor-config <FILE> --pools <FILE> --result-url <URL>
+agent-board supervise execute [OPTIONS] --config <FILE> --supervisor-config <FILE> --pools <FILE> <--result-url <URL>|--requests <FILE>>
 ```
 
 Options:
@@ -750,6 +750,10 @@ Options:
 - `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
 - `--pools <FILE>`: The pools file; a request must name one of its pools
 - `--result-url <URL>`: The agent run's result URL: its comment on the requests issue
+- `--requests <FILE>`: The agent run's safe outputs (JSON Lines), handed back as an artifact of this run
+- `--ledger <FILE>`: The previous executor run's ledger, an artifact of that run; leave it out when none was found
+- `--ledger-run <ID>`: The id of the run whose artifact --ledger is
+- `--ledger-out <FILE>`: Where this run's ledger is written for the next run; with --requests, the day's count comes from it, not the log issue
 
 ## agent-board supervise due
 
@@ -805,7 +809,7 @@ Options:
 Print the agent's result comment without applying it (GH_TOKEN reads)
 
 ```text
-agent-board supervise preview [OPTIONS] --config <FILE> --supervisor-config <FILE> --result-url <URL>
+agent-board supervise preview [OPTIONS] --config <FILE> --supervisor-config <FILE> <--result-url <URL>|--requests <FILE>>
 ```
 
 Options:
@@ -814,6 +818,7 @@ Options:
 - `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
 - `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
 - `--result-url <URL>`: The agent run's result URL: its comment on the requests issue
+- `--requests <FILE>`: The agent run's safe outputs (JSON Lines), handed back as an artifact of this run
 
 ## agent-board supervise session
 
