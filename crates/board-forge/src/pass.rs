@@ -60,9 +60,10 @@ pub(super) const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 /// and write after it: the triage plan's post, or a body plan's second read
 /// of the body and the comments and its post, the plan protocol's two reads
 /// of the comments (10 pages each), its account read, the overlap check (at
-/// most 14), the record, the dispatch (two tries) and its note, with room for
-/// a stack's reads. A start never runs out of budget between claim and run.
-const START_REQUESTS: usize = 64;
+/// most 14, and [`overlap::DRAFT_READS`] more), the record, the dispatch (two
+/// tries) and its note, with room for a stack's reads. A start never runs out
+/// of budget between claim and run.
+const START_REQUESTS: usize = 64 + overlap::DRAFT_READS;
 /// Requests only writes may spend: a claim already posted is still sent or
 /// noted when its reads have spent the rest.
 const WRITE_RESERVE: usize = 4;
@@ -127,6 +128,10 @@ const RUNS_PER_PAGE: u64 = 100;
 const TRIAGE_RUNNER: &str = "hosted";
 /// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
+/// `overlap.staleDraftHours` when the key is left out, and the most it may
+/// be: a week, past which a draft nobody moves holds nothing anyway.
+const STALE_DRAFT_HOURS: u64 = 4;
+const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
 /// Triage verdicts that ask the operator, which label the issue
 /// [`NEEDS_HUMAN`]: `done` for a close, which the pass does not make since no
 /// review follows it, and the others for a decision.
@@ -304,6 +309,9 @@ pub struct Config {
     /// Off unless set: a daily digest of incoming pull requests, planned
     /// before stage 2 within a share of the pools ([`Scheduler::maintain`]).
     pub maintain: Option<maintain::Maintain>,
+    /// Off unless set: the open pull requests whose overlap does not hold a
+    /// start ([`Scheduler::waiver`]).
+    pub overlap: Option<Overlap>,
     #[serde(default)]
     pub pools: Pools,
     pub usage: Option<Usage>,
@@ -354,6 +362,20 @@ pub struct Epics {
     /// `repository`'s.
     #[serde(default)]
     pub in_work_repositories: bool,
+}
+
+/// [`overlap::Waiver`]'s settings: set, a documentation-only overlap does
+/// not hold an issue in the board's first Priority option, and a draft
+/// unchanged for `staleDraftHours` (0: never) holds nothing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Overlap {
+    #[serde(default = "stale_draft_hours")]
+    pub stale_draft_hours: u64,
+}
+
+fn stale_draft_hours() -> u64 {
+    STALE_DRAFT_HOURS
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -656,6 +678,12 @@ impl Config {
         }
         if let Some(maintain) = &self.maintain {
             maintain.check(self)?;
+        }
+        if let Some(overlap) = &self.overlap {
+            ensure!(
+                overlap.stale_draft_hours <= STALE_DRAFT_HOURS_LIMIT,
+                "overlap staleDraftHours is not 0 to {STALE_DRAFT_HOURS_LIMIT}"
+            );
         }
         if !self.pools.0.is_empty() {
             ensure!(self.usage.is_some(), "pools need usage");
@@ -1696,6 +1724,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         probes: BTreeMap::new(),
         holds_whole: true,
         ended: RefCell::new(BTreeMap::new()),
+        ignored: RefCell::default(),
         failed: BTreeMap::new(),
         direction: None,
     };
@@ -1964,6 +1993,9 @@ struct Scheduler<'a, C> {
     holds_whole: bool,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
+    /// The overlaps [`Config::overlap`] waived for the candidate considered,
+    /// which its hold snapshot shows as `overlap-ignored`.
+    ignored: RefCell<Vec<String>>,
     /// The caller's runs that failed in the last day, by id, where
     /// [`Config::reruns`] is set ([`Self::failed_runs`]).
     failed: BTreeMap<u64, Value>,
@@ -2203,6 +2235,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             let issue = facts.issue.display();
             let step = self.consider(facts, board, slots, snapshot, target);
+            for why in self.ignored.take() {
+                self.held(facts, Hold::new(HoldKind::OverlapIgnored, why));
+            }
             let earlier = std::mem::replace(&mut self.considered, true);
             // A start under way finishes; the next waits for the time bound.
             self.client.bounds.finishing.set(false);
@@ -2898,6 +2933,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             number: plan.item,
             ..issue.clone()
         };
+        let waiver = self.waiver(&facts, board);
         // A triage run changes no files, and is checked as a triage start.
         if let Some(run) = failed.filter(|_| plan.kind != "implement") {
             if plan.kind != "triage" || dest != *issue {
@@ -2908,7 +2944,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 );
                 return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
             }
-            return self.rerun((issue, issue), &plan, run, slots, (snapshot, target));
+            return self.rerun(
+                (issue, issue),
+                &plan,
+                run,
+                slots,
+                (snapshot, target, &waiver),
+            );
         }
         if !config.works_in(&dest.repository) {
             let dest = dest.display();
@@ -2930,7 +2972,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         }
         if let Some(run) = failed {
-            return self.rerun((issue, &dest), &plan, run, slots, (snapshot, target));
+            return self.rerun(
+                (issue, &dest),
+                &plan,
+                run,
+                slots,
+                (snapshot, target, &waiver),
+            );
         }
         let names: Vec<String> = match plan.pool.is_empty() {
             true => config.pools.0.iter().map(|(n, _)| n.clone()).collect(),
@@ -2967,18 +3015,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             if base.is_none() {
                 let decision = overlap::decide_strict(
                     &self.client,
-                    issue,
-                    &dest,
+                    (issue, &dest),
                     &plan.brief,
                     &config.bot,
                     target,
-                    &self.ended_runs(),
+                    (&self.ended_runs(), &waiver),
                 );
-                if let Decision::Wait(_) = decision {
-                    return Ok(Step::Hold(Hold::new(
-                        HoldKind::Overlap,
-                        decision.sentence(),
-                    )));
+                if let Some(step) = self.overlap_hold(decision) {
+                    return Ok(step);
                 }
             }
             return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
@@ -3009,6 +3053,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             pool: Some(&pool),
             strict: true,
             ended: Some(&ended),
+            waiver,
             // A plan written by hand carries no direction.
             direction: None,
         };
@@ -3031,7 +3076,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         plan: &plan::JobPlan,
         run: &Value,
         slots: &Slots,
-        (snapshot, target): (Option<&Value>, &Target),
+        (snapshot, target, waiver): (Option<&Value>, &Target, &overlap::Waiver),
     ) -> Result<Step> {
         let id = run["id"].as_u64().context("run has no id")?;
         let title = text(run, "/display_title");
@@ -3062,13 +3107,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if plan.kind == "implement" {
             let done = self.ended_runs();
             let bot = &self.config.bot;
-            let decision =
-                overlap::decide_strict(&self.client, issue, dest, &plan.brief, bot, target, &done);
-            if let Decision::Wait(_) = decision {
-                return Ok(Step::Hold(Hold::new(
-                    HoldKind::Overlap,
-                    decision.sentence(),
-                )));
+            let checks = (&done, waiver);
+            let decision = overlap::decide_strict(
+                &self.client,
+                (issue, dest),
+                &plan.brief,
+                bot,
+                target,
+                checks,
+            );
+            if let Some(step) = self.overlap_hold(decision) {
+                return Ok(step);
             }
         }
         let on = match dest == issue {
@@ -3186,6 +3235,35 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
+    /// What [`Config::overlap`] waives for the candidate `facts`: nothing
+    /// unless it is set.
+    fn waiver(&self, facts: &Facts, board: &BoardRead) -> overlap::Waiver {
+        let Some(settings) = &self.config.overlap else {
+            return overlap::Waiver::default();
+        };
+        let hours = settings.stale_draft_hours;
+        overlap::Waiver {
+            stale_draft: (hours > 0).then_some((self.now, hours)),
+            top: (board.options.first()).is_some_and(|p| facts.priority.as_ref() == Some(p)),
+        }
+    }
+
+    /// An overlap check's `decision` as the step it holds a start with, if
+    /// it does; the overlap it ignored is kept for [`HoldKind::OverlapIgnored`].
+    fn overlap_hold(&self, decision: Decision) -> Option<Step> {
+        match decision {
+            Decision::Wait(_) => Some(Step::Hold(Hold::new(
+                HoldKind::Overlap,
+                decision.sentence(),
+            ))),
+            Decision::Ignored(why) => {
+                self.ignored.borrow_mut().push(why);
+                None
+            }
+            Decision::Independent(_) => None,
+        }
+    }
+
     /// A run's outcome as a step: no record is a wait, with nothing written.
     fn dispatched(
         &self,
@@ -3203,6 +3281,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 None => Step::Hold(Hold::new(HoldKind::Other, "the dispatch waited")),
             },
             Ok(done) => {
+                if let Some(Decision::Ignored(why)) = &done.overlap {
+                    self.ignored.borrow_mut().push(why.clone());
+                }
                 let run = done.run.as_deref().unwrap_or("unnamed");
                 let record = done.record.unwrap_or_default();
                 Step::Started(format!("{line} record={record} run={run}"), holds)
@@ -3498,6 +3579,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             pool: Some(pool),
             strict: true,
             ended: None,
+            waiver: Default::default(),
             direction: self.direction_hash(),
         };
         let writers = self.writers();

@@ -97,7 +97,9 @@ which still blocks dispatch but asks the operator nothing), `blocked`
 dependencies, or a lower stacked slice not yet open), `pr-open` (the bot's or
 the operator's), `in-flight`, `dispatched` (its plan's run has ended, or an
 epic's planning request waits for its plan), `triage-cooldown` (triaged or
-planned too recently to ask again), `overlap`, `unreadable` (labels, pull
+planned too recently to ask again), `overlap`, `overlap-ignored` (not a hold:
+an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),
+`unreadable` (labels, pull
 requests, a parent epic, a plan's target or the runs not read whole), `wip`,
 `pools`, `budget` (the week's spend reached `budget.weeklyUsd`, or has no
 reading; see below) and `other`; a reader shows a kind it does not know as
@@ -505,6 +507,22 @@ Check both the board issue and a plan's target; neither may escape configured
 repositories. To avoid duplicate/conflicting work, pass always enables the
 existing bot overlap check and conservatively waits when it cannot complete it;
 this is stricter than standalone dispatch's best-effort heuristic.
+
+With `overlap` set (agent-board#426), an open pull request of the bot's that
+overlaps a start does not hold it when it is a draft opened and last
+committed to at least `overlap.staleDraftHours` before the pass's clock (a
+draft nobody moves races no run), or when every path it shares is
+documentation (`*.md` or under `docs/`) and the issue is in the board's first
+Priority option (such a conflict is cheap to resolve, and P0 work should not
+wait on it). Its head's commit time stands in for its last push. Each overlapping
+pull request is judged alone, and any one not waived still holds the start;
+a run in flight is never waived. A waived overlap is said as
+`overlap ignored: OWNER/REPO#N: open pull request … changes …, but …`, kept
+in the hold snapshot as kind `overlap-ignored` (not blocking, not the
+operator's), and the dispatch record says it too. The draft rule reads one
+more request per overlapping pull request, for at most four of them, which
+a start's request reservation covers; any past those, and one that cannot
+read, holds the start, as any unreadable overlap check does.
 
 With no accepted plan, start one triage run if enabled and a slot/pool is
 available. It proposes an implement plan, or explains a needs-design/human hold;
@@ -1262,6 +1280,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `maintain.share` | The share (0 < share < 1) of each pool's allowance the digest keeps while due; needs `pools`; section absent (off) |
 | `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, outside `maintain.repos.include`; its run is dispatched where the repository is public, else only planned; required |
 | `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
+| `overlap.staleDraftHours` | With `overlap` set, an overlapping draft unchanged this many hours (0–168; 0 never) does not hold a start, nor does a documentation-only overlap of a first-Priority issue, see [scheduling](#scheduling); `4`; section absent (off) |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; required to refresh when pools are configured |

@@ -788,6 +788,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             pool: Some(pool),
             strict: true,
             ended: None,
+            waiver: Default::default(),
             routing: None,
             direction: self.direction_hash(),
         };

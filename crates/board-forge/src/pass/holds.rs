@@ -63,6 +63,9 @@ pub enum HoldKind {
     /// Priority is among the board's first ([`Hold::operator`]).
     EpicNotLive,
     Overlap,
+    /// Not a hold: an open pull request overlaps it, but the pass's
+    /// `overlap` setting let it start anyway, so the overlap stays visible.
+    OverlapIgnored,
     /// Something it depends on could not be read.
     Unreadable,
     /// The WIP limit.
@@ -90,6 +93,7 @@ impl HoldKind {
             Self::NeedsOperator => "needs-operator",
             Self::EpicNotLive => "epic-not-live",
             Self::Overlap => "overlap",
+            Self::OverlapIgnored => "overlap-ignored",
             Self::Unreadable => "unreadable",
             Self::Wip => "wip",
             Self::Pools => "pools",
@@ -166,6 +170,9 @@ impl Entry {
     /// The pass's line for it.
     pub fn line(&self) -> String {
         let reason = &self.hold.reason;
+        if let (HoldKind::OverlapIgnored, Some(item)) = (self.hold.kind, self.item()) {
+            return format!("overlap ignored: {}: {reason}", item.display());
+        }
         match &self.scope {
             Scope::Pass => format!("hold {}: {reason}", self.hold.kind.name()),
             Scope::Item(item) | Scope::Under(item, _) => {
