@@ -345,6 +345,8 @@ pub(super) struct Inputs<'a> {
     pub now: OffsetDateTime,
     /// `triageFollowUpDays`: the most the back-off waits, in days; 0, none.
     pub follow_up_days: u64,
+    /// The hash of the operator's direction this pass read, if any.
+    pub direction: Option<&'a str>,
 }
 
 /// The run a dispatch record names, `…/actions/runs/ID`.
@@ -514,6 +516,14 @@ pub(super) fn decide(i: &Inputs) -> Next {
         .unwrap_or(at);
     if since(at.max(last)) {
         return Next::Plan("operator direction since it was last planned".into());
+    }
+    // A record from before the direction was set carries no hash: setting it
+    // plans no epic, changing it plans each once.
+    let recorded = request.and_then(|q| plan::recorded_direction(&q.body));
+    if let (Some(was), Some(now)) = (recorded, i.direction)
+        && was != now
+    {
+        return Next::Plan("the operator's direction changed since it was last planned".into());
     }
     let epic = i.epic;
     let mut why = Vec::new();
@@ -842,6 +852,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             busy: busy.map(String::as_str),
             now: self.now,
             follow_up_days: self.config.triage_follow_up_days,
+            direction: self.direction_hash(),
         });
         if let Some(held) = person_hold(
             &facts.labels,

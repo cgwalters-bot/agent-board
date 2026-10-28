@@ -23,6 +23,9 @@ pub const PLAN_FENCE: &str = "agent-board-plan";
 /// The tag of the hidden first line of the comment that records a plan's
 /// dispatch: `<!-- agent-board-dispatch: PLAN-ID -->`.
 pub const DISPATCH_MARKER: &str = "agent-board-dispatch";
+/// The tag of the hidden line after it in the record of a plan the pass
+/// wrote with the operator's direction: `<!-- agent-board-direction: HASH -->`.
+pub const DIRECTION_MARKER: &str = "agent-board-direction";
 /// The info string of the fence a triage run's answer puts its verdict in:
 /// ```` ```schedule-triage ```` around `{"verdict": "done"}`, as tracker's
 /// scheduler asked for it and the supervisor reads it.
@@ -568,6 +571,15 @@ fn marker_line(plan: &str) -> String {
     format!("<!-- {DISPATCH_MARKER}: {plan} -->")
 }
 
+/// The hash of the operator's direction a dispatch record carries on its
+/// own hidden line, where the pass wrote the plan's brief with it.
+pub(crate) fn recorded_direction(record: &str) -> Option<&str> {
+    let prefix = format!("<!-- {DIRECTION_MARKER}: ");
+    record
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str())?.strip_suffix(" -->"))
+}
+
 /// The comments by `logins` that record dispatching `plan`, oldest first.
 /// Only the writers' count, so a visitor cannot block a plan with a copied
 /// marker, while an operator's dispatch with their own token still holds off
@@ -769,6 +781,9 @@ pub struct Scheduled<'a> {
     /// The runs the pass took as ended though GitHub says they are in
     /// progress, which the strict check leaves out.
     pub ended: Option<&'a std::collections::BTreeSet<u64>>,
+    /// The hash of the operator's direction the pass put in the plan's
+    /// brief, which its record carries ([`recorded_direction`]).
+    pub direction: Option<&'a str>,
 }
 
 /// A dispatcher's refusal before it sent anything, as a lease admission
@@ -973,11 +988,15 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             .find(|(n, _)| *n < record.id)
             .map(|(_, first)| format!("{} recorded this plan first", first.url)))
     };
+    let header = match scheduled.direction {
+        Some(hash) => format!("{}\n<!-- {DIRECTION_MARKER}: {hash} -->", marker_line(&id)),
+        None => marker_line(&id),
+    };
     let mut records = vec![post(
         issue,
         &id,
         &from.url,
-        marker_line(&id),
+        header,
         format!("Dispatching the plan in {}.", from.url),
     )?];
     // Extras left out, by index into `chosen.extras`, why, and whether their

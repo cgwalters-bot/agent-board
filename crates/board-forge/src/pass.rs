@@ -137,6 +137,13 @@ const AGAIN: &str = "The board pass asks a triage run to plan this issue again."
 /// `triageFollowUpDays` or `revisit`: the [`fingerprint`] of what its run
 /// read, `<!-- agent-board-inputs: HASH -->` (agent-board#383).
 const INPUTS_MARKER: &str = "agent-board-inputs";
+/// The most characters the operator's direction may have: past it the pass
+/// reports an error rather than cut it short.
+const DIRECTION_LIMIT: usize = 4_000;
+/// What a brief says before the operator's direction.
+const DIRECTION_HEADING: &str = "## The operator's direction";
+/// What a directed brief says before its own task.
+const TASK_HEADING: &str = "## This run's task";
 /// Hex characters of a [`fingerprint`] kept.
 const FINGERPRINT_CHARS: usize = 16;
 /// How long a triage that had nothing to do waits before a follow-up, at
@@ -302,6 +309,9 @@ pub struct Config {
     /// and stage 4's triage and implement runs ([`Scheduler::rerun`]).
     #[serde(default)]
     pub reruns: bool,
+    /// Off unless set: the operator's direction, an issue whose body every
+    /// brief the pass writes starts with ([`Scheduler::direction`]).
+    pub direction: Option<DirectionAt>,
     /// None: no hold on spend.
     pub budget: Option<WeeklyBudget>,
     /// The poll's response cache, which only an applying pass writes.
@@ -401,6 +411,16 @@ pub struct Usage {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HoldsAt {
+    pub repository: String,
+    pub issue: u64,
+}
+
+/// The issue whose body is the operator's direction: in a private
+/// repository no run the pass starts may write to, last edited by the
+/// operator or the bot.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectionAt {
     pub repository: String,
     pub issue: u64,
 }
@@ -645,6 +665,26 @@ impl Config {
         if let Some(holds) = &self.holds {
             validate_repository(&holds.repository).context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
+        }
+        if let Some(direction) = &self.direction {
+            let at = &direction.repository;
+            validate_repository(at).context("direction repository")?;
+            ensure!(
+                direction.issue > 0,
+                "direction issue is not a positive number"
+            );
+            // A run that could edit the direction would steer every brief.
+            let targets = [&self.dispatch_repo].into_iter();
+            let targets = targets
+                .chain(&self.work_repositories)
+                .chain(&self.follow)
+                .chain(self.epics.as_ref().map(|e| &e.repository));
+            for repo in targets {
+                ensure!(
+                    !repo.eq_ignore_ascii_case(at),
+                    "direction repository {at} is one the pass starts runs on"
+                );
+            }
         }
         if let Some(budget) = self.budget.as_ref().filter(|b| !b.spends()) {
             ensure!(
@@ -1636,7 +1676,15 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         holds_whole: true,
         ended: RefCell::new(BTreeMap::new()),
         failed: BTreeMap::new(),
+        direction: None,
     };
+    match scheduler.direction() {
+        Ok(direction) => scheduler.direction = direction,
+        Err(error) => {
+            scheduler.report.failures += 1;
+            scheduler.line(format!("direction error: {error:#}"));
+        }
+    }
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
     scheduler.refresh();
@@ -1898,6 +1946,9 @@ struct Scheduler<'a, C> {
     /// The caller's runs that failed in the last day, by id, where
     /// [`Config::reruns`] is set ([`Self::failed_runs`]).
     failed: BTreeMap<u64, Value>,
+    /// With [`Config::direction`], the operator's direction and its hash, read
+    /// once a pass; none where it could not be trusted, which was reported.
+    direction: Option<(String, String)>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2921,6 +2972,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             pool: Some(&pool),
             strict: true,
             ended: Some(&ended),
+            // A plan written by hand carries no direction.
+            direction: None,
         };
         let options = (0, Some(config.bot.as_str()), None, scheduled);
         let dispatcher = self.lease_dispatch(&dest, &pool);
@@ -3369,7 +3422,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "kind": "triage",
             "runner": TRIAGE_RUNNER,
             "pool": pool,
-            "brief": brief,
+            "brief": self.directed(brief),
         });
         let config = self.config;
         let tracked = config.triage_follow_up_days > 0 || config.revisit.is_some();
@@ -3390,12 +3443,85 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             pool: Some(pool),
             strict: true,
             ended: None,
+            direction: self.direction_hash(),
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);
         let dispatcher = self.lease_dispatch(issue, pool);
         let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
         Ok(self.dispatched(line, holds, done))
+    }
+
+    /// [`Config::direction`]'s body and its hash, where it is set: an error
+    /// where its repository is public or within `--fix-bounds`, its body was
+    /// last edited by neither writer, or it is longer than [`DIRECTION_LIMIT`].
+    fn direction(&self) -> Result<Option<(String, String)>> {
+        let Some(at) = &self.config.direction else {
+            return Ok(None);
+        };
+        let repo = &at.repository;
+        if let Some(bounds) = &self.config.fix_bounds {
+            ensure!(
+                !bounds.admits_repo(repo),
+                "{repo} is within the fix bounds, so a run may write to it"
+            );
+        }
+        let read = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
+        ensure!(
+            read.status == 200,
+            "reading {repo}: GitHub HTTP status {}",
+            read.status
+        );
+        ensure!(
+            read.body["private"] == true,
+            "{repo} is not private; the direction needs a private repository"
+        );
+        let issue = ItemRef {
+            host: DEFAULT_HOST.into(),
+            repository: repo.clone(),
+            number: at.issue,
+        };
+        let body = self.body(&issue)?;
+        let last = match body.edited || body.editor.is_some() {
+            true => body.editor.as_deref(),
+            false => body.author.as_deref(),
+        };
+        ensure!(
+            is(last, &self.writers()),
+            "{} was last written by {}, neither {} nor {}",
+            issue.display(),
+            last.unwrap_or("an unknown account"),
+            self.config.operator,
+            self.config.bot
+        );
+        let text = body.body.trim();
+        let n = text.chars().count();
+        ensure!(
+            n <= DIRECTION_LIMIT,
+            "{} has {n} characters, more than {DIRECTION_LIMIT}",
+            issue.display()
+        );
+        let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        Ok(Some((
+            text.to_owned(),
+            hash[..FINGERPRINT_CHARS].to_owned(),
+        )))
+    }
+
+    /// `brief` after the operator's direction, where there is one.
+    fn directed(&self, brief: String) -> String {
+        match &self.direction {
+            Some((text, _)) => {
+                format!("{DIRECTION_HEADING}\n\n{text}\n\n{TASK_HEADING}\n\n{brief}")
+            }
+            None => brief,
+        }
+    }
+
+    /// The hash of the operator's direction, which the records of the
+    /// pass's own plans carry.
+    fn direction_hash(&self) -> Option<&str> {
+        self.direction.as_ref().map(|(_, hash)| hash.as_str())
     }
 
     /// Posts `plan` on `issue` after `intro`, as the plan writer the pass's

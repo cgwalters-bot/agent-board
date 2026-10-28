@@ -2210,6 +2210,113 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
     );
 }
 
+/// `forge` with the operator's direction on operator#3: `body` by `author`
+/// and last edited by `editor`, in a repository `private` or not.
+fn directed(forge: &mut Forge, (author, editor): (&str, Option<&str>), body: &str, private: bool) {
+    let visibility = if private { "private" } else { "public" };
+    let variables = json!({"owner": "cgwalters-forge", "name": "operator", "number": 3});
+    let issue = json!({"url": "https://github.com/cgwalters-forge/operator/issues/3",
+        "title": "Direction", "body": body, "createdAt": "2026-10-20T00:00:00Z",
+        "lastEditedAt": editor.map(|_| "2026-10-27T00:00:00Z"),
+        "author": {"login": author}, "editor": editor.map(|e| json!({"login": e}))});
+    forge.replay.requests.extend([
+        json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/operator")},
+            "answer": {"status": 200, "link": null,
+                "body": {"private": private, "visibility": visibility}}}),
+        json!({"request": graphql_key(BODY_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": issue}}}}),
+    ]);
+}
+
+/// With `direction`, every brief the pass writes starts with the
+/// operator's direction and its record carries the direction's hash; a plan
+/// written by hand is sent as it is. A direction in a public repository,
+/// last edited by anyone but a writer, or too long is an error, and the
+/// pass goes on without it.
+#[test]
+fn apply_puts_the_operator_direction_in_front_of_its_briefs() {
+    let config =
+        config(json!({"direction": {"repository": "cgwalters-forge/operator", "issue": 3}}));
+    let long = "x".repeat(DIRECTION_LIMIT + 1);
+    let said = "Prefer small changes.";
+    for (who, body, private, error) in [
+        (("cgwalters", None), said, true, None),
+        (("cgwalters-bot", Some("cgwalters")), said, true, None),
+        (("cgwalters", Some("cgwalters-bot")), said, true, None),
+        (
+            ("cgwalters", Some("visitor")),
+            said,
+            true,
+            Some(
+                "cgwalters-forge/operator#3 was last written by visitor, neither cgwalters nor cgwalters-bot",
+            ),
+        ),
+        (
+            ("visitor", None),
+            said,
+            true,
+            Some("was last written by visitor"),
+        ),
+        (
+            ("cgwalters", None),
+            said,
+            false,
+            Some("cgwalters-forge/operator is not private"),
+        ),
+        (
+            ("cgwalters", None),
+            &long,
+            true,
+            Some("cgwalters-forge/operator#3 has 4001 characters, more than 4000"),
+        ),
+    ] {
+        let mut forge = Forge::new(None, false);
+        implement_plan(&mut forge.replay);
+        unpathed(&mut forge.replay);
+        directed(&mut forge, who, body, private);
+        let report = apply(&forge, &config);
+        let errors: Vec<&String> = (report.lines.iter())
+            .filter(|l| l.starts_with("direction error: "))
+            .collect();
+        assert_eq!(report.failures, errors.len(), "{:#?}", report.lines);
+        match error {
+            Some(error) => assert!(
+                errors.len() == 1 && errors[0].contains(error),
+                "{who:?}: {errors:?}"
+            ),
+            None => assert!(errors.is_empty(), "{who:?}: {errors:?}"),
+        }
+        let heading = format!("{DIRECTION_HEADING}\n\n{said}\n\n{TASK_HEADING}\n\n");
+        let writes = forge.writes.borrow();
+        let sent: Vec<&Value> = (writes.iter())
+            .filter(|(_, url, _)| url.ends_with("/dispatches"))
+            .map(|(_, _, body)| &body["inputs"])
+            .collect();
+        assert!(
+            sent.iter().any(|i| i["kind"] == "triage")
+                && sent.iter().any(|i| i["kind"] != "triage"),
+            "{sent:#?}"
+        );
+        for inputs in sent {
+            let directed = error.is_none() && inputs["kind"] == "triage";
+            let task = text(inputs, "/task");
+            assert_eq!(task.starts_with(&heading), directed, "{task}");
+            assert!(!task.contains(DIRECTION_HEADING) || directed, "{task}");
+        }
+        let hash = |number: u64| {
+            let records = forge.comments_on("cgwalters-forge/tracker", number);
+            let mut hashes = records.iter().filter_map(|c| plan::recorded_direction(c));
+            hashes.next().map(str::to_owned)
+        };
+        let expected = format!("{:x}", Sha256::digest(said.as_bytes()));
+        let expected = error
+            .is_none()
+            .then(|| expected[..FINGERPRINT_CHARS].to_owned());
+        assert_eq!(hash(459), expected);
+        assert_eq!(hash(446), None);
+    }
+}
+
 /// A triage run's answer on tracker#446, `days` from the pass's clock, by
 /// `author` and edited by `editor`, for [`Forge`] to read after its record.
 fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, days: i64) {
@@ -5179,6 +5286,14 @@ fn config_table() {
             "is not a pool name",
         ),
         (json!({"pools": {"a": {}}}), "pools need usage"),
+        (
+            json!({"direction": {"repository": "o/ops", "issue": 0}}),
+            "direction issue is not a positive number",
+        ),
+        (
+            json!({"direction": {"repository": "O/Caller", "issue": 3}}),
+            "direction repository O/Caller is one the pass starts runs on",
+        ),
         (
             json!({"planPools": ["a"]}),
             "planPools names a, which is not in pools",

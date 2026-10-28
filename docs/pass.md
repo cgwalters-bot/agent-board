@@ -999,6 +999,34 @@ nothing changed.` is not success evidence, and stale local pending state cannot
 freeze an epic whose apply is already proved. This observation-based recovery
 is part of the first implementation, not deferred cleanup.
 
+## Operator direction
+
+With `direction` (agent-board#395), the operator's direction is state on the
+forge: the body of one issue, a short distillation the operator and the bot
+edit in place. The pass reads it once a pass and puts it, under the heading
+`## The operator's direction`, in front of every brief it writes: triage and
+its follow-ups, revisits, epic planning and the maintain digest. A plan written
+by hand, in a comment or an issue body, is dispatched as it is.
+
+A run that could edit the direction could steer every brief after it, so the
+pass uses it only where its repository is private, is none it starts runs on
+(`dispatchRepo`, `workRepositories`, `follow`, `epics.repository`) and is
+outside `--fix-bounds` when that is given, and where the body was last edited
+by `operator` or `bot` (its author where it was never edited). The pass
+cannot read the caller's bounds for other kinds; keep the repository out of
+them. A body over 4,000 characters is refused, not cut short. Any of these is
+a `direction error:` line and a failure, and the pass goes on with no
+direction.
+
+The briefs are posted in plan comments, so the direction is as public as the
+issues they are posted on. The record of each plan the pass writes carries the
+direction's hash on a second hidden line, `<!-- agent-board-direction: HASH
+-->`. An epic whose last planning request carries a hash other than this
+pass's is due again, `the operator's direction changed since it was last
+planned`; the request that plans it carries the new hash, so each change plans
+it once. A request with no hash, from before `direction` was set, plans
+nothing.
+
 ## Leases
 
 The pass's WIP limit and pacing bound only what the pass starts; a run
@@ -1168,6 +1196,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
+| `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
 | `reruns` | Re-run a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |

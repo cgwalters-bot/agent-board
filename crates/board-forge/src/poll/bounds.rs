@@ -69,6 +69,11 @@ impl FixBounds {
         })
     }
 
+    /// Whether a fix run may push to `repo`.
+    pub fn admits_repo(&self, repo: &str) -> bool {
+        admits(&REPOS, &self.repos, repo)
+    }
+
     /// Why a fix run on `repo`'s pull request from `branch` is outside the
     /// bounds; none where it is inside.
     pub fn refusal(&self, repo: &str, branch: &str) -> Option<String> {
