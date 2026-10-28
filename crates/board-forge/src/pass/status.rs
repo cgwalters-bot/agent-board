@@ -16,7 +16,8 @@ use board_core::{Item, Status, StatusRules, StatusSignals, derive_status};
 /// The pass's rules over [`derive_status`]. Done is released too: an issue
 /// open again goes back to Todo like any derived value that no longer holds.
 /// Blocked and Backlog are a person's holds, which only Done replaces; the
-/// legacy columns (Draft, In Review, Triage) give way to any rule.
+/// legacy columns (Draft, In Review, Triage) give way to any rule, and an
+/// unset Status also falls back to Todo.
 pub const PASS_STATUS_RULES: StatusRules<'static> = StatusRules {
     released: &[Status::InProgress, Status::NeedsHuman, Status::Done],
     kept: &[Status::Blocked, Status::Backlog],
@@ -399,6 +400,7 @@ mod tests {
         "status cgwalters-bot/homegit#110: Draft -> In Progress (open pull request)",
         "status cgwalters-bot/homegit#139: Needs human -> Done (closed)",
         "status cgwalters-bot/homegit#146: Needs human -> Done (closed)",
+        "status cgwalters-forge/actions#62: unset -> Todo (not labelled needs-human, no run in flight or open pull request)",
         "status cgwalters-forge/actions#105: unset -> Done (closed)",
         "status cgwalters-forge/actions#115: unset -> In Progress (pull request cgwalters-forge/actions#116 is open)",
         "status cgwalters-forge/agent-board#10: Todo -> Done (closed)",
@@ -462,19 +464,19 @@ mod tests {
         };
         let report = preview(Limits::default());
         let mut expected =
-            vec!["status: 39 change(s) of 46 item(s) read; 2 kept, their own facts not read whole"];
+            vec!["status: 40 change(s) of 46 item(s) read; 2 kept, their own facts not read whole"];
         expected.extend(CHANGES);
         assert_eq!(stage(&report), expected);
-        assert_eq!(report.summary, "summary: dispatched 0, writes 39, held 0");
+        assert_eq!(report.summary, "summary: dispatched 0, writes 40, held 0");
         assert_eq!(report.failures, 0);
         let report = preview(Limits {
-            status_changes: Some(38),
+            status_changes: Some(39),
             ..Limits::default()
         });
         let lines = stage(&report);
         assert_eq!(
             lines[1],
-            "status: refused, 39 changes are more than --max-status-changes 38; nothing is written. Check them, then pass a higher cap once"
+            "status: refused, 40 changes are more than --max-status-changes 39; nothing is written. Check them, then pass a higher cap once"
         );
         let refused: Vec<String> = CHANGES.iter().map(|l| format!("refused: {l}")).collect();
         assert_eq!(lines[2..], refused);
@@ -608,7 +610,7 @@ mod tests {
         let now = board.replay.now;
         let report = block(run(&board, &board, &config, State::default(), mode, now)).unwrap();
         let mut expected = vec![
-            "status: 39 change(s) of 46 item(s) read; 2 kept, their own facts not read whole",
+            "status: 40 change(s) of 46 item(s) read; 2 kept, their own facts not read whole",
             CHANGES[0],
             "status bootc-dev/bootc#1030: changed to Todo since the board was read; left for the next pass",
             CHANGES[2],
@@ -621,7 +623,7 @@ mod tests {
         assert_eq!(stage(&report), expected);
         assert_eq!(
             report.summary,
-            "summary: dispatched 0/0, writes 2/2, held 36"
+            "summary: dispatched 0/0, writes 2/2, held 37"
         );
         assert_eq!(report.failures, 0);
         let written: Vec<(String, String)> = board
@@ -727,7 +729,7 @@ mod tests {
         assert_eq!(
             lines[3..],
             [
-                "status: the pass's request budget or time is spent; 37 change(s) wait for the next pass"
+                "status: the pass's request budget or time is spent; 38 change(s) wait for the next pass"
             ]
         );
         assert_eq!(board.writes.borrow().len(), 2);
@@ -902,7 +904,21 @@ mod tests {
             ("a person's Backlog stays", Some(Backlog), |_| {}, None),
             ("Draft stays", Some(Draft), |_| {}, None),
             ("In Review stays", Some(InReview), |_| {}, None),
-            ("unset stays", None, |_| {}, None),
+            (
+                "unset with nothing under way",
+                None,
+                |_| {},
+                Some((
+                    Todo,
+                    "not labelled needs-human, no run in flight or open pull request",
+                )),
+            ),
+            (
+                "unlisted runs: unset stays",
+                None,
+                |f| f.runs_read = false,
+                None,
+            ),
             (
                 "Blocked stays with a run",
                 Some(Blocked),

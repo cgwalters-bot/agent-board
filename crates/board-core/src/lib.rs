@@ -360,8 +360,8 @@ pub const POLL_STATUS_RULES: StatusRules<'static> = StatusRules {
 
 /// The Status an item's signals derive, with its rule, or `None` to leave it:
 /// terminal facts win, then an ask for a person, then active work. A
-/// derived value that no longer holds goes back to Todo, but only when
-/// absence of work is known.
+/// derived value that no longer holds, or an unset Status, goes to Todo, but
+/// only when absence of work is known.
 pub fn derive_status(
     current: Option<&Status>,
     signals: &StatusSignals,
@@ -377,7 +377,7 @@ pub fn derive_status(
         Some(("open_human_ask", Status::NeedsHuman))
     } else if signals.active == Some(true) {
         Some(("active_work", Status::InProgress))
-    } else if signals.active == Some(false) && current.is_some_and(|c| rules.released.contains(c)) {
+    } else if signals.active == Some(false) && current.is_none_or(|c| rules.released.contains(c)) {
         Some(("inactive_work", Status::Todo))
     } else {
         None
