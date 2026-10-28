@@ -17,6 +17,10 @@
 //! the files a pull request touches or the paths a running issue names. It is
 //! a scheduling heuristic, not a boundary: a read that fails runs the issue
 //! independently, as without the check. See docs/job-plans.md#overlap.
+//!
+//! The pass may waive an open pull request's overlap ([`Waiver`],
+//! agent-board#426): a draft nobody is moving races no run, and a conflict
+//! in documentation is cheap to resolve for the board's most urgent work.
 use crate::github::{API_ROOT, Transport};
 use crate::plan::Target;
 use crate::poll::{Rest, validate_repository};
@@ -24,6 +28,7 @@ use anyhow::{Context, Result, ensure};
 use board_core::ItemRef;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Paths read from one issue's text, at most, so that a pasted listing
 /// costs a bounded comparison.
@@ -34,6 +39,10 @@ pub const PULL_READS: u64 = 50;
 pub const FILE_READS: u64 = 100;
 /// Running issues whose text is read, at most.
 pub const RUN_READS: usize = 10;
+/// Overlapping pull requests read for [`Waiver::stale_draft`], at most, so
+/// that the check's requests stay within what a start reserves; one past it
+/// holds.
+pub const DRAFT_READS: usize = 4;
 /// Paths named in a decision, at most.
 const SHOWN: usize = 3;
 
@@ -49,12 +58,23 @@ pub(crate) const TEXT_QUERY: &str = r#"query($owner: String!, $name: String!, $n
   repository(owner: $owner, name: $name) { issue(number: $number) { title body } }
 }"#;
 
+/// Whether an overlapping pull request is a draft, when it was opened and
+/// when its head was committed; read only where [`Waiver::stale_draft`] asks.
+pub(crate) const DRAFT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    isDraft createdAt commits(last: 1) { nodes { commit { committedDate } } }
+  } }
+}"#;
+
 /// What the check decided for a dispatch.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decision {
     /// Nothing overlaps, or the check was off or could not read; the note
     /// says which.
     Independent(String),
+    /// Only open pull requests a [`Waiver`] waives overlap: run
+    /// independently, and say which and why.
+    Ignored(String),
     /// Dispatch nothing now: the next pass decides again.
     Wait(String),
 }
@@ -64,8 +84,76 @@ impl Decision {
     pub fn sentence(&self) -> String {
         match self {
             Self::Independent(why) => format!("Run independently: {why}."),
+            Self::Ignored(why) => format!("Run independently: overlap ignored: {why}."),
             Self::Wait(why) => format!("Waiting: {why}."),
         }
+    }
+}
+
+/// When an open pull request's overlap does not hold a run, as the pass's
+/// `overlap` setting asks; the default waives nothing. Runs in flight are
+/// never waived: they have not pushed, so nobody can tell what they change.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Waiver {
+    /// The pass's clock and `overlap.staleDraftHours`: a draft opened and
+    /// last committed to at least that many hours before does not hold.
+    pub stale_draft: Option<(OffsetDateTime, u64)>,
+    /// Whether the waiting issue is in the board's first Priority option:
+    /// then a pull request that shares only documentation does not hold.
+    pub top: bool,
+}
+
+/// Whether a path is documentation for [`Waiver::top`]: Markdown, or
+/// anything under `docs/`.
+fn documentation(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".md") || path.starts_with("docs/")
+}
+
+impl Waiver {
+    /// Why pull request `pull` of `dest`'s repository, which shares
+    /// `theirs`, does not hold the run, if it does not. A draft read spends
+    /// one of `reads`; with none left, it holds.
+    fn waives<T: Transport>(
+        &self,
+        client: &T,
+        (dest, pull): (&ItemRef, u64),
+        theirs: &[String],
+        reads: &mut usize,
+    ) -> Result<Option<String>> {
+        if self.top && theirs.iter().all(|p| documentation(p)) {
+            return Ok(Some(
+                "it shares only documentation, and the issue is in the first Priority".into(),
+            ));
+        }
+        let Some((now, hours)) = self.stale_draft.filter(|_| *reads > 0) else {
+            return Ok(None);
+        };
+        *reads -= 1;
+        let (owner, name) = owner_name(dest)?;
+        let data = client.graphql(
+            DRAFT_QUERY,
+            json!({"owner": owner, "name": name, "number": pull}),
+        )?;
+        let node = data
+            .pointer("/repository/pullRequest")
+            .filter(|n| n.is_object())
+            .with_context(|| format!("pull request {pull} is not readable"))?;
+        if node["isDraft"] != Value::Bool(true) {
+            return Ok(None);
+        }
+        // Both must read: a draft whose age is unknown holds.
+        let at = |pointer: &str| {
+            node.pointer(pointer)
+                .and_then(Value::as_str)
+                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        };
+        let changed = at("/createdAt").zip(at("/commits/nodes/0/commit/committedDate"));
+        let Some(changed) = changed.map(|(opened, committed)| opened.max(committed)) else {
+            return Ok(None);
+        };
+        let idle = (now - changed).whole_hours();
+        Ok((idle >= i64::try_from(hours)?)
+            .then(|| format!("it is a draft whose head has not changed for {idle} hours")))
     }
 }
 
@@ -162,7 +250,15 @@ pub fn decide<C: Transport + Rest>(
     bot: &str,
     target: &Target,
 ) -> Decision {
-    match check(client, source, dest, brief, bot, target, &BTreeSet::new()) {
+    let waiver = Waiver::default();
+    match check(
+        client,
+        (source, dest),
+        brief,
+        bot,
+        target,
+        (&BTreeSet::new(), &waiver),
+    ) {
         Ok(decision) => decision,
         // Without the check every run is independent; failing to read leaves that.
         Err(error) => {
@@ -174,29 +270,28 @@ pub fn decide<C: Transport + Rest>(
 /// [`decide`] for a scheduler that starts runs on its own (`agent-board
 /// pass`): a check that cannot read waits rather than runs, as nobody chose
 /// this issue by hand to run beside whatever it may overlap. The runs by id
-/// in `ended` are not in flight, whatever GitHub says (agent-board#376).
+/// in `ended` are not in flight, whatever GitHub says (agent-board#376), and
+/// the pull requests `waiver` waives do not hold it.
 pub fn decide_strict<C: Transport + Rest>(
     client: &C,
-    source: &ItemRef,
-    dest: &ItemRef,
+    (source, dest): (&ItemRef, &ItemRef),
     brief: &str,
     bot: &str,
     target: &Target,
-    ended: &BTreeSet<u64>,
+    (ended, waiver): (&BTreeSet<u64>, &Waiver),
 ) -> Decision {
-    check(client, source, dest, brief, bot, target, ended).unwrap_or_else(|error| {
+    check(client, (source, dest), brief, bot, target, (ended, waiver)).unwrap_or_else(|error| {
         Decision::Wait(format!("the overlap check could not read ({error:#})"))
     })
 }
 
 fn check<C: Transport + Rest>(
     client: &C,
-    source: &ItemRef,
-    dest: &ItemRef,
+    (source, dest): (&ItemRef, &ItemRef),
     brief: &str,
     bot: &str,
     target: &Target,
-    ended: &BTreeSet<u64>,
+    (ended, waiver): (&BTreeSet<u64>, &Waiver),
 ) -> Result<Decision> {
     let mut named = paths(brief);
     named.extend(paths(&text(client, source)?));
@@ -226,7 +321,8 @@ fn check<C: Transport + Rest>(
             )));
         }
     }
-    let mut overlapping = Vec::new();
+    let (mut overlapping, mut ignored) = (Vec::new(), Vec::new());
+    let mut reads = DRAFT_READS;
     for (number, files) in open_pulls(client, dest, bot)? {
         let theirs = shared(&named, &files);
         if !theirs.is_empty() {
@@ -234,15 +330,21 @@ fn check<C: Transport + Rest>(
                 number,
                 ..dest.clone()
             };
-            overlapping.push(format!("{} changes {}", pull.display(), shown(&theirs)));
+            let changes = format!("{} changes {}", pull.display(), shown(&theirs));
+            match waiver.waives(client, (dest, number), &theirs, &mut reads)? {
+                Some(why) => ignored.push(format!("{changes}, but {why}")),
+                None => overlapping.push(changes),
+            }
         }
     }
-    Ok(if overlapping.is_empty() {
+    Ok(if !overlapping.is_empty() {
+        Decision::Wait(format!("open pull request {}", overlapping.join("; ")))
+    } else if !ignored.is_empty() {
+        Decision::Ignored(format!("open pull request {}", ignored.join("; ")))
+    } else {
         Decision::Independent(format!(
             "no open pull request of {bot} changes a path it names"
         ))
-    } else {
-        Decision::Wait(format!("open pull request {}", overlapping.join("; ")))
     })
 }
 
@@ -449,6 +551,12 @@ mod tests {
                     other => panic!("pull requests of {other}"),
                 };
                 return Ok(json!({"repository": {"pullRequests": {"nodes": nodes}}}));
+            }
+            if query == DRAFT_QUERY {
+                assert_eq!(repo, "example/work");
+                let node = (self.pulls.as_array().into_iter().flatten())
+                    .find(|p| p["number"] == variables["number"]);
+                return Ok(json!({"repository": {"pullRequest": node}}));
             }
             assert_eq!(query, TEXT_QUERY);
             let key = format!("{repo}#{}", variables["number"]);
@@ -732,7 +840,15 @@ mod tests {
             fail: false,
         };
         let strict = |ended: &BTreeSet<u64>| {
-            decide_strict(&forge, &issue, &issue, "Do it.", bot, &target, ended)
+            let waiver = Waiver::default();
+            decide_strict(
+                &forge,
+                (&issue, &issue),
+                "Do it.",
+                bot,
+                &target,
+                (ended, &waiver),
+            )
         };
         let running = wait("the run for example/work#11 in flight names `a.rs`");
         assert_eq!(strict(&BTreeSet::new()), running);
@@ -744,6 +860,176 @@ mod tests {
         assert_eq!(
             wait(&many).sentence(),
             "Waiting: open pull request example/work#5 changes `a/1.rs`, `a/2.rs`, `a/3.rs`, 1 more."
+        );
+    }
+
+    /// The pass's `overlap` setting (agent-board#426): a pull request it
+    /// waives does not hold the run, and the decision says which and why;
+    /// every other overlap holds as without it, the default.
+    #[test]
+    fn waiver_table() {
+        let target = Target {
+            caller: "cgwalters-forge/tracker".into(),
+            workflow: "dispatch.yml".into(),
+            git_ref: "main".into(),
+        };
+        let issue = ItemRef {
+            host: "github.com".into(),
+            repository: "example/work".into(),
+            number: 10,
+        };
+        let now = OffsetDateTime::parse("2026-10-28T18:00:00Z", &Rfc3339).unwrap();
+        // The bot's pull request, a draft or not, opened and last committed
+        // to the given hours before `now`.
+        let pull = |n: u64, files: &[&str], draft: bool, (opened, committed): (i64, i64)| {
+            let at = |h: i64| (now - time::Duration::hours(h)).format(&Rfc3339).unwrap();
+            json!({"number": n, "author": {"login": "agentic-bot"}, "isDraft": draft,
+                "createdAt": at(opened),
+                "commits": {"nodes": [{"commit": {"committedDate": at(committed)}}]},
+                "files": {"nodes": files.iter().map(|p| json!({"path": p})).collect::<Vec<_>>()}})
+        };
+        let mut unknown = pull(5, &["src/a.rs"], true, (9, 9));
+        unknown["commits"]["nodes"] = json!([]);
+        let off = Waiver::default();
+        let stale = Waiver {
+            stale_draft: Some((now, 4)),
+            top: false,
+        };
+        let top = Waiver {
+            stale_draft: None,
+            top: true,
+        };
+        let both = Waiver {
+            stale_draft: Some((now, 4)),
+            top: true,
+        };
+        let wait = |why: &str| Decision::Wait(format!("open pull request {why}"));
+        let ignored = |why: &str| Decision::Ignored(format!("open pull request {why}"));
+        let code = "example/work#5 changes `src/a.rs`";
+        let docs = "example/work#5 changes `README.md`, `docs/a.md`";
+        let only_docs = "it shares only documentation, and the issue is in the first Priority";
+        let (fix_code, fix_docs) = ("Fix src/a.rs.", "Fix docs/a.md and README.md.");
+        // Name, the issue's text, the open pull requests, the waiver; the decision.
+        let cases = [
+            (
+                "off, a stale draft holds",
+                fix_code,
+                json!([pull(5, &["src/a.rs"], true, (9, 5))]),
+                off,
+                wait(code),
+            ),
+            (
+                "stale draft",
+                fix_code,
+                json!([pull(5, &["src/a.rs"], true, (9, 5))]),
+                stale,
+                ignored(&format!(
+                    "{code}, but it is a draft whose head has not changed for 5 hours"
+                )),
+            ),
+            (
+                "draft committed to since",
+                fix_code,
+                json!([pull(5, &["src/a.rs"], true, (9, 3))]),
+                both,
+                wait(code),
+            ),
+            (
+                "draft opened since",
+                fix_code,
+                json!([pull(5, &["src/a.rs"], true, (2, 9))]),
+                stale,
+                wait(code),
+            ),
+            (
+                "draft of unknown age",
+                fix_code,
+                json!([unknown]),
+                stale,
+                wait(code),
+            ),
+            (
+                "not a draft",
+                fix_code,
+                json!([pull(5, &["src/a.rs"], false, (9, 9))]),
+                stale,
+                wait(code),
+            ),
+            (
+                "off, documentation holds",
+                fix_docs,
+                json!([pull(5, &["docs/a.md", "README.md"], false, (1, 1))]),
+                off,
+                wait(docs),
+            ),
+            (
+                "documentation, first Priority",
+                fix_docs,
+                json!([pull(5, &["docs/a.md", "README.md"], false, (1, 1))]),
+                top,
+                ignored(&format!("{docs}, but {only_docs}")),
+            ),
+            (
+                "documentation, another Priority",
+                fix_docs,
+                json!([pull(5, &["docs/a.md", "README.md"], false, (1, 1))]),
+                stale,
+                wait(docs),
+            ),
+            (
+                "documentation and code",
+                "Fix docs/a.md and src/a.rs.",
+                json!([pull(5, &["docs/a.md", "src/a.rs"], false, (1, 1))]),
+                top,
+                wait("example/work#5 changes `docs/a.md`, `src/a.rs`"),
+            ),
+            (
+                "one waived, one holds",
+                "Fix docs/a.md and src/b.rs.",
+                json!([
+                    pull(5, &["docs/a.md"], false, (1, 1)),
+                    pull(6, &["src/b.rs"], false, (1, 1))
+                ]),
+                both,
+                wait("example/work#6 changes `src/b.rs`"),
+            ),
+            (
+                "more stale drafts than are read",
+                fix_code,
+                (5..=5 + DRAFT_READS as u64)
+                    .map(|n| pull(n, &["src/a.rs"], true, (9, 9)))
+                    .collect(),
+                stale,
+                wait(&format!(
+                    "example/work#{} changes `src/a.rs`",
+                    5 + DRAFT_READS
+                )),
+            ),
+        ];
+        for (name, text, pulls, waiver, expected) in cases {
+            let forge = Forge {
+                runs: vec![],
+                pulls,
+                tracker_pulls: json!([]),
+                texts: [("example/work#10", text)].into(),
+                fail: false,
+            };
+            let checks = (&BTreeSet::new(), &waiver);
+            let decision = decide_strict(
+                &forge,
+                (&issue, &issue),
+                "-",
+                "agentic-bot",
+                &target,
+                checks,
+            );
+            assert_eq!(decision, expected, "{name}");
+        }
+        assert_eq!(
+            ignored(&format!("{docs}, but {only_docs}")).sentence(),
+            format!(
+                "Run independently: overlap ignored: open pull request {docs}, but {only_docs}."
+            )
         );
     }
 }

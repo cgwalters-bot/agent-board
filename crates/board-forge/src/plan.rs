@@ -781,6 +781,8 @@ pub struct Scheduled<'a> {
     /// The runs the pass took as ended though GitHub says they are in
     /// progress, which the strict check leaves out.
     pub ended: Option<&'a std::collections::BTreeSet<u64>>,
+    /// The open pull requests the strict check waives.
+    pub waiver: overlap::Waiver,
     /// The hash of the operator's direction the pass put in the plan's
     /// brief, which its record carries ([`recorded_direction`]).
     pub direction: Option<&'a str>,
@@ -896,8 +898,9 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     // plan, not a guess from paths, decided how it runs.
     let none = std::collections::BTreeSet::new();
     let ended = scheduled.ended.unwrap_or(&none);
+    let strict = (ended, &scheduled.waiver);
     let check = |bot| match scheduled.strict {
-        true => overlap::decide_strict(client, issue, &dest, &plan.brief, bot, target, ended),
+        true => overlap::decide_strict(client, (issue, &dest), &plan.brief, bot, target, strict),
         false => overlap::decide(client, issue, &dest, &plan.brief, bot, target),
     };
     let overlap = bot.filter(|_| base.is_none()).map(check);

@@ -296,6 +296,33 @@ fn replay_idle_board_starts_work() {
     assert_eq!(report.failures, 0);
 }
 
+/// With `overlap` set (agent-board#426), tracker#832's overlap with P0
+/// tracker#527, only `README.md`, does not hold it: it starts, and the
+/// overlap stays in the hold snapshot, not blocking and not the operator's.
+/// Unset, it holds as in [`replay_idle_board_starts_work`].
+#[test]
+fn overlap_setting_ignores_a_documentation_overlap() {
+    let report = preview(&config(json!({"overlap": {}})), &replay());
+    let ignored = "overlap ignored: cgwalters-forge/tracker#527: open pull request \
+        cgwalters-forge/tracker#832 changes `README.md`, but it shares only documentation, \
+        and the issue is in the first Priority";
+    let at = (report.lines.iter().position(|l| l == ignored))
+        .unwrap_or_else(|| panic!("{:#?}", report.lines));
+    let started = &report.lines[at + 1];
+    assert!(
+        started.starts_with("start implement cgwalters-forge/tracker#527 "),
+        "{started}"
+    );
+    assert!(!report.lines.contains(&STARTED[4].to_owned()));
+    assert_eq!(report.failures, 0);
+    let snapshot = holds::snapshot(&report.holds, String::new(), report.tally.clone());
+    let published: Vec<Value> = (snapshot.holds.iter())
+        .filter(|h| h.item.as_deref() == Some("cgwalters-forge/tracker#527"))
+        .map(|h| json!([h.kind, h.operator]))
+        .collect();
+    assert_eq!(published, [json!(["overlap-ignored", false])]);
+}
+
 /// Spend at the weekly budget holds stage 3's planning run as it holds
 /// stage 4's: a planning run is a new run too.
 #[test]
@@ -5310,12 +5337,12 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     let cases = [
         (
             168,
-            "budget: 61 requests left, fewer than a start may take (64); 1 more candidate(s) wait",
+            "budget: 61 requests left, fewer than a start may take (68); 1 more candidate(s) wait",
             0,
         ),
         (
             84,
-            "budget: 62 requests left, fewer than a start may take (64); 9 more candidate(s) wait",
+            "budget: 62 requests left, fewer than a start may take (68); 9 more candidate(s) wait",
             1,
         ),
     ];
@@ -5837,6 +5864,14 @@ fn config_table() {
         (
             json!({"replanAfterDays": 1}),
             "replanAfterDays needs triage",
+        ),
+        (
+            json!({"overlap": {"staleDraftHours": 169}}),
+            "overlap staleDraftHours is not 0 to 168",
+        ),
+        (
+            json!({"overlap": {"staleDraftHour": 4}}),
+            "unknown field `staleDraftHour`",
         ),
         (
             json!({"revisit": {"perPass": 1, "afterDays": 14}}),
