@@ -950,9 +950,53 @@ fn decide_coalesces_changes_but_not_direction() {
             busy: None,
             now: at(now),
             follow_up_days: follow_up_days.parse().unwrap(),
+            direction: None,
         });
         let got = format!("{next:?}");
         assert!(got.starts_with(expected), "{now}: {got}");
+    }
+    // The operator's direction: its hash in the record of the request the
+    // applied plan answered, the hash this pass read, and the request that
+    // a change led to, not yet answered.
+    let record = |id: u64, when: &str, hash: Option<&str>| {
+        let line = hash.map(|h| format!("\n<!-- agent-board-direction: {h} -->"));
+        let body = format!(
+            "<!-- agent-board-dispatch: {id}@{when} -->{}\nDispatched the plan.",
+            line.unwrap_or_default()
+        );
+        note(id, "cgwalters-bot", when, &body)
+    };
+    let idle = "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied";
+    let changed = "Plan(\"the operator's direction changed since it was last planned\")";
+    for (recorded_hash, now_hash, again, expected) in [
+        (Some("aaaa"), Some("aaaa"), false, idle),
+        (Some("aaaa"), Some("bbbb"), false, changed),
+        // Once: the planning request the change led to carries its hash.
+        (Some("aaaa"), Some("bbbb"), true, "Unanswered"),
+        // Set where it was not, or unreadable this pass: nothing is due.
+        (None, Some("bbbb"), false, idle),
+        (Some("aaaa"), None, false, idle),
+    ] {
+        let mut all = recorded.clone();
+        all.push(record(30, "2026-10-23T13:30:00Z", recorded_hash));
+        if again {
+            all.push(record(31, "2026-10-25T14:00:00Z", now_hash));
+        }
+        let next = decide(&Inputs {
+            epic: &settled,
+            comments: &all,
+            operator: "cgwalters",
+            bot: "cgwalters-bot",
+            busy: None,
+            now: at("2026-10-30T14:00:00Z"),
+            follow_up_days: 0,
+            direction: now_hash,
+        });
+        let got = format!("{next:?}");
+        assert!(
+            got.starts_with(expected),
+            "{recorded_hash:?} {now_hash:?}: {got}"
+        );
     }
 }
 

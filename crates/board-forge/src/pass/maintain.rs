@@ -631,7 +631,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 let plan = json!({
                     "schema": JOB_PLAN_SCHEMA, "repo": on.0, "item": on.1,
                     "kind": DIGEST_KIND, "runner": TRIAGE_RUNNER, "pool": pool,
-                    "brief": brief(config, maintain, from.date(), &repos, review, more),
+                    "brief": self.directed(brief(config, maintain, from.date(), &repos, review, more)),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
                 let issue = ItemRef {
@@ -784,6 +784,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             strict: true,
             ended: None,
             routing: None,
+            direction: self.direction_hash(),
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);
