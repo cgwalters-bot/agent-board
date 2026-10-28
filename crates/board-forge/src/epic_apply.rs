@@ -94,9 +94,10 @@ pub struct Config {
     pub priority_field_id: String,
     pub priorities: BTreeMap<String, String>,
     pub default_priority: String,
-    /// Require the newest `epic` labeling to be the operator's, so that
-    /// someone with only triage access (or the bot) cannot start a
-    /// decomposition the bot then carries out. Off by default.
+    /// Require the newest `epic` labeling to be the operator's or the bot's
+    /// (the operator files epics through it), so that someone with only
+    /// triage access cannot start a decomposition the bot then carries out.
+    /// Off by default.
     pub label_by_operator: bool,
     /// Let a plan's `close_epic` close the epic. Off by default, closing an
     /// epic is the operator's call alone: off, a plan writer cannot end a
@@ -771,10 +772,14 @@ fn designated<T: Transport>(
     ensure!(epic.designated, "parent {has} the epic label");
     if config.label_by_operator {
         let by = epic_labelled_by(client, issue)?;
+        let trusted = by.as_deref().is_some_and(|login| {
+            [&config.operator, &config.bot]
+                .iter()
+                .any(|who| login.eq_ignore_ascii_case(who))
+        });
         ensure!(
-            by.as_deref()
-                .is_some_and(|login| login.eq_ignore_ascii_case(&config.operator)),
-            "parent's epic label was added by {}, not the operator",
+            trusted,
+            "parent's epic label was added by {}, not the operator or the bot",
             by.map_or("an app or a deleted account".into(), |login| format!(
                 "{login:?}"
             ))
@@ -2009,8 +2014,8 @@ mod tests {
     }
 
     /// With `label_by_operator`, the newest epic labeling must be a user's
-    /// whose login is the operator's, before apply and after its claim. Off,
-    /// the timeline is never read.
+    /// whose login is the operator's or the bot's, before apply and after
+    /// its claim. Off, the timeline is never read.
     #[test]
     fn label_by_operator_requires_the_operators_newest_labeling() {
         let operator = ("User", "Operator", "epic");
@@ -2020,6 +2025,12 @@ mod tests {
         for (on, timeline, later, expected) in [
             (false, labellings(&[intruder], false), None, None),
             (true, labellings(&[operator], false), None, None),
+            (
+                true,
+                labellings(&[("User", "planner", "epic")], false),
+                None,
+                None,
+            ),
             (
                 true,
                 labellings(&[intruder, operator, other], true),
