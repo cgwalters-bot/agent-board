@@ -296,6 +296,77 @@ fn replay_idle_board_starts_work() {
     assert_eq!(report.failures, 0);
 }
 
+/// `triage` true, or with the scope `all`, triages each candidate without a
+/// plan. The scope `epics`, an object's default (agent-board#431), triages
+/// only tracker#446, the child of a live epic, and holds the unparented
+/// tracker#459 and #533, which no revisit draws either. The unparented
+/// tracker#527's own plan starts it under each (`overlap` lets it), and
+/// agentic-job#188's dispatched plan holds it as before. Each case: the
+/// setting, and the lines from the candidates line to the Status stage's.
+#[test]
+fn triage_scope_epics_triages_only_epic_children() {
+    let triaged = |n| format!("start triage cgwalters-forge/tracker#{n} pool=claude");
+    let outside = |n| format!("hold cgwalters-forge/tracker#{n}: {OUTSIDE_EPICS}");
+    let ignored = "overlap ignored: cgwalters-forge/tracker#527: open pull request cgwalters-forge/tracker#832 changes `README.md`, but it shares only documentation, and the issue is in the first Priority";
+    let implement = "start implement cgwalters-forge/tracker#527 plan=6332955694@2026-10-22T04:47:39Z pool=claude";
+    let planned = "hold cgwalters-forge/agentic-job#188: plan 6229359427@2026-10-17T03:59:02Z was dispatched already, https://github.com/cgwalters-forge/agentic-job/issues/188#issuecomment-6229434409".to_owned();
+    let all = vec![
+        "candidates: 5 (0 opened by others, 0 outside a live epic)".to_owned(),
+        triaged(446),
+        triaged(459),
+        planned.clone(),
+        ignored.to_owned(),
+        implement.to_owned(),
+        triaged(533),
+        "revisit: 1 due, seed 1792768510, drawn: cgwalters-forge/agentic-job#188 (weight 4)"
+            .to_owned(),
+        "start revisit cgwalters-forge/agentic-job#188 pool=claude".to_owned(),
+    ];
+    let epics = vec![
+        "candidates: 5 (0 opened by others, 0 outside a live epic, 4 unparented: run only with a plan)".to_owned(),
+        triaged(446),
+        outside(459),
+        planned,
+        ignored.to_owned(),
+        implement.to_owned(),
+        outside(533),
+        "revisit: none of 5 candidate(s) is due".to_owned(),
+    ];
+    for (setting, expected) in [
+        (json!(true), &all),
+        (json!({"scope": "all"}), &all),
+        (json!({}), &epics),
+        (json!({"scope": "epics"}), &epics),
+    ] {
+        let mut replay = replay();
+        only(
+            &mut replay,
+            &[
+                "cgwalters-forge/tracker#446",
+                "cgwalters-forge/tracker#459",
+                "cgwalters-forge/agentic-job#188",
+                "cgwalters-forge/tracker#527",
+                "cgwalters-forge/tracker#533",
+            ],
+        );
+        silent(&mut replay, &[("cgwalters-forge/agentic-job#188", 20)], &[]);
+        let revisit = json!({"perPass": 1, "afterDays": 14});
+        let config = config(json!({"triage": setting, "revisit": revisit, "overlap": {}}));
+        let report = preview(&config, &replay);
+        assert_eq!(report.failures, 0, "{setting}: {:#?}", report.lines);
+        let from = (report.lines.iter()).position(|l| l.starts_with("candidates: "));
+        let to = (report.lines.iter()).position(|l| l.starts_with("status: "));
+        let lines = &report.lines[from.unwrap()..to.unwrap()];
+        assert_eq!(lines, expected.as_slice(), "{setting}");
+        let kinds: Vec<HoldKind> = (report.holds.iter())
+            .filter(|e| e.hold.reason == OUTSIDE_EPICS)
+            .map(|e| e.hold.kind)
+            .collect();
+        let held = if expected == &epics { 2 } else { 0 };
+        assert_eq!(kinds, vec![HoldKind::OutsideEpics; held], "{setting}");
+    }
+}
+
 /// With `overlap` set (agent-board#426), tracker#832's overlap with P0
 /// tracker#527, only `README.md`, does not hold it: it starts, and the
 /// overlap stays in the hold snapshot, not blocking and not the operator's.
@@ -2771,6 +2842,78 @@ fn apply_doubles_the_wait_after_each_follow_up() {
     assert_eq!(backoff(day, 99, i64::MAX), day << 30);
 }
 
+/// Under the triage scope `epics`, tracker#446 made an issue outside every
+/// live epic after its triage: a verdict for the operator still labels it,
+/// but nothing triages it again, neither its wait, a change nor the
+/// operator's comment. Each case: its answers (author, verdict or body,
+/// days from now) and how its line ends.
+#[test]
+fn triage_scope_epics_follows_up_no_issue_outside_them() {
+    let verdict = |v: &str| format!("```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let bot = "cgwalters-bot";
+    type Answer = (&'static str, String, i64);
+    let cases: Vec<(&str, Vec<Answer>, &str)> = vec![
+        (
+            "done still asks the operator",
+            vec![(bot, verdict("done"), 0)],
+            "; label needs-human",
+        ),
+        (
+            "partly, its day past and changed since, is not triaged again",
+            vec![
+                (bot, verdict("partly"), -4),
+                ("visitor", "Fixed by #9?".into(), -3),
+            ],
+            OUTSIDE_EPICS,
+        ),
+        (
+            "nor after the operator's comment",
+            vec![
+                (bot, verdict("partly"), 0),
+                ("cgwalters", "Not done: see #2.".into(), 0),
+            ],
+            OUTSIDE_EPICS,
+        ),
+    ];
+    let all = config(json!({"triageFollowUpDays": 3}));
+    let epics = config(json!({"triageFollowUpDays": 3, "triage": {"scope": "epics"}}));
+    for (name, answers, ends) in cases {
+        let mut forge = Forge::new(None, false);
+        apply(&forge, &all);
+        let triaged = |forge: &Forge| {
+            (forge.dispatches().iter())
+                .filter(|d| d.ends_with("tracker#446"))
+                .count()
+        };
+        assert_eq!(triaged(&forge), 1, "{name}");
+        for entry in &mut forge.replay.requests {
+            let nodes = entry["answer"]
+                .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                .and_then(Value::as_array_mut);
+            for node in nodes.into_iter().flatten() {
+                let content = &mut node["content"];
+                if content["number"] == 446
+                    && text(content, "/repository/nameWithOwner") == "cgwalters-forge/tracker"
+                {
+                    content["parent"] = Value::Null;
+                }
+            }
+        }
+        for (author, body, days) in answers {
+            answered(&forge, (author, None), &body, days);
+        }
+        let report = apply(&forge, &epics);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = report.lines.iter().find(|l| l.contains("tracker#446"));
+        assert!(
+            line.is_some_and(|l| l.ends_with(ends)),
+            "{name}: no line ending {ends:?} in {:#?}",
+            report.lines
+        );
+        assert_eq!(triaged(&forge), 1, "{name}");
+    }
+}
+
 /// Gives `repo#number` on the board one open pull request by `author`.
 fn closing_pull(replay: &mut Replay, (repo, number): (&str, u64), author: &str) {
     for entry in &mut replay.requests {
@@ -2864,6 +3007,17 @@ fn apply_replans_an_open_issue_after_its_run() {
             [
                 "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
                 "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
+            ],
+            None,
+        ),
+        (
+            "outside every live epic under the triage scope epics, it is not",
+            json!({"replanAfterDays": 1, "triage": {"scope": "epics"}}),
+            |_| {},
+            tracker(468),
+            [
+                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic",
+                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic",
             ],
             None,
         ),
@@ -2992,6 +3146,7 @@ fn apply_reruns_a_failed_run_once() {
         )
     };
     let stacked: Edit = |r| replan_468(r, r#""item":468,"#, r#""item":468,"stacks_on":467,"#);
+    let triage: Edit = |r| replan_468(r, r#""kind":"implement","#, r#""kind":"triage","#);
     // The recording's open tracker#889 changes paths its plan names: the
     // rerun waits for it, as a start would. Without it, it is re-run.
     let independent: Edit = |r| {
@@ -3062,6 +3217,14 @@ fn apply_reruns_a_failed_run_once() {
             vec![run(1)],
             none,
             "hold cgwalters-forge/tracker#468: Waiting: open pull request cgwalters-forge/tracker#889 changes",
+            0,
+        ),
+        (
+            "a failed triage outside every live epic is not re-run under the scope epics",
+            json!({"reruns": true, "triage": {"scope": "epics"}}),
+            vec![run(1)],
+            triage,
+            "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z's triage run failed; outside every live epic",
             0,
         ),
         (
@@ -5787,7 +5950,7 @@ fn maintain(edit: Value) -> Value {
 fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
     let parsed = Config::parse(&minimal.to_string()).unwrap();
-    assert!(!parsed.work() && !parsed.triage && parsed.follow.is_empty());
+    assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
     assert!(parsed.pools.0.is_empty() && parsed.dispatch_ref.is_none());
     // Pools keep the file's order, which breaks ties.
     let ordered = Config::parse(
@@ -5844,6 +6007,23 @@ fn config_table() {
         (
             json!({"triage": true}),
             "triage needs triagePools or planPools",
+        ),
+        (
+            json!({"triage": {"scope": "some"}}),
+            "triage: unknown variant `some`, expected `epics` or `all`",
+        ),
+        (
+            json!({"triage": {"scopes": "all"}}),
+            "triage: unknown field `scopes`",
+        ),
+        (
+            json!({"triage": "all"}),
+            "triage is \"all\", not true, false or an object",
+        ),
+        (
+            json!({"triage": {}, "planPools": ["a"], "pools": {"a": {}},
+                "usage": {"repository": "o/ops", "issue": 1}}),
+            "triage scope epics needs epics",
         ),
         (
             json!({"triageFollowUpDays": 31}),
@@ -6102,6 +6282,21 @@ fn config_table() {
             .extend(edit.as_object().unwrap().clone());
         let got = format!("{:#}", Config::parse(&value.to_string()).unwrap_err());
         assert!(got.contains(error), "{edit}: {got}");
+    }
+    // `triage` true is the scope all, as before scopes; an object's scope
+    // is epics unless it says all.
+    for (setting, scope) in [
+        (json!(false), None),
+        (json!(true), Some(TriageScope::All)),
+        (json!({"scope": "all"}), Some(TriageScope::All)),
+        (json!({}), Some(TriageScope::Epics)),
+        (json!({"scope": "epics"}), Some(TriageScope::Epics)),
+    ] {
+        assert_eq!(
+            config(json!({"triage": setting})).triage,
+            scope,
+            "{setting}"
+        );
     }
     // A held item waits afterDays unless heldAfterDays is set; a revisit
     // runs on the triage pools unless its own are named.

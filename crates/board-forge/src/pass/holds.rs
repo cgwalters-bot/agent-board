@@ -62,6 +62,9 @@ pub enum HoldKind {
     /// Its parent is not a live epic; the operator's only where its
     /// Priority is among the board's first ([`Hold::operator`]).
     EpicNotLive,
+    /// Outside every live epic, with no plan, under the triage scope
+    /// `epics`: no triage run plans it.
+    OutsideEpics,
     Overlap,
     /// Not a hold: an open pull request overlaps it, but the pass's
     /// `overlap` setting let it start anyway, so the overlap stays visible.
@@ -92,6 +95,7 @@ impl HoldKind {
             Self::EpicUnplanned => "epic-unplanned",
             Self::NeedsOperator => "needs-operator",
             Self::EpicNotLive => "epic-not-live",
+            Self::OutsideEpics => "outside-epics",
             Self::Overlap => "overlap",
             Self::OverlapIgnored => "overlap-ignored",
             Self::Unreadable => "unreadable",
@@ -798,6 +802,7 @@ mod tests {
             HoldKind::EpicUnplanned,
             HoldKind::NeedsOperator,
             HoldKind::EpicNotLive,
+            HoldKind::OutsideEpics,
             HoldKind::Overlap,
             HoldKind::Unreadable,
             HoldKind::Wip,

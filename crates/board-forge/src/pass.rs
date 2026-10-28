@@ -136,6 +136,9 @@ const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
 /// [`NEEDS_HUMAN`]: `done` for a close, which the pass does not make since no
 /// review follows it, and the others for a decision.
 const ASK_VERDICTS: &[&str] = &["done", "needs-design", "needs-operator"];
+/// Why [`TriageScope::Epics`] starts no triage run on an issue outside
+/// every live epic.
+const OUTSIDE_EPICS: &str = "outside every live epic, so not triaged (triage scope epics)";
 /// What a triage plan posted again by [`Scheduler::follow_up`] says first.
 const AGAIN: &str = "The board pass asks a triage run to plan this issue again.";
 /// The hidden line a triage plan comment carries after its intro, with
@@ -281,8 +284,12 @@ pub struct Config {
     pub epics: Option<Epics>,
     #[serde(default)]
     pub wip: u64,
-    #[serde(default)]
-    pub triage: bool,
+    /// Off unless set: an issue without a plan gets a triage run, for the
+    /// issues of its [`TriageScope`]. `true` is [`TriageScope::All`], the
+    /// setting before scopes; `{"scope": …}` defaults to
+    /// [`TriageScope::Epics`].
+    #[serde(default, deserialize_with = "triage_setting")]
+    pub triage: Option<TriageScope>,
     #[serde(default)]
     pub plan_pools: Vec<String>,
     /// None: `planPools`.
@@ -338,6 +345,43 @@ pub struct Config {
     /// `--fix-bounds`, never the file's: the poll's [`PollPolicy::fix_bounds`].
     #[serde(skip)]
     pub fix_bounds: Option<poll::bounds::FixBounds>,
+}
+
+/// Which candidates without a plan a triage run plans
+/// (docs/pass.md#scheduling).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TriageScope {
+    /// Only the children of live epics; an issue outside every live epic
+    /// runs only with an accepted plan.
+    #[default]
+    Epics,
+    /// Every candidate.
+    All,
+}
+
+/// `triage` as an object.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriageSection {
+    #[serde(default)]
+    scope: TriageScope,
+}
+
+/// `triage`: `false` (off), `true` ([`TriageScope::All`]) or an object
+/// with an optional `scope`.
+fn triage_setting<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<TriageScope>, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::Bool(on) => Ok(on.then_some(TriageScope::All)),
+        section @ Value::Object(_) => serde_json::from_value::<TriageSection>(section)
+            .map(|s| Some(s.scope))
+            .map_err(|e| de::Error::custom(format!("triage: {e}"))),
+        other => Err(de::Error::custom(format!(
+            "triage is {other}, not true, false or an object"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -654,15 +698,19 @@ impl Config {
             }
         }
         ensure!(
-            !self.triage || !self.triage_pools().is_empty(),
+            self.triage.is_none() || !self.triage_pools().is_empty(),
             "triage needs triagePools or planPools"
+        );
+        ensure!(
+            self.triage != Some(TriageScope::Epics) || self.epics.is_some(),
+            "triage scope epics needs epics"
         );
         ensure!(
             self.triage_follow_up_days <= FOLLOW_UP_DAYS_LIMIT,
             "triageFollowUpDays is not 0 to {FOLLOW_UP_DAYS_LIMIT}"
         );
         ensure!(
-            self.triage_follow_up_days == 0 || self.triage,
+            self.triage_follow_up_days == 0 || self.triage.is_some(),
             "triageFollowUpDays needs triage"
         );
         ensure!(
@@ -670,7 +718,7 @@ impl Config {
             "replanAfterDays is not 0 to {FOLLOW_UP_DAYS_LIMIT}"
         );
         ensure!(
-            self.replan_after_days == 0 || self.triage,
+            self.replan_after_days == 0 || self.triage.is_some(),
             "replanAfterDays needs triage"
         );
         if let Some(revisit) = &self.revisit {
@@ -2621,7 +2669,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .map(|(repository, issue)| format!("{repository}#{issue}").to_ascii_lowercase())
             .collect();
         let mut ranked = Vec::new();
-        let (mut visitors, mut outside) = (0, Vec::new());
+        let (mut visitors, mut outside, mut unparented) = (0, Vec::new(), 0);
         for facts in board.items.values() {
             if !facts.open
                 || !config.works_in(&facts.issue.repository)
@@ -2638,7 +2686,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 continue;
             }
             let epic = match &facts.parent {
-                None if is(facts.author.as_deref(), &people) => None,
+                None if is(facts.author.as_deref(), &people) => {
+                    unparented += 1;
+                    None
+                }
                 None => {
                     visitors += 1;
                     continue;
@@ -2671,8 +2722,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
         self.report.tally.1.candidates = Some(ranked.len());
+        let scoped = match config.triage {
+            Some(TriageScope::Epics) => format!(", {unparented} unparented: run only with a plan"),
+            _ => String::new(),
+        };
         self.line(format!(
-            "candidates: {} ({visitors} opened by others, {} outside a live epic)",
+            "candidates: {} ({visitors} opened by others, {} outside a live epic{scoped})",
             ranked.len(),
             outside.len()
         ));
@@ -2954,6 +3009,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     dest.display()
                 );
                 return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+            }
+            if let Some(held) = self.outside_epics(&facts) {
+                let why = format!("plan {id}'s triage run failed; {}", held.reason);
+                return Ok(Step::Hold(Hold {
+                    reason: why,
+                    ..held
+                }));
             }
             return self.rerun(
                 (issue, issue),
@@ -3324,9 +3386,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     ) -> Result<Step> {
         let config = self.config;
         let issue = &read.0.issue;
-        if !config.triage {
+        if config.triage.is_none() {
             let why = "no plan, and triage is off";
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+        }
+        if let Some(held) = self.outside_epics(read.0) {
+            return Ok(Step::Hold(held));
         }
         let pool = match self.pool(snapshot, config.triage_pools(), slots) {
             Ok(pool) => pool,
@@ -3456,6 +3521,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!("{said}; label {NEEDS_HUMAN}");
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsHuman, why)));
         }
+        // Not triaged again, so neither its wait nor its inputs matter.
+        if let Some(held) = self.outside_epics(facts) {
+            let why = format!("{said}; {}", held.reason);
+            return Ok(Step::Hold(Hold {
+                reason: why,
+                ..held
+            }));
+        }
         let days = time::Duration::days(config.triage_follow_up_days as i64);
         // Without a verdict the run may have failed: retried after the days.
         let carried = carried(&from.body).filter(|_| verdict.is_some());
@@ -3497,6 +3570,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.triage(read, AGAIN, (snapshot, target, slots))
     }
 
+    /// With [`TriageScope::Epics`], the hold of a candidate outside every
+    /// live epic, which no triage run plans: a candidate's parent, where it
+    /// has one, is a live epic ([`Self::candidates`]). Read from the board,
+    /// not again before the start.
+    fn outside_epics(&self, facts: &Facts) -> Option<Hold> {
+        (self.config.triage == Some(TriageScope::Epics) && facts.parent.is_none())
+            .then(|| Hold::new(HoldKind::OutsideEpics, OUTSIDE_EPICS))
+    }
+
     /// [`fingerprint`] of an issue as `facts` and `comments` read it, with
     /// its body read and its closing pull requests completed.
     fn inputs(&self, facts: &Facts, comments: &[plan::Comment]) -> Result<String> {
@@ -3526,6 +3608,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         record: &plan::Comment,
         context: (Option<&Value>, &Target, &Slots),
     ) -> Result<Step> {
+        if let Some(held) = self.outside_epics(read.0) {
+            let why = format!(
+                "plan {id} was dispatched already, {}; {}",
+                record.url, held.reason
+            );
+            return Ok(Step::Hold(Hold {
+                reason: why,
+                ..held
+            }));
+        }
         let due = record.changed + time::Duration::days(self.config.replan_after_days as i64);
         if self.now >= due {
             return self.triage(read, REPLAN, context);
