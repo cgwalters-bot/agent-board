@@ -95,6 +95,9 @@ const WEEKLY_USD_LIMIT: f64 = 100_000.0;
 /// How far past the weekly budget pull requests' fix rounds go on, so that
 /// work already in flight can land.
 const FOLLOW_MARGIN: f64 = 0.1;
+/// Why runs wait once the week's spend reaches the budget: no dollar
+/// amounts, as a hold's reason is published; the `usage:` line has them.
+const BUDGET_REACHED: &str = "weekly budget reached";
 /// Labels a person puts on an issue to keep runs off it.
 const HOLD_LABELS: &[(&str, HoldKind)] = &[
     (NEEDS_HUMAN, HoldKind::NeedsHuman),
@@ -1799,7 +1802,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         });
     }
 
-    /// A hold of every new run, `hold wip|pools: why`.
+    /// A hold of every new run, `hold wip|pools|budget: why`.
     fn pass_held(&mut self, kind: HoldKind, why: impl Into<String>) {
         self.record(Entry {
             scope: Scope::Pass,
@@ -1823,7 +1826,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let mut fresh = self.snapshot.clone().flatten();
         if let Some(why) = self.budget_hold(1.0 + FOLLOW_MARGIN) {
-            self.line(format!("{why}; pull requests' fix rounds wait"));
+            self.line(format!("budget: {why}; pull requests' fix rounds wait"));
             // Every pool held, as the poll paces fix rounds by the snapshot:
             // a pool it lacks would be unpaced room.
             let held = json!({"hold": true, "reason": "budget", "next_dispatch_at": null});
@@ -1932,7 +1935,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(());
         }
         if let Some(why) = self.budget_hold(1.0) {
-            self.line(format!("{why}; new runs wait"));
+            // Held like a step past a cap, so the summary does not read idle.
+            self.caps.hold();
+            self.pass_held(HoldKind::Budget, format!("{why}; new runs wait"));
             return Ok(());
         }
         let board = self.board();
@@ -2246,15 +2251,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// Why runs wait on `budget` at `share` of it: the week's spend there or
-    /// past it, or no spend reading. None without a budget.
-    /// A grant holds each pool in its snapshot entry instead.
+    /// past it ([`BUDGET_REACHED`]), or no spend reading. None without a
+    /// budget. A grant holds each pool in its snapshot entry instead.
     fn budget_hold(&mut self, share: f64) -> Option<String> {
         let weekly = self.config.budget.as_ref()?.weekly_usd?;
         let snapshot = self.snapshot();
         match spent(snapshot.as_ref(), self.now) {
             Ok(spent) if spent < weekly * share => None,
-            Ok(spent) => Some(format!("budget: ${spent:.0} of ${weekly:.0} this week")),
-            Err(why) => Some(format!("budget: {why}")),
+            Ok(_) => Some(BUDGET_REACHED.into()),
+            Err(why) => Some(why),
         }
     }
 

@@ -111,6 +111,12 @@ impl Caps {
         })
     }
 
+    /// A step held by the weekly budget rather than a cap, counted in the
+    /// summary's `held` as one.
+    pub fn hold(&self) {
+        self.held.set(self.held.get() + 1);
+    }
+
     /// A step of `kind` that went ahead and wrote, or that a preview plans.
     pub fn count(&self, kind: Kind) {
         self.count_many(kind, 1);

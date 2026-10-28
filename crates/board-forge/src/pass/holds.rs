@@ -24,7 +24,8 @@ const QUESTION_PREFIX: &str = "Q:";
 /// operator are left out ([`fit`]).
 pub const MAX_COMMENT_CHARS: usize = 60_000;
 
-/// What keeps the pass off an item, or off every new run (`Wip`, `Pools`):
+/// What keeps the pass off an item, or off every new run (`Wip`, `Pools`,
+/// `Budget`):
 /// an entry's `kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -61,6 +62,8 @@ pub enum HoldKind {
     Wip,
     /// No pool has room.
     Pools,
+    /// The week's spend reached the budget, or has no reading.
+    Budget,
     Other,
 }
 
@@ -82,6 +85,7 @@ impl HoldKind {
             Self::Unreadable => "unreadable",
             Self::Wip => "wip",
             Self::Pools => "pools",
+            Self::Budget => "budget",
             Self::Other => "other",
         }
     }
@@ -126,7 +130,7 @@ impl Hold {
 /// What a hold keeps the pass off.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
-    /// Every new run: `hold wip|pools: …`.
+    /// Every new run: `hold wip|pools|budget: …`.
     Pass,
     /// A stage 4 candidate: `hold OWNER/REPO#N: …`.
     Item(ItemRef),
@@ -676,6 +680,7 @@ mod tests {
             HoldKind::Unreadable,
             HoldKind::Wip,
             HoldKind::Pools,
+            HoldKind::Budget,
             HoldKind::Other,
         ]
         .into_iter()

@@ -1306,8 +1306,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return;
             }
         };
-        if let Some(then) = self.budget_hold(1.0) {
-            self.epic_held(facts, due(HoldKind::Other, &then));
+        if let Some(why) = self.budget_hold(1.0) {
+            let then = format!("budget: {why}");
+            self.epic_held(facts, due(HoldKind::Budget, &then));
             return;
         }
         turn.planned = true;
