@@ -280,7 +280,7 @@ impl Request {
             .find(|(r, _)| *r == self.reason)
             .map_or("", |(_, text)| *text);
         let answer = if self.kind == "triage" {
-            "\nPost your conclusion and evidence in one comment on the issue, with exactly one schedule-triage fenced JSON block as described in the supervisor playbook:\n```schedule-triage\n{\"verdict\":\"done | partly | not-done | needs-design\"}\n```\nChoose one verdict; done means every part is complete."
+            "\nPost your conclusion and evidence in one comment on the issue, with exactly one schedule-triage fenced JSON block as described in the supervisor playbook:\n```schedule-triage\n{\"verdict\":\"done | obsolete | partly | not-done | needs-design\"}\n```\nChoose one verdict; done means every part is complete, obsolete that it is no longer wanted and should be closed as not planned."
         } else {
             ""
         };

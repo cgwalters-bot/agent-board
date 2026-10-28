@@ -491,7 +491,7 @@ fn dispatches_after_every_target_is_read_with_a_fixed_brief_and_logs_first() {
     let triage_task = writes[2].2["inputs"]["task"].as_str().unwrap();
     assert!(triage_task.contains("exactly one schedule-triage fenced JSON block"));
     assert!(triage_task.contains("```schedule-triage\n{\"verdict\":"));
-    assert!(triage_task.contains("done | partly | not-done | needs-design"));
+    assert!(triage_task.contains("done | obsolete | partly | not-done | needs-design"));
     assert_eq!(outcome.lines.len(), 2);
     assert!(
         outcome

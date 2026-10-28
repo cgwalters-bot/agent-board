@@ -113,8 +113,10 @@ your claims about usage. Dispatches also obey `maxDispatchesPerPass`.
 The reasons:
 
 The triage dispatch brief asks for a conclusion with evidence and exactly one
-`schedule-triage` fenced JSON block, choosing `done`, `partly`, `not-done` or
-`needs-design` as its `verdict`. Only `done` is close evidence; the named run
+`schedule-triage` fenced JSON block, choosing `done`, `obsolete`, `partly`,
+`not-done` or `needs-design` as its `verdict`. Only `done` is close evidence
+for a supervisor `close`; the board pass may close on `done` or `obsolete`
+itself (its `triageClose`). The named run
 binds the answer to this issue, without a scheduler question's `request` ID.
 
 - `no-plan`: the issue has no accepted job plan.
