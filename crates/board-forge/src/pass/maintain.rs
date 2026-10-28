@@ -786,12 +786,14 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);
+        let dispatcher = self.lease_dispatch(issue, pool);
         let attempt = Attempt {
-            client: &self.dispatcher,
+            client: &dispatcher,
             maybe_started: Cell::new(false),
         };
         let done = plan::dispatch_with(&self.client, &attempt, issue, &writers, &target, options);
-        let maybe_started = attempt.maybe_started.get();
+        let maybe_started =
+            attempt.maybe_started.get() && (!self.config.leases || dispatcher.sent.get());
         match done {
             Ok(plan::Dispatched {
                 record: Some(record),

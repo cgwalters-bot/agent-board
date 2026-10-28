@@ -330,6 +330,35 @@ fn runs(n: u64) -> Vec<Value> {
         .collect()
 }
 
+/// Leases on claude in the dispatch repository of runs `ids`, queued, and
+/// after them an expired one of run 7, with [`Config::leases`] on.
+fn leased(replay: &mut Replay, settings: &mut Value, ids: &[u64]) {
+    settings["leases"] = true.into();
+    let get = |path: String, body: Value| {
+        let url = format!("{API_ROOT}repos/cgwalters-forge/tracker/{path}");
+        json!({"request": {"get": url}, "answer": {"status": 200, "body": body}})
+    };
+    let mut refs = Vec::new();
+    for (slot, &id) in ids.iter().chain(&[7]).enumerate() {
+        let expires = match id {
+            7 => "2026-10-23T00:00:00Z",
+            _ => "2026-10-24T15:00:00Z",
+        };
+        let lease = json!({"run": id, "item": "o/r#1", "pool": "claude",
+            "taken_at": "2026-10-23T15:00:00Z", "expires_at": expires});
+        refs.push(json!({"ref": format!("refs/agent-board/leases/{slot}"),
+            "object": {"sha": format!("c{slot}")}}));
+        let message = json!({"message": lease.to_string()});
+        replay
+            .requests
+            .push(get(format!("git/commits/c{slot}"), message));
+        let run = json!({"id": id, "status": "queued"});
+        replay.requests.push(get(format!("actions/runs/{id}"), run));
+    }
+    let list = get("git/matching-refs/agent-board/leases/".into(), refs.into());
+    replay.requests.push(list);
+}
+
 /// The recording's stuck run's jobs on one page: each job's status and when
 /// it completed.
 fn jobs(replay: &mut Replay, jobs: &[(&str, Option<&str>)]) {
@@ -447,6 +476,19 @@ fn replay_scenarios() {
             "full WIP: eight runs with the two in progress",
             Box::new(|r, _| in_flight(r, runs(6))),
             vec!["hold wip: 8 of 8 runs active"],
+            0,
+            0,
+        ),
+        (
+            "full WIP: six leased runs, two of them listed, with the two in progress",
+            Box::new(|r, settings| {
+                in_flight(r, runs(2));
+                leased(r, settings, &[1, 2, 3, 4, 5, 6]);
+            }),
+            vec![
+                "lease: reap agent-board/leases/6: expired 2026-10-23T00:00:00Z; a preview does not free it",
+                "hold wip: 8 of 8 runs active",
+            ],
             0,
             0,
         ),
@@ -1580,6 +1622,112 @@ fn apply(forge: &Forge, config: &Config) -> Report {
         forge.replay.now,
     ))
     .unwrap()
+}
+
+/// Replay the pass against the atomic ref forge, with a foreign workflow
+/// taking a lease on a chosen listing. Its run is never in the caller list.
+struct LeasedForge {
+    pass: Forge,
+    leases: lease::tests::Forge,
+    reads: Cell<usize>,
+    appear_on: usize,
+    item: &'static str,
+}
+
+impl Rest for LeasedForge {
+    fn get(&self, url: &str, condition: Option<(&str, &str)>) -> Result<RestResponse> {
+        if url.contains("/git/")
+            || url.ends_with("/actions/runs/123")
+            || url == format!("{API_ROOT}repos/cgwalters-forge/tracker")
+        {
+            if url.contains("/matching-refs/") {
+                let n = self.reads.get() + 1;
+                self.reads.set(n);
+                if n == self.appear_on {
+                    self.leases.raw(
+                        "agent-board/leases/0",
+                        &json!({
+                            "run": 123, "item": self.item, "pool": "claude",
+                            "taken_at": "2026-10-23T15:00:00Z",
+                            "expires_at": "2026-10-24T15:00:00Z"
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+            return self.leases.get(url, condition);
+        }
+        self.pass.get(url, condition)
+    }
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        if url.contains("/git/") {
+            self.leases.send(method, url, body)
+        } else {
+            self.pass.send(method, url, body)
+        }
+    }
+}
+
+impl Transport for LeasedForge {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(&self.pass, query, variables)
+    }
+}
+
+impl crate::github::GraphQl for LeasedForge {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
+impl Broker for LeasedForge {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.pass.usage(url)
+    }
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.pass.grant(url)
+    }
+}
+
+#[test]
+fn foreign_leases_hold_capacity_and_normalized_candidate_items() {
+    for (appear_on, wip, item, expected) in [
+        (2, 1, "o/r#1", "1 of 1 runs active"),
+        (1, 3, "CGWALTERS-FORGE/TRACKER#446", "leased by run 123"),
+        (2, 3, "CGWALTERS-FORGE/TRACKER#446", "leased by run 123"),
+    ] {
+        let mut pass = Forge::new(None, false);
+        only(&mut pass.replay, &["cgwalters-forge/tracker#446"]);
+        for status in ACTIVE_RUNS {
+            let body = &mut answer(&mut pass.replay, &format!("status={status}"))["body"];
+            body["total_count"] = json!(0);
+            body["workflow_runs"] = json!([]);
+        }
+        let forge = LeasedForge {
+            pass,
+            leases: lease::tests::forge("cgwalters-bot", &[]),
+            reads: Cell::new(0),
+            appear_on,
+            item,
+        };
+        let config = config(json!({"leases": true, "wip": wip}));
+        let report = block(run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            (Mode::Actions(&own()), Limits::default()),
+            forge.pass.replay.now,
+        ))
+        .unwrap();
+        assert!(forge.pass.dispatches().is_empty(), "{:#?}", report.lines);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| l.contains(expected)),
+            "{:#?}",
+            report.lines
+        );
+    }
 }
 
 /// A grant used up on both pools holds the pass, and the same grant restored

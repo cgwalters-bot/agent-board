@@ -4,6 +4,7 @@
 //! made from that one value, so the two cannot drift. Nothing here reads
 //! the forge, a clock or a file.
 
+use super::lease::Held;
 use crate::supervise::health::json_block;
 use anyhow::{Context, Result};
 use board_core::ItemRef;
@@ -220,6 +221,9 @@ pub struct Snapshot {
     pub truncated: usize,
     pub wip: Wip,
     pub pass: PassSummary,
+    /// The live leases ([`super::Config::leases`]); absent where it is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leases: Option<Vec<Held>>,
     pub holds: Vec<Published>,
 }
 
@@ -264,6 +268,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, pass): (Wip, PassSummary)) 
         truncated: 0,
         wip,
         pass,
+        leases: None,
         holds: sorted.into_iter().map(Entry::published).collect(),
     }
 }
@@ -292,8 +297,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         true => String::new(),
         false => format!("\n{}", holds.join(",\n")),
     };
+    let leases = match &snapshot.leases {
+        Some(leases) => format!(",\"leases\":{}", serde_json::to_string(leases)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -342,6 +351,7 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
             truncated: dropped.len(),
             wip: snapshot.wip.clone(),
             pass: snapshot.pass.clone(),
+            leases: snapshot.leases.clone(),
             holds: kept,
         };
         let body = render(&fitted)?;
@@ -449,6 +459,36 @@ mod tests {
             let value = serde_json::to_value(snapshot(&[], String::new(), (wip, pass))).unwrap();
             assert_eq!(value["pass"].get("revisited"), expected.as_ref());
         }
+    }
+
+    /// `leases` is absent where they are off, and otherwise listed, each
+    /// with its slot; a change in them publishes.
+    #[test]
+    fn leases_in_the_snapshot() {
+        let at = "2026-10-26T00:00:00Z";
+        let off = snapshot(&entries(), at.into(), tally());
+        let body = render(&off).unwrap();
+        assert!(parse(&body).unwrap().get("leases").is_none(), "{body}");
+        let lease = super::super::lease::Lease {
+            run: 7,
+            item: "o/r#1".into(),
+            pool: "claude".into(),
+            taken_at: at.into(),
+            expires_at: "2026-10-27T00:00:00Z".into(),
+            overridden: false,
+        };
+        let mut on = snapshot(&entries(), at.into(), tally());
+        on.leases = Some(vec![Held { slot: 3, lease }]);
+        assert!(changed(Some(&body), &on).unwrap());
+        let body = render(&on).unwrap();
+        assert_eq!(
+            parse(&body).unwrap()["leases"],
+            json!([{"slot": 3, "run": 7, "item": "o/r#1", "pool": "claude",
+                "taken_at": at, "expires_at": "2026-10-27T00:00:00Z"}])
+        );
+        assert_eq!(parse(&body), Some(serde_json::to_value(&on).unwrap()));
+        let (fitted, _) = fit(on).unwrap();
+        assert_eq!(fitted.leases.unwrap().len(), 1);
     }
 
     /// The snapshot of `entries` with no clock, WIP count or summary.

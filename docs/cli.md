@@ -29,6 +29,8 @@ Commands:
 - [`reconcile`](#agent-board-reconcile): Preview deterministic board repairs; never apply them
 - [`poll`](#agent-board-poll): One pass of the pull request poll, previewed or applied; says when the next is due
 - [`pass`](#agent-board-pass): One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md)
+- [`admit`](#agent-board-admit): Take a lease on a free slot for a run before any inference, reaping an ended or expired lease to take its slot, or report the one the run holds already; refused, with the reason, when wip, pacing of its pool or the budget leave none (docs/pass.md#leases)
+- [`release`](#agent-board-release): Free a run's lease, as its last step
 - [`budget`](#agent-board-budget): What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree)
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
@@ -619,6 +621,36 @@ Options:
 - `--max-status-changes <N>`: Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through
 - `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage
 - `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture
+
+## agent-board admit
+
+Take a lease on a free slot for a run before any inference, reaping an ended or expired lease to take its slot, or report the one the run holds already; refused, with the reason, when wip, pacing of its pool or the budget leave none (docs/pass.md#leases)
+
+```text
+agent-board admit [OPTIONS] --config <FILE> --pool <POOL> --item <ITEM> --run <ID>
+```
+
+Options:
+
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: its dispatchRepo holds the leases, and its wip, pools, usage and budget size each pool
+- `--pool <POOL>`: The pool the run uses, one of the configuration's pools
+- `--item <ITEM>`: The item the run works on: URL or OWNER/REPO#N
+- `--run <ID>`: The run taking the lease, in dispatchRepo (GITHUB_RUN_ID); a lease is reaped once it ends
+- `--override`: Take a slot past wip and pacing; only for GH_TOKEN of the configuration's operator, and said on stdout and in the lease
+
+## agent-board release
+
+Free a run's lease, as its last step
+
+```text
+agent-board release [OPTIONS] --config <FILE> --pool <POOL> --run <ID>
+```
+
+Options:
+
+- `--config <FILE>`: The pass configuration, as for admit
+- `--pool <POOL>`: The pool the run took its lease of
+- `--run <ID>`: The run whose lease to free
 
 ## agent-board budget
 

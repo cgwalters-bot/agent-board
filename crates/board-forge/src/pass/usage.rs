@@ -499,7 +499,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
         let snapshot = match read {
             Ok((unasked, snapshot)) => {
+                let mut snapshot = snapshot;
                 if usage.probe {
+                    snapshot["probes"] = json!(unasked);
                     self.probes = unasked;
                 }
                 snapshot
@@ -655,7 +657,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let said = format!("holds: publish to {}#{}", at.repository, at.issue);
         let tally = self.report.tally.clone();
-        let fitted = holds::fit(holds::snapshot(&self.report.holds, stamp, tally));
+        let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
+        snapshot.leases = self.report.leases.clone();
+        let fitted = holds::fit(snapshot);
         let comment = fitted.and_then(|fitted| {
             let comment = self.bot_comment(on, holds::HOLDS_MARKER, "hold snapshot")?;
             Ok((fitted, comment))

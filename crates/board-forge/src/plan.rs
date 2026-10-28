@@ -751,6 +751,20 @@ pub struct Scheduled<'a> {
     pub ended: Option<&'a std::collections::BTreeSet<u64>>,
 }
 
+/// A dispatcher's refusal before it sent anything, as a lease admission
+/// that found no slot: [`dispatch_with`] releases the plan's records, so a
+/// later dispatch may take it.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// [`dispatch`] with its batch, bot, collaborator rule and [`Scheduled`] checks.
 pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     client: &C,
@@ -979,12 +993,30 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         Ok(run) => run,
         Err(error) => {
             let why: String = format!("{error:#}").chars().take(ERROR_LIMIT).collect();
+            let refused = error.is::<Refused>();
             let mut noted = Ok(());
             for record in &records {
-                noted = noted.and(edit(record, format!(
-                    "The plan in {} was not dispatched, or not knowingly ({why}). It is not tried again; edit or replace the plan to dispatch it.",
-                    record.plan_url
-                )));
+                noted = noted.and(match refused {
+                    // Without its marker the comment no longer holds the plan.
+                    true => send(
+                        client,
+                        "PATCH",
+                        &format!(
+                            "{API_ROOT}repos/{}/issues/comments/{}",
+                            record.issue.repository, record.id
+                        ),
+                        &json!({"body": format!(
+                            "The plan in {} was not dispatched ({why}). A later dispatch may take it.{note}",
+                            record.plan_url
+                        )}),
+                        0,
+                    )
+                    .map(drop),
+                    false => edit(record, format!(
+                        "The plan in {} was not dispatched, or not knowingly ({why}). It is not tried again; edit or replace the plan to dispatch it.",
+                        record.plan_url
+                    )),
+                });
             }
             return Err(match noted {
                 Ok(()) => error,
@@ -1771,6 +1803,9 @@ mod tests {
                     "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches"
                 )
             );
+            if self.twist == "refused" {
+                return Err(Refused("lease admission: no slot".into()).into());
+            }
             self.dispatches.borrow_mut().push(body.clone());
             Ok(self.answers.borrow_mut().remove(0))
         }
@@ -1835,6 +1870,9 @@ mod tests {
             ("final edit fails", vec![planned()], vec![run.clone()], "final edit fails", 1,
                 Err("dispatched https://github.com/cgwalters-forge/tracker/actions/runs/99, but https://github.com/cgwalters-forge/tracker/issues/540#issuecomment-101 still says it is starting"),
                 "Dispatching the plan in https://github.com/cgwalters-forge/tracker/issues/540#issuecomment-7.".into()),
+            // Refused before it was sent: the record is released, for a later pass.
+            ("refused", vec![planned()], vec![], "refused", 0, Err("lease admission: no slot"),
+                "(lease admission: no slot). A later dispatch may take it.".into()),
             ("no plan", vec![node(7, "visitor", "2026-10-13T10:00:00Z", &fenced)], vec![], "", 0,
                 Err("no plan on this issue"), fenced.clone()),
         ];
@@ -1847,7 +1885,10 @@ mod tests {
                 ..Forge::new(comments, vec![])
             };
             // The run is started with the dispatch token only.
-            let dispatcher = Forge::new(vec![], answers);
+            let dispatcher = Forge {
+                twist,
+                ..Forge::new(vec![], answers)
+            };
             let result = dispatch(
                 &forge,
                 &dispatcher,
@@ -1899,7 +1940,11 @@ mod tests {
                     None,
                 );
                 let again = format!("{:#}", again.unwrap_err());
-                assert!(again.contains("record already"), "{name}: {again}");
+                let held = match twist {
+                    "refused" => "lease admission: no slot",
+                    _ => "record already",
+                };
+                assert!(again.contains(held), "{name}: {again}");
                 assert_eq!(dispatcher.dispatches.borrow().len(), sent, "{name}");
             }
         }

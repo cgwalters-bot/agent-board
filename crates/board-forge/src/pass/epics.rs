@@ -647,17 +647,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         live.sort_by_key(|e| (index(e.priority.as_deref()), e.issue.number));
         let target = self.config.target(git_ref);
-        let slots = match self.runs(&target) {
-            Ok((runs, busy)) => Some((
-                runs,
-                Slots {
-                    wip: self.config.wip as usize,
-                    earlier,
-                    mine: Vec::new(),
-                    busy,
-                    probes: BTreeMap::new(),
-                },
-            )),
+        let listed = self.runs(&target);
+        let slots = match listed.and_then(|listed| Ok((listed, self.leased()?))) {
+            Ok(((runs, mut busy), leased)) => {
+                lease::busy(&leased, &mut busy)?;
+                Some((
+                    runs,
+                    Slots {
+                        wip: self.config.wip as usize,
+                        earlier,
+                        mine: Vec::new(),
+                        busy,
+                        probes: BTreeMap::new(),
+                        leased,
+                    },
+                ))
+            }
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!(
