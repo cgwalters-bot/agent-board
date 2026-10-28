@@ -534,7 +534,7 @@ read, holds the start, as any unreadable overlap check does.
 With no accepted plan, start one triage run if enabled and a slot/pool is
 available, for an issue in the triage scope (below). It proposes an
 implement plan, or explains a needs-design/human hold; it does not close
-the issue on a `done` verdict. Record the question using the
+the issue itself. Record the question using the
 existing dispatch claim protocol, not another scheduler marker. A completed run
 without a usable plan remains visible for a person; do not automatically retry,
 unless `triageFollowUpDays` is set. Then the triage brief asks for a
@@ -542,16 +542,40 @@ unless `triageFollowUpDays` is set. Then the triage brief asks for a
 reads the newest one the bot posted after the dispatch record, unedited but by
 a writer; a visitor's comment is never a verdict. A comment by the operator
 after it (or after the record, with no verdict) triages the issue again.
-Otherwise `done`, `needs-design` and `needs-operator` label it `needs-human`,
-so it shows as the operator's ask, and post one comment whose hidden first
-line, `<!-- agent-board-hold: verdict COMMENT-ID -->`, names the verdict
-comment it holds, then a sentence saying so: one step of two writes under
-`--max-writes`, neither made in a preview. The label then keeps the issue out
-of the follow-up; taken off with no operator comment, the same verdict labels
-it and posts the comment again. The pass never closes an
-issue on a verdict, since no review follows a close; the supervisor's `close`
-may, and takes the label as the pass's hold of a `done` verdict only with that
-comment. Before opening a question, `ask create --apply` comments on the
+Otherwise `done`, `obsolete`, `needs-design` and `needs-operator` label it
+`needs-human`, so it shows as the operator's ask, and post one comment
+whose hidden first line, `<!-- agent-board-hold: verdict COMMENT-ID -->`,
+names the verdict comment it holds, then a sentence saying so: one step of
+two writes under `--max-writes`, neither made in a preview. The label then
+keeps the issue out of the follow-up; taken off with no operator comment,
+the same verdict labels it and posts the comment again.
+
+With `triageClose` (agent-board#428), `done` instead closes the issue as
+completed and `obsolete` as not planned, and the pass posts one line
+linking the verdict, so the operator can reopen it: the line, then the
+close, again one step of two writes under `--max-writes`, and no label.
+No review follows a close, so, as the supervisor's `close` does
+(agent-board#111), it closes only an issue locked from before its triage
+plan was posted until now, so that no visitor could add or delete text the
+triage read, and whose body and every comment were written, and edited if
+at all, by the operator or the bot, none of them a supervisor agent's note
+(one more read, for the body and lock events). An unlocked issue, or one
+locked only later, is never closed this
+way, nor is one on an earlier verdict (below), whose run start the pass does
+not know. Neither is one whose body or title was edited after the verdict,
+nor one with any comment posted or edited after it, an earlier comment the
+operator edited, a later word or an `ask create` hold alike, but for the
+triage's own dispatch record and its run's agentic-job status comment: the
+verdict was about the issue as triage read it. The newest lock, unlock,
+title edit and reopen are each read on their own, so that no number of other
+events hides one. It also closes once:
+reopened after the verdict, whoever closed it, or left open by a failed
+close, which leaves the pass's line for that verdict, the verdict then labels
+it as above, as does one any of these checks refuses, the line saying why. Without
+`triageClose` the pass never closes an issue on a verdict; the
+supervisor's `close` may, and takes the label as the pass's hold of a
+`done` verdict only with that comment. Before opening a question,
+`ask create --apply` comments on the
 blocked item to invalidate any earlier verdict, even if its additive labeling
 leaves the pass's existing label and event unchanged
 ([supervisor requests](supervisor-requests.md)). Any other verdict had
@@ -564,6 +588,20 @@ failed, the issue is triaged again `triageFollowUpDays` after the record,
 changed or not, as is one whose triage plan predates this and carries no
 fingerprint.
 
+An issue triaged before the pass's own triage, as by a supervisor's
+dispatch, can already carry a verdict. With `triageFollowUpDays`, before a
+first triage the pass reads the newest verdict the bot posted on the issue,
+unedited but by a writer, and takes it as the triage's when nothing happened
+after it: no comment posted or edited since but agentic-job's status
+comments, the bot's own other comments included (an `ask create` hold is
+one), and no edit of the issue's body or title (one more read, made only
+when such a verdict exists). It is then
+acted on as above, but labels rather than closes the issue. Any other verdict holds
+it (`earlier triage verdict …; nothing changed since`) until
+`triageFollowUpDays` after the verdict, as a follow-up holds an issue whose
+plan carries no fingerprint, or until someone comments or edits a comment, the body or the title;
+then the first triage starts.
+
 Work starts from the epics (agent-board#431). Under the triage scope
 `epics`, triage, its follow-ups above, re-planning below, a triage's rerun
 and [revisits](#revisits) are only for the children of live epics. An
@@ -571,7 +609,8 @@ issue outside every live epic, an unparented one the operator or the bot
 opened, still runs an accepted plan (its own plan comment, or with
 `bodyPlans` its body's), but is otherwise held as `outside-epics`
 (`outside every live epic, so not triaged (triage scope epics)`), not the
-operator's; an ended triage's verdict for the operator still labels it.
+operator's; an ended triage's verdict is still acted on: it labels the
+issue, or with `triageClose` may close it.
 The `candidates:` line then counts these issues too (`, N unparented: run
 only with a plan`). The scope `all`, or `triage: true` as before scopes,
 triages every candidate.
@@ -708,9 +747,9 @@ implement plan for what is left; or, for a held issue, restate its question
 with today's facts, or say how the evidence answers it. Its outputs go
 through agentic-job's check and apply like any triage run's, so a close
 happens only where the caller's bounds for its triage runs allow one; the
-pass itself still closes nothing. With `triageFollowUpDays` the brief also
-asks for a verdict, and the revisit's plan is then followed up as any triage
-plan is.
+pass itself closes nothing for it but on a verdict with `triageClose`. With
+`triageFollowUpDays` the brief also asks for a verdict, and the revisit's
+plan is then followed up as any triage plan is.
 
 ## Reruns
 
@@ -1292,6 +1331,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
+| `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |

@@ -88,9 +88,11 @@ const CHECKPOINT_MARKER: &str = "coordinator/v1";
 /// The usage snapshot comment (`pass`'s stage 1, or tracker's usage.yml) and its JSON's schema.
 pub(crate) const USAGE_MARKER: &str = "<!-- bot-usage v1 -->";
 pub(crate) const USAGE_SCHEMA: &str = "bot-usage/v1";
+/// The last line of agentic-job's status comment on a run's target.
+pub(crate) const STATUS_MARKER: &str = "<!-- agentic-job-status -->";
 /// agentic-job's status comment on a run's target ends with this.
-fn status_end(run: u64) -> String {
-    format!("\n\n<!-- agentic-job-run: {run} -->\n\n<!-- agentic-job-status -->")
+pub(crate) fn status_end(run: u64) -> String {
+    format!("\n\n<!-- agentic-job-run: {run} -->\n\n{STATUS_MARKER}")
 }
 const STATUS_REASON: &str = " Its reason:";
 /// agentic-job's policy step refusing a request outside the caller's bounds,

@@ -133,9 +133,16 @@ const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 const STALE_DRAFT_HOURS: u64 = 4;
 const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
 /// Triage verdicts that ask the operator, which label the issue
-/// [`NEEDS_HUMAN`]: `done` for a close, which the pass does not make since no
-/// review follows it, and the others for a decision.
-const ASK_VERDICTS: &[&str] = &["done", "needs-design", "needs-operator"];
+/// [`NEEDS_HUMAN`]: `done` and `obsolete` for a close, which the pass makes
+/// only with [`Config::triage_close`] ([`CLOSE_VERDICTS`]), and the others
+/// for a decision.
+const ASK_VERDICTS: &[&str] = &["done", "obsolete", "needs-design", "needs-operator"];
+/// With [`Config::triage_close`], the triage verdicts that close the issue,
+/// each with the `state_reason` it closes with (agent-board#428).
+const CLOSE_VERDICTS: &[(&str, &str)] = &[("done", "completed"), ("obsolete", "not_planned")];
+/// What the bot's line for a close on a verdict says first, which
+/// [`Scheduler::close_refused`] reads back so that it closes only once.
+const CLOSED: &str = "The board pass closed this issue as";
 /// Why [`TriageScope::Epics`] starts no triage run on an issue outside
 /// every live epic.
 const OUTSIDE_EPICS: &str = "outside every live epic, so not triaged (triage scope epics)";
@@ -249,6 +256,59 @@ const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!
 }
 "#;
 
+/// [`BODY_QUERY`]'s fields, whether the issue is locked, and the events
+/// [`Scheduler::close_refused`] weighs: the newest lock, unlock, title edit
+/// and reopen, each read on its own, so that no number of other events can
+/// push one out of what is read.
+const CLOSE_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { issue(number: $number) {
+    url title body createdAt lastEditedAt author { login } editor { login } locked
+    locks: timelineItems(itemTypes: [LOCKED_EVENT], last: 1) { nodes { ... on LockedEvent { createdAt } } }
+    unlocks: timelineItems(itemTypes: [UNLOCKED_EVENT], last: 1) { nodes { ... on UnlockedEvent { createdAt } } }
+    renames: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], last: 1) { nodes { ... on RenamedTitleEvent { createdAt } } }
+    reopens: timelineItems(itemTypes: [REOPENED_EVENT], last: 1) { nodes { ... on ReopenedEvent { createdAt } } }
+  } }
+}
+"#;
+
+/// The triage plan a verdict answers, and its dispatch record.
+type Triage<'c> = (&'c plan::Comment, &'c plan::Comment);
+
+/// The newest of each kind of event [`CLOSE_QUERY`] reads of an issue.
+#[derive(Default)]
+struct IssueEvents {
+    locked: Option<OffsetDateTime>,
+    unlocked: Option<OffsetDateTime>,
+    renamed: Option<OffsetDateTime>,
+    reopened: Option<OffsetDateTime>,
+}
+
+impl IssueEvents {
+    /// The events of `node`, `issue` as [`CLOSE_QUERY`] read it.
+    fn read(issue: &ItemRef, node: &Value) -> Result<Self> {
+        let newest = |alias: &str| -> Result<Option<OffsetDateTime>> {
+            let events = (node.get(alias))
+                .and_then(|e| e["nodes"].as_array())
+                .with_context(|| format!("{} has no {alias} events", issue.display()))?;
+            let mut newest = None;
+            for event in events {
+                let at = event["createdAt"]
+                    .as_str()
+                    .context("event has no createdAt")?;
+                let at = OffsetDateTime::parse(at, &Rfc3339).context("event time")?;
+                newest = newest.max(Some(at));
+            }
+            Ok(newest)
+        };
+        Ok(Self {
+            locked: newest("locks")?,
+            unlocked: newest("unlocks")?,
+            renamed: newest("renames")?,
+            reopened: newest("reopens")?,
+        })
+    }
+}
+
 /// An issue's body plan ([`Scheduler::body_plan`]): the plan, its JSON block
 /// and the body it was read from.
 type BodyPlan = (plan::JobPlan, Value, plan::Comment);
@@ -300,6 +360,10 @@ pub struct Config {
     /// epic's planning backs off.
     #[serde(default)]
     pub triage_follow_up_days: u64,
+    /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
+    /// issue rather than asking the operator; needs `triageFollowUpDays`.
+    #[serde(default)]
+    pub triage_close: bool,
     /// Off at 0: else an issue still open after its implement plan's run
     /// ended is triaged again this many days after the plan's dispatch
     /// record ([`Scheduler::replan`]).
@@ -712,6 +776,10 @@ impl Config {
         ensure!(
             self.triage_follow_up_days == 0 || self.triage.is_some(),
             "triageFollowUpDays needs triage"
+        );
+        ensure!(
+            !self.triage_close || self.triage_follow_up_days > 0,
+            "triageClose needs triageFollowUpDays"
         );
         ensure!(
             self.replan_after_days <= FOLLOW_UP_DAYS_LIMIT,
@@ -2944,6 +3012,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let (plan, id, body, failed) = if plan::no_plan(&comments, &writers) {
             match self.body_plan(&facts, board)? {
                 None => {
+                    if let Some(step) = self.earlier_verdict(&facts, &comments)? {
+                        return Ok(step);
+                    }
                     let intro = "The board pass asks a triage run to plan this issue.";
                     return self.triage(read, intro, (snapshot, target, slots));
                 }
@@ -3424,18 +3495,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         format!(
             " If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
              {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
-             needs-design, needs-operator, partly or not-done."
+             obsolete (no longer wanted: close as not planned), needs-design, needs-operator, \
+             partly or not-done."
         )
     }
 
     /// A triage plan dispatched already, whose run has ended (one in flight
     /// holds the issue before this), followed up by the newest verdict the
-    /// bot posted after its record ([`plan::triage_verdict`]): only the
-    /// bot's, unedited by anyone but a writer, so that a visitor's comment
-    /// cannot label or triage the issue. A comment by the operator after it
-    /// triages the issue again: the issue changed. Else a verdict of
-    /// [`ASK_VERDICTS`] labels the issue [`NEEDS_HUMAN`], which holds it until
-    /// a person removes the label. Any other verdict had nothing to do: the
+    /// bot posted after its record ([`Self::newest_verdict`]), so that a
+    /// visitor's comment cannot close, label or triage the issue. A comment
+    /// by the operator after it triages the issue again: the issue changed.
+    /// Else [`Self::act_on_verdict`] closes the issue, or labels it
+    /// [`NEEDS_HUMAN`], which holds it until a person removes the label.
+    /// Any other verdict had nothing to do: the
     /// issue is triaged again once its [`fingerprint`] differs from the one
     /// its plan `from` carries, a day after the verdict, doubled for each
     /// follow-up in a row before it, up to
@@ -3451,16 +3523,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let config = self.config;
         let (facts, comments) = read;
         let writers = self.writers();
-        let bot = [config.bot.as_str()];
-        let unedited = |c: &plan::Comment| {
-            (!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers)
-        };
         let after = comments.iter().position(|c| c.url == record.url);
         let later = &comments[after.map_or(comments.len(), |n| n + 1)..];
-        let verdict = later.iter().enumerate().rev().find_map(|(n, c)| {
-            let trusted = is(c.author.as_deref(), &bot) && unedited(c);
-            Some((n, c, plan::triage_verdict(&c.body).filter(|_| trusted)?))
-        });
+        let verdict = self.newest_verdict(later);
         let (since, rest, said) = match &verdict {
             Some((n, c, verdict)) => (
                 *c,
@@ -3477,49 +3542,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if rest.iter().any(|c| is(c.author.as_deref(), &operator)) {
             return self.triage(read, AGAIN, (snapshot, target, slots));
         }
-        let issue = &facts.issue;
         if let Some((_, c, verdict)) = &verdict
-            && ASK_VERDICTS.contains(&verdict.as_str())
+            && let Some(step) = self.act_on_verdict(
+                &facts.issue,
+                (c, comments, Some((from, record))),
+                verdict,
+                &said,
+            )?
         {
-            // The label and the comment naming the verdict it holds.
-            if let Some(held) = self.caps.check_many(Kind::Write, 2) {
-                let why = format!("{said}; {held}: label {NEEDS_HUMAN}");
-                return Ok(Step::Hold(Hold::new(HoldKind::NeedsHuman, why)));
-            }
-            let id = plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?;
-            // Counted once sent, whether or not its answer comes back.
-            self.caps.count_many(Kind::Write, 2);
-            if self.apply {
-                let issue_url = format!(
-                    "{API_ROOT}repos/{}/issues/{}",
-                    issue.repository, issue.number
-                );
-                plan::send(
-                    &self.client,
-                    "POST",
-                    &format!("{issue_url}/labels"),
-                    &json!({"labels": [NEEDS_HUMAN]}),
-                    0,
-                )?;
-                // After the label: should this fail, the hold has no marker
-                // and waits for the operator, rather than a second marker
-                // being posted by the next pass.
-                let body = format!(
-                    "{}\nThe board pass held [this triage verdict]({}) for the operator with the label {NEEDS_HUMAN}.\n\n{}",
-                    hold_marker(id),
-                    c.url,
-                    crate::Footer::default()
-                );
-                plan::send(
-                    &self.client,
-                    "POST",
-                    &format!("{issue_url}/comments"),
-                    &json!({"body": body}),
-                    0,
-                )?;
-            }
-            let why = format!("{said}; label {NEEDS_HUMAN}");
-            return Ok(Step::Hold(Hold::new(HoldKind::NeedsHuman, why)));
+            return Ok(step);
         }
         // Not triaged again, so neither its wait nor its inputs matter.
         if let Some(held) = self.outside_epics(facts) {
@@ -3577,6 +3608,250 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn outside_epics(&self, facts: &Facts) -> Option<Hold> {
         (self.config.triage == Some(TriageScope::Epics) && facts.parent.is_none())
             .then(|| Hold::new(HoldKind::OutsideEpics, OUTSIDE_EPICS))
+    }
+
+    /// The newest triage verdict of `comments` ([`plan::triage_verdict`]),
+    /// with its index and comment: only the bot's, unedited by anyone but a
+    /// writer, so that a visitor's comment is never one.
+    fn newest_verdict<'c>(
+        &self,
+        comments: &'c [plan::Comment],
+    ) -> Option<(usize, &'c plan::Comment, String)> {
+        let writers = self.writers();
+        let bot = [self.config.bot.as_str()];
+        let unedited = |c: &plan::Comment| {
+            (!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers)
+        };
+        comments.iter().enumerate().rev().find_map(|(n, c)| {
+            let trusted = is(c.author.as_deref(), &bot) && unedited(c);
+            Some((n, c, plan::triage_verdict(&c.body).filter(|_| trusted)?))
+        })
+    }
+
+    /// What `verdict`, in the bot's comment `c` among the issue's
+    /// `comments`, does by itself, `said` beginning its line: with
+    /// [`Config::triage_close`] one of [`CLOSE_VERDICTS`] posts a line
+    /// linking `c`, so the operator can reopen it, and closes the issue,
+    /// unless [`Self::close_refused`] given the triage plan `triage` the
+    /// verdict answers; else one of [`ASK_VERDICTS`] labels it
+    /// [`NEEDS_HUMAN`] and posts the [`hold_marker`] comment. Each is one
+    /// step of two writes under `--max-writes`, neither made in a preview.
+    /// `None` for any other verdict, which had nothing to do.
+    fn act_on_verdict(
+        &self,
+        issue: &ItemRef,
+        (c, comments, triage): (&plan::Comment, &[plan::Comment], Option<Triage<'_>>),
+        verdict: &str,
+        said: &str,
+    ) -> Result<Option<Step>> {
+        let mut close = (CLOSE_VERDICTS.iter())
+            .find(|(v, _)| *v == verdict)
+            .filter(|_| self.config.triage_close);
+        let mut label = format!("label {NEEDS_HUMAN}");
+        if close.is_some()
+            && let Some(why) = self.close_refused(issue, (c, comments), triage)?
+        {
+            close = None;
+            label = format!("{label}, not closed: {why}");
+        }
+        let (kind, act) = match close {
+            Some((_, reason)) => (HoldKind::Closed, format!("close as {reason}")),
+            None if ASK_VERDICTS.contains(&verdict) => (HoldKind::NeedsHuman, label),
+            None => return Ok(None),
+        };
+        if let Some(held) = self.caps.check_many(Kind::Write, 2) {
+            let why = format!("{said}; {held}: {act}");
+            let kind = match close {
+                Some(_) => HoldKind::Other,
+                None => HoldKind::NeedsHuman,
+            };
+            return Ok(Some(Step::Hold(Hold::new(kind, why))));
+        }
+        let id = plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?;
+        // Counted once sent, whether or not its answer comes back.
+        self.caps.count_many(Kind::Write, 2);
+        if self.apply {
+            let issue_url = format!(
+                "{API_ROOT}repos/{}/issues/{}",
+                issue.repository, issue.number
+            );
+            let post = |body: String| {
+                let body = format!("{body}\n\n{}", crate::Footer::default());
+                let url = format!("{issue_url}/comments");
+                plan::send(&self.client, "POST", &url, &json!({"body": body}), 0)
+            };
+            match close {
+                // The line first, which is what tells a reopen apart: should
+                // the close fail, the next pass asks the operator rather
+                // than closing, and a close never lands without it.
+                Some((_, reason)) => {
+                    post(format!(
+                        "{CLOSED} {} on [this triage verdict]({}); reopen it if that is wrong.",
+                        reason.replace('_', " "),
+                        c.url
+                    ))?;
+                    let state = json!({"state": "closed", "state_reason": reason});
+                    plan::send(&self.client, "PATCH", &issue_url, &state, 0)?;
+                }
+                None => {
+                    plan::send(
+                        &self.client,
+                        "POST",
+                        &format!("{issue_url}/labels"),
+                        &json!({"labels": [NEEDS_HUMAN]}),
+                        0,
+                    )?;
+                    // After the label: should this fail, the hold has no
+                    // marker and waits for the operator, rather than a
+                    // second marker being posted by the next pass.
+                    post(format!(
+                        "{}\nThe board pass held [this triage verdict]({}) for the operator with the label {NEEDS_HUMAN}.",
+                        hold_marker(id),
+                        c.url
+                    ))?;
+                }
+            }
+        }
+        Ok(Some(Step::Hold(Hold::new(kind, format!("{said}; {act}")))))
+    }
+
+    /// Why the verdict comment `c` among `comments` may not close `issue`,
+    /// which is then asked of the operator instead. It closes once: the
+    /// bot's line for a close on `c` means it was reopened since, or its
+    /// close failed, and any reopen since `c` was the operator's call. The
+    /// verdict is about the issue as triage read it, so neither its body
+    /// nor its title may have changed since, nor any comment been posted or
+    /// edited since but the triage's own dispatch record and its run's
+    /// status comment. And no review follows a close,
+    /// so as with the supervisor's `close` (agent-board#111) only writers'
+    /// text may have steered its triage: the issue locked from before its
+    /// triage plan of `triage` was posted, unedited, to now, so that no one
+    /// else could add or delete any, no supervisor note in it, and its body
+    /// and every comment written, and edited if at all, by a writer.
+    /// Without `triage`, as for an earlier verdict, no lock is known to have
+    /// covered the run.
+    fn close_refused(
+        &self,
+        issue: &ItemRef,
+        (c, comments): (&plan::Comment, &[plan::Comment]),
+        triage: Option<Triage<'_>>,
+    ) -> Result<Option<&'static str>> {
+        let link = format!("[this triage verdict]({})", c.url);
+        let bot = [self.config.bot.as_str()];
+        let closed = |c: &plan::Comment| {
+            is(c.author.as_deref(), &bot) && c.body.starts_with(CLOSED) && c.body.contains(&link)
+        };
+        if comments.iter().any(closed) {
+            return Ok(Some(
+                "it was reopened, or not closed, after the pass's line for this verdict",
+            ));
+        }
+        let Some((plan, record)) = triage.filter(|(t, _)| !t.edited) else {
+            return Ok(Some("no lock is known to have covered its triage"));
+        };
+        let start = plan.changed;
+        // The verdict answers the issue as its triage read it: a comment
+        // posted or edited since, an ask's hold or a person's word alike,
+        // is news it did not weigh. Only the triage's own comments may be
+        // newer: its dispatch record, and its run's status comment, which
+        // agentic-job updates as the run ends.
+        let run = epics::record_run(&record.body);
+        let own = |x: &plan::Comment| {
+            x.url == record.url
+                || run.is_some_and(|run| {
+                    is(x.author.as_deref(), &bot)
+                        && x.body.ends_with(&crate::supervise::health::status_end(run))
+                })
+        };
+        if (comments.iter()).any(|x| x.url != c.url && x.changed > c.changed && !own(x)) {
+            return Ok(Some("a comment was posted or edited after this verdict"));
+        }
+        let node = self.issue_read(issue, CLOSE_QUERY)?;
+        let body = plan::comment(&node)?;
+        let events = IssueEvents::read(issue, &node)?;
+        // Whoever closed it before, a reopen is the operator's decision.
+        if events.reopened > Some(c.changed) {
+            return Ok(Some("it was reopened after this verdict"));
+        }
+        if body.changed > c.changed || events.renamed > Some(c.changed) {
+            return Ok(Some("the issue was edited after this verdict"));
+        }
+        let held = events
+            .locked
+            .is_some_and(|t| t < start && events.unlocked < Some(t));
+        if node["locked"] != true || !held {
+            return Ok(Some("it was not locked throughout its triage"));
+        }
+        // The bot posts the supervisor agent's notes, but the agent chose
+        // their words, as the supervisor's own `close` refuses.
+        if std::iter::once(&body)
+            .chain(comments)
+            .any(|c| crate::input::is_supervisor_note(&c.body))
+        {
+            return Ok(Some("its body or a comment is the supervisor agent's text"));
+        }
+        let writers = self.writers();
+        let written = |c: &plan::Comment| {
+            is(c.author.as_deref(), &writers)
+                && ((!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers))
+        };
+        if !written(&body) || !comments.iter().all(written) {
+            return Ok(Some("its body or a comment is not only a writer's"));
+        }
+        Ok(None)
+    }
+
+    /// An issue with no plan and no triage of the pass's own, whose newest
+    /// verdict ([`Self::newest_verdict`]) is one the bot posted with nothing
+    /// after it: no comment posted or edited since but agentic-job's status
+    /// comments, and no edit of the issue's body or title.
+    /// That verdict is acted on ([`Self::act_on_verdict`]) as a
+    /// follow-up's would be, or else holds the issue for
+    /// [`Config::triage_follow_up_days`] after it, as a follow-up holds one
+    /// whose plan carries no fingerprint, rather than a first triage
+    /// settling it again (agent-board#428). `None` without one, or with
+    /// `triageFollowUpDays` off.
+    fn earlier_verdict(&self, facts: &Facts, comments: &[plan::Comment]) -> Result<Option<Step>> {
+        let days = self.config.triage_follow_up_days;
+        if days == 0 {
+            return Ok(None);
+        }
+        let Some((n, c, verdict)) = self.newest_verdict(comments) else {
+            return Ok(None);
+        };
+        // Nothing posted or edited since but agentic-job's status comments,
+        // which it updates as a run ends: a person's word, an ask's hold or
+        // an edit of the discussion is news the verdict did not weigh.
+        let bot = [self.config.bot.as_str()];
+        let status = |x: &plan::Comment| {
+            is(x.author.as_deref(), &bot)
+                && x.body.ends_with(crate::supervise::health::STATUS_MARKER)
+        };
+        let newer = |x: &plan::Comment| x.url != c.url && x.changed > c.changed;
+        if comments[n + 1..].iter().any(|x| !status(x))
+            || comments.iter().any(|x| newer(x) && !status(x))
+        {
+            return Ok(None);
+        }
+        let node = self.issue_read(&facts.issue, CLOSE_QUERY)?;
+        let body = plan::comment(&node)?;
+        let renamed = IssueEvents::read(&facts.issue, &node)?.renamed;
+        if body.changed > c.changed || renamed > Some(c.changed) {
+            return Ok(None);
+        }
+        let said = format!("earlier triage verdict {verdict}, {}", c.url);
+        let read = (c, comments, None);
+        if let Some(step) = self.act_on_verdict(&facts.issue, read, &verdict, &said)? {
+            return Ok(Some(step));
+        }
+        let due = c.changed + time::Duration::days(days as i64);
+        if self.now >= due {
+            return Ok(None);
+        }
+        let due = due.format(&Rfc3339).unwrap_or_default();
+        let why =
+            format!("{said}; nothing changed since, triaged from {due}, or once anyone comments");
+        Ok(Some(Step::Hold(Hold::new(HoldKind::TriageCooldown, why))))
     }
 
     /// [`fingerprint`] of an issue as `facts` and `comments` read it, with
@@ -3828,9 +4103,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// `issue`'s title and own text, as [`BODY_QUERY`] reads them.
     fn issue_node(&self, issue: &ItemRef) -> Result<Value> {
+        self.issue_read(issue, BODY_QUERY)
+    }
+
+    /// `issue` as `query`, [`BODY_QUERY`] or [`CLOSE_QUERY`], reads it.
+    fn issue_read(&self, issue: &ItemRef, query: &str) -> Result<Value> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
         let mut data = self.client.graphql(
-            BODY_QUERY,
+            query,
             json!({"owner": owner, "name": name, "number": issue.number}),
         )?;
         data.pointer_mut("/repository/issue")

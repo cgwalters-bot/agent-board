@@ -1659,6 +1659,13 @@ impl Forge {
                 json!({"id": id, "html_url": html_url, "created_at": created}),
             ));
         }
+        // An issue's state, which no read here answers from.
+        if method == "PATCH"
+            && path.split('/').nth(3) == Some("issues")
+            && path.split('/').count() == 5
+        {
+            return Ok((200, json!({})));
+        }
         if method == "PATCH" {
             let edited: u64 = path.rsplit('/').next().unwrap_or_default().parse()?;
             let at =
@@ -1757,6 +1764,10 @@ impl Transport for Forge {
                     "url": format!("https://github.com/cgwalters-forge/{repo}/issues/{number}"),
                     "title": "Work", "body": "Work.", "createdAt": "2026-10-01T00:00:00Z", "lastEditedAt": null,
                     "author": {"login": "cgwalters"}, "editor": null}}})
+            }
+            // And locked since then.
+            Err(_) if query == CLOSE_QUERY => {
+                close_read(&variables, Some("2026-10-01T00:00:00Z".into()), None)
             }
             data => data?,
         };
@@ -2523,13 +2534,14 @@ fn apply_puts_the_operator_direction_in_front_of_its_briefs() {
 }
 
 /// A triage run's answer on tracker#446, `days` from the pass's clock, by
-/// `author` and edited by `editor`, for [`Forge`] to read after its record.
+/// `author` and edited by `editor`, for [`Forge`] to read after its record:
+/// as [`Forge`] dates the comments it posts, seconds later for each, so
+/// that one posted after another is newer.
 fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, days: i64) {
     let id = forge.ids.get() + 1;
     forge.ids.set(id);
-    let created = (forge.replay.now + time::Duration::days(days))
-        .format(&Rfc3339)
-        .unwrap();
+    let offset = time::Duration::days(days) + time::Duration::seconds((id % 1000) as i64);
+    let created = (forge.replay.now + offset).format(&Rfc3339).unwrap();
     let edited = editor.map(|_| created.clone());
     let key = ("cgwalters-forge/tracker".to_owned(), 446);
     forge.added.borrow_mut().entry(key).or_default().push(json!({
@@ -2539,24 +2551,54 @@ fn answered(forge: &Forge, (author, editor): (&str, Option<&str>), body: &str, d
     }));
 }
 
+/// The operator's issue as [`CLOSE_QUERY`] reads it, `locked` at that time
+/// or not, and its body `edited` at that time or not.
+fn close_read(variables: &Value, locked: Option<String>, edited: Option<String>) -> Value {
+    let (repo, number) = (text(variables, "/name"), &variables["number"]);
+    let locks: Vec<Value> = (locked.iter()).map(|at| json!({"createdAt": at})).collect();
+    json!({"repository": {"issue": {
+        "url": format!("https://github.com/cgwalters-forge/{repo}/issues/{number}"),
+        "title": "Work", "body": "Work.", "createdAt": "2026-10-01T00:00:00Z",
+        "lastEditedAt": edited, "author": {"login": "cgwalters"},
+        "editor": edited.as_ref().map(|_| json!({"login": "cgwalters"})),
+        "locked": locked.is_some(), "locks": {"nodes": locks}, "unlocks": {"nodes": []},
+        "renames": {"nodes": []}, "reopens": {"nodes": []}}}})
+}
+
+/// Makes an event of `kind` at `at` the newest of its kind in `data`, a
+/// [`close_read`], which reads the newest of each kind alone.
+fn add_event(data: &mut Value, kind: &str, at: &str) {
+    let alias = match kind {
+        "LockedEvent" => "locks",
+        "UnlockedEvent" => "unlocks",
+        "RenamedTitleEvent" => "renames",
+        "ReopenedEvent" => "reopens",
+        _ => panic!("no {kind} events are read"),
+    };
+    let events = data.pointer_mut(&format!("/repository/issue/{alias}/nodes"));
+    *events.unwrap() = json!([{"createdAt": at}]);
+}
+
 /// With `triageFollowUpDays`, a triage that ended without a plan is acted on
 /// by its verdict, read only from the bot's answer after the run's record:
 /// one for the operator labels the issue, any other waits a day and then
 /// triages it again only if something but the bot's comments changed, and
-/// the operator's comment triages it again at once. Each case: its answers
-/// (author, editor, verdict or body, days from now), `--max-writes`, the
-/// line for tracker#446 (`{record}`, `{answer}` and `{due}` filled in),
-/// whether it was triaged again and whether it was labelled.
+/// the operator's comment triages it again at once; with `triageClose`, a
+/// `done` or `obsolete` one closes the issue instead. Each case: its answers
+/// (author, editor, verdict or body, days from now), `triageClose` and
+/// `--max-writes`, the line for tracker#446 (`{record}`, `{answer}` and
+/// `{due}` filled in), whether it was triaged again and what the pass
+/// wrote for the verdict: [`LABEL`], a close's `state_reason`, or nothing.
 #[test]
 fn apply_follows_up_a_triage_by_its_verdict() {
     type Answer = (&'static str, Option<&'static str>, &'static str, i64);
     type Case = (
         &'static str,
         Vec<Answer>,
-        Option<usize>,
+        (bool, Option<usize>),
         &'static str,
         bool,
-        bool,
+        &'static str,
     );
     let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
     let bot = "cgwalters-bot";
@@ -2564,66 +2606,201 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         (
             "done asks the operator to close it, which the pass does not",
             vec![(bot, None, "done", 0)],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human",
             false,
-            true,
+            LABEL,
+        ),
+        (
+            "so does obsolete",
+            vec![(bot, None, "obsolete", 0)],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: triage verdict obsolete, {answer}; label needs-human",
+            false,
+            LABEL,
+        ),
+        (
+            "with triageClose, done closes it as completed",
+            vec![(bot, None, "done", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; close as completed",
+            false,
+            "completed",
+        ),
+        (
+            "and obsolete as not planned",
+            vec![(bot, None, "obsolete", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict obsolete, {answer}; close as not_planned",
+            false,
+            "not_planned",
+        ),
+        (
+            "with triageClose, a visitor's comment keeps it open",
+            vec![
+                ("visitor", None, "Agreed, done.", 0),
+                (bot, None, "done", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: its body or a comment is not only a writer's",
+            false,
+            LABEL,
+        ),
+        (
+            "unlocked, it keeps it open, as a visitor's comment may have been deleted",
+            vec![(bot, None, "done", 0), ("", None, "unlocked", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: it was not locked throughout its triage",
+            false,
+            LABEL,
+        ),
+        (
+            "so does a lock only after its triage started",
+            vec![(bot, None, "done", 0), ("", None, "locked", 1)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: it was not locked throughout its triage",
+            false,
+            LABEL,
+        ),
+        (
+            "and the operator's edit of the body after the verdict",
+            vec![(bot, None, "done", 0), ("", None, "edited", 1)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: the issue was edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "reopened after its line, or not closed, it asks the operator",
+            vec![(bot, None, "done", 0), (bot, None, "closed", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: it was reopened, or not closed, after the pass's line for this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "so does one closed by anyone else and reopened, without the line",
+            vec![(bot, None, "done", 0), ("", None, "reopened", 1)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: it was reopened after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "a supervisor note the bot posted keeps it open",
+            vec![(bot, None, "note", 0), (bot, None, "done", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: its body or a comment is the supervisor agent's text",
+            false,
+            LABEL,
+        ),
+        (
+            "so does any comment after the verdict, an ask's hold the bot posted too",
+            vec![(bot, None, "done", 0), (bot, None, "ask", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "and the operator's edit of an earlier comment after the verdict",
+            vec![
+                ("cgwalters", None, "Also the docs.", 0),
+                (bot, None, "done", 0),
+                ("", None, "edit-first", 1),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "but not the status comment of the triage's own run",
+            vec![(bot, None, "done", 0), (bot, None, "status", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; close as completed",
+            false,
+            "completed",
+        ),
+        (
+            "needs-operator still asks the operator",
+            vec![(bot, None, "needs-operator", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-operator, {answer}; label needs-human",
+            false,
+            LABEL,
         ),
         (
             "needs-design asks the operator",
             vec![(bot, None, "needs-design", 0)],
-            None,
+            (true, None),
             "hold cgwalters-forge/tracker#446: triage verdict needs-design, {answer}; label needs-human",
             false,
-            true,
+            LABEL,
         ),
         (
             "--max-writes holds the label",
             vec![(bot, None, "done", 0)],
-            Some(0),
+            (false, Some(0)),
             "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; held by --max-writes: label needs-human",
             false,
-            false,
+            "",
         ),
         (
             "nor does it label without room for the comment",
             vec![(bot, None, "done", 0)],
-            Some(1),
+            (false, Some(1)),
             "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; held by --max-writes: label needs-human",
             false,
+            "",
+        ),
+        (
+            "nor close",
+            vec![(bot, None, "obsolete", 0)],
+            (true, Some(1)),
+            "hold cgwalters-forge/tracker#446: triage verdict obsolete, {answer}; held by --max-writes: close as not_planned",
             false,
+            "",
+        ),
+        (
+            "a visitor's done closes nothing",
+            vec![("visitor", None, "done", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict",
+            false,
+            "",
         ),
         (
             "partly waits a day",
             vec![(bot, None, "partly", 0)],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; triaged again from {due} if anything changed, or once cgwalters comments",
             false,
-            false,
+            "",
         ),
         (
             "partly, its day past and nothing changed, is not triaged again",
             vec![(bot, None, "partly", -4)],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; nothing changed since its triage",
             false,
-            false,
+            "",
         ),
         (
             "a plan posted before fingerprints is triaged again after the days, changed or not",
             vec![("", None, "unmarked", 0), (bot, None, "partly", -4)],
-            None,
+            (false, None),
             "start triage cgwalters-forge/tracker#446 pool=claude record=",
             true,
-            false,
+            "",
         ),
         (
             "nor after the bot's own comment",
             vec![(bot, None, "partly", -4), (bot, None, "Still partly.", -3)],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}; nothing changed since its triage",
             false,
-            false,
+            "",
         ),
         (
             "a comment by anyone else since makes it due",
@@ -2631,10 +2808,10 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 (bot, None, "partly", -4),
                 ("visitor", None, "Fixed by #9?", -3),
             ],
-            None,
+            (false, None),
             "start triage cgwalters-forge/tracker#446 pool=claude record=",
             true,
-            false,
+            "",
         ),
         (
             "the operator's comment after the verdict triages it again, unlabelled",
@@ -2642,10 +2819,10 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 (bot, None, "done", 0),
                 ("cgwalters", None, "Not done: see #2.", 0),
             ],
-            None,
+            (false, None),
             "start triage cgwalters-forge/tracker#446 pool=claude record=",
             true,
-            false,
+            "",
         ),
         (
             "a visitor's comment after it does not",
@@ -2653,39 +2830,41 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 (bot, None, "partly", 0),
                 ("visitor", None, "Please retry.", 0),
             ],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: triage verdict partly, {answer}",
             false,
-            false,
+            "",
         ),
         (
             "a visitor's verdict is none",
             vec![("visitor", None, "done", 0)],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict; triaged again from",
             false,
-            false,
+            "",
         ),
         (
+            // Posted after the plan, it is a writer's comment someone else
+            // edited, which the plan protocol holds as a tampered plan.
             "a verdict a visitor edited is none",
             vec![(bot, Some("visitor"), "done", 0)],
-            None,
-            "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict",
+            (false, None),
+            "hold cgwalters-forge/tracker#446: its newest plan is invalid: newest plan {answer} was last edited by visitor, who may not write plans",
             false,
-            false,
+            "",
         ),
         (
             "two verdicts in one answer are none",
             vec![(bot, None, "two", 0)],
-            None,
+            (false, None),
             "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict",
             false,
-            false,
+            "",
         ),
     ];
-    let config = config(json!({"triageFollowUpDays": 3}));
-    for (name, answers, writes, expected, again, labelled) in cases {
-        let forge = Forge::new(None, false);
+    for (name, answers, (close, writes), expected, again, held) in cases {
+        let config = config(json!({"triageFollowUpDays": 3, "triageClose": close}));
+        let mut forge = Forge::new(None, false);
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
@@ -2714,16 +2893,75 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 *plan = body.into();
                 continue;
             }
+            // The operator's edit, `days` from now, of their first answer.
+            if said == "edit-first" {
+                let at = (forge.replay.now + time::Duration::days(days))
+                    .format(&Rfc3339)
+                    .unwrap();
+                let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                let mut added = forge.added.borrow_mut();
+                let first = (added.get_mut(&key).unwrap().iter_mut())
+                    .find(|c| c["author"]["login"] == "cgwalters")
+                    .unwrap();
+                first["lastEditedAt"] = at.into();
+                first["editor"] = json!({"login": "cgwalters"});
+                continue;
+            }
+            // The issue as a close reads it: not locked, locked `days` from
+            // now, or locked but its body edited or the issue reopened then.
+            if let "unlocked" | "locked" | "edited" | "reopened" = said {
+                let at = (forge.replay.now + time::Duration::days(days))
+                    .format(&Rfc3339)
+                    .unwrap();
+                let since = Some("2026-10-01T00:00:00Z".to_owned());
+                let (locked, edited) = match said {
+                    "unlocked" => (None, None),
+                    "locked" => (Some(at.clone()), None),
+                    "edited" => (since, Some(at.clone())),
+                    _ => (since, None),
+                };
+                let variables =
+                    json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
+                let mut data = close_read(&variables, locked, edited);
+                if said == "reopened" {
+                    add_event(&mut data, "ReopenedEvent", &at);
+                }
+                forge.replay.requests.push(json!({
+                    "request": graphql_key(CLOSE_QUERY, &variables),
+                    "answer": {"data": data}}));
+                continue;
+            }
             let body = match said {
                 "two" => verdict("done").repeat(2),
-                "done" | "needs-design" | "partly" => verdict(said),
-                text => text.to_owned(),
+                // The pass's line for a close on the first answer.
+                "closed" => {
+                    let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                    let first = text(&forge.added.borrow()[&key][2], "/url").to_owned();
+                    let line = &wrote("", &first, "completed")[0].1;
+                    line.as_str().unwrap().to_owned()
+                }
+                "note" => format!("Close it.\n\n{}", crate::input::SUPERVISOR_NOTE),
+                // `ask create --apply`'s hold, crates/agent-board/src/ask.rs.
+                "ask" => "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.".to_owned(),
+                // agentic-job's status comment for the run the record names.
+                "status" => {
+                    let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                    let record = text(&forge.added.borrow()[&key][1], "/body").to_owned();
+                    let run = epics::record_run(&record).unwrap();
+                    format!("Done.{}", crate::supervise::health::status_end(run))
+                }
+                text if text.contains(' ') => text.to_owned(),
+                said => verdict(said),
             };
             answered(&forge, (author, editor), &body, days);
         }
         let added = forge.added.borrow()[&("cgwalters-forge/tracker".to_owned(), 446)].clone();
-        let answer = text(&added[2], "/url").to_owned();
-        let due = (forge.replay.now + time::Duration::days(1))
+        // The first verdict, after the plan and its record.
+        let first = (added[2..].iter())
+            .find(|c| text(c, "/body").contains(TRIAGE_FENCE))
+            .unwrap_or(&added[2]);
+        let answer = text(first, "/url").to_owned();
+        let due = (at(text(first, "/createdAt")) + time::Duration::days(1))
             .format(&Rfc3339)
             .unwrap();
         let expected = expected
@@ -2751,7 +2989,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             written,
             "{name}: preview wrote"
         );
-        if labelled {
+        if !held.is_empty() {
             let line = preview.lines.iter().find(|l| l.contains("tracker#446"));
             assert!(
                 line.is_some_and(|l| l.starts_with(&expected)),
@@ -2781,19 +3019,268 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             .filter(|d| d.ends_with("tracker#446"))
             .count();
         assert_eq!(triaged, 1 + usize::from(again), "{name}");
-        // The label, then the comment whose first line names the verdict.
-        let holds: Vec<(String, Value)> = (forge.writes.borrow().iter())
-            .filter(|(_, url, body)| {
-                url.ends_with("/labels") || text(body, "/body").starts_with("<!-- agent-board-hold")
-            })
-            .map(|(_, url, body)| match body["body"].as_str() {
-                Some(text) => (url.clone(), text.lines().next().into()),
-                None => (url.clone(), body.clone()),
-            })
-            .collect();
         let issue = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446");
-        let id = answer.rsplit_once("#issuecomment-").unwrap().1;
-        let held = vec![
+        assert_eq!(
+            verdict_writes(&forge, &issue),
+            wrote(&issue, &answer, held),
+            "{name}"
+        );
+    }
+}
+
+/// Before a first triage, the bot's earlier verdict with nothing after it
+/// but the bot's comments, and the issue's body and title not edited since,
+/// is acted on as a follow-up's would be, rather than triaged again. Each
+/// case: the pass's settings, the answers before it (as in
+/// [`apply_follows_up_a_triage_by_its_verdict`], the first verdict
+/// `{answer}`), what of the issue was edited since (`body`, `title` or
+/// nothing), the line for tracker#446 (`{answer}` filled in) and what the
+/// pass wrote for it, or `None` for a triage.
+#[test]
+fn apply_takes_an_earlier_triage_verdict() {
+    type Answer = (&'static str, Option<&'static str>, &'static str, i64);
+    type Case<'a> = (
+        &'a str,
+        &'a Value,
+        Vec<Answer>,
+        &'a str,
+        Option<(&'a str, &'a str)>,
+    );
+    let verdict = |v: &str| format!("Found.\n\n```{TRIAGE_FENCE}\n{{\"verdict\": \"{v}\"}}\n```\n");
+    let bot = "cgwalters-bot";
+    let off = json!({});
+    let on = json!({"triageFollowUpDays": 3});
+    let close = json!({"triageFollowUpDays": 3, "triageClose": true});
+    let cases: Vec<Case> = vec![
+        (
+            "done asks the operator even with triageClose: no lock is known to cover its run",
+            &close,
+            vec![(bot, None, "done", -4)],
+            "",
+            Some((
+                "earlier triage verdict done, {answer}; label needs-human, not closed: no lock is known to have covered its triage",
+                LABEL,
+            )),
+        ),
+        (
+            "obsolete asks the operator without it",
+            &on,
+            vec![(bot, None, "obsolete", -4)],
+            "",
+            Some((
+                "earlier triage verdict obsolete, {answer}; label needs-human",
+                LABEL,
+            )),
+        ),
+        (
+            "partly holds for triageFollowUpDays",
+            &on,
+            vec![(bot, None, "partly", -1), (bot, None, "status", -1)],
+            "",
+            Some((
+                "earlier triage verdict partly, {answer}; nothing changed since, triaged from ",
+                "",
+            )),
+        ),
+        (
+            "a comment of the bot's since triages it, an ask's hold say",
+            &on,
+            vec![(bot, None, "partly", -1), (bot, None, "Still partly.", -1)],
+            "",
+            None,
+        ),
+        (
+            "so does an edit since of an earlier comment",
+            &close,
+            vec![
+                ("cgwalters", None, "Also the docs.", -5),
+                (bot, None, "done", -4),
+                ("", None, "edit-first", -3),
+            ],
+            "",
+            None,
+        ),
+        (
+            "and is triaged after them",
+            &on,
+            vec![(bot, None, "partly", -4)],
+            "",
+            None,
+        ),
+        (
+            "a visitor's comment before the verdict keeps it open",
+            &close,
+            vec![
+                ("visitor", None, "It is done.", -5),
+                (bot, None, "done", -4),
+            ],
+            "",
+            Some((
+                "earlier triage verdict done, {answer}; label needs-human, not closed: no lock is known to have covered its triage",
+                LABEL,
+            )),
+        ),
+        (
+            "a comment by anyone else since triages it",
+            &on,
+            vec![(bot, None, "partly", -4), ("visitor", None, "Still?", -3)],
+            "",
+            None,
+        ),
+        (
+            "so does the operator's",
+            &close,
+            vec![(bot, None, "done", -4), ("cgwalters", None, "No.", -3)],
+            "",
+            None,
+        ),
+        (
+            "so does an edit of the body since",
+            &close,
+            vec![(bot, None, "done", -4)],
+            "body",
+            None,
+        ),
+        (
+            "and of the title alone",
+            &close,
+            vec![(bot, None, "done", -4)],
+            "title",
+            None,
+        ),
+        (
+            "a visitor's verdict is none",
+            &close,
+            vec![("visitor", None, "done", -4)],
+            "",
+            None,
+        ),
+        (
+            "nor any without triageFollowUpDays",
+            &off,
+            vec![(bot, None, "done", -4)],
+            "",
+            None,
+        ),
+    ];
+    for (name, settings, answers, edited, expected) in cases {
+        let config = config(settings.clone());
+        let mut forge = Forge::new(None, false);
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
+        let at = (forge.replay.now - time::Duration::days(1))
+            .format(&Rfc3339)
+            .unwrap();
+        // Only the answers below: the recording's comments are newer than
+        // some of them, which would be news each verdict did not weigh.
+        for entry in &mut forge.replay.requests {
+            if entry["request"]["variables"]["number"] == 446
+                && let Some(nodes) =
+                    entry["answer"].pointer_mut("/data/repository/issue/comments/nodes")
+            {
+                *nodes = json!([]);
+            }
+        }
+        let since = Some("2026-10-01T00:00:00Z".to_owned());
+        let body = (edited == "body").then(|| at.clone());
+        let mut data = close_read(&variables, since, body);
+        if edited == "title" {
+            add_event(&mut data, "RenamedTitleEvent", &at);
+        }
+        forge
+            .replay
+            .requests
+            .push(json!({"request": graphql_key(CLOSE_QUERY, &variables),
+                "answer": {"data": data}}));
+        for (author, editor, said, days) in answers {
+            if said == "edit-first" {
+                let at = (forge.replay.now + time::Duration::days(days))
+                    .format(&Rfc3339)
+                    .unwrap();
+                let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                let mut added = forge.added.borrow_mut();
+                let first = (added.get_mut(&key).unwrap().iter_mut())
+                    .find(|c| c["author"]["login"] == "cgwalters")
+                    .unwrap();
+                first["lastEditedAt"] = at.into();
+                first["editor"] = json!({"login": "cgwalters"});
+                continue;
+            }
+            let body = match said {
+                "done" | "obsolete" | "partly" => verdict(said),
+                "status" => format!("Done.{}", crate::supervise::health::status_end(7)),
+                text => text.to_owned(),
+            };
+            answered(&forge, (author, editor), &body, days);
+        }
+        let added = forge.added.borrow()[&("cgwalters-forge/tracker".to_owned(), 446)].clone();
+        let fenced = added
+            .iter()
+            .find(|c| text(c, "/body").contains(TRIAGE_FENCE));
+        let answer = text(fenced.unwrap(), "/url").to_owned();
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = report.lines.iter().find(|l| l.contains("tracker#446"));
+        let issue = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446");
+        let triaged = forge
+            .dispatches()
+            .iter()
+            .any(|d| d.ends_with("tracker#446"));
+        match expected {
+            Some((said, held)) => {
+                let said = format!(
+                    "hold cgwalters-forge/tracker#446: {}",
+                    said.replace("{answer}", &answer)
+                );
+                assert!(
+                    line.is_some_and(|l| l.starts_with(&said)),
+                    "{name}: no line {said:?} in {:#?}",
+                    report.lines
+                );
+                assert!(!triaged, "{name}");
+                assert_eq!(
+                    verdict_writes(&forge, &issue),
+                    wrote(&issue, &answer, held),
+                    "{name}"
+                );
+            }
+            None => {
+                assert!(triaged, "{name}: {:#?}", report.lines);
+                assert_eq!(verdict_writes(&forge, &issue), vec![], "{name}");
+            }
+        }
+    }
+}
+
+/// What [`apply_follows_up_a_triage_by_its_verdict`]'s `held` stands for.
+const LABEL: &str = "label";
+
+/// The writes acting on a triage verdict on `issue` (its API URL): a
+/// label, a close and the comments that say so, by their first line.
+fn verdict_writes(forge: &Forge, issue: &str) -> Vec<(String, Value)> {
+    (forge.writes.borrow().iter())
+        .filter(|(_, url, body)| {
+            let said = text(body, "/body");
+            let acted = url.ends_with("/labels")
+                || url == issue
+                || said.starts_with("<!-- agent-board-hold")
+                || said.starts_with("The board pass closed");
+            acted && url.starts_with(issue)
+        })
+        .map(|(_, url, body)| match body["body"].as_str() {
+            Some(text) => (url.clone(), text.lines().next().into()),
+            None => (url.clone(), body.clone()),
+        })
+        .collect()
+}
+
+/// [`verdict_writes`] of a verdict, the comment `answer`, `held` as
+/// [`apply_follows_up_a_triage_by_its_verdict`] names it: the label and
+/// the comment naming the verdict, or the line linking it and the close.
+fn wrote(issue: &str, answer: &str, held: &str) -> Vec<(String, Value)> {
+    let id = answer.rsplit_once("#issuecomment-").unwrap().1;
+    match held {
+        "" => vec![],
+        LABEL => vec![
             (
                 format!("{issue}/labels"),
                 json!({"labels": ["needs-human"]}),
@@ -2802,8 +3289,21 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 format!("{issue}/comments"),
                 format!("<!-- agent-board-hold: verdict {id} -->").into(),
             ),
-        ];
-        assert_eq!(holds, if labelled { held } else { vec![] }, "{name}");
+        ],
+        reason => vec![
+            (
+                format!("{issue}/comments"),
+                format!(
+                    "The board pass closed this issue as {} on [this triage verdict]({answer}); reopen it if that is wrong.",
+                    reason.replace('_', " ")
+                )
+                .into(),
+            ),
+            (
+                issue.to_owned(),
+                json!({"state": "closed", "state_reason": reason}),
+            ),
+        ],
     }
 }
 
@@ -2815,7 +3315,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
 fn apply_doubles_the_wait_after_each_follow_up() {
     let partly = format!("```{TRIAGE_FENCE}\n{{\"verdict\": \"partly\"}}\n```\n");
     let config = config(json!({"triageFollowUpDays": 3}));
-    for (days, again) in [(-1, false), (-2, true)] {
+    for (days, again) in [(-1, false), (-3, true)] {
         let forge = Forge::new(None, false);
         apply(&forge, &config);
         answered(&forge, ("cgwalters-bot", None), &partly, -4);
@@ -2825,12 +3325,17 @@ fn apply_doubles_the_wait_after_each_follow_up() {
         let started = |report: &Report| report.lines.iter().any(|l| l.starts_with(start));
         assert!(started(&second), "{:#?}", second.lines);
         answered(&forge, ("cgwalters-bot", None), &partly, days);
+        let key = ("cgwalters-forge/tracker".to_owned(), 446);
+        let second_verdict = at(text(
+            forge.added.borrow()[&key].last().unwrap(),
+            "/createdAt",
+        ));
         answered(&forge, ("visitor", None), "Or by #10?", days);
         let third = apply(&forge, &config);
         assert_eq!(third.failures, 0, "{:#?}", third.lines);
         assert_eq!(started(&third), again, "{days}: {:#?}", third.lines);
         if !again {
-            let due = forge.replay.now + time::Duration::days(1);
+            let due = second_verdict + time::Duration::days(2);
             let due = format!("triaged again from {} ", due.format(&Rfc3339).unwrap());
             let line = third.lines.iter().find(|l| l.contains(&due));
             assert!(line.is_some(), "{due}: {:#?}", third.lines);
@@ -6034,6 +6539,10 @@ fn config_table() {
             "triageFollowUpDays needs triage",
         ),
         (
+            json!({"triageClose": true}),
+            "triageClose needs triageFollowUpDays",
+        ),
+        (
             json!({"replanAfterDays": 31}),
             "replanAfterDays is not 0 to 30",
         ),
@@ -7045,4 +7554,42 @@ fn runs_past_the_budget_are_no_capacity() {
     assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
     // The Status stage finds the budget spent too.
     assert_eq!(report.failures, 2, "{:#?}", report.lines);
+}
+
+/// [`CLOSE_QUERY`] reads the newest event of each kind on its own, so no
+/// number of other events hides a rename or reopen; an answer missing a
+/// kind is an error, never no such event.
+#[test]
+fn close_events_are_each_the_newest_of_their_kind() {
+    let issue = ItemRef {
+        host: DEFAULT_HOST.into(),
+        repository: "o/r".into(),
+        number: 1,
+    };
+    let event = |at: &str| json!({"nodes": [{"createdAt": at}]});
+    let node = json!({
+        "locks": event("2026-10-01T00:00:00Z"), "unlocks": {"nodes": []},
+        "renames": event("2026-10-20T00:00:00Z"), "reopens": event("2026-10-21T00:00:00Z"),
+    });
+    let read = IssueEvents::read(&issue, &node).unwrap();
+    assert_eq!(read.locked, Some(at("2026-10-01T00:00:00Z")));
+    assert_eq!(read.unlocked, None);
+    assert_eq!(read.renamed, Some(at("2026-10-20T00:00:00Z")));
+    assert_eq!(read.reopened, Some(at("2026-10-21T00:00:00Z")));
+    for missing in ["locks", "unlocks", "renames", "reopens"] {
+        let mut node = node.clone();
+        node.as_object_mut().unwrap().remove(missing);
+        let error = IssueEvents::read(&issue, &node).err().unwrap();
+        assert!(
+            format!("{error:#}").contains(&format!("no {missing} events")),
+            "{missing}"
+        );
+    }
+    for alias in ["locks:", "unlocks:", "renames:", "reopens:"] {
+        assert!(
+            CLOSE_QUERY.contains(&format!("{alias} timelineItems(")),
+            "{alias}"
+        );
+    }
+    assert_eq!(CLOSE_QUERY.matches("last: 1)").count(), 4);
 }
