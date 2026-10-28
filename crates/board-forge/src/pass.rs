@@ -2601,8 +2601,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// Whether `parent` is a live epic: open, in the epics repository (or,
     /// with [`Epics::in_work_repositories`], a work repository) and labelled
-    /// `epic`, last by the operator, so that no one else with triage access
-    /// can make an issue's children work. Read once a pass each.
+    /// `epic`, last by the operator or the bot, so that no one else with
+    /// triage access can make an issue's children work. Read once a pass each.
     fn live(&mut self, parent: &Parent) -> std::result::Result<bool, String> {
         let config = self.config;
         let Some(epics) = &config.epics else {
@@ -2630,7 +2630,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Ok(false)
         } else {
             epic_labelled_by(&self.client, &parent.issue)
-                .map(|by| is(by.as_deref(), &[&config.operator]))
+                .map(|by| is(by.as_deref(), &[&config.operator, &config.bot]))
                 .map_err(|e| {
                     format!(
                         "whether {} is a live epic is unknown: {e:#}",
