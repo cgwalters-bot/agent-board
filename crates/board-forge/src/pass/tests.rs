@@ -1420,6 +1420,9 @@ struct Forge {
     passes: Vec<Value>,
     /// A confirmed response to workflow dispatch, instead of a successful start.
     dispatch_status: Option<u16>,
+    /// Fails the first write whose method and URL contain it before it is
+    /// made, unlike `fail`, which loses the answer to one that was.
+    refuse: RefCell<Option<String>>,
 }
 
 /// The workflow run an applying pass runs in, a run of workflow 77.
@@ -1459,6 +1462,7 @@ impl Forge {
             racing: None,
             passes: vec![],
             dispatch_status: None,
+            refuse: RefCell::new(None),
         }
     }
 
@@ -1617,8 +1621,15 @@ impl Rest for Forge {
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        let what = format!("{method} {url}");
+        let mut refuse = self.refuse.borrow_mut();
+        if refuse.as_deref().is_some_and(|r| what.contains(r)) {
+            *refuse = None;
+            bail!("connection refused during {what}");
+        }
+        drop(refuse);
         let written = self.write(method, url, body)?;
-        self.failing(&format!("{method} {url}"))?;
+        self.failing(&what)?;
         Ok(written)
     }
 }
@@ -4547,6 +4558,270 @@ fn maintain_reads_only_the_comment_it_edited() {
         let state = State::from_json(&report.state.unwrap().to_json()).unwrap();
         assert!(state.maintain.unwrap().done, "{name}");
     }
+}
+
+/// `forge`'s writes from the `from`th on, each as its method, its path
+/// below the digest repository or the last part of another, and what it
+/// wrote: the pass's marked plan comment, a job plan, a dispatch record,
+/// or else the body's first line.
+fn digest_writes(forge: &Forge, from: usize) -> Vec<String> {
+    let repo = format!("{API_ROOT}repos/cgwalters-forge/bot-ops/");
+    let writes = forge.writes.borrow();
+    (writes[from..].iter())
+        .map(|(method, url, body)| {
+            let path = match url.strip_prefix(&repo) {
+                Some(path) => path,
+                None => url.rsplit('/').next().unwrap_or(url),
+            };
+            let body = text(body, "/body");
+            let what = if body.starts_with(maintain::PLAN_MARKER) {
+                "marked plan"
+            } else if body.starts_with("<!-- agent-board-dispatch") {
+                "dispatch record"
+            } else if plan::fenced_json(body, PLAN_FENCE).is_ok_and(|p| p.is_some()) {
+                "job plan"
+            } else {
+                body.lines().next().unwrap_or("")
+            };
+            format!("{method} {path} {what}").trim_end().to_owned()
+        })
+        .collect()
+}
+
+/// The writes of a start on the digest issue, by [`digest_writes`]: the
+/// job plan, its dispatch record, the dispatch and the record's edit.
+const DIGEST_START: &[&str] = &[
+    "POST issues/9/comments job plan",
+    "POST issues/9/comments dispatch record",
+    "POST dispatches",
+    "PATCH issues/comments/9000000002 dispatch record",
+];
+
+/// The placeholder the pass adds its plan comment with, by [`digest_writes`].
+const PLACEHOLDER: &str =
+    "POST issues/9/comments The board pass is recording its maintain plan here.";
+
+/// A start and the record after it are taken together within the caps: one
+/// write left holds the start whole, as `--max-dispatch 0` does, so no
+/// placeholder is added and nothing dispatched; two let the pass post and
+/// dispatch its plan, which count as the one dispatch, and add the
+/// placeholder and edit the plan in, the two writes. One whose plan comment
+/// exists needs one. A preview counts the same and writes nothing.
+#[test]
+fn maintain_holds_its_start_and_record_together() {
+    let yesterdays = || vec![on_digest(5, Some("2026-10-22T09:00:00Z"), json!({}))];
+    let added = "PATCH issues/comments/9000000005 marked plan";
+    let edited = "PATCH issues/comments/5 marked plan";
+    // Its comments, `--max-dispatch` and `--max-writes`, the flag that
+    // holds the start, if one does, the record's writes where it starts,
+    // and the summary.
+    let cases = [
+        (
+            vec![],
+            Some(0),
+            Some(2),
+            Some("--max-dispatch"),
+            vec![],
+            "dispatched 0/0, writes 0/2, held 1",
+        ),
+        (
+            vec![],
+            None,
+            Some(1),
+            Some("--max-writes"),
+            vec![],
+            "dispatched 0, writes 0/1, held 1",
+        ),
+        (
+            vec![],
+            Some(1),
+            Some(2),
+            None,
+            vec![PLACEHOLDER, added],
+            "dispatched 1/1, writes 2/2, held 0",
+        ),
+        (
+            yesterdays(),
+            None,
+            Some(0),
+            Some("--max-writes"),
+            vec![],
+            "dispatched 0, writes 0/0, held 1",
+        ),
+        (
+            yesterdays(),
+            None,
+            Some(1),
+            None,
+            vec![edited],
+            "dispatched 1, writes 1/1, held 0",
+        ),
+    ];
+    let start = "maintain: start research cgwalters-forge/bot-ops#9 pool=claude";
+    for (comments, dispatch, writes, held, record, summary) in cases {
+        let limits = Limits {
+            dispatch,
+            writes,
+            ..Limits::default()
+        };
+        for applies in [false, true] {
+            let name = format!("{} comment(s), {limits:?}, apply {applies}", comments.len());
+            let (config, forge) = two_days(maintained(9, comments.clone(), 40.0));
+            let own = own();
+            let mode = if applies {
+                Mode::Actions(&own)
+            } else {
+                Mode::Preview
+            };
+            let report = block(run(
+                &forge,
+                &forge,
+                &config,
+                State::default(),
+                (mode, limits),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+            assert_eq!(report.summary, format!("summary: {summary}"), "{name}");
+            let lines = maintain_lines(&report);
+            let held_line = held.map(|flag| format!("held by {flag}: {start}"));
+            assert_eq!(
+                held_line.as_ref().is_some_and(|l| report.lines.contains(l)),
+                held.is_some(),
+                "{name}: {:#?}",
+                report.lines
+            );
+            let mut expected: Vec<String> = vec![];
+            if held.is_none() && applies {
+                expected = DIGEST_START.iter().map(|w| w.to_string()).collect();
+                expected.extend(record.iter().map(|w| w.to_string()));
+            }
+            assert_eq!(digest_writes(&forge, 0), expected, "{name}");
+            let dispatched = usize::from(held.is_none() && applies);
+            assert_eq!(forge.dispatches().len(), dispatched, "{name}");
+            // Started or previewed, the plan's record follows: the day ends
+            // only where it was recorded.
+            assert_eq!(lines.len(), if held.is_some() { 2 } else { 4 }, "{name}");
+            if held.is_none() {
+                assert!(lines[2].starts_with(start), "{name}: {lines:#?}");
+            }
+            let done = report.maintain.unwrap().done;
+            assert_eq!(done, held.is_none() && applies, "{name}");
+        }
+    }
+}
+
+/// A pass that dispatched the digest, added the placeholder, and failed to
+/// edit the plan into it has spent the two writes and ended its day. A pass
+/// that lost its state reads no heads from the placeholder, which carries no
+/// marker, but today's research plan holds the digest: nothing is written or
+/// dispatched again. The next day, still with no plan recorded, the pull
+/// requests the first run was given are due again, and a preview of that
+/// writes and starts nothing before an applying pass starts them.
+#[test]
+fn maintain_recovers_from_an_interrupted_record() {
+    let (config, mut forge) = two_days(maintained(9, vec![], 40.0));
+    let placeholder = format!("{API_ROOT}repos/cgwalters-forge/bot-ops/issues/comments/9000000005");
+    *forge.refuse.borrow_mut() = Some(format!("PATCH {placeholder}"));
+    let limits = Limits {
+        writes: Some(2),
+        ..Limits::default()
+    };
+    let pass = |forge: &Forge, state: State, mode, at| {
+        let report = block(run(forge, forge, &config, state, (mode, limits), at)).unwrap();
+        let lines: Vec<String> = (maintain_lines(&report).into_iter())
+            .map(str::to_owned)
+            .collect();
+        (report, lines)
+    };
+    let own = own();
+    let today = forge.replay.now;
+    let (report, lines) = pass(&forge, State::default(), Mode::Actions(&own), today);
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    assert_eq!(report.summary, "summary: dispatched 1, writes 2/2, held 0");
+    let refused = format!(
+        "maintain error: maintain: record the plan on cgwalters-forge/bot-ops#9: \
+         connection refused during PATCH {placeholder}"
+    );
+    assert_eq!(lines[3], refused, "{lines:#?}");
+    let mut expected = DIGEST_START.to_vec();
+    expected.push(PLACEHOLDER);
+    assert_eq!(digest_writes(&forge, 0), expected);
+    let comments = forge.comments_on("cgwalters-forge/bot-ops", 9);
+    assert!(
+        !comments
+            .iter()
+            .any(|c| c.starts_with(maintain::PLAN_MARKER))
+    );
+    // The dispatch may have started a run: the day ends all the same.
+    let state = report.state.unwrap();
+    assert!(state.maintain.as_ref().unwrap().done);
+    let written = forge.writes.borrow().len();
+    let (report, lines) = pass(&forge, state, Mode::Actions(&own), today);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        lines,
+        [format!(
+            "maintain: done for today; the next is due from {NEXT}"
+        )]
+    );
+    // A fresh state finds no plan comment of the pass's, and the plan vetoes.
+    let (report, lines) = pass(&forge, State::default(), Mode::Actions(&own), today);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        lines[1..],
+        [
+            "maintain: digest due: 2 of 2 incoming pull request(s) changed since no plan; \
+             reviews up/a#1, up/a#2",
+            "maintain: a research plan already exists today; the digest waits",
+        ]
+    );
+    assert_eq!(report.summary, "summary: dispatched 0, writes 0/2, held 0");
+    assert!(!report.maintain.unwrap().done);
+    assert_eq!(forge.writes.borrow().len(), written);
+    // The next day, with no state and that day's usage, previews the same
+    // pull requests' start.
+    let tomorrow = today + time::Duration::days(1);
+    let mut snapshot = usage(&mut forge.replay);
+    let updated = at(text(&snapshot, "/updated_at")) + time::Duration::days(1);
+    snapshot["updated_at"] = updated.format(&Rfc3339).unwrap().into();
+    set_usage(&mut forge.replay, &snapshot);
+    let (report, lines) = pass(&forge, State::default(), Mode::Preview, tomorrow);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        lines[1..],
+        [
+            "maintain: digest due: 2 of 2 incoming pull request(s) changed since no plan; \
+             reviews up/a#1, up/a#2",
+            "maintain: start research cgwalters-forge/bot-ops#9 pool=claude",
+            "maintain: record the plan on cgwalters-forge/bot-ops#9; a preview records nothing",
+        ]
+    );
+    assert_eq!(report.summary, "summary: dispatched 1, writes 2/2, held 0");
+    assert_eq!(forge.writes.borrow().len(), written);
+    assert_eq!(forge.dispatches().len(), 1);
+    // And an applying pass starts them, adding a plan comment of its own.
+    let (report, lines) = pass(&forge, State::default(), Mode::Actions(&own), tomorrow);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert!(
+        lines[3].starts_with("maintain: recorded the plan in "),
+        "{lines:#?}"
+    );
+    assert_eq!(forge.dispatches().len(), 2);
+    assert_eq!(report.summary, "summary: dispatched 1, writes 2/2, held 0");
+    let record = (forge.comments_on("cgwalters-forge/bot-ops", 9).iter())
+        .find_map(|c| plan::fenced_json(c, maintain::PLAN_BLOCK).unwrap())
+        .unwrap();
+    // None acknowledged; both pending on the new plan, not the first day's.
+    assert_eq!(record["heads"], json!({}));
+    assert_eq!(
+        record["pending"]["heads"],
+        json!({"up/a#1": head("aa"), "up/a#2": head("bb")})
+    );
+    let id = text(&record, "/pending/plan");
+    assert!(!id.is_empty() && !id.starts_with("9000000001@"), "{id}");
+    assert!(report.maintain.unwrap().done);
 }
 
 /// Even a pending same-day cache must be re-derived with new selection or
