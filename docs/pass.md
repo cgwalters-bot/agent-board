@@ -301,7 +301,7 @@ Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N
 `revisit: …` and `revisit OWNER/REPO#N: why`, `maintain: …`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools|budget: why`,
-`review rerun|run rerun OWNER/REPO#N …`,
+`review rerun|check rerun|run rerun OWNER/REPO#N …`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
 step that a cap held ends `-> held by --max-dispatch` or
@@ -354,7 +354,7 @@ starts, stage 2's fix, rebase, continuation and answer rounds and their
 reruns, stage 3's planning run and stage 4's starts and reruns together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
 1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues,
-merges, branch updates and review reruns, stage 3's
+merges, branch updates, review reruns and required-check reruns, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
 and its recovery, and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
@@ -682,8 +682,10 @@ operator's “Rerun failed jobs” (agent-board#396). With `reruns: true` (off
 unless set), the pass asks GitHub to run a failed run's failed jobs once
 more (`POST …/actions/runs/ID/rerun-failed-jobs`): the same run, inputs and
 event. It does not tell an outage from the agent's own failure, so it does
-this once, on the run's first attempt (`run_attempt` 1), and a run that failed
-again is a person's; the attempt number on the forge is the only record. Only
+this once, on the run's first attempt (`run_attempt` 1). For agent and review
+runs a second failure is a person's; the attempt number on the forge records
+their rerun. Required-check reruns also record the head in the PR's
+`tracker-poll` marker, as described below. Only
 a run created in the last day, and so ended in it, is re-run: switching
 `reruns` on re-runs no old failure, a refused rerun (`-> not re-run: GitHub
 HTTP status 403: …`, such as for a run too old) is not asked for again after
@@ -709,6 +711,33 @@ cancelled too.
   after a rerun, …`, and where ten were read, so that an older one re-run may
   have been left out, `needs-human: … which has more runs than the 10 read
   for an earlier rerun; …`.
+* **Required checks, stage 2 (agent-board#413).** Before spending a fix round
+  or stopping the bot's pull request from its fork, rerun the Actions runs
+  named by its failed checks once per head. This uses the existing failed-check
+  selection: with a merge queue, required checks (or all checks where none
+  are required); without a merge queue, all checks, including optional ones. Each
+  job URL must be in the PR's repository; the job's run must be completed with
+  `failure`, on attempt 1, created in the last day and for the current head in
+  that repository. Distinct runs are rerun once, using the bot's token, with
+  reads bounded by the existing check-rollup and pass request limits. An
+  operator answer, stack operation, explicit queue stop or running fix round
+  is not displaced.
+  `check rerun OWNER/REPO#N SHA: failed jobs ci (run ID) at head SHA, … -> re-run`
+  logs the jobs and head. The claim, marker and rerun requests together are
+  one write step within `--max-writes`, not a fix round or agent dispatch.
+  The marker records `checks_rerun: SHA`, selected `checks_runs` IDs and the
+  reservation time `checks_at` **before** the rerun requests, so an
+  interrupted pass or refused request cannot buy another retry; authenticated
+  older markers also prevent a reset or return to that head buying one.
+  Subsequent polls read those runs: stale attempt 1 results and in-progress
+  retries wait rather than spending a fix round or stopping. A completed
+  second failure spends a fix round or stops as before; successful retries
+  wait for the check rollup to catch up, then use the normal approval and
+  merge gates. A request still on attempt 1 after ten minutes, or an orphaned
+  claim older than ten minutes (or without a readable time), stops for a
+  person without repeating the POST. In-progress retries and stale rollups
+  stop after a day from reservation. Legacy receipts without run IDs also
+  need a person. A new head gets its own chance.
 * **Fix, rebase and continuation rounds, stage 2.** A round whose run failed
   and pushed no new head is re-run with the dispatch token that started it,
   paced on the round's pool and within the fix bounds, before the poll would
@@ -1241,7 +1270,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
-| `reruns` | Re-run a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
+| `reruns` | Re-run failed required checks once per head, or a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |
