@@ -2287,10 +2287,11 @@ fn pass_replay_previews_without_credentials() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.starts_with("pass: preview\n"), "{text}");
     // The recording's stuck run (agent-board#376) is old enough to have its
-    // jobs read; none are recorded, so it keeps its slot.
+    // jobs read; none are recorded, so it keeps its slot. tracker#596's
+    // sub-issues are all closed: it is asked about, three writes, not planned.
     assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
     assert!(
-        text.ends_with("\nsummary: dispatched 6, writes 0, held 0, requests 51, points ~37\n"),
+        text.ends_with("\nsummary: dispatched 6, writes 3, held 0, requests 52, points ~38\n"),
         "{text}"
     );
     for refused in [

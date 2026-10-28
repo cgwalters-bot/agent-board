@@ -228,12 +228,12 @@ fn last_scheduled(report: &Report) -> &str {
 }
 
 /// Stage 3 on the recorded board: tracker#596, whose applied plan's
-/// sub-issues have closed since, is planned; #890's changes wait three hours
-/// after its last plan; #766 is held by its label.
+/// sub-issues have all closed since, is asked about rather than planned;
+/// #890's changes wait a day after its last plan; #766 is held by its label.
 pub(super) const EPIC_LINES: &[&str] = &[
     "epics: 3 live of 3 open in cgwalters-forge/tracker",
-    "start planning cgwalters-forge/tracker#596 pool=claude: its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 3 more)",
-    "hold epic cgwalters-forge/tracker#890: its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); cgwalters-forge/agent-board#284 edited; cgwalters-forge/agent-board#289's Priority is P0, not P2; planned again from 2026-10-23T16:34:49Z, 3 hours after its last request",
+    "hold epic cgwalters-forge/tracker#596: every sub-issue is closed; its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 3 more); label needs-human, Why Q: Every sub-issue of this epic is closed. Close it, or comment with what is left?",
+    "hold epic cgwalters-forge/tracker#890: its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); planned again from 2026-10-24T13:34:49Z, 24 hours after its last request",
     "hold epic cgwalters-forge/tracker#766: labelled needs-human; otherwise due to be planned (its sub-issues changed (cgwalters-forge/actions#83 closed, cgwalters-forge/agent-board#167 closed, cgwalters-forge/agent-board#168 closed and 2 more))",
 ];
 
@@ -286,9 +286,8 @@ fn replay_idle_board_starts_work() {
         })
         .collect();
     expected.extend(not_live.iter().map(String::as_str));
-    // The planning run took the last slot stage 4 had.
-    expected.extend(&STARTED[..STARTED.len() - 2]);
-    expected.push("wip: no slot left; 271 more candidate(s) wait");
+    // No epic is planned, so stage 4 has every slot.
+    expected.extend(STARTED);
     // The recording's whole-board read is an empty board: the Status stage
     // has its own recording.
     expected.push("status: 0 change(s) of 0 item(s) read");
@@ -399,6 +398,7 @@ fn overlap_setting_ignores_a_documentation_overlap() {
 #[test]
 fn budget_holds_epic_planning() {
     let mut replay = replay();
+    unfinished(&mut replay);
     let mut settings = json!({});
     with_spend(&mut replay, &mut settings, spend(1000.0));
     let report = preview(&config(settings), &replay);
@@ -410,6 +410,24 @@ fn budget_holds_epic_planning() {
     let held = held.unwrap_or_else(|| panic!("{line} is not a recorded hold"));
     assert_eq!(held.hold.kind, HoldKind::Budget);
     assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
+}
+
+/// Gives tracker#596 an open sub-issue, tracker#9999, so that it is planned
+/// for its closed ones rather than asked about (agent-board#429).
+pub(super) fn unfinished(replay: &mut Replay) {
+    let nodes = (replay.requests.iter_mut())
+        .filter_map(|e| e["answer"].pointer_mut("/data/repository/issues/nodes"))
+        .filter_map(Value::as_array_mut)
+        .flatten();
+    for node in nodes.filter(|n| n["number"] == 596) {
+        let subs = &mut node["subIssues"];
+        let mut open = subs["nodes"][0].clone();
+        open["number"] = 9999.into();
+        open["state"] = "OPEN".into();
+        open["repository"] = json!({"nameWithOwner": "cgwalters-forge/tracker"});
+        subs["nodes"].as_array_mut().unwrap().push(open);
+        subs["totalCount"] = (subs["totalCount"].as_u64().unwrap() + 1).into();
+    }
 }
 
 /// Keeps only `issues` (`OWNER/REPO#N`) and the epics on every recorded board page,
@@ -2273,6 +2291,7 @@ fn apply_publishes_the_holds() {
         not_live("tracker#401", false, "P2"),
         not_live("tracker#430", true, "P1"),
         not_live("tracker#446", true, "P0"),
+        ["cgwalters-forge/tracker#596", "needs-human", true, "P0"],
         not_live("tracker#649", true, "P0"),
         ["cgwalters-forge/tracker#766", "needs-human", true, null],
         not_live("tracker#848", true, "P1"),
@@ -7592,4 +7611,126 @@ fn close_events_are_each_the_newest_of_their_kind() {
         );
     }
     assert_eq!(CLOSE_QUERY.matches("last: 1)").count(), 4);
+}
+
+/// An epic's planning request edits the bot's last one in place rather
+/// than adding a comment (agent-board#429): tracker#596, given an open
+/// sub-issue, is planned in the bot's earlier request comment, whose new
+/// change time makes it a new plan; only its dispatch record is added, as
+/// the claim protocol needs. Only the bot's own is reused, not one the
+/// operator wrote; and one the operator edits after the pass read it is
+/// neither overwritten nor planned past, but left to the next pass.
+#[test]
+fn apply_edits_an_epics_planning_request_in_place() {
+    let cases = [
+        ("cgwalters-bot", false, Some("PATCH")),
+        ("cgwalters", false, Some("POST")),
+        ("cgwalters-bot", true, None),
+    ];
+    for (author, raced, posted) in cases {
+        let mut forge = Forge::new(None, false);
+        let mut replay = replay();
+        only(&mut replay, FIRST);
+        unfinished(&mut replay);
+        forge.replay = replay;
+        let at = (forge.replay.now - time::Duration::minutes(1))
+            .format(&Rfc3339)
+            .unwrap();
+        let old = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 596,
+            "kind": "triage", "runner": TRIAGE_RUNNER, "brief": "Plan the epic."});
+        let body = plan_body("The board pass asks a triage run to plan this epic.", &old);
+        let id = 8_000_000_001_u64;
+        let url =
+            format!("https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-{id}");
+        forge.added.borrow_mut().insert(
+            ("cgwalters-forge/tracker".into(), 596),
+            vec![json!({"id": id, "url": url,
+                "body": body, "createdAt": at, "lastEditedAt": null,
+                "author": {"login": author}, "editor": null})],
+        );
+        if raced {
+            // Every read of it after the first: the operator's edit.
+            let reads = Cell::new(0);
+            forge.racing = Some(Box::new(move |query, data| {
+                let nodes = (query == plan::COMMENTS_QUERY)
+                    .then(|| data.pointer_mut("/repository/issue/comments/nodes"))
+                    .flatten()
+                    .and_then(Value::as_array_mut);
+                for node in nodes.into_iter().flatten().filter(|n| n["id"] == id) {
+                    reads.set(reads.get() + 1);
+                    if reads.get() > 1 {
+                        node["body"] = "Plan only the docs.".into();
+                        node["lastEditedAt"] = "2026-10-23T21:05:00Z".into();
+                        node["editor"] = json!({"login": "cgwalters"});
+                    }
+                }
+            }));
+        }
+        let report = apply(&forge, &config(json!({})));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        if posted.is_none() {
+            let held = format!(
+                "hold epic cgwalters-forge/tracker#596: its planning request {url} changed since the pass read it; the next pass reads it again"
+            );
+            assert!(report.lines.contains(&held), "{held}: {:#?}", report.lines);
+            let dispatched = forge.dispatches();
+            assert!(
+                !dispatched.contains(&"cgwalters-forge/tracker#596".to_owned()),
+                "{dispatched:?}"
+            );
+            let writes = forge.writes.borrow();
+            assert!(
+                !(writes.iter()).any(|(_, url, _)| url.contains("/tracker/issues/596/comments")
+                    || url.ends_with(&format!("/comments/{id}"))),
+                "{writes:#?}"
+            );
+            continue;
+        }
+        let start = "start planning cgwalters-forge/tracker#596 pool=claude: ";
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(start)),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            forge
+                .dispatches()
+                .contains(&"cgwalters-forge/tracker#596".to_owned())
+        );
+        let writes = forge.writes.borrow();
+        let on_596: Vec<(&str, &str)> = (writes.iter())
+            .filter(|(_, url, body)| {
+                url.contains("/tracker/issues/596/comments")
+                    || (url.ends_with(&format!("/comments/{id}")))
+                    || text(body, "/body").contains("\"item\": 596")
+            })
+            .map(|(method, url, body)| {
+                let first = text(body, "/body").lines().next().unwrap_or_default();
+                (
+                    method.as_str(),
+                    if url.ends_with(&id.to_string()) {
+                        "ours"
+                    } else {
+                        first
+                    },
+                )
+            })
+            .collect();
+        let plan = "The board pass asks a triage run to plan this epic.";
+        let reused = posted == Some("PATCH");
+        let first = match reused {
+            true => ("PATCH", "ours"),
+            false => ("POST", plan),
+        };
+        assert_eq!(on_596[0], first, "{author}: {on_596:#?}");
+        let plans = (on_596.iter())
+            .filter(|(m, f)| *m == "POST" && *f == plan)
+            .count();
+        assert_eq!(plans, usize::from(!reused), "{author}: {on_596:#?}");
+        assert!(
+            (on_596.iter())
+                .any(|(m, f)| *m == "POST" && f.starts_with("<!-- agent-board-dispatch")),
+            "{on_596:#?}"
+        );
+    }
 }

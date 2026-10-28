@@ -18,10 +18,15 @@ use crate::plan::{
 
 /// Pages of open epics read, 20 each; more is an error.
 const EPIC_PAGES: usize = 5;
-/// Automatic changes within this long of a planning request wait, so that
-/// the pass's own writes and a run's churn do not spend a run each; each
-/// plan in a row that had nothing to do doubles it ([`backoff`]).
-const COALESCE_SECONDS: i64 = 3 * 60 * 60;
+/// Sub-issue changes within a day of a planning request wait, so that an
+/// epic is planned at most once a day however often its sub-issues move
+/// (agent-board#429); each plan in a row that had nothing to do doubles
+/// it ([`backoff`]).
+const DAY_SECONDS: i64 = 24 * 60 * 60;
+/// The hidden first line of the bot's comment that an epic's sub-issues
+/// were all closed, with the hash of their [`epic_apply::fingerprint_pairs`]:
+/// said once for those sub-issues ([`done_marker`]).
+const DONE_MARKER: &str = "agent-board-epic-done";
 /// How long a finished planning run's plan may take to show.
 const ANSWER_SECONDS: i64 = 5 * 60;
 /// How long a planning request whose run GitHub did not name may wait.
@@ -34,6 +39,11 @@ const RETRY_SECONDS: i64 = 6 * 60 * 60;
 /// request it retries: how the next pass tells that it was the retry.
 const RETRY_INTRO: &str =
     "The board pass asks a triage run to plan this epic once more: its planning request ";
+/// How the bot's planning request plan on an epic starts, a retry's too.
+const PLAN_INTRO: &str = "The board pass asks a triage run to plan this epic";
+/// What the bot asks the operator of an epic whose sub-issues are all closed.
+const DONE_QUESTION: &str =
+    "Q: Every sub-issue of this epic is closed. Close it, or comment with what is left?";
 /// The board's text field where the bot asks the operator, as `Q: …`.
 const WHY_FIELD: &str = "Why";
 /// Characters of the planner's own words put in a question.
@@ -129,16 +139,12 @@ pub struct EpicFacts {
     pub issue: ItemRef,
     pub labels: Vec<String>,
     pub labels_complete: bool,
-    /// When its text was last edited.
-    pub edited: Option<OffsetDateTime>,
     /// Its board Priority, Status and Why.
     pub priority: Option<String>,
     pub status: Option<String>,
     pub why: Option<String>,
     /// Its sub-issues, open and closed, as an apply reads them.
     pub census: Epic,
-    /// When each sub-issue's text was last edited, by lower-case key.
-    pub edits: BTreeMap<String, OffsetDateTime>,
     /// Each sub-issue's board Priority, where the board shows it to the
     /// bot, by lower-case key.
     pub priorities: BTreeMap<String, String>,
@@ -209,7 +215,7 @@ impl EpicFacts {
             sub_issues: Vec::new(),
             closed: Vec::new(),
         };
-        let (mut edits, mut priorities) = (BTreeMap::new(), BTreeMap::new());
+        let mut priorities = BTreeMap::new();
         for sub in nodes {
             let at = issue_ref(sub)?;
             let child = IssueRef {
@@ -217,9 +223,6 @@ impl EpicFacts {
                 number: at.number,
             };
             let name = key(&at);
-            if let Some(edited) = time(sub, "lastEditedAt") {
-                edits.insert(name.clone(), edited);
-            }
             // A sub-issue whose boards were not all read shows no Priority,
             // as one the board does not show to the bot.
             if let Ok(BoardFields {
@@ -236,7 +239,6 @@ impl EpicFacts {
             }
         }
         Ok(Self {
-            edited: time(node, "lastEditedAt"),
             issue,
             labels,
             labels_complete,
@@ -244,7 +246,6 @@ impl EpicFacts {
             status,
             why,
             census,
-            edits,
             priorities,
         })
     }
@@ -285,6 +286,111 @@ fn changed(before: &[(String, String)], after: &[(String, String)]) -> Option<St
     (!parts.is_empty()).then(|| format!("its sub-issues changed ({})", some(&parts)))
 }
 
+/// [`DONE_MARKER`]'s line for `census`'s sub-issues.
+fn done_marker(census: &Epic) -> String {
+    let pairs = epic_apply::fingerprint_pairs(census);
+    let text: String = (pairs.iter())
+        .map(|(issue, state)| format!("{issue} {state}\n"))
+        .collect();
+    let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    format!("<!-- {DONE_MARKER}: {} -->", &hash[..FINGERPRINT_CHARS])
+}
+
+/// Whether `c` is the bot's own, edited by nobody else.
+fn bots(c: &Comment, bot: &str) -> bool {
+    is(c.author.as_deref(), &[bot])
+        && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[bot]))
+}
+
+/// The bot's newest planning request plan on an epic, which the next
+/// request edits rather than adding a comment (agent-board#429).
+fn planning_comment<'c>(comments: &'c [Comment], bot: &str) -> Option<&'c Comment> {
+    (comments.iter())
+        .filter(|c| {
+            bots(c, bot)
+                && c.body.starts_with(PLAN_INTRO)
+                && has_fence(&c.body, PLAN_FENCE)
+                && plan::comment_id(&c.url).is_some()
+        })
+        .max_by_key(|c| c.changed)
+}
+
+/// Whether the bot's planning request `seen` is in `comments`, read again
+/// just before it is edited, as the pass read it before: still the bot's
+/// alone, with the same text and change time, so that an edit made since,
+/// the operator's included, is never overwritten.
+pub(super) fn unchanged(comments: &[Comment], seen: &Comment, bot: &str) -> bool {
+    (comments.iter()).any(|c| {
+        c.url == seen.url && bots(c, bot) && c.body == seen.body && c.changed == seen.changed
+    })
+}
+
+/// The bot's newest comment starting with `marker`.
+fn newest_said<'c>(comments: &'c [Comment], bot: &str, marker: &str) -> Option<&'c Comment> {
+    (comments.iter())
+        .filter(|c| bots(c, bot) && c.body.starts_with(marker))
+        .max_by_key(|c| c.changed)
+}
+
+/// When the operator last spoke on the epic: their newest comment that is
+/// neither a record, a receipt, a plan nor the bot's [`DONE_MARKER`] (the
+/// pass's own, where the operator is the bot), and not edited by anyone
+/// else.
+fn spoke(i: &Inputs, receipts: &[Receipt]) -> Option<OffsetDateTime> {
+    let (record, done) = (
+        format!("<!-- {DISPATCH_MARKER}: "),
+        format!("<!-- {DONE_MARKER}: "),
+    );
+    (i.comments.iter())
+        .filter(|c| {
+            is(c.author.as_deref(), &[i.operator])
+                && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[i.operator]))
+                && !c.body.starts_with(&record)
+                && !c.body.starts_with(&done)
+                && !receipts.iter().any(|r| r.url == c.url)
+                && !has_fence(&c.body, PLAN_FENCE)
+                && !has_fence(&c.body, EPIC_PLAN_FENCE)
+        })
+        .map(|c| c.changed)
+        .max()
+}
+
+/// With every sub-issue of the epic closed, which no plan is needed for:
+/// [`Next::Done`], or idle once the bot has said so for these sub-issues,
+/// until the operator speaks after it, which plans it.
+fn finished(i: &Inputs, why: &str, spoke: Option<OffsetDateTime>) -> Option<Next> {
+    let census = &i.epic.census;
+    if census.closed.is_empty() || !census.sub_issues.is_empty() {
+        return None;
+    }
+    Some(match newest_said(i.comments, i.bot, &done_marker(census)) {
+        Some(c) if spoke.is_some_and(|s| s > c.changed) => {
+            Next::Plan(format!("operator direction since {}", c.url))
+        }
+        Some(c) => Next::Said(format!("every sub-issue is closed, as {} says", c.url)),
+        None => Next::Done(format!("every sub-issue is closed; {why}")),
+    })
+}
+
+/// The bot's completion ask the operator answered: the bot's newest
+/// [`DONE_MARKER`] comment, with no planning request since and the
+/// operator's comment after it. Its `needs-human` label, which the
+/// operator was told a comment answers, then holds the epic no more
+/// ([`Scheduler::release_epic`]).
+pub(super) fn answered(i: &Inputs) -> Option<String> {
+    let writers = [i.operator, i.bot];
+    let (receipts, _) = epic_apply::receipts(i.comments, &writers);
+    let asked = newest_said(i.comments, i.bot, &format!("<!-- {DONE_MARKER}: "))?;
+    let marker = format!("<!-- {DISPATCH_MARKER}: ");
+    let requested = (i.comments.iter()).any(|c| {
+        is(c.author.as_deref(), &writers)
+            && c.body.starts_with(&marker)
+            && c.changed > asked.changed
+    });
+    let spoke = spoke(i, &receipts).is_some_and(|s| s > asked.changed);
+    (spoke && !requested).then(|| asked.url.clone())
+}
+
 /// What an epic comes to on this pass, from its own facts.
 #[derive(Debug, PartialEq)]
 pub(super) enum Next {
@@ -317,6 +423,12 @@ pub(super) enum Next {
     },
     /// Due to be planned, and why.
     Plan(String),
+    /// Every sub-issue is closed, and why it would be planned: closed or
+    /// asked about once instead ([`Scheduler::finish_epic`]).
+    Done(String),
+    /// Nothing to do, as the bot said: still the operator's while a person
+    /// holds it, the question it asked staying in the hold snapshot.
+    Said(String),
 }
 
 impl Next {
@@ -331,6 +443,7 @@ impl Next {
             }
             Self::Unanswered { record, .. } => format!("its planning request {record} has no plan"),
             Self::Plan(why) => format!("due to be planned ({why})"),
+            Self::Done(why) | Self::Said(why) => why.clone(),
         }
     }
 }
@@ -407,20 +520,7 @@ pub(super) fn decide(i: &Inputs) -> Next {
         .iter()
         .filter(|c| record(c))
         .max_by_key(|c| c.changed);
-    // The operator's own words: neither a record, a receipt nor a plan (the
-    // pass's own, where the operator is the bot), and not edited by anyone
-    // else.
-    let direction = (i.comments.iter())
-        .filter(|c| {
-            is(c.author.as_deref(), &[i.operator])
-                && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[i.operator]))
-                && !record(c)
-                && !receipts.iter().any(|r| r.url == c.url)
-                && !has_fence(&c.body, PLAN_FENCE)
-                && !has_fence(&c.body, EPIC_PLAN_FENCE)
-        })
-        .map(|c| c.changed)
-        .max();
+    let direction = spoke(i, &receipts);
     let since = |at: OffsetDateTime| direction.is_some_and(|d| d > at);
     // Direction that may plan an epic whose plan cannot be applied or
     // recovered: newer than `at` and than the last planning request, with
@@ -508,7 +608,8 @@ pub(super) fn decide(i: &Inputs) -> Next {
         return Next::Hold(Hold::new(HoldKind::InFlight, why));
     }
     let Some((at, receipt, id)) = baseline else {
-        return Next::Plan("it has never been planned".into());
+        let why = "it has never been planned";
+        return finished(i, why, direction).unwrap_or_else(|| Next::Plan(why.into()));
     };
     // The last request: its record, or for an epic planned before this
     // stage existed, the plan that answered it.
@@ -526,44 +627,28 @@ pub(super) fn decide(i: &Inputs) -> Next {
     {
         return Next::Plan("the operator's direction changed since it was last planned".into());
     }
-    let epic = i.epic;
-    let mut why = Vec::new();
-    if epic.edited.is_some_and(|e| e > at) {
-        why.push("the epic was edited".to_owned());
-    }
-    if let Some(before) = &receipt.detail.fingerprint
-        && let Some(change) = changed(before, &epic_apply::fingerprint_pairs(&epic.census))
-    {
-        why.push(change);
-    }
-    let edited: Vec<String> = (epic.edits.iter())
-        .filter(|(_, e)| **e > at)
-        .map(|(issue, _)| issue.clone())
-        .collect();
-    if !edited.is_empty() {
-        why.push(format!("{} edited", some(&edited)));
-    }
-    for (issue, set) in receipt.detail.priorities() {
-        if let Some(now) = epic.priorities.get(&issue)
-            && *now != set
-        {
-            why.push(format!("{issue}'s Priority is {now}, not {set}"));
-        }
-    }
-    if why.is_empty() {
+    // Only its sub-issues opening, closing, coming or going (a merged pull
+    // request closes its issue) plan it again: edits, labels and Priority
+    // churn do not (agent-board#429).
+    let change = (receipt.detail.fingerprint.as_ref())
+        .and_then(|before| changed(before, &epic_apply::fingerprint_pairs(&i.epic.census)));
+    let Some(why) = change else {
         return Next::Idle(format!(
             "plan {id} applied; nothing changed since {}",
             stamp(at)
         ));
+    };
+    // Closing or asking starts no run: it does not wait for the day.
+    if let Some(done) = finished(i, &why, direction) {
+        return done;
     }
-    let why = why.join("; ");
     // The applied plans in a row, newest first, that had nothing to do.
     let empty = (receipts.iter().rev())
         .filter(|r| r.detail.outcome.applied())
         .take_while(|r| r.detail.actions.is_empty())
         .count();
-    let cap = COALESCE_SECONDS.max(i.follow_up_days as i64 * 24 * 60 * 60);
-    let wait = backoff(COALESCE_SECONDS, empty, cap);
+    let cap = DAY_SECONDS.max(i.follow_up_days as i64 * DAY_SECONDS);
+    let wait = backoff(DAY_SECONDS, empty, cap);
     let until = last + time::Duration::seconds(wait);
     if i.now < until {
         let why = format!(
@@ -845,7 +930,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         };
         let busy = slots.and_then(|(_, s)| s.busy.get(&key(&facts.issue)));
-        let next = decide(&Inputs {
+        let reuse = planning_comment(&comments, &self.config.bot);
+        let inputs = Inputs {
             epic: facts,
             comments: &comments,
             operator: &self.config.operator,
@@ -854,23 +940,51 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             now: self.now,
             follow_up_days: self.config.triage_follow_up_days,
             direction: self.direction_hash(),
-        });
-        if let Some(held) = person_hold(
+        };
+        let (next, answered) = (decide(&inputs), answered(&inputs));
+        let next = if let Some(held) = person_hold(
             &facts.labels,
             facts.labels_complete,
             facts.status.as_deref(),
         ) {
-            match next {
-                Next::Idle(why) => self.line(format!("epic {name}: {why}")),
-                next => {
+            // The completion ask's label, the only hold, which the
+            // operator's comment answered.
+            let others: Vec<String> = (facts.labels.iter())
+                .filter(|l| !l.eq_ignore_ascii_case(NEEDS_HUMAN))
+                .cloned()
+                .collect();
+            let release = answered.filter(|_| {
+                held.kind == HoldKind::NeedsHuman
+                    && matches!(next, Next::Plan(_))
+                    && person_hold(&others, true, facts.status.as_deref()).is_none()
+            });
+            match (release, next) {
+                (Some(asked), next) => {
+                    if !self.release_epic(facts, &asked, &next) {
+                        return;
+                    }
+                    next
+                }
+                (None, Next::Idle(why)) => {
+                    self.line(format!("epic {name}: {why}"));
+                    return;
+                }
+                (None, Next::Said(why)) => {
+                    let why = format!("{}; {why}", held.reason);
+                    self.epic_held(facts, Hold::new(held.kind, why));
+                    return;
+                }
+                (None, next) => {
                     let why = format!("{}; otherwise {}", held.reason, next.otherwise());
                     self.epic_held(facts, Hold::new(held.kind, why));
+                    return;
                 }
             }
-            return;
-        }
+        } else {
+            next
+        };
         match next {
-            Next::Idle(why) => self.line(format!("epic {name}: {why}")),
+            Next::Idle(why) | Next::Said(why) => self.line(format!("epic {name}: {why}")),
             Next::Hold(hold) => self.epic_held(facts, hold),
             Next::Apply {
                 id,
@@ -882,7 +996,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let refused = self.apply_epic(facts, project, (&id, &url, changed), pages, turn);
                 if refused && direction {
                     let why = "operator direction since its plan, which cannot be applied";
-                    self.plan_epic(facts, (why, None), project, slots, target, turn);
+                    self.plan_epic(facts, (why, None, reuse), project, slots, target, turn);
                 }
             }
             Next::Recover {
@@ -924,7 +1038,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.recover_epic(facts, &receipt, &url, outcome);
                 } else if direction {
                     let why = "operator direction since its apply was cut short";
-                    self.plan_epic(facts, (why, None), project, slots, target, turn);
+                    self.plan_epic(facts, (why, None, reuse), project, slots, target, turn);
                 } else {
                     let why = format!(
                         "the apply of plan {id} was {outcome}, and is not proved: {}; it is never replayed: a person inspects {}, then replaces the plan or comments",
@@ -992,9 +1106,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return;
                 }
                 let why = format!("{none}, retried once");
-                self.plan_epic(facts, (&why, Some(&record)), project, slots, target, turn);
+                let ask = (why.as_str(), Some(record.as_str()), reuse);
+                self.plan_epic(facts, ask, project, slots, target, turn);
             }
-            Next::Plan(why) => self.plan_epic(facts, (&why, None), project, slots, target, turn),
+            Next::Plan(why) => {
+                self.plan_epic(facts, (&why, None, reuse), project, slots, target, turn)
+            }
+            Next::Done(why) => self.finish_epic(facts, &why),
         }
     }
 
@@ -1236,6 +1354,192 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
+    /// An epic held only by the [`NEEDS_HUMAN`] label of its completion
+    /// ask `asked`, which the operator answered by a comment ([`answered`]):
+    /// the label removed, one write, so that `next` goes on. Whether it
+    /// may; else held as the operator's still, and why.
+    fn release_epic(&mut self, facts: &EpicFacts, asked: &str, next: &Next) -> bool {
+        let line = format!(
+            "release epic {}: the operator answered {asked}; unlabel {NEEDS_HUMAN}",
+            facts.issue.display()
+        );
+        let hold = |why: String| Hold::new(HoldKind::NeedsHuman, why);
+        let blocked = match self.caps.check_many(Kind::Write, 1) {
+            Some(cap) => Some(cap.to_string()),
+            None => self.other_holds(),
+        };
+        if let Some(blocked) = blocked {
+            let why = format!(
+                "labelled {NEEDS_HUMAN}; {blocked}; otherwise {}",
+                next.otherwise()
+            );
+            self.epic_held(facts, hold(why));
+            return false;
+        }
+        // Counted once sent, whether or not its answer comes back.
+        self.caps.count_many(Kind::Write, 1);
+        if self.apply {
+            let issue = &facts.issue;
+            let url = format!(
+                "{API_ROOT}repos/{}/issues/{}/labels/{NEEDS_HUMAN}",
+                issue.repository, issue.number
+            );
+            // Gone already is released too.
+            if let Err(error) = plan::send(&self.client, "DELETE", &url, &Value::Null, 404) {
+                self.report.failures += 1;
+                self.epic_held(facts, hold(format!("{line} failed: {error:#}")));
+                return false;
+            }
+        }
+        self.line(line);
+        true
+    }
+
+    /// An epic whose sub-issues are all closed, which no plan is needed
+    /// for: with `epics.close`, closed as completed after a comment saying
+    /// why, two writes; else held for the operator, with the question in
+    /// its Why, a comment and the label `needs-human`, up to three writes. The
+    /// comment carries [`done_marker`], so either is done once for these
+    /// sub-issues ([`finished`]); the operator's comment plans it again,
+    /// and takes the label off ([`Self::release_epic`]). An applying pass
+    /// reads the epic again first, and waits if it changed
+    /// ([`Self::changed_since`]).
+    fn finish_epic(&mut self, facts: &EpicFacts, why: &str) {
+        let close = self.config.epics.as_ref().is_some_and(|e| e.close);
+        let board = self.config.board.as_ref();
+        let name = facts.issue.display();
+        let (line, writes) = match close {
+            true => (format!("close epic {name}: {why}"), 2),
+            false => {
+                let mut why = format!("{why}; label {NEEDS_HUMAN}");
+                if board.is_some() {
+                    why.push_str(&format!(", {WHY_FIELD} {DONE_QUESTION}"));
+                }
+                (why, 2 + usize::from(board.is_some()))
+            }
+        };
+        let said = |line: &str| match close {
+            true => None,
+            false => Some(Hold::new(HoldKind::NeedsHuman, line)),
+        };
+        let report = |this: &mut Self, line: String| match said(&line) {
+            Some(hold) => this.epic_held(facts, hold),
+            None => this.line(line),
+        };
+        if let Some(cap) = self.caps.check_many(Kind::Write, writes) {
+            match said(&line) {
+                Some(hold) => {
+                    let entry = self.epic_entry(facts, hold);
+                    self.line(format!("{cap}: {}", entry.line()));
+                    self.report.holds.push(entry);
+                }
+                None => self.line(format!("{cap}: {line}")),
+            }
+            return;
+        }
+        if let Some(other) = self.other_holds() {
+            report(self, format!("{line}; {other}"));
+            return;
+        }
+        if self.apply {
+            let changed = match self.changed_since(facts) {
+                Ok(changed) => changed.map(|why| (HoldKind::Other, why)),
+                Err(error) => {
+                    self.report.failures += 1;
+                    let why = format!("it could not be read again: {error:#}");
+                    Some((HoldKind::Unreadable, why))
+                }
+            };
+            if let Some((kind, why)) = changed {
+                let why = format!("{line}; not yet: {why}; the next pass reads it again");
+                self.epic_held(facts, Hold::new(kind, why));
+                return;
+            }
+        }
+        // Counted once sent, whether or not its answer comes back.
+        self.caps.count_many(Kind::Write, writes);
+        if !self.apply {
+            report(self, line);
+            return;
+        }
+        let issue = &facts.issue;
+        let url = format!(
+            "{API_ROOT}repos/{}/issues/{}",
+            issue.repository, issue.number
+        );
+        let text = match close {
+            true => {
+                "Every sub-issue of this epic is closed, so the board pass closes it as completed. \
+                     If work is left, reopen it and comment with what is left, which plans it again."
+            }
+            false => {
+                "Every sub-issue of this epic is closed, so the board pass plans it no further. \
+                      Close it if it is done, or comment with what is left, which plans it again."
+            }
+        };
+        let body = format!(
+            "{}\n{text}\n\n{}",
+            done_marker(&facts.census),
+            crate::Footer::default()
+        );
+        let comment = |this: &Self| {
+            let posted = json!({"body": body});
+            plan::send(&this.client, "POST", &format!("{url}/comments"), &posted, 0).map(drop)
+        };
+        // The comment first: should the close fail after it, the epic stays
+        // open with the line's failure, and is not closed again unasked.
+        // Asking, the comment marks the ask made, so the Why goes before
+        // it, which the next pass sets again should it fail; and the label
+        // after it, which would hold the epic from that pass: should the
+        // label fail, the question still stands in the Why and the comment.
+        let sent = match close {
+            true => comment(self).and_then(|()| {
+                let state = json!({"state": "closed", "state_reason": "completed"});
+                plan::send(&self.client, "PATCH", &url, &state, 0).map(drop)
+            }),
+            false => board
+                .map_or(Ok(()), |b| self.set_why(issue, b, DONE_QUESTION))
+                .and_then(|()| comment(self))
+                .and_then(|()| {
+                    let labels = json!({"labels": [NEEDS_HUMAN]});
+                    plan::send(&self.client, "POST", &format!("{url}/labels"), &labels, 0).map(drop)
+                }),
+        };
+        match sent {
+            Ok(()) => report(self, line),
+            Err(error) => {
+                self.report.failures += 1;
+                report(self, format!("{line} failed: {error:#}"));
+            }
+        }
+    }
+
+    /// What changed in the epic of `facts` since the epics were listed,
+    /// read again just before its completion writes: it must still be
+    /// listed open, with the same sub-issues all closed and no person's
+    /// hold.
+    fn changed_since(&self, facts: &EpicFacts) -> Result<Option<String>> {
+        let at = key(&facts.issue);
+        let listed = self.open_epics(&facts.issue.repository)?;
+        let fresh = listed.into_iter().find_map(|f| match f {
+            Ok(fresh) if key(&fresh.issue) == at => Some(Ok(fresh)),
+            Err((issue, error)) if key(&issue) == at => Some(Err(error)),
+            _ => None,
+        });
+        let Some(fresh) = fresh.transpose()? else {
+            return Ok(Some("it is no longer an open epic".into()));
+        };
+        if done_marker(&fresh.census) != done_marker(&facts.census) {
+            return Ok(Some("its sub-issues changed since they were read".into()));
+        }
+        let held = person_hold(
+            &fresh.labels,
+            fresh.labels_complete,
+            fresh.status.as_deref(),
+        );
+        Ok(held.map(|h| h.reason))
+    }
+
     /// Sets `issue`'s Why on `board` to `text`, unless it is that already.
     fn set_why(&self, issue: &ItemRef, board: &Board, text: &str) -> Result<()> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
@@ -1280,7 +1584,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn plan_epic(
         &mut self,
         facts: &EpicFacts,
-        (why, retry): (&str, Option<&str>),
+        (why, retry, reuse): (&str, Option<&str>, Option<&Comment>),
         project: Option<&Project>,
         slots: Option<&(BTreeSet<u64>, Slots)>,
         target: &Target,
@@ -1340,10 +1644,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let line = format!("start planning {name} pool={pool}: {why}");
         let intro = match retry {
             Some(record) => format!("{RETRY_INTRO}{record} got no plan."),
-            None => "The board pass asks a triage run to plan this epic.".into(),
+            None => format!("{PLAN_INTRO}."),
         };
         let context = (slots, target, hold as HoldRule);
-        let step = self.start_triage(&facts.issue, (&pool, brief, &intro), None, line, context);
+        let start = (pool.as_str(), brief, intro.as_str());
+        let step = self.start_triage(&facts.issue, start, reuse, None, line, context);
         self.client.bounds.finishing.set(false);
         let step = match step {
             Ok(step) => step,

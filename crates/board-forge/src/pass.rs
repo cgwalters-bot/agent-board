@@ -146,6 +146,14 @@ const CLOSED: &str = "The board pass closed this issue as";
 /// Why [`TriageScope::Epics`] starts no triage run on an issue outside
 /// every live epic.
 const OUTSIDE_EPICS: &str = "outside every live epic, so not triaged (triage scope epics)";
+/// A plan comment's body: `intro`, then `plan` in its fence.
+fn plan_body(intro: &str, plan: &Value) -> String {
+    format!(
+        "{intro}\n\n```{PLAN_FENCE}\n{plan:#}\n```\n\n{}",
+        crate::Footer::default()
+    )
+}
+
 /// What a triage plan posted again by [`Scheduler::follow_up`] says first.
 const AGAIN: &str = "The board pass asks a triage run to plan this issue again.";
 /// The hidden line a triage plan comment carries after its intro, with
@@ -470,6 +478,10 @@ pub struct Epics {
     /// `repository`'s.
     #[serde(default)]
     pub in_work_repositories: bool,
+    /// Off unless set: an epic whose sub-issues are all closed is closed as
+    /// completed, rather than asked about once ([`Scheduler::finish_epic`]).
+    #[serde(default)]
+    pub close: bool,
 }
 
 /// [`overlap::Waiver`]'s settings: set, a documentation-only overlap does
@@ -3483,7 +3495,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         );
         brief.push_str(&self.verdict_ask());
         let context = (slots, target, hold as HoldRule);
-        self.start_triage(issue, (&pool, brief, intro), Some(read), line, context)
+        self.start_triage(
+            issue,
+            (&pool, brief, intro),
+            None,
+            Some(read),
+            line,
+            context,
+        )
     }
 
     /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
@@ -3910,11 +3929,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// under `rule`, its plan posted as the bot's after `intro` and
     /// dispatched by the plan protocol, whose record keeps it from running twice.
     /// With `triageFollowUpDays` or `revisit`, the plan carries the
-    /// [`fingerprint`] of `read`, the issue's facts and comments.
+    /// [`fingerprint`] of `read`, the issue's facts and comments. With
+    /// `reuse`, the bot's comment as the pass read it is edited into the
+    /// plan instead, a new plan by its new change time, unless it changed
+    /// since.
     fn start_triage(
         &self,
         issue: &ItemRef,
         (pool, brief, intro): (&str, String, &str),
+        reuse: Option<&plan::Comment>,
         read: Option<(&Facts, &[plan::Comment])>,
         line: String,
         (slots, target, rule): (&Slots, &Target, HoldRule),
@@ -3947,7 +3970,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             None => intro.to_owned(),
         };
-        if let Err(error) = self.post_plan(issue, &intro, &plan) {
+        if let Some(seen) = reuse {
+            let comments = plan::issue_comments(&self.client, issue)?;
+            if !epics::unchanged(&comments, seen, &self.config.bot) {
+                let why = format!(
+                    "its planning request {} changed since the pass read it; the next pass reads it again",
+                    seen.url
+                );
+                return Ok(Step::Hold(Hold::new(HoldKind::Other, why)));
+            }
+        }
+        let posted = match reuse.and_then(|seen| plan::comment_id(&seen.url)) {
+            Some(id) => self.edit_plan(issue, id, &intro, &plan),
+            None => self.post_plan(issue, &intro, &plan).map(drop),
+        };
+        if let Err(error) = posted {
             return Ok(Step::Failed(format!("{line} failed: {error:#}"), holds));
         }
         // No overlap check: a triage run changes no files.
@@ -4039,13 +4076,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.direction.as_ref().map(|(_, hash)| hash.as_str())
     }
 
+    /// The bot's comment `id` on `issue` edited to hold `plan` after
+    /// `intro`, as [`Self::post_plan`] would post it.
+    fn edit_plan(&self, issue: &ItemRef, id: u64, intro: &str, plan: &Value) -> Result<()> {
+        let url = format!("{API_ROOT}repos/{}/issues/comments/{id}", issue.repository);
+        let body = plan_body(intro, plan);
+        plan::send(&self.client, "PATCH", &url, &json!({"body": body}), 0).map(drop)
+    }
+
     /// Posts `plan` on `issue` after `intro`, as the plan writer the pass's
     /// token is, and returns the posted plan's id ([`plan::plan_id`]).
     fn post_plan(&self, issue: &ItemRef, intro: &str, plan: &Value) -> Result<String> {
-        let body = format!(
-            "{intro}\n\n```{PLAN_FENCE}\n{plan:#}\n```\n\n{}",
-            crate::Footer::default()
-        );
+        let body = plan_body(intro, plan);
         let comments = format!(
             "{API_ROOT}repos/{}/issues/{}/comments",
             issue.repository, issue.number
