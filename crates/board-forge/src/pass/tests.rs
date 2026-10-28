@@ -237,6 +237,33 @@ pub(super) const EPIC_LINES: &[&str] = &[
     "hold epic cgwalters-forge/tracker#766: labelled needs-human; otherwise due to be planned (its sub-issues changed (cgwalters-forge/actions#83 closed, cgwalters-forge/agent-board#167 closed, cgwalters-forge/agent-board#168 closed and 2 more))",
 ];
 
+/// The recorded board's children of a parent that is not a live epic, held
+/// after the candidates line, under `cgwalters-forge/`.
+const NOT_LIVE: &[(&str, &str)] = &[
+    ("agent-board#100", "tracker#649"),
+    ("agentic-job#1736", "agentic-job#1735"),
+    ("tracker#159", "tracker#101"),
+    ("tracker#185", "tracker#33"),
+    ("tracker#226", "tracker#225"),
+    ("tracker#227", "tracker#225"),
+    ("tracker#228", "tracker#225"),
+    ("tracker#229", "tracker#225"),
+    ("tracker#230", "tracker#225"),
+    ("tracker#235", "tracker#33"),
+    ("tracker#291", "tracker#286"),
+    ("tracker#301", "tracker#238"),
+    ("tracker#403", "tracker#401"),
+    ("tracker#441", "tracker#430"),
+    ("tracker#447", "tracker#446"),
+    ("tracker#448", "tracker#446"),
+    ("tracker#449", "tracker#446"),
+    ("tracker#450", "tracker#446"),
+    ("tracker#650", "tracker#649"),
+    ("tracker#659", "tracker#649"),
+    ("tracker#666", "tracker#649"),
+    ("tracker#849", "tracker#848"),
+];
+
 /// The idle board of 23 October: two runs in flight of eight, a usable
 /// pool, so six runs start: an epic's planning run, then five in Priority
 /// order. Zero would be a regression. Recorded plans and an overlap behind
@@ -250,6 +277,15 @@ fn replay_idle_board_starts_work() {
     ];
     expected.extend(EPIC_LINES);
     expected.push("candidates: 279 (0 opened by others, 22 outside a live epic)");
+    let not_live: Vec<String> = NOT_LIVE
+        .iter()
+        .map(|(child, parent)| {
+            format!(
+                "hold cgwalters-forge/{child}: its parent cgwalters-forge/{parent} is not a live epic (open and labelled epic by the operator or the bot)"
+            )
+        })
+        .collect();
+    expected.extend(not_live.iter().map(String::as_str));
     // The planning run took the last slot stage 4 had.
     expected.extend(&STARTED[..STARTED.len() - 2]);
     expected.push("wip: no slot left; 271 more candidate(s) wait");
@@ -1247,7 +1283,10 @@ fn replay_scenarios() {
         (
             "an epic outside the epics repository is not live",
             Box::new(|r, _| sub_issue(r, "cgwalters-forge/review", "cgwalters")),
-            vec!["candidates: 0 (0 opened by others, 1 outside a live epic)"],
+            vec![
+                "candidates: 0 (0 opened by others, 1 outside a live epic)",
+                "hold cgwalters-forge/tracker#446: its parent cgwalters-forge/review#135 is not a live epic",
+            ],
             0,
             0,
         ),
@@ -1286,7 +1325,10 @@ fn replay_scenarios() {
                 c["epics"] =
                     json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
             }),
-            vec!["candidates: 0 (0 opened by others, 1 outside a live epic)"],
+            vec![
+                "candidates: 0 (0 opened by others, 1 outside a live epic)",
+                "hold cgwalters-forge/tracker#446: its parent cgwalters-forge/review#135 is not a live epic",
+            ],
             0,
             0,
         ),
@@ -1297,7 +1339,10 @@ fn replay_scenarios() {
                 c["epics"] =
                     json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
             }),
-            vec!["candidates: 0 (0 opened by others, 1 outside a live epic)"],
+            vec![
+                "candidates: 0 (0 opened by others, 1 outside a live epic)",
+                "hold cgwalters-forge/tracker#446: its parent elsewhere/review#135 is not a live epic",
+            ],
             0,
             0,
         ),
@@ -2088,8 +2133,29 @@ fn apply_publishes_the_holds() {
         .filter(|h| h.epic)
         .map(|h| json!([h.item, h.kind, h.operator, h.priority]))
         .collect();
+    // So is each parent that is not a live epic, once for all its held
+    // children, waiting on the operator where one of them is P0 or P1.
+    let not_live = |item: &str, operator: bool, priority: &str| {
+        json!([
+            format!("cgwalters-forge/{item}"),
+            "epic-not-live",
+            operator,
+            priority
+        ])
+    };
     let expected = json!([
+        not_live("agentic-job#1735", true, "P1"),
+        not_live("tracker#33", false, "P2"),
+        not_live("tracker#101", false, "P2"),
+        not_live("tracker#225", false, "P2"),
+        not_live("tracker#238", false, "P2"),
+        not_live("tracker#286", false, "P2"),
+        not_live("tracker#401", false, "P2"),
+        not_live("tracker#430", true, "P1"),
+        not_live("tracker#446", true, "P0"),
+        not_live("tracker#649", true, "P0"),
         ["cgwalters-forge/tracker#766", "needs-human", true, null],
+        not_live("tracker#848", true, "P1"),
         [
             "cgwalters-forge/tracker#890",
             "triage-cooldown",
@@ -2098,6 +2164,16 @@ fn apply_publishes_the_holds() {
         ],
     ]);
     assert_eq!(Value::Array(epics), expected);
+    // No entry is a held child of its own.
+    let not_live_kind = |h: &&holds::Published| h.kind == HoldKind::EpicNotLive;
+    let mut kinds = snapshot.holds.iter().filter(not_live_kind);
+    assert!(kinds.clone().all(|h| h.epic));
+    let item = Some("cgwalters-forge/tracker#649");
+    let held = kinds.find(|h| h.item.as_deref() == item);
+    assert_eq!(
+        held.unwrap().reason,
+        "not a live epic, so its 4 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#650 (P0), cgwalters-forge/tracker#659 (P0), cgwalters-forge/tracker#666 (P0) and 1 more"
+    );
 }
 
 /// Two passes compete for the last slot, each with a different plan: the

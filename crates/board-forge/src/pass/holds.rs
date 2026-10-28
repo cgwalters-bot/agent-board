@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use board_core::ItemRef;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The schema of the hold snapshot ([`super::Config::holds`]).
 pub const HOLDS_SCHEMA: &str = "agent-board/holds/v1";
@@ -24,6 +24,9 @@ const QUESTION_PREFIX: &str = "Q:";
 /// for a comment with room to spare; past it, holds that do not wait on the
 /// operator are left out ([`fit`]).
 pub const MAX_COMMENT_CHARS: usize = 60_000;
+/// The most children waiting on the operator a not-live epic's entry names
+/// ([`not_live`]); it counts the rest.
+const MAX_NAMED: usize = 3;
 
 /// What keeps the pass off an item, or off every new run (`Wip`, `Pools`,
 /// `Budget`):
@@ -56,6 +59,9 @@ pub enum HoldKind {
     /// invalid or refused plan, an apply cut short and not proved, a plan
     /// dispatched by hand, or no plan with triage off.
     NeedsOperator,
+    /// Its parent is not a live epic; the operator's only where its
+    /// Priority is among the board's first ([`Hold::operator`]).
+    EpicNotLive,
     Overlap,
     /// Something it depends on could not be read.
     Unreadable,
@@ -82,6 +88,7 @@ impl HoldKind {
             Self::TriageCooldown => "triage-cooldown",
             Self::EpicUnplanned => "epic-unplanned",
             Self::NeedsOperator => "needs-operator",
+            Self::EpicNotLive => "epic-not-live",
             Self::Overlap => "overlap",
             Self::Unreadable => "unreadable",
             Self::Wip => "wip",
@@ -98,7 +105,7 @@ impl HoldKind {
     pub fn operator(self) -> bool {
         matches!(
             self,
-            Self::NeedsHuman | Self::EpicUnplanned | Self::NeedsOperator
+            Self::NeedsHuman | Self::EpicUnplanned | Self::NeedsOperator | Self::EpicNotLive
         )
     }
 }
@@ -138,6 +145,10 @@ pub enum Scope {
     Item(ItemRef),
     /// A stage 3 epic: `hold epic OWNER/REPO#N: …`.
     Epic(ItemRef),
+    /// A stage 4 candidate under a parent that is not a live epic, and that
+    /// parent: a line of its own like [`Scope::Item`]'s, but one entry for
+    /// all of the parent's children in the snapshot ([`snapshot`]).
+    Under(ItemRef, ItemRef),
 }
 
 /// One hold the pass decided, with what the board says of its item.
@@ -157,7 +168,9 @@ impl Entry {
         let reason = &self.hold.reason;
         match &self.scope {
             Scope::Pass => format!("hold {}: {reason}", self.hold.kind.name()),
-            Scope::Item(item) => format!("hold {}: {reason}", item.display()),
+            Scope::Item(item) | Scope::Under(item, _) => {
+                format!("hold {}: {reason}", item.display())
+            }
             Scope::Epic(epic) => format!("hold epic {}: {reason}", epic.display()),
         }
     }
@@ -165,7 +178,7 @@ impl Entry {
     fn item(&self) -> Option<&ItemRef> {
         match &self.scope {
             Scope::Pass => None,
-            Scope::Item(item) | Scope::Epic(item) => Some(item),
+            Scope::Item(item) | Scope::Epic(item) | Scope::Under(item, _) => Some(item),
         }
     }
 
@@ -173,7 +186,7 @@ impl Entry {
         let item = self.item();
         Published {
             item: item.map(ItemRef::display),
-            url: item.map(|i| format!("https://{}/{}/issues/{}", i.host, i.repository, i.number)),
+            url: item.map(url),
             epic: matches!(self.scope, Scope::Epic(_)),
             kind: self.hold.kind,
             reason: self.hold.reason.clone(),
@@ -235,7 +248,8 @@ pub struct Published {
     /// `OWNER/REPO#N`; null for a hold of every new run.
     pub item: Option<String>,
     pub url: Option<String>,
-    /// Whether the item is an epic stage 3 holds.
+    /// Whether the item is an epic stage 3 holds, or a parent that is not
+    /// a live epic (`epic-not-live`).
     pub epic: bool,
     pub kind: HoldKind,
     /// What its line says after `hold …: `.
@@ -254,15 +268,74 @@ pub fn question(why: &str) -> Option<String> {
     (!asked.is_empty()).then(|| asked.to_owned())
 }
 
+fn url(item: &ItemRef) -> String {
+    format!(
+        "https://{}/{}/issues/{}",
+        item.host, item.repository, item.number
+    )
+}
+
+/// How the snapshot orders an item: by repository and number.
+fn order(item: &ItemRef) -> (String, u64) {
+    (item.repository.to_ascii_lowercase(), item.number)
+}
+
+/// The one entry for `epic`, not live, and its held `children`: it waits
+/// on the operator if any of them does, with their highest Priority, and
+/// names up to [`MAX_NAMED`] of those children, highest Priority first.
+fn not_live(epic: &ItemRef, children: &[&Entry]) -> Published {
+    let mut waiting = children.to_vec();
+    waiting.retain(|c| c.hold.operator);
+    waiting.sort_by_key(|c| (c.priority.clone(), c.item().map(order)));
+    let mut reason = format!(
+        "not a live epic, so its {} open child issue(s) wait until the operator or the bot labels it epic",
+        children.len()
+    );
+    let named: Vec<String> = (waiting.iter().take(MAX_NAMED))
+        .map(|c| {
+            let item = c.item().map(ItemRef::display).unwrap_or_default();
+            format!("{item} ({})", c.priority.as_deref().unwrap_or_default())
+        })
+        .collect();
+    if !named.is_empty() {
+        reason.push_str(&format!(", among them {}", named.join(", ")));
+    }
+    if waiting.len() > MAX_NAMED {
+        reason.push_str(&format!(" and {} more", waiting.len() - MAX_NAMED));
+    }
+    Published {
+        item: Some(epic.display()),
+        url: Some(url(epic)),
+        epic: true,
+        kind: HoldKind::EpicNotLive,
+        reason,
+        operator: !waiting.is_empty(),
+        priority: children.iter().filter_map(|c| c.priority.clone()).min(),
+        question: None,
+    }
+}
+
 /// The snapshot of `entries` at `at`, with the pass's `wip` and `pass`: the
 /// holds of every new run first, in the order decided, then by repository
-/// and number.
+/// and number. The children held under a parent that is not a live epic
+/// ([`Scope::Under`]) are one entry for that parent ([`not_live`]), so
+/// that the review app asks the operator once an epic, not once a child.
 pub fn snapshot(entries: &[Entry], at: String, (wip, pass): (Wip, PassSummary)) -> Snapshot {
-    let mut sorted: Vec<&Entry> = entries.iter().collect();
-    sorted.sort_by_key(|e| {
-        e.item()
-            .map(|i| (i.repository.to_ascii_lowercase(), i.number))
-    });
+    let mut under: BTreeMap<(String, u64), (&ItemRef, Vec<&Entry>)> = BTreeMap::new();
+    let mut sorted = Vec::new();
+    for entry in entries {
+        match &entry.scope {
+            Scope::Under(_, epic) => {
+                let (_, children) = under.entry(order(epic)).or_insert((epic, Vec::new()));
+                children.push(entry);
+            }
+            _ => sorted.push((entry.item().map(order), entry.published())),
+        }
+    }
+    for (key, (epic, children)) in under {
+        sorted.push((Some(key), not_live(epic, &children)));
+    }
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
     Snapshot {
         schema: HOLDS_SCHEMA,
         at,
@@ -270,7 +343,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, pass): (Wip, PassSummary)) 
         wip,
         pass,
         leases: None,
-        holds: sorted.into_iter().map(Entry::published).collect(),
+        holds: sorted.into_iter().map(|(_, published)| published).collect(),
     }
 }
 
@@ -717,6 +790,7 @@ mod tests {
             HoldKind::TriageCooldown,
             HoldKind::EpicUnplanned,
             HoldKind::NeedsOperator,
+            HoldKind::EpicNotLive,
             HoldKind::Overlap,
             HoldKind::Unreadable,
             HoldKind::Wip,
@@ -731,7 +805,69 @@ mod tests {
         .collect();
         assert_eq!(
             operator,
-            ["needs-human", "epic-unplanned", "needs-operator"]
+            [
+                "needs-human",
+                "epic-unplanned",
+                "needs-operator",
+                "epic-not-live"
+            ]
+        );
+    }
+
+    /// Children under a parent that is not a live epic: a line each, one
+    /// entry for the parent, which waits on the operator only through a
+    /// child that does, named highest Priority first; their order decided
+    /// does not change it.
+    #[test]
+    fn not_live_epics_are_one_entry() {
+        let under = |n, epic, priority: Option<&str>| Entry {
+            scope: Scope::Under(item("o/r", n), item("o/t", epic)),
+            hold: Hold::new(HoldKind::EpicNotLive, "its parent is not a live epic")
+                .operator(priority.is_some_and(|p| p < "P2")),
+            priority: priority.map(Into::into),
+            why: None,
+        };
+        let mut entries = vec![
+            under(1, 9, Some("P3")),
+            under(2, 9, Some("P1")),
+            under(3, 9, Some("P0")),
+            under(4, 5, Some("P2")),
+            under(5, 5, None),
+        ];
+        assert_eq!(
+            entries[0].line(),
+            "hold o/r#1: its parent is not a live epic"
+        );
+        let grouped = |entries: &[Entry]| {
+            (bare(entries).holds.iter())
+                .map(|h| json!([h.item, h.epic, h.operator, h.priority, h.reason]))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            json!([
+                "o/t#5",
+                true,
+                false,
+                "P2",
+                "not a live epic, so its 2 open child issue(s) wait until the operator or the bot labels it epic"
+            ]),
+            json!([
+                "o/t#9",
+                true,
+                true,
+                "P0",
+                "not a live epic, so its 3 open child issue(s) wait until the operator or the bot labels it epic, among them o/r#3 (P0), o/r#2 (P1)"
+            ]),
+        ];
+        assert_eq!(grouped(&entries), expected);
+        entries.reverse();
+        assert_eq!(grouped(&entries), expected);
+        for n in 6..=9 {
+            entries.push(under(n, 9, Some("P1")));
+        }
+        assert_eq!(
+            grouped(&entries)[1][4],
+            "not a live epic, so its 7 open child issue(s) wait until the operator or the bot labels it epic, among them o/r#3 (P0), o/r#2 (P1), o/r#6 (P1) and 3 more"
         );
     }
 }
