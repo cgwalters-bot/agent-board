@@ -159,9 +159,11 @@ const FOLLOW_UP_SECONDS: i64 = 24 * 60 * 60;
 /// What a triage plan posted by [`Scheduler::replan`] says first.
 const REPLAN: &str = "The board pass asks a triage run to plan the rest of this issue: \
                       its last planned run ended and the issue is still open.";
-/// How many of the board's first Priority options (P0 and P1) an issue's
-/// own body plan is taken for, with [`Config::body_plans`].
-const BODY_PLAN_PRIORITIES: usize = 2;
+/// How many of the board's first Priority options (P0 and P1) are its top
+/// ([`top_priority`]): an issue's own body plan is taken for these, with
+/// [`Config::body_plans`], and a child held under a parent that is not a
+/// live epic waits on the operator at these.
+const TOP_PRIORITIES: usize = 2;
 /// What the copy of an issue's body plan posted by [`Scheduler::consider`]
 /// says first.
 const BODY_PLAN: &str = "The board pass takes this issue's plan from its body.";
@@ -1315,6 +1317,13 @@ pub fn rank(options: &[String], epic: Option<&str>, own: Option<&str>, facts: &F
         facts.issue.repository.to_ascii_lowercase(),
         facts.issue.number,
     )
+}
+
+/// Whether `facts`'s own Priority is among the board's first
+/// [`TOP_PRIORITIES`] options.
+fn top_priority(options: &[String], facts: &Facts) -> bool {
+    let top = &options[..options.len().min(TOP_PRIORITIES)];
+    top.iter().any(|p| facts.priority.as_ref() == Some(p))
 }
 
 // ---- The forge, bounded ----
@@ -2554,7 +2563,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// The board issues that qualify, in order: open, in a work repository,
     /// not an epic, question or the usage or holds issue; a child of a live epic, or
     /// opened by the operator or the bot, each with its [`Rank`]. Says how
-    /// many were left out.
+    /// many were left out, then holds each child of a parent that is not a
+    /// live epic ([`HoldKind::EpicNotLive`]): only the operator or the bot
+    /// makes it live, but the operator learns what waits on it.
     fn candidates<'b>(&mut self, board: &'b BoardRead) -> Vec<(Rank, &'b Facts)> {
         let config = self.config;
         let people = self.writers();
@@ -2564,7 +2575,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .map(|(repository, issue)| format!("{repository}#{issue}").to_ascii_lowercase())
             .collect();
         let mut ranked = Vec::new();
-        let (mut visitors, mut outside) = (0, 0);
+        let (mut visitors, mut outside) = (0, Vec::new());
         for facts in board.items.values() {
             if !facts.open
                 || !config.works_in(&facts.issue.repository)
@@ -2589,7 +2600,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Some(parent) => match self.live(parent) {
                     Ok(true) => board.items.get(&key(&parent.issue)),
                     Ok(false) => {
-                        outside += 1;
+                        let why = format!(
+                            "its parent {} is not a live epic (open and labelled epic by the operator or the bot)",
+                            parent.issue.display()
+                        );
+                        let top = top_priority(&board.options, facts);
+                        outside.push(Entry {
+                            scope: Scope::Under(facts.issue.clone(), parent.issue.clone()),
+                            hold: Hold::new(HoldKind::EpicNotLive, why).operator(top),
+                            priority: facts.priority.clone(),
+                            why: facts.why.clone(),
+                        });
                         continue;
                     }
                     Err(why) => {
@@ -2605,9 +2626,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
         self.report.tally.1.candidates = Some(ranked.len());
         self.line(format!(
-            "candidates: {} ({visitors} opened by others, {outside} outside a live epic)",
-            ranked.len()
+            "candidates: {} ({visitors} opened by others, {} outside a live epic)",
+            ranked.len(),
+            outside.len()
         ));
+        for entry in outside {
+            self.record(entry);
+        }
         ranked
     }
 
@@ -3585,7 +3610,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// With [`Config::body_plans`], the plan an issue with no plan comment
     /// holds in its body, with its JSON block and the body as read: none for an issue outside
-    /// the board's first [`BODY_PLAN_PRIORITIES`] Priority options, or whose
+    /// the board's first [`TOP_PRIORITIES`] Priority options, or whose
     /// body holds no plan block by a writer, which leaves it to triage. The
     /// body is weighed as a plan comment is ([`plan::newest_plan`]), so one
     /// last edited by someone else, or an invalid plan, holds the issue.
@@ -3594,8 +3619,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         facts: &Facts,
         board: &BoardRead,
     ) -> Result<Option<std::result::Result<BodyPlan, String>>> {
-        let top = &board.options[..board.options.len().min(BODY_PLAN_PRIORITIES)];
-        if !self.config.body_plans || !top.iter().any(|p| facts.priority.as_ref() == Some(p)) {
+        if !self.config.body_plans || !top_priority(&board.options, facts) {
             return Ok(None);
         }
         let body = [self.body(&facts.issue)?];

@@ -83,6 +83,14 @@ more from T`): `epic-unplanned` with `operator` false. When the retry gets no
 plan either, the hold is `epic-unplanned` with `operator` true; once its
 `needs-human` label is on, it is `needs-human`, its Why's question in
 `question`.
+A candidate whose parent is not a live epic (see [Scheduling](#scheduling))
+is held `epic-not-live` with a line of its own after the `candidates:` line
+(`hold OWNER/REPO#N: its parent OWNER/REPO#E is not a live epic …`), but the
+snapshot has one entry per such parent instead of one per child: the
+parent's `item` and `url`, `epic` true, the highest Priority among its held
+children, a reason that counts them and names up to three at the board's
+first two Priority options (P0 and P1), and `operator` true only where there
+is one, so that the review app asks the operator once to label the epic.
 The other kinds are `closed`, `needs-design` (labelled so: a parked design,
 which still blocks dispatch but asks the operator nothing), `blocked`
 (board Blocked), `waiting-on` (open
@@ -461,7 +469,9 @@ repositories, excluding epics and the usage issue. An epic child qualifies
 only through a live epic whose latest `epic` label event is the operator's
 or the bot's: the operator files epics through the bot.
 A live epic is in `epics.repository`, or with `epics.inWorkRepositories` in
-any work repository; stage 3 plans only the former.
+any work repository; stage 3 plans only the former. A child of any other
+parent does not qualify, and is held as `epic-not-live`, so the operator sees
+what waits on the label (see the hold snapshot above).
 An unparented issue qualifies only when opened by the operator or bot; public
 visitors must not be able to spend runs simply by filing issues. Deduplicate by
 repository and number. No separate under-pace candidate source exists.
