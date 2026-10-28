@@ -1,14 +1,17 @@
 //! The maintain stage (agent-board#384, docs/pass.md#maintain): once a day,
 //! after `hourUtc`, the incoming pull requests of the repositories where
 //! the operator opened or reviewed pull requests, whose head changed since
-//! the pass last planned a digest, are due one read-only run, which assesses
+//! a digest last assessed it, are due one read-only run, which assesses
 //! them for the operator as one comment on the digest issue. While a digest
 //! is due, the other stages leave `share` of each pool's allowance to it.
 //!
-//! The pass records the heads it planned for in its own comment on the
-//! digest issue (agent-board#387): the run's comment is the bot's too, and
-//! heads a prompt injection wrote there could keep a pull request out of
-//! review for good.
+//! The pass records the heads it planned for, pending, and those a digest
+//! acknowledged in its own comment on the digest issue (agent-board#387,
+//! agent-board#400): the run's comment is the bot's too, and heads a prompt
+//! injection wrote there could keep a pull request out of review for good.
+//! So a later day's pass acknowledges only the pull requests the digest
+//! after the plan's dispatch record lists at the planned head, and reads no
+//! heads of the run's.
 //!
 //! The run is a `research` run of the caller's, whose comment, logs and
 //! artifacts are public. So the stage dispatches the run's plan only where
@@ -47,13 +50,23 @@ impl<C: Rest> Rest for Attempt<'_, C> {
 pub const DIGEST_SCHEMA: &str = "agent-board/maintain-digest/v1";
 /// The info string of that block's fence.
 pub const DIGEST_FENCE: &str = "agent-board-maintain-digest";
+/// The digest's groups, and whether an entry of each names its head.
+const DIGEST_GROUPS: &[(&str, bool)] = &[
+    ("approve", true),
+    ("closer", true),
+    ("waiting", false),
+    ("stale", false),
+];
 /// The first line of the pass's own comment on the digest issue, by which
 /// it finds it again.
 pub const PLAN_MARKER: &str = "<!-- agent-board-maintain-plan v1 -->";
 /// The schema of that comment's block.
-pub const PLAN_SCHEMA: &str = "agent-board/maintain-plan/v1";
+pub const PLAN_SCHEMA: &str = "agent-board/maintain-plan/v2";
 /// The info string of that block's fence.
 pub const PLAN_BLOCK: &str = "agent-board-maintain-plan";
+/// The schema before acknowledged heads were kept apart from pending ones:
+/// its day still counts, its heads, never assessed, do not.
+pub(super) const OLD_PLAN_SCHEMA: &str = "agent-board/maintain-plan/v1";
 /// The run kind the digest's plan asks for: its runs hand back one comment.
 const DIGEST_KIND: &str = "research";
 /// The most repositories `maintain.repos.max` may keep: one listing request
@@ -239,16 +252,46 @@ fn due_from(now: OffsetDateTime, hour: u8) -> Result<OffsetDateTime> {
     Ok(now.to_offset(time::UtcOffset::UTC).replace_time(time))
 }
 
-/// The pass's recorded plan: the day it was for, and the heads it recorded.
-fn recorded(body: &str) -> Result<(String, BTreeMap<String, String>)> {
+/// The pass's recorded plan.
+#[derive(Debug)]
+struct Record {
+    /// The start of the day it was planned for.
+    from: String,
+    /// The heads a digest acknowledged, the first [`HEAD_CHARS`] of each,
+    /// by `OWNER/REPO#N`.
+    heads: BTreeMap<String, String>,
+    pending: Option<Pending>,
+}
+
+/// The pull requests a plan listed, awaiting its digest.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pending {
+    /// The plan's id on the digest issue ([`plan::plan_id`]), whose
+    /// dispatch record the digest follows; none where it was not posted.
+    plan: Option<String>,
+    /// The full head commit the brief listed, by `OWNER/REPO#N`.
+    heads: BTreeMap<String, String>,
+}
+
+/// The pass's recorded plan in `body`.
+fn recorded(body: &str) -> Result<Record> {
     let value = plan::fenced_json(body, PLAN_BLOCK)
         .context("its block")?
         .context("no block")?;
+    let old = value["schema"] == OLD_PLAN_SCHEMA;
     ensure!(
-        value["schema"] == PLAN_SCHEMA,
+        old || value["schema"] == PLAN_SCHEMA,
         "its schema is not {PLAN_SCHEMA}"
     );
-    let from = value["from"].as_str().context("it has no from")?;
+    let from = value["from"].as_str().context("it has no from")?.to_owned();
+    if old {
+        return Ok(Record {
+            from,
+            heads: BTreeMap::new(),
+            pending: None,
+        });
+    }
     let heads = value["heads"].as_object().context("it has no heads")?;
     let heads = heads
         .iter()
@@ -257,18 +300,25 @@ fn recorded(body: &str) -> Result<(String, BTreeMap<String, String>)> {
             Ok((key.clone(), head.to_owned()))
         })
         .collect::<Result<_>>()?;
-    Ok((from.to_owned(), heads))
+    let pending: Option<Pending> =
+        serde_json::from_value(value["pending"].clone()).context("its pending")?;
+    if let Some(pending) = &pending {
+        ensure!(
+            (pending.heads.values())
+                .all(|h| h.len() == 40 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))),
+            "a pending head is not a full head commit"
+        );
+    }
+    Ok(Record {
+        from,
+        heads,
+        pending,
+    })
 }
 
-/// The plan `comment` records, if only `bot` wrote it: whoever may edit
-/// comments on the digest issue could otherwise set its day or its heads,
-/// and so keep pull requests out of review. A comment edited by another
-/// account, or by one GitHub cannot name, is unreadable, and the pass's
-/// next record replaces it.
-fn trusted(
-    comment: &plan::Comment,
-    bot: &str,
-) -> Result<(String, BTreeMap<String, String>), String> {
+/// Whether only `bot` wrote `comment`: one edited by another account, or
+/// by one GitHub cannot name, could say anything.
+fn unedited(comment: &plan::Comment, bot: &str) -> Result<(), String> {
     let editor = comment.editor.as_deref();
     if (comment.edited || editor.is_some()) && !is(editor, &[bot]) {
         return Err(format!(
@@ -276,7 +326,47 @@ fn trusted(
             editor.unwrap_or("an unknown account")
         ));
     }
+    Ok(())
+}
+
+/// The plan `comment` records, if only `bot` wrote it: whoever may edit
+/// comments on the digest issue could otherwise set its day or its heads,
+/// and so keep pull requests out of review. A comment edited by another
+/// account, or by one GitHub cannot name, is unreadable, and the pass's
+/// next record replaces it.
+fn trusted(comment: &plan::Comment, bot: &str) -> Result<Record, String> {
+    unedited(comment, bot)?;
     recorded(&comment.body).map_err(|e| format!("{e:#}"))
+}
+
+/// The pull requests of `pending` that a digest in `body` for the day
+/// `date` assessed, by key; none where `body` holds no such digest. An
+/// entry counts only at the head the brief listed, where its group names
+/// one, and a pull request any entry lists at another head does not count
+/// at all. No other field of the run's is read.
+fn assessed(body: &str, date: &str, pending: &Pending) -> Option<BTreeSet<String>> {
+    let digest = plan::fenced_json(body, DIGEST_FENCE).ok()??;
+    if digest["schema"] != DIGEST_SCHEMA || digest["date"] != date {
+        return None;
+    }
+    let (mut found, mut moved) = (BTreeSet::new(), BTreeSet::new());
+    for (group, headed) in DIGEST_GROUPS {
+        for entry in digest[*group].as_array()? {
+            let pr = entry["pr"].as_str().unwrap_or_default();
+            let Some((key, sha)) =
+                (pending.heads.iter()).find(|(key, _)| key.eq_ignore_ascii_case(pr))
+            else {
+                continue;
+            };
+            let at = match entry.get("head") {
+                Some(head) => head.as_str() == Some(sha.as_str()),
+                None => !headed,
+            };
+            if at { &mut found } else { &mut moved }.insert(key.clone());
+        }
+    }
+    found.retain(|key| !moved.contains(key));
+    Some(found)
 }
 
 /// Each pool of `snapshot` that has used more than `keep` of its allowance
@@ -471,7 +561,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             configuration: Some(configuration),
             comment: receipt.clone(),
         });
-        let comment = self.plan_comment(on, receipt.as_deref())?;
+        let (comments, comment) = self.plan_comment(on, receipt.as_deref())?;
         let last = comment
             .as_ref()
             .map(|c| (c.url.clone(), trusted(c, &config.bot)));
@@ -484,14 +574,14 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         };
         let (heads, since) = match &last {
             None => (BTreeMap::new(), "no plan".to_owned()),
-            Some((url, Ok((day, _)))) if *day == stamp => {
+            Some((url, Ok(record))) if record.from == stamp => {
                 self.line(format!(
                     "maintain: today's plan is {url}; the next is due from {next}"
                 ));
                 self.settle();
                 return Ok(0);
             }
-            Some((url, Ok((_, heads)))) => (heads.clone(), url.clone()),
+            Some((url, Ok(record))) => (self.acknowledge(record, &comments)?, url.clone()),
             Some((url, Err(why))) => (
                 BTreeMap::new(),
                 format!("{url}, whose heads are unreadable: {why}"),
@@ -516,10 +606,14 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             changed.len(),
             names.join(", ")
         ));
-        // Those left for the next digest are recorded as unread.
-        let carried: BTreeMap<&str, &str> = (pulls.iter())
-            .filter(|p| review.contains(p) || !changed.contains(p))
+        // The acknowledged heads still listed are kept; those reviewed
+        // await the digest, and those left for the next digest stay due.
+        let acknowledged: BTreeMap<&str, &str> = (pulls.iter())
+            .filter(|p| !changed.contains(p))
             .map(|p| (p.key.as_str(), p.head.as_str()))
+            .collect();
+        let pending: BTreeMap<&str, &str> = (review.iter())
+            .map(|p| (p.key.as_str(), p.sha.as_str()))
             .collect();
         let snapshot = self.snapshot();
         let own = snapshot.as_ref().map(|s| {
@@ -540,8 +634,6 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     "brief": brief(config, maintain, from.date(), &repos, review, more),
                 });
                 plan::JobPlan::from_json(&plan).context("the digest's plan")?;
-                let record =
-                    json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": carried, "plan": plan});
                 let issue = ItemRef {
                     host: DEFAULT_HOST.into(),
                     repository: on.0.into(),
@@ -553,15 +645,24 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     Ok(false) => Some(format!("{repo} is not public")),
                     Err(error) => Some(format!("cannot read whether {repo} is public: {error:#}")),
                 };
-                if let Some(why) = dry {
-                    self.line(format!("maintain: plan only; {why}: {plan}"));
-                    self.record_plan(on, comment.as_ref(), &record, false);
-                } else if self.start_digest(&issue, &pool, &plan, git_ref)? {
-                    started = 1;
-                    self.record_plan(on, comment.as_ref(), &record, true);
+                let public = dry.is_none();
+                // The plan's id where it was posted, if it was started, or
+                // sent and perhaps started; a plan only is posted nowhere.
+                let posted = match dry {
+                    Some(why) => {
+                        self.line(format!("maintain: plan only; {why}: {plan}"));
+                        Some(None)
+                    }
+                    None => self.start_digest(&issue, &pool, &plan, git_ref)?,
+                };
+                if let Some(id) = posted {
+                    let record = json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": acknowledged,
+                        "pending": {"plan": id, "heads": pending}, "plan": plan});
+                    started = usize::from(public);
+                    self.record_plan(on, comment.as_ref(), &record, public);
                     // Started, or sent and perhaps started: not again today,
-                    // its heads recorded or not.
-                    if self.apply {
+                    // its plan recorded or not.
+                    if public && self.apply {
                         self.settle();
                     }
                 }
@@ -608,25 +709,26 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// as a writer's plan and dispatched by the plan protocol. The heads are
     /// recorded after it, so `--max-writes` must leave that write too, or
     /// the next pass would start it again. Whether it started, or was sent
-    /// and perhaps started; a preview says it would.
+    /// and perhaps started, with the posted plan's id; a preview says it
+    /// would, and posts none.
     fn start_digest(
         &mut self,
         issue: &ItemRef,
         pool: &str,
         plan: &Value,
         git_ref: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<Option<String>>> {
         let line = format!(
             "maintain: start {DIGEST_KIND} {} pool={pool}",
             issue.display()
         );
         if let Some(why) = self.budget_hold(1.0) {
             self.line(format!("maintain: {why}; the digest waits"));
-            return Ok(false);
+            return Ok(None);
         }
         if let Some(why) = self.other_holds() {
             self.line(format!("maintain: {why}; the digest waits"));
-            return Ok(false);
+            return Ok(None);
         }
         let target = self.config.target(git_ref);
         target.validate()?;
@@ -637,12 +739,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 "maintain: wip: {} of {wip} runs active; the digest waits",
                 active.len()
             ));
-            return Ok(false);
+            return Ok(None);
         }
         for kind in [Kind::Dispatch, Kind::Write] {
             if let Some(held) = self.caps.check(kind) {
                 self.line(format!("{held}: {line}"));
-                return Ok(false);
+                return Ok(None);
             }
         }
         // Do not adopt heads or receipts from discovered comments. They may
@@ -666,12 +768,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     .is_ok_and(|p| p.is_some_and(|p| p.kind == DIGEST_KIND))
         }) {
             self.line("maintain: a research plan already exists today; the digest waits".into());
-            return Ok(false);
+            return Ok(None);
         }
         self.caps.count(Kind::Dispatch);
         if !self.apply {
             self.line(line);
-            return Ok(true);
+            return Ok(Some(None));
         }
         let intro = "The board pass's maintain digest for today: a read-only run, whose only \
                      output is one comment on this issue.";
@@ -698,18 +800,18 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             }) => {
                 let run = run.as_deref().unwrap_or("unnamed");
                 self.line(format!("{line} record={record} run={run}"));
-                Ok(true)
+                Ok(Some(Some(id)))
             }
             Ok(_) => {
                 self.line(format!("{line}: the dispatch waited; the digest waits"));
-                Ok(false)
+                Ok(None)
             }
-            // Preparation failures and confirmed refusals leave heads pending.
+            // Preparation failures and confirmed refusals record nothing.
             // A lost response or server error might still hide a start.
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("{line} failed: {error:#}"));
-                Ok(maybe_started)
+                Ok(maybe_started.then_some(Some(id)))
             }
         }
     }
@@ -721,9 +823,10 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }
     }
 
-    /// Records `record`, the plan and the heads it was planned for, in the
-    /// pass's own comment on the digest issue, editing `comment` where there
-    /// is one: one write, which `--max-writes` holds and a preview leaves.
+    /// Records `record`, the plan, the heads it was planned for and those
+    /// acknowledged, in the pass's own comment on the digest issue, editing
+    /// `comment` where there is one: one write, which `--max-writes` holds
+    /// and a preview leaves.
     /// Only where `public`, read so just before, may the repository not be
     /// private.
     fn record_plan(
@@ -744,9 +847,9 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             return;
         }
         let body = format!(
-            "{PLAN_MARKER}\nThe board pass's maintain plan for the day from {}, and the heads it was \
-             planned for. Written by `agent-board pass`, which edits this comment each day and reads \
-             only it.\n\n```{PLAN_BLOCK}\n{record:#}\n```\n",
+            "{PLAN_MARKER}\nThe board pass's maintain plan for the day from {}, the heads it was \
+             planned for and those digests acknowledged. Written by `agent-board pass`, which edits \
+             this comment each day and reads only it.\n\n```{PLAN_BLOCK}\n{record:#}\n```\n",
             text(record, "/from")
         );
         let written = if public {
@@ -772,14 +875,15 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// Only the comment whose creation the pass recorded locally may supply
     /// heads. If it disappeared or lost its marker, bootstrap a new comment
     /// without adopting any other bot-authored marker. Edit metadata still
-    /// guards the recorded comment's current contents ([`trusted`]).
+    /// guards the recorded comment's current contents ([`trusted`]). With
+    /// it, the digest issue's comments, where the digest is looked for.
     fn plan_comment(
         &self,
         on: (&str, u64),
         receipt: Option<&str>,
-    ) -> Result<Option<plan::Comment>> {
+    ) -> Result<(Vec<plan::Comment>, Option<plan::Comment>)> {
         let Some(receipt) = receipt else {
-            return Ok(None);
+            return Ok((vec![], None));
         };
         let issue = ItemRef {
             host: DEFAULT_HOST.into(),
@@ -788,9 +892,82 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         };
         let comments = plan::issue_comments(&self.client, &issue)?;
         let bot = [self.config.bot.as_str()];
-        Ok(comments.into_iter().find(|c| {
+        let own = comments.iter().find(|c| {
             c.url == receipt && is(c.author.as_deref(), &bot) && c.body.starts_with(PLAN_MARKER)
-        }))
+        });
+        let own = own.cloned();
+        Ok((comments, own))
+    }
+
+    /// The heads `record` acknowledged, with those its pending plan's
+    /// digest assessed. The digest is the first comment after the plan's
+    /// first dispatch record by a writer that only the bot wrote and that
+    /// holds a digest for the plan's day: a run posts as the bot, but
+    /// cannot write before its own dispatch, and a later record, which a
+    /// run could forge, does not count. With none, the plan's pull requests
+    /// stay due, and are planned again.
+    fn acknowledge(
+        &mut self,
+        record: &Record,
+        comments: &[plan::Comment],
+    ) -> Result<BTreeMap<String, String>> {
+        let mut heads = record.heads.clone();
+        let Some(pending) = &record.pending else {
+            return Ok(heads);
+        };
+        let n = pending.heads.len();
+        let day = OffsetDateTime::parse(&record.from, &Rfc3339).context("the plan's from")?;
+        let date = day.date().to_string();
+        let writers = self.writers();
+        let bot = self.config.bot.as_str();
+        let claimed = (pending.plan.as_deref()).and_then(|id| {
+            plan::records(comments, &writers, id)
+                .into_iter()
+                .map(|(n, _)| n)
+                .min()
+        });
+        let digest = claimed.and_then(|claimed| {
+            (comments.iter())
+                .filter(|c| plan::comment_id(&c.url).is_some_and(|id| id > claimed))
+                .filter(|c| is(c.author.as_deref(), &[bot]) && unedited(c, bot).is_ok())
+                .find_map(|c| Some((&c.url, assessed(&c.body, &date, pending)?)))
+        });
+        let said = match (pending.plan.as_deref(), claimed, digest) {
+            (None, ..) => {
+                format!("the plan for {date} was not dispatched; its {n} pull request(s) stay due")
+            }
+            (Some(id), None, _) => {
+                format!(
+                    "plan {id} for {date} has no dispatch record; its {n} pull request(s) stay due"
+                )
+            }
+            (Some(_), Some(_), None) => {
+                format!(
+                    "no digest for {date} followed its dispatch; its {n} pull request(s) stay due"
+                )
+            }
+            (Some(_), Some(_), Some((url, assessed))) => {
+                for (key, sha) in &pending.heads {
+                    if assessed.contains(key) {
+                        heads.insert(key.clone(), sha.chars().take(HEAD_CHARS).collect());
+                    }
+                }
+                let left: Vec<&str> = (pending.heads.keys())
+                    .filter(|key| !assessed.contains(*key))
+                    .map(String::as_str)
+                    .collect();
+                let mut said = format!(
+                    "the digest {url} assessed {} of {n} planned pull request(s)",
+                    assessed.len()
+                );
+                if !left.is_empty() {
+                    said.push_str(&format!("; due again: {}", left.join(", ")));
+                }
+                said
+            }
+        };
+        self.line(format!("maintain: {said}"));
+        Ok(heads)
     }
 
     /// The repositories of [`Repos`]: those of the operator's pull requests
