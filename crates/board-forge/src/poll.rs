@@ -3004,7 +3004,11 @@ pub fn decide(
         }
         return step(if harness { "needs-human" } else { "wait" }, why);
     }
-    step("merge", "review approved and checks green")
+    if harness && matches!(verdicts(pull, config).0, Some((Review::Approved, _))) {
+        step("merge", format!("approved by the operator at {head}"))
+    } else {
+        step("merge", "review approved and checks green")
+    }
 }
 
 /// The fields of an event the pass reads; the rest is not kept in the state.
@@ -5086,7 +5090,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let done = done?.map(|d| format!(" -> {d}")).unwrap_or_default();
         let (action, reason) = (decision.action, &decision.reason);
         // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
-        let line = if matches!(action, REVIEW_RERUN | RUN_RERUN) {
+        let line = if action == "merge" && reason.starts_with("approved by the operator at ") {
+            format!("merge {repo}#{number}: {reason}{done}")
+        } else if matches!(action, REVIEW_RERUN | RUN_RERUN) {
             format!("{action} {repo}#{number} {}: {reason}{done}", short(head))
         } else {
             format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
@@ -8922,6 +8928,67 @@ mod tests {
     }
 
     #[test]
+    fn operator_approval_merges_only_at_head_through_the_normal_path() {
+        for queue in [false, true] {
+            for (login, oid, ci, merged) in [
+                ("cgwalters", HEAD, "SUCCESS", true),
+                ("cgwalters", "older", "SUCCESS", false),
+                ("visitor", HEAD, "SUCCESS", false),
+                ("cgwalters", HEAD, "PENDING", false),
+            ] {
+                let mut fake = github();
+                if queue {
+                    fake.rest
+                        .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                        .unwrap()
+                        .3
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"type": "merge_queue"}));
+                }
+                fake.pulls.insert(
+                    470,
+                    pull(
+                        "pull-470",
+                        json!({
+                            "reviews": {"nodes": [review("APPROVED", user(login), oid, "")]},
+                            "contexts": {"ci": {"conclusion": ci}}
+                        }),
+                    ),
+                );
+                let dispatcher = Fake::default();
+                let outcome = applied(&fake, &dispatcher);
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                assert!(dispatcher.writes.borrow().is_empty());
+                let writes = fake.writes.borrow();
+                assert_eq!(
+                    writes.len(),
+                    usize::from(merged),
+                    "{queue} {login} {oid} {ci}: {:?}",
+                    outcome.lines
+                );
+                if merged {
+                    assert_eq!(
+                        writes[0].1,
+                        json!({"id": fake.pulls[&470]["id"], "head": HEAD})
+                    );
+                    assert_eq!(writes[0].0 == ENQUEUE, queue);
+                    if !queue {
+                        assert!(writes[0].0.contains("mergePullRequest"));
+                    }
+                    assert!(
+                        outcome.lines.iter().any(|line| line.starts_with(&format!(
+                            "merge {REPO}#470: approved by the operator at {HEAD}"
+                        ))),
+                        "{:?}",
+                        outcome.lines
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_behind_head_is_updated_once_a_base_and_never_merged() {
         // #469 comes first, then #470; both approved and green on main.
         let (update, merge) = ("update", "merge");
@@ -8972,7 +9039,7 @@ mod tests {
                 [BEHIND, BEHIND],
                 false,
                 vec![],
-                "#469 488f45ebacd0 merge: review approved and checks green",
+                "#469: approved by the operator at 488f45ebacd03a8bc88dceb3d703a5322850ce77",
             ),
         ] {
             let mut fake = github();
@@ -9856,6 +9923,7 @@ mod tests {
         let stale =
             "needs-human: approved before its base became main; the head needs a review against it";
         let merge = "merge: review approved and checks green";
+        let operator_merge = format!("approved by the operator at {HEAD}");
         let operator = json!({"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]});
         for (default, changed, reviews, line) in [
             (json!({"name": "main"}), None, None, merge),
@@ -9888,7 +9956,7 @@ mod tests {
                 json!({"name": "main"}),
                 Some("2026-10-12T00:55:00Z"),
                 Some(operator.clone()),
-                merge,
+                operator_merge.as_str(),
             ),
             (
                 json!({"name": "main"}),

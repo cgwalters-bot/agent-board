@@ -384,7 +384,14 @@ A pass captures one clock and performs these stages in order:
 2. Follow up PRs using today's `poll` decisions: read followed repositories,
    PR heads, reviews, checks, comments and runs; dispatch bounded fixes/reviews,
    merge only an approved head with green required checks, or comment/label for
-   a person. Retain its claim and head-recheck rules, but follow the
+   a person. For a harness PR (the bot's PR from its fork), an `APPROVED`
+   review by the configured `operator` at the current head suffices in place
+   of the review job's approval. An operator approval at an older head and a
+   visitor's approval count for nothing. This uses the same merge path,
+   including enqueueing where a merge queue is required: required checks,
+   head rechecks and per-pass write caps still gate it. Its log is
+   `merge OWNER/REPO#N: approved by the operator at <head>`.
+   Retain its claim and head-recheck rules, but follow the
    [bookkeeping rule](architecture.md#bookkeeping): in an external repository
    the claims and markers become one hidden comment the bot edits in place, and
    it posts no claim or status comments there. Count every dispatch made
