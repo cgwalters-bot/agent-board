@@ -60,14 +60,20 @@ The concrete threats and the corresponding bounds are:
   routed dispatch, and again before each POST, read both the legacy and selected
   workflow's active runs. Any active run targeting the same repository holds the
   dispatch, conservatively including other items and kinds. The sandbox title
-  suffix `(openai, 4c)` is accepted. Each check reads at most ten pages: five
-  pages of at most 100 runs per workflow, **without a status filter** so a run
-  moving between active states cannot disappear between filtered queries.
-  Completed runs do not hold work. An unavailable, malformed, changing or
-  incomplete inventory fails closed, as does more than 500 historical runs on
-  either workflow. This conservative bound can block the deployed tracker route;
-  it must not be raised or bypassed as an activation workaround. A scalable
-  consistent active-run inventory is a follow-up before adopting crowded callers.
+  suffix `(openai, 4c)` is accepted. Each check lists one page of up to 100
+  runs for each active status (requested, pending, waiting, queued,
+  in_progress), in that order and then again: ten listings per workflow,
+  whatever the length of its history. Neither paging the whole history nor
+  GitHub's filtered `total_count`, which stops at 2500, bounds a busy caller
+  such as the tracker. A run that only moves forward between the reads is
+  listed by the first pass, and one that moves back once (a gate taking it
+  from queued or in_progress to waiting) by the second; one that moves back twice
+  during the reads, or that GitHub's run index has not listed yet, can be
+  missed. Completed runs do not hold work, judged by each run's current
+  status. An unavailable or malformed listing, an unknown status, or more
+  than 100 runs in one active status fails closed. Active runs are identified
+  by their title's second word, `OWNER/NAME#N`, as both callers' `run-name`
+  writes it today; changing that format needs this check changed with it.
   This is a bounded admission check, **not an atomic cross-workflow
   lock**: the operator must serialize invocations across both callers. The
   caller must keep `cancel-in-progress: false`.
