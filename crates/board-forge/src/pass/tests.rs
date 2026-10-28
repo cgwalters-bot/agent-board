@@ -271,10 +271,10 @@ fn budget_holds_epic_planning() {
     let planned = "hold epic cgwalters-forge/tracker#596: due (its sub-issues changed";
     let line = report.lines.iter().find(|l| l.starts_with(planned));
     let line = line.unwrap_or_else(|| panic!("{:#?}", report.lines));
-    assert!(
-        line.ends_with("; budget: $1000 of $1000 this week"),
-        "{line}"
-    );
+    assert!(line.ends_with("; budget: weekly budget reached"), "{line}");
+    let held = report.holds.iter().find(|e| e.line() == *line);
+    let held = held.unwrap_or_else(|| panic!("{line} is not a recorded hold"));
+    assert_eq!(held.hold.kind, HoldKind::Budget);
     assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
 }
 
@@ -744,7 +744,7 @@ fn replay_scenarios() {
         (
             "spend at the weekly budget holds every new run",
             Box::new(|r, c| with_spend(r, c, spend(1003.0))),
-            vec!["budget: $1003 of $1000 this week; new runs wait"],
+            vec!["hold budget: weekly budget reached; new runs wait"],
             0,
             0,
         ),
@@ -753,7 +753,7 @@ fn replay_scenarios() {
             Box::new(|r, c| with_spend(r, c, Value::Null)),
             vec![
                 "usage: claude: 18% used",
-                "budget: the usage snapshot has no spend reading; new runs wait",
+                "hold budget: the usage snapshot has no spend reading; new runs wait",
             ],
             0,
             0,
@@ -765,7 +765,7 @@ fn replay_scenarios() {
                 spend["window_days"] = 30.into();
                 with_spend(r, c, spend);
             }),
-            vec!["budget: the usage snapshot has no spend reading; new runs wait"],
+            vec!["hold budget: the usage snapshot has no spend reading; new runs wait"],
             0,
             0,
         ),
@@ -778,7 +778,7 @@ fn replay_scenarios() {
             }),
             vec![
                 "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $1000 a week, 1000 request(s) unpriced (held)",
-                "budget: the usage snapshot has no spend reading; new runs wait",
+                "hold budget: the usage snapshot has no spend reading; new runs wait",
             ],
             0,
             0,
@@ -793,7 +793,7 @@ fn replay_scenarios() {
                     .remove("unpriced_requests");
                 with_spend(r, c, spend);
             }),
-            vec!["budget: the usage snapshot has no spend reading; new runs wait"],
+            vec!["hold budget: the usage snapshot has no spend reading; new runs wait"],
             0,
             0,
         ),
@@ -804,7 +804,7 @@ fn replay_scenarios() {
                 spend.as_object_mut().unwrap().remove("runs");
                 with_spend(r, c, spend);
             }),
-            vec!["budget: the usage snapshot has no spend reading; new runs wait"],
+            vec!["hold budget: the usage snapshot has no spend reading; new runs wait"],
             0,
             0,
         ),
@@ -837,7 +837,7 @@ fn replay_scenarios() {
             vec![
                 "budget: the usage snapshot has no spend reading; pull requests' fix rounds wait",
                 "pools: claude held, openai held",
-                "budget: the usage snapshot has no spend reading; new runs wait",
+                "hold budget: the usage snapshot has no spend reading; new runs wait",
             ],
             0,
             0,
@@ -863,7 +863,7 @@ fn replay_scenarios() {
             }),
             vec![
                 "usage error: reading the broker",
-                "budget: the usage snapshot has no spend reading; new runs wait",
+                "hold budget: the usage snapshot has no spend reading; new runs wait",
             ],
             0,
             1,
@@ -902,7 +902,7 @@ fn replay_scenarios() {
             }),
             vec![
                 "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)",
-                "budget: $1050 of $1000 this week; new runs wait",
+                "hold budget: weekly budget reached; new runs wait",
             ],
             0,
             0,
@@ -914,9 +914,9 @@ fn replay_scenarios() {
                 followed_draft(r, c);
             }),
             vec![
-                "budget: $1150 of $1000 this week; pull requests' fix rounds wait",
+                "budget: weekly budget reached; pull requests' fix rounds wait",
                 "pools: claude held, openai held",
-                "budget: $1150 of $1000 this week; new runs wait",
+                "hold budget: weekly budget reached; new runs wait",
             ],
             0,
             0,
@@ -1700,7 +1700,9 @@ fn apply_publishes_the_refreshed_usage() {
 /// `--max-writes` holds, only to a private repository, and none where the
 /// comment already has the same holds. tracker#446 is board Blocked and asks
 /// a question in its Why, #527 has no Priority; at WIP 2 the two runs in
-/// flight hold every new run, and stage 3 still holds its epics.
+/// flight hold every new run, and stage 3 still holds its epics. Spend at
+/// the weekly budget (WIP 0 below, which reads 8) holds every new run too,
+/// without its dollar amounts, counted as held in the summary.
 #[test]
 fn apply_publishes_the_holds() {
     let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
@@ -1733,12 +1735,15 @@ fn apply_publishes_the_holds() {
             None,
         ),
         (8, None, false, None, not_private, None),
-        (2, None, true, None, published, Some(&add)),
+        (2, None, true, None, published.clone(), Some(&add)),
+        (0, None, true, None, published, Some(&add)),
     ];
     let at = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1});
     let items = "/data/repositoryOwner/projectV2/items/nodes";
     let mut first: Option<String> = None;
     for (wip, writes, private, found, line, wrote) in cases {
+        let budget = wip == 0;
+        let wip = if budget { 8 } else { wip };
         let mut forge = Forge::new(None, false);
         for entry in &mut forge.replay.requests {
             let nodes = entry["answer"].pointer_mut(items);
@@ -1774,7 +1779,10 @@ fn apply_publishes_the_holds() {
             let request = json!({"request": {"get": url}, "answer": reply(body)});
             forge.replay.requests.push(request);
         }
-        let settings = json!({"wip": wip, "holds": at});
+        let mut settings = json!({"wip": wip, "holds": at});
+        if budget {
+            with_spend(&mut forge.replay, &mut settings, spend(1003.0));
+        }
         let limits = Limits {
             writes,
             ..Limits::default()
@@ -1792,7 +1800,12 @@ fn apply_publishes_the_holds() {
         let writes = forge.writes.borrow();
         let holds = writes
             .iter()
-            .find(|(m, url, _)| url.starts_with(&bot_ops) && m != "GET")
+            // Not the usage snapshot's, which a budget reads from a broker.
+            .find(|(m, url, body)| {
+                url.starts_with(&bot_ops)
+                    && m != "GET"
+                    && text(body, "/body").starts_with(holds::HOLDS_MARKER)
+            })
             .map(|(m, url, body)| (format!("{m} {url}"), text(body, "/body").to_owned()));
         assert_eq!(holds.as_ref().map(|(w, _)| w), wrote, "{line}");
         let Some((_, body)) = holds else {
@@ -1802,10 +1815,14 @@ fn apply_publishes_the_holds() {
         let snapshot = holds::parse(&body).unwrap();
         assert_eq!(snapshot["at"], now.format(&Rfc3339).unwrap());
         // The WIP limit and count and the pass's summary, as its lines say.
-        let (in_flight, candidates, started) = match wip {
-            2 => (2, Value::Null, 0),
+        // Both stop before the board is read.
+        let (in_flight, candidates, started) = match (budget, wip) {
+            (true, _) | (_, 2) => (2, Value::Null, 0),
             _ => (7, json!(9), 5),
         };
+        let held = usize::from(budget);
+        assert!(report.summary.ends_with(&format!("held {held}")), "{line}");
+        assert!(!body.contains('$'), "{body}");
         if let Some(n) = candidates.as_u64() {
             let said = format!("candidates: {n} (");
             assert!(report.lines.iter().any(|l| l.starts_with(&said)), "{said}");
@@ -1844,6 +1861,7 @@ fn apply_publishes_the_holds() {
             ]));
         }
         let expected = match wip {
+            _ if budget => json!([[null, "budget", false, null, null]]),
             2 => json!([[null, "wip", false, null, null]]),
             _ => json!([
                 [

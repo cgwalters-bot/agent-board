@@ -60,8 +60,8 @@ typed value, a kind, a reason and whether it waits on the operator, and its
 `hold …` line is made from that
 value, so the line and the snapshot cannot say different things. Each
 candidate stage 4 holds (`hold OWNER/REPO#N: R`), each epic stage 3 holds
-(`hold epic OWNER/REPO#N: R`) and each hold of every new run (`hold wip|pools:
-R`) is one entry:
+(`hold epic OWNER/REPO#N: R`) and each hold of every new run (`hold
+wip|pools|budget: R`) is one entry:
 
 ```json
 {"item":"cgwalters-forge/tracker#596","url":"https://github.com/cgwalters-forge/tracker/issues/596","epic":true,"kind":"epic-unplanned","reason":"its planning request URL got no plan, nor did URL0 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (its run 77 ended failure). What should change?","operator":true,"priority":"P1","question":null}
@@ -87,10 +87,11 @@ the operator's), `in-flight`, `dispatched` (its plan's run has ended, or an
 epic's planning request waits for its plan), `triage-cooldown` (triaged or
 planned too recently to ask again), `overlap`, `unreadable` (labels, pull
 requests, a parent epic, a plan's target or the runs not read whole), `wip`,
-`pools` and `other`; a reader shows a kind it does not know as `other`.
-Entries are sorted by repository and number, the holds of every new run first.
-A candidate whose consideration failed (`fail …`) or that the pass did not
-reach has none, and a budget stop (`budget: …; new runs wait`) is not one.
+`pools`, `budget` (the week's spend reached `budget.weeklyUsd`, or has no
+reading; see below) and `other`; a reader shows a kind it does not know as
+`other`. Entries are sorted by repository and number, the holds of every new
+run first. A candidate whose consideration failed (`fail …`) or that the pass
+did not reach has none.
 After stage 5, unless stage 3 or 4 failed or stopped early (`epics error: …`,
 `schedule error: …`, `epics: the pass's request or time budget is low`), the
 snapshot `{"schema": "agent-board/holds/v1", "at": T, "truncated": N,
@@ -144,10 +145,18 @@ it does, and a snapshot without it: never $0. Operators' interactive use
 neither counts nor, unpriced, holds. A `since` under a week old does not hold
 either: the broker's spend restarts with it until praxis-credential-broker#35,
 so the week may read low after a deploy. Once the week's spend reaches the budget,
-stages 3 and 4 start no new run (`budget: $1003 of $1000 this week; new runs
-wait`); pull requests' fix and continuation rounds go on until it is 10% past,
-so that work in flight can land, then wait too (`…; pull requests' fix rounds
-wait`). A missing or stale spend reading holds both, as missing usage does.
+stages 3 and 4 start no new run (`hold budget: weekly budget reached; new runs
+wait`, and `…; budget: weekly budget reached` on an epic stage 3 would plan);
+pull requests' fix and continuation rounds go on until it is 10% past,
+so that work in flight can land, then wait too (`budget: weekly budget
+reached; pull requests' fix rounds wait`). A missing or stale spend reading
+holds both, as missing usage does (`hold budget: the usage snapshot has no
+spend reading; new runs wait`). Stage 4's stop is a `budget` hold of every
+new run in the hold snapshot above, and counts as one in the summary's
+`held`. Its reason names no dollar amount, so that what the pass publishes
+does not either; the `usage:` line has the figures. It gives no resume time:
+the broker's spend is a trailing week with no reset, so new runs go again on
+the first pass whose reading is under the budget.
 Without `budget` nothing holds on spend.
 
 With `budget.source: "broker"` (agent-board#341), the budget is instead the
@@ -274,15 +283,15 @@ agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board
 Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N … pool=P`,
 `revisit: …` and `revisit OWNER/REPO#N: why`, `maintain: …`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
-`hold [epic] OWNER/REPO#N: why`, `hold wip|pools: why`,
+`hold [epic] OWNER/REPO#N: why`, `hold wip|pools|budget: why`,
 `held by --max-dispatch: start …`, `status OWNER/REPO#N: …`, `fail …` or
 `… error: …`; a pull request's
 step that a cap held ends `-> held by --max-dispatch` or
 `-> held by --max-writes`. With `--apply`, a started line also names its
 dispatch record and run. The last line is a summary such as
 `summary: dispatched 1/1, writes 3/5, held 12, requests 80, points ~95`, which
-counts what a preview plans and what an apply did, the steps the caps held
-(an uncapped kind has no `/N`), and the pass's budgeted requests and GraphQL
+counts what a preview plans and what an apply did (an uncapped kind has no
+`/N`), the steps the caps held plus stage 4's stop on the weekly budget, and the pass's budgeted requests and GraphQL
 points; `~` marks points estimated as 1 a query and 5 a mutation where the
 response reads no `rateLimit { cost }`.
 A request GitHub still refuses under a rate limit after the client's
