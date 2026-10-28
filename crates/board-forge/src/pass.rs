@@ -137,6 +137,13 @@ const AGAIN: &str = "The board pass asks a triage run to plan this issue again."
 /// `triageFollowUpDays` or `revisit`: the [`fingerprint`] of what its run
 /// read, `<!-- agent-board-inputs: HASH -->` (agent-board#383).
 const INPUTS_MARKER: &str = "agent-board-inputs";
+/// The hidden first line of the comment [`Scheduler::follow_up`] posts with
+/// the [`NEEDS_HUMAN`] label for a verdict of [`ASK_VERDICTS`],
+/// `<!-- agent-board-hold: verdict COMMENT-ID -->` ([`hold_marker`]): the
+/// supervisor's close takes the hold of a `done` verdict as the pass's own
+/// only with it (agent-board#363), as `ask create --apply` adds the same
+/// label as the same bot.
+const HOLD_MARKER: &str = "agent-board-hold";
 /// The most characters the operator's direction may have: past it the pass
 /// reports an error rather than cut it short.
 const DIRECTION_LIMIT: usize = 4_000;
@@ -1194,6 +1201,11 @@ fn carried(body: &str) -> Option<&str> {
     let start = format!("<!-- {INPUTS_MARKER}: ");
     let line = body.lines().find_map(|l| l.strip_prefix(start.as_str()))?;
     line.strip_suffix(" -->")
+}
+
+/// The [`HOLD_MARKER`] line naming the triage verdict comment `verdict`.
+pub(crate) fn hold_marker(verdict: u64) -> String {
+    format!("<!-- {HOLD_MARKER}: verdict {verdict} -->")
 }
 
 /// `base` seconds doubled for each of the `empty` runs in a row that had
@@ -3284,25 +3296,43 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return self.triage(read, AGAIN, (snapshot, target, slots));
         }
         let issue = &facts.issue;
-        if let Some((_, _, verdict)) = &verdict
+        if let Some((_, c, verdict)) = &verdict
             && ASK_VERDICTS.contains(&verdict.as_str())
         {
-            if let Some(held) = self.caps.check(Kind::Write) {
+            // The label and the comment naming the verdict it holds.
+            if let Some(held) = self.caps.check_many(Kind::Write, 2) {
                 let why = format!("{said}; {held}: label {NEEDS_HUMAN}");
                 return Ok(Step::Hold(Hold::new(HoldKind::NeedsHuman, why)));
             }
+            let id = plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?;
             // Counted once sent, whether or not its answer comes back.
-            self.caps.count(Kind::Write);
+            self.caps.count_many(Kind::Write, 2);
             if self.apply {
-                let url = format!(
-                    "{API_ROOT}repos/{}/issues/{}/labels",
+                let issue_url = format!(
+                    "{API_ROOT}repos/{}/issues/{}",
                     issue.repository, issue.number
                 );
                 plan::send(
                     &self.client,
                     "POST",
-                    &url,
+                    &format!("{issue_url}/labels"),
                     &json!({"labels": [NEEDS_HUMAN]}),
+                    0,
+                )?;
+                // After the label: should this fail, the hold has no marker
+                // and waits for the operator, rather than a second marker
+                // being posted by the next pass.
+                let body = format!(
+                    "{}\nThe board pass held [this triage verdict]({}) for the operator with the label {NEEDS_HUMAN}.\n\n{}",
+                    hold_marker(id),
+                    c.url,
+                    crate::Footer::default()
+                );
+                plan::send(
+                    &self.client,
+                    "POST",
+                    &format!("{issue_url}/comments"),
+                    &json!({"body": body}),
                     0,
                 )?;
             }

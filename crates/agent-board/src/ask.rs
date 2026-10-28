@@ -14,6 +14,11 @@
 //! add`/`item edit`, both print proposals unless `--apply` is given, and only then write
 //! with the operator's own token. No workflow here passes `--apply`, and an agent holds
 //! no token.
+//!
+//! Creating an ask first comments on the blocked item. Adding an already-present
+//! `needs-human` label leaves no event, so the comment must invalidate any pass
+//! marker admitting closure of an earlier triage verdict. If it fails, no ask is
+//! opened; a later failure can leave a conservative hold without an ask.
 use anyhow::{Context, Result, ensure};
 use board_core::{ItemRef, NEEDS_HUMAN_LABEL, Snapshot};
 use board_forge::github::{GitHub, Transport};
@@ -174,10 +179,13 @@ fn create_proposals(
     body: &str,
 ) -> Vec<Value> {
     vec![
+        json!({"type": "add_comment", "target_repo": blocked.repository, "item_number": blocked.number, "body": ASK_HOLD}),
         json!({"type": "create_issue", "target_repo": repository, "title": title, "body": body, "labels": [ASK_LABEL, NEEDS_HUMAN_LABEL], "assignees": [args.assignee]}),
         needs_human("add_labels", blocked),
     ]
 }
+
+const ASK_HOLD: &str = "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.";
 
 /// `answer` is `None` for an ask already closed, which is not closed again.
 fn resolve_proposals(ask: &ItemRef, answer: Option<&str>, unblock: Option<&ItemRef>) -> Vec<Value> {
@@ -245,8 +253,9 @@ pub fn create_preview(
 }
 
 /// Check the blocked item's membership and both labels, then print the proposals or,
-/// with `apply`, open the ask labelled, add it to the board and label the blocked item.
-/// The issue is only opened once everything else checks out; a failure after that
+/// with `apply`, comment on the blocked item, open the ask labelled, add it to the
+/// board and label the blocked item. The issue is only opened once everything else
+/// checks out and the comment is posted; a failure after that
 /// leaves the rows printed before it done.
 pub fn create<T: Transport>(
     github: &GitHub<T>,
@@ -272,6 +281,10 @@ pub fn create<T: Transport>(
             &create_proposals(blocked, repository, args, title, body),
         );
     }
+    let comment = github
+        .comment(&blocked.repository, &blocked_issue, ASK_HOLD)
+        .context("record the ask hold on the blocked item; no ask opened")?;
+    writeln!(out, "{comment}\tcommented")?;
     let (issue, number) = github.create_issue(&target, title, body)?;
     let ask = ItemRef {
         host: blocked.host.clone(),
@@ -730,9 +743,15 @@ mod tests {
                     Ok(json!({"addProjectV2ItemById":{"item":{"id":"M8"}}}))
                 }
                 "addComment" => {
-                    assert_eq!(variables["id"], "I8");
+                    let number = if variables["id"] == "I7" {
+                        assert_eq!(variables["body"], ASK_HOLD);
+                        7
+                    } else {
+                        assert_eq!(variables["id"], "I8");
+                        8
+                    };
                     Ok(
-                        json!({"addComment":{"commentEdge":{"node":{"url":"https://github.com/example/intake/issues/8#issuecomment-1"}}}}),
+                        json!({"addComment":{"commentEdge":{"node":{"url":format!("https://github.com/example/intake/issues/{number}#issuecomment-1")}}}}),
                     )
                 }
                 "closeIssue" => {
@@ -756,7 +775,12 @@ mod tests {
 
     #[test]
     fn create_table() {
-        let preview = "{\"assignees\":[\"op\"],\"body\":\"Blocks: https://github.com/example/intake/issues/7\\n\\nQ: Q?\\n\\nOptions:\\nA) a\\nB) b\\n\\nReply with a letter or free text. Only comments by @op count.\\n\",\"labels\":[\"question\",\"needs-human\"],\"target_repo\":\"example/intake\",\"title\":\"Q?\",\"type\":\"create_issue\"}\n{\"item_number\":7,\"labels\":[\"needs-human\"],\"target_repo\":\"example/intake\",\"type\":\"add_labels\"}\n";
+        let proposals = "{\"assignees\":[\"op\"],\"body\":\"Blocks: https://github.com/example/intake/issues/7\\n\\nQ: Q?\\n\\nOptions:\\nA) a\\nB) b\\n\\nReply with a letter or free text. Only comments by @op count.\\n\",\"labels\":[\"question\",\"needs-human\"],\"target_repo\":\"example/intake\",\"title\":\"Q?\",\"type\":\"create_issue\"}\n{\"item_number\":7,\"labels\":[\"needs-human\"],\"target_repo\":\"example/intake\",\"type\":\"add_labels\"}\n";
+        let preview = format!(
+            "{}\n{proposals}",
+            json!({"type": "add_comment", "target_repo": "example/intake", "item_number": 7, "body": ASK_HOLD})
+        );
+        let commented = "https://github.com/example/intake/issues/7#issuecomment-1\tcommented\n";
         // Columns: board setup, apply, stdout, mutations in order, error.
         // No Status is written: the pass derives it from the labels.
         for (setup, apply, stdout, mutations, error) in [
@@ -771,7 +795,14 @@ mod tests {
                 ],
                 None,
             ),
-            (NONE, false, preview, vec![], None),
+            (NONE, false, preview.as_str(), vec![], None),
+            (
+                |b| b.fail = Some("addComment"),
+                true,
+                "",
+                vec!["addComment"],
+                Some("record the ask hold on the blocked item; no ask opened"),
+            ),
             // Every refusal below precedes opening the issue.
             (
                 |b| b.members.borrow_mut().clear(),
@@ -883,6 +914,18 @@ mod tests {
                 &composed,
                 &mut out,
             );
+            // Every attempt to open an ask first invalidates the old verdict,
+            // even when the blocked item already carries needs-human (the default).
+            let opens = mutations.contains(&"createIssue");
+            let stdout = if opens {
+                format!("{commented}{stdout}")
+            } else {
+                stdout.into()
+            };
+            let mut mutations = mutations;
+            if opens {
+                mutations.insert(0, "addComment");
+            }
             assert_eq!(String::from_utf8(out).unwrap(), stdout, "{error:?}");
             assert_eq!(*github.transport.mutations.borrow(), mutations, "{error:?}");
             match error {

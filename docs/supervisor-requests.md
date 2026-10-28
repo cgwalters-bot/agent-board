@@ -328,9 +328,23 @@ The comment must have been created within that run's start/end timestamps.
 The finding must still describe the issue: no reopen or rename event, body
 edit, or comment may follow the receipt, except the bot's own comments before
 the triage run ended.
-Like a dispatch, a close refuses an issue that carries `epic`, `question` or
-`needs-human` when the request runs, however long after the receipt the hold
-was added.
+Like a dispatch, a close refuses an issue that carries `epic` or `question`
+when the request runs, however long after the receipt the hold was added. It
+refuses `needs-human` too, unless that is the pass's own hold of this receipt
+(`triageFollowUpDays`, agent-board#363): the label (in any case) was added once
+after the triage run ended, by the bot, and the one comment after the run's
+end is the bot's, unedited, whose first line is
+`<!-- agent-board-hold: verdict COMMENT-ID -->` naming `triage_comment`. A
+marker naming another verdict, a label with no marker, one the operator added,
+one last added before the run ended or taken
+off and put back since, and any other comment after the run's end, the operator's
+included, all refuse.
+Before opening a question, `ask create --apply` must comment on the blocked
+item, invalidating the earlier verdict even when `needs-human` is already
+present and adding it produces no new label event. A failed comment prevents
+ask creation; a later failure may leave the conservative comment hold in place.
+Use the updated ask command with this closure protocol; older clients that only
+add the label cannot invalidate an existing marker.
 Nothing reviews a closure, so unlike a dispatch it keeps agent-board#111's
 input check: the issue must have been locked since before the triage run
 started, and every author and editor of its body and comments, the bot

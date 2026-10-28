@@ -2387,6 +2387,14 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             false,
         ),
         (
+            "nor does it label without room for the comment",
+            vec![(bot, None, "done", 0)],
+            Some(1),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; held by --max-writes: label needs-human",
+            false,
+            false,
+        ),
+        (
             "partly waits a day",
             vec![(bot, None, "partly", 0)],
             None,
@@ -2527,6 +2535,31 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             writes,
             ..Limits::default()
         };
+        // A preview first, which says the same and writes nothing.
+        let written = forge.writes.borrow().len();
+        let preview = block(run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            (Mode::Preview, limits),
+            forge.replay.now,
+        ))
+        .unwrap();
+        assert_eq!(preview.failures, 0, "{name}: {:#?}", preview.lines);
+        assert_eq!(
+            forge.writes.borrow().len(),
+            written,
+            "{name}: preview wrote"
+        );
+        if labelled {
+            let line = preview.lines.iter().find(|l| l.contains("tracker#446"));
+            assert!(
+                line.is_some_and(|l| l.starts_with(&expected)),
+                "{name}: no preview line {expected:?} in {:#?}",
+                preview.lines
+            );
+        }
         let second = block(run(
             &forge,
             &forge,
@@ -2549,19 +2582,29 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             .filter(|d| d.ends_with("tracker#446"))
             .count();
         assert_eq!(triaged, 1 + usize::from(again), "{name}");
-        let labels: Vec<(String, Value)> = (forge.writes.borrow().iter())
-            .filter(|(_, url, _)| url.ends_with("/labels"))
-            .map(|(_, url, body)| (url.clone(), body.clone()))
+        // The label, then the comment whose first line names the verdict.
+        let holds: Vec<(String, Value)> = (forge.writes.borrow().iter())
+            .filter(|(_, url, body)| {
+                url.ends_with("/labels") || text(body, "/body").starts_with("<!-- agent-board-hold")
+            })
+            .map(|(_, url, body)| match body["body"].as_str() {
+                Some(text) => (url.clone(), text.lines().next().into()),
+                None => (url.clone(), body.clone()),
+            })
             .collect();
-        let label = (
-            format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446/labels"),
-            json!({"labels": ["needs-human"]}),
-        );
-        assert_eq!(
-            labels,
-            if labelled { vec![label] } else { vec![] },
-            "{name}"
-        );
+        let issue = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446");
+        let id = answer.rsplit_once("#issuecomment-").unwrap().1;
+        let held = vec![
+            (
+                format!("{issue}/labels"),
+                json!({"labels": ["needs-human"]}),
+            ),
+            (
+                format!("{issue}/comments"),
+                format!("<!-- agent-board-hold: verdict {id} -->").into(),
+            ),
+        ];
+        assert_eq!(holds, if labelled { held } else { vec![] }, "{name}");
     }
 }
 
