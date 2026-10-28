@@ -56,7 +56,8 @@ structural format; runtime checks also enforce the bounds and relationships belo
 
 | `type` | Fields | Mutations |
 |---|---|---|
-| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `plan`, `stacks_on` | Create the issue, link it to the epic, enroll it in the project with its Priority, and post `plan` as a job plan |
+| `create_sub_issue` | `repo`, `title`, `body`; optional `labels`, `question`, `plan`, `stacks_on`, `blocked_by` | Create the issue, link `blocked_by`, link it to the epic, enroll it in the project with its Priority, and post `plan` as a job plan |
+| `attach_sub_issue` | `issue` | Link the existing issue to the epic |
 | `close_sub_issue` | `issue`, `reason` | Comment the reason, close as not planned |
 | `rescope_sub_issue` | `issue`, `body`, `reason` | Replace the body, comment the reason |
 | `set_priority` | `issue` or `new`, `value` | Set the board's Priority |
@@ -87,6 +88,57 @@ files should stack, in the order they can land; independent slices name no
 `stacks_on` and stay on the default branch. The planning brief that asks for
 these plans is the caller's, and should say so.
 
+`blocked_by` names the issue a new one waits on: `k`, an earlier
+`create_sub_issue`, or `OWNER/REPO#N`, any issue in a configured repository
+but the epic (which closes only once its sub-issues are done, so one blocked by
+it would never be unblocked). Apply links it with GitHub's blocked-by
+dependency right after the create, before the new issue is a sub-issue or on
+the board, so no pass finds it schedulable without that dependency, even if
+the apply stops there. Unlike `stacks_on` it says nothing about branches.
+
+`attach_sub_issue` links an existing issue, in a configured repository and
+not yet a sub-issue of the epic, to it. It keeps the Priority it has; a later
+`set_priority` with the same `issue` may set one, and nothing else in the plan
+may act on it, since it was not a sub-issue when the plan was checked. Apply
+and its preview refuse it unless the configuration sets
+[`attach_sub_issue`](#apply); `epic plan --dry-run`, which has no
+configuration, shows it.
+
+Apply and its preview read each existing issue an `attach_sub_issue` or a
+`blocked_by` names before claiming the plan, so a number that is no issue (a
+typo, or a pull request's) stops it with an error before any write rather
+than part way, after the new issues are made. An issue that already has
+another parent is still refused only by GitHub, when it is attached.
+
+A new issue labelled `needs-human` (any case) needs a `question` (up to 4,000
+characters), which apply appends to its body as `Q: ...`. The label is the
+[one marker](architecture.md#one-marker-for-the-operator) that the operator
+must act, and the question says what for; answering is acting and taking the
+label off. It is not a question issue of `agent-board ask create`: it has no
+`question` label, assignee or `Blocks:` line, so `ask list` and `ask resolve`
+do not see it. A `question` without the label is refused too: the label
+without a question holds the issue with nothing to answer, and a question
+without the label waits for an answer no one was asked for.
+
+So one operator instruction, such as "make GitLab first class, P0, and get a
+test token", is one plan's actions, applied where the configuration sets
+`attach_sub_issue`:
+
+```json
+[
+  {"type": "attach_sub_issue", "issue": "OWNER/agent-board#300"},
+  {"type": "set_priority", "issue": "OWNER/agent-board#300", "value": "P0"},
+  {"type": "create_sub_issue", "repo": "OWNER/agent-board", "title": "GitLab test token",
+   "body": "...", "labels": ["needs-human"],
+   "question": "Which GitLab account should own the test token?"},
+  {"type": "create_sub_issue", "repo": "OWNER/agent-board", "title": "GitLab live test",
+   "body": "...", "blocked_by": 3,
+   "plan": {"schema": "agent-board/job-plan/v1", "kind": "implement",
+            "runner": "hosted", "brief": "..."}},
+  {"type": "set_priority", "new": 4, "value": "P0"}
+]
+```
+
 ## Refusals
 
 The plan is refused if any action is, and every refused action is named with
@@ -107,12 +159,18 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
   `stacks_on` in a job plan rather than on its action;
 - a `stacks_on` without an implement plan, or naming anything but an earlier
   new slice with one or an open sub-issue, of the same repository;
+- a `blocked_by` naming anything but an earlier new issue or an issue in a
+  configured repository, or naming the epic;
+- an `attach_sub_issue` of the epic or of one of its sub-issues, open or
+  closed, and any action on an attached issue but its `set_priority`;
+- a `needs-human` label (in any case) without a `question`, a `question`
+  without the label, and a question holding an `` ```agent-board-plan `` fence;
 - two actions of one type on one issue, or any other action on an issue the
   plan closes, a new slice that stacks on it included: its run would start
   unstacked once the pull request it was written to build on is abandoned;
-- a `close_epic` that is not the last action, follows a `create_sub_issue`,
-  or, without `moved_to`, leaves a sub-issue open or closes an epic that
-  never had one;
+- a `close_epic` that is not the last action, follows a `create_sub_issue`
+  or an `attach_sub_issue`, or, without `moved_to`, leaves a sub-issue open
+  or closes an epic that never had one;
 - a `reason` holding an `` ```agent-board `` fence or a `<!--` marker: it is
   posted as a comment by the applier, which may also be a plan writer, where it
   would count as a plan or a dispatch record;
@@ -192,9 +250,16 @@ dispatch branch. Its JSON object has these fields (unknown fields are refused):
   "priorities": {"P0": "OPTION_ID_0", "P1": "OPTION_ID_1"},
   "default_priority": "P1",
   "label_by_operator": true,
-  "close_epic": true
+  "close_epic": true,
+  "attach_sub_issue": true
 }
 ```
+
+`attach_sub_issue` is optional and off by default. Off, a plan with an
+`attach_sub_issue` action is refused. On, a plan writer may link any issue in
+the configured repositories that has no parent to the epic, and every later
+plan may then close or rescope it as any sub-issue: without the opt-in a plan
+reaches only the epic's own sub-issues. `agent-board pass` does not set it.
 
 `close_epic` is optional and off by default. Off, a plan with a `close_epic`
 action is refused and closing an epic stays the operator's alone; on, a plan
@@ -231,6 +296,11 @@ on re-run. The claim, not validation, is what stops a replay: a close the plan
 made is satisfied when it is checked again. A foreign edit to the
 plan still refuses it; accepted edits identify a new plan.
 
+A successful apply prints one line per sub-issue saying what it did, then a
+`Review: REVIEW-URL GITHUB-URL` line for each issue it wrote to, where the
+review app (`https://cgwalters-forge.github.io/review/#issue/OWNER/REPO/N`)
+and GitHub show it, then `Receipt: URL`.
+
 Apply stops on the first failed request, records each confirmed write (including
 partial actions), and retains the claim. No rollback or automatic retry occurs.
 Inspect a failed or interrupted run and edit/replace the plan to continue.
@@ -257,11 +327,12 @@ Applied [this epic plan](https://github.com/OWNER/REPO/issues/7#issuecomment-1) 
   "outcome": "applied",
   "actions": [
     {"action": 1, "type": "create_sub_issue", "issue": "OWNER/agentic-job#715",
-     "priority": "P0", "writes": ["create", "link", "priority", "comment"]},
+     "priority": "P0", "needs": ["create", "link", "priority", "comment"],
+     "writes": ["create", "link", "priority", "comment"]},
     {"action": 2, "type": "set_priority", "issue": "OWNER/agentic-job#715",
-     "priority": "P0", "writes": ["folded"]},
+     "priority": "P0", "needs": ["priority"], "writes": ["folded"]},
     {"action": 3, "type": "close_sub_issue", "issue": "OWNER/REPO#611",
-     "writes": ["comment", "patch"]}
+     "needs": ["comment", "patch"], "writes": ["comment", "patch"]}
   ],
   "fingerprint": [["owner/agentic-job#715", "OPEN"], ["owner/repo#611", "CLOSED"]]
 }
@@ -274,9 +345,14 @@ action's effect later proved by [`agent-board pass`](pass.md#what-is-built)
 from the identities the receipt confirmed). `fingerprint` is the sorted list
 of `[lowercase OWNER/REPO#N, OPEN-or-CLOSED]` pairs for all sub-issues once the
 apply ended (absent where that read failed): membership and state, not body or
-Priority. `writes` names the requests confirmed; `folded` is a new sub-issue's
-Priority, set by its create's own write. A sub-issue the apply created is
-named only by the identity its create returned, never found by its title.
+Priority. `needs` names the writes each action was to make, and `writes` the
+requests confirmed; a create missing any is shown as `Created X, then stopped
+before its ...`, naming them. `folded` is a new sub-issue's
+Priority, set by its create's own write, and `blocked_by` its blocked-by link,
+which a pass does not read back, so a create with `blocked_by` cut short
+before that write is confirmed is never recovered. A sub-issue the apply
+created is named only by the identity its create returned, never found by its
+title.
 The hidden first line is the older receipts' claim, kept so that an earlier
 build sees it too. Older receipts, that line with a separate
 `<!-- agent-board-epic-fingerprint: JSON -->` comment, are still read as

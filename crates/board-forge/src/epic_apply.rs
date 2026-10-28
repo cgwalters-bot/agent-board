@@ -13,7 +13,7 @@ use crate::plan::{
     viewer,
 };
 use crate::poll::Rest;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +26,10 @@ pub const APPLY_MARKER: &str = "agent-board-epic-apply";
 pub const FINGERPRINT_MARKER: &str = "agent-board-epic-fingerprint";
 /// The schema of a receipt's machine detail.
 pub const RECEIPT_SCHEMA: &str = "agent-board/epic-apply/v1";
+/// The review app, whose `#issue/OWNER/REPO/N` route shows one issue.
+pub const REVIEW_APP: &str = "https://cgwalters-forge.github.io/review/";
+/// The prefix of an apply's output line naming a touched issue's links.
+pub const LINKS: &str = "Review: ";
 
 /// Optional caller observations, never authority to select a different plan.
 #[derive(Debug, Default)]
@@ -104,6 +108,11 @@ pub struct Config {
     /// decomposition the operator still wants worked, which `moved_to` (the
     /// planner's own word that work moved) would otherwise let it do.
     pub close_epic: bool,
+    /// Let a plan's `attach_sub_issue` link an existing issue. Off by
+    /// default: an attached issue is a sub-issue to every later plan, which
+    /// may close or rescope it, so attaching would let a plan writer reach
+    /// any issue in the configured repositories, not only the epic's.
+    pub attach_sub_issue: bool,
 }
 
 impl Config {
@@ -122,7 +131,8 @@ impl Config {
                     "priorities",
                     "default_priority",
                     "label_by_operator",
-                    "close_epic"
+                    "close_epic",
+                    "attach_sub_issue"
                 ]
                 .contains(&key.as_str()),
                 "unknown epic config field {key:?}"
@@ -212,6 +222,7 @@ impl Config {
             default_priority,
             label_by_operator,
             close_epic: flag("close_epic")?,
+            attach_sub_issue: flag("attach_sub_issue")?,
         })
     }
 
@@ -221,6 +232,10 @@ impl Config {
         ensure!(
             self.close_epic || !plan.closes_epic(),
             "the plan closes the epic, which the configuration does not allow (close_epic)"
+        );
+        ensure!(
+            self.attach_sub_issue || !plan.attaches(),
+            "the plan attaches an existing issue, which the configuration does not allow (attach_sub_issue)"
         );
         Ok(plan)
     }
@@ -280,8 +295,9 @@ impl Outcome {
 }
 
 /// One plan action as far as its writes were confirmed. The writes are
-/// named `create`, `link`, `priority`, `comment` and `patch` (a close or a
-/// new body), or `satisfied` for a close of an issue already closed.
+/// named `create`, `link`, `priority`, `blocked_by`, `comment` and `patch`
+/// (a close or a new body), or `satisfied` for a close of an issue already
+/// closed.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Confirmed {
     /// Its 1-based position in the plan.
@@ -295,6 +311,10 @@ pub struct Confirmed {
     /// The Priority it set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// The writes it was to make, as the apply knew them; empty in an older
+    /// receipt, which did not say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
     #[serde(default)]
     pub writes: Vec<String>,
 }
@@ -305,17 +325,52 @@ impl Confirmed {
     fn wrote(&self, name: &str) -> bool {
         (self.writes.iter()).any(|w| w == name || (name == "priority" && w == "folded"))
     }
+
+    /// The writes it was to make and did not confirm. An older receipt's are
+    /// inferred from what it wrote.
+    fn missing(&self) -> Vec<String> {
+        let wanted = match self.needs.is_empty() {
+            true => needs(&self.kind, self.wrote("comment"), self.wrote("blocked_by")),
+            false => self.needs.iter().map(String::as_str).collect(),
+        };
+        (wanted.into_iter())
+            .filter(|w| !self.wrote(w))
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
-/// The writes a plan action of `kind` makes, by the names [`Confirmed`]
-/// records them; a create with a job plan also posts it, a comment.
-fn needs(kind: &str, job_plan: bool) -> &'static [&'static str] {
+/// The writes a plan action of `kind` makes, in order, by the names
+/// [`Confirmed`] records them; a create with `blocked_by` also links it, and
+/// one with a job plan posts it, a comment.
+fn needs(kind: &str, job_plan: bool, blocked: bool) -> Vec<&'static str> {
     match kind {
-        "create_sub_issue" if job_plan => &["create", "link", "priority", "comment"],
-        "create_sub_issue" => &["create", "link", "priority"],
-        "close_sub_issue" | "close_epic" | "rescope_sub_issue" => &["comment", "patch"],
-        "set_priority" => &["priority"],
-        _ => &[],
+        "create_sub_issue" => {
+            let mut out = vec!["create"];
+            if blocked {
+                out.push("blocked_by");
+            }
+            out.extend(["link", "priority"]);
+            if job_plan {
+                out.push("comment");
+            }
+            out
+        }
+        "attach_sub_issue" => vec!["link"],
+        "close_sub_issue" | "close_epic" | "rescope_sub_issue" => vec!["comment", "patch"],
+        "set_priority" => vec!["priority"],
+        _ => vec![],
+    }
+}
+
+/// How a receipt line names a create's missing write.
+fn unmade(write: &str) -> &str {
+    match write {
+        "blocked_by" => "blocked-by link",
+        "link" => "sub-issue link",
+        "priority" => "Priority",
+        "comment" => "job plan",
+        other => other,
     }
 }
 
@@ -443,7 +498,7 @@ fn legacy(comment: &Comment, after: &[&Comment]) -> Option<Detail> {
             continue;
         };
         let Ok(n) = n.parse::<usize>() else { continue };
-        if !detail.actions.last().is_some_and(|c| c.action == n) {
+        if detail.actions.last().is_none_or(|c| c.action != n) {
             detail.actions.push(Confirmed {
                 action: n,
                 ..Confirmed::default()
@@ -553,8 +608,8 @@ pub fn readable(detail: &Detail, epic: Option<&IssueRef>) -> Vec<String> {
     for c in &detail.actions {
         let issue = c.issue.as_deref().map(|i| named(i, epic));
         let priority = c.priority.as_deref().map(plain);
-        let wanted = needs(&c.kind, c.wrote("comment"));
-        let whole = wanted.iter().all(|w| c.wrote(w));
+        let missing = c.missing();
+        let whole = missing.is_empty();
         let phrase = match (c.kind.as_str(), &issue) {
             (_, Some(i)) if c.wrote("satisfied") => format!("{i} was already closed"),
             ("create_sub_issue", Some(i)) if whole => match &priority {
@@ -562,11 +617,16 @@ pub fn readable(detail: &Detail, epic: Option<&IssueRef>) -> Vec<String> {
                 None => format!("Created {i}"),
             },
             ("create_sub_issue", Some(i)) => {
-                format!("Created {i}, then stopped before linking and prioritising it")
+                let missing: Vec<String> = missing.iter().map(|w| plain(unmade(w))).collect();
+                format!(
+                    "Created {i}, then stopped before its {}",
+                    missing.join(", ")
+                )
             }
             ("create_sub_issue", None) => {
                 format!("Action {}: stopped before creating its sub-issue", c.action)
             }
+            ("attach_sub_issue", Some(i)) if whole => format!("Attached {i}"),
             ("close_sub_issue", Some(i)) if whole => format!("Closed {i} as not planned"),
             ("rescope_sub_issue", Some(i)) if whole => format!("Rescoped {i}"),
             ("set_priority", Some(i)) => match &priority {
@@ -661,12 +721,9 @@ pub fn unproved(
         let n = index + 1;
         let kind = action["type"].as_str().unwrap_or("?");
         let c = confirmed(n);
-        let whole = c.is_some_and(|c| {
-            c.wrote("satisfied")
-                || needs(kind, action.get("plan").is_some())
-                    .iter()
-                    .all(|w| c.wrote(w))
-        });
+        let (job_plan, blocked) = (action.get("plan"), action.get("blocked_by"));
+        let wanted = needs(kind, job_plan.is_some(), blocked.is_some());
+        let whole = c.is_some_and(|c| c.wrote("satisfied") || wanted.iter().all(|w| c.wrote(w)));
         let issue = action["issue"].as_str();
         let missing = match kind {
             "create_sub_issue" => match c.and_then(|c| c.issue.as_deref()) {
@@ -676,6 +733,13 @@ pub fn unproved(
                 )),
                 Some(made) if !member(made) => {
                     Some(format!("{made} is not a sub-issue of the epic"))
+                }
+                // Not observed: confirmed only as it is written.
+                Some(made)
+                    if action.get("blocked_by").is_some()
+                        && !c.is_some_and(|c| c.wrote("blocked_by")) =>
+                {
+                    Some(format!("{made}'s blocked-by link was not confirmed"))
                 }
                 // Cut short after its create, what followed is observed: it is
                 // linked, being a sub-issue; it has a Priority on the board;
@@ -689,6 +753,8 @@ pub fn unproved(
                 }
                 Some(_) => None,
             },
+            "attach_sub_issue" => (!whole && !issue.is_some_and(member))
+                .then(|| format!("{} is not a sub-issue of the epic", issue.unwrap_or("?"))),
             "close_sub_issue" => (!whole && !issue.is_some_and(closed))
                 .then(|| format!("{} is open", issue.unwrap_or("?"))),
             "rescope_sub_issue" => {
@@ -823,8 +889,28 @@ fn checked<T: Transport>(
     expected.check(&value, &from)?;
     let epic = read_epic(client, issue)?;
     let plan = (config.validate(&value, &epic)).map_err(|e| e.context(Refused))?;
+    // Not Refused: a failed read may be a rate limit, not a missing issue.
+    existing(client, &plan)?;
     designated(client, issue, &epic, config, false)?;
     Ok((value, from, epic, plan))
+}
+
+/// Reads each existing issue the plan links to, an attached one or a
+/// `blocked_by`, so that a mistyped number or a pull request's stops the
+/// apply before its claim rather than part way.
+fn existing<T: Transport>(client: &T, plan: &EpicPlan) -> Result<()> {
+    for action in &plan.actions {
+        let issue = match action {
+            Action::Attach { issue } => issue,
+            Action::Create {
+                blocked_by: Some(Target::Issue(issue)),
+                ..
+            } => issue,
+            _ => continue,
+        };
+        node_id(client, issue)?;
+    }
+    Ok(())
 }
 
 /// Read-only preview. Apply checks for an existing claim before validating
@@ -856,8 +942,12 @@ pub fn preview_checked<T: Transport>(
             mutation["field"] = config.priority_field.clone().into();
             out.push(json!({"action": mutation["action"], "graphql": "addProjectV2ItemById", "project": config.project, "issue": mutation["issue"]}));
         }
-        let link = mutation["graphql"] == "addSubIssue";
         let n = mutation["action"].clone();
+        // An attached issue keeps the Priority it has, unless the plan sets one.
+        let created = (n.as_u64())
+            .and_then(|n| plan.actions.get((n as usize).checked_sub(1)?))
+            .is_some_and(|a| matches!(a, Action::Create { .. }));
+        let link = mutation["graphql"] == "addSubIssue" && created;
         out.push(mutation);
         if link {
             let value = (n.as_u64())
@@ -901,6 +991,7 @@ pub fn planned<T: Transport>(
                     .unwrap_or(&config.default_priority);
                 format!("Create a sub-issue in {repo} ({p})")
             }
+            Action::Attach { issue } => format!("Attach {issue}"),
             Action::Close { issue, .. } => format!("Close {issue} as not planned"),
             Action::AlreadyClosed { issue } => format!("{issue} is already closed"),
             Action::Rescope { issue, .. } => format!("Rescope {issue}"),
@@ -977,7 +1068,8 @@ pub fn apply_checked<C: Transport + Rest>(
     }
     let epic = read_epic(client, issue)?;
     designated(client, issue, &epic, config, false)?;
-    config.validate(&value, &epic)?;
+    let plan = config.validate(&value, &epic)?;
+    existing(client, &plan)?;
     let path = format!(
         "{API_ROOT}repos/{}/issues/{}/comments",
         issue.repository, issue.number
@@ -1068,8 +1160,25 @@ pub fn apply_checked<C: Transport + Rest>(
     Ok(request_output()
         .into_iter()
         .chain(lines)
+        .chain(touched(&detail).iter().map(links))
         .chain(receipt_url.map(|url| format!("Receipt: {url}")))
         .collect())
+}
+
+/// Each issue the apply wrote to, once, in the order first written: not one
+/// a close found already closed.
+fn touched(detail: &Detail) -> Vec<IssueRef> {
+    let mut out: Vec<IssueRef> = Vec::new();
+    for c in &detail.actions {
+        let wrote = c.writes.iter().any(|w| w != "satisfied");
+        let issue = c.issue.as_deref().and_then(|i| IssueRef::parse(i).ok());
+        if let Some(issue) = issue.filter(|_| wrote)
+            && !out.iter().any(|i| key(i) == key(&issue))
+        {
+            out.push(issue);
+        }
+    }
+    out
 }
 
 /// What [`apply`] says when the plan has a receipt already.
@@ -1079,6 +1188,7 @@ pub const ALREADY_CLAIMED: &str = "Already claimed; nothing changed.";
 fn kind(action: &Action) -> &'static str {
     match action {
         Action::Create { .. } => "create_sub_issue",
+        Action::Attach { .. } => "attach_sub_issue",
         Action::Close { .. } | Action::AlreadyClosed { .. } => "close_sub_issue",
         Action::Rescope { .. } => "rescope_sub_issue",
         Action::SetPriority { .. } => "set_priority",
@@ -1109,10 +1219,18 @@ fn execute<C: Transport + Rest>(
             .context("mutation has no action")?;
         let index = n as usize - 1;
         let action = plan.actions.get(index).context("mutation's action")?;
-        if !confirmed.last().is_some_and(|c| c.action == index + 1) {
+        if confirmed.last().is_none_or(|c| c.action != index + 1) {
+            let wanted = match action {
+                Action::Create {
+                    plan, blocked_by, ..
+                } => needs(kind(action), plan.is_some(), blocked_by.is_some()),
+                Action::AlreadyClosed { .. } => vec!["satisfied"],
+                _ => needs(kind(action), false, false),
+            };
             confirmed.push(Confirmed {
                 action: index + 1,
                 kind: kind(action).into(),
+                needs: wanted.into_iter().map(str::to_owned).collect(),
                 ..Confirmed::default()
             });
         }
@@ -1196,9 +1314,29 @@ fn execute<C: Transport + Rest>(
                 let issue = url.strip_prefix(API_ROOT).and_then(rest_issue);
                 record(confirmed, write, issue.map(|i| i.to_string()));
             }
+        } else if let (Action::Attach { issue }, Some("addSubIssue")) =
+            (action, mutation["graphql"].as_str())
+        {
+            link(client, epic, issue)?;
+            record(confirmed, "link", Some(issue.to_string()));
+        } else if let (Action::Create { blocked_by, .. }, Some("addBlockedBy")) =
+            (action, mutation["graphql"].as_str())
+        {
+            let blocked = created.get(&n).context("blocked issue was not created")?;
+            let blocker = match blocked_by {
+                Some(Target::Issue(issue)) => issue,
+                // Only an earlier action's, created by now.
+                Some(Target::New(k)) => created
+                    .get(&(*k as u64))
+                    .context("blocked_by was not created")?,
+                None => bail!("addBlockedBy without blocked_by"),
+            };
+            let (issue, blocking) = (node_id(client, blocked)?, node_id(client, blocker)?);
+            client.graphql("mutation($issue: ID!, $blocking: ID!) { addBlockedBy(input: {issueId: $issue, blockingIssueId: $blocking}) { issue { id } } }", json!({"issue": issue, "blocking": blocking}))?;
+            record(confirmed, "blocked_by", None);
         } else if mutation["graphql"] == "addSubIssue" {
             let sub = created.get(&n).context("sub-issue was not created")?;
-            client.graphql("mutation($issueId: ID!, $subIssueUrl: String!) { addSubIssue(input: {issueId: $issueId, subIssueUrl: $subIssueUrl}) { issue { id } } }", json!({"issueId": epic.id, "subIssueUrl": format!("https://github.com/{}/issues/{}", sub.repo, sub.number)}))?;
+            link(client, epic, sub)?;
             record(confirmed, "link", None);
             let value = priorities
                 .get(&(n as usize))
@@ -1227,6 +1365,28 @@ fn execute<C: Transport + Rest>(
     Ok(())
 }
 
+/// Links `sub` to the epic as a sub-issue.
+fn link<T: Transport>(client: &T, epic: &Epic, sub: &IssueRef) -> Result<()> {
+    client.graphql("mutation($issueId: ID!, $subIssueUrl: String!) { addSubIssue(input: {issueId: $issueId, subIssueUrl: $subIssueUrl}) { issue { id } } }", json!({"issueId": epic.id, "subIssueUrl": format!("https://{DEFAULT_HOST}/{}/issues/{}", sub.repo, sub.number)}))?;
+    Ok(())
+}
+
+/// The node ID of `issue`, which project and dependency mutations take.
+fn node_id<T: Transport>(client: &T, issue: &IssueRef) -> Result<String> {
+    let (owner, name) = issue.repo.split_once('/').context("issue repository")?;
+    let data = client.graphql("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id } } }", json!({"owner": owner, "name": name, "number": issue.number}))?;
+    data.pointer("/repository/issue/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .with_context(|| format!("{issue} is not an issue"))
+}
+
+/// The review app's and GitHub's addresses of `issue`, as an apply prints them.
+pub fn links(issue: &IssueRef) -> String {
+    let (repo, n) = (&issue.repo, issue.number);
+    format!("{LINKS}{REVIEW_APP}#issue/{repo}/{n} https://{DEFAULT_HOST}/{repo}/issues/{n}")
+}
+
 /// Puts `issue` on the project, where it may be already, and sets its
 /// Priority: one write step.
 fn set_priority<T: Transport>(
@@ -1235,12 +1395,7 @@ fn set_priority<T: Transport>(
     value: &str,
     config: &Config,
 ) -> Result<()> {
-    let (owner, name) = issue.repo.split_once('/').context("priority repository")?;
-    let data = client.graphql("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { id } } }", json!({"owner": owner, "name": name, "number": issue.number}))?;
-    let content = data
-        .pointer("/repository/issue/id")
-        .and_then(Value::as_str)
-        .context("priority target is not an issue")?;
+    let content = node_id(client, issue).context("priority target")?;
     let data = client.graphql("mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }", json!({"project": config.project, "content": content}))?;
     let item = data
         .pointer("/addProjectV2ItemById/item/id")
@@ -1419,6 +1574,10 @@ mod tests {
                 );
             }
             if query.starts_with("query") {
+                // A number that is no issue: none, or a pull request's.
+                if variables["number"] == 404 {
+                    return Ok(json!({"repository": {"issue": null}}));
+                }
                 return Ok(
                     json!({"repository": {"issue": {"id": format!("I{}", variables["number"])}}}),
                 );
@@ -1432,6 +1591,10 @@ mod tests {
                     "{variables}"
                 );
                 return Ok(json!({"addSubIssue": {"issue": {"id": "E"}}}));
+            }
+            if query.contains("addBlockedBy(") {
+                self.log("graphql", "blocked_by", variables.clone())?;
+                return Ok(json!({"addBlockedBy": {"issue": {"id": variables["issue"]}}}));
             }
             if query.contains("addProjectV2ItemById(") {
                 self.log("graphql", "enroll", variables.clone())?;
@@ -1624,12 +1787,17 @@ mod tests {
     fn applies_once_with_configured_ids_and_real_job_plan_number() {
         let forge = Forge::full();
         let changes = apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap();
+        let review = "Review: https://cgwalters-forge.github.io/review/#issue/example/work";
+        let github = "https://github.com/example/work/issues";
         assert_eq!(
             changes,
             [
-                "Created example/work#10 (High)",
-                "Rescoped example/work#2",
-                "Closed example/work#3 as not planned"
+                "Created example/work#10 (High)".to_owned(),
+                "Rescoped example/work#2".into(),
+                "Closed example/work#3 as not planned".into(),
+                format!("{review}/10 {github}/10"),
+                format!("{review}/2 {github}/2"),
+                format!("{review}/3 {github}/3"),
             ]
         );
         let requests = forge.requests.borrow().clone();
@@ -1717,6 +1885,8 @@ mod tests {
         forge.closed.set(true);
         let lines = apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap();
         assert_eq!(lines[2], "example/work#3 was already closed");
+        // Not touched, so not linked.
+        assert!(!lines.iter().any(|l| l.ends_with("issues/3")), "{lines:?}");
         let targets: Vec<_> = (forge.requests.borrow().iter())
             .map(|(_, target, _)| target.clone())
             .collect();
@@ -1771,6 +1941,182 @@ mod tests {
                 ("repos/example/work/issues/11/comments", 11, Some(10)),
             ]
         );
+    }
+
+    /// agent-board#412: one plan attaches an existing issue with a Priority,
+    /// adds slices blocked by it and by each other, one of them an ask, and
+    /// apply prints where the review app and GitHub show each issue touched.
+    #[test]
+    fn attaches_and_links_blocked_by_before_the_job_plan() {
+        let job = json!({"schema": crate::plan::JOB_PLAN_SCHEMA, "kind": "implement",
+            "runner": "hosted", "brief": "do it"});
+        let actions = json!([
+            {"type": "attach_sub_issue", "issue": "example/work#12"},
+            {"type": "set_priority", "issue": "example/work#12", "value": "High"},
+            {"type": "create_sub_issue", "repo": "example/work", "title": "gitlab", "body": "a",
+             "plan": job, "blocked_by": "example/work#12"},
+            {"type": "create_sub_issue", "repo": "example/work", "title": "token", "body": "b",
+             "labels": ["needs-human"], "question": "Which account?", "blocked_by": 3}
+        ]);
+        // Attaching is the caller's opt-in.
+        let attaching = || Config {
+            attach_sub_issue: true,
+            ..config()
+        };
+        let forge = Forge::new(actions.clone());
+        let lines = apply(&forge, &issue(), &attaching(), OffsetDateTime::UNIX_EPOCH).unwrap();
+        let review = "Review: https://cgwalters-forge.github.io/review/#issue/example/work";
+        let github = "https://github.com/example/work/issues";
+        assert_eq!(
+            lines,
+            [
+                "Attached example/work#12; Set example/work#12 to High".to_owned(),
+                "Created example/work#10 (Normal)".into(),
+                "Created example/work#11 (Normal)".into(),
+                format!("{review}/12 {github}/12"),
+                format!("{review}/10 {github}/10"),
+                format!("{review}/11 {github}/11"),
+            ]
+        );
+        let requests = forge.requests.borrow().clone();
+        let targets: Vec<_> = (requests.iter())
+            .map(|(method, target, _)| format!("{method} {target}"))
+            .collect();
+        // Each slice is blocked before it is linked and on the board, so a
+        // pass never finds it schedulable and unblocked.
+        assert_eq!(
+            targets,
+            [
+                "POST repos/example/epics/issues/1/comments",
+                "graphql link",
+                "graphql enroll",
+                "graphql priority",
+                "POST repos/example/work/issues",
+                "PATCH repos/example/epics/issues/comments/2",
+                "graphql blocked_by",
+                "graphql link",
+                "graphql enroll",
+                "graphql priority",
+                "POST repos/example/work/issues/10/comments",
+                "POST repos/example/work/issues",
+                "PATCH repos/example/epics/issues/comments/2",
+                "graphql blocked_by",
+                "graphql link",
+                "graphql enroll",
+                "graphql priority",
+                "PATCH repos/example/epics/issues/comments/2"
+            ]
+        );
+        assert_eq!(
+            requests[1].2["subIssueUrl"],
+            "https://github.com/example/work/issues/12"
+        );
+        assert_eq!(requests[3].2["option"], "O_high");
+        assert_eq!(requests[6].2, json!({"issue": "I10", "blocking": "I12"}));
+        assert_eq!(requests[13].2, json!({"issue": "I11", "blocking": "I10"}));
+        assert_eq!(
+            requests[11].2,
+            json!({"title": "token", "labels": ["needs-human"], "body": "b\n\nQ: Which account?\n"})
+        );
+        let receipt = receipt(&forge);
+        assert_eq!(receipt.detail.outcome, Outcome::Applied);
+        assert_eq!(receipt.detail.actions[0].kind, "attach_sub_issue");
+        let writes: Vec<_> = (receipt.detail.actions.iter())
+            .map(|c| c.writes.join(","))
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                "link",
+                "priority",
+                "create,blocked_by,link,priority,comment",
+                "create,blocked_by,link,priority",
+            ]
+        );
+        // The preview enrolls only the new issues for their Priority.
+        let shown = preview(&Forge::new(actions.clone()), &issue(), &attaching()).unwrap();
+        let op = |m: &Value| m["graphql"].as_str().unwrap_or("rest").to_owned();
+        let ops: Vec<String> = (shown.iter())
+            .map(|m| format!("{} {}", m["action"], op(m)))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                "1 addSubIssue",
+                "2 addProjectV2ItemById",
+                "2 updateProjectV2ItemFieldValue",
+                "3 rest",
+                "3 addBlockedBy",
+                "3 addSubIssue",
+                "3 addProjectV2ItemById",
+                "3 updateProjectV2ItemFieldValue",
+                "3 rest",
+                "4 rest",
+                "4 addBlockedBy",
+                "4 addSubIssue",
+                "4 addProjectV2ItemById",
+                "4 updateProjectV2ItemFieldValue",
+            ]
+        );
+        // Without the opt-in an attach is refused before the claim, as is a
+        // blocked_by that is no issue with it.
+        let mut stray = actions.clone();
+        stray[2]["blocked_by"] = json!("example/work#404");
+        let off = "does not allow (attach_sub_issue)";
+        for (actions, config, error, refused) in [
+            (actions.clone(), config(), off, true),
+            // A failed read is no refusal: it may be a rate limit.
+            (
+                stray,
+                attaching(),
+                "example/work#404 is not an issue",
+                false,
+            ),
+        ] {
+            let forge = Forge::new(actions);
+            let message = format!(
+                "{:#}",
+                apply(&forge, &issue(), &config, OffsetDateTime::UNIX_EPOCH).unwrap_err()
+            );
+            assert!(message.contains(error), "{message}");
+            assert!(forge.requests.borrow().is_empty(), "{error}");
+            // A refusal the preview, and so the pass, holds for a person.
+            let shown = preview(&forge, &issue(), &config).unwrap_err();
+            assert_eq!(shown.downcast_ref::<Refused>().is_some(), refused);
+        }
+        // A blocked slice cut short before its blocked-by link is neither a
+        // sub-issue nor on the board, so no pass can schedule it; its
+        // receipt names each write it is missing, as for its job plan.
+        for (fail, writes, line) in [
+            (
+                "blocked_by",
+                "create",
+                "blocked-by link, sub-issue link, Priority, job plan",
+            ),
+            (
+                "repos/example/work/issues/10/comments",
+                "create,blocked_by,link,priority",
+                "job plan",
+            ),
+        ] {
+            let mut forge = Forge::new(actions.clone());
+            forge.fail = Some(fail);
+            let error = format!(
+                "{:#}",
+                apply(&forge, &issue(), &attaching(), OffsetDateTime::UNIX_EPOCH).unwrap_err()
+            );
+            let created = format!("Created example/work#10, then stopped before its {line}");
+            assert!(error.contains(&created), "{error}");
+            let stopped = super::tests::receipt(&forge).detail;
+            assert_eq!(stopped.outcome, Outcome::Stopped);
+            assert_eq!(stopped.actions[2].writes.join(","), writes);
+            let after: Vec<_> = (forge.requests.borrow().iter())
+                .skip_while(|(_, target, _)| target != "repos/example/work/issues")
+                .map(|(_, target, _)| target.clone())
+                .collect();
+            let enrolled = after.iter().any(|t| t == "link" || t == "enroll");
+            assert_eq!(enrolled, fail != "blocked_by", "{after:?}");
+        }
     }
 
     #[test]
@@ -2442,6 +2788,7 @@ mod tests {
             kind: kind.into(),
             issue: Some(issue.into()),
             priority: None,
+            needs: Vec::new(),
             writes: writes.iter().map(|w| (*w).to_owned()).collect(),
         };
         let all = [
@@ -2562,6 +2909,55 @@ mod tests {
             assert_eq!(got.is_empty(), proved, "{got:?}");
         }
         assert!(!unproved(&short, &cut, &epic(&[], &[]), &board, &|_| true).is_empty());
+        // An attach is proved by the issue being a sub-issue now; a blocked-by
+        // link, which no pass reads, only by its confirmed write.
+        let linked_plan = json!({"actions": [
+            {"type": "attach_sub_issue", "issue": "example/work#12"},
+            {"type": "create_sub_issue", "repo": "example/work", "title": "c", "body": "b",
+             "blocked_by": "example/work#12"}
+        ]});
+        let made = |writes: &[&str]| done(2, "create_sub_issue", "example/work#10", writes);
+        for (actions, open, expected) in [
+            (
+                vec![
+                    done(1, "attach_sub_issue", "example/work#12", &["link"]),
+                    made(&["create", "link", "priority", "blocked_by"]),
+                ],
+                &[10][..],
+                vec![],
+            ),
+            (
+                vec![made(&["create", "link", "priority", "blocked_by"])],
+                &[10, 12],
+                vec![],
+            ),
+            (
+                vec![made(&["create", "link", "priority", "blocked_by"])],
+                &[10],
+                vec!["action 1 (attach_sub_issue): example/work#12 is not a sub-issue of the epic"],
+            ),
+            (
+                vec![made(&["create", "link", "priority"])],
+                &[10, 12],
+                vec![
+                    "action 2 (create_sub_issue): example/work#10's blocked-by link was not confirmed",
+                ],
+            ),
+            (
+                vec![made(&["create"])],
+                &[10, 12],
+                vec![
+                    "action 2 (create_sub_issue): example/work#10's blocked-by link was not confirmed",
+                ],
+            ),
+        ] {
+            let detail = Detail {
+                actions,
+                ..Detail::new("1@2026-10-14T10:00:00Z", Outcome::Claimed)
+            };
+            let got = unproved(&linked_plan, &detail, &epic(open, &[]), &board, &|_| true);
+            assert_eq!(got, expected, "{open:?}");
+        }
     }
 
     /// A comment that looks like a receipt and cannot be read, or one edited

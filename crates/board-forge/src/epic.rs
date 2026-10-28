@@ -11,7 +11,7 @@ use crate::overlap::owner_name;
 use crate::plan::{Comment, JobPlan, fenced_json, issue_comments, newest_fenced};
 use crate::poll::validate_repository;
 use anyhow::{Context, Result, bail, ensure};
-use board_core::ItemRef;
+use board_core::{ItemRef, NEEDS_HUMAN_LABEL};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -115,10 +115,17 @@ pub enum Action {
         body: String,
         labels: Vec<String>,
         /// Posted on the new issue; its `item` is 0 until the issue exists.
-        plan: Option<JobPlan>,
+        plan: Option<Box<JobPlan>>,
         /// The slice in the same repository whose pull request the plan's
         /// run builds on ([`crate::stack`]); posted as the plan's `stacks_on`.
         stacks_on: Option<Target>,
+        /// The issue the new one is blocked by, linked before its job plan
+        /// is posted, so the pass holds it from the start.
+        blocked_by: Option<Target>,
+    },
+    /// Link an existing issue, not yet one of the epic's, as a sub-issue.
+    Attach {
+        issue: IssueRef,
     },
     Close {
         issue: IssueRef,
@@ -155,8 +162,18 @@ pub enum Action {
 const ACTIONS: &[(&str, &[&str])] = &[
     (
         "create_sub_issue",
-        &["repo", "title", "body", "labels", "plan", "stacks_on"],
+        &[
+            "repo",
+            "title",
+            "body",
+            "labels",
+            "question",
+            "plan",
+            "stacks_on",
+            "blocked_by",
+        ],
     ),
+    ("attach_sub_issue", &["issue"]),
     ("close_sub_issue", &["issue", "reason"]),
     ("rescope_sub_issue", &["issue", "body", "reason"]),
     ("set_priority", &["issue", "new", "value"]),
@@ -277,10 +294,40 @@ fn body(object: &Map<String, Value>) -> Result<String> {
     Ok(body.into())
 }
 
+/// A new issue's body with its `question` for the operator, if it has one:
+/// labelled [`NEEDS_HUMAN_LABEL`], the issue is the ask, read where the label
+/// is, as `ask create` writes one. The label without a question would hold
+/// the issue for the operator with nothing to answer, and a question without
+/// the label would wait for an answer no one is asked for.
+fn asked(object: &Map<String, Value>, body: String, labels: &[String]) -> Result<String> {
+    let held = (labels.iter()).any(|l| l.trim().eq_ignore_ascii_case(NEEDS_HUMAN_LABEL));
+    match (held, object.contains_key("question")) {
+        (false, false) => Ok(body),
+        (true, false) => {
+            bail!("the {NEEDS_HUMAN_LABEL:?} label needs a question, which becomes the ask")
+        }
+        (false, true) => bail!("question needs the {NEEDS_HUMAN_LABEL:?} label"),
+        (true, true) => {
+            let question = bounded(object, "question", REASON_LIMIT)?;
+            let body = format!("{body}\n\nQ: {}\n", question.trim());
+            ensure!(
+                !crate::plan::has_fence(&body, crate::plan::PLAN_FENCE),
+                "question holds an agent-board-plan fence"
+            );
+            Ok(body)
+        }
+    }
+}
+
 impl EpicPlan {
     /// Whether applying the plan would close the epic.
     pub fn closes_epic(&self) -> bool {
         (self.actions.iter()).any(|a| matches!(a, Action::CloseEpic { .. }))
+    }
+
+    /// Whether applying the plan would attach an existing issue to the epic.
+    pub fn attaches(&self) -> bool {
+        (self.actions.iter()).any(|a| matches!(a, Action::Attach { .. }))
     }
 
     /// Validate one plan object against `bounds` and the epic it was found on.
@@ -377,12 +424,19 @@ impl EpicPlan {
                     labels,
                     plan,
                     stacks_on,
+                    blocked_by,
                 } => {
                     let mut issue = json!({"title": title, "body": body});
                     if !labels.is_empty() {
                         issue["labels"] = json!(labels);
                     }
                     out.push(rest(n, "POST", format!("repos/{repo}/issues"), issue));
+                    // Before it is linked and on the board, so that the pass
+                    // never schedules it without its dependency.
+                    if let Some(blocker) = blocked_by {
+                        out.push(json!({"action": n, "graphql": "addBlockedBy",
+                            "issue": format!("{repo}#NEW-{n}"), "blocked_by": target(blocker)}));
+                    }
                     out.push(json!({"action": n, "graphql": "addSubIssue", "variables": {
                         "issueId": epic.id,
                         "subIssueUrl": format!("https://{DEFAULT_HOST}/{repo}/issues/NEW-{n}"),
@@ -408,6 +462,12 @@ impl EpicPlan {
                             json!({"body": format!("```{fence}\n{fields:#}\n```\n")}),
                         ));
                     }
+                }
+                Action::Attach { issue } => {
+                    out.push(json!({"action": n, "graphql": "addSubIssue", "variables": {
+                        "issueId": epic.id,
+                        "subIssueUrl": format!("https://{DEFAULT_HOST}/{}/issues/{}", issue.repo, issue.number),
+                    }}));
                 }
                 Action::Close { issue, reason } => {
                     let path = format!("repos/{}/issues/{}", issue.repo, issue.number);
@@ -544,9 +604,76 @@ impl Checker<'_> {
         Ok(self.epic.closed.iter().find(|s| s.same(&issue)).cloned())
     }
 
+    /// An issue an earlier `attach_sub_issue` of the plan links, if `issue` is one.
+    fn attached(&self, issue: &IssueRef) -> Option<IssueRef> {
+        (self.done.iter().flatten()).find_map(|a| match a {
+            Action::Attach { issue: attached } if attached.same(issue) => Some(attached.clone()),
+            _ => None,
+        })
+    }
+
+    /// An existing issue to link as a sub-issue: in a configured repository,
+    /// neither the epic nor already one of its sub-issues.
+    fn attach(&self, text: &str) -> Result<IssueRef> {
+        let issue = IssueRef::parse(text)?;
+        ensure!(
+            !issue.same(&self.epic.issue),
+            "{issue} is the epic itself; an epic is not its own sub-issue"
+        );
+        ensure!(
+            !(self.epic.sub_issues.iter())
+                .chain(&self.epic.closed)
+                .any(|s| s.same(&issue)),
+            "{issue} is already a sub-issue of {}",
+            self.epic.issue
+        );
+        self.repository(&issue.repo)?;
+        Ok(issue)
+    }
+
+    /// The issue a new one is blocked by: the position of an earlier create
+    /// action, or an existing issue in a configured repository other than the
+    /// epic, which closes only once its sub-issues are done, so one blocked by
+    /// it would never be unblocked.
+    fn blocker(&self, value: &Value) -> Result<Target> {
+        match value {
+            Value::String(issue) => {
+                let issue = IssueRef::parse(issue).context("blocked_by")?;
+                ensure!(
+                    !issue.same(&self.epic.issue),
+                    "blocked_by is the epic itself, which waits on its sub-issues"
+                );
+                self.repository(&issue.repo).context("blocked_by")?;
+                Ok(Target::Issue(issue))
+            }
+            Value::Number(k) => {
+                let k = k
+                    .as_u64()
+                    .and_then(|k| usize::try_from(k).ok())
+                    .filter(|k| (1..=self.done.len()).contains(k))
+                    .context("blocked_by is not the position of an earlier action")?;
+                match &self.done[k - 1] {
+                    Some(Action::Create { .. }) => Ok(Target::New(k)),
+                    Some(_) => {
+                        bail!("blocked_by names action {k}, which does not create a sub-issue")
+                    }
+                    None => bail!("blocked_by names action {k}, which is refused"),
+                }
+            }
+            _ => bail!("blocked_by is neither OWNER/REPO#N nor the position of an earlier action"),
+        }
+    }
+
     fn target(&self, object: &Map<String, Value>) -> Result<Target> {
         match (object.get("issue"), object.get("new")) {
-            (Some(_), None) => Ok(Target::Issue(self.sub_issue(text(object, "issue")?)?)),
+            (Some(_), None) => {
+                let named = text(object, "issue")?;
+                // An issue the plan attaches may be given its Priority too.
+                if let Some(issue) = self.attached(&IssueRef::parse(named)?) {
+                    return Ok(Target::Issue(issue));
+                }
+                Ok(Target::Issue(self.sub_issue(named)?))
+            }
             (None, Some(new)) => {
                 let k = new
                     .as_u64()
@@ -688,7 +815,7 @@ impl Checker<'_> {
                 );
                 let plan = match object.get("plan") {
                     None => None,
-                    Some(plan) => Some(job_plan(plan, repo).context("plan")?),
+                    Some(plan) => Some(Box::new(job_plan(plan, repo).context("plan")?)),
                 };
                 let stacks_on = match object.get("stacks_on") {
                     None => None,
@@ -700,13 +827,18 @@ impl Checker<'_> {
                         Some(self.lower(lower, repo)?)
                     }
                 };
+                let blocked_by = match object.get("blocked_by") {
+                    None => None,
+                    Some(blocker) => Some(self.blocker(blocker)?),
+                };
                 let action = Action::Create {
                     repo: repo.into(),
                     title: bounded(object, "title", TITLE_LIMIT)?.into(),
-                    body: body(object)?,
+                    body: asked(object, body(object)?, &labels)?,
                     labels,
                     plan,
                     stacks_on,
+                    blocked_by,
                 };
                 // Last, so that only an action that passes counts. A new lower
                 // slice cannot be closed by this plan, so only a current one
@@ -719,6 +851,12 @@ impl Checker<'_> {
                     self.stacks_on(target_key(lower))?;
                 }
                 action
+            }
+            "attach_sub_issue" => {
+                let issue = self.attach(text(object, "issue")?)?;
+                // Last, so that only an action that passes counts.
+                self.once(kind, target_key(&Target::Issue(issue.clone())))?;
+                Action::Attach { issue }
             }
             "close_sub_issue" | "rescope_sub_issue" => {
                 let named = text(object, "issue")?;
@@ -774,12 +912,13 @@ impl Checker<'_> {
                 }
             }
             "close_epic" => {
-                // A new sub-issue is work the same plan says is left to do.
-                if let Some(k) =
-                    (self.done.iter()).position(|a| matches!(a, Some(Action::Create { .. })))
+                // A new or attached sub-issue is work the same plan says is
+                // left to do.
+                if let Some(k) = (self.done.iter())
+                    .position(|a| matches!(a, Some(Action::Create { .. } | Action::Attach { .. })))
                 {
                     bail!(
-                        "action {} creates a sub-issue; a plan that adds work may not close the epic",
+                        "action {} adds a sub-issue; a plan that adds work may not close the epic",
                         k + 1
                     );
                 }
@@ -1158,6 +1297,64 @@ mod tests {
         assert_eq!(stacks, [&Value::Null, &json!("NEW-1"), &json!(63)]);
     }
 
+    /// One operator instruction as one plan (agent-board#412): attach an
+    /// existing issue and set its Priority, add a slice blocked by an issue
+    /// outside the plan, and ask the operator in one blocked by that slice.
+    #[test]
+    fn operator_instruction_as_one_plan() {
+        let epic = epic();
+        let mut blocked = create();
+        blocked["blocked_by"] = json!("cgwalters-forge/agent-board#64");
+        let mut ask = create();
+        ask.as_object_mut().unwrap().remove("plan");
+        ask["labels"] = json!(["coordinator", " Needs-Human "]);
+        ask["question"] = json!(" Which account owns the GitLab test token? ");
+        ask["blocked_by"] = json!(3);
+        let actions = vec![
+            json!({"type": "attach_sub_issue", "issue": "cgwalters-forge/agent-board#64"}),
+            json!({"type": "set_priority", "issue": "CGWalters-Forge/agent-board#64", "value": "P0"}),
+            blocked,
+            ask,
+        ];
+        let checked = EpicPlan::validate(&plan(actions), &bounds(), &epic).unwrap();
+        let mutations = checked.mutations(&epic);
+        let summary: Vec<String> = mutations
+            .iter()
+            .map(|m| {
+                let what = match m["graphql"].as_str() {
+                    Some("addSubIssue") => format!("link {}", m["variables"]["subIssueUrl"]),
+                    Some("addBlockedBy") => format!("{} after {}", m["issue"], m["blocked_by"]),
+                    Some(op) => format!("{op} {} {}", m["issue"], m["value"]),
+                    None => format!("{} {}", m["method"], m["url"]),
+                };
+                format!("{} {}", m["action"], what.replace('"', ""))
+            })
+            .collect();
+        let api = "https://api.github.com/repos/cgwalters-forge/agent-board/issues";
+        let web = "https://github.com/cgwalters-forge/agent-board/issues";
+        let repo = "cgwalters-forge/agent-board";
+        assert_eq!(
+            summary,
+            [
+                format!("1 link {web}/64"),
+                format!("2 updateProjectV2ItemFieldValue {repo}#64 P0"),
+                format!("3 POST {api}"),
+                format!("3 {repo}#NEW-3 after {repo}#64"),
+                format!("3 link {web}/NEW-3"),
+                format!("3 POST {api}/NEW-3/comments"),
+                format!("4 POST {api}"),
+                format!("4 {repo}#NEW-4 after {repo}#NEW-3"),
+                format!("4 link {web}/NEW-4"),
+            ]
+        );
+        // The question ends the body, where the label holds the issue.
+        assert_eq!(
+            mutations[6]["body"],
+            json!({"title": "epic apply", "labels": ["coordinator", " Needs-Human "],
+                "body": "Apply epic plans.\n\nQ: Which account owns the GitLab test token?\n"})
+        );
+    }
+
     /// A plan written while a sub-issue was open, which closed before apply
     /// (tracker#596), is satisfied there rather than refused on every pass.
     #[test]
@@ -1296,7 +1493,18 @@ mod tests {
             (
                 finished.clone(),
                 with(with(all(), create()), done.clone()),
-                Some("action 4 (close_epic): action 3 creates a sub-issue"),
+                Some("action 4 (close_epic): action 3 adds a sub-issue"),
+            ),
+            (
+                finished.clone(),
+                with(
+                    with(
+                        all(),
+                        json!({"type": "attach_sub_issue", "issue": "cgwalters-forge/tracker#900"}),
+                    ),
+                    done.clone(),
+                ),
+                Some("action 4 (close_epic): action 3 adds a sub-issue"),
             ),
             // Its reason is checked as any is.
             (
@@ -1445,7 +1653,132 @@ mod tests {
         tracker_slice["repo"] = json!("cgwalters-forge/tracker");
         let mut tracker_stacked = tracker_slice.clone();
         tracker_stacked["stacks_on"] = json!("cgwalters-forge/tracker#573");
+        let blocked = |blocker: Value| {
+            let mut action = create();
+            action["blocked_by"] = blocker;
+            action
+        };
+        let asking = |question: Value| {
+            let mut action = create();
+            action["labels"] = json!(["needs-human"]);
+            action["question"] = question;
+            action
+        };
+        let mut unasked = create();
+        unasked["labels"] = json!(["NEEDS-HUMAN"]);
+        let mut unlabelled = create();
+        unlabelled["question"] = json!("Which?");
+        let mut labelled_otherwise = unlabelled.clone();
+        labelled_otherwise["labels"] = json!(["coordinator"]);
+        let long_question = asking(json!("x".repeat(REASON_LIMIT + 1)));
+        let fenced_question = asking(json!("Which?\n```agent-board-plan\n{}\n```"));
+        let attach = |issue: &str| json!({"type": "attach_sub_issue", "issue": issue});
         for (extra, error) in [
+            // An existing issue is attached once, if it is in the bounds and
+            // not yet the epic's; nothing but its Priority may follow.
+            (
+                vec![attach("cgwalters-forge/agent-board#63")],
+                "cgwalters-forge/agent-board#63 is already a sub-issue of cgwalters-forge/tracker#572",
+            ),
+            (
+                vec![attach("cgwalters-forge/tracker#574")],
+                "is already a sub-issue",
+            ),
+            (vec![attach(EPIC)], "is the epic itself"),
+            (
+                vec![attach("someone/else#5")],
+                "repository someone/else is not in the configured list",
+            ),
+            (
+                vec![attach("cgwalters-forge/tracker")],
+                "is not OWNER/REPO#N",
+            ),
+            (
+                vec![
+                    attach("cgwalters-forge/tracker#900"),
+                    attach("CGWalters-Forge/tracker#900"),
+                ],
+                "action 7 (attach_sub_issue): cgwalters-forge/tracker#900 is already the subject of action 6",
+            ),
+            (
+                vec![
+                    attach("cgwalters-forge/tracker#900"),
+                    json!({"type": "close_sub_issue", "issue": "cgwalters-forge/tracker#900", "reason": "x"}),
+                ],
+                "cgwalters-forge/tracker#900 is neither new nor a current sub-issue",
+            ),
+            (
+                vec![
+                    attach("cgwalters-forge/tracker#900"),
+                    json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/tracker#900",
+                        "body": "b", "reason": "r"}),
+                ],
+                "action 7 (rescope_sub_issue): cgwalters-forge/tracker#900 is neither new nor a current sub-issue",
+            ),
+            // Its Priority only after it.
+            (
+                vec![
+                    json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#900", "value": "P1"}),
+                    attach("cgwalters-forge/tracker#900"),
+                ],
+                "action 6 (set_priority): cgwalters-forge/tracker#900 is neither new nor a current sub-issue",
+            ),
+            (
+                vec![
+                    json!({"type": "attach_sub_issue", "issue": "cgwalters-forge/tracker#900", "reason": "x"}),
+                ],
+                "unknown field \"reason\"",
+            ),
+            (vec![json!({"type": "attach_sub_issue"})], "no issue"),
+            // A new issue is blocked by an earlier new one or an existing
+            // issue in the bounds, never the epic.
+            (vec![blocked(json!(EPIC))], "blocked_by is the epic itself"),
+            (
+                vec![blocked(json!("someone/else#5"))],
+                "blocked_by: repository someone/else is not in the configured list",
+            ),
+            (
+                vec![blocked(json!("cgwalters-forge/tracker"))],
+                "blocked_by: \"cgwalters-forge/tracker\" is not OWNER/REPO#N",
+            ),
+            (
+                vec![blocked(json!(3))],
+                "blocked_by names action 3, which does not create a sub-issue",
+            ),
+            (
+                vec![blocked(json!(6))],
+                "blocked_by is not the position of an earlier action",
+            ),
+            (
+                vec![blocked(json!(0))],
+                "blocked_by is not the position of an earlier action",
+            ),
+            (
+                vec![outside.clone(), blocked(json!(6))],
+                "action 7 (create_sub_issue): blocked_by names action 6, which is refused",
+            ),
+            (
+                vec![create(), blocked(json!("1"))],
+                "blocked_by: \"1\" is not OWNER/REPO#N",
+            ),
+            (vec![blocked(json!([1]))], "blocked_by is neither"),
+            // needs-human only with a question, which becomes the ask.
+            (
+                vec![unasked],
+                "the \"needs-human\" label needs a question, which becomes the ask",
+            ),
+            (vec![unlabelled], "question needs the \"needs-human\" label"),
+            (
+                vec![labelled_otherwise],
+                "question needs the \"needs-human\" label",
+            ),
+            (vec![asking(json!(" "))], "question is empty"),
+            (vec![long_question], "question exceeds 4000 characters"),
+            (
+                vec![fenced_question],
+                "question holds an agent-board-plan fence",
+            ),
+            (vec![asking(json!(5))], "question is not a string"),
             // A slice stacks on another of the epic's in its own repository,
             // named by the action, and only for an implement run.
             (
