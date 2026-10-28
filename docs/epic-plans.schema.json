@@ -33,8 +33,17 @@
           "title": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S"},
           "body": {"$ref": "#/$defs/body"},
           "labels": {"type": "array", "maxItems": 10, "items": {"type": "string", "pattern": "\\S"}},
+          "question": {"$ref": "#/$defs/reason"},
           "plan": {"$ref": "#/$defs/job"},
-          "stacks_on": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 20}, {"$ref": "#/$defs/issue"}]}
+          "stacks_on": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 20}, {"$ref": "#/$defs/issue"}]},
+          "blocked_by": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 20}, {"$ref": "#/$defs/issue"}]}
+        },
+        "if": {"required": ["labels"], "properties": {"labels": {"contains":
+          {"pattern": "^\\s*[Nn][Ee][Ee][Dd][Ss]-[Hh][Uu][Mm][Aa][Nn]\\s*(?![\\s\\S])"}}}},
+        "then": {"required": ["question"]},
+        "else": {"not": {"required": ["question"]}}},
+        {"required": ["issue"], "properties": {
+          "type": {"const": "attach_sub_issue"}, "issue": {"$ref": "#/$defs/issue"}
         }},
         {"required": ["issue", "reason"], "properties": {
           "type": {"const": "close_sub_issue"}, "issue": {"$ref": "#/$defs/issue"}, "reason": {"$ref": "#/$defs/reason"}

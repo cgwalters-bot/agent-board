@@ -43,8 +43,9 @@ const REPORT_CHARS: usize = 200;
 /// claim, the receipt and the final read.
 const APPLY_REQUESTS: usize = 16;
 /// Requests one action of an apply takes at most: a create's issue, its
-/// receipt update, link, Priority (three) and job plan.
-const ACTION_REQUESTS: usize = 8;
+/// receipt update, link, Priority (three), blocked-by link (three), the
+/// blocking issue's read before the claim, and job plan.
+const ACTION_REQUESTS: usize = 11;
 /// Changed sub-issues a line names before it counts the rest.
 const NAMED: usize = 3;
 
@@ -1124,7 +1125,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     .unwrap_or_default();
                 let done: Vec<&str> = (lines.iter())
                     .map(String::as_str)
-                    .filter(|l| !l.starts_with("Receipt: ") && !l.starts_with("Request: "))
+                    .filter(|l| {
+                        !["Receipt: ", "Request: ", epic_apply::LINKS]
+                            .iter()
+                            .any(|p| l.starts_with(p))
+                    })
                     .collect();
                 let done = match done.is_empty() {
                     true => "no changes".to_owned(),
