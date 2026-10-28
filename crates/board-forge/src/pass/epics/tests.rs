@@ -1,6 +1,8 @@
 use super::*;
 use crate::epic::SUB_ISSUES_QUERY;
-use crate::pass::tests::{answer, block, config, preview, replay as board, set_usage, usage};
+use crate::pass::tests::{
+    answer, block, config, preview, replay as board, set_usage, unfinished, usage,
+};
 use std::cell::{Cell, RefCell};
 
 /// The plan tracker#890 applied, and its receipt, as recorded.
@@ -171,29 +173,67 @@ fn unapplied(replay: &mut Replay) {
     census(replay, 890);
 }
 
+/// `author`'s comment on tracker#596, a minute before the recording, that
+/// its recorded sub-issues are all closed.
+fn said_done(replay: &mut Replay, author: &str) {
+    let board = config(json!({})).board.unwrap();
+    let facts = EpicFacts::from_node(node(replay, 596), Some(&board)).unwrap();
+    let body = format!("{}\nEvery sub-issue is closed.", done_marker(&facts.census));
+    let said = posted(replay, 596, 7_000_000_009, author, 1, &body);
+    comments(replay, COMMENTS_596).push(said);
+}
+
+/// Labels tracker#596 with each of `labels`.
+fn label_596(replay: &mut Replay, labels: &[&str]) {
+    let nodes = (replay.requests.iter_mut())
+        .filter_map(|e| e["answer"].pointer_mut("/data/repository/issues/nodes"))
+        .filter_map(Value::as_array_mut)
+        .flatten();
+    for node in nodes.filter(|n| n["number"] == 596) {
+        let held = &mut node["labels"];
+        for label in labels {
+            held["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name": label}));
+        }
+        held["totalCount"] = (held["totalCount"].as_u64().unwrap() + labels.len() as u64).into();
+    }
+}
+
+/// [`said_done`] by the bot and labelled `labels`, then the operator's
+/// comment, at the recording.
+fn answered_done(replay: &mut Replay, labels: &[&str]) {
+    said_done(replay, "cgwalters-bot");
+    label_596(replay, labels);
+    let answer = posted(replay, 596, 7_000_000_010, "cgwalters", 0, "Docs next.");
+    comments(replay, COMMENTS_596).push(answer);
+}
+
 /// The live board of the evening of 23 October with a fresh usage
-/// snapshot: tracker#596, frozen since tracker#851 by a coordinator that
-/// matched its sub-issues by title, is planned; tracker#890's plan is
-/// recognised as applied from its receipt, though most of the sub-issues
-/// it created have closed since and one was reprioritised, so nothing is
-/// created again; it is due too, but one epic is planned a pass; #766 is
-/// held by its `needs-human` label.
+/// snapshot, tracker#596 given an open sub-issue: #596, frozen since
+/// tracker#851 by a coordinator that matched its sub-issues by title, is
+/// planned; tracker#890's plan is recognised as applied from its receipt,
+/// though most of the sub-issues it created have closed since and one was
+/// reprioritised, so nothing is created again; it waits a day after its
+/// last plan; #766 is held by its `needs-human` label.
 #[test]
 fn replay_plans_one_epic_and_recreates_nothing() {
-    let report = preview(&config(json!({})), &replay());
+    let mut replay = replay();
+    unfinished(&mut replay);
+    let report = preview(&config(json!({})), &replay);
     assert_eq!(
         stage(&report),
         [
             "epics: 3 live of 3 open in cgwalters-forge/tracker",
-            "start planning cgwalters-forge/tracker#596 pool=claude: its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 3 more)",
-            "hold epic cgwalters-forge/tracker#890: due (its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); cgwalters-forge/agent-board#284 edited; cgwalters-forge/agent-board#289's Priority is P0, not P2); one epic is planned a pass",
+            "start planning cgwalters-forge/tracker#596 pool=claude: its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 4 more)",
+            "hold epic cgwalters-forge/tracker#890: its sub-issues changed (cgwalters-forge/agent-board#285 closed, cgwalters-forge/agent-board#286 closed, cgwalters-forge/agent-board#287 closed and 5 more); planned again from 2026-10-24T13:34:49Z, 24 hours after its last request",
             "hold epic cgwalters-forge/tracker#766: labelled needs-human; otherwise due to be planned (its sub-issues changed (cgwalters-forge/actions#83 closed, cgwalters-forge/agent-board#167 closed, cgwalters-forge/agent-board#168 closed and 2 more))",
         ]
     );
     assert!(!report.lines.iter().any(|l| l.contains("apply epic")));
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
-    // The planning run counts against --max-dispatch, and takes its turn.
-    let replay = replay();
+    // The planning run counts against --max-dispatch.
     let capped = Limits {
         dispatch: Some(0),
         writes: Some(0),
@@ -216,7 +256,7 @@ fn replay_plans_one_epic_and_recreates_nothing() {
         "{lines:#?}"
     );
     assert!(
-        lines[2].ends_with("; one epic is planned a pass"),
+        lines[2].ends_with(", 24 hours after its last request"),
         "{lines:#?}"
     );
 }
@@ -390,6 +430,75 @@ fn replay_epic_scenarios() {
             None,
         ),
         (
+            "done: an epic whose sub-issues are all closed is asked about, not planned",
+            Box::new(|_| {}),
+            "hold epic cgwalters-forge/tracker#596: every sub-issue is closed; its sub-issues changed (cgwalters-forge/agentic-job#630 closed, cgwalters-forge/agentic-job#715 closed, cgwalters-forge/agentic-job#716 closed and 3 more); label needs-human, Why Q: Every sub-issue of this epic is closed. Close it, or comment with what is left?",
+            0,
+            Some((HoldKind::NeedsHuman, true)),
+        ),
+        (
+            "done: once, for those sub-issues",
+            Box::new(|r| said_done(r, "cgwalters-bot")),
+            "epic cgwalters-forge/tracker#596: every sub-issue is closed, as https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000009 says",
+            0,
+            None,
+        ),
+        (
+            "done: while its label holds it, the question stays the operator's",
+            Box::new(|r| {
+                said_done(r, "cgwalters-bot");
+                label_596(r, &["needs-human"]);
+            }),
+            "hold epic cgwalters-forge/tracker#596: labelled needs-human; every sub-issue is closed, as https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000009 says",
+            0,
+            Some((HoldKind::NeedsHuman, true)),
+        ),
+        (
+            "done: the operator's comment answers the ask, releasing its label",
+            Box::new(|r| answered_done(r, &["needs-human"])),
+            "release epic cgwalters-forge/tracker#596: the operator answered https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-7000000009; unlabel needs-human",
+            0,
+            None,
+        ),
+        (
+            "done: the answer, released, plans it",
+            Box::new(|r| answered_done(r, &["needs-human"])),
+            "start planning cgwalters-forge/tracker#596 pool=claude: operator direction since it was last planned",
+            0,
+            None,
+        ),
+        (
+            "done: the answer releases no other hold",
+            Box::new(|r| answered_done(r, &["needs-human", "needs-design"])),
+            "hold epic cgwalters-forge/tracker#596: labelled needs-human; otherwise due to be planned (operator direction since it was last planned)",
+            0,
+            Some((HoldKind::NeedsHuman, true)),
+        ),
+        (
+            "done: a visitor's marker is not the bot's",
+            Box::new(|r| said_done(r, "visitor")),
+            "hold epic cgwalters-forge/tracker#596: every sub-issue is closed; ",
+            0,
+            Some((HoldKind::NeedsHuman, true)),
+        ),
+        (
+            "done: with epics.close, it is closed instead",
+            Box::new(|_| {}),
+            "close epic cgwalters-forge/tracker#596: every sub-issue is closed; its sub-issues changed (",
+            0,
+            None,
+        ),
+        (
+            "done: the operator's direction still plans it",
+            Box::new(|r| {
+                let direction = posted(r, 596, 7_000_000_004, "cgwalters", 1, "Next: the docs.");
+                comments(r, COMMENTS_596).push(direction);
+            }),
+            "start planning cgwalters-forge/tracker#596 pool=claude: operator direction since it was last planned",
+            0,
+            None,
+        ),
+        (
             "no planning while new work is off",
             Box::new(|_| {}),
             "hold epic cgwalters-forge/tracker#596: due (its sub-issues changed",
@@ -399,10 +508,18 @@ fn replay_epic_scenarios() {
     ];
     for (name, edit, expected, failures, kind) in cases {
         let mut replay = replay();
+        // tracker#596's sub-issues are all closed, which only the cases
+        // about that leave so.
+        if !name.starts_with("done: ") {
+            unfinished(&mut replay);
+        }
         edit(&mut replay);
-        let settings = match name.starts_with("no planning") {
-            true => json!({"wip": 0}),
-            false => json!({}),
+        let settings = if name.starts_with("no planning") {
+            json!({"wip": 0})
+        } else if name.contains("epics.close") {
+            json!({"epics": {"repository": "cgwalters-forge/tracker", "close": true}})
+        } else {
+            json!({})
         };
         let report = preview(&config(settings), &replay);
         let lines = stage(&report);
@@ -425,6 +542,12 @@ struct Forge {
     added: RefCell<Vec<Value>>,
     writes: RefCell<Vec<(String, Value)>>,
     ids: Cell<u64>,
+    /// Refuses a board Why update.
+    why_fails: Cell<bool>,
+    /// Edits each listing of the epics after the first: what changed while
+    /// the pass went through them.
+    relisted: Cell<Option<fn(&mut Value)>>,
+    listings: Cell<usize>,
 }
 
 impl Forge {
@@ -434,6 +557,9 @@ impl Forge {
             added: RefCell::new(vec![]),
             writes: RefCell::new(vec![]),
             ids: Cell::new(1000),
+            why_fails: Cell::new(false),
+            relisted: Cell::new(None),
+            listings: Cell::new(0),
         }
     }
 
@@ -478,17 +604,14 @@ impl Rest for Forge {
         if method == "POST" && path.ends_with("/issues") {
             return Ok((201, json!({"number": id})));
         }
-        if method == "POST" && path == "repos/cgwalters-forge/tracker/issues/890/comments" {
+        let commented = (path.strip_prefix("repos/cgwalters-forge/tracker/issues/"))
+            .and_then(|rest| rest.strip_suffix("/comments")?.parse::<u64>().ok());
+        if method == "POST"
+            && let Some(n) = commented
+        {
             let html_url =
-                format!("https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-{id}");
-            let mut node = posted(
-                &self.replay,
-                890,
-                id,
-                "cgwalters-bot",
-                0,
-                text(body, "/body"),
-            );
+                format!("https://github.com/cgwalters-forge/tracker/issues/{n}#issuecomment-{id}");
+            let mut node = posted(&self.replay, n, id, "cgwalters-bot", 0, text(body, "/body"));
             node["url"] = html_url.clone().into();
             self.added.borrow_mut().push(node);
             return Ok((201, json!({"id": id, "html_url": html_url})));
@@ -524,6 +647,9 @@ impl Transport for Forge {
         .iter()
         .find(|m| query.contains(*m))
         {
+            if self.why_fails.get() && variables["field"] == "F_why" {
+                bail!("{WHY_FIELD} update refused");
+            }
             let item = variables["item"].clone();
             self.kept(format!("graphql {}", name.trim_end_matches('(')), variables);
             return Ok(json!({"addProjectV2ItemById": {"item": {"id": "PVTI_new"}},
@@ -541,12 +667,20 @@ impl Transport for Forge {
             ));
         }
         let mut data = self.replay.graphql(query, variables.clone())?;
-        if variables["number"] == 890
-            && let Some(nodes) = data
-                .pointer_mut("/repository/issue/comments/nodes")
-                .and_then(Value::as_array_mut)
+        if query == EPICS_QUERY {
+            self.listings.set(self.listings.get() + 1);
+            if let Some(edit) = self.relisted.get().filter(|_| self.listings.get() > 1) {
+                edit(&mut data);
+            }
+        }
+        if let Some(nodes) = data
+            .pointer_mut("/repository/issue/comments/nodes")
+            .and_then(Value::as_array_mut)
         {
-            nodes.extend(self.added.borrow().iter().cloned());
+            let on = format!("/issues/{}#", variables["number"]);
+            let added = self.added.borrow();
+            let here = added.iter().filter(|c| text(c, "/url").contains(&on));
+            nodes.extend(here.cloned());
         }
         Ok(data)
     }
@@ -554,12 +688,17 @@ impl Transport for Forge {
 
 /// An applying pass in `forge`, starting no run, within `writes` writes.
 fn local(forge: &Forge, writes: usize) -> Report {
+    local_with(forge, writes, json!({}))
+}
+
+/// [`local`] with `settings`.
+fn local_with(forge: &Forge, writes: usize, settings: Value) -> Report {
     let limits = Limits {
         dispatch: Some(0),
         writes: Some(writes),
         ..Limits::default()
     };
-    let config = config(json!({}));
+    let config = config(settings);
     let mode = (Mode::Local, limits);
     block(run(
         forge,
@@ -580,6 +719,7 @@ fn local(forge: &Forge, writes: usize) -> Report {
 #[test]
 fn apply_creates_once_with_final_priorities() {
     let mut replay = replay();
+    unfinished(&mut replay);
     unapplied(&mut replay);
     let held = Forge::new(Replay {
         now: replay.now,
@@ -725,12 +865,170 @@ fn second_empty_plan_labels_and_asks() {
     }
 }
 
-/// [`decide`] on tracker#890's recorded facts at other times: changes wait
-/// three hours after the last plan unless the operator speaks, twice as
-/// long for each apply in a row that had nothing to do; an unchanged epic
-/// is left alone however long after, the bot's comments notwithstanding;
-/// and the operator's word plans an epic whose plan is invalid once, not
-/// again after the request it led to.
+/// An applying pass on tracker#596, whose sub-issues are all closed: asks
+/// the operator (the Why, the comment that says so once, the label), all
+/// or, past --max-writes, none of it; or with `epics.close` closes it as
+/// completed after that comment. The comment's marker makes the next pass
+/// leave it be; a Why that failed before it is asked again.
+#[test]
+fn done_epic_is_asked_or_closed_once() {
+    let mut replay = replay();
+    let variables =
+        json!({"owner": "cgwalters-forge", "name": "tracker", "number": 596, "field": WHY_FIELD});
+    replay.requests.push(json!({
+        "request": graphql_key(WHY_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"projectItems": {"nodes": [{"id": "PVTI_596",
+            "project": {"id": "PVT_1", "number": 1, "owner": {"login": "cgwalters-forge"},
+                "field": {"id": "F_why", "dataType": "TEXT"}},
+            "why": null}], "totalCount": 1}}}}},
+    }));
+    let board = config(json!({})).board.unwrap();
+    let marker = done_marker(
+        &EpicFacts::from_node(node(&replay, 596), Some(&board))
+            .unwrap()
+            .census,
+    );
+    let close = json!({"epics": {"repository": "cgwalters-forge/tracker", "close": true}});
+    let asked = [
+        "graphql updateProjectV2ItemFieldValue",
+        "POST repos/cgwalters-forge/tracker/issues/596/comments",
+        "POST repos/cgwalters-forge/tracker/issues/596/labels",
+    ];
+    let closed = [
+        "POST repos/cgwalters-forge/tracker/issues/596/comments",
+        "PATCH repos/cgwalters-forge/tracker/issues/596",
+    ];
+    let ours = |forge: &Forge| -> Vec<(String, Value)> {
+        (forge.writes.borrow().iter())
+            .filter(|(w, body)| w.contains("/596") || body["field"] == "F_why")
+            .cloned()
+            .collect()
+    };
+    let names = |writes: &[(String, Value)]| -> Vec<String> {
+        writes.iter().map(|(w, _)| w.clone()).collect()
+    };
+    for (settings, writes, expected) in [
+        (json!({}), 2, &[][..]),
+        (json!({}), 3, &asked[..]),
+        (close.clone(), 1, &[][..]),
+        (close, 2, &closed[..]),
+    ] {
+        let forge = Forge::new(Replay {
+            now: replay.now,
+            requests: replay.requests.clone(),
+        });
+        let report = local_with(&forge, writes, settings.clone());
+        assert_eq!(
+            report.failures, 0,
+            "{settings} {writes}: {:#?}",
+            report.lines
+        );
+        let made = ours(&forge);
+        assert_eq!(
+            names(&made),
+            expected,
+            "{settings} {writes}: {:#?}",
+            report.lines
+        );
+        // The next pass reads the comment, and leaves the epic be.
+        let again = local_with(&forge, writes, settings.clone());
+        assert_eq!(ours(&forge).len(), made.len(), "{:#?}", again.lines);
+        for (what, body) in &made {
+            if what.ends_with("/comments") {
+                assert!(text(body, "/body").starts_with(&marker), "{body}");
+            }
+            if what.starts_with("PATCH") {
+                assert_eq!(
+                    *body,
+                    json!({"state": "closed", "state_reason": "completed"})
+                );
+            }
+        }
+    }
+    // The Why refused: no comment marks the ask made, so the next pass
+    // asks whole, once.
+    let forge = Forge::new(Replay {
+        now: replay.now,
+        requests: replay.requests.clone(),
+    });
+    forge.why_fails.set(true);
+    let failed = local_with(&forge, 3, json!({}));
+    assert_eq!(failed.failures, 1, "{:#?}", failed.lines);
+    assert!(ours(&forge).is_empty(), "{:#?}", failed.lines);
+    forge.why_fails.set(false);
+    for _ in 0..2 {
+        let report = local_with(&forge, 3, json!({}));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    }
+    assert_eq!(names(&ours(&forge)), asked);
+    // The operator's answer takes the ask's label off first.
+    let mut answered = Replay {
+        now: replay.now,
+        requests: replay.requests.clone(),
+    };
+    answered_done(&mut answered, &["needs-human"]);
+    let forge = Forge::new(answered);
+    let report = local_with(&forge, 3, json!({}));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        names(&ours(&forge)).first().map(String::as_str),
+        Some("DELETE repos/cgwalters-forge/tracker/issues/596/labels/needs-human"),
+        "{:#?}",
+        report.lines
+    );
+    // A sub-issue reopened, or a hold put on, after the epics were listed:
+    // read again before the writes, it waits, asked or closed.
+    fn epic_596(data: &mut Value) -> &mut Value {
+        let nodes = data["repository"]["issues"]["nodes"].as_array_mut();
+        (nodes.unwrap().iter_mut())
+            .find(|n| n["number"] == 596)
+            .unwrap()
+    }
+    let reopened: fn(&mut Value) = |data| {
+        epic_596(data)["subIssues"]["nodes"][0]["state"] = "OPEN".into();
+    };
+    let held: fn(&mut Value) = |data| {
+        let labels = &mut epic_596(data)["labels"];
+        labels["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "needs-design"}));
+        labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+    };
+    let close = json!({"epics": {"repository": "cgwalters-forge/tracker", "close": true}});
+    for (change, why) in [
+        (reopened, "its sub-issues changed since they were read"),
+        (held, "labelled needs-design"),
+    ] {
+        for settings in [json!({}), close.clone()] {
+            let forge = Forge::new(Replay {
+                now: replay.now,
+                requests: replay.requests.clone(),
+            });
+            forge.relisted.set(Some(change));
+            let report = local_with(&forge, 3, settings.clone());
+            assert_eq!(report.failures, 0, "{why}: {:#?}", report.lines);
+            assert!(ours(&forge).is_empty(), "{why}: {:#?}", report.lines);
+            let waits = format!("; not yet: {why}; the next pass reads it again");
+            assert!(
+                (report.lines.iter())
+                    .any(|l| l.starts_with("hold epic cgwalters-forge/tracker#596: ")
+                        && l.ends_with(&waits)),
+                "{settings} {why}: {:#?}",
+                report.lines
+            );
+        }
+    }
+}
+
+/// [`decide`] on tracker#890's recorded facts at other times: changes to
+/// its sub-issues wait a day after the last plan unless the operator
+/// speaks, twice as long for each apply in a row that had nothing to do;
+/// an epic whose sub-issues changed only in Priority or text, or not at
+/// all, is left alone however long after, the bot's comments and an empty
+/// plan notwithstanding; one whose sub-issues are all closed is done; and
+/// the operator's word plans an epic whose plan is invalid once, not again
+/// after the request it led to.
 #[test]
 fn decide_coalesces_changes_but_not_direction() {
     let replay = replay();
@@ -794,8 +1092,12 @@ fn decide_coalesces_changes_but_not_direction() {
             _ => settled.census.closed.push(issue),
         }
     }
-    settled.edits.clear();
     settled.priorities = receipt[0].detail.priorities();
+    // Its sub-issues' Priority moved since: churn, not a change.
+    let mut drifted = settled.clone();
+    for priority in drifted.priorities.values_mut() {
+        *priority = "P3".into();
+    }
     let mut empty = settled.clone();
     empty.census.closed.append(&mut empty.census.sub_issues);
     // An apply after it that had nothing to do, the `n`th.
@@ -805,6 +1107,15 @@ fn decide_coalesces_changes_but_not_direction() {
         let body = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER);
         note(20 + n, "cgwalters-bot", "2026-10-23T14:00:00Z", &body)
     };
+    // Never planned, and the bot's comment that its sub-issues are all
+    // closed.
+    let unplanned = vec![];
+    let said = note(
+        40,
+        "cgwalters-bot",
+        "2026-10-25T14:00:00Z",
+        &format!("{}\nDone.", done_marker(&empty.census)),
+    );
     // The facts, the recorded comments and more, the time, and the start
     // of what comes of it; a time after `3 ` sets `triageFollowUpDays` to 3.
     type Case<'a> = (
@@ -841,7 +1152,29 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![],
             "2026-10-23T16:35:00Z",
+            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+        ),
+        (
+            &facts,
+            &recorded,
+            vec![],
+            "2026-10-24T13:35:00Z",
             "Plan(\"its sub-issues changed",
+        ),
+        (
+            &drifted,
+            &recorded,
+            vec![],
+            "2026-10-30T14:00:00Z",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since",
+        ),
+        // A plan that had nothing to do ends planning until they change.
+        (
+            &settled,
+            &recorded,
+            vec![nothing(1)],
+            "2026-10-30T14:00:00Z",
+            "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since 2026-10-23T14:00:00Z\")",
         ),
         (
             &settled,
@@ -876,8 +1209,8 @@ fn decide_coalesces_changes_but_not_direction() {
             &empty,
             &recorded,
             vec![],
-            "2026-10-24T14:00:00Z",
-            "Plan(\"its sub-issues changed",
+            "2026-10-23T15:00:00Z",
+            "Done(\"every sub-issue is closed; its sub-issues changed",
         ),
         (
             &empty,
@@ -886,41 +1219,71 @@ fn decide_coalesces_changes_but_not_direction() {
             "2026-10-24T14:00:00Z",
             "Idle(\"plan 6366132099@2026-10-23T13:34:49Z applied; nothing changed since",
         ),
-        // Each apply in a row that had nothing to do doubles the three
-        // hours, up to `triageFollowUpDays`.
+        // Never planned: done, said once, and planned on the operator's
+        // word after that.
+        (
+            &empty,
+            &unplanned,
+            vec![],
+            "2026-10-25T13:00:00Z",
+            "Done(\"every sub-issue is closed; it has never been planned\")",
+        ),
+        (
+            &empty,
+            &unplanned,
+            vec![say("cgwalters", "2026-10-25T13:00:00Z"), said.clone()],
+            "2026-10-30T14:00:00Z",
+            "Said(\"every sub-issue is closed, as",
+        ),
+        (
+            &empty,
+            &unplanned,
+            vec![said.clone(), say("cgwalters-bot", "2026-10-25T15:00:00Z")],
+            "2026-10-30T14:00:00Z",
+            "Said(\"every sub-issue is closed, as",
+        ),
+        (
+            &empty,
+            &unplanned,
+            vec![said, say("cgwalters", "2026-10-25T15:00:00Z")],
+            "2026-10-30T14:00:00Z",
+            "Plan(\"operator direction since https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-40\")",
+        ),
+        // Each apply in a row that had nothing to do doubles the day, up
+        // to `triageFollowUpDays`; without it, a day.
         (
             &facts,
             &recorded,
             vec![nothing(1)],
-            "3 2026-10-23T18:00:00Z",
+            "3 2026-10-25T13:00:00Z",
             "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
         ),
         (
             &facts,
             &recorded,
             vec![nothing(1)],
-            "3 2026-10-23T20:00:00Z",
+            "3 2026-10-25T14:00:00Z",
             "Plan(\"its sub-issues changed",
         ),
         (
             &facts,
             &recorded,
             vec![nothing(1), nothing(2)],
-            "3 2026-10-23T20:00:00Z",
+            "3 2026-10-26T13:00:00Z",
             "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
         ),
         (
             &facts,
             &recorded,
             vec![nothing(1), nothing(2)],
-            "3 2026-10-24T02:00:00Z",
+            "3 2026-10-26T14:00:00Z",
             "Plan(\"its sub-issues changed",
         ),
         (
             &facts,
             &recorded,
             vec![nothing(1), nothing(2)],
-            "2026-10-23T18:00:00Z",
+            "2026-10-24T14:00:00Z",
             "Plan(\"its sub-issues changed",
         ),
         (

@@ -236,7 +236,31 @@ one line an epic:
 * `start planning OWNER/REPO#N pool=P: why` for the first due epic: a
   triage run on the epic, started as stage 4 starts one, from `planPools`,
   whose brief asks for an epic plan. It takes a slot from stage 4 and counts
-  against `--max-dispatch`; one epic is planned a pass.
+  against `--max-dispatch`; one epic is planned a pass. Its plan comment is
+  the bot's last planning request on the epic, edited in place where there
+  is one the bot wrote and only the bot edited (agent-board#429): its new
+  change time makes it a new plan. Read again just before the edit, a
+  comment changed since the pass read it is left as it is, and the epic
+  held to the next pass. Its dispatch record is still a comment
+  of its own, since the claim protocol orders records by comment.
+* Where every sub-issue of a due epic is closed (it has at least one),
+  it is not planned: no plan is needed to say it is done. With
+  `epics.close`, `close epic OWNER/REPO#N: every sub-issue is closed; why`
+  comments so and closes it as completed, two write steps held whole by
+  `--max-writes`; else `hold epic …: every sub-issue is closed; why; label
+  needs-human, Why Q: …` asks the operator, setting the question in its
+  board Why, then commenting and labelling it `needs-human`, three. Either
+  comment's hidden first line, `<!-- agent-board-epic-done: HASH -->`,
+  hashes the sub-issues and their states, so it is said once for them
+  (`epic …: every sub-issue is closed, as URL says`), the bot's alone
+  counting; a write that failed before the comment is made again by the
+  next pass. An applying pass lists the epics again just before these
+  writes, and holds an epic whose sub-issues or holds changed since
+  (`…; not yet: why; the next pass reads it again`). A new sub-issue plans it again once no label holds it. The
+  operator's comment after the ask, with no planning request since,
+  answers it: where the label is the epic's only hold, `release epic …:
+  the operator answered URL; unlabel needs-human` takes it off, one write
+  step, and the epic is planned.
 * `epic OWNER/REPO#N: plan ID applied; nothing changed since T`, or
   `hold epic OWNER/REPO#N: why`: a planning run in flight, a request waiting
   for its plan, or for its retry six hours after its run ended, an invalid
@@ -258,15 +282,16 @@ retitled, closed or reprioritised since is not missing. An epic is due when
 it has no plan or request; on the operator's comment since its last plan
 (for a plan that cannot be applied or recovered, since its last request too,
 so a run that answers nothing is not started again);
-otherwise, once three hours have passed since its last request (its record,
-or for an epic planned before this stage, its plan), when the epic's text was
-edited, a sub-issue was added, removed, closed or reopened against the
-receipt's fingerprint, a sub-issue's text was edited, or a Priority the
-apply set differs now. That wait doubles for each applied plan in a row
-that had no actions, up to `triageFollowUpDays`. An unchanged epic is not
-planned again (agent-board#383). Not noticed: a Priority change of a
-sub-issue the apply did not set, and a comment by anyone but the operator,
-whose word alone decides an epic's plan.
+otherwise, once a day has passed since its last request (its record, or for
+an epic planned before this stage, its plan), when a sub-issue was added,
+removed, closed or reopened against the receipt's fingerprint; a merged
+pull request counts through the issue it closes. That wait doubles for each
+applied plan in a row that had no actions, up to `triageFollowUpDays`. So
+a plan with nothing to do ends planning until a sub-issue changes, and an
+unchanged epic is not planned again (agent-board#383). Not noticed
+(agent-board#429): edits of the epic's or a sub-issue's text, label and
+Priority churn, and a comment by anyone but the operator, whose word alone
+decides an epic's plan.
 
 Stage 5 reads the whole board (closed issues and pull requests included, in
 about one request per hundred items) besides the runs and open issues that
@@ -1090,11 +1115,13 @@ heads it planned, and never records one the run chose.
 ## Epic planning and recovery
 
 A live, unheld epic is due initially, after changed intent/operator direction
-or membership/state, body or Priority changes in its children, and never on
-a timer alone (agent-board#383). Coalesce automatic changes for three
-hours after a request, doubled for each applied plan in a row with no
-actions, up to `triageFollowUpDays` (none without it); new operator
-direction may bypass that interval. Ignore
+or membership/state changes in its children, and never on a timer alone
+(agent-board#383); body, label and Priority changes in its children are
+churn, not demand (agent-board#429). Coalesce automatic changes for a day
+after a request, doubled for each applied plan in a row with no actions,
+up to `triageFollowUpDays`; new operator direction may bypass that
+interval. An epic whose children are all closed is closed or asked about
+once instead of planned. Ignore
 the controller's own comments/timestamps as change triggers. Do not repeatedly
 plan an unchanged empty epic. A planning run in flight holds that epic. A plan
 must still match its requested intent and target preconditions; drift requires
@@ -1327,6 +1354,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `board.priorityField` | Priority single-select field; `"Priority"` |
 | `epics.repository` | Repository containing live epics; absent disables epic planning |
 | `epics.inWorkRepositories` | Also take operator-labelled epics in every work repository as live, for candidates only; `false` |
+| `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
