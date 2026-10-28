@@ -451,7 +451,8 @@ does not change the apply cache.
 
 There is one candidate set: open board issues in explicitly configured work
 repositories, excluding epics and the usage issue. An epic child qualifies
-only through a live epic whose latest `epic` label event is the operator's.
+only through a live epic whose latest `epic` label event is the operator's
+or the bot's: the operator files epics through the bot.
 A live epic is in `epics.repository`, or with `epics.inWorkRepositories` in
 any work repository; stage 3 plans only the former.
 An unparented issue qualifies only when opened by the operator or bot; public

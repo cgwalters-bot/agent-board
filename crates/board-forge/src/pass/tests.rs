@@ -215,7 +215,7 @@ const STARTED: &[&str] = &[
     "start triage cgwalters-forge/agent-board#40 pool=claude",
     "start triage cgwalters-forge/agent-board#44 pool=claude",
     "start triage cgwalters-forge/tracker#540 pool=claude",
-    "wip: no slot left; 185 more candidate(s) wait",
+    "wip: no slot left; 270 more candidate(s) wait",
 ];
 
 /// The last line of scheduling, before the Status stage's.
@@ -249,10 +249,10 @@ fn replay_idle_board_starts_work() {
         "follow: no repositories",
     ];
     expected.extend(EPIC_LINES);
-    expected.push("candidates: 194 (0 opened by others, 107 outside a live epic)");
+    expected.push("candidates: 279 (0 opened by others, 22 outside a live epic)");
     // The planning run took the last slot stage 4 had.
     expected.extend(&STARTED[..STARTED.len() - 2]);
-    expected.push("wip: no slot left; 186 more candidate(s) wait");
+    expected.push("wip: no slot left; 271 more candidate(s) wait");
     // The recording's whole-board read is an empty board: the Status stage
     // has its own recording.
     expected.push("status: 0 change(s) of 0 item(s) read");
@@ -601,7 +601,7 @@ fn replay_scenarios() {
             vec![
                 "hold cgwalters-forge/tracker#446: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
                 "start triage cgwalters-forge/tracker#459 pool=claude",
-                "wip: no slot left; 185 more candidate(s) wait",
+                "wip: no slot left; 270 more candidate(s) wait",
             ],
             5,
             0,
@@ -615,7 +615,7 @@ fn replay_scenarios() {
             }),
             vec![
                 "hold cgwalters-forge/tracker#446: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
-                "wip: no slot left; 185 more candidate(s) wait",
+                "wip: no slot left; 270 more candidate(s) wait",
             ],
             5,
             0,
@@ -738,7 +738,7 @@ fn replay_scenarios() {
                 "start triage cgwalters-forge/tracker#446 pool=claude",
                 "probe: openai has no reading; one run to take one",
                 "start triage cgwalters-forge/tracker#459 pool=openai",
-                "hold pools: claude has no reading; openai has no reading; 192 more candidate(s) wait",
+                "hold pools: claude has no reading; openai has no reading; 277 more candidate(s) wait",
             ],
             2,
             0,
@@ -1083,7 +1083,7 @@ fn replay_scenarios() {
             vec![
                 "probe: claude has no reading; one run to take one",
                 "start triage cgwalters-forge/tracker#446 pool=claude",
-                "hold pools: claude has no reading; openai is held by its grant; 193 more candidate(s) wait",
+                "hold pools: claude has no reading; openai is held by its grant; 278 more candidate(s) wait",
             ],
             1,
             0,
@@ -1094,7 +1094,7 @@ fn replay_scenarios() {
             vec![
                 "probe: claude has no reading; one run to take one",
                 "start triage cgwalters-forge/tracker#446 pool=claude",
-                "hold pools: claude has no reading; fable has no reading; openai is held by its grant; 193 more candidate(s) wait",
+                "hold pools: claude has no reading; fable has no reading; openai is held by its grant; 278 more candidate(s) wait",
             ],
             1,
             0,
@@ -1255,6 +1255,20 @@ fn replay_scenarios() {
             "inWorkRepositories: the operator's epic in a work repository is live",
             Box::new(|r, c| {
                 sub_issue(r, "cgwalters-forge/review", "cgwalters");
+                c["epics"] =
+                    json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
+            }),
+            vec![
+                "candidates: 1 (0 opened by others, 0 outside a live epic)",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            1,
+            0,
+        ),
+        (
+            "inWorkRepositories: the bot's epic is live too",
+            Box::new(|r, c| {
+                sub_issue(r, "cgwalters-forge/review", "cgwalters-bot");
                 c["epics"] =
                     json!({"repository": "cgwalters-forge/tracker", "inWorkRepositories": true});
             }),
