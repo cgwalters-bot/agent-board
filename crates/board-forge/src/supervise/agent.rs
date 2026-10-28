@@ -14,6 +14,8 @@
 //! issue whose body and comments only collaborators wrote, locked throughout
 //! the run.
 //! Judgment writes share that log and fail closed without configured caps.
+//! With the requests handed back as an artifact instead ([`handback`]), a
+//! ledger the executor owns takes the log's place in the count.
 use super::{AgentSettings, Api, HOUR_MS, IssueRef, Settings, encode, iso, millis, run_title};
 use crate::plan::Target;
 use crate::poll::pace::{Tiers, expand, tiers};
@@ -21,7 +23,10 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+pub mod handback;
 pub(super) mod judgment;
+
+use handback::{HandBack, Ledger};
 
 /// The instructions the agent's task opens with, [`OPERATOR`] replaced by
 /// the configured operator.
@@ -441,22 +446,34 @@ pub fn request_comment(url: &str, requests: &IssueRef) -> Result<u64> {
     Ok(id)
 }
 
+/// Where the agent's requests come from.
+pub enum Source {
+    /// The agent run's result URL: its comment on the requests issue. The
+    /// log issue gets an entry per run and counts the day's writes.
+    Comment(String),
+    /// The agent run's safe outputs; a ledger counts the day's writes and
+    /// the log issue holds one status comment.
+    HandBack(HandBack),
+}
+
 /// Where the executor runs: its own run, from the Actions environment.
 pub struct Run {
-    pub result_url: String,
+    pub source: Source,
     pub run_url: String,
     pub default_branch: String,
     pub attempt: u64,
     pub now: i64,
 }
 
-/// What a pass did: one line each, and the log comment it recorded its
-/// dispatches in before starting them, if any.
+/// What a pass did: one line each, the log comment it recorded its
+/// dispatches in before starting them, if any, and with a hand-back the
+/// ledger for the next run, if this run could read the previous one's.
 #[derive(Debug, PartialEq)]
 pub struct Outcome {
     pub ok: bool,
     pub lines: Vec<String>,
     pub log_comment: Option<u64>,
+    pub ledger: Option<Ledger>,
 }
 
 const CONVERSATION: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
@@ -696,10 +713,11 @@ const LOG_START: &str = "Supervisor [run](";
 
 /// The executor's entry in the operator's log.
 pub fn log_body(policy: &Policy, ctx: &Run, lines: &[String]) -> String {
-    let requests = if request_comment(&ctx.result_url, &policy.agent.requests).is_ok() {
-        format!("[requests]({})", ctx.result_url)
-    } else {
-        "requests".into()
+    let requests = match &ctx.source {
+        Source::Comment(url) if request_comment(url, &policy.agent.requests).is_ok() => {
+            format!("[requests]({url})")
+        }
+        _ => "requests".into(),
     };
     let mut body = format!("{LOG_START}{}), {requests}:", ctx.run_url);
     if lines.is_empty() {
@@ -716,18 +734,17 @@ fn log_path(log: &IssueRef) -> String {
     format!("/repos/{}/issues/{}/comments", log.repository, log.issue)
 }
 
-/// Everything up to the first write: the comment, the batch, every target
-/// and the daily cap. Then the record of what is about to start.
-fn prepare(
-    api: &dyn Api,
-    policy: &Policy,
-    ctx: &Run,
-) -> Result<(Vec<judgment::Checked>, Option<u64>)> {
-    // A re-run would perform the same batch again, possibly long after the
-    // pass that asked for it; the next scheduled pass asks afresh instead.
-    ensure!(ctx.attempt == 1, "Only a run's first attempt executes");
+/// The text holding the agent's requests block: its comment on the requests
+/// issue, or the comment in its safe outputs.
+fn report(api: &dyn Api, policy: &Policy, source: &Source) -> Result<String> {
+    let url = match source {
+        Source::Comment(url) => url,
+        // The caller downloads them from this run's agent job: only that
+        // job, whose requests are the attacker's anyway, could change them.
+        Source::HandBack(hand_back) => return handback::report(&hand_back.outputs),
+    };
     let requests_issue = &policy.agent.requests;
-    let id = request_comment(&ctx.result_url, requests_issue)?;
+    let id = request_comment(url, requests_issue)?;
     let comment = api.get(&format!(
         "/repos/{}/issues/comments/{id}",
         requests_issue.repository
@@ -746,12 +763,34 @@ fn prepare(
                 .as_str(),
         "The requests comment is not the bot's as posted"
     );
-    let mut requests = judgment::parse_batch(
-        &extract(comment["body"].as_str().unwrap_or_default())?,
-        policy,
-    )?;
+    Ok(comment["body"].as_str().unwrap_or_default().to_owned())
+}
+
+/// Everything up to the first write: the requests, the batch, every target
+/// and the daily cap. Then the record of what is about to start: in the log,
+/// or in `ledger`, which a hand-back reads first.
+fn prepare(
+    api: &dyn Api,
+    policy: &Policy,
+    ctx: &Run,
+    ledger: &mut Option<Ledger>,
+) -> Result<(Vec<judgment::Checked>, Option<u64>)> {
+    // A re-run would perform the same batch again, possibly long after the
+    // pass that asked for it; the next scheduled pass asks afresh instead.
+    ensure!(ctx.attempt == 1, "Only a run's first attempt executes");
+    let mut created = None;
+    if let Source::HandBack(hand_back) = &ctx.source {
+        let books;
+        (books, created) = handback::books(api, policy, hand_back, ctx)?;
+        *ledger = Some(books);
+    }
+    let mut requests =
+        judgment::parse_batch(&extract(&report(api, policy, &ctx.source)?)?, policy)?;
     if requests.is_empty() {
         return Ok((requests, None));
+    }
+    if ledger.is_some() {
+        handback::fresh(created, ctx.now)?;
     }
     let s = policy.settings;
     Target {
@@ -764,16 +803,29 @@ fn prepare(
     for r in &mut requests {
         r.preflight(api, policy, ctx.now)?;
     }
+    if let Some(until) = ledger.as_ref().and_then(|l| l.blocked_until) {
+        bail!(
+            "A supervisor run since the ledger's left none, so writes wait until {}",
+            iso(until)
+        );
+    }
     // Counted, then recorded: two executors at once could both count before
     // either records. The caller runs one at a time (supervisor.yml's
     // execute job has a concurrency group of its own).
     for action in requests.iter().map(|r| r.action()).collect::<BTreeSet<_>>() {
-        let used = dispatches_since(api, policy, ctx.now - DAY_MS, action)?;
+        let used = match ledger {
+            Some(ledger) => ledger.used(action),
+            None => dispatches_since(api, policy, ctx.now - DAY_MS, action)?,
+        };
         let count = requests.iter().filter(|r| r.action() == action).count();
         ensure!(
             (used + count) as u64 <= judgment::cap(policy, action),
             "The daily {action} cap is reached"
         );
+    }
+    if let Some(ledger) = ledger {
+        ledger.reserve(&requests, ctx);
+        return Ok((requests, None));
     }
     // Recorded before the first dispatch and edited with the outcome after,
     // so that a dispatch counts against the cap even when its outcome is
@@ -797,7 +849,8 @@ fn prepare(
 /// One pass of the executor. Writes nothing unless the whole batch and
 /// every target passed; stops at the first failed dispatch.
 pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
-    let (requests, log_comment) = match prepare(api, policy, ctx) {
+    let mut ledger = None;
+    let (requests, log_comment) = match prepare(api, policy, ctx, &mut ledger) {
         Ok(prepared) => prepared,
         Err(error) => {
             // The messages are fixed text or name checked fields and logins.
@@ -805,6 +858,7 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
                 ok: false,
                 lines: vec![format!("- refused the whole batch: {error:#}")],
                 log_comment: None,
+                ledger,
             };
         }
     };
@@ -828,16 +882,24 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
             }
         }
     }
+    if let Some(ledger) = &mut ledger {
+        ledger.settle(&lines);
+    }
     Outcome {
         ok,
         lines,
         log_comment,
+        ledger,
     }
 }
 
 /// Records the outcome in the operator's log: the dispatches' record, if
-/// any, becomes it. Returns the entry.
+/// any, becomes it, and with a hand-back the status comment does. Returns
+/// the entry.
 pub fn record(api: &dyn Api, policy: &Policy, ctx: &Run, outcome: &Outcome) -> Result<String> {
+    if let Source::HandBack(_) = &ctx.source {
+        return handback::status(api, policy, ctx, outcome);
+    }
     let body = log_body(policy, ctx, &outcome.lines);
     let log = &policy.agent.log;
     match outcome.log_comment {

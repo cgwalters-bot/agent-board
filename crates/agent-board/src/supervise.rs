@@ -81,9 +81,39 @@ struct Execute {
     /// The pools file; a request must name one of its pools.
     #[arg(long, value_name = "FILE")]
     pools: PathBuf,
+    #[command(flatten)]
+    source: Source,
+    /// The previous executor run's ledger, an artifact of that run; leave it out when none was found.
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "ledger_run",
+        conflicts_with = "result_url"
+    )]
+    ledger: Option<PathBuf>,
+    /// The id of the run whose artifact --ledger is.
+    #[arg(long, value_name = "ID", requires = "ledger")]
+    ledger_run: Option<u64>,
+    /// Where this run's ledger is written for the next run; with --requests, the day's count comes from it, not the log issue.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "result_url",
+        required_unless_present = "result_url"
+    )]
+    ledger_out: Option<PathBuf>,
+}
+
+/// Where the agent's requests are: one of the two.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct Source {
     /// The agent run's result URL: its comment on the requests issue.
     #[arg(long, value_name = "URL")]
-    result_url: String,
+    result_url: Option<String>,
+    /// The agent run's safe outputs (JSON Lines), handed back as an artifact of this run.
+    #[arg(long, value_name = "FILE")]
+    requests: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -138,9 +168,8 @@ struct Compose {
 struct Preview {
     #[command(flatten)]
     files: Files,
-    /// The agent run's result URL: its comment on the requests issue.
-    #[arg(long, value_name = "URL")]
-    result_url: String,
+    #[command(flatten)]
+    source: Source,
 }
 
 #[derive(clap::Args)]
@@ -233,6 +262,26 @@ fn pinned_profile(s: &Settings) -> Result<&supervise::profile::Profile> {
         .context("supervisor agent.profile is not configured")
 }
 
+/// A file of at most `max` bytes.
+fn bounded(path: &Path, max: usize) -> Result<String> {
+    let size = std::fs::metadata(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .len();
+    ensure!(size <= max as u64, "{} exceeds {max} bytes", path.display());
+    std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+}
+
+/// The agent's safe outputs, read only up to their bound.
+fn outputs(path: &Path) -> Result<String> {
+    bounded(path, agent::handback::MAX_OUTPUTS_BYTES)
+}
+
+/// The previous run's ledger, read only up to its bound.
+fn ledger(path: &Path) -> Result<Value> {
+    serde_json::from_str(&bounded(path, agent::handback::MAX_LEDGER_BYTES)?)
+        .with_context(|| format!("decode {}", path.display()))
+}
+
 /// A file that may be absent: `None` when it cannot be read or decoded.
 fn read_optional(path: Option<&Path>) -> Option<Value> {
     path.and_then(|p| read(p).ok())
@@ -314,13 +363,29 @@ pub fn run(args: &Supervise) -> Result<()> {
             let policy = agent::Policy::new(&s, &pools)?
                 .context("supervisor: the requests and log issues are not configured")?;
             let client = board_forge::github::Client::from_env()?;
+            let repository = env("GITHUB_REPOSITORY")?;
+            let run_id = env("GITHUB_RUN_ID")?;
+            let source = match (&args.source.result_url, &args.source.requests) {
+                (Some(url), _) => agent::Source::Comment(url.clone()),
+                (None, Some(path)) => agent::Source::HandBack(agent::handback::HandBack {
+                    outputs: outputs(path)?,
+                    previous: match (&args.ledger, args.ledger_run) {
+                        (Some(path), Some(run)) => Some((run, ledger(path)?)),
+                        _ => None,
+                    },
+                    repository: repository.clone(),
+                    run_id: run_id.parse().context("GITHUB_RUN_ID")?,
+                    run_number: env("GITHUB_RUN_NUMBER")?
+                        .parse()
+                        .context("GITHUB_RUN_NUMBER")?,
+                }),
+                (None, None) => anyhow::bail!("--result-url or --requests is required"),
+            };
             let run = agent::Run {
-                result_url: args.result_url.clone(),
+                source,
                 run_url: format!(
-                    "{}/{}/actions/runs/{}",
-                    env("GITHUB_SERVER_URL")?,
-                    env("GITHUB_REPOSITORY")?,
-                    env("GITHUB_RUN_ID")?
+                    "{}/{repository}/actions/runs/{run_id}",
+                    env("GITHUB_SERVER_URL")?
                 ),
                 default_branch: env("DEFAULT_BRANCH")?,
                 attempt: env("GITHUB_RUN_ATTEMPT")?
@@ -329,6 +394,13 @@ pub fn run(args: &Supervise) -> Result<()> {
                 now: now(),
             };
             let outcome = agent::execute(&client, &policy, &run);
+            // Written before the log, which may fail: without it the next
+            // run blocks writes for a day.
+            if let (Some(ledger), Some(out)) = (&outcome.ledger, &args.ledger_out) {
+                let mut text = serde_json::to_string_pretty(&ledger.to_json())?;
+                text.push('\n');
+                std::fs::write(out, text).with_context(|| format!("write {}", out.display()))?;
+            }
             let body = agent::record(&client, &policy, &run, &outcome)?;
             writeln!(std::io::stdout().lock(), "{body}")?;
             ensure!(outcome.ok, "supervisor: not every request was performed");
@@ -402,13 +474,23 @@ pub fn run(args: &Supervise) -> Result<()> {
         Command::Preview(args) => {
             let s = settings(&args.files)?;
             let requests = &agent_settings(&s)?.requests;
-            let id = agent::request_comment(&args.result_url, requests)?;
-            let client = board_forge::github::Client::from_env()?;
-            let comment = client.get(&format!(
-                "/repos/{}/issues/comments/{id}",
-                requests.repository
-            ))?;
-            let body = comment["body"].as_str().context("comment has no body")?;
+            let body = match (&args.source.result_url, &args.source.requests) {
+                (_, Some(path)) => agent::handback::report(&outputs(path)?)?,
+                (Some(url), None) => {
+                    let id = agent::request_comment(url, requests)?;
+                    let client = board_forge::github::Client::from_env()?;
+                    let comment = client.get(&format!(
+                        "/repos/{}/issues/comments/{id}",
+                        requests.repository
+                    ))?;
+                    comment["body"]
+                        .as_str()
+                        .context("comment has no body")?
+                        .to_owned()
+                }
+                (None, None) => anyhow::bail!("--result-url or --requests is required"),
+            };
+            let body = body.as_str();
             // The agent's text must not be read as workflow commands.
             let token = delimiter("preview")?;
             ensure!(!body.contains(&token), "comment contains its delimiter");

@@ -28,7 +28,9 @@ runs: on a failing check, outside a cooldown, or on the daily pass. It prints
 the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
 naming the configured `operator` as the one login whose text is instructions,
 the policy and the report. `supervise execute` holds the bot's token. It takes
-the agent's one unedited comment on the requests issue and accepts bounded
+the agent's one unedited comment on the requests issue, or with `--requests`
+the comment the agent handed back in its run's safe outputs without posting
+it (see [hand-back](#hand-back)), and accepts bounded
 requests: dispatches (triage, research and, under an open epic, implement) and
 the judgment writes below, all off by default: dispatches need their
 `agent.kinds` entry and nonzero dispatch caps, every other write its
@@ -40,7 +42,8 @@ is invalid, if an issue holds a supervisor note, if an issue has a dispatch
 run in flight, or if the batch would pass
 `maxDispatchesPerPass` or `maxDispatchesPerDay`. The day's count comes from the
 executor's own entries in the log issue, each written before the dispatches it
-names. That count holds only if the caller runs one executor at a time, as
+names, or with `--requests` from the executor's ledger. That count holds only if
+the caller runs one executor at a time, as
 tracker's execute job does with its own concurrency group. Explicitly enabled
 implement dispatches additionally require native membership under an open,
 epic-labeled plan. Judgment writes (comments, operator-assigned tracker issues,
@@ -86,7 +89,8 @@ delimiter) and keeps its diagnostics on stderr. All but `due` also take
   the configured `operator` on the locked `agent.requests` issue (not a pull
   request); any other comment is refused.
 - `supervise preview --result-url URL` prints the agent's comment on the
-  requests issue between `::stop-commands::` markers, applying nothing.
+  requests issue between `::stop-commands::` markers, applying nothing;
+  `--requests FILE` prints the comment in the agent's safe outputs instead.
 - `supervise session --session session.json --rules session.md --pools
   pools.json --pool NAME [--idle-minutes N] [--prompt TEXT]` prints an
   operator session's `repo`, `item`, `idle`, `agent`, `model`, `budget` and
@@ -101,6 +105,59 @@ a 40-character commit, never a branch, so that what the agent is told
 changes only with a reviewed config edit. `compose` and `session` read
 `.github/agentic-job/profiles/supervisor.md` and `skills/supervisor/SKILL.md`
 there through the contents API with `GH_TOKEN`, each at most 64 KiB.
+
+### Hand-back
+
+By default the agent's comment is posted on the requests issue, and the
+executor posts an entry on the log issue for every pass: a person's issue
+used as a message bus, which on tracker#656 reached 170 comments
+(agent-board#398). With `supervise execute --requests FILE --ledger-out
+LEDGER [--ledger PREVIOUS --ledger-run ID]` neither issue gets those
+comments:
+
+- `FILE` is the agent run's safe outputs, the JSON Lines it handed back,
+  which the caller downloads from the agent job of the same workflow run
+  and does not apply. Its one `add_comment` output (more refuse the batch,
+  none asks for nothing) is read exactly like the comment, at most 1 MiB.
+  Only the agent job, whose requests are already treated as the attacker's,
+  could have written it. There is no comment to check for edits.
+- The day's counts come from a ledger, `agent-board/supervisor-ledger/v1`,
+  that each executor run writes to `LEDGER` for the caller to upload as an
+  artifact. It holds the run's number and each write of the last 24 hours:
+  its time, action, run and log line, reserved before the first write and
+  kept unless it was not attempted. The caller passes the newest earlier
+  ledger and the id of the run it came from. That run must be a run of
+  `supervisorWorkflow` in this repository, on the default branch, started
+  by a schedule, a dispatch or a comment, with the ledger's number, so an
+  artifact by the same name from another workflow or from a pull request's
+  copy of this one is refused. Only the execute job may upload it: the
+  agent job must not be able to upload an artifact by that name.
+- A lost ledger must not reset the caps. An executor writes only within 6
+  hours of its run's creation, and its writes end within the 6-hour job
+  limit of GitHub-hosted runners (give a self-hosted execute job a
+  `timeout-minutes` of at most 360), so whatever was written in the last day came from runs created in
+  the last 36 hours. Each run lists those runs of its workflow, but for a
+  pull request's or a fork's. One numbered after
+  the ledger's, later ones included since only the execute jobs are
+  serialized, whose `execute` job (or `execute / ...`) ran in any attempt,
+  may have written what the ledger does not count, and so may a finished
+  run with jobs none of which has that name. No write then starts until 36
+  hours after that run was created. The ledger carries that time forward
+  as `blockedUntil`, so a refused run's own ledger does not hide the gap.
+  Without a previous ledger, every such run of the window counts. A
+  previous ledger that cannot be read or checked, and a run's later
+  attempts, write no ledger. A lost ledger costs at most a day and a half
+  of writes.
+- The log issue holds one status comment by the bot, starting
+  `<!-- agent-board-supervisor-status -->`, which each run replaces: this
+  run's entry and up to 30 earlier entries of the ledger's day. It is
+  found among the comments updated in the last week, and posted anew if
+  there is none. Existing comments are left as they are.
+
+Without `--requests`, all of this is off and the log issue counts as before.
+Going back from `--requests` to `--result-url` undercounts the day's writes,
+which the log entries do not hold: switch back with the caps at zero for a
+day.
 
 ## Requests
 
@@ -402,7 +459,8 @@ to every kind. A failed or interrupted write consumes its reserved cap, because
 it may have reached GitHub.
 
 The rolling 24-hour counts come only from bot-authored executor entries on the
-configured log issue. All requests are recorded as `starting` before any action
+configured log issue, or with a [hand-back](#hand-back) from the executor's
+ledger. All requests are recorded as `starting` before any action
 and their outcomes are recorded as before. No user-supplied text is copied into
 those accounting lines. Comment/evidence pagination and the log census fail
 closed at their existing finite page limits. The caller must serialize executors

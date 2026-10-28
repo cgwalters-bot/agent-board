@@ -6,6 +6,9 @@ use std::collections::HashMap;
 #[path = "judgment_tests.rs"]
 mod judgment_tests;
 
+#[path = "handback_tests.rs"]
+mod handback_tests;
+
 fn pools() -> Value {
     json!({"large": {"agent": "a", "model": "m", "budget": "1"}, "small": {}})
 }
@@ -323,6 +326,13 @@ impl Api for Fake {
                 .cloned()
                 .unwrap_or(json!({"workflow_runs": []})));
         }
+        // The supervisor's runs, which a hand-back's ledger is checked
+        // against: by default only the executor's own, run 1.
+        if path.starts_with("/repos/example/control/actions/workflows/supervisor.yml/runs?") {
+            return Ok(self.objects.get("own runs").cloned().unwrap_or(
+                json!({"workflow_runs": [{"id": 1, "run_number": 50, "created_at": NOW}]}),
+            ));
+        }
         if path.starts_with("/repos/example/operator/issues/7/comments?since=") {
             return Ok(self.objects.get("log").cloned().unwrap_or(json!([])));
         }
@@ -414,7 +424,7 @@ fn block(requests: &[Value]) -> String {
 fn run(fake: &Fake, s: &Settings, url: &str, attempt: u64) -> Outcome {
     let p = policy(s);
     let ctx = Run {
-        result_url: url.into(),
+        source: Source::Comment(url.into()),
         run_url: RUN_URL.into(),
         default_branch: "main".into(),
         attempt,
@@ -425,7 +435,7 @@ fn run(fake: &Fake, s: &Settings, url: &str, attempt: u64) -> Outcome {
 
 fn ctx(url: &str) -> Run {
     Run {
-        result_url: url.into(),
+        source: Source::Comment(url.into()),
         run_url: RUN_URL.into(),
         default_branch: "main".into(),
         attempt: 1,
@@ -644,6 +654,7 @@ fn a_rerun_attempt_replays_nothing() {
             ok: false,
             lines: vec!["- refused the whole batch: Only a run's first attempt executes".into()],
             log_comment: None,
+            ledger: None,
         }
     );
     assert!(fake.calls.borrow().is_empty());
@@ -749,7 +760,8 @@ fn a_comment_without_a_block_asks_for_nothing() {
         Outcome {
             ok: true,
             lines: vec![],
-            log_comment: None
+            log_comment: None,
+            ledger: None,
         }
     );
     assert_eq!(fake.writes(), []);
@@ -770,6 +782,7 @@ fn a_comment_without_a_block_asks_for_nothing() {
         ok: false,
         lines: vec!["- refused the whole batch: x".into()],
         log_comment: None,
+        ledger: None,
     };
     assert!(
         record(&malformed, &p, &ctx("https://evil.example/"), &refused)
