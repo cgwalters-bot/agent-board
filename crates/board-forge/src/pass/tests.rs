@@ -1516,6 +1516,9 @@ impl Forge {
         if method == "POST" && path.ends_with("/labels") {
             return Ok((200, json!([])));
         }
+        if method == "POST" && path.ends_with("/rerun-failed-jobs") {
+            return Ok((201, json!({})));
+        }
         bail!("unexpected write {method} {url}")
     }
 }
@@ -2617,6 +2620,196 @@ fn apply_replans_an_open_issue_after_its_run() {
         let comments = forge.comments_on(repo, number);
         let posted = comments.first().and_then(|c| c.lines().next());
         assert_eq!(posted, intro, "{name}");
+    }
+}
+
+/// The caller's runs that failed in the day before the recording, as
+/// [`Scheduler::failed_runs`] lists them.
+fn failed(replay: &mut Replay, runs: Vec<Value>) {
+    let since = (replay.now - time::Duration::seconds(RERUN_WINDOW_SECONDS))
+        .format(&Rfc3339)
+        .unwrap();
+    let url = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?status=failure&created=%3E%3D{since}&per_page=100"
+    );
+    let body = json!({"total_count": runs.len(), "workflow_runs": runs});
+    replay
+        .requests
+        .push(json!({"request": {"get": url}, "answer": {"status": 200, "body": body}}));
+}
+
+/// tracker#468's plan with `from` replaced by `to`, as a writer edited it
+/// after its dispatch.
+fn replan_468(replay: &mut Replay, from: &str, to: &str) {
+    for entry in &mut replay.requests {
+        let nodes = (entry["answer"].pointer_mut("/data/repository/issue/comments/nodes"))
+            .and_then(Value::as_array_mut);
+        for node in nodes.into_iter().flatten() {
+            if text(node, "/url").ends_with("#issuecomment-6332112108") {
+                node["body"] = text(node, "/body").replace(from, to).into();
+            }
+        }
+    }
+}
+
+/// tracker#468's title and body as the overlap check reads them: `body`.
+fn text_468(replay: &mut Replay, body: &str) {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468});
+    replay.requests.push(json!({
+        "request": graphql_key(overlap::TEXT_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"title": "Wake", "body": body}}}},
+    }));
+}
+
+#[test]
+fn apply_reruns_a_failed_run_once() {
+    // tracker#468's implement plan was dispatched as run 39718949900.
+    let url = "https://github.com/cgwalters-forge/tracker/actions/runs/39718949900";
+    let run = |attempt: u64| {
+        json!({"id": 39718949900_u64, "display_title": "implement cgwalters-forge/tracker#468 (claude)",
+            "conclusion": "failure", "run_attempt": attempt, "html_url": url})
+    };
+    let held = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already";
+    let rerun = format!(
+        "run rerun cgwalters-forge/tracker#468: its implement run {url} ended (failure), so its failed jobs run once more pool=claude run={url}"
+    );
+    let again = format!(
+        "hold cgwalters-forge/tracker#468: its implement run {url} ended (failure) again after a rerun, so it waits for a person"
+    );
+    let other = json!({"id": 1, "display_title": "implement cgwalters-forge/tracker#468 (claude)",
+        "conclusion": "failure", "run_attempt": 1});
+    // Since the run failed: its plan moved to #469, which a person held.
+    let held_469: Edit = |r| {
+        replan_468(r, r#""item":468,"#, r#""item":469,"#);
+        let pages = (r.requests.iter())
+            .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+            .filter_map(Value::as_array);
+        // As #468 is on the board, which this test reads alone.
+        let node = pages.flatten().find(|n| n["content"]["number"] == 468);
+        let mut issue = node.unwrap()["content"].clone();
+        issue["number"] = 469.into();
+        let labels = &mut issue["labels"];
+        labels["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "needs-human"}));
+        labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 469});
+        r.requests.push(json!({
+            "request": graphql_key(&format!("{ISSUE_QUERY}{FACTS}"), &variables),
+            "answer": {"data": {"repository": {"issue": issue}}},
+        }));
+    };
+    let elsewhere: Edit = |r| {
+        replan_468(
+            r,
+            r#""cgwalters-forge/tracker","item""#,
+            r#""cgwalters-forge/elsewhere","item""#,
+        )
+    };
+    let stacked: Edit = |r| replan_468(r, r#""item":468,"#, r#""item":468,"stacks_on":467,"#);
+    // The recording's open tracker#889 changes paths its plan names: the
+    // rerun waits for it, as a start would. Without it, it is re-run.
+    let independent: Edit = |r| {
+        let pulls = (r.requests.iter_mut())
+            .filter_map(|e| e["answer"].pointer_mut("/data/repository/pullRequests/nodes"))
+            .filter_map(Value::as_array_mut);
+        for nodes in pulls {
+            nodes.retain(|n| n["number"] != 889);
+        }
+    };
+    type Edit = fn(&mut Replay);
+    let none: Edit = |_| {};
+    // Name, settings, the failed runs listed, an edit of the recording, the
+    // line and the reruns.
+    type Case<'a> = (&'a str, Value, Vec<Value>, Edit, &'a str, usize);
+    let cases: Vec<Case> = vec![
+        (
+            "off, it is held as dispatched",
+            json!({}),
+            vec![run(1)],
+            none,
+            held,
+            0,
+        ),
+        (
+            "on, its failed run is re-run",
+            json!({"reruns": true}),
+            vec![run(1)],
+            independent,
+            &rerun,
+            1,
+        ),
+        (
+            "one that failed again holds it",
+            json!({"reruns": true}),
+            vec![run(2)],
+            none,
+            &again,
+            0,
+        ),
+        (
+            "another run of it is not its plan's",
+            json!({"reruns": true}),
+            vec![other],
+            none,
+            held,
+            0,
+        ),
+        (
+            "its plan's item held since holds it",
+            json!({"reruns": true}),
+            vec![run(1)],
+            held_469,
+            "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#469: labelled needs-human",
+            0,
+        ),
+        (
+            "so does one outside the work repositories",
+            json!({"reruns": true}),
+            vec![run(1)],
+            elsewhere,
+            "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/elsewhere#468 is not in a work repository",
+            0,
+        ),
+        (
+            "and an overlap since",
+            json!({"reruns": true}),
+            vec![run(1)],
+            none,
+            "hold cgwalters-forge/tracker#468: Waiting: open pull request cgwalters-forge/tracker#889 changes",
+            0,
+        ),
+        (
+            "a stacked plan's run is a person's",
+            json!({"reruns": true}),
+            vec![run(1)],
+            stacked,
+            "hold cgwalters-forge/tracker#468: its implement run",
+            0,
+        ),
+    ];
+    for (name, settings, runs, edit, expected, reruns) in cases {
+        let config = config(settings);
+        let mut forge = Forge::new(None, false);
+        failed(&mut forge.replay, runs);
+        edit(&mut forge.replay);
+        text_468(&mut forge.replay, "Work.");
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = (report.lines.iter())
+            .find(|l| l.contains("cgwalters-forge/tracker#468:"))
+            .map_or("", String::as_str);
+        assert!(line.starts_with(expected), "{name}: {:#?}", report.lines);
+        let sent = (forge.writes.borrow().iter())
+            .filter(|(_, u, _)| u.ends_with("/runs/39718949900/rerun-failed-jobs"))
+            .count();
+        assert_eq!(sent, reruns, "{name}");
+        assert!(
+            !forge
+                .dispatches()
+                .contains(&"cgwalters-forge/tracker#468".to_owned())
+        );
     }
 }
 

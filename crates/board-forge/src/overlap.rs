@@ -45,7 +45,7 @@ const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $pulls: Int!
   }
 }"#;
 
-const TEXT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+pub(crate) const TEXT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) { title body } }
 }"#;
 

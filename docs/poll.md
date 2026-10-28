@@ -267,7 +267,9 @@ retargeting when a merged head branch is deleted), or whose review job run
 started before it, is not merged on it: that review read the change against
 the branch below, with that branch's review workflow. Nothing asks the review
 job to run again, so the bot's pull request goes to `needs-human` for the
-operator to review the head against the new base.
+operator to review the head against the new base; with the pass's
+[`reruns`](pass.md#reruns), a head behind its new base is rebased onto it
+instead, and its push asks for that review.
 
 `brokerOutage` (absent by default, which charges every failed run) keeps a
 broker outage from using a round (agent-board#108):
