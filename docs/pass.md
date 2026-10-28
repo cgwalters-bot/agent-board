@@ -121,7 +121,12 @@ start; and the sum of stage 3's `epics: N live …`. `candidates` and
 absent, so a pass without it publishes what it did before. `wip` and
 `pass` were added to v1 later, so a reader treats them as absent in an
 older comment, and a change in either publishes as a change of the holds
-does.
+does. With `leases` set, the snapshot also has `leases`, after `pass`: the
+live [leases](#leases) the pass read, each `{"slot", "run", "item", "pool",
+"taken_at", "expires_at"}` and `"override": true` where the operator took
+it so; absent otherwise, and where stage 3 or 4 did not get as far as
+reading them. It too was added to v1 later, and a reader treats
+it as absent in an older comment.
 
 The JSON is compact, one entry a line, so that a board of a few hundred holds
 fits GitHub's 65,536-character comment. The comment is also capped at 60,000
@@ -911,6 +916,86 @@ nothing changed.` is not success evidence, and stale local pending state cannot
 freeze an epic whose apply is already proved. This observation-based recovery
 is part of the first implementation, not deferred cleanup.
 
+## Leases
+
+The pass's WIP limit and pacing bound only what the pass starts; a run
+dispatched by hand, by a peer agent or by the review app skips them
+(agent-board#382). A lease is a slot of the runs' capacity that a run takes
+before any inference, whoever started it. `agent-board admit --config FILE
+--pool P --item OWNER/REPO#N --run ID` takes one with GH_TOKEN, and exits
+non-zero with one line, `admit refused: …`, when it gets none; `agent-board
+release --config FILE --pool P --run ID` frees the run's own. The caller's
+`dispatch.yml` is not wired to them yet.
+
+A lease is the ref `refs/agent-board/leases/SLOT` in `dispatchRepo`, SLOT
+below 100, at a commit on a tree of one fixed `README` (GitHub refuses
+to create an empty tree) whose message is
+`{"run", "item", "pool", "taken_at", "expires_at"}`, with `"override": true`
+where the operator overrode. Every pool shares the slots, so admit refuses
+once there are `wip` live leases, whatever their pools and slots; and it
+refuses a run on a pool, however much WIP is free, unless the published
+usage snapshot gives that pool room as stage 4 reads it, its holds included
+(the five-hour window used up among them), and the weekly budget, where
+set, is not spent. A run that holds a live lease of the pool already, as
+when admit is retried after its answer was lost, gets that lease back and
+takes no second. `--override` takes a slot past `wip` and pacing (at most
+100 leases in all), only with the operator's token: any other is an error.
+It prints `admit: override by LOGIN, past wip and pacing`, and the lease
+says so.
+
+The lease destination `dispatchRepo` must be private: lease commit messages name
+work items and remain in Git history after release. Every lease write verifies
+visibility before creating any Git objects, including with `--override`.
+
+With `usage.probe`, a fresh snapshot also publishes `probes`, the pool-to-provider
+map of no-reading pools with zero requests since the broker started. Admission
+lets such a pool probe without a reading, but not past the weekly budget. All
+probes contend for slot zero and wait while any lease is live: this deliberately
+conservative shared bound admits at most one cold probe at a time, even across
+providers and passes. Missing eligibility or a stale snapshot never permits one.
+
+A ref is never deleted. Admit tries the lowest slot no live lease holds,
+when capacity remains, by creating its ref, which GitHub refuses while it
+exists, or by moving it with `force` off to a child of the commit it read,
+which GitHub refuses unless the ref is still there. Release and a reap move
+the ref likewise, to a commit that is no lease, which frees the slot. So of
+two writers that read the same commit exactly one moves it: of two admits
+racing for the last slot exactly one wins, and a stale reap cannot free a
+lease taken since. Losing a slot race refuses this attempt; retry admission to
+read current ownership rather than risk a second lease for the same run.
+Retries of one run can still take two different slots, as when a slot frees
+between their reads; after taking one, admit reads the leases again and frees
+all but the run's lowest, so the later of the two keeps the run to one.
+
+A lease may be reaped once its `expires_at`, 24 hours after it was taken,
+has passed, or its run has ended: completed, or `in_progress` with every job
+finished as the [scheduler reads it](#scheduling) (agent-board#376). A run
+that cannot be read or is not found in `dispatchRepo` keeps its lease until
+it expires. Admit reaps the one whose slot it takes; stage 3 or 4 of a pass
+with `leases` set reaps every one, each one write step (a preview frees none
+and prints `lease: reap NAME: why; a preview does not free it`), and counts
+the runs holding the rest toward `wip`, once each with the runs it lists. A
+commit there that is no lease holds nothing, and a ref that is no slot is
+ignored. More than 100 lease refs, or a lease that cannot be read, is an
+error: capacity read without them would be guessed.
+
+With `leases`, the scheduler also merges validated lease item identities into its
+busy map and reads leases again at its final item/capacity recheck. Scheduled
+implement, triage, epic and digest dispatches claim a shared slot at the actual
+send boundary, so a peer admission after that recheck cannot bypass the bound.
+The pending lease has `run: 0`; a named dispatch response binds it to that run by
+fast forward. The caller retries admission while binding is pending. A
+refused reservation sends nothing: the plan's dispatch records are released
+and the item held, so a later pass dispatches it once there is room. A failed,
+ambiguous or unnamed response leaves the reservation until expiry; it is never
+given to an arbitrary caller merely because its item matches. This can hold
+capacity for 24 hours on GitHub versions without named dispatch responses.
+Reservation and response binding are part of the existing dispatch step, not
+additional write steps. Admission subtracts active unleased caller runs from
+available capacity (excluding the requesting run itself); incomplete caller
+listings refuse admission. Every path must participate before inference for a
+shared bound: arbitrary external work started without admission cannot be bounded.
+
 ## Budget tree
 
 `agent-board budget --config FILE` reads the pass configuration and prints
@@ -1000,6 +1085,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
+| `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |

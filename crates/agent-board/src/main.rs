@@ -8,6 +8,7 @@ mod decisions;
 mod dispatch;
 mod epic;
 mod item;
+mod lease;
 mod live;
 mod org_status;
 mod pass;
@@ -158,6 +159,10 @@ enum Command {
     Poll(poll::Poll),
     /// One scheduled pass: follow up pull requests, apply and plan live epics, then choose and start board work by Priority, WIP and pace; previews unless --apply (docs/pass.md).
     Pass(pass::Pass),
+    /// Take a lease on a free slot for a run before any inference, reaping an ended or expired lease to take its slot, or report the one the run holds already; refused, with the reason, when wip, pacing of its pool or the budget leave none (docs/pass.md#leases).
+    Admit(lease::Admit),
+    /// Free a run's lease, as its last step.
+    Release(lease::Release),
     /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree).
     Budget(budget::Budget),
     /// Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md).
@@ -1064,6 +1069,18 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             );
             pass::run(args, runtime, &mut io::stdout().lock())
         }
+        Command::Admit(_) | Command::Release(_)
+            if cli.json.is_some()
+                || cli.repo.is_some()
+                || cli.snapshot.is_some()
+                || cli.owner.is_some()
+                || cli.project.is_some()
+                || cli.board_config.is_some() =>
+        {
+            bail!("admit and release read their settings from --config only")
+        }
+        Command::Admit(args) => lease::admit(args, &mut io::stdout().lock()),
+        Command::Release(args) => lease::release(args, &mut io::stdout().lock()),
         Command::Budget(args) => {
             ensure!(
                 cli.json.is_none()

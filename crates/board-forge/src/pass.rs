@@ -292,6 +292,10 @@ pub struct Config {
     pub usage: Option<Usage>,
     /// Off unless set.
     pub holds: Option<HoldsAt>,
+    /// Off unless set: stage 4 reaps the leases in `dispatchRepo` and counts
+    /// the rest toward `wip` ([`lease`]).
+    #[serde(default)]
+    pub leases: bool,
     /// None: no hold on spend.
     pub budget: Option<WeeklyBudget>,
     /// The poll's response cache, which only an applying pass writes.
@@ -834,6 +838,23 @@ pub fn spent(snapshot: Option<&Value>, now: OffsetDateTime) -> std::result::Resu
     spent
         .filter(|s| s.is_finite() && *s >= 0.0)
         .ok_or_else(|| "the usage snapshot has no spend reading".into())
+}
+
+/// Why runs wait on `budget` at `share` of it: the week's spend there or
+/// past it ([`BUDGET_REACHED`]), or no spend reading. None without a
+/// budget. A grant holds each pool in its snapshot entry instead.
+fn budget_hold(
+    config: &Config,
+    snapshot: Option<&Value>,
+    now: OffsetDateTime,
+    share: f64,
+) -> Option<String> {
+    let weekly = config.budget.as_ref()?.weekly_usd?;
+    match spent(snapshot, now) {
+        Ok(spent) if spent < weekly * share => None,
+        Ok(_) => Some(BUDGET_REACHED.into()),
+        Err(why) => Some(why),
+    }
 }
 
 /// A pool's room below its pace, in points of its paced window:
@@ -1460,6 +1481,9 @@ pub struct Report {
     pub tally: (Wip, PassSummary),
     /// What the maintain stage decided today, kept in `state`.
     pub maintain: Option<maintain::Day>,
+    /// The live leases, published with the holds; none where
+    /// [`Config::leases`] is off or they were not read.
+    pub leases: Option<Vec<lease::Held>>,
 }
 
 impl Report {
@@ -1656,6 +1680,84 @@ fn default_branch(client: &impl Rest, repo: &str) -> Result<String> {
         .and_then(|b| (!b.is_empty()).then_some(b).context("no default branch"))
 }
 
+/// The bot's usage snapshot from the configured issue, if `usage` is set.
+fn published_usage(client: &impl Rest, config: &Config) -> Result<Option<Value>> {
+    let Some(usage) = &config.usage else {
+        return Ok(None);
+    };
+    let on = (usage.repository.as_str(), usage.issue);
+    let comment = bot_comment(client, &config.bot, on, (USAGE_MARKER, "usage snapshot"))?;
+    Ok(comment.and_then(|c| usage_snapshot(text(&c, "/body"))))
+}
+
+/// `bot`'s comment on issue `on` (repository and number) that starts with
+/// `marker`, the `what` an error names.
+fn bot_comment(
+    client: &impl Rest,
+    bot: &str,
+    on: (&str, u64),
+    (marker, what): (&str, &str),
+) -> Result<Option<Value>> {
+    let (repository, issue) = on;
+    let mut url = format!("{API_ROOT}repos/{repository}/issues/{issue}/comments?per_page=100");
+    for _ in 0..USAGE_PAGES {
+        let response = client.get(&url, None)?;
+        ensure!(
+            response.status == 200,
+            "reading the {what}: GitHub HTTP status {}",
+            response.status
+        );
+        let comments = response
+            .body
+            .as_array()
+            .context("comments are not a list")?;
+        let found = comments.iter().find(|c| {
+            text(c, "/user/login").eq_ignore_ascii_case(bot) && text(c, "/body").starts_with(marker)
+        });
+        if let Some(comment) = found {
+            return Ok(Some(comment.clone()));
+        }
+        match response.link.as_deref().and_then(next_link) {
+            Some(next) => url = next,
+            None => return Ok(None),
+        }
+    }
+    bail!("the usage issue has more than {USAGE_PAGES} pages of comments")
+}
+
+/// Whether `run` on `repo`, which GitHub says is `in_progress`, has ended
+/// all the same at `now`: past [`STUCK_CHECK_SECONDS`] with every job
+/// completed, the last over [`JOBS_SETTLED_SECONDS`] ago. Age alone is no
+/// evidence, as a run may legitimately take days. Younger runs cost no
+/// request; jobs that cannot be read, or not on one page, leave the run in
+/// flight.
+fn jobs_ended(client: &impl Rest, repo: &str, run: &Value, now: OffsetDateTime) -> bool {
+    let Some(id) = run["id"]
+        .as_u64()
+        .filter(|_| run["status"] == "in_progress")
+    else {
+        return false;
+    };
+    let since = |at: Option<OffsetDateTime>| at.map(|at| (now - at).whole_seconds());
+    let started = at(&run["run_started_at"]).or_else(|| at(&run["created_at"]));
+    match since(started) {
+        None => false,
+        Some(age) if age <= STUCK_CHECK_SECONDS => false,
+        Some(_) => {
+            let url =
+                format!("{API_ROOT}repos/{repo}/actions/runs/{id}/jobs?per_page={JOBS_PER_PAGE}");
+            let response = client.get(&url, None).ok().filter(|r| r.status == 200);
+            let body = response.map_or(Value::Null, |r| r.body);
+            let jobs = body["jobs"].as_array().map_or(&[][..], Vec::as_slice);
+            let last = jobs.iter().map(|j| at(&j["completed_at"])).max().flatten();
+            !jobs.is_empty()
+                && body["total_count"].as_u64() == Some(jobs.len() as u64)
+                && jobs.iter().all(|j| j["status"] == "completed")
+                && since(last).is_some_and(|s| s > JOBS_SETTLED_SECONDS)
+        }
+    }
+}
+
 /// What one candidate came to.
 enum Step {
     Hold(Hold),
@@ -1696,6 +1798,7 @@ impl Halt {
 }
 
 /// What holds a slot or an issue besides the runs a listing shows.
+#[derive(Clone)]
 struct Slots {
     wip: usize,
     /// Runs stage 2 started.
@@ -1709,6 +1812,9 @@ struct Slots {
     /// ([`Usage::probe`]), with their provider: none is in flight on that
     /// provider, and none started on it yet.
     probes: BTreeMap<String, String>,
+    /// The runs that hold a lease ([`Config::leases`]), which a listing of
+    /// the caller's runs shows too where they are its own.
+    leased: Vec<lease::Held>,
 }
 
 /// The runs that hold a slot, the issues they name and the pools they run on
@@ -1720,8 +1826,11 @@ impl Slots {
     /// poll's runs may be listed already too: counted twice, they leave
     /// fewer slots, never more.
     fn active(&self, listed: &BTreeSet<u64>) -> usize {
-        let known: BTreeSet<u64> = self.mine.iter().flatten().copied().collect();
-        let unknown = self.mine.iter().filter(|r| r.is_none()).count();
+        let mine = self.mine.iter().flatten().copied();
+        let leased = self.leased.iter().map(|h| h.lease.run).filter(|&r| r != 0);
+        let known: BTreeSet<u64> = mine.chain(leased).collect();
+        let unknown = self.mine.iter().filter(|r| r.is_none()).count()
+            + self.leased.iter().filter(|h| h.lease.run == 0).count();
         listed.union(&known).count() + unknown + self.earlier
     }
 
@@ -1901,7 +2010,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         }
         self.busy = Some(listed.as_ref().ok().map(|(_, busy, _)| busy.clone()));
-        let (runs, busy, pools) = listed?;
+        let (runs, mut busy, pools) = listed?;
+        let leased = self.leased()?;
+        lease::busy(&leased, &mut busy)?;
+        self.busy = Some(Some(busy.clone()));
         // A run in flight on a pool will give its provider a reading: no
         // probe goes alongside it, on that pool or another on the provider.
         // One that names no pool may be on any; once it has asked, the
@@ -1918,6 +2030,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             mine: Vec::new(),
             busy,
             probes,
+            leased,
         };
         let active = slots.active(&runs);
         self.report.tally.0.in_flight = Some(active);
@@ -2183,12 +2296,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok((ids, busy, pools))
     }
 
-    /// Whether `run` on `repo`, which GitHub says is `in_progress`, has
-    /// ended all the same: past [`STUCK_CHECK_SECONDS`] with every job
-    /// completed, the last over [`JOBS_SETTLED_SECONDS`] ago. Age alone is
-    /// no evidence, as a run may legitimately take days. Younger runs cost no
-    /// request, and each run's jobs are read once a pass; jobs that cannot be
-    /// read, or not on one page, leave the run in flight, as before.
+    /// [`jobs_ended`], each run's jobs read once a pass.
     fn ended(&self, repo: &str, run: &Value) -> bool {
         let Some(id) = run["id"]
             .as_u64()
@@ -2199,27 +2307,55 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(&ended) = self.ended.borrow().get(&id) {
             return ended;
         }
-        let since = |at: Option<OffsetDateTime>| at.map(|at| (self.now - at).whole_seconds());
-        let started = at(&run["run_started_at"]).or_else(|| at(&run["created_at"]));
-        let ended = match since(started) {
-            None => false,
-            Some(age) if age <= STUCK_CHECK_SECONDS => false,
-            Some(_) => {
-                let url = format!(
-                    "{API_ROOT}repos/{repo}/actions/runs/{id}/jobs?per_page={JOBS_PER_PAGE}"
-                );
-                let response = self.client.get(&url, None).ok().filter(|r| r.status == 200);
-                let body = response.map_or(Value::Null, |r| r.body);
-                let jobs = body["jobs"].as_array().map_or(&[][..], Vec::as_slice);
-                let last = jobs.iter().map(|j| at(&j["completed_at"])).max().flatten();
-                !jobs.is_empty()
-                    && body["total_count"].as_u64() == Some(jobs.len() as u64)
-                    && jobs.iter().all(|j| j["status"] == "completed")
-                    && since(last).is_some_and(|s| s > JOBS_SETTLED_SECONDS)
-            }
-        };
+        let ended = jobs_ended(&self.client, repo, run, self.now);
         self.ended.borrow_mut().insert(id, ended);
         ended
+    }
+
+    /// The runs that hold a lease, where [`Config::leases`] is set: read
+    /// once a pass, after reaping the ended ones ([`lease::read`]), each
+    /// reap one write step; a preview frees none, and counts those it
+    /// would reap as reaped.
+    /// The leases left go to the hold snapshot. A read that fails is an
+    /// error, as capacity read without it would be guessed.
+    fn leased(&mut self) -> Result<Vec<lease::Held>> {
+        let config = self.config;
+        if !config.leases {
+            return Ok(Vec::new());
+        }
+        if let Some(leases) = &self.report.leases {
+            return Ok(leases.clone());
+        }
+        let repo = &config.dispatch_repo;
+        let mut live = Vec::new();
+        for found in lease::read(&self.client, repo, self.now)? {
+            if let Some(why) = &found.ended {
+                let said = format!("lease: reap {}: {why}", found.name);
+                if let Some(held) = self.caps.check(Kind::Write) {
+                    self.line(format!("{held}: {said}"));
+                } else if !self.apply {
+                    self.caps.count(Kind::Write);
+                    self.line(format!("{said}; a preview does not free it"));
+                    continue;
+                } else {
+                    self.caps.count(Kind::Write);
+                    match lease::free(&self.client, repo, &found, &format!("reaped: {why}")) {
+                        Ok(true) => {
+                            self.line(said);
+                            continue;
+                        }
+                        Ok(false) => self.line(format!("{said}; it moved since, so it stays")),
+                        Err(error) => {
+                            self.report.failures += 1;
+                            self.line(format!("lease error: {said}: {error:#}"));
+                        }
+                    }
+                }
+            }
+            live.extend(found.held);
+        }
+        self.report.leases = Some(live.clone());
+        Ok(live)
     }
 
     /// The runs [`Self::ended`] took as ended in this pass, for the overlap
@@ -2250,58 +2386,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.snapshot.clone().flatten()
     }
 
-    /// Why runs wait on `budget` at `share` of it: the week's spend there or
-    /// past it ([`BUDGET_REACHED`]), or no spend reading. None without a
-    /// budget. A grant holds each pool in its snapshot entry instead.
+    /// [`budget_hold`] by the pass's snapshot, read only with a budget.
     fn budget_hold(&mut self, share: f64) -> Option<String> {
-        let weekly = self.config.budget.as_ref()?.weekly_usd?;
+        self.config.budget.as_ref()?.weekly_usd?;
         let snapshot = self.snapshot();
-        match spent(snapshot.as_ref(), self.now) {
-            Ok(spent) if spent < weekly * share => None,
-            Ok(_) => Some(BUDGET_REACHED.into()),
-            Err(why) => Some(why),
-        }
+        budget_hold(self.config, snapshot.as_ref(), self.now, share)
     }
 
     /// The bot's usage snapshot from the configured issue, if `usage` is set.
     fn usage(&self) -> Result<Option<Value>> {
-        let Some(usage) = &self.config.usage else {
-            return Ok(None);
-        };
-        let on = (usage.repository.as_str(), usage.issue);
-        let comment = self.bot_comment(on, USAGE_MARKER, "usage snapshot")?;
-        Ok(comment.and_then(|c| usage_snapshot(text(&c, "/body"))))
+        published_usage(&self.client, self.config)
     }
 
     /// The bot's comment on issue `on` (repository and number) that starts
     /// with `marker`, the `what` an error names.
     fn bot_comment(&self, on: (&str, u64), marker: &str, what: &str) -> Result<Option<Value>> {
-        let (repository, issue) = on;
-        let mut url = format!("{API_ROOT}repos/{repository}/issues/{issue}/comments?per_page=100");
-        for _ in 0..USAGE_PAGES {
-            let response = self.client.get(&url, None)?;
-            ensure!(
-                response.status == 200,
-                "reading the {what}: GitHub HTTP status {}",
-                response.status
-            );
-            let comments = response
-                .body
-                .as_array()
-                .context("comments are not a list")?;
-            let found = comments.iter().find(|c| {
-                text(c, "/user/login").eq_ignore_ascii_case(&self.config.bot)
-                    && text(c, "/body").starts_with(marker)
-            });
-            if let Some(comment) = found {
-                return Ok(Some(comment.clone()));
-            }
-            match response.link.as_deref().and_then(next_link) {
-                Some(next) => url = next,
-                None => return Ok(None),
-            }
-        }
-        bail!("the usage issue has more than {USAGE_PAGES} pages of comments")
+        bot_comment(&self.client, &self.config.bot, on, (marker, what))
     }
 
     /// Every open issue on the board, whole, or an error: scheduling from
@@ -2564,7 +2664,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         rule: HoldRule,
     ) -> Result<Option<Step>> {
         let (listed, mut busy) = self.runs(target)?;
-        let active = slots.active(&listed);
+        let mut current = slots.clone();
+        if self.config.leases {
+            current.leased = lease::read(&self.client, &self.config.dispatch_repo, self.now)?
+                .into_iter()
+                .filter(|f| f.ended.is_none())
+                .filter_map(|f| f.held)
+                .collect();
+            lease::busy(&current.leased, &mut busy)?;
+        }
+        let active = current.active(&listed);
         if active >= slots.wip {
             let why = format!("{WIP_HOLD}{active} of {} runs active", slots.wip);
             return Ok(Some(Step::Stop(why, Halt::Full)));
@@ -2764,14 +2873,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ended: Some(&ended),
         };
         let options = (0, Some(config.bot.as_str()), None, scheduled);
-        let done = plan::dispatch_with(
-            &self.client,
-            &self.dispatcher,
-            issue,
-            &writers,
-            target,
-            options,
-        );
+        let dispatcher = self.lease_dispatch(&dest, &pool);
+        let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
         Ok(self.dispatched(line, holds, done))
     }
 
@@ -2780,6 +2883,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn capped(&self, line: &str) -> Option<Step> {
         let held = self.caps.check(Kind::Dispatch)?;
         Some(Step::Capped(format!("{held}: {line}")))
+    }
+
+    fn lease_dispatch<'b>(
+        &'b self,
+        item: &'b ItemRef,
+        pool: &'b str,
+    ) -> lease::Dispatch<'b, Budget<'b, C>, Budget<'b, C>> {
+        lease::Dispatch {
+            client: &self.client,
+            dispatcher: &self.dispatcher,
+            config: self.config,
+            item,
+            pool,
+            now: self.now,
+            sent: Cell::new(false),
+            reserved: RefCell::new(None),
+        }
     }
 
     /// [`choose`] of `names`, or where none has room, the first that may
@@ -2826,6 +2946,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let run = done.run.as_deref().unwrap_or("unnamed");
                 let record = done.record.unwrap_or_default();
                 Step::Started(format!("{line} record={record} run={run}"), holds)
+            }
+            // Refused before it was sent, its records released: a later
+            // pass dispatches it once there is a slot.
+            Err(error) if error.is::<plan::Refused>() => {
+                Step::Hold(Hold::new(HoldKind::Other, error.to_string()))
             }
             // Sent or not, the slot stays taken: an ambiguous dispatch is
             // recorded on the issue, and the next pass reads it.
@@ -3097,14 +3222,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let writers = self.writers();
         let options = (0, None, None, scheduled);
-        let done = plan::dispatch_with(
-            &self.client,
-            &self.dispatcher,
-            issue,
-            &writers,
-            target,
-            options,
-        );
+        let dispatcher = self.lease_dispatch(issue, pool);
+        let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
         Ok(self.dispatched(line, holds, done))
     }
 
@@ -3491,6 +3610,7 @@ impl crate::github::GraphQl for Replay {
 
 mod epics;
 pub mod holds;
+pub mod lease;
 pub mod maintain;
 pub mod revisit;
 mod status;
