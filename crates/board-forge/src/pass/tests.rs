@@ -1711,6 +1711,16 @@ impl Forge {
         if method == "POST" && path.ends_with("/rerun-failed-jobs") {
             return Ok((201, json!({})));
         }
+        if method == "POST" && path.ends_with("/issues") {
+            let repo = path
+                .trim_start_matches("repos/")
+                .trim_end_matches("/issues");
+            let html_url = format!("https://github.com/{repo}/issues/{id}");
+            return Ok((201, json!({"number": id, "html_url": html_url})));
+        }
+        if method == "POST" && path.ends_with("/sub_issues") {
+            return Ok((201, json!({})));
+        }
         bail!("unexpected write {method} {url}")
     }
 }
@@ -7732,5 +7742,850 @@ fn apply_edits_an_epics_planning_request_in_place() {
                 .any(|(m, f)| *m == "POST" && f.starts_with("<!-- agent-board-dispatch")),
             "{on_596:#?}"
         );
+    }
+}
+
+/// Page `page` of the bot's issues in tracker in `state`, newest first, as
+/// the sweep lists them.
+fn sweep_page(replay: &mut Replay, state: &str, page: usize, issues: Value) {
+    let url = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/issues?state={state}&creator=cgwalters-bot&sort=created&direction=desc&per_page=100&page={page}"
+    );
+    replay
+        .requests
+        .push(json!({"request": {"get": url}, "answer": {"status": 200, "body": issues}}));
+}
+
+/// The bot's issues in tracker, as the sweep lists them: its open ones,
+/// then any.
+fn sweep_listing(replay: &mut Replay, issues: Value) {
+    for state in ["open", "all"] {
+        sweep_page(replay, state, 1, issues.clone());
+    }
+}
+
+/// tracker#9001, an open sweep issue of the bot's on the board, filed on
+/// the recording's day, whose body lists `issues`; no comment recorded.
+fn sweep_issue(replay: &mut Replay, issues: &[&str]) {
+    let url = "https://github.com/cgwalters-forge/tracker/issues/9001";
+    let list =
+        json!({"schema": "agent-board/sweep/v1", "due": "2026-10-23T00:00:00Z", "issues": issues});
+    let body = format!(
+        "{}\nListed.\n\n```agent-board-sweep\n{list}\n```\n",
+        sweep::SWEEP_MARKER
+    );
+    sweep_listing(
+        replay,
+        json!([{"number": 9001, "html_url": url, "state": "open",
+            "created_at": "2026-10-23T00:00:00Z", "body": body}]),
+    );
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 9001});
+    replay.requests.push(json!({
+        "request": graphql_key(BODY_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"url": url, "title": "Weekly sweep",
+            "body": body, "createdAt": "2026-10-23T00:00:00Z", "lastEditedAt": null,
+            "author": {"login": "cgwalters-bot"}, "editor": null}}}},
+    }));
+    let variables =
+        json!({"owner": "cgwalters-forge", "name": "tracker", "number": 9001, "after": null});
+    replay.requests.push(json!({
+        "request": graphql_key(plan::COMMENTS_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"comments": {"nodes": [],
+            "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}},
+    }));
+    for entry in &mut replay.requests {
+        let nodes = entry["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut);
+        if let Some(nodes) = nodes
+            && let Some(node) = nodes.iter().find(|n| {
+                n["content"]["number"] == 459
+                    && text(&n["content"], "/repository/nameWithOwner") == "cgwalters-forge/tracker"
+            })
+        {
+            let mut node = node.clone();
+            node["content"]["number"] = 9001.into();
+            nodes.push(node);
+        }
+    }
+}
+
+/// The weekly sweep (agent-board#431) on the recording, a Friday, with
+/// tracker#446 in a live epic and tracker#459 and #533 outside every one.
+/// Due and not yet filed, a preview says it files one issue listing the
+/// two, and an apply files it, with the bot's token only, and an issue of
+/// another repository only where it is read as public. Once filed, its one
+/// triage run starts with a slot spare and claude under its pace, but not
+/// while openai, over its pace, is a triage pool. The bot's reply then
+/// attaches tracker#459 to tracker#446's live epic and leaves tracker#533's
+/// question and the verdict on tracker#9999, off the board but open, for
+/// the operator, leaving out tracker#9998, closed since, and labelling the
+/// sweep issue; the next pass applies nothing.
+#[test]
+fn sweep_files_runs_and_applies_once_a_week() {
+    let settings = json!({"triage": {"scope": "epics"}, "triagePools": ["claude"], "wip": 12,
+        "sweep": {"weekday": "friday", "hourUtc": 0}});
+    let issues = [
+        "cgwalters-forge/tracker#446",
+        "cgwalters-forge/tracker#459",
+        "cgwalters-forge/tracker#533",
+    ];
+    let board = |forge: &mut Forge| {
+        only(&mut forge.replay, &issues);
+        silent(&mut forge.replay, &[], &[]);
+    };
+    let sweeps = |report: &Report| -> Vec<String> {
+        (report.lines.iter())
+            .filter(|l| l.starts_with("sweep") || l.starts_with("start sweep"))
+            .cloned()
+            .collect()
+    };
+
+    // Due, and filed by an apply.
+    let mut forge = Forge::new(None, false);
+    board(&mut forge);
+    sweep_listing(&mut forge.replay, json!([]));
+    let filed_line =
+        "sweep: file Weekly sweep: 2 issues outside the epics in cgwalters-forge/tracker";
+    let report = preview(&config(settings.clone()), &forge.replay);
+    assert_eq!(
+        sweeps(&report),
+        [format!("{filed_line}; a preview files nothing")]
+    );
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let posted: Vec<_> = (forge.writes.borrow().iter())
+        .filter(|(m, u, _)| m == "POST" && u.ends_with("/tracker/issues"))
+        .map(|(_, _, body)| body.clone())
+        .collect();
+    assert_eq!(posted.len(), 1, "{:#?}", report.lines);
+    assert_eq!(
+        posted[0]["title"],
+        "Weekly sweep: 2 issues outside the epics"
+    );
+    let body = text(&posted[0], "/body");
+    assert!(body.starts_with(sweep::SWEEP_MARKER), "{body}");
+    assert!(
+        body.contains("\"cgwalters-forge/tracker#459\",\n    \"cgwalters-forge/tracker#533\""),
+        "{body}"
+    );
+
+    // Not with the operator's token: the next pass would not find it.
+    let mut operator = Forge::new(None, false);
+    operator.login = "cgwalters";
+    board(&mut operator);
+    sweep_listing(&mut operator.replay, json!([]));
+    let report = apply(&operator, &config(settings.clone()));
+    assert_eq!(
+        sweeps(&report),
+        [
+            "sweep error: the token is cgwalters's, not cgwalters-bot's; only the bot files and applies a sweep, which the pass would not find again"
+        ]
+    );
+    assert!(
+        !(operator.writes.borrow().iter()).any(|(_, u, _)| u.ends_with("/tracker/issues")),
+        "{:#?}",
+        report.lines
+    );
+
+    // An issue of another repository only where it is read as public: not
+    // one read as private, nor one whose visibility is not recorded.
+    let hidden = "sweep: 1 issue(s) outside the epics are in repositories not read as public, and not listed in cgwalters-forge/tracker";
+    for (visibility, expected) in [
+        (
+            Some(json!({"private": false, "visibility": "public"})),
+            vec!["sweep: file Weekly sweep: 3 issues outside the epics in cgwalters-forge/tracker; a preview files nothing".to_owned()],
+        ),
+        (
+            Some(json!({"private": true, "visibility": "private"})),
+            vec![hidden.to_owned(), format!("{filed_line}; a preview files nothing")],
+        ),
+        (
+            None,
+            vec![hidden.to_owned(), format!("{filed_line}; a preview files nothing")],
+        ),
+    ] {
+        let mut fresh = Forge::new(None, false);
+        let mut more = issues.to_vec();
+        more.push("cgwalters-forge/agent-board#40");
+        only(&mut fresh.replay, &more);
+        silent(&mut fresh.replay, &[], &[]);
+        sweep_listing(&mut fresh.replay, json!([]));
+        if let Some(body) = &visibility {
+            let url = format!("{API_ROOT}repos/cgwalters-forge/agent-board");
+            fresh
+                .replay
+                .requests
+                .push(json!({"request": {"get": url}, "answer": {"status": 200, "body": body}}));
+        }
+        let report = preview(&config(settings.clone()), &fresh.replay);
+        assert_eq!(sweeps(&report), expected, "{visibility:?}");
+    }
+
+    // A closed one filed since this week's due time ends the week, past a
+    // full page of the bot's newer issues too; one from the week before
+    // does not. More than three full pages of open issues could hide an
+    // open one, and file none.
+    let url = "https://github.com/cgwalters-forge/tracker/issues/8000";
+    let closed = |created: &str| {
+        json!([{"number": 8000, "html_url": url, "state": "closed",
+            "created_at": created, "body": format!("{}\nListed.", sweep::SWEEP_MARKER)}])
+    };
+    let full: Value = (1..=100)
+        .map(|n| json!({"number": n, "state": "open", "created_at": "2026-10-23T00:00:01Z", "body": "Other."}))
+        .collect();
+    let this_week =
+        format!("sweep: this week's, {url}, is closed; the next is due from 2026-10-30T00:00:00Z");
+    let none = json!([]);
+    for (open, all, expected) in [
+        (
+            vec![none.clone()],
+            vec![closed("2026-10-23T00:00:00Z")],
+            this_week.clone(),
+        ),
+        (
+            vec![none.clone()],
+            vec![full.clone(), closed("2026-10-23T00:00:00Z")],
+            this_week,
+        ),
+        (
+            vec![none.clone()],
+            vec![closed("2026-10-16T09:00:00Z")],
+            format!("{filed_line}; a preview files nothing"),
+        ),
+        (
+            vec![full.clone(); 3],
+            vec![],
+            "sweep error: the bot's open issues in cgwalters-forge/tracker are more than 3 pages; no sweep is filed or started".to_owned(),
+        ),
+    ] {
+        let mut fresh = Forge::new(None, false);
+        board(&mut fresh);
+        let pages = (open.len(), all.len());
+        for (state, bodies) in [("open", open), ("all", all)] {
+            for (n, body) in bodies.into_iter().enumerate() {
+                sweep_page(&mut fresh.replay, state, n + 1, body);
+            }
+        }
+        let report = preview(&config(settings.clone()), &fresh.replay);
+        assert_eq!(sweeps(&report), [expected], "{pages:?}");
+    }
+
+    // Filed: started only with every triage pool under its pace.
+    let mut forge = Forge::new(None, false);
+    board(&mut forge);
+    // tracker#9999 and #9998 are not on the board, which holds open issues
+    // only: #9999 is open, #9998 closed since it was listed.
+    let gone = "cgwalters-forge/tracker#9999";
+    let closed_since = "cgwalters-forge/tracker#9998";
+    sweep_issue(
+        &mut forge.replay,
+        &[issues[1], issues[2], gone, closed_since],
+    );
+    let both = json!({"triagePools": ["claude", "openai"]});
+    let mut over = settings.clone();
+    over.as_object_mut()
+        .unwrap()
+        .extend(both.as_object().unwrap().clone());
+    let report = preview(&config(over), &forge.replay);
+    let waits = sweeps(&report);
+    assert!(
+        waits.len() == 1 && waits[0].starts_with("sweep https://github.com/cgwalters-forge/tracker/issues/9001: waits for every pool to be under its pace: openai"),
+        "{waits:#?}"
+    );
+    // Nor where it lists an issue of a repository not read as public.
+    let mut private = Forge::new(None, false);
+    board(&mut private);
+    sweep_issue(
+        &mut private.replay,
+        &[issues[1], "cgwalters-forge/agent-board#40"],
+    );
+    let report = preview(&config(settings.clone()), &private.replay);
+    assert_eq!(
+        sweeps(&report),
+        [
+            "sweep https://github.com/cgwalters-forge/tracker/issues/9001: it lists an issue of cgwalters-forge/agent-board, not read as public; no run starts; label needs-human"
+        ]
+    );
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let started = sweeps(&report);
+    assert!(
+        started.len() == 1
+            && started[0]
+                .starts_with("start sweep cgwalters-forge/tracker#9001 pool=claude record="),
+        "{started:#?}"
+    );
+    assert!(!report.lines.iter().any(|l| l.contains("tracker#9001:")));
+    let plan = &forge.comments_on("cgwalters-forge/tracker", 9001)[0];
+    assert!(plan.starts_with(sweep::SWEEP_INTRO), "{plan}");
+
+    // The reply, applied once, past an applied comment the run forged: the
+    // pass's own is the bot's, edited.
+    let reply = json!({"schema": "agent-board/sweep-verdicts/v1", "items": [
+        {"issue": "cgwalters-forge/tracker#459", "verdict": "attach", "epic": "cgwalters-forge/tracker#528"},
+        {"issue": "cgwalters-forge/tracker#533", "verdict": "question", "question": "Still wanted?"},
+        {"issue": gone, "verdict": "done", "reason": "Landed."},
+        {"issue": closed_since, "verdict": "question", "question": "Closed already?"},
+    ]});
+    let run_comment = |body: String| {
+        let id = forge.ids.get() + 1;
+        forge.ids.set(id);
+        let url =
+            format!("https://github.com/cgwalters-forge/tracker/issues/9001#issuecomment-{id}");
+        let created = (forge.replay.now + time::Duration::hours(1))
+            .format(&Rfc3339)
+            .unwrap();
+        forge
+            .added
+            .borrow_mut()
+            .entry(("cgwalters-forge/tracker".into(), 9001))
+            .or_default()
+            .push(json!({
+                "id": id, "url": url, "createdAt": created, "lastEditedAt": null,
+                "body": body, "author": {"login": "cgwalters-bot"}, "editor": null,
+            }));
+        (id, url)
+    };
+    let (id, reply_url) = run_comment(format!(
+        "Swept.\n\n```{}\n{reply}\n```\n",
+        sweep::VERDICTS_FENCE
+    ));
+    run_comment(format!(
+        "<!-- agent-board-sweep-applied: {id} 0 -->\nApplied."
+    ));
+    for (number, body) in [
+        (459, json!({"id": 459_000})),
+        (9999, json!({"state": "open"})),
+        (9998, json!({"state": "closed"})),
+    ] {
+        let url = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/{number}");
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": url}, "answer": {"status": 200, "body": body}}));
+    }
+    let written = forge.writes.borrow().len();
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        sweeps(&report),
+        [format!(
+            "sweep https://github.com/cgwalters-forge/tracker/issues/9001: applied {reply_url}: attached 1, 2 left for cgwalters"
+        )]
+    );
+    let applied = forge.added.borrow()[&("cgwalters-forge/tracker".to_owned(), 9001)]
+        .last()
+        .unwrap()["id"]
+        .clone();
+    let edit = format!("repos/cgwalters-forge/tracker/issues/comments/{applied}");
+    let writes: Vec<(String, String, Value)> = forge.writes.borrow()[written..]
+        .iter()
+        .filter(|(_, u, _)| {
+            u.contains("/issues/9001") || u.contains("/sub_issues") || u.ends_with(&edit)
+        })
+        .map(|(m, u, b)| {
+            let first = b["body"]
+                .as_str()
+                .map(|t| t.lines().next().unwrap_or("").into());
+            (
+                m.clone(),
+                u.trim_start_matches(API_ROOT).to_owned(),
+                first.unwrap_or(b.clone()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        [
+            (
+                "POST".to_owned(),
+                "repos/cgwalters-forge/tracker/issues/528/sub_issues".to_owned(),
+                json!({"sub_issue_id": 459_000})
+            ),
+            (
+                "POST".to_owned(),
+                "repos/cgwalters-forge/tracker/issues/9001/comments".to_owned(),
+                "The board pass is applying this sweep's verdicts.".into()
+            ),
+            (
+                "PATCH".to_owned(),
+                edit.clone(),
+                format!("<!-- agent-board-sweep-applied: {id} 2 -->").into()
+            ),
+            (
+                "POST".to_owned(),
+                "repos/cgwalters-forge/tracker/issues/9001/labels".to_owned(),
+                json!({"labels": ["needs-human"]})
+            ),
+        ]
+    );
+    let summary = forge.comments_on("cgwalters-forge/tracker", 9001);
+    let summary = summary.last().unwrap();
+    assert!(
+        summary.contains("- Attached cgwalters-forge/tracker#459 to cgwalters-forge/tracker#528"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("- cgwalters-forge/tracker#533: Still wanted?"),
+        "{summary}"
+    );
+    assert!(
+        summary
+            .contains("- cgwalters-forge/tracker#9999, not on the board: done, to close: Landed."),
+        "{summary}"
+    );
+    assert!(!summary.contains(closed_since), "{summary}");
+    // A pass that stopped after its comment: the label again, then nothing.
+    let labelled = |forge: &Forge, from: usize| -> usize {
+        forge.writes.borrow()[from..]
+            .iter()
+            .filter(|(_, u, _)| u.contains("/issues/9001") || u.contains("/sub_issues"))
+            .count()
+    };
+    let written = forge.writes.borrow().len();
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(
+        sweeps(&report),
+        [
+            "sweep https://github.com/cgwalters-forge/tracker/issues/9001: applied, with something left for the operator; label needs-human"
+        ]
+    );
+    assert_eq!(labelled(&forge, written), 1);
+    for entry in &mut forge.replay.requests {
+        if entry["request"]["get"]
+            .as_str()
+            .is_some_and(|u| u.contains("creator=cgwalters-bot"))
+        {
+            entry["answer"]["body"][0]["labels"] = json!([{"name": "needs-human"}]);
+        }
+    }
+    let written = forge.writes.borrow().len();
+    let report = apply(&forge, &config(settings));
+    let waiting = sweeps(&report);
+    assert!(
+        waiting.len() == 1
+            && waiting[0].contains(
+                ": applied, https://github.com/cgwalters-forge/tracker/issues/9001#issuecomment-"
+            ),
+        "{waiting:#?}"
+    );
+    assert_eq!(labelled(&forge, written), 0);
+}
+
+/// The settings of the sweep tests: tracker#446 in a live epic, tracker#459
+/// and #533 outside every one.
+fn sweep_settings() -> Value {
+    json!({"triage": {"scope": "epics"}, "triagePools": ["claude"], "wip": 12,
+        "sweep": {"weekday": "friday", "hourUtc": 0}})
+}
+
+/// The sweep issue tracker#9001 listing tracker#459 and #533, its run
+/// started by an applying pass.
+fn started_sweep(settings: &Value) -> Forge {
+    let mut forge = Forge::new(None, false);
+    only(
+        &mut forge.replay,
+        &[
+            "cgwalters-forge/tracker#446",
+            "cgwalters-forge/tracker#459",
+            "cgwalters-forge/tracker#533",
+        ],
+    );
+    silent(&mut forge.replay, &[], &[]);
+    sweep_issue(
+        &mut forge.replay,
+        &["cgwalters-forge/tracker#459", "cgwalters-forge/tracker#533"],
+    );
+    let issue_459 = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/459");
+    forge.replay.requests.push(
+        json!({"request": {"get": issue_459}, "answer": {"status": 200, "body": {"id": 459_000}}}),
+    );
+    let report = apply(&forge, &config(settings.clone()));
+    let start = "start sweep cgwalters-forge/tracker#9001 pool=claude record=";
+    assert!(
+        report.lines.iter().any(|l| l.starts_with(start)),
+        "{:#?}",
+        report.lines
+    );
+    forge
+}
+
+/// The sweep run's reply on tracker#9001, the bot's, with `items`.
+fn sweep_reply(forge: &Forge, items: Value) -> String {
+    let id = forge.ids.get() + 1;
+    forge.ids.set(id);
+    let url = format!("https://github.com/cgwalters-forge/tracker/issues/9001#issuecomment-{id}");
+    let created = (forge.replay.now + time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let reply = json!({"schema": "agent-board/sweep-verdicts/v1", "items": items});
+    forge
+        .added
+        .borrow_mut()
+        .entry(("cgwalters-forge/tracker".into(), 9001))
+        .or_default()
+        .push(json!({
+            "id": id, "url": url, "createdAt": created, "lastEditedAt": null,
+            "body": format!("Swept.\n\n```{}\n{reply}\n```\n", sweep::VERDICTS_FENCE),
+            "author": {"login": "cgwalters-bot"}, "editor": null,
+        }));
+    url
+}
+
+/// The pass's sweep lines and its hold of every new run.
+fn sweep_lines(report: &Report) -> Vec<&str> {
+    (report.lines.iter())
+        .map(String::as_str)
+        .filter(|l| {
+            l.starts_with("sweep") || l.starts_with("hold wip") || l.starts_with("hold budget")
+        })
+        .collect()
+}
+
+/// Applying a sweep's reply, and finishing an apply a pass stopped in,
+/// take no run: they go on while every slot is taken or the weekly budget
+/// is reached, which only holds new runs. A reply that leaves listed
+/// issues out (here, every one) keeps them pending as questions, and the
+/// sweep issue open; a label lost after the applied comment is put on by
+/// the next pass.
+#[test]
+fn sweep_finishes_without_capacity() {
+    let mut settings = sweep_settings();
+    let mut forge = started_sweep(&settings);
+    let url = "https://github.com/cgwalters-forge/tracker/issues/9001";
+    // Every slot taken: the reply, attaching #459 and silent on #533.
+    let reply = sweep_reply(
+        &forge,
+        json!([{"issue": "cgwalters-forge/tracker#459", "verdict": "attach",
+            "epic": "cgwalters-forge/tracker#528"}]),
+    );
+    in_flight(&mut forge.replay, runs(12));
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = sweep_lines(&report);
+    assert!(
+        lines.len() == 2
+            && lines[0].starts_with("hold wip: ")
+            && lines[1]
+                == format!("sweep {url}: applied {reply}: attached 1, 1 left for cgwalters"),
+        "{lines:#?}"
+    );
+    let summary = forge.comments_on("cgwalters-forge/tracker", 9001);
+    let summary = summary.last().unwrap();
+    assert!(
+        summary.contains("- cgwalters-forge/tracker#533: the sweep gave it no verdict"),
+        "{summary}"
+    );
+
+    // An empty reply on a second sweep, whose label is lost after its
+    // comment; the budget reached, the next pass labels it.
+    let mut forge = started_sweep(&settings);
+    let reply = sweep_reply(&forge, json!([]));
+    let labels = format!("POST {API_ROOT}repos/cgwalters-forge/tracker/issues/9001/labels");
+    *forge.refuse.borrow_mut() = Some(labels);
+    let report = apply(&forge, &config(settings.clone()));
+    let lines = sweep_lines(&report);
+    assert!(
+        lines.len() == 1
+            && lines[0].starts_with("sweep error: ")
+            && lines[0].contains("connection refused"),
+        "{lines:#?}"
+    );
+    let summary = forge.comments_on("cgwalters-forge/tracker", 9001);
+    let summary = summary.last().unwrap();
+    for issue in ["459", "533"] {
+        let pending = format!("- cgwalters-forge/tracker#{issue}: the sweep gave it no verdict");
+        assert!(summary.contains(&pending), "{summary}");
+    }
+    assert!(summary.contains(&reply), "{summary}");
+    with_spend(&mut forge.replay, &mut settings, spend(1000.0));
+    // Where an applying pass publishes the usage it read from the broker.
+    let ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    forge.replay.requests.push(json!({"request": {"get": ops},
+        "answer": {"status": 200, "body": {"private": true, "visibility": "private"}}}));
+    let written = forge.writes.borrow().len();
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let lines = sweep_lines(&report);
+    assert!(
+        lines.len() == 2
+            && lines[0].starts_with("hold budget: ")
+            && lines[1]
+                == format!(
+                    "sweep {url}: applied, with something left for the operator; label needs-human"
+                ),
+        "{lines:#?}"
+    );
+    let writes: Vec<String> = (forge.writes.borrow()[written..].iter())
+        .filter(|(_, u, _)| !u.contains("/bot-ops/"))
+        .map(|(m, u, _)| format!("{m} {u}"))
+        .collect();
+    assert_eq!(
+        writes,
+        [format!(
+            "POST {API_ROOT}repos/cgwalters-forge/tracker/issues/9001/labels"
+        )]
+    );
+}
+
+/// A sweep whose plan cannot be used, here edited by a visitor, is stuck:
+/// labelled for a person, with no run started and no reply read.
+#[test]
+fn sweep_with_an_unusable_plan_is_stuck() {
+    let settings = sweep_settings();
+    let forge = started_sweep(&settings);
+    {
+        let mut added = forge.added.borrow_mut();
+        let plan = &mut added
+            .get_mut(&("cgwalters-forge/tracker".to_owned(), 9001))
+            .unwrap()[0];
+        plan["lastEditedAt"] = "2026-10-23T16:00:00Z".into();
+        plan["editor"] = json!({"login": "visitor"});
+    }
+    sweep_reply(&forge, json!([]));
+    let dispatched = forge.dispatches().len();
+    let written = forge.writes.borrow().len();
+    let report = apply(&forge, &config(settings));
+    let lines = sweep_lines(&report);
+    assert!(
+        lines.len() == 1
+            && lines[0].starts_with("sweep https://github.com/cgwalters-forge/tracker/issues/9001: its plan cannot be used: ")
+            && lines[0].ends_with("; a person replaces it; label needs-human"),
+        "{lines:#?}"
+    );
+    let sweep_writes: Vec<String> = (forge.writes.borrow()[written..].iter())
+        .filter(|(_, u, _)| u.contains("/issues/9001"))
+        .map(|(m, u, _)| format!("{m} {u}"))
+        .collect();
+    assert_eq!(
+        sweep_writes,
+        [format!(
+            "POST {API_ROOT}repos/cgwalters-forge/tracker/issues/9001/labels"
+        )]
+    );
+    let dispatches = forge.dispatches();
+    assert!(
+        !dispatches[dispatched..]
+            .iter()
+            .any(|d| d.ends_with("#9001")),
+        "{dispatches:#?}"
+    );
+}
+
+/// A sweep listing an issue of a repository that is no longer a work
+/// repository: no run starts for it, and where its reply came, that issue
+/// is left for the operator, not attached, though the board still holds it.
+#[test]
+fn sweep_keeps_to_the_work_repositories() {
+    let settings = sweep_settings();
+    let mut revoked = settings.clone();
+    let config_value: Value = serde_json::from_str(CONFIG).unwrap();
+    let work: Vec<Value> = (config_value["workRepositories"].as_array().unwrap().iter())
+        .filter(|r| *r != "cgwalters-forge/agent-board")
+        .cloned()
+        .collect();
+    revoked["workRepositories"] = json!(work);
+    let url = "https://github.com/cgwalters-forge/tracker/issues/9001";
+    let removed = "cgwalters-forge/agent-board#40";
+    let listed = ["cgwalters-forge/tracker#459", removed];
+    let fresh = |listed: &[&str]| {
+        let mut forge = Forge::new(None, false);
+        only(
+            &mut forge.replay,
+            &["cgwalters-forge/tracker#446", listed[0], listed[1]],
+        );
+        silent(&mut forge.replay, &[], &[]);
+        sweep_issue(&mut forge.replay, listed);
+        let public = format!("{API_ROOT}repos/cgwalters-forge/agent-board");
+        let issue_459 = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/459");
+        forge.replay.requests.extend([
+            json!({"request": {"get": public},
+                "answer": {"status": 200, "body": {"private": false, "visibility": "public"}}}),
+            json!({"request": {"get": issue_459}, "answer": {"status": 200, "body": {"id": 459_000}}}),
+        ]);
+        forge
+    };
+
+    // Removed before its run: none starts.
+    let report = preview(&config(revoked.clone()), &fresh(&listed).replay);
+    assert_eq!(
+        sweep_lines(&report),
+        [format!(
+            "sweep {url}: it lists an issue of cgwalters-forge/agent-board, not a work repository; no run starts; label needs-human"
+        )]
+    );
+
+    // Removed after its run started: only the work repository's is attached.
+    let forge = fresh(&listed);
+    let report = apply(&forge, &config(settings));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let reply = sweep_reply(
+        &forge,
+        json!([
+            {"issue": listed[0], "verdict": "attach", "epic": "cgwalters-forge/tracker#528"},
+            {"issue": removed, "verdict": "attach", "epic": "cgwalters-forge/tracker#528"},
+        ]),
+    );
+    let written = forge.writes.borrow().len();
+    let report = apply(&forge, &config(revoked));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        sweep_lines(&report),
+        [format!(
+            "sweep {url}: applied {reply}: attached 1, 1 left for cgwalters"
+        )]
+    );
+    let attached: Vec<Value> = (forge.writes.borrow()[written..].iter())
+        .filter(|(_, u, _)| u.contains("/sub_issues"))
+        .map(|(_, _, b)| b.clone())
+        .collect();
+    assert_eq!(attached, [json!({"sub_issue_id": 459_000})]);
+    let summary = forge.comments_on("cgwalters-forge/tracker", 9001);
+    let summary = summary.last().unwrap();
+    assert!(
+        summary.contains(&format!(
+            "- {removed}, not in a work repository: belongs to cgwalters-forge/tracker#528"
+        )),
+        "{summary}"
+    );
+
+    // Made private after its run started: its verdict is not copied.
+    let mut forge = fresh(&listed);
+    let report = apply(&forge, &config(sweep_settings()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let reply = sweep_reply(
+        &forge,
+        json!([
+            {"issue": listed[0], "verdict": "attach", "epic": "cgwalters-forge/tracker#528"},
+            {"issue": removed, "verdict": "question", "question": "Read while private?"},
+        ]),
+    );
+    for entry in &mut forge.replay.requests {
+        if entry["request"]["get"] == format!("{API_ROOT}repos/cgwalters-forge/agent-board") {
+            entry["answer"]["body"] = json!({"private": true, "visibility": "private"});
+        }
+    }
+    let report = apply(&forge, &config(sweep_settings()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    assert_eq!(
+        sweep_lines(&report),
+        [format!(
+            "sweep {url}: applied {reply}: attached 1, 1 left for cgwalters"
+        )]
+    );
+    let summary = forge.comments_on("cgwalters-forge/tracker", 9001);
+    let summary = summary.last().unwrap();
+    let hidden = format!("- {removed}, not read as public: its verdict is left out");
+    assert!(summary.contains(&hidden), "{summary}");
+    assert!(!summary.contains("Read while private?"), "{summary}");
+}
+
+/// A sweep whose comments cannot be read, here more pages than the bound,
+/// is stuck: labelled for a person rather than failing every later pass.
+#[test]
+fn sweep_with_unreadable_comments_is_stuck() {
+    let mut forge = Forge::new(None, false);
+    only(
+        &mut forge.replay,
+        &[
+            "cgwalters-forge/tracker#446",
+            "cgwalters-forge/tracker#459",
+        ],
+    );
+    silent(&mut forge.replay, &[], &[]);
+    sweep_issue(&mut forge.replay, &["cgwalters-forge/tracker#459"]);
+    // Every page, the first and each after it, says there is another.
+    let page = |after: Value| {
+        let variables =
+            json!({"owner": "cgwalters-forge", "name": "tracker", "number": 9001, "after": after});
+        graphql_key(plan::COMMENTS_QUERY, &variables)
+    };
+    let more = json!({"data": {"repository": {"issue": {"comments": {"nodes": [],
+        "pageInfo": {"hasNextPage": true, "endCursor": "c"}}}}}});
+    for entry in &mut forge.replay.requests {
+        if entry["request"] == page(Value::Null) {
+            entry["answer"] = more.clone();
+        }
+    }
+    forge.replay.requests.push(json!({"request": page(json!("c")), "answer": more}));
+    let report = preview(&config(sweep_settings()), &forge.replay);
+    assert_eq!(
+        sweep_lines(&report),
+        [
+            "sweep https://github.com/cgwalters-forge/tracker/issues/9001: its comments cannot be read: cgwalters-forge/tracker#9001 has more than 1000 comments; the newest could be unread; a person closes it; label needs-human"
+        ]
+    );
+}
+
+/// `sweep` is checked with the rest of the configuration.
+#[test]
+fn sweep_config_table() {
+    let epics = json!({"scope": "epics"});
+    let sweep = |edit: Value| {
+        let mut section = json!({"weekday": "friday", "hourUtc": 9});
+        section
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        section
+    };
+    for (triage, section, error) in [
+        (
+            json!(true),
+            sweep(json!({})),
+            Some("sweep needs triage scope epics"),
+        ),
+        (epics.clone(), sweep(json!({})), None),
+        (
+            epics.clone(),
+            sweep(json!({"weekday": "fri"})),
+            Some("sweep weekday \"fri\" is not a day of the week"),
+        ),
+        (
+            epics.clone(),
+            sweep(json!({"hourUtc": 24})),
+            Some("sweep hourUtc is not 0 to 23"),
+        ),
+        (
+            epics.clone(),
+            sweep(json!({"max": 0})),
+            Some("sweep max is not 1 to 100"),
+        ),
+        (
+            epics.clone(),
+            sweep(json!({"max": 101})),
+            Some("sweep max is not 1 to 100"),
+        ),
+        (
+            epics.clone(),
+            sweep(json!({"repository": "cgwalters-forge/elsewhere"})),
+            Some("sweep repository cgwalters-forge/elsewhere is not a work repository"),
+        ),
+        (
+            epics.clone(),
+            sweep(json!({"every": "week"})),
+            Some("unknown field `every`"),
+        ),
+    ] {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        value["triage"] = triage;
+        value["sweep"] = section.clone();
+        let parsed = Config::parse(&value.to_string());
+        match error {
+            None => {
+                let parsed = parsed.unwrap();
+                let sweep = parsed.sweep.as_ref().unwrap();
+                assert_eq!(sweep.max, 40);
+                assert_eq!(
+                    sweep.repository(&parsed).unwrap(),
+                    "cgwalters-forge/tracker"
+                );
+            }
+            Some(error) => {
+                let got = format!("{:#}", parsed.unwrap_err());
+                assert!(got.contains(error), "{section}: {got}");
+            }
+        }
     }
 }

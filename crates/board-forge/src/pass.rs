@@ -385,6 +385,9 @@ pub struct Config {
     /// Off unless set: spare slots after stage 4's starts revisit a sample
     /// of old issues ([`Scheduler::revisit`]).
     pub revisit: Option<revisit::Revisit>,
+    /// Off unless set: once a week, one issue lists the candidates outside
+    /// every live epic for one triage run ([`Scheduler::sweep`]).
+    pub sweep: Option<sweep::Sweep>,
     /// Off unless set: a daily digest of incoming pull requests, planned
     /// before stage 2 within a share of the pools ([`Scheduler::maintain`]).
     pub maintain: Option<maintain::Maintain>,
@@ -803,6 +806,9 @@ impl Config {
         );
         if let Some(revisit) = &self.revisit {
             revisit.check(self)?;
+        }
+        if let Some(sweep) = &self.sweep {
+            sweep.check(self)?;
         }
         if let Some(maintain) = &self.maintain {
             maintain.check(self)?;
@@ -1854,6 +1860,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         caps,
         report: &mut report,
         epics: BTreeMap::new(),
+        swept: None,
         busy: None,
         board: None,
         snapshot: None,
@@ -2108,6 +2115,9 @@ struct Scheduler<'a, C> {
     report: &'a mut Report,
     /// Whether each parent read is a live epic, or why that is unknown.
     epics: BTreeMap<String, std::result::Result<bool, String>>,
+    /// With [`Config::sweep`], the newest sweep issue, read before stage
+    /// 4's candidates; `None` where it was not read.
+    swept: Option<Option<sweep::Found>>,
     /// For the Status stage, what scheduling read: the issues with a run in
     /// flight, by key, with what it started; `Some(None)` where the listing
     /// failed, and `None` where scheduling did not get that far.
@@ -2290,21 +2300,28 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.report.tally.0.in_flight = Some(active);
         if active >= wip {
             self.pass_held(HoldKind::Wip, format!("{active} of {wip} runs active"));
+            if config.sweep.is_some() {
+                let snapshot = self.snapshot();
+                self.sweep_without_starts(&mut slots, (&target, snapshot.as_ref()));
+            }
             return Ok(());
         }
         let snapshot = self.snapshot();
+        let context = (&target, snapshot.as_ref());
         // No pool to start anything on: the board is not read for nothing.
         let all: Vec<String> = config.pools.0.iter().map(|(n, _)| n.clone()).collect();
         if let Err(why) = choose(snapshot.as_ref(), &config.pools, &all, self.now)
             && slots.probes.is_empty()
         {
             self.pass_held(HoldKind::Pools, format!("{why}; new runs wait"));
+            self.sweep_without_starts(&mut slots, context);
             return Ok(());
         }
         if let Some(why) = self.budget_hold(1.0) {
             // Held like a step past a cap, so the summary does not read idle.
             self.caps.hold();
             self.pass_held(HoldKind::Budget, format!("{why}; new runs wait"));
+            self.sweep_without_starts(&mut slots, context);
             return Ok(());
         }
         let board = self.board();
@@ -2321,11 +2338,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         }
+        if config.sweep.is_some() {
+            match self.find_sweep() {
+                Ok(found) => self.swept = Some(found),
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("sweep error: {error:#}"));
+                }
+            }
+        }
         let candidates = self.candidates(&board);
-        let context = (&target, snapshot.as_ref());
         let (free, started) = self.start(&candidates, &board, &mut slots, wip - active, context);
         let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
-        let taken = started + revisited;
+        let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
+        let taken = started + revisited + swept;
         drop(candidates);
         self.board = Some(Some(board));
         self.report.tally.0.in_flight = Some(active + taken);
@@ -2674,7 +2700,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// part of the board would start the wrong work.
     fn board(&self) -> Result<BoardRead> {
         let board = self.config.board.as_ref().context("no board")?;
-        let query = board_query(self.config.revisit.is_some());
+        let query = board_query(self.config.revisit.is_some() || self.config.sweep.is_some());
         let mut cursor = Value::Null;
         let mut options = None;
         let mut items = BTreeMap::new();
@@ -2745,9 +2771,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let people = self.writers();
         let usage = (config.usage.as_ref()).map(|u| (&u.repository, u.issue));
         let holds = (config.holds.as_ref()).map(|h| (&h.repository, h.issue));
-        let control: Vec<String> = (usage.into_iter().chain(holds))
+        let mut control: Vec<String> = (usage.into_iter().chain(holds))
             .map(|(repository, issue)| format!("{repository}#{issue}").to_ascii_lowercase())
             .collect();
+        // The sweep issue's one run is the sweep's to start.
+        if let Some(Some(found)) = &self.swept {
+            control.push(key(&found.issue));
+        }
         let mut ranked = Vec::new();
         let (mut visitors, mut outside, mut unparented) = (0, Vec::new(), 0);
         for facts in board.items.values() {
@@ -3625,8 +3655,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// has one, is a live epic ([`Self::candidates`]). Read from the board,
     /// not again before the start.
     fn outside_epics(&self, facts: &Facts) -> Option<Hold> {
+        let why = match self.config.sweep {
+            Some(_) => format!("{OUTSIDE_EPICS}; the weekly sweep lists it"),
+            None => OUTSIDE_EPICS.to_owned(),
+        };
         (self.config.triage == Some(TriageScope::Epics) && facts.parent.is_none())
-            .then(|| Hold::new(HoldKind::OutsideEpics, OUTSIDE_EPICS))
+            .then(|| Hold::new(HoldKind::OutsideEpics, why))
     }
 
     /// The newest triage verdict of `comments` ([`plan::triage_verdict`]),
@@ -4472,6 +4506,7 @@ pub mod lease;
 pub mod maintain;
 pub mod revisit;
 mod status;
+pub mod sweep;
 mod usage;
 
 pub use usage::Broker;
