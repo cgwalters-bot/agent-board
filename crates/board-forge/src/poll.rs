@@ -3269,7 +3269,7 @@ fn changed(pull: &Value) -> Option<BTreeSet<String>> {
 /// A failing step that comes before the job's own: the runner's setup, or
 /// the checkout, which fails with `Remote branch gh-readonly-queue/... not
 /// found` once the queue rebuilt and deleted the group's branch.
-fn before_own_steps(step: &str) -> bool {
+pub(crate) fn before_own_steps(step: &str) -> bool {
     step == "Set up job" || step.to_ascii_lowercase().contains("checkout")
 }
 
@@ -3292,7 +3292,7 @@ fn job_id(repo: &str, url: &str) -> Option<u64> {
 
 /// The check run of an Actions job: the one its `check_run_url` names, in
 /// this repository's API. A job's own id is not its check run's.
-fn check_run_id(repo: &str, job: &Value) -> Option<u64> {
+pub(crate) fn check_run_id(repo: &str, job: &Value) -> Option<u64> {
     let runs = format!("{API_ROOT}repos/{repo}/check-runs/");
     job["check_run_url"]
         .as_str()
