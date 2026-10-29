@@ -1159,6 +1159,10 @@ impl Client {
 }
 
 impl crate::poll::Rest for Client {
+    fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        Client::download(self, url, limit)
+    }
+
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         ensure!(
             url.starts_with(API_ROOT),

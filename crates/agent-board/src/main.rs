@@ -4,6 +4,7 @@ mod ask;
 mod broker;
 mod budget;
 mod cli_docs;
+mod cost;
 mod decisions;
 mod dispatch;
 mod epic;
@@ -165,6 +166,8 @@ enum Command {
     Release(lease::Release),
     /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree).
     Budget(budget::Budget),
+    /// What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md).
+    Cost(cost::Cost),
     /// Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md).
     Prune(prune::Prune),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
@@ -1098,6 +1101,27 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             budget::run(
                 args,
                 board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::Cost(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "cost reads its settings from --config only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            cost::run(
+                args,
+                board_forge::github::Client::from_env,
+                time::OffsetDateTime::now_utc().date(),
                 &mut io::stdout().lock(),
             )
         }

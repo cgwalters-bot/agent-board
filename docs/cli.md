@@ -32,6 +32,7 @@ Commands:
 - [`admit`](#agent-board-admit): Take a lease on a free slot for a run before any inference, reaping an ended or expired lease to take its slot, or report the one the run holds already; refused, with the reason, when wip, pacing of its pool or the budget leave none (docs/pass.md#leases)
 - [`release`](#agent-board-release): Free a run's lease, as its last step
 - [`budget`](#agent-board-budget): What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree)
+- [`cost`](#agent-board-cost): What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md)
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
@@ -667,6 +668,21 @@ Options:
 - `--split`: Instead of the tree, print the share of the window's public spend on upstream work and on the harness (`budget.harnessRepositories`), in percentages only
 - `--since <TIME>`: Start of the --split window, RFC 3339 (such as 2026-10-19T00:00:00Z)
 - `--until <TIME>`: End of the --split window, RFC 3339; without it, the window runs to now
+
+## agent-board cost
+
+What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md)
+
+```text
+agent-board cost [OPTIONS] --config <FILE> --date <DATE>
+```
+
+Options:
+
+- `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: its `workRepositories`, `follow` and `dispatchRepo`, whose runs count, and its `prices`. GH_TOKEN reads their Actions runs and artifacts
+- `--date <DATE>`: The UTC day, YYYY-MM-DD, whose completed runs count; not after today
+- `--human`: Print a short table instead of the agent-board/cost-day/v1 JSON
+- `--cache <DIR>`: A directory that keeps each run's summary.json by run id, so that a run read once is never downloaded again
 
 ## agent-board prune
 

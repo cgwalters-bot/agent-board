@@ -1,0 +1,210 @@
+{
+  "by_kind": {
+    "implement": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 400000,
+        "cache_write": 50000,
+        "input": 100000,
+        "output": 20000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.87
+    },
+    "review": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 68000,
+        "cache_write": 0,
+        "input": 344000,
+        "output": 1800
+      },
+      "unpriced_runs": 1,
+      "usd": null
+    },
+    "triage": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 20000,
+        "output": 2000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.09
+    }
+  },
+  "by_model": {
+    "anthropic/claude-x": {
+      "runs": 2,
+      "tokens": {
+        "cache_read": 400000,
+        "cache_write": 50000,
+        "input": 120000,
+        "output": 22000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.96
+    },
+    "praxis/gpt-6.1-sol": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 68000,
+        "cache_write": 0,
+        "input": 344000,
+        "output": 1800
+      },
+      "unpriced_runs": 1,
+      "usd": null
+    }
+  },
+  "by_repository": {
+    "cgwalters-forge/agent-board": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 68000,
+        "cache_write": 0,
+        "input": 344000,
+        "output": 1800
+      },
+      "unpriced_runs": 1,
+      "usd": null
+    },
+    "cgwalters-forge/bootc": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 400000,
+        "cache_write": 50000,
+        "input": 100000,
+        "output": 20000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.87
+    },
+    "cgwalters-forge/tracker": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 20000,
+        "output": 2000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.09
+    }
+  },
+  "date": "2026-10-28",
+  "repositories": [
+    "cgwalters-forge/agent-board",
+    "cgwalters-forge/tracker"
+  ],
+  "runs": [
+    {
+      "duration_s": 1800.0,
+      "id": 40811000001,
+      "item": "cgwalters-forge/bootc#12",
+      "kind": "implement",
+      "model": "anthropic/claude-x",
+      "outcome": "success",
+      "repo": "cgwalters-forge/bootc",
+      "tokens": {
+        "cache_read": 400000,
+        "cache_write": 50000,
+        "input": 100000,
+        "output": 20000
+      },
+      "url": "https://github.com/cgwalters-forge/tracker/actions/runs/40811000001",
+      "usd": 0.87
+    },
+    {
+      "duration_s": 95.0,
+      "id": 40811000002,
+      "item": "cgwalters-forge/tracker#900",
+      "kind": "triage",
+      "model": "anthropic/claude-x",
+      "outcome": "success",
+      "repo": "cgwalters-forge/tracker",
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 20000,
+        "output": 2000
+      },
+      "url": "https://github.com/cgwalters-forge/tracker/actions/runs/40811000002",
+      "usd": 0.09
+    },
+    {
+      "duration_s": 412.5,
+      "id": 40812885249,
+      "item": "cgwalters-forge/agent-board#440",
+      "kind": "review",
+      "model": "praxis/gpt-6.1-sol",
+      "outcome": "success",
+      "repo": "cgwalters-forge/agent-board",
+      "tokens": {
+        "cache_read": 68000,
+        "cache_write": 0,
+        "input": 344000,
+        "output": 1800
+      },
+      "url": "https://github.com/cgwalters-forge/agent-board/actions/runs/40812885249",
+      "usd": null
+    }
+  ],
+  "schema": "agent-board/cost-day/v1",
+  "top_items": [
+    {
+      "item": "cgwalters-forge/bootc#12",
+      "runs": 1,
+      "tokens": {
+        "cache_read": 400000,
+        "cache_write": 50000,
+        "input": 100000,
+        "output": 20000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.87
+    },
+    {
+      "item": "cgwalters-forge/tracker#900",
+      "runs": 1,
+      "tokens": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 20000,
+        "output": 2000
+      },
+      "unpriced_runs": 0,
+      "usd": 0.09
+    }
+  ],
+  "totals": {
+    "runs": 3,
+    "tokens": {
+      "cache_read": 468000,
+      "cache_write": 50000,
+      "input": 464000,
+      "output": 23800
+    },
+    "unpriced_runs": 1,
+    "usd": 0.96
+  },
+  "unpriced": {
+    "praxis/gpt-6.1-sol": {
+      "runs": 1,
+      "tokens": {
+        "cache_read": 68000,
+        "cache_write": 0,
+        "input": 344000,
+        "output": 1800
+      }
+    }
+  },
+  "unread": [
+    {
+      "id": 40812000002,
+      "reason": "its artifact expired",
+      "url": "https://github.com/cgwalters-forge/agent-board/actions/runs/40812000002"
+    }
+  ]
+}
