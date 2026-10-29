@@ -1,5 +1,8 @@
 # Working on agent-board
 
+**Run `just fmt` then `just check` before every commit you hand back; a change
+that fails `just check` isn't done.**
+
 agent-board is a Rust CLI for a forge-hosted work board; start with the
 [site's landing page](site/index.md) for its purpose and the
 [setup](docs/setup.md) for its quickstart.
@@ -30,7 +33,7 @@ that a feature or security boundary has been implemented.
 
 Run from the repository root with Rust supporting edition 2024. There is no
 Makefile or separate test harness. These are the exact commands in
-[CI](.github/workflows/ci.yml), in order:
+[CI](.github/workflows/ci.yml), in order; `just check` runs the first three:
 
 ```sh
 cargo fmt --all --check
