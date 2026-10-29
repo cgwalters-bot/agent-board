@@ -628,6 +628,10 @@ fn broker_url(url: &str) -> bool {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Pr {
     pub review_workflow: Option<String>,
+    /// Pools the pass starts the review job on itself ([`PollPolicy::review_pools`]);
+    /// empty leaves reviews to the job's `pull_request_target` runs.
+    #[serde(default)]
+    pub review_pools: Vec<String>,
     #[serde(default)]
     pub fix_pools: Vec<String>,
     pub toil_fix_pool: Option<String>,
@@ -913,6 +917,10 @@ impl Config {
         if let Some(workflow) = &self.pr.review_workflow {
             validate_workflow(workflow)?;
         }
+        ensure!(
+            self.pr.review_pools.is_empty() || self.pr.review_workflow.is_some(),
+            "pr reviewPools needs pr reviewWorkflow, the workflow it starts"
+        );
         for author in &self.pr.merge_authors {
             ensure!(!author.is_empty(), "pr mergeAuthors names an empty login");
         }
@@ -934,6 +942,7 @@ impl Config {
             .pr
             .fix_pools
             .iter()
+            .chain(&self.pr.review_pools)
             .chain(&self.pr.toil_fix_pool)
             .chain(&self.pr.conflict_fix_pool)
         {
@@ -1008,6 +1017,7 @@ impl Config {
             fix_bounds: self.fix_bounds.clone(),
             stale_days: self.pr.stale_days,
             reruns: self.reruns,
+            review_pools: self.pr.review_pools.clone(),
             ..PollPolicy::default()
         };
         poll::Config {
@@ -1873,6 +1883,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         ignored: RefCell::default(),
         failed: BTreeMap::new(),
         direction: None,
+        reviewing: 0,
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
@@ -2151,6 +2162,10 @@ struct Scheduler<'a, C> {
     /// With [`Config::direction`], the operator's direction and its hash, read
     /// once a pass; none where it could not be trusted, which was reported.
     direction: Option<(String, String)>,
+    /// Stage 2's review runs started by earlier passes that still run
+    /// ([`poll::Outcome::reviewing`]): outside the caller's workflow, so
+    /// counted toward `wip` here rather than listed.
+    reviewing: usize,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2230,6 +2245,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.report.lines.extend(outcome.lines);
                 self.report.failures += outcome.errors;
                 self.report.state = Some(outcome.state);
+                self.reviewing = outcome.reviewing;
                 outcome.dispatched
             }
             Err(error) => {
@@ -2290,7 +2306,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let wip = config.wip as usize;
         let mut slots = Slots {
             wip,
-            earlier,
+            earlier: earlier + self.reviewing,
             mine: Vec::new(),
             busy,
             probes,

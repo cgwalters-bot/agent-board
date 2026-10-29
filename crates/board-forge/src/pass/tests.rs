@@ -6495,6 +6495,12 @@ fn config_table() {
     let names: Vec<&str> = ordered.pools.0.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["zeta", "alpha"]);
     assert_eq!(ordered.pools.0[0].1.target, DEFAULT_TARGET);
+    // Stage 2 starts reviews on the pools `pr.reviewPools` names.
+    let mut reviewed = minimal.clone();
+    reviewed["pr"] = json!({"reviewWorkflow": "review.yml", "reviewPools": ["b", "a"]});
+    let reviewed = Config::parse(&reviewed.to_string()).unwrap();
+    assert_eq!(reviewed.poll(None).policy.review_pools, ["b", "a"]);
+    assert!(parsed.poll(None).policy.review_pools.is_empty());
     let usage = json!({"url": "http://b.example/usage", "repository": "o/ops", "issue": 1});
     for (edit, error) in [
         (json!({"extra": 1}), "unknown field `extra`"),
@@ -6504,6 +6510,14 @@ fn config_table() {
             "config.pr.fixPools[0] is null",
         ),
         (json!({"pr": {"other": 1}}), "unknown field `other`"),
+        (
+            json!({"pr": {"reviewPools": ["a"]}}),
+            "pr reviewPools needs pr reviewWorkflow, the workflow it starts",
+        ),
+        (
+            json!({"pr": {"reviewWorkflow": "review.yml", "reviewPools": ["tier-1"]}}),
+            "pr pool \"tier-1\" is not a pool name",
+        ),
         (json!({"wip": 101}), "wip is not 0 to 100"),
         (
             json!({"wip": 1, "workRepositories": ["o/r"]}),
