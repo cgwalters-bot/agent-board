@@ -417,6 +417,12 @@ pub struct Config {
     pub direction: Option<DirectionAt>,
     /// None: no hold on spend.
     pub budget: Option<WeeklyBudget>,
+    /// List prices by model, which `agent-board cost` prices runs at.
+    #[serde(default)]
+    pub prices: crate::cost::Prices,
+    /// Off unless set: once a day, the last days' cost reports are
+    /// published to `epics.repository`'s data branch ([`crate::cost`]).
+    pub cost: Option<crate::cost::Publish>,
     /// The poll's response cache, which only an applying pass writes.
     pub state: Option<String>,
     #[serde(default)]
@@ -823,6 +829,10 @@ impl Config {
         }
         if let Some(starts) = &self.starts {
             starts.check(self)?;
+        }
+        crate::cost::check_prices(&self.prices)?;
+        if let Some(cost) = &self.cost {
+            cost.check(self)?;
         }
         if let Some(overlap) = &self.overlap {
             ensure!(
@@ -1844,6 +1854,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     report.tally.0.limit = config.wip;
     report.tally.1.mode = name;
     report.tally.1.revisited = config.revisit.as_ref().map(|_| None);
+    let unbudgeted = client;
     let client = Budget {
         inner: client,
         bounds,
@@ -1937,6 +1948,12 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // partial.
     if scheduler.holds_whole {
         scheduler.publish_holds();
+    }
+    // Last, within a request bound of its own and the pass's time bound: the
+    // cost reports, unless a rate limit stopped the pass.
+    if bounds.rate_limited.borrow().is_none() {
+        let within = (now, apply, bounds.admit_by);
+        cost::stage(unbudgeted, config, within, caps, &mut report);
     }
     report
 }
@@ -4557,6 +4574,7 @@ impl crate::github::GraphQl for Replay {
     }
 }
 
+mod cost;
 mod epics;
 pub mod holds;
 pub mod lease;

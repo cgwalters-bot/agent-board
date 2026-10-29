@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cost day v1",
+  "description": "One UTC day's agent runs and their cost at list prices, as agent-board cost prints it (docs/cost.md).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "date", "repositories", "totals", "by_kind", "by_model", "by_repository", "top_items", "unpriced", "runs", "unread"],
+  "properties": {
+    "schema": {"const": "agent-board/cost-day/v1"},
+    "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "repositories": {"type": "array", "items": {"$ref": "#/$defs/repo"}},
+    "totals": {"$ref": "#/$defs/group"},
+    "by_kind": {
+      "type": "object",
+      "propertyNames": {"enum": ["review", "implement", "triage", "fix", "planning", "supervisor", "other"]},
+      "additionalProperties": {"$ref": "#/$defs/group"}
+    },
+    "by_model": {"type": "object", "additionalProperties": {"$ref": "#/$defs/group"}},
+    "by_repository": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/repo"},
+      "additionalProperties": {"$ref": "#/$defs/group"}
+    },
+    "top_items": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "$ref": "#/$defs/fields",
+        "required": ["item"],
+        "properties": {"item": {"type": "string"}},
+        "unevaluatedProperties": false
+      }
+    },
+    "unpriced": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runs", "tokens"],
+        "properties": {"runs": {"$ref": "#/$defs/count"}, "tokens": {"$ref": "#/$defs/tokens"}}
+      }
+    },
+    "runs": {"type": "array", "items": {"$ref": "#/$defs/run"}},
+    "unread": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "url", "reason"],
+        "properties": {"id": {"$ref": "#/$defs/count"}, "url": {"type": "string"}, "reason": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "repo": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]{0,38}/[A-Za-z0-9_.-]{1,100}$"},
+    "count": {"type": "integer", "minimum": 0},
+    "usd": {"description": "US dollars at list prices; null where no run is priced, never 0 for an unpriced run.", "type": ["number", "null"], "minimum": 0},
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "output", "cache_read", "cache_write"],
+      "properties": {
+        "input": {"$ref": "#/$defs/count"},
+        "output": {"$ref": "#/$defs/count"},
+        "cache_read": {"$ref": "#/$defs/count"},
+        "cache_write": {"$ref": "#/$defs/count"}
+      }
+    },
+    "fields": {
+      "type": "object",
+      "required": ["runs", "tokens", "usd", "unpriced_runs"],
+      "properties": {
+        "runs": {"$ref": "#/$defs/count"},
+        "tokens": {"$ref": "#/$defs/tokens"},
+        "usd": {"$ref": "#/$defs/usd"},
+        "unpriced_runs": {"$ref": "#/$defs/count"}
+      }
+    },
+    "group": {"type": "object", "$ref": "#/$defs/fields", "unevaluatedProperties": false},
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "url", "kind", "repo", "item", "model", "tokens", "usd", "outcome", "duration_s"],
+      "properties": {
+        "id": {"$ref": "#/$defs/count"},
+        "url": {"type": "string"},
+        "kind": {"enum": ["review", "implement", "triage", "fix", "planning", "supervisor", "other"]},
+        "repo": {"$ref": "#/$defs/repo"},
+        "item": {"type": ["string", "null"], "maxLength": 200},
+        "model": {"type": "string", "maxLength": 200},
+        "tokens": {"$ref": "#/$defs/tokens"},
+        "usd": {"$ref": "#/$defs/usd"},
+        "outcome": {"type": ["string", "null"], "maxLength": 200},
+        "duration_s": {"type": ["number", "null"]}
+      }
+    }
+  }
+}

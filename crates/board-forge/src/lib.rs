@@ -10,6 +10,7 @@ pub mod broker;
 pub mod budget;
 pub mod caps;
 pub mod changes;
+pub mod cost;
 pub mod dispatch;
 pub mod epic;
 pub mod epic_apply;

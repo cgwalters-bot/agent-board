@@ -480,6 +480,9 @@ A pass captures one clock and performs these stages in order:
    its own fields, labels or state incomplete, or, for the fall back to Todo,
    runs that could not all be listed or an open issue's closing pull requests
    that could not all be read.
+6. With `cost`, from its hour each day, publish the last days' cost reports
+   that are not on `epics.repository`'s `data` branch yet, as one write step
+   within request bounds of its own (see [cost](cost.md#publishing)).
 
 The result names actions, holds, incomplete reads and failures, with a nonzero
 exit for an operational failure. Independent PRs may still be followed when an
@@ -1642,6 +1645,9 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |
+| `prices` | List prices by model, `{"MODEL": {"input", "cached_input", "output"}}` in dollars per million tokens (0–10000), which [`agent-board cost`](cost.md#prices) prices runs at; a model left out is unpriced, never $0; `{}` |
+| `cost.hourUtc` | The hour (0–23 UTC) from which the pass [publishes](cost.md#publishing) each of the last seven days' cost reports missing from `epics.repository`'s `data` branch; needs `epics`; section absent (off) |
+| `cost.cache` | A directory keeping each read run summary by run id; absent, none |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |

@@ -1,0 +1,41 @@
+{
+  "note": "GitHub's answers for one day's cost read, by request path, in the shape of the Actions REST API (fields not read are left out); artifacts holds each agent-run artifact's summary.json, which the tests pack into a zip.",
+  "responses": {
+    "repos/cgwalters-forge/agent-board/actions/runs?created=2026-10-28&status=completed&per_page=100&page=1": {
+      "total_count": 3,
+      "workflow_runs": [
+        {"id": 40812885249, "name": "review", "path": ".github/workflows/review.yml", "display_title": "Review cgwalters-forge/agent-board#440", "status": "completed", "conclusion": "success", "created_at": "2026-10-28T12:01:00Z", "html_url": "https://github.com/cgwalters-forge/agent-board/actions/runs/40812885249"},
+        {"id": 40812000001, "name": "ci", "path": ".github/workflows/ci.yml", "display_title": "pass: Start reviews itself", "status": "completed", "conclusion": "success", "created_at": "2026-10-28T10:00:00Z", "html_url": "https://github.com/cgwalters-forge/agent-board/actions/runs/40812000001"},
+        {"id": 40812000002, "name": "agent", "path": ".github/workflows/agent.yml", "display_title": "fix cgwalters-forge/agent-board#438 (openai)", "status": "completed", "conclusion": "failure", "created_at": "2026-10-28T08:55:00Z", "html_url": "https://github.com/cgwalters-forge/agent-board/actions/runs/40812000002"}
+      ]
+    },
+    "repos/cgwalters-forge/agent-board/actions/artifacts?name=agent-run&per_page=100&page=1": {
+      "total_count": 4,
+      "artifacts": [
+        {"id": 7003, "name": "agent-run", "size_in_bytes": 2048, "expired": false, "created_at": "2026-10-29T01:00:00Z", "workflow_run": {"id": 40899999999}},
+        {"id": 7001, "name": "agent-run", "size_in_bytes": 2048, "expired": false, "created_at": "2026-10-28T12:10:00Z", "workflow_run": {"id": 40812885249}},
+        {"id": 7002, "name": "agent-run", "size_in_bytes": 2048, "expired": true, "created_at": "2026-10-28T09:00:00Z", "workflow_run": {"id": 40812000002}},
+        {"id": 6999, "name": "agent-run", "size_in_bytes": 2048, "expired": false, "created_at": "2026-10-27T23:00:00Z", "workflow_run": {"id": 40800000000}}
+      ]
+    },
+    "repos/cgwalters-forge/tracker/actions/runs?created=2026-10-28&status=completed&per_page=100&page=1": {
+      "total_count": 2,
+      "workflow_runs": [
+        {"id": 40811000002, "name": "dispatch", "path": ".github/workflows/dispatch.yml", "display_title": "triage cgwalters-forge/tracker#900 (claude)", "status": "completed", "conclusion": "success", "created_at": "2026-10-28T07:00:00Z", "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/40811000002"},
+        {"id": 40811000001, "name": "dispatch", "path": ".github/workflows/dispatch.yml", "display_title": "implement cgwalters-forge/bootc#12 (claude)", "status": "completed", "conclusion": "success", "created_at": "2026-10-28T06:00:00Z", "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/40811000001"}
+      ]
+    },
+    "repos/cgwalters-forge/tracker/actions/artifacts?name=agent-run&per_page=100&page=1": {
+      "total_count": 2,
+      "artifacts": [
+        {"id": 8002, "name": "agent-run", "size_in_bytes": 1024, "expired": false, "created_at": "2026-10-28T07:20:00Z", "workflow_run": {"id": 40811000002}},
+        {"id": 8001, "name": "agent-run", "size_in_bytes": 1024, "expired": false, "created_at": "2026-10-28T06:40:00Z", "workflow_run": {"id": 40811000001}}
+      ]
+    }
+  },
+  "artifacts": {
+    "7001": {"model": "praxis/gpt-6.1-sol", "agent": "codex", "workflow": "review", "repo": "cgwalters-forge/agent-board", "item": 440, "duration_s": 412.5, "outcome": "success", "tokens": {"input": 344000, "output": 1800, "cache_read": 68000, "cache_write": 0}},
+    "8001": {"model": "anthropic/claude-x", "agent": "claude", "workflow": "dispatch", "repo": "cgwalters-forge/bootc", "item": 12, "duration_s": 1800, "outcome": "success", "tokens": {"input": 100000, "output": 20000, "cache_read": 400000, "cache_write": 50000}},
+    "8002": {"model": "anthropic/claude-x", "agent": "claude", "workflow": "dispatch", "repo": "cgwalters-forge/tracker", "item": "cgwalters-forge/tracker#900", "duration_s": 95, "outcome": "success", "tokens": {"input": 20000, "output": 2000, "cache_read": 0}}
+  }
+}

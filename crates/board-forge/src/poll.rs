@@ -888,6 +888,11 @@ pub trait Rest {
     /// A write, or a GET whose 404 is an answer; any status comes back,
     /// for the caller to judge.
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)>;
+    /// The bytes of a GET the API answers with a redirect off itself, such
+    /// as an artifact's zip, at most `limit`; only the live client has it.
+    fn download(&self, url: &str, _limit: u64) -> Result<Vec<u8>> {
+        bail!("GET {url}: this client downloads nothing")
+    }
 }
 
 /// The `rel="next"` URL of a `Link` header.
