@@ -2847,6 +2847,8 @@ pub(super) mod tests {
                 envelope: None,
                 caps: None,
                 writes: 0,
+                review_runs: BTreeMap::new(),
+                reviewing: 0,
             };
             let events = "repos/upstream/app/issues/7/events?per_page=100";
             fake.page(

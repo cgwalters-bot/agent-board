@@ -648,6 +648,7 @@ impl PollPolicy {
             .cloned(),
         );
         pools.extend(expand(&self.tiers, fix_pools));
+        pools.extend(expand(&self.tiers, &self.review_pools));
         pools
     }
 

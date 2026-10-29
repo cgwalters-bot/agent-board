@@ -751,7 +751,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     runs,
                     Slots {
                         wip: self.config.wip as usize,
-                        earlier,
+                        earlier: earlier + self.reviewing,
                         mine: Vec::new(),
                         busy,
                         probes: BTreeMap::new(),

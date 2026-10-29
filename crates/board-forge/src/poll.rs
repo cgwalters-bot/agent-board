@@ -76,6 +76,9 @@ const ACTIONS_BOT_ID: u64 = 41898282;
 const RUN_MARKER: &str = "<!-- gh-aw-agentic-workflow: ";
 /// The event the review job's verdict must come from; see [`review_run_matches`].
 const REVIEW_EVENT: &str = "pull_request_target";
+/// The event of the review job's runs the pass starts itself, with
+/// [`PollPolicy::review_pools`]; see [`reviews_head`].
+const DISPATCH_EVENT: &str = "workflow_dispatch";
 /// Where a repository's workflows are, as a run's `path` gives them.
 const WORKFLOWS_DIR: &str = ".github/workflows/";
 /// The connections of `PULL_QUERY` the decision reads as whole. One that is not
@@ -205,6 +208,11 @@ const CHECK_RERUN_START_SECONDS: i64 = 10 * 60;
 const REVIEW_RUN_READS: u64 = 10;
 /// The step that re-runs the review job's failed run ([`Pass::review_rerun`]).
 const REVIEW_RERUN: &str = "review rerun";
+/// The step that starts the review job for a head ([`Pass::review_start`]).
+const REVIEW: &str = "review";
+/// The review job's runs the pass started, read newest first since the start
+/// of the previous day (UTC), one page: a head with none of them is due one.
+const REVIEW_DISPATCH_READS: u64 = 100;
 
 const CHECK_RERUN: &str = "check rerun";
 
@@ -478,6 +486,11 @@ pub struct PollPolicy {
     /// of a round's failed run or the review job's run with no review, run
     /// once more before a person is asked. Off by default.
     pub reruns: bool,
+    /// The pass's `pr.reviewPools`: the pass starts the review job for a
+    /// head that has no run of it, paced on these pools, and the runs it
+    /// started count as the job's ([`reviews_head`]). Empty (the default)
+    /// leaves reviews to the job's own `pull_request_target` runs.
+    pub review_pools: Vec<String>,
 }
 
 /// `brokerOutage`: the open or recently closed issues labelled `outage` in
@@ -763,6 +776,7 @@ impl PollPolicy {
             // The pass's only.
             stale_days: 0,
             reruns: false,
+            review_pools: Vec::new(),
         })
     }
 
@@ -1411,6 +1425,10 @@ pub fn review_run_id(pull: &Value, config: &Config) -> Option<u64> {
 /// A verdict and the review that gave it.
 type Verdict<'a> = Option<(Review, &'a Value)>;
 
+/// A step for a head waiting for its review, and with a review rerun, the
+/// run and the pool it ran on where its title names one.
+type ReviewStep = (Decision, Option<(u64, Option<String>)>);
+
 /// The operator's newest verdict on the head, and the review job's where it
 /// may count, before its run is checked.
 fn verdicts<'a>(pull: &'a Value, config: &Config) -> (Verdict<'a>, Verdict<'a>) {
@@ -1477,22 +1495,66 @@ fn cited_run(body: &str) -> Option<(&str, u64)> {
 /// request with this head. They are trusted with the verdict, as is whoever
 /// can change what the workflow calls.
 fn review_run_matches(pull: &Value, review: &Value, run: Option<&Value>, config: &Config) -> bool {
-    let (Some(run), Some(workflow)) = (run, &config.review_workflow) else {
+    let Some(run) = run else {
         return false;
     };
-    let head = text(pull, "/headRefOid");
     let base = text(pull, "/baseRepository/nameWithOwner");
     cited_run(text(review, "/body")).is_some_and(|(repo, id)| {
-        !head.is_empty()
-            && repo == base
+        repo == base
             && run["id"].as_u64() == Some(id)
-            && text(run, "/repository/full_name") == base
-            && text(run, "/path") == format!("{WORKFLOWS_DIR}{workflow}")
-            && text(run, "/event") == REVIEW_EVENT
-            && text(run, "/head_sha") == head
+            && reviews_head(pull, run, config)
             && run["status"] == "completed"
             && within(review, run)
     })
+}
+
+/// Whether `run`, read from the base repository, is the configured review
+/// workflow's run for the pull request's head ([`review_run_matches`]): on
+/// `pull_request_target` for the head, or, only with
+/// [`PollPolicy::review_pools`], one the pass started ([`Pass::review_start`]).
+/// A dispatched run gives the branch it ran from as its `head_sha`, so it
+/// must have run from the base repository's default branch (or a tag of its
+/// name, which whoever can push the branch can push), and its title must
+/// name the pull request and head
+/// ([`review_title`]), which the workflow's `run-name` takes from the inputs
+/// the pass gave it. Whoever can dispatch it can write to the repository, and
+/// is trusted with the verdict as above.
+fn reviews_head(pull: &Value, run: &Value, config: &Config) -> bool {
+    let Some(workflow) = &config.review_workflow else {
+        return false;
+    };
+    let head = text(pull, "/headRefOid");
+    let default = text(pull, "/baseRepository/defaultBranchRef/name");
+    let for_head = match text(run, "/event") {
+        REVIEW_EVENT => text(run, "/head_sha") == head,
+        DISPATCH_EVENT => {
+            let title = review_title(pull);
+            let named = text(run, "/display_title");
+            !config.policy.review_pools.is_empty()
+                && !default.is_empty()
+                && text(run, "/head_branch") == default
+                && named
+                    .strip_prefix(&title)
+                    .is_some_and(|pool| pool.is_empty() || pool.starts_with(" ("))
+        }
+        _ => false,
+    };
+    !head.is_empty()
+        && for_head
+        && text(run, "/repository/full_name") == text(pull, "/baseRepository/nameWithOwner")
+        && text(run, "/path") == format!("{WORKFLOWS_DIR}{workflow}")
+}
+
+/// `review OWNER/REPO#N HEAD`, the title (`run-name`) of the review job's run
+/// that the pass starts for the pull request's head, which the workflow may
+/// follow with ` (POOL)`.
+fn review_title(pull: &Value) -> String {
+    format!(
+        "{REVIEW} {}#{} {}",
+        text(pull, "/baseRepository/nameWithOwner"),
+        pull["number"].as_u64().unwrap_or_default(),
+        text(pull, "/headRefOid")
+    )
 }
 
 /// Whether `review` was submitted between the start of `run`'s latest attempt
@@ -2539,7 +2601,7 @@ pub struct Decision {
 fn step_kind(action: &str) -> Option<Kind> {
     match action {
         "skip" | "wait" => None,
-        "fix" | "continue" | "rebase" | "answer" | RUN_RERUN => Some(Kind::Dispatch),
+        "fix" | "continue" | "rebase" | "answer" | RUN_RERUN | REVIEW => Some(Kind::Dispatch),
         // merge, update, refund, needs-human, retitle and a review rerun.
         _ => Some(Kind::Write),
     }
@@ -3062,6 +3124,8 @@ fn slim_run(run: &Value) -> Value {
         "path": run["path"],
         "event": run["event"],
         "head_sha": run["head_sha"],
+        "head_branch": run["head_branch"],
+        "display_title": run["display_title"],
         "status": run["status"],
         "run_started_at": run["run_started_at"],
         "updated_at": run["updated_at"],
@@ -3140,6 +3204,9 @@ pub struct Outcome {
     pub in_flight: usize,
     /// The runs this pass started, which a caller counts against its capacity.
     pub dispatched: usize,
+    /// The review job's runs an earlier pass started that still run, outside
+    /// the caller's workflow, which a caller counts against its capacity too.
+    pub reviewing: usize,
     /// The state to keep for the next pass; its interval is the next gap.
     pub state: State,
 }
@@ -3175,6 +3242,11 @@ struct Pass<'a, R, G> {
     caps: Option<&'a caps::Caps>,
     /// Writes sent, or tried, so far: whether a step wrote anything.
     writes: usize,
+    /// The review job's runs the pass started, by repository, read once a
+    /// pass ([`Pass::review_start`]); none where they were not all read.
+    review_runs: BTreeMap<String, Option<Vec<Value>>>,
+    /// See [`Outcome::reviewing`].
+    reviewing: usize,
 }
 
 /// A merge queue entry: its number and the files it changes, if all were read.
@@ -4158,12 +4230,27 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         );
         let list = self.get_url(&url, slim_runs, false)?.0;
         let runs = nodes(&list, "/workflow_runs");
+        // A full read may leave out an older run that was re-run.
+        let whole = (runs.len() as u64) < REVIEW_RUN_READS;
+        self.review_rerun_of(repo, pull, runs, whole)
+    }
+
+    /// [`Pass::review_rerun`] of the head's runs `runs`, newest first, all
+    /// of them where `whole`.
+    fn review_rerun_of(
+        &self,
+        repo: &str,
+        pull: &Value,
+        runs: &[Value],
+        whole: bool,
+    ) -> Result<Option<(Decision, u64)>> {
+        let head = text(pull, "/headRefOid");
         let Some(run) = runs.first() else {
             return Ok(None);
         };
         let rerun_before = runs
             .iter()
-            .any(|r| text(r, "/head_sha") == head && r["run_attempt"].as_u64() != Some(1));
+            .any(|r| reviews_head(pull, r, self.config) && r["run_attempt"].as_u64() != Some(1));
         let conclusion = text(run, "/conclusion");
         let id = run["id"].as_u64().context("review run has no id")?;
         let cited = nodes(pull, "/reviews/nodes").iter().any(|r| {
@@ -4176,12 +4263,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .zip(timestamp(run["created_at"].as_str()))
                 .is_some_and(|(changed, created)| created > changed),
         };
-        if head.is_empty()
-            || run["status"] != "completed"
+        if run["status"] != "completed"
             || !REVIEW_RERUN_CONCLUSIONS.contains(&conclusion)
-            || text(run, "/head_sha") != head
-            || text(run, "/repository/full_name") != repo
-            || text(run, "/path") != format!("{WORKFLOWS_DIR}{workflow}")
+            || !reviews_head(pull, run, self.config)
             || cited
             || !since_base
         {
@@ -4189,8 +4273,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let url = format!("https://github.com/{repo}/actions/runs/{id}");
         let ended = format!("the review job's run {url} ended ({conclusion})");
-        // A full read may leave out an older run that was re-run.
-        let unread = runs.len() as u64 >= REVIEW_RUN_READS;
+        let unread = !whole;
         let window = rerun_window(self.now, run);
         let decision = if rerun_before {
             step(
@@ -4217,6 +4300,118 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok(None);
         };
         Ok(Some((decision, id)))
+    }
+
+    /// With [`PollPolicy::review_pools`], for the bot's `pull` that waits for
+    /// a review ([`NO_REVIEW`]): the step for its head among the review job's
+    /// runs the pass started ([`reviews_head`]). With none, the job starts
+    /// ([`REVIEW`]); while the newest runs, the head waits for it, which is
+    /// counted in flight; one that ended with no review is re-run once with
+    /// [`PollPolicy::reruns`] ([`Pass::review_rerun`]), and its run and the
+    /// pool its title names come with the step. None leaves the wait as it
+    /// is. Where the runs were not all read, the head waits rather than get
+    /// a second review. A head still without a verdict once its run is older
+    /// than the read gets another. In a repository not known to be public
+    /// the job's verdict never counts ([`verdicts`]), so none is started.
+    fn review_dispatch(&mut self, repo: &str, pull: &Value) -> Result<Option<ReviewStep>> {
+        let Some(workflow) = self.config.review_workflow.clone() else {
+            return Ok(None);
+        };
+        if pull["baseRepository"]["isPrivate"] != false {
+            return Ok(None);
+        }
+        let runs = match self.review_runs.get(repo) {
+            Some(runs) => runs.clone(),
+            None => {
+                let since = (self.now - time::Duration::days(1)).date();
+                let url = format!(
+                    "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?event={DISPATCH_EVENT}&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"
+                );
+                let (list, next) = self.get_url(&url, slim_runs, false)?;
+                let runs = next
+                    .is_none()
+                    .then(|| nodes(&list, "/workflow_runs").to_vec());
+                self.review_runs.insert(repo.to_owned(), runs.clone());
+                runs
+            }
+        };
+        let Some(runs) = runs else {
+            let why = format!(
+                "{NO_REVIEW}, and the review job has more runs since yesterday than the {REVIEW_DISPATCH_READS} read"
+            );
+            return Ok(Some((step("wait", why), None)));
+        };
+        let mine: Vec<Value> = runs
+            .into_iter()
+            .filter(|r| reviews_head(pull, r, self.config))
+            .collect();
+        let Some(newest) = mine.first() else {
+            let why = "no run of the review job for the head, so it starts";
+            return Ok(Some((step(REVIEW, why), None)));
+        };
+        let id = newest["id"].as_u64().context("review run has no id")?;
+        if newest["status"] != "completed" {
+            self.reviewing += 1;
+            let why = format!(
+                "the review job's run https://github.com/{repo}/actions/runs/{id} reviews the head"
+            );
+            return Ok(Some((step("wait", why), None)));
+        }
+        if !self.config.policy.reruns {
+            return Ok(None);
+        }
+        let pool = text(newest, "/display_title")
+            .strip_prefix(&review_title(pull))
+            .and_then(|p| p.strip_prefix(" (")?.strip_suffix(')'))
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned);
+        Ok(self
+            .review_rerun_of(repo, pull, &mine, true)?
+            .map(|(step, id)| (step, Some((id, pool)))))
+    }
+
+    /// Starts the review job of `pull`'s head as the bot, from the base
+    /// repository's default branch, on a pool paced among
+    /// [`PollPolicy::review_pools`] as a fix round's is among its pools, and
+    /// within the poll's [`POLL_DISPATCH_LIMIT`]. The workflow's `run-name`
+    /// gives the run [`review_title`], by which later passes find it.
+    fn review_start(&mut self, repo: &str, pull: &Value) -> Result<String> {
+        let workflow = (self.config.review_workflow.clone())
+            .context("a review start without a review workflow")?;
+        if self.dispatched >= POLL_DISPATCH_LIMIT {
+            return Ok(format!(
+                "not started: this pass started {POLL_DISPATCH_LIMIT} runs already"
+            ));
+        }
+        let policy = &self.config.policy;
+        let pools = pace::expand(&policy.tiers, &policy.review_pools);
+        let pool = match self.paced(pools.first().cloned(), &pools) {
+            Ok(Some(pool)) => pool,
+            Ok(None) => bail!("no review pool"),
+            Err(why) => return Ok(format!("not started: {why}")),
+        };
+        let number = pull["number"]
+            .as_u64()
+            .context("pull request has no number")?;
+        let default = text(pull, "/baseRepository/defaultBranchRef/name");
+        ensure!(
+            !default.is_empty(),
+            "the default branch of {repo} was not read"
+        );
+        let inputs =
+            json!({"pr": number.to_string(), "head": text(pull, "/headRefOid"), "pool": pool});
+        // Counted once asked for, whatever follows: an answer lost on the
+        // way may still have started it.
+        self.dispatched += 1;
+        let rest = self.rest;
+        self.send(
+            rest,
+            "POST",
+            &format!("repos/{repo}/actions/workflows/{workflow}/dispatches"),
+            json!({"ref": default, "inputs": inputs}),
+            0,
+        )?;
+        Ok(format!("started on {pool}"))
     }
 
     /// Runs the failed jobs of `repo`'s run `id` once more as `client`, paced
@@ -5164,15 +5359,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         // Read only where the head waits for its review and nothing else.
         let mut review_rerun = None;
-        if self.config.policy.reruns
-            && !merge_only
+        let unreviewed = !merge_only
             && retarget.is_none()
             && decision.action == "wait"
             && decision.reason == NO_REVIEW
-            && is_harness(&pull, &self.config.bot)
-            && let Some((step, run)) = self.review_rerun(repo, &pull)?
-        {
-            review_rerun = Some(run);
+            && is_harness(&pull, &self.config.bot);
+        let review_step = if unreviewed && !self.config.policy.review_pools.is_empty() {
+            self.review_dispatch(repo, &pull)?
+        } else if unreviewed && self.config.policy.reruns {
+            self.review_rerun(repo, &pull)?
+                .map(|(step, run)| (step, Some((run, None))))
+        } else {
+            None
+        };
+        if let Some((step, run)) = review_step {
+            review_rerun = run;
             decision = Decision {
                 queue: decision.queue.take(),
                 ..step
@@ -5307,9 +5508,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             // The review job runs in the pull request's repository, and the
             // round's run in the caller's, as each was started.
             (Some(apply), None, _) if decision.action == REVIEW_RERUN => {
-                let (rest, fix) = (self.rest, apply.pools.clone());
-                let run = review_rerun.context("a review rerun without its run")?;
-                self.rerun(rest, (repo, run), None, &fix).map(Some)
+                let reviews = &self.config.policy.review_pools;
+                let pools = if reviews.is_empty() {
+                    &apply.pools
+                } else {
+                    reviews
+                };
+                let (rest, pools) = (self.rest, pools.clone());
+                let (run, pool) = review_rerun.context("a review rerun without its run")?;
+                self.rerun(rest, (repo, run), pool, &pools).map(Some)
+            }
+            (Some(_), None, _) if decision.action == REVIEW => {
+                self.review_start(repo, &pull).map(Some)
             }
             (Some(_), None, _) if decision.action == CHECK_RERUN => self
                 .rerun_checks(repo, &pull, &marker, &comments, &check_reruns)
@@ -5350,7 +5560,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
         let line = if action == "merge" && reason.starts_with("approved by the operator at ") {
             format!("merge {repo}#{number}: {reason}{done}")
-        } else if matches!(action, REVIEW_RERUN | RUN_RERUN | CHECK_RERUN) {
+        } else if matches!(action, REVIEW | REVIEW_RERUN | RUN_RERUN | CHECK_RERUN) {
             format!("{action} {repo}#{number} {}: {reason}{done}", short(head))
         } else {
             format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
@@ -5521,6 +5731,8 @@ pub fn run_capped<R: Rest, G: Transport>(
         envelope: None,
         caps,
         writes: 0,
+        review_runs: BTreeMap::new(),
+        reviewing: 0,
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -5648,6 +5860,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         state.interval_seconds
     };
     outcome.dispatched = pass.dispatched;
+    outcome.reviewing = pass.reviewing;
     outcome.state = State {
         interval_seconds: next_interval(previous, active),
         responses: pass.used,
@@ -8076,6 +8289,84 @@ mod tests {
             );
             assert_eq!(got.action, action, "{name}: {}", got.reason);
         }
+        // A run the pass started (`reviewPools`): from the default branch,
+        // so its `head_sha` is that branch's, and named for the head by its
+        // title.
+        let title = format!("review {REPO}#470 {HEAD}");
+        for (name, pools, run, action) in [
+            (
+                "the pass's run of the head merges",
+                true,
+                json!({}),
+                "merge",
+            ),
+            (
+                "so does one whose title names no pool",
+                true,
+                json!({"display_title": title}),
+                "merge",
+            ),
+            (
+                "without reviewPools it does not count",
+                false,
+                json!({}),
+                "wait",
+            ),
+            (
+                "a run from another branch",
+                true,
+                json!({"head_branch": "other"}),
+                "wait",
+            ),
+            (
+                "a run of an older head",
+                true,
+                json!({"display_title": format!("review {REPO}#470 {} (claude)", "f".repeat(40))}),
+                "wait",
+            ),
+            (
+                "a run of another pull request with the head",
+                true,
+                json!({"display_title": format!("review {REPO}#47 {HEAD} (claude)")}),
+                "wait",
+            ),
+            (
+                "a title that only starts with the head",
+                true,
+                json!({"display_title": format!("{title}0 (claude)")}),
+                "wait",
+            ),
+            (
+                "a run of another workflow",
+                true,
+                json!({"path": ".github/workflows/triage.yml"}),
+                "wait",
+            ),
+        ] {
+            let mut job = job_run(&HEAD.into());
+            job["event"] = DISPATCH_EVENT.into();
+            job["head_sha"] = "a".repeat(40).into();
+            job["head_branch"] = "main".into();
+            job["display_title"] = format!("{title} (claude)").into();
+            for (field, value) in run.as_object().unwrap() {
+                job[field] = value.clone();
+            }
+            let mut config = config();
+            if pools {
+                config.policy.review_pools = vec!["claude".into()];
+            }
+            let p = pull("pull-470", json!({}));
+            let got = decide(
+                &config,
+                &p,
+                &classify_checks(&p, &required()),
+                &Marker::default(),
+                (None, Some(&job)),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!(got.action, action, "{name}: {}", got.reason);
+        }
         // A pass reads the run only where the job's verdict could count.
         for (change, read) in [
             (json!({}), Some(REVIEW_RUN)),
@@ -8825,7 +9116,10 @@ mod tests {
         // The review job's run keeps only what its check reads.
         let run =
             &first.state.responses[&format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}")];
-        assert_eq!(run["body"], job_run(&HEAD.into()));
+        let mut kept = job_run(&HEAD.into());
+        kept["head_branch"] = "dispatch/implement/agent-run-38180063797".into();
+        kept["display_title"] = Value::Null;
+        assert_eq!(run["body"], kept);
         // Events keep only what the pass reads.
         let events = &first.state.responses[&format!("{API_ROOT}repos/{REPO}/events?per_page=100")];
         assert_eq!(
@@ -10902,6 +11196,187 @@ mod tests {
             written(&dispatcher.writes),
             ["POST repos/cgwalters-forge/tracker/actions/runs/7/rerun-failed-jobs"]
         );
+    }
+
+    #[test]
+    fn the_pass_starts_a_review_of_a_head_with_no_run() {
+        let head = text(&fixture("pull-470"), "/headRefOid").to_owned();
+        let runs = format!(
+            "repos/{REPO}/actions/workflows/review.yml/runs?event=workflow_dispatch&created=%3E%3D2026-10-11&per_page={REVIEW_DISPATCH_READS}"
+        );
+        let title = format!("review {REPO}#470 {head}");
+        let start = |done: &str| {
+            format!(
+                "review {REPO}#470 {}: no run of the review job for the head, so it starts -> {done}",
+                short(&head)
+            )
+        };
+        let dispatch = format!("POST repos/{REPO}/actions/workflows/review.yml/dispatches");
+        let rerun = format!("POST repos/{REPO}/actions/runs/77/rerun-failed-jobs");
+        let wait = |why: &str| format!("{REPO}#470 {} wait: {why}", short(&head));
+        let held = "not started: every pool is held (claude until 2026-10-14T21:12Z, openai until 2026-10-13T14:40Z)";
+        // A pool `passed` hours into a week, having used `used` percent of it.
+        let pool = |used: f64, passed: i64| {
+            let resets = now() + time::Duration::hours(7 * 24 - passed);
+            json!({"used_percent": used, "window_minutes": 7 * 24 * 60,
+                "resets_at": resets.format(&Rfc3339).unwrap()})
+        };
+        #[rustfmt::skip]
+        // Name, `reruns`, the dispatched runs listed, newest first, each as
+        // its fields changed (`unread`: more than a page), the pools' usage
+        // (null: not paced), then the line, the writes and the review runs
+        // counted in flight.
+        type Case<'a> = (&'a str, bool, Value, Value, String, Vec<String>, usize);
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            ("a head with no run gets one", false, json!([]), Value::Null, start("started on claude"), vec![dispatch.clone()], 0),
+            ("so does one whose run is of an older head", false, json!([{"display_title": format!("review {REPO}#470 {}", "f".repeat(40))}]),
+                Value::Null, start("started on claude"), vec![dispatch.clone()], 0),
+            ("or of another pull request", false, json!([{"display_title": format!("review {REPO}#47 {head}")}]),
+                Value::Null, start("started on claude"), vec![dispatch.clone()], 0),
+            ("or from another branch", false, json!([{"head_branch": "other"}]), Value::Null, start("started on claude"), vec![dispatch.clone()], 0),
+            ("a held pool sends it to the other", false, json!([]), json!({"claude": pool(90.0, 84), "openai": pool(10.0, 84)}),
+                start("started on openai"), vec![dispatch.clone()], 0),
+            ("every pool held, it waits", false, json!([]), json!({"claude": pool(90.0, 84), "openai": pool(26.0, 7)}),
+                start(held), vec![], 0),
+            ("a run still reviewing is waited on and counted", false, json!([{"status": "in_progress", "conclusion": null}]), Value::Null,
+                wait(&format!("the review job's run https://github.com/{REPO}/actions/runs/77 reviews the head")), vec![], 1),
+            ("a run that ended is not started again", false, json!([{"conclusion": "success"}]), Value::Null, wait(NO_REVIEW), vec![], 0),
+            ("a failed one waits without reruns", false, json!([{}]), Value::Null, wait(NO_REVIEW), vec![], 0),
+            ("and is re-run once with them", true, json!([{}]), Value::Null,
+                format!("review rerun {REPO}#470 {}: the review job's run https://github.com/{REPO}/actions/runs/77 ended (failure) with no review of the head, so its failed jobs run once more -> re-run", short(&head)),
+                vec![rerun], 0),
+            ("runs not all read start none", false, json!("unread"), Value::Null,
+                wait(&format!("{NO_REVIEW}, and the review job has more runs since yesterday than the {REVIEW_DISPATCH_READS} read")), vec![], 0),
+        ];
+        for (name, reruns, listed, usage, line, writes, reviewing) in cases {
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"reviews": {"nodes": []}})));
+            let base = json!({"id": 77, "path": ".github/workflows/review.yml", "event": "workflow_dispatch",
+                "head_sha": "a".repeat(40), "head_branch": "main", "display_title": format!("{title} (claude)"),
+                "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                "created_at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:30:00Z",
+                "repository": {"full_name": REPO}});
+            let listed: Vec<Value> = match &listed {
+                Value::Array(changes) => changes
+                    .iter()
+                    .map(|fields| {
+                        let mut run = base.clone();
+                        for (key, value) in fields.as_object().unwrap() {
+                            run[key] = value.clone();
+                        }
+                        run
+                    })
+                    .collect(),
+                _ => vec![base.clone()],
+            };
+            fake.page(&runs, None, None, json!({"workflow_runs": listed}));
+            if name.starts_with("runs not all read") {
+                let url = format!("{API_ROOT}{runs}");
+                fake.rest.get_mut(&url).unwrap().2 = Some(format!("{url}&page=2"));
+            }
+            let mut cfg = config();
+            cfg.policy.reruns = reruns;
+            cfg.policy.review_pools = vec!["claude".into(), "openai".into()];
+            if !usage.is_null() {
+                let updated = (now() - time::Duration::minutes(1))
+                    .format(&Rfc3339)
+                    .unwrap();
+                let snapshot =
+                    json!({"schema": "bot-usage/v1", "updated_at": updated, "pools": usage});
+                fake.page(
+                    "repos/o/ops/issues/1/comments?per_page=100",
+                    None,
+                    None,
+                    json!([{"user": {"login": BOT}, "body": format!("<!-- bot-usage v1 -->\n```json\n{snapshot}\n```\n")}]),
+                );
+                cfg.policy.pace = pace::Pace::from_json(Some(
+                    &json!({"repository": "o/ops", "issue": 1, "bot": BOT}),
+                ))
+                .unwrap();
+            }
+            let dispatcher = Fake::default();
+            let follow = [REPO.to_owned()];
+            let outcome = crate::pool_choice::with_index(0, || {
+                run_capped(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    (&[], &follow),
+                    applying(&dispatcher),
+                    None,
+                    now(),
+                )
+            })
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            assert!(outcome.lines.contains(&line), "{name}: {:?}", outcome.lines);
+            assert_eq!(written(&fake.writes), writes, "{name}");
+            assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            assert_eq!(outcome.reviewing, reviewing, "{name}");
+            let started = writes.iter().any(|w| w.ends_with("/dispatches"));
+            assert_eq!(outcome.dispatched, usize::from(started), "{name}");
+            if started {
+                let pool = if line.ends_with("openai") {
+                    "openai"
+                } else {
+                    "claude"
+                };
+                assert_eq!(
+                    fake.writes.borrow()[0].1,
+                    json!({"ref": "main", "inputs": {"pr": "470", "head": head, "pool": pool}}),
+                    "{name}"
+                );
+            }
+        }
+        // A preview says the step and starts nothing; without reviewPools,
+        // or where the job's verdict could not count, the dispatched runs
+        // are not read at all.
+        // (reviewPools set, a private repository, whether a review is due)
+        for (pools, private, due) in [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let mut fake = github();
+            let mut change = json!({"reviews": {"nodes": []}});
+            if private {
+                change["baseRepository"] = json!({"nameWithOwner": REPO, "isPrivate": true,
+                    "defaultBranchRef": {"name": "main"}});
+            }
+            fake.pulls.insert(470, pull("pull-470", change));
+            fake.page(&runs, None, None, json!({"workflow_runs": []}));
+            let mut cfg = config();
+            if pools {
+                cfg.policy.review_pools = vec!["claude".into()];
+            }
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                None,
+                now(),
+            )
+            .unwrap();
+            let expected = if due {
+                start("").trim_end_matches(" -> ").to_owned()
+            } else {
+                wait(NO_REVIEW)
+            };
+            assert_eq!(outcome.lines.last().unwrap(), &expected);
+            assert!(fake.writes.borrow().is_empty());
+            let read = fake
+                .sent
+                .borrow()
+                .iter()
+                .any(|(url, _)| url.contains("event=workflow_dispatch"));
+            assert_eq!(read, due);
+        }
     }
 
     #[test]
@@ -13904,6 +14379,8 @@ mod tests {
             envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),
             caps: None,
             writes: 0,
+            review_runs: BTreeMap::new(),
+            reviewing: 0,
         };
         let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();

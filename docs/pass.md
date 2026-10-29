@@ -385,7 +385,7 @@ check and apply; that boundary is for what agents produce. Their guards are
 preview by default, caps per pass, and the replay gate below. The caps are
 two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
 starts, stage 2's fix, rebase, continuation and answer rounds and their
-reruns, stage 3's planning run and stage 4's starts and reruns together, and `--max-writes N` bounds its
+reruns and its [review](#reviews) starts, stage 3's planning run and stage 4's starts and reruns together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
 1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues,
 merges, branch updates, review reruns and required-check reruns, stage 3's
@@ -518,7 +518,9 @@ ranked parent. Priority is the only readiness ordering; there is no Ready step.
 
 `wip` is the total cap on noncompleted caller-workflow runs, including queued,
 waiting, planning, triage, implement, review and fix runs. Include starts earlier
-in this pass even if the API has not listed them. A pre-existing excess is not
+in this pass even if the API has not listed them. With `pr.reviewPools`,
+the review job's runs the pass started in the followed repositories count
+while they run and their head waits for them ([reviews](#reviews)). A pre-existing excess is not
 cancelled; it leaves no new slots. PR repair retains its own existing bounds;
 if it consumes/exceeds WIP, later stages start nothing. No planning exemption.
 GitHub can leave a run `in_progress` after every job has completed
@@ -910,7 +912,8 @@ cancelled too.
   already, it is `needs-human: the review job's run URL ended (failure) again
   after a rerun, …`, and where ten were read, so that an older one re-run may
   have been left out, `needs-human: … which has more runs than the 10 read
-  for an earlier rerun; …`.
+  for an earlier rerun; …`. With `pr.reviewPools` it takes the runs the
+  pass started instead ([reviews](#reviews)).
 * **Required checks, stage 2 (agent-board#413).** Before spending a fix round
   or stopping the bot's pull request from its fork, rerun the Actions runs
   named by its failed checks once per head. This uses the existing failed-check
@@ -977,6 +980,71 @@ became main; …, so it is rebased onto main -> brought up to date with
 main; …`, one write step, one pull request a base each pass), whose push asks
 the review job for a review against the new base. A conflict is a rebase or
 fix round as before; a head not behind still goes to `needs-human`.
+
+## Reviews
+
+The review job starts on every `pull_request_target` push, on the model the
+repository's variables fix, out of sight of the pass's pacing, pools and
+WIP: on 28 October about 95 reviews took a subscription to 79% of its weekly
+limit with six days left (agent-board#439). With `pr.reviewPools` (off
+unless set), stage 2 starts reviews itself.
+
+For the bot's pull request from its fork into a public repository, the only
+one whose review job's verdict counts, whose head waits with no verdict
+(`wait: no approving review of the head yet`), the pass reads the
+`pr.reviewWorkflow` runs on `workflow_dispatch` in its repository created
+since the start of the previous day (UTC), one page of 100, one request a
+repository a pass, and keeps those whose title is `review OWNER/REPO#N HEAD`
+for the current head, optionally followed by ` (POOL)`. With none, it starts
+one as the bot from the repository's default branch, with the inputs `pr`,
+`head` and `pool`:
+`review OWNER/REPO#N SHA: no run of the review job for the head, so it
+starts -> started on POOL`. The pool is chosen among `pr.reviewPools` as a
+fix round's is among `pr.fixPools`, by stage 1's reading; where every pool
+is held the line ends `-> not started: every pool is held (…)` and the head
+waits for a later pass. A start is a dispatch within `--max-dispatch` and the
+poll's three a pass, is counted in the tally, and takes a WIP slot from
+stages 3 and 4. A run in flight (`wait: the review job's run URL reviews the
+head`) keeps its slot on later passes while its head waits so: stage 4
+lists only the caller's workflow, so stage 2 counts it. A run that ended with no review is not
+started again; with `reruns` its failed jobs run once more as
+[above](#reruns), paced on the pool its title names, else on
+`pr.reviewPools`, a write step as before. Where the runs fill more than a
+page the head waits, rather than get a second review. A head still without
+a verdict once its run is older than the read, 24 to 48 hours, gets
+another. Heads are started in stage 2's order, by
+repository and number; Priority does not order them yet.
+
+The pass starts only the head it has just read. A later push leaves that
+run reviewing a superseded head, whose verdict counts for nothing; the
+workflow stops it (below). The merge rule's checks stay as they are: the
+approval must be the review job's, at the head, citing its run and submitted
+while that run ran. A `workflow_dispatch` run counts in place of a
+`pull_request_target` one only with `pr.reviewPools`, only where its
+`head_branch` is the repository's default branch (a tag of that name passes
+too; whoever can push one can push the branch), and only where its title
+names the pull request and the head. The title is the
+workflow's `run-name`, made from the inputs; whoever can dispatch the
+workflow can write to the repository, and is already trusted with the
+verdict ([poll](poll.md)).
+
+The callers turn it on, together (cgwalters-forge/agentic-job#2163):
+
+* Each followed repository's review workflow takes `workflow_dispatch` with
+  the string inputs `pr`, `head` and `pool`, and for it sets
+  `run-name: review ${{ github.repository }}#${{ inputs.pr }} ${{ inputs.head }} (${{ inputs.pool }})`.
+  It maps the pool to its agent and model as the caller's dispatch workflow
+  does, reviews pull request `pr` only while `head` is its head, and submits
+  its review on `head`; a `concurrency` group a pull request with
+  `cancel-in-progress` stops the run of a superseded head. On
+  `pull_request_target`, for the bot's pull requests from its fork, it only
+  records that the head needs a review, its status, and runs no agent;
+  other authors' pull requests, which the pass does not review, keep their
+  review there. The bot's token needs `actions: write` there, as review
+  reruns already do.
+* tracker's pass configuration sets `pr.reviewPools`, in the same change
+  that switches the workflows' `pull_request_target` mode: before it, the
+  head gets a review on both events; after it without the key, none.
 
 ## Maintain
 
@@ -1495,6 +1563,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
+| `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
