@@ -5,9 +5,10 @@
 //!
 //! Each completed workflow run created that day in the pass configuration's
 //! work, followed and dispatch repositories that uploaded an [`ARTIFACT`]
-//! artifact, or a dispatched run's `PREFIX-agent-run`, counts once, by the
-//! `summary.json` in its zip: its tokens, model, repository, item, outcome
-//! and duration. The runs and artifacts are listed a page of 100 at a time;
+//! artifact, or a dispatched run's `dispatch-KIND-agent-run`, counts once, by
+//! the `summary.json` in its zip: its tokens, model, repository, item, outcome
+//! and duration. The runs, and the artifacts of each of those names, are
+//! listed a page of 100 at a time;
 //! each artifact is downloaded, at most [`ARTIFACT_BYTES`], and only its
 //! [`SUMMARY_FILE`], at most [`SUMMARY_BYTES`], is read. With a cache directory, a run's summary is
 //! kept there by run id and never downloaded again. A run whose artifact
@@ -34,9 +35,13 @@ use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// The schema of a day's report.
 pub const COST_DAY_SCHEMA: &str = "agent-board/cost-day/v1";
-/// The artifact every agentic-job run uploads: so named by a review, with a
-/// prefix by a dispatched run ([`is_agent_artifact`]).
+/// The artifact every agentic-job run uploads: so named by a review, and
+/// `dispatch-KIND-agent-run` by a dispatched run ([`artifact_names`]).
 pub const ARTIFACT: &str = "agent-run";
+/// The kinds the shared agentic-job workflow takes (its `kind` input,
+/// cgwalters-forge/actions' `cgwalters-agentic-job.yml`), each run uploading
+/// `dispatch-KIND-agent-run`. A kind not here is not counted.
+pub const DISPATCH_KINDS: &[&str] = &["implement", "triage", "research", "review", "fix"];
 /// The one file read from it.
 pub const SUMMARY_FILE: &str = "summary.json";
 /// The most of an artifact's zip downloaded.
@@ -50,7 +55,7 @@ pub const COST_SECONDS: u64 = 10 * 60;
 /// The most runs GitHub lists for one filter, and the pages of them read.
 const RUN_LIST_LIMIT: u64 = 1000;
 const PER_PAGE: usize = 100;
-/// Pages of a repository's artifacts read back to the day.
+/// Pages of a repository's artifacts of one name read back to the day.
 const ARTIFACT_PAGES: usize = 20;
 /// The items the report ranks by cost.
 const TOP_ITEMS: usize = 10;
@@ -200,12 +205,17 @@ pub struct Day {
     pub unread: Vec<Unread>,
 }
 
-/// Whether `name` is an agentic-job run's artifact: [`ARTIFACT`], as a
-/// review uploads it, or `PREFIX-agent-run`, as a dispatched run does
-/// (`dispatch-implement-agent-run`).
-fn is_agent_artifact(name: &str) -> bool {
-    name.strip_suffix(ARTIFACT)
-        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('-'))
+/// The names of agentic-job runs' artifacts, each listed apart: [`ARTIFACT`],
+/// as a review uploads it, then `dispatch-KIND-agent-run` for each of
+/// [`DISPATCH_KINDS`].
+pub fn artifact_names() -> Vec<String> {
+    std::iter::once(ARTIFACT.to_owned())
+        .chain(
+            DISPATCH_KINDS
+                .iter()
+                .map(|k| format!("dispatch-{k}-{ARTIFACT}")),
+        )
+        .collect()
 }
 
 /// A summary's `workflow`, the agentic-job workflow a run used, and the kind
@@ -399,16 +409,32 @@ impl<'a, C: Rest> Reader<'a, C> {
         bail!("{repository}'s runs created {created} are more than GitHub lists")
     }
 
-    /// `repository`'s agent run artifacts ([`is_agent_artifact`]) created
-    /// since `start`, by run id: GitHub lists them newest first, so the
-    /// listing stops at the first older one. The listing is of every
-    /// artifact, as dispatched runs name theirs apart; a run with several
-    /// keeps the shortest name, and of the same name the newest.
+    /// `repository`'s agent run artifacts ([`artifact_names`]) created since
+    /// `start`, by run id, listed by name: GitHub lists them newest first,
+    /// so each listing stops at the first older one. A run with several
+    /// keeps the shortest name, and of the same name the newest. Not the
+    /// unfiltered listing, which in a repository of many artifacts reads
+    /// other workflows' too and fails now and then (agent-board#447).
     fn artifacts(&self, repository: &str, start: OffsetDateTime) -> Result<BTreeMap<u64, Value>> {
         let mut found: BTreeMap<u64, Value> = BTreeMap::new();
+        for name in artifact_names() {
+            self.artifacts_named(repository, &name, start, &mut found)?;
+        }
+        Ok(found)
+    }
+
+    /// Adds `repository`'s artifacts named `name` created since `start` to
+    /// `found`, as [`Reader::artifacts`] keeps them.
+    fn artifacts_named(
+        &self,
+        repository: &str,
+        name: &str,
+        start: OffsetDateTime,
+        found: &mut BTreeMap<u64, Value>,
+    ) -> Result<()> {
         for page in 1..=ARTIFACT_PAGES {
             let url = format!(
-                "{API_ROOT}repos/{repository}/actions/artifacts?per_page={PER_PAGE}&page={page}"
+                "{API_ROOT}repos/{repository}/actions/artifacts?name={name}&per_page={PER_PAGE}&page={page}"
             );
             let body = self.get(&url)?.body;
             let listed = body["artifacts"]
@@ -418,15 +444,11 @@ impl<'a, C: Rest> Reader<'a, C> {
                 let created = OffsetDateTime::parse(text(artifact, "/created_at"), &Rfc3339)
                     .context("artifact has no created_at")?;
                 if created < start {
-                    return Ok(found);
+                    return Ok(());
                 }
-                let name = text(artifact, "/name");
                 let Some(run) = artifact["workflow_run"]["id"].as_u64() else {
                     continue;
                 };
-                if !is_agent_artifact(name) {
-                    continue;
-                }
                 // Of a run's, the shortest name counts, and of one name the
                 // newest (a re-run's), listed first.
                 let shorter = |kept: &Value| name.len() < text(kept, "/name").len();
@@ -435,11 +457,11 @@ impl<'a, C: Rest> Reader<'a, C> {
                 }
             }
             if listed.len() < PER_PAGE {
-                return Ok(found);
+                return Ok(());
             }
         }
         bail!(
-            "{repository} has more than {} artifacts since the day began",
+            "{repository} has more than {} {name} artifacts since the day began",
             ARTIFACT_PAGES * PER_PAGE
         )
     }

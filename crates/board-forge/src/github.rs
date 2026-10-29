@@ -680,6 +680,13 @@ pub const RATE_LIMIT_RETRIES: u32 = 3;
 /// for a secondary rate limit.
 pub const SECONDARY_WAIT: Duration = Duration::from_secs(60);
 
+/// The first wait before retrying a GET that GitHub answered with a server
+/// error (5xx), doubled for each retry after it, within the same retry and
+/// wait bounds. GitHub answers some reads with a 500 now and then, as gh and
+/// curl see too: a page of a large repository's artifacts, for one
+/// (agent-board#447).
+pub const SERVER_ERROR_WAIT: Duration = Duration::from_secs(2);
+
 /// The longest one request's retries may wait together, the secondary waits
 /// of every retry; a wait past it gives up at once. Per request, not per
 /// operation: a read of many requests may wait this long for each, within
@@ -882,6 +889,9 @@ enum Wait {
     Asked(Duration),
     /// It does not say, as for most secondary rate limits.
     Unsaid,
+    /// Not a refusal: a GET's server error (5xx), retried by
+    /// [`SERVER_ERROR_WAIT`].
+    Server,
 }
 
 /// Whether a GraphQL error is a rate limit's: `RATE_LIMITED` for the
@@ -936,7 +946,8 @@ fn rate_limited(status: u16, limits: &Limits, body: &Value, now: SystemTime) -> 
 }
 
 /// The waits of one request's retries under a rate limit: what GitHub asks,
-/// or else [`SECONDARY_WAIT`] doubled for each retry before; at most
+/// or else [`SECONDARY_WAIT`] doubled for each retry before ([`Wait::Server`]
+/// after a GET's server error, [`SERVER_ERROR_WAIT`] doubled); at most
 /// [`RATE_LIMIT_RETRIES`], [`RATE_LIMIT_WAIT`] together, and none past the
 /// deadline. Every transport path retries by it.
 struct Backoff {
@@ -957,12 +968,19 @@ impl Backoff {
     /// How long to wait at `now` before retrying a refusal that asks for
     /// `wait`, or why it is not retried.
     fn next(&mut self, wait: Wait, now: Instant) -> std::result::Result<Duration, String> {
-        let (wait, asked) = match wait {
-            Wait::Asked(wait) => (wait, "asked to wait"),
-            Wait::Unsaid => {
-                let doubled = 1u32.checked_shl(self.retries).unwrap_or(u32::MAX);
-                (SECONDARY_WAIT.saturating_mul(doubled), "backing off")
-            }
+        let doubled = 1u32.checked_shl(self.retries).unwrap_or(u32::MAX);
+        let (wait, asked, what) = match wait {
+            Wait::Asked(wait) => (wait, "asked to wait", "rate limit"),
+            Wait::Unsaid => (
+                SECONDARY_WAIT.saturating_mul(doubled),
+                "backing off",
+                "rate limit",
+            ),
+            Wait::Server => (
+                SERVER_ERROR_WAIT.saturating_mul(doubled),
+                "backing off",
+                "server error",
+            ),
         };
         let total = self.waited.saturating_add(wait);
         let late = self
@@ -971,7 +989,7 @@ impl Backoff {
         if self.retries >= RATE_LIMIT_RETRIES || total > RATE_LIMIT_WAIT || late {
             let past = if late { ", past the time bound" } else { "" };
             return Err(format!(
-                "GitHub rate limit: gave up after {} retries and {}s of waiting, {asked} {}s more{past}",
+                "GitHub {what}: gave up after {} retries and {}s of waiting, {asked} {}s more{past}",
                 self.retries,
                 self.waited.as_secs(),
                 wait.as_secs()
@@ -981,6 +999,10 @@ impl Backoff {
         self.waited = total;
         Ok(wait)
     }
+}
+
+fn server_error(status: u16) -> bool {
+    (500..600).contains(&status)
 }
 
 /// `send` again after each refusal under a rate limit, sleeping between by
@@ -1251,11 +1273,19 @@ impl crate::poll::Rest for Client {
                 )
             });
             let (wait, refusal) = wait.unzip();
-            Ok(((response, refusal), wait.flatten()))
+            // A GET is safe to send again; a server error may pass.
+            let wait = wait
+                .flatten()
+                .or(server_error(status).then_some(Wait::Server));
+            Ok(((response, refusal), wait))
         };
         let ((mut response, refusal), gave_up) =
             retrying(self.backoff(), send, std::thread::sleep)?;
         let status = response.status().as_u16();
+        if server_error(status) {
+            let retried = gave_up.map_or(String::new(), |why| format!(" ({why})"));
+            anyhow::bail!("GET {path}: GitHub HTTP status {status}{retried}");
+        }
         if let Some(why) = gave_up {
             let body = refusal.unwrap_or_default();
             let message = body["message"].as_str().unwrap_or("message unavailable");
@@ -2521,17 +2551,22 @@ mod tests {
     /// The sync paths' retry sleeps through the sleep it is given.
     #[test]
     fn sync_retry_table() {
-        let (asked, unsaid) = (
+        let (asked, unsaid, server) = (
             Some(Wait::Asked(Duration::from_secs(5))),
             Some(Wait::Unsaid),
+            Some(Wait::Server),
         );
         for (script, slept, gave_up) in [
             (vec![None], vec![], false),
             (vec![asked, None], vec![5], false),
             (vec![unsaid, unsaid, None], vec![60, 120], false),
             (vec![unsaid; 4], vec![60, 120, 240], true),
+            // A GET's server errors: retried soon, within the same bound.
+            (vec![server, server, None], vec![2, 4], false),
+            (vec![server; 4], vec![2, 4, 8], true),
         ] {
             let sends = script.len();
+            let script_kind = script[0];
             let mut script = script.into_iter();
             let mut sent = 0;
             let mut sleeps = vec![];
@@ -2544,6 +2579,13 @@ mod tests {
             assert_eq!(last, sends, "{slept:?}");
             assert_eq!(sleeps, slept);
             assert_eq!(why.is_some(), gave_up, "{why:?}");
+            if let Some(why) = why {
+                let what = match script_kind {
+                    Some(Wait::Server) => "GitHub server error: gave up after 3 retries",
+                    _ => "GitHub rate limit: gave up after 3 retries",
+                };
+                assert!(why.starts_with(what), "{why}");
+            }
         }
     }
 

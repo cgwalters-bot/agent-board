@@ -111,10 +111,17 @@ impl Rest for Forge {
                 false => error,
             });
         }
-        // Every other day had no runs.
-        let none = path
-            .contains("/actions/runs?")
-            .then(|| json!({"total_count": 0, "workflow_runs": []}));
+        // Every other day had no runs, and every name not recorded no
+        // artifacts.
+        let none = match path {
+            p if p.contains("/actions/runs?") => {
+                Some(json!({"total_count": 0, "workflow_runs": []}))
+            }
+            p if p.contains("/actions/artifacts?name=") => {
+                Some(json!({"total_count": 0, "artifacts": []}))
+            }
+            _ => None,
+        };
         let body = (self.fixture["responses"].get(path).cloned())
             .or(none)
             .with_context(|| format!("no recorded answer for GET {path}"))?;
@@ -194,12 +201,16 @@ fn reads_and_prices_a_recorded_day() {
     let forge = Forge::new();
     let reader = Reader::new(&forge, None);
     let read = read_day(&reader, &repositories(), day()).unwrap();
-    // Two run listings, two artifact listings and four downloads: the CI
-    // run has no agent artifact, the fix run's expired, the review's
-    // `agent-run` is read rather than its longer-named one, the dispatched
-    // runs' `dispatch-KIND-agent-run` are, and the listing stops at the
-    // first artifact of the day before.
-    assert_eq!((reader.spent(), forge.downloads.get()), (8, 4));
+    // Two run listings, an artifact listing per name in each repository
+    // and four downloads: the CI run has no agent artifact, the fix run's
+    // expired, the review's `agent-run` is read rather than its
+    // longer-named one, the dispatched runs' `dispatch-KIND-agent-run` are,
+    // and the `agent-run` listing stops at the first of the day before.
+    let listings = 2 * artifact_names().len();
+    assert_eq!(
+        (reader.spent(), forge.downloads.get()),
+        (2 + listings + 4, 4)
+    );
     let report = report(day(), read, &prices());
     let expected: Value = serde_json::from_str(&std::fs::read_to_string(REPORT).unwrap()).unwrap();
     assert_eq!(report, expected, "{report:#}");
@@ -220,7 +231,8 @@ fn a_cached_summary_is_not_downloaded_again() {
     let reader = Reader::new(&again, Some(&dir));
     let second = read_day(&reader, &repositories(), day()).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
-    assert_eq!((again.downloads.get(), reader.spent()), (0, 4));
+    let listings = 2 * artifact_names().len();
+    assert_eq!((again.downloads.get(), reader.spent()), (0, 2 + listings));
     assert_eq!(first, second);
 }
 
@@ -230,7 +242,7 @@ fn the_request_budget_bounds_a_read_and_leaves_the_commit_its_share() {
     let reader = Reader::new(&forge, None);
     reader.left.set(COMMIT_REQUESTS + 3);
     let error = read_day(&reader, &repositories(), day()).unwrap_err();
-    // The fourth read, the tracker's runs, is refused.
+    // The fourth read, agent-board's third artifact listing, is refused.
     assert!(
         format!("{error:#}").contains("cost request budget"),
         "{error:#}"
@@ -388,20 +400,68 @@ fn kinds_come_from_the_workflow_then_the_title() {
 }
 
 #[test]
-fn agent_artifacts_are_named_agent_run_with_or_without_a_prefix() {
-    for (name, expected) in [
-        ("agent-run", true),
-        ("dispatch-implement-agent-run", true),
-        ("dispatch-fix-agent-run", true),
-        // Any prefix: a summary that is no agentic-job run's is unread.
-        ("logs-agent-run", true),
-        ("agent-run-logs", false),
-        ("coverage", false),
-        ("wagent-run", false),
-        ("", false),
-    ] {
-        assert_eq!(is_agent_artifact(name), expected, "{name}");
+fn agent_artifacts_are_listed_by_each_name_dispatch_gives_them() {
+    assert_eq!(
+        artifact_names(),
+        [
+            "agent-run",
+            "dispatch-implement-agent-run",
+            "dispatch-triage-agent-run",
+            "dispatch-research-agent-run",
+            "dispatch-review-agent-run",
+            "dispatch-fix-agent-run",
+        ]
+    );
+}
+
+/// Answers each artifact listing with a full page of the day's artifacts
+/// of its name, all for one run, and records the listings asked for.
+struct Crowded(RefCell<Vec<String>>);
+
+impl Rest for Crowded {
+    fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+        let path = url.trim_start_matches(API_ROOT);
+        self.0.borrow_mut().push(path.to_owned());
+        let name = path
+            .split("name=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        let artifact = json!({"id": 1, "name": name, "created_at": "2026-10-28T12:00:00Z",
+            "workflow_run": {"id": 9}});
+        Ok(RestResponse {
+            status: 200,
+            etag: None,
+            last_modified: None,
+            link: None,
+            body: json!({"artifacts": vec![artifact; PER_PAGE]}),
+        })
     }
+
+    fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+        bail!("no writes")
+    }
+}
+
+#[test]
+fn each_name_is_listed_within_its_page_bound() {
+    let crowded = Crowded(RefCell::default());
+    let start = day().midnight().assume_utc();
+    let error = Reader::new(&crowded, None)
+        .artifacts("o/r", start)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "o/r has more than 2000 agent-run artifacts since the day began"
+    );
+    let listed = crowded.0.borrow();
+    assert_eq!(listed.len(), ARTIFACT_PAGES);
+    assert_eq!(
+        listed[ARTIFACT_PAGES - 1],
+        "repos/o/r/actions/artifacts?name=agent-run&per_page=100&page=20"
+    );
 }
 
 #[test]
