@@ -1699,6 +1699,11 @@ impl<C: Rest> Rest for Budget<'_, C> {
         self.spend(true)?;
         self.observe(self.inner.send(method, url, body))
     }
+
+    fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        self.spend(false)?;
+        self.observe(self.inner.download(url, limit))
+    }
 }
 
 impl<C: Transport> Transport for Budget<'_, C> {
@@ -2185,9 +2190,9 @@ struct Scheduler<'a, C> {
     /// The caller's runs that failed in the last day, by id, where
     /// [`Config::reruns`] or [`Config::starts`] is set ([`Self::failed_runs`]).
     failed: BTreeMap<u64, Value>,
-    /// Whether each failed run looked at failed before its agent started,
-    /// and its first error line, by id ([`Self::before_agent`]).
-    infra: RefCell<BTreeMap<u64, Option<String>>>,
+    /// Whether each failed run looked at failed on infrastructure, and how,
+    /// by id ([`Self::before_agent`]).
+    infra: RefCell<BTreeMap<u64, Option<starts::Infra>>>,
     /// With [`Config::starts`], the bot's open alarm issues, read once a
     /// pass ([`Self::alarms`]).
     alarms: Option<BTreeMap<String, starts::Alarm>>,
@@ -3155,8 +3160,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         let why = format!("plan {id}'s batched run failed; it is re-run by hand");
                         return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
                     }
-                    // Its rerun never reached the agent either: the plan
-                    // was not spent.
+                    // Its rerun failed on infrastructure too: the plan was
+                    // not spent.
                     if let Some(first) = &early
                         && plan.kind == "implement"
                         && run["run_attempt"].as_u64() != Some(1)
@@ -3181,7 +3186,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let waiver = self.waiver(&facts, board);
         // A triage run changes no files, and is checked as a triage start.
-        let failed = failed.as_ref().map(|(run, early)| (*run, early.as_deref()));
+        let failed = failed.as_ref().map(|(run, early)| (*run, early.as_ref()));
         if let Some(run) = failed.filter(|_| plan.kind != "implement") {
             if plan.kind != "triage" || dest != *issue {
                 let why = format!(
@@ -3323,13 +3328,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// pacing on the pool its title names, `--max-dispatch`, an implement
     /// plan's overlap check and a lease. A run that failed again after that,
     /// or a stacked plan's, whose base may have moved, holds the issue for a
-    /// person. `early` is its first error line where it failed before its
-    /// agent started ([`Self::before_agent`]).
+    /// person. `early` says how it failed where it failed on infrastructure
+    /// ([`Self::before_agent`]).
     fn rerun(
         &self,
         (issue, dest): (&ItemRef, &ItemRef),
         plan: &plan::JobPlan,
-        (run, early): (&Value, Option<&str>),
+        (run, early): (&Value, Option<&starts::Infra>),
         slots: &Slots,
         (snapshot, target, waiver): (Option<&Value>, &Target, &overlap::Waiver),
     ) -> Result<Step> {
@@ -3338,9 +3343,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let kind = run_title(title).map_or("dispatched", |(kind, _, _)| kind);
         let url = format!("https://{DEFAULT_HOST}/{}/actions/runs/{id}", target.caller);
         let ended = match early {
-            Some(first) => {
-                format!("its {kind} run {url} failed before the agent started ({first})")
-            }
+            Some(starts::Infra { how, line }) => format!("its {kind} run {url} {how} ({line})"),
             None => format!("its {kind} run {url} ended ({})", text(run, "/conclusion")),
         };
         if run["run_attempt"].as_u64() != Some(1) {
@@ -4328,6 +4331,11 @@ fn broker_key(path: &str) -> Value {
     json!({"broker": path})
 }
 
+/// A download, such as a job's log, in a recording.
+fn download_key(url: &str) -> Value {
+    json!({"download": url})
+}
+
 /// Reads through `inner`, keeping each request and its answer for a replay
 /// fixture. Reads are made without the poll's validators, so the fixture
 /// replays without its state file. It never writes.
@@ -4379,6 +4387,14 @@ impl<C: Rest> Rest for Recorder<'_, C> {
 
     fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
         bail!("a recorded pass is a preview, and does not {method} {url}")
+    }
+
+    /// Kept as text, as the pass downloads only job logs.
+    fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        let bytes = self.inner.download(url, limit)?;
+        let text = String::from_utf8_lossy(&bytes);
+        self.keep(download_key(url), json!({"text": text}));
+        Ok(bytes)
     }
 }
 
@@ -4477,6 +4493,13 @@ impl<C: Rest> Rest for Seeded<'_, C> {
     fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
         bail!("a seeded recording is a preview, and does not {method} {url}")
     }
+
+    fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        match self.seed.answer(&download_key(url)) {
+            Ok(_) => self.seed.download(url, limit),
+            Err(_) => self.live.download(url, limit),
+        }
+    }
 }
 
 impl<C: Broker> Broker for Seeded<'_, C> {
@@ -4527,6 +4550,16 @@ impl Rest for Replay {
 
     fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
         bail!("a replay is read-only, and does not {method} {url}")
+    }
+
+    fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        let answer = self.answer(&download_key(url))?;
+        let text = answer["text"].as_str().context("recorded download text")?;
+        ensure!(
+            text.len() as u64 <= limit,
+            "GET {url}: body over {limit} bytes"
+        );
+        Ok(text.as_bytes().to_vec())
     }
 }
 

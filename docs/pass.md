@@ -688,14 +688,15 @@ An epic plan may not put a plan block in a body it writes.
 The one automatic rerun is meant for infrastructure: a scheduled run that
 failed before the agent's work could succeed or fail on its own (runner lost,
 setup or checkout failed, broker or forge outage). With `starts`, a run that
-failed before its agent session started is that, by the rule of
+failed before its agent session started, or whose inference token its
+broker lost mid-run, is that, by the rule of
 [start failures](#start-failures); without it, [`reruns`](#reruns) re-runs
 any failed run once, and a second failure is left for a person.
 
 With an accepted implement plan, dispatch precisely that plan once. An invalid
 newest plan does not mean “no plan”; report it, never fall back. Recorded plans
 do not run again, except by the rerun above, or with `starts` once their run
-never reached the agent; an operator/planner
+and its rerun failed on infrastructure; an operator/planner
 edit or replacement is needed. Research or
 triage plans explicitly posted on issues remain manual dispatches.
 
@@ -1007,17 +1008,38 @@ it. A job of the caller's own that fails at its own steps, such as a
 policy refusal, would fail the same way again, so it is not one. Its first
 error line is that job's first failure annotation, else the job and step,
 and the breaker compares it exactly. Telling costs two reads a run, once a
-pass: its jobs and that job's annotations.
+pass: its jobs and that job's annotations, and for some a third, below.
+
+A run whose agent had started fails on infrastructure too where the
+inference proxy lost its token mid-run, as when its broker is redeployed:
+the agent's requests are refused from then on, and its plan was not tried
+(agent-board#449). agentic-job has no exit state of its own for that, so
+where the agent's step failed with exit state 1 or 3 (`agentic-job run
+ended with exit state 1` or `3`), the pass reads that job's log, a third
+read of at most 4 MiB, for agentic-job's own line `warning: the inference
+proxy at URL no longer knows this run's token (HTTP 401; did it
+restart?)` at the start of a log line, after the runner's timestamp. A log
+that cannot be read, gone or longer, does not say so, and a later pass
+reads it again. Its first error line is then always the same, `the
+inference proxy no longer knew the run's token (HTTP 401; did it
+restart?)`, and lines below say the run `lost its inference token
+mid-run` where others say it `failed before the agent started`. The
+agent's condensed output in that log has lines of its own, so an agent
+that printed that line and failed could earn its run the same one rerun
+and its plan a release, each time two runs within WIP and the pass's
+caps, as a broker restart would; an annotation of agentic-job's, which
+the agent cannot write, would close that. Either is a run that failed on
+infrastructure below.
 
 1. **The run is re-run, and its plan not spent.** Stage 4 reads the failed
    runs of the last day as [reruns](#reruns) does. A candidate's run that
-   failed before its agent started gets the one rerun of
+   failed on infrastructure gets the one rerun of
    [reruns](#reruns), checked as it is there, with or without `reruns`:
    `run rerun OWNER/REPO#N: its implement run URL failed before the agent
    started (LINE), so its failed jobs run once more …`. Where the rerun
-   never reached the agent either, an implement plan's dispatch record is
-   released as a refused dispatch's is: the bot edits it to say the run
-   failed before the agent started, without its marker or the error, which
+   failed on infrastructure too, an implement plan's dispatch record is
+   released as a refused dispatch's is: the bot edits it to say how the run
+   failed, without its marker or the error, which
    readers of the issue's repository may not see. The plan then starts
    again on a later pass as any undispatched plan does (`hold OWNER/REPO#N:
    its implement run URL failed before the agent started again after a
@@ -1029,7 +1051,7 @@ pass: its jobs and that job's annotations.
 2. **A breaker.** Before it starts anything, stage 4 reads the caller
    workflow's newest 20 runs, one request. Where the newest
    `starts.breakerRuns` (default 3) that ended, across issues and kinds,
-   all failed before the agent started with the same first error line, it
+   all failed on infrastructure with the same first error line, it
    starts nothing (`breaker: the newest 3 runs failed before the agent
    started: LINE (URL, …); stage 4 starts nothing until a run starts
    cleanly, and probes it from T`). A run in flight neither trips nor
@@ -1038,7 +1060,7 @@ pass: its jobs and that job's annotations.
    find out whether the cause is gone (`…; one run starts to probe it`);
    one that fails the same way keeps it tripped, and the next probe waits
    another hour. Any run that ends otherwise among those newest,
-   succeeded or failed once its agent started, clears it. Stage 2's fix
+   succeeded or failed otherwise once its agent started, clears it. Stage 2's fix
    rounds are not stopped. A breaker that cannot be read holds every start,
    as an unreadable hold does.
 3. **A stall alarm.** Where stage 4 starts nothing with slots free, stage 2

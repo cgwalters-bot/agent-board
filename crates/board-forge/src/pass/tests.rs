@@ -1765,6 +1765,11 @@ impl Rest for Forge {
         self.failing(&what)?;
         Ok(written)
     }
+
+    fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        self.failing(&format!("GET {url}"))?;
+        self.replay.download(url, limit)
+    }
 }
 
 impl crate::github::GraphQl for Forge {
@@ -3847,9 +3852,29 @@ fn agent_failed() -> Vec<Value> {
     vec![agent_job(["success", "success", "success", "failure"])]
 }
 
+/// The agent job, failed at the agent's step, whose log is `log`.
+fn agent_logged(log: &str) -> Vec<Value> {
+    let mut jobs = agent_failed();
+    jobs[0]["log"] = log.into();
+    jobs
+}
+
+/// The log of agentic-job's agent job in the broker restart of
+/// agent-board#449 (tracker run 40957702666), cut to its end.
+const TOKEN_LOST_LOG: &str = "\
+2026-10-29T21:29:36.8140498Z ▶ Bash: cd crates/agentic-job/src; rg -n \"Gitlab|GitLab\" apply/mod.rs | sed -n 1,80p (ok, 0s)
+2026-10-29T21:29:54.6856192Z warning: the inference proxy has given no count of this run's model requests 6 times in a row: a request-capped session must stop
+2026-10-29T21:29:54.8410797Z ⚠ model request count is unavailable
+2026-10-29T21:29:54.8411077Z ⚠ cancelling the session
+2026-10-29T21:29:54.8504575Z done: cancelled, 19 tool calls
+2026-10-29T21:30:01.1105672Z warning: the inference proxy at http://100.114.231.4:18080 no longer knows this run's token (HTTP 401; did it restart?), so the token admits nothing, but there is no usage record of the run
+2026-10-29T21:30:01.6539257Z The agent claude ended: budget. Redacted 0 string(s).
+2026-10-29T21:30:05.6493063Z ##[error]agentic-job run ended with exit state 3
+";
+
 /// Run `id`'s jobs as [`Scheduler::before_agent`] reads them: the profile
 /// job passed, then `jobs`, the first that failed with the annotation
-/// `message`.
+/// `message`, and with its log where it has a `log`.
 fn failed_at(replay: &mut Replay, id: u64, jobs: Vec<Value>, message: &str) {
     let get = |url: String, body: Value| json!({"request": {"get": url}, "answer": {"status": 200, "body": body}});
     let repo = format!("{API_ROOT}repos/cgwalters-forge/tracker");
@@ -3857,7 +3882,12 @@ fn failed_at(replay: &mut Replay, id: u64, jobs: Vec<Value>, message: &str) {
     let mut all = vec![json!({"name": "profile", "conclusion": "success", "steps": []})];
     all.extend(jobs);
     if let Some(failed) = all.iter_mut().find(|j| j["conclusion"] == "failure") {
+        failed["id"] = check.into();
         failed["check_run_url"] = format!("{repo}/check-runs/{check}").into();
+        if let Some(log) = failed.as_object_mut().and_then(|j| j.remove("log")) {
+            let url = format!("{repo}/actions/jobs/{check}/logs");
+            (replay.requests).push(json!({"request": {"download": url}, "answer": {"text": log}}));
+        }
     }
     let jobs = json!({"total_count": all.len(), "jobs": all});
     let url = format!("{repo}/actions/runs/{id}/jobs?per_page={JOBS_PER_PAGE}");
@@ -3925,6 +3955,16 @@ fn apply_reruns_and_releases_runs_that_never_started() {
             "hold cgwalters-forge/tracker#468: its implement run {url} failed before the agent started again after a rerun ({why}), so its record is released and its plan starts again"
         )
     };
+    let state_3 = "agentic-job run ended with exit state 3";
+    let lost_why = "the inference proxy no longer knew the run's token (HTTP 401; did it restart?)";
+    let lost_rerun = format!(
+        "run rerun cgwalters-forge/tracker#468: its implement run {url} lost its inference token mid-run ({lost_why}), so its failed jobs run once more pool=claude run={url}"
+    );
+    let lost_released = format!(
+        "hold cgwalters-forge/tracker#468: its implement run {url} lost its inference token mid-run again after a rerun ({lost_why}), so its record is released and its plan starts again"
+    );
+    // The agent's condensed output quoting agentic-job's warning.
+    let quoting = "2026-10-29T21:29:36.8140498Z ▶ Bash: rg 'warning: the inference proxy at X no longer knows this run's token (HTTP 401; did it restart?)' (ok, 0s)\n";
     let held = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already".to_owned();
     let again = format!(
         "hold cgwalters-forge/tracker#468: its implement run {url} ended (failure) again after a rerun"
@@ -3988,6 +4028,55 @@ fn apply_reruns_and_releases_runs_that_never_started() {
             1,
         ),
         (
+            "a run whose broker lost its token mid-run is re-run",
+            starts.clone(),
+            1,
+            (agent_logged(TOKEN_LOST_LOG), state_3),
+            lost_rerun,
+            1,
+            0,
+        ),
+        (
+            "its rerun lost it again: its plan is not spent",
+            starts.clone(),
+            2,
+            (agent_logged(TOKEN_LOST_LOG), state_3),
+            lost_released.clone(),
+            0,
+            1,
+        ),
+        (
+            "nor where it then failed with exit state 1",
+            starts.clone(),
+            2,
+            (
+                agent_logged(TOKEN_LOST_LOG),
+                "agentic-job run ended with exit state 1 (inference_unauthorized)",
+            ),
+            lost_released,
+            0,
+            1,
+        ),
+        (
+            "a run stopped at a limit with its token known is not re-run",
+            starts.clone(),
+            2,
+            (agent_logged(quoting), state_3),
+            held.clone(),
+            0,
+            0,
+        ),
+        (
+            "nor one whose log cannot be read, which is no error",
+            starts.clone(),
+            2,
+            (agent_failed(), state_3),
+            held.clone(),
+            0,
+            0,
+        ),
+        (
+            // Exit state 2: its log is not read, which no answer is recorded for.
             "an agent that started and failed is not re-run without reruns",
             starts.clone(),
             1,

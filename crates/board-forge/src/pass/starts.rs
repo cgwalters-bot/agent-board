@@ -1,6 +1,7 @@
 //! Runs that never started (agent-board#440, docs/pass.md#start-failures):
-//! a run that failed before its agent session started says nothing of the
-//! work, so it is re-run once and then leaves its plan unspent; a run of such
+//! a run that failed before its agent session started, or whose inference
+//! token was lost mid-run (agent-board#449), says nothing of the work, so it
+//! is re-run once and then leaves its plan unspent; a run of such
 //! failures with the same first error line stops stage 4's starts until a
 //! run starts cleanly; and stage 4 raises an alarm when it starts nothing
 //! for a while with slots free and candidates held for no reason it expects.
@@ -20,7 +21,28 @@ pub(super) const AGENT_STEP: &str = "Run ./.agentic-job-source/run";
 /// What agentic-job's `run` says where the agent session did not start, its
 /// exit state 4.
 const NOT_STARTED: &str = "the run did not start";
-const EXIT_STATE: &str = "agentic-job run ended with exit state 4";
+const EXIT_STATE: &str = "agentic-job run ended with exit state ";
+const NOT_STARTED_STATE: u8 = 4;
+/// The exit states of a run that ended once its agent had started, a
+/// failure and a stop at a limit, after which its log is read for a lost
+/// inference token ([`token_lost`]).
+const ENDED_STATES: [u8; 2] = [1, 3];
+/// What agentic-job's `run` logs, on its own line, where the inference proxy
+/// no longer knew the run's token, as when its broker restarted: the agent's
+/// requests were refused from then on (agent-board#449). It has no exit
+/// state of its own.
+const PROXY_WARNING: &str = "warning: the inference proxy at ";
+const TOKEN_LOST: &str = "no longer knows this run's token (HTTP 401; did it restart?)";
+/// The bytes of an agent job's log read for it: agent-board#449's was
+/// 126 KB, its agent's output condensed.
+const LOG_BYTES: u64 = 4 << 20;
+/// How a run failed on infrastructure ([`Infra::how`]).
+const BEFORE_AGENT: &str = "failed before the agent started";
+const LOST_TOKEN: &str = "lost its inference token mid-run";
+/// The first error line of a run that lost its inference token, the same
+/// for every such run, so that the breaker counts them together.
+const LOST_TOKEN_LINE: &str =
+    "the inference proxy no longer knew the run's token (HTTP 401; did it restart?)";
 /// The caller's newest runs read for the breaker and the stall alarm.
 const RECENT_RUNS: usize = 20;
 /// `starts.breakerRuns` when left out, and its bounds: at most half of
@@ -91,16 +113,47 @@ impl Starts {
     }
 }
 
+/// Whether an annotation is agentic-job's saying its run ended with exit
+/// state `state`: it begins `agentic-job run ended with exit state STATE`
+/// and no further digit. Only its start counts, as the agent may quote
+/// these words in an annotation of its own.
+fn ended_with(message: &str, state: u8) -> bool {
+    let lower = message.trim_start().to_ascii_lowercase();
+    (lower.strip_prefix(EXIT_STATE))
+        .and_then(|rest| rest.strip_prefix(&state.to_string()))
+        .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Whether an annotation is agentic-job's saying the agent session did not
-/// start: it begins `the run did not start`, or `agentic-job run ended with
-/// exit state 4` and no further digit. Only its start counts, as the agent
-/// may quote these words in an annotation of its own.
+/// start: it begins `the run did not start`, or says exit state 4.
 fn not_started(message: &str) -> bool {
     let lower = message.trim_start().to_ascii_lowercase();
-    lower.starts_with(NOT_STARTED)
-        || lower
-            .strip_prefix(EXIT_STATE)
-            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+    lower.starts_with(NOT_STARTED) || ended_with(message, NOT_STARTED_STATE)
+}
+
+/// Whether an agent job's `log` has agentic-job's own warning that the
+/// inference proxy no longer knew the run's token: a line that, after the
+/// runner's timestamp, begins [`PROXY_WARNING`] and says [`TOKEN_LOST`].
+/// The agent's condensed output in the log has lines of its own, so an
+/// agent that printed such a line, and ended with one of [`ENDED_STATES`],
+/// could earn its run the one rerun and its plan a release, as a broker
+/// restart would: each time, two runs within WIP and the pass's caps.
+/// agentic-job does not yet say this in an annotation, which the agent
+/// could not write.
+fn token_lost(log: &str) -> bool {
+    (log.lines())
+        .filter_map(|line| line.split_once(' ').map(|(_, rest)| rest))
+        .any(|rest| rest.starts_with(PROXY_WARNING) && rest.contains(TOKEN_LOST))
+}
+
+/// Why a run failed on infrastructure ([`Scheduler::before_agent`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Infra {
+    /// How, as a line says it after the run: [`BEFORE_AGENT`] or
+    /// [`LOST_TOKEN`].
+    pub how: &'static str,
+    /// Its first error line.
+    pub line: String,
 }
 
 /// The steps of an Actions `job`, in order.
@@ -120,9 +173,9 @@ fn first_line(message: &str) -> String {
 
 /// What stage 4 may start, by [`Scheduler::guard`].
 pub(super) struct Guard {
-    /// The breaker's first error line and the runs that tripped it, newest
+    /// How the runs that tripped the breaker failed, and those runs, newest
     /// first; none where it is not tripped.
-    tripped: Option<(String, Vec<String>)>,
+    tripped: Option<(Infra, Vec<String>)>,
     /// When the newest run read was created or last started.
     newest: Option<OffsetDateTime>,
 }
@@ -147,8 +200,11 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// that fails at its own steps (a policy refusal, say) would fail the
     /// same way again, and an agent job without the agent's step cannot be
     /// read, so neither is one. Two reads, once a pass: the run's jobs and
-    /// that job's annotations.
-    pub(super) fn before_agent(&self, repo: &str, run: &Value) -> Result<Option<String>> {
+    /// that job's annotations. An agent job whose agent's step failed with
+    /// exit state 1 or 3 ([`ENDED_STATES`]) is read a third time, for its
+    /// log, and where the inference proxy lost the run's token there
+    /// ([`token_lost`]), the run failed on infrastructure too.
+    pub(super) fn before_agent(&self, repo: &str, run: &Value) -> Result<Option<Infra>> {
         if run["conclusion"] != RERUN_CONCLUSION {
             return Ok(None);
         }
@@ -188,11 +244,38 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 let line = (messages.first().map(|m| first_line(m)))
                     .filter(|l| !l.is_empty())
                     .unwrap_or_else(|| first_line(&format!("job {name} failed at {step}")));
-                early.then_some(line)
+                let ended = !early
+                    && agent.is_some_and(|a| text(&own[a], "/conclusion") == RERUN_CONCLUSION)
+                    && (messages.iter()).any(|m| ENDED_STATES.iter().any(|&s| ended_with(m, s)));
+                if early {
+                    Some(Infra {
+                        how: BEFORE_AGENT,
+                        line,
+                    })
+                } else if ended && self.lost_token(repo, job)? {
+                    Some(Infra {
+                        how: LOST_TOKEN,
+                        line: LOST_TOKEN_LINE.to_owned(),
+                    })
+                } else {
+                    None
+                }
             }
         };
         self.infra.borrow_mut().insert(id, found.clone());
         Ok(found)
+    }
+
+    /// Whether the Actions agent `job`'s log says the inference proxy no
+    /// longer knew the run's token ([`token_lost`]), at most [`LOG_BYTES`]
+    /// of it read. A log that cannot be read, gone or too long, does not
+    /// say so: an error here would stop the breaker's every pass while
+    /// that run is among the newest. A later pass reads it again.
+    fn lost_token(&self, repo: &str, job: &Value) -> Result<bool> {
+        let id = job["id"].as_u64().context("job has no id")?;
+        let url = format!("{API_ROOT}repos/{repo}/actions/jobs/{id}/logs");
+        let log = self.client.download(&url, LOG_BYTES).unwrap_or_default();
+        Ok(token_lost(&String::from_utf8_lossy(&log)))
     }
 
     /// The failure annotations' messages of the Actions `job`, in order:
@@ -246,17 +329,17 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             .filter(|r| r["status"] == "completed")
             .take(starts.breaker_runs)
             .collect();
-        let mut lines = Vec::new();
+        let mut infra = Vec::new();
         for run in &ended {
-            let Some(line) = self.before_agent(&target.caller, run)? else {
+            let Some(found) = self.before_agent(&target.caller, run)? else {
                 break;
             };
-            lines.push(line);
+            infra.push(found);
         }
-        let tripped = (lines.len() == starts.breaker_runs && lines.iter().all(|l| *l == lines[0]))
+        let tripped = (infra.len() == starts.breaker_runs && infra.iter().all(|i| *i == infra[0]))
             .then(|| {
                 let urls = ended.iter().map(|r| text(r, "/html_url").to_owned());
-                (lines[0].clone(), urls.collect())
+                (infra[0].clone(), urls.collect())
             });
         Ok(Guard { tripped, newest })
     }
@@ -289,17 +372,15 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return Some((free, guard.newest));
         };
         let n = runs.len();
-        let said = format!(
-            "the newest {n} runs failed before the agent started: {first} ({})",
-            runs.join(", ")
-        );
+        let Infra { how, line: first } = first;
+        let said = format!("the newest {n} runs {how}: {first} ({})", runs.join(", "));
         let caller = format!("{}'s {}", target.caller, target.workflow);
         let links: String = runs.iter().map(|r| format!("- {r}\n")).collect();
         let text = format!(
-            "The board pass stopped starting runs: the newest {n} runs of {caller} failed before the agent started, each with\n\n\
+            "The board pass stopped starting runs: the newest {n} runs of {caller} {how}, each with\n\n\
              ```text\n{first}\n```\n\n{links}\n\
              It starts one run an hour after the newest to find out whether the cause is gone, and closes this issue once a run starts cleanly. \
-             Each such run that failed before the agent started is re-run once, and its plan is not spent."
+             Each such run that {how} is re-run once, and its plan is not spent."
         );
         let probe = guard
             .newest
@@ -322,7 +403,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         };
         self.alarm(
             BREAKER,
-            Some(("Board pass: runs fail before the agent starts", text)),
+            Some(("Board pass: runs fail on infrastructure", text)),
         );
         allowed
     }
@@ -497,21 +578,21 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     }
 
     /// The step for `issue`, whose implement `plan`'s dispatched `run` failed
-    /// before its agent started again after its rerun, `first` saying why:
-    /// its `record` is released as a refused dispatch's is, so the plan
-    /// starts again on a later pass, which the breaker bounds. One write
-    /// step within `--max-writes`; the comment links the run, but does not
-    /// carry its error, which another repository's readers may not see.
+    /// on infrastructure again after its rerun, `infra` saying how: its
+    /// `record` is released as a refused dispatch's is, so the plan starts
+    /// again on a later pass, which the breaker bounds. One write step
+    /// within `--max-writes`; the comment links the run, but does not carry
+    /// its error, which another repository's readers may not see.
     pub(super) fn release(
         &self,
         issue: &ItemRef,
         (plan, record): (&plan::Comment, &plan::Comment),
         run: &Value,
-        first: &str,
+        Infra { how, line: first }: &Infra,
     ) -> Result<Step> {
         let url = text(run, "/html_url");
         let line = format!(
-            "its implement run {url} failed before the agent started again after a rerun ({first}), so its record is released and its plan starts again"
+            "its implement run {url} {how} again after a rerun ({first}), so its record is released and its plan starts again"
         );
         let hold = |why: String| Ok(Step::Hold(Hold::new(HoldKind::Dispatched, why)));
         if let Some(held) = self.caps.check(Kind::Write) {
@@ -525,7 +606,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             .with_context(|| format!("its record {} has no id", record.url))?;
         let at = format!("{API_ROOT}repos/{}/issues/comments/{id}", issue.repository);
         let body = format!(
-            "The plan in {} was dispatched, but its [run]({url}) failed before the agent started. A later dispatch may take it.",
+            "The plan in {} was dispatched, but its [run]({url}) {how}. A later dispatch may take it.",
             plan.url
         );
         plan::send(&self.client, "PATCH", &at, &json!({"body": body}), 0)
@@ -553,6 +634,48 @@ mod tests {
         ] {
             assert_eq!(not_started(message), expected, "{message}");
         }
+    }
+
+    #[test]
+    fn ended_with_reads_one_exit_state() {
+        for (message, state, expected) in [
+            ("agentic-job run ended with exit state 3", 3, true),
+            (
+                "agentic-job run ended with exit state 1 (inference_unauthorized)",
+                1,
+                true,
+            ),
+            ("agentic-job run ended with exit state 3", 1, false),
+            ("agentic-job run ended with exit state 124", 1, false),
+            ("agentic-job run ended with exit state 30", 3, false),
+            (
+                "the agent said: agentic-job run ended with exit state 3",
+                3,
+                false,
+            ),
+        ] {
+            assert_eq!(ended_with(message, state), expected, "{message}");
+        }
+    }
+
+    #[test]
+    fn token_lost_reads_agentic_jobs_own_line() {
+        let warning = "warning: the inference proxy at http://100.114.231.4:18080 no longer knows this run's token (HTTP 401; did it restart?), so the token admits nothing";
+        let quoted = format!("▶ Bash: echo '{warning}' (ok, 0s)");
+        let other = "warning: the inference proxy has given no count of this run's model requests 6 times in a row";
+        for (lines, expected) in [
+            (vec![warning], true),
+            (vec![other, warning], true),
+            (vec![other], false),
+            (vec![quoted.as_str()], false),
+        ] {
+            let log: String = (lines.iter())
+                .map(|l| format!("2026-10-29T21:30:01.1105672Z {l}\n"))
+                .collect();
+            assert_eq!(token_lost(&log), expected, "{log}");
+        }
+        // A runner's log line begins with its timestamp.
+        assert!(!token_lost(warning));
     }
 
     #[test]
