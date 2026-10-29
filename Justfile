@@ -8,6 +8,15 @@ forge_actions := env("FORGE_ACTIONS", "../actions")
 lint:
     {{ just_executable() }} --justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check
 
+fmt:
+    cargo fmt --all
+
+# CI's rust job: format, clippy, tests. Nothing slow or networked here.
+check:
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo test --workspace --locked
+
 # docs/cli.md, the CLI reference, from the binary's own help; a test
 # fails when the committed copy is stale.
 cli-docs:
