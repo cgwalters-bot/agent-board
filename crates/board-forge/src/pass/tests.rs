@@ -8488,10 +8488,7 @@ fn sweep_with_unreadable_comments_is_stuck() {
     let mut forge = Forge::new(None, false);
     only(
         &mut forge.replay,
-        &[
-            "cgwalters-forge/tracker#446",
-            "cgwalters-forge/tracker#459",
-        ],
+        &["cgwalters-forge/tracker#446", "cgwalters-forge/tracker#459"],
     );
     silent(&mut forge.replay, &[], &[]);
     sweep_issue(&mut forge.replay, &["cgwalters-forge/tracker#459"]);
@@ -8508,7 +8505,10 @@ fn sweep_with_unreadable_comments_is_stuck() {
             entry["answer"] = more.clone();
         }
     }
-    forge.replay.requests.push(json!({"request": page(json!("c")), "answer": more}));
+    forge
+        .replay
+        .requests
+        .push(json!({"request": page(json!("c")), "answer": more}));
     let report = preview(&config(sweep_settings()), &forge.replay);
     assert_eq!(
         sweep_lines(&report),

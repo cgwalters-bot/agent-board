@@ -810,7 +810,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             // Read as public before its run, and no longer: its verdict may
             // hold what the run read there since, so it is not copied here.
             if !self.shown(&found.issue.repository, &issue.repository, &mut read) {
-                left.push(format!("- {name}, not read as public: its verdict is left out"));
+                left.push(format!(
+                    "- {name}, not read as public: its verdict is left out"
+                ));
                 continue;
             }
             // Off the board this pass read, which holds open issues only:
