@@ -8,8 +8,12 @@ agent runs used and cost, by kind, model, repository and item, as
 prints a short table instead (agent-board#441). It is read-only. Unlike the
 [budget tree](pass.md#budget-tree), it counts every run with an agentic-job
 artifact, reviews included, which are no board items: a review's is named
-`agent-run`, a dispatched run's `dispatch-KIND-agent-run`
-(`dispatch-implement-agent-run`, `dispatch-triage-agent-run`, ...).
+`agent-run`, a dispatched run's `dispatch-KIND-agent-run`, for each kind
+the shared agentic-job workflow (`cgwalters-agentic-job.yml` in
+cgwalters-forge/actions, which tracker's dispatch and supervisor workflows
+call) takes: `implement`, `triage`, `research`, `review` and `fix`
+(`DISPATCH_KINDS` in `crates/board-forge/src/cost.rs`). A kind that workflow
+gains later is not counted until `DISPATCH_KINDS` names it too.
 
 The configuration is the [pass's](pass.md#one-configuration-file), from a
 trusted default-branch checkout. Cost reads its `workRepositories`, `follow`
@@ -21,11 +25,14 @@ Actions runs and artifacts.
 For each repository, the completed workflow runs created on the day
 (`actions/runs?created=DATE&status=completed`; GitHub lists at most 1000 for
 one filter, so a day with more is listed in halves of it, down to an hour),
-and, where there are any, the repository's artifacts, all names, newest
-first, back to the first one created before the day began (at most 2000,
-other workflows' artifacts included). Of those, the ones named `agent-run`
-or ending in `-agent-run` count, one per run: where a run has several, the
-shortest name, and of a re-run's same name the newest attempt's. A run with
+and, where there are any, the repository's artifacts of each of the names
+above, one listing per name (`actions/artifacts?name=NAME`), newest first,
+back to the first one created before the day began (at most 2000 a name).
+Not the unfiltered listing: in tracker, with some 17,800 artifacts, it reads
+other workflows' artifacts too, and GitHub answers a page of it with HTTP 500
+now and then, gh and curl as well (agent-board#447). One artifact counts per
+run: where a run has several, the shortest name, and of a re-run's same name
+the newest attempt's. A run with
 such an artifact is downloaded, at most 4 MiB, and only the `summary.json` at
 the top of its zip is read, at most 64 KiB unpacked, stored or deflated. From
 the summary, `tokens` (`input`, `output`, `cache_read`, `cache_write`; a
@@ -33,7 +40,10 @@ missing count is 0), `model`, `repo`, `item`, `outcome`, `duration_s` and
 `workflow`, the last only where nothing else names the run's kind. A run
 whose artifact expired, is too large or has no readable summary is listed under `unread` with the reason, not counted; a request that
 fails, the bounds below or the cache fail the whole day instead, so that a
-report never leaves out a run for a passing reason. A read sends at most 1000
+report never leaves out a run for a passing reason. GitHub's server errors
+(5xx) on a read are retried first, as every GET of the client is: at most 3
+times, 2, 4 and 8 seconds apart, the retries not counted in the bounds
+below. A read sends at most 1000
 requests, the last 5 of them only for publishing, takes at most 10 minutes,
 and sends nothing more once a request is refused under a rate limit.
 
@@ -94,6 +104,11 @@ the reports as its last stage:
 ```json
 "cost": {"hourUtc": 6}
 ```
+
+Nothing is published until the caller's configuration names it: tracker's
+`.github/pass.json` had no `cost` (nor `prices`) on 29 Oct 2026, so its
+passes never ran the stage, their logs have no `cost` line, and tracker has no
+`data` branch (agent-board#447).
 
 From `hourUtc` (0–23) each day, it lists `cost/` on the `data` branch of
 `epics.repository`, one request, and reads and publishes each of the last
