@@ -1391,6 +1391,18 @@ each epic's sub-issues, nested as deep as GitHub nests them. Each item shows its
 of its own runs plus that of its descendants. An epic that sits under another
 epic appears only there. The command is read-only and holds nothing.
 
+An item without its own `Budget ($)` under a parent that has a budget, set or
+derived, gets a share of what the parent leaves unallocated: the parent's
+budget, minus the budgets its children set, minus the cost of the parent's own
+runs, split equally among its children without one, open or closed, and never
+below $0. Such a budget is marked `shared`. An item with no budget and no
+budgeted ancestor shows none. A budgeted item shows its remaining budget,
+`remaining $N`, or `over by $N` once its actual has reached its budget; a
+parent whose children's set budgets exceed its own shows `over-allocated by
+$N`. As actuals are lower bounds, a remaining budget and a share are upper
+bounds. Epics do not share the board's `budget.weeklyUsd`: it is a rate over a
+week, while actuals cover all time.
+
 A run's cost is the `<!-- agentic-job-cost: RUN usd=N partial=B -->` line that
 agentic-job (agentic-job#1945) writes into the run's status comment on its
 target. It is the list price in dollars. An item's own runs are those on the

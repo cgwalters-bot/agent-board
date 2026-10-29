@@ -1,7 +1,8 @@
 //! `agent-board budget` (docs/pass.md#budget-tree, agent-board#281): what
 //! each item under the board's open epics has cost, its own runs' and its
 //! sub-issues', beside the board's weekly budget and each item's
-//! [`BUDGET_FIELD`]. Read-only: nothing is held on it yet.
+//! [`BUDGET_FIELD`], or its share of its parent's budget where it sets none,
+//! and what remains. Read-only: nothing is held on it yet.
 //!
 //! A run's cost is the line agentic-job writes into the run's status comment
 //! on its item or on a pull request that closes it (agentic-job#1945),
@@ -105,15 +106,37 @@ pub struct Item {
 }
 
 impl Item {
-    /// Its own runs' cost and its descendants'.
-    pub fn actual(&self) -> Spend {
-        let own = Spend {
+    /// Its own runs' cost.
+    fn own(&self) -> Spend {
+        Spend {
             // Not `sum`, whose empty sum is -0.0.
             usd: self.runs.values().fold(0.0, |usd, c| usd + c.usd),
             runs: self.runs.len(),
             partial: self.runs.values().any(|c| c.partial),
-        };
-        self.children.iter().map(Item::actual).fold(own, add)
+        }
+    }
+
+    /// Its own runs' cost and its descendants'.
+    pub fn actual(&self) -> Spend {
+        self.children.iter().map(Item::actual).fold(self.own(), add)
+    }
+
+    /// The budget of each child without its own [`BUDGET_FIELD`], given this
+    /// item's `budget`: an equal share of what the children's set budgets and
+    /// this item's own runs leave of it, never below $0; `None` without a
+    /// budget or a child without one.
+    fn share(&self, budget: Option<f64>) -> Option<f64> {
+        let budget = budget?;
+        let unset = self.children.iter().filter(|c| c.budget.is_none()).count();
+        let left = budget - self.allocated() - self.own().usd;
+        // Not `max`, which may keep -0.0.
+        let left = if left > 0.0 { left } else { 0.0 };
+        (unset > 0).then(|| left / unset as f64)
+    }
+
+    /// The sum of its children's set budgets.
+    fn allocated(&self) -> f64 {
+        (self.children.iter().filter_map(|c| c.budget)).fold(0.0, |a, b| a + b)
     }
 
     /// Drops the runs in `seen` from it and its descendants, in the order
@@ -422,8 +445,30 @@ fn actual(spend: Spend) -> String {
     )
 }
 
+/// An item's budget, `shared` where derived from its parent's, and what
+/// remains of it, or `over` once its actual has reached it; then by how much
+/// its children's set budgets exceed it, if they do.
+fn budget_part(item: &Item, budget: f64, shared: bool, spend: Spend) -> String {
+    let shared = if shared { " shared" } else { "" };
+    let remaining = if spend.usd < budget {
+        format!("remaining {}", dollars(budget - spend.usd))
+    } else {
+        format!("over by {}", dollars(spend.usd - budget))
+    };
+    let allocated = item.allocated();
+    let over_allocated = if allocated > budget {
+        format!(", over-allocated by {}", dollars(allocated - budget))
+    } else {
+        String::new()
+    };
+    format!(
+        "budget {}{shared}, {remaining}{over_allocated}, ",
+        dollars(budget)
+    )
+}
+
 /// The tree as lines: the board first, then each item indented below its
-/// parent, with its budget where set.
+/// parent, with its budget where it has one (docs/pass.md#budget-tree).
 pub fn lines(tree: &Tree) -> Vec<String> {
     let total = (tree.epics.iter().map(Item::actual)).fold(Spend::default(), add);
     let budget = tree.weekly_usd.map_or("no weekly budget".into(), |usd| {
@@ -434,25 +479,29 @@ pub fn lines(tree: &Tree) -> Vec<String> {
         actual(total),
         tree.epics.len()
     )];
-    fn walk(item: &Item, depth: usize, out: &mut Vec<String>) {
+    /// `share` is the item's share of its parent's budget, where it has one.
+    fn walk(item: &Item, share: Option<f64>, depth: usize, out: &mut Vec<String>) {
         let spend = item.actual();
         let closed = if item.open { "" } else { ", closed" };
-        let budget = item.budget.map_or(String::new(), |usd| {
-            let over = if spend.usd > usd { ", over" } else { "" };
-            format!("budget {}{over}, ", dollars(usd))
+        let budget = item.budget.or(share);
+        let part = budget.map_or(String::new(), |usd| {
+            budget_part(item, usd, item.budget.is_none(), spend)
         });
         out.push(format!(
-            "{}{}{closed}: {budget}{}",
+            "{}{}{closed}: {part}{}",
             "  ".repeat(depth),
             item.issue.display(),
             actual(spend)
         ));
+        let share = item.share(budget);
         for child in &item.children {
-            walk(child, depth + 1, out);
+            walk(child, share, depth + 1, out);
         }
     }
+    // The weekly budget is a rate and actuals cover all time, so epics do
+    // not share it.
     for epic in &tree.epics {
-        walk(epic, 1, &mut out);
+        walk(epic, None, 1, &mut out);
     }
     out
 }
@@ -683,11 +732,11 @@ mod tests {
             lines(&tree),
             [
                 "board: no weekly budget; actual at least $33.00 (9 run(s)) under 2 open epic(s), all time, at list prices",
-                "  cgwalters-forge/tracker#10: budget $50.00, actual at least $33.00 (9 run(s))",
-                "    cgwalters-forge/agent-board#5, closed: actual $20.50 (4 run(s))",
-                "    cgwalters-forge/agent-board#6: budget $5.00, over, actual at least $12.00 (4 run(s))",
-                "      cgwalters-forge/agent-board#7: actual $6.00 (1 run(s))",
-                "    cgwalters-forge/tracker#11: actual $0.00 (0 run(s))",
+                "  cgwalters-forge/tracker#10: budget $50.00, remaining $17.00, actual at least $33.00 (9 run(s))",
+                "    cgwalters-forge/agent-board#5, closed: budget $22.25 shared, remaining $1.75, actual $20.50 (4 run(s))",
+                "    cgwalters-forge/agent-board#6: budget $5.00, over by $7.00, actual at least $12.00 (4 run(s))",
+                "      cgwalters-forge/agent-board#7: budget $0.00 shared, over by $6.00, actual $6.00 (1 run(s))",
+                "    cgwalters-forge/tracker#11: budget $22.25 shared, remaining $22.25, actual $0.00 (0 run(s))",
                 "  cgwalters-forge/tracker#12: actual $0.00 (0 run(s))",
             ]
         );
@@ -701,6 +750,63 @@ mod tests {
         )
         .unwrap();
         assert!(lines(&tree)[0].starts_with("board: budget $1000.00 a week; "));
+    }
+
+    /// Budgets as set on #10 and #6, and the item lines they print; the
+    /// default, a share after the epic's own spend, one at $0 and one passed,
+    /// is in `tree_sums_runs_with_descendants`.
+    #[test]
+    fn budgets_roll_up_to_children_without_one() {
+        for (epic, sub, expected) in [
+            // The children's set budgets exceed the epic's: no share is left.
+            (
+                json!(50),
+                json!(60),
+                [
+                    "  cgwalters-forge/tracker#10: budget $50.00, remaining $17.00, over-allocated by $10.00, actual at least $33.00 (9 run(s))",
+                    "    cgwalters-forge/agent-board#5, closed: budget $0.00 shared, over by $20.50, actual $20.50 (4 run(s))",
+                    "    cgwalters-forge/agent-board#6: budget $60.00, remaining $48.00, actual at least $12.00 (4 run(s))",
+                    "      cgwalters-forge/agent-board#7: budget $54.00 shared, remaining $48.00, actual $6.00 (1 run(s))",
+                    "    cgwalters-forge/tracker#11: budget $0.00 shared, over by $0.00, actual $0.00 (0 run(s))",
+                    "  cgwalters-forge/tracker#12: actual $0.00 (0 run(s))",
+                ],
+            ),
+            // A smaller epic budget: #5's share is passed.
+            (
+                json!(30),
+                json!(5),
+                [
+                    "  cgwalters-forge/tracker#10: budget $30.00, over by $3.00, actual at least $33.00 (9 run(s))",
+                    "    cgwalters-forge/agent-board#5, closed: budget $12.25 shared, over by $8.25, actual $20.50 (4 run(s))",
+                    "    cgwalters-forge/agent-board#6: budget $5.00, over by $7.00, actual at least $12.00 (4 run(s))",
+                    "      cgwalters-forge/agent-board#7: budget $0.00 shared, over by $6.00, actual $6.00 (1 run(s))",
+                    "    cgwalters-forge/tracker#11: budget $12.25 shared, remaining $12.25, actual $0.00 (0 run(s))",
+                    "  cgwalters-forge/tracker#12: actual $0.00 (0 run(s))",
+                ],
+            ),
+            // No budgets: the output is as before budgets rolled up.
+            (
+                Value::Null,
+                Value::Null,
+                [
+                    "  cgwalters-forge/tracker#10: actual at least $33.00 (9 run(s))",
+                    "    cgwalters-forge/agent-board#5, closed: actual $20.50 (4 run(s))",
+                    "    cgwalters-forge/agent-board#6: actual at least $12.00 (4 run(s))",
+                    "      cgwalters-forge/agent-board#7: actual $6.00 (1 run(s))",
+                    "    cgwalters-forge/tracker#11: actual $0.00 (0 run(s))",
+                    "  cgwalters-forge/tracker#12: actual $0.00 (0 run(s))",
+                ],
+            ),
+        ] {
+            let mut forge = forge();
+            forge.issues.get_mut("cgwalters-forge/tracker#10").unwrap()["budget"] = epic;
+            forge
+                .issues
+                .get_mut("cgwalters-forge/agent-board#6")
+                .unwrap()["budget"] = sub;
+            let tree = read(&forge, &config(json!({}))).unwrap();
+            assert_eq!(lines(&tree)[1..], expected);
+        }
     }
 
     #[test]
