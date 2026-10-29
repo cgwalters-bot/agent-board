@@ -194,10 +194,12 @@ fn reads_and_prices_a_recorded_day() {
     let forge = Forge::new();
     let reader = Reader::new(&forge, None);
     let read = read_day(&reader, &repositories(), day()).unwrap();
-    // Two run listings, two artifact listings and three downloads: the CI
-    // run has no artifact, the fix run's expired, and the listing stops
-    // at the first artifact of the day before.
-    assert_eq!((reader.spent(), forge.downloads.get()), (7, 3));
+    // Two run listings, two artifact listings and four downloads: the CI
+    // run has no agent artifact, the fix run's expired, the review's
+    // `agent-run` is read rather than its longer-named one, the dispatched
+    // runs' `dispatch-KIND-agent-run` are, and the listing stops at the
+    // first artifact of the day before.
+    assert_eq!((reader.spent(), forge.downloads.get()), (8, 4));
     let report = report(day(), read, &prices());
     let expected: Value = serde_json::from_str(&std::fs::read_to_string(REPORT).unwrap()).unwrap();
     assert_eq!(report, expected, "{report:#}");
@@ -353,7 +355,52 @@ fn kinds_come_from_the_workflow_then_the_title() {
             "review",
         ),
     ] {
-        assert_eq!(kind(path, title), expected, "{path} {title:?}");
+        assert_eq!(
+            kind(ARTIFACT, path, title, ""),
+            expected,
+            "{path} {title:?}"
+        );
+    }
+    // A dispatched run's artifact prefix comes first, then the file name and
+    // title, then the summary's workflow.
+    let dispatch = ".github/workflows/dispatch.yml";
+    for (artifact, title, workflow, expected) in [
+        ("dispatch-implement-agent-run", "", "", "implement"),
+        ("dispatch-fix-agent-run", "implement", "branch", "fix"),
+        ("dispatch-triage-agent-run", "", "analysis", "triage"),
+        ("dispatch-planning-agent-run", "", "", "planning"),
+        ("dispatch-agent-run", "fix o/r#1", "branch", "fix"),
+        ("dispatch-agent-run", "", "branch", "implement"),
+        ("dispatch-agent-run", "", "analysis", "triage"),
+        ("dispatch-agent-run", "", "dispatch", "other"),
+        (ARTIFACT, "", "", "other"),
+    ] {
+        assert_eq!(
+            kind(artifact, dispatch, title, workflow),
+            expected,
+            "{artifact} {title:?} {workflow}"
+        );
+    }
+    assert_eq!(
+        kind(ARTIFACT, ".github/workflows/review.yml", "", "branch"),
+        "review"
+    );
+}
+
+#[test]
+fn agent_artifacts_are_named_agent_run_with_or_without_a_prefix() {
+    for (name, expected) in [
+        ("agent-run", true),
+        ("dispatch-implement-agent-run", true),
+        ("dispatch-fix-agent-run", true),
+        // Any prefix: a summary that is no agentic-job run's is unread.
+        ("logs-agent-run", true),
+        ("agent-run-logs", false),
+        ("coverage", false),
+        ("wagent-run", false),
+        ("", false),
+    ] {
+        assert_eq!(is_agent_artifact(name), expected, "{name}");
     }
 }
 
@@ -390,6 +437,8 @@ fn unzips_only_a_bounded_stored_or_deflated_file() {
 #[test]
 fn summaries_without_tokens_are_unread_and_prices_are_checked() {
     let run = json!({"id": 1, "path": ".github/workflows/review.yml", "display_title": ""});
+    let run = &run;
+    let artifact = &json!({"name": ARTIFACT});
     for (summary, expected) in [
         (&b"{"[..], "not JSON"),
         (br#"{"model": "m"}"#, "has no tokens"),
@@ -398,13 +447,14 @@ fn summaries_without_tokens_are_unread_and_prices_are_checked() {
             "tokens.input is not a count",
         ),
     ] {
-        let error = counted(summary, "o/r", &run, "u").unwrap_err();
+        let error = counted(summary, "o/r", run, artifact, "u").unwrap_err();
         assert!(format!("{error:#}").contains(expected), "{error:#}");
     }
     let read = counted(
         br#"{"tokens": {"input": 1}, "repo": "../x", "item": "7"}"#,
         "o/r",
-        &run,
+        run,
+        artifact,
         "u",
     );
     let read = read.unwrap();
@@ -424,7 +474,7 @@ fn summaries_without_tokens_are_unread_and_prices_are_checked() {
         (json!("o/r#9 \u{1b}[2J"), Some("o/r#9 [2J")),
     ] {
         let summary = json!({"tokens": {}, "item": item, "model": "m\u{7}"}).to_string();
-        let read = counted(summary.as_bytes(), "o/r", &run, "u").unwrap();
+        let read = counted(summary.as_bytes(), "o/r", run, artifact, "u").unwrap();
         assert_eq!((read.item.as_deref(), read.model.as_str()), (expected, "m"));
     }
     for (price, ok) in [

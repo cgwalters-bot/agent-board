@@ -6,8 +6,10 @@
 agent runs used and cost, by kind, model, repository and item, as
 `agent-board/cost-day/v1` JSON ([schema](cost-day.schema.json)); `--human`
 prints a short table instead (agent-board#441). It is read-only. Unlike the
-[budget tree](pass.md#budget-tree), it counts every run with an `agent-run`
-artifact, reviews included, which are no board items.
+[budget tree](pass.md#budget-tree), it counts every run with an agentic-job
+artifact, reviews included, which are no board items: a review's is named
+`agent-run`, a dispatched run's `dispatch-KIND-agent-run`
+(`dispatch-implement-agent-run`, `dispatch-triage-agent-run`, ...).
 
 The configuration is the [pass's](pass.md#one-configuration-file), from a
 trusted default-branch checkout. Cost reads its `workRepositories`, `follow`
@@ -19,16 +21,17 @@ Actions runs and artifacts.
 For each repository, the completed workflow runs created on the day
 (`actions/runs?created=DATE&status=completed`; GitHub lists at most 1000 for
 one filter, so a day with more is listed in halves of it, down to an hour),
-and, where there are any, the repository's `agent-run` artifacts, newest
-first, back to the first one created before the day began (at most 2000). A
-run with such an artifact is downloaded, at most 4 MiB, and only the
-`summary.json` at the top of its zip is read, at most 64 KiB unpacked,
-stored or deflated. Of a re-run, the newest attempt's artifact counts. From
+and, where there are any, the repository's artifacts, all names, newest
+first, back to the first one created before the day began (at most 2000,
+other workflows' artifacts included). Of those, the ones named `agent-run`
+or ending in `-agent-run` count, one per run: where a run has several, the
+shortest name, and of a re-run's same name the newest attempt's. A run with
+such an artifact is downloaded, at most 4 MiB, and only the `summary.json` at
+the top of its zip is read, at most 64 KiB unpacked, stored or deflated. From
 the summary, `tokens` (`input`, `output`, `cache_read`, `cache_write`; a
-missing count is 0), `model`, `repo`, `item`, `outcome` and `duration_s`;
-the run's kind comes from its workflow file name and title, not from the
-summary. A run whose artifact expired, is too large or has no readable
-summary is listed under `unread` with the reason, not counted; a request that
+missing count is 0), `model`, `repo`, `item`, `outcome`, `duration_s` and
+`workflow`, the last only where nothing else names the run's kind. A run
+whose artifact expired, is too large or has no readable summary is listed under `unread` with the reason, not counted; a request that
 fails, the bounds below or the cache fail the whole day instead, so that a
 report never leaves out a run for a passing reason. A read sends at most 1000
 requests, the last 5 of them only for publishing, takes at most 10 minutes,
@@ -39,10 +42,15 @@ summary is there is never downloaded again: a later read of the same day costs
 only the listings.
 
 A run's kind is the first of `review`, `implement`, `triage`, `fix`, `planning`
-(`plan`) and `supervisor` (`supervis`) that a word of its workflow file name,
-split at `-`, `_` and `.`, starts with; otherwise the one the first word of
+(`plan`) and `supervisor` (`supervis`) that a word of its artifact's prefix
+(`dispatch-fix` of `dispatch-fix-agent-run`) starts with, else a word of its
+workflow file name, each split at `-`, `_` and `.`, so a review's plain
+`agent-run` from `review.yml` is `review`; otherwise the one the first word of
 its title starts with, as in the pass's `implement OWNER/REPO#N (pool)`;
-otherwise `other`. Its repository
+otherwise, from the summary's `workflow`, `implement` for `branch` and
+`triage` for `analysis` (each of which also serves the other of its pair, fix
+and planning, which only the name or title tells apart); otherwise `other`.
+Its repository
 is the summary's `repo` where that is a repository name, else the one it ran
 in; its item is `REPO#N` for a numeric `item`, else the summary's text.
 
