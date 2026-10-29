@@ -390,7 +390,8 @@ other write steps, forge writes such as comments, labels and merges (stage
 1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues,
 merges, branch updates, review reruns and required-check reruns, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
-and its recovery, and stage 5's Status changes).
+and its recovery, stage 4's released records and alarm issues
+([start failures](#start-failures)), and stage 5's Status changes).
 The unit is a step, not a request: a fix round's claim, marker and dispatch
 are one dispatch, and a stop's label and marker one write. A step is checked
 before its first write and taken whole or held whole; a held step is
@@ -683,14 +684,15 @@ An epic plan may not put a plan block in a body it writes.
 
 The one automatic rerun is meant for infrastructure: a scheduled run that
 failed before the agent's work could succeed or fail on its own (runner lost,
-setup or checkout failed, broker or forge outage; the exact rule is an
-[open question](architecture.md#open-questions)). Until that rule exists,
-[`reruns`](#reruns) re-runs any failed run once, and a second failure is left
-for a person.
+setup or checkout failed, broker or forge outage). With `starts`, a run that
+failed before its agent session started is that, by the rule of
+[start failures](#start-failures); without it, [`reruns`](#reruns) re-runs
+any failed run once, and a second failure is left for a person.
 
 With an accepted implement plan, dispatch precisely that plan once. An invalid
 newest plan does not mean “no plan”; report it, never fall back. Recorded plans
-do not run again, except by the rerun above; an operator/planner
+do not run again, except by the rerun above, or with `starts` once their run
+never reached the agent; an operator/planner
 edit or replacement is needed. Research or
 triage plans explicitly posted on issues remain manual dispatches.
 
@@ -980,6 +982,84 @@ became main; …, so it is rebased onto main -> brought up to date with
 main; …`, one write step, one pull request a base each pass), whose push asks
 the review job for a review against the new base. A conflict is a rebase or
 fix round as before; a head not behind still goes to `needs-human`.
+
+## Start failures
+
+On 29 October every agent run failed for four and a half hours at the same
+step, before the agent session started (agentic-job's `run` said `the run did
+not start: …`, its exit state 4). The pass dispatched three runs into it,
+recorded each plan as dispatched, held those issues for two days, and told
+nobody (agent-board#440). With `starts` set (off unless set; it needs
+`epics.repository` to be `dispatchRepo`, as its issues name that
+repository's runs), stage 4 does three things.
+
+A run failed before its agent started where, in its latest attempt, the
+agent's step (`Run ./.agentic-job-source/run`) failed with an annotation of
+agentic-job's that begins `the run did not start` or `agentic-job run ended
+with exit state 4`, or where that step did not run and the first failed
+job has no failed step (a lost runner), failed at its setup or checkout,
+or failed at a step listed before the agent's. An agent's step that ran
+otherwise, cancelled at a timeout say, had started, whatever failed after
+it. A job of the caller's own that fails at its own steps, such as a
+policy refusal, would fail the same way again, so it is not one. Its first
+error line is that job's first failure annotation, else the job and step,
+and the breaker compares it exactly. Telling costs two reads a run, once a
+pass: its jobs and that job's annotations.
+
+1. **The run is re-run, and its plan not spent.** Stage 4 reads the failed
+   runs of the last day as [reruns](#reruns) does. A candidate's run that
+   failed before its agent started gets the one rerun of
+   [reruns](#reruns), checked as it is there, with or without `reruns`:
+   `run rerun OWNER/REPO#N: its implement run URL failed before the agent
+   started (LINE), so its failed jobs run once more …`. Where the rerun
+   never reached the agent either, an implement plan's dispatch record is
+   released as a refused dispatch's is: the bot edits it to say the run
+   failed before the agent started, without its marker or the error, which
+   readers of the issue's repository may not see. The plan then starts
+   again on a later pass as any undispatched plan does (`hold OWNER/REPO#N:
+   its implement run URL failed before the agent started again after a
+   rerun (LINE), so its record is released and its plan starts again`), one
+   write within `--max-writes`; a preview releases nothing. A triage plan's
+   run is re-run but not released. A run that
+   failed later is left to `reruns` as before. Only the day's failed runs
+   are read, so a run that failed earlier stays spent.
+2. **A breaker.** Before it starts anything, stage 4 reads the caller
+   workflow's newest 20 runs, one request. Where the newest
+   `starts.breakerRuns` (default 3) that ended, across issues and kinds,
+   all failed before the agent started with the same first error line, it
+   starts nothing (`breaker: the newest 3 runs failed before the agent
+   started: LINE (URL, …); stage 4 starts nothing until a run starts
+   cleanly, and probes it from T`). A run in flight neither trips nor
+   clears it. An hour after the newest run read was created or last
+   started (a rerun keeps its creation time), it lets one run start to
+   find out whether the cause is gone (`…; one run starts to probe it`);
+   one that fails the same way keeps it tripped, and the next probe waits
+   another hour. Any run that ends otherwise among those newest,
+   succeeded or failed once its agent started, clears it. Stage 2's fix
+   rounds are not stopped. A breaker that cannot be read holds every start,
+   as an unreadable hold does.
+3. **A stall alarm.** Where stage 4 starts nothing with slots free, stage 2
+   and 3 started nothing either, the newest run was created or started at least
+   `starts.stallAfterMinutes` (default 60) ago, and a candidate was held as
+   `other` or `unreadable` (not a person's hold, nor a wait on a pull request,
+   run, date, overlap or pacing, which end by themselves), it says so
+   (`stall: nothing started since T, with N slot(s) free and M candidate(s)
+   held as unreadable`). A quiet board then does not look like a healthy
+   one.
+
+Each alarm is one issue of the bot's in `epics.repository`, labelled
+`needs-human`, whose body starts with `<!-- agent-board-alarm: breaker -->`
+or `<!-- agent-board-alarm: stall -->`: the breaker's names the error line
+and the runs, the stall's the time and the hold kinds but not the
+candidates, whose repositories may be private. The pass finds them among
+the bot's open issues there, up to three pages of 100 (more is an error,
+`alarm KIND error: …`), files one where it is raised and none is open
+(`alarm breaker: file "…" in OWNER/REPO`), edits its body where the text
+changed (`alarm breaker: update URL`), and closes it as completed once the
+breaker clears or nothing stalls (`alarm stall: close URL, cleared`): each
+one write within `--max-writes`, only with the bot's token, and none in a
+preview. A pass that stops before its candidates (WIP full, no pool, the
+budget, another pass) leaves the stall's issue as it is.
 
 ## Reviews
 
@@ -1558,6 +1638,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
 | `reruns` | Re-run failed required checks once per head, or a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
+| `starts.breakerRuns`, `starts.stallAfterMinutes` | Re-run a stage 4 run that failed before its agent started and leave its plan unspent; stop starting where this many (2–10) of the newest ended runs failed so with the same first error line; raise an alarm where nothing started for this many minutes (10–10080) with slots free, see [start failures](#start-failures); needs `epics.repository` to be `dispatchRepo`; `3`, `60`; section absent (off) |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage.url`; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
 | `budget.harnessRepositories` | Exact repositories of the harness, against which `budget --split` reports upstream work's share of spend, see [budget tree](#budget-tree); no duplicates; needs neither `weeklyUsd` nor `usage.url`; absent, the split is not reported |

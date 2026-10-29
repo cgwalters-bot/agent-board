@@ -3794,6 +3794,584 @@ fn apply_reruns_a_failed_run_once() {
     }
 }
 
+/// What agentic-job's `run` said in the outage of agent-board#440.
+const NOT_STARTED: &str = "the run did not start: runner-sandbox cannot run podman";
+
+/// The caller's newest runs as [`Scheduler::guard`] lists them, and the
+/// bot's open issues in tracker, where its alarms are, `alarms`.
+fn newest_runs(replay: &mut Replay, runs: Vec<Value>, alarms: Vec<Value>) {
+    let get = |url: String, body: Value| json!({"request": {"get": url}, "answer": {"status": 200, "body": body}});
+    let runs_url = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/runs?per_page=20"
+    );
+    let runs = json!({"total_count": runs.len(), "workflow_runs": runs});
+    replay.requests.push(get(runs_url, runs));
+    let issues = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/issues?state=open&creator=cgwalters-bot&sort=created&direction=desc&per_page=100&page=1"
+    );
+    replay.requests.push(get(issues, alarms.into()));
+}
+
+/// An Actions job of the caller's run named `name`, its steps `names`
+/// ended as `conclusions` say ("" for not at all), failed where `failed`.
+fn job(name: &str, names: &[&str], conclusions: &[&str], failed: bool) -> Value {
+    let steps: Vec<Value> = (names.iter().zip(conclusions))
+        .map(|(name, conclusion)| match *conclusion {
+            "" => json!({"name": name, "conclusion": null}),
+            _ => json!({"name": name, "conclusion": conclusion}),
+        })
+        .collect();
+    let conclusion = if failed { "failure" } else { "success" };
+    json!({"name": name, "conclusion": conclusion, "steps": steps})
+}
+
+/// agentic-job's agent job, its steps ended as `conclusions` say, the
+/// agent's last; failed unless the agent's step succeeded.
+fn agent_job(conclusions: [&str; 4]) -> Value {
+    let names = [
+        "Set up job",
+        "Run actions/checkout",
+        "Check inference proxy reachability",
+        starts::AGENT_STEP,
+    ];
+    job(
+        "run / agent",
+        &names,
+        &conclusions,
+        conclusions[3] != "success",
+    )
+}
+
+/// The agent job, failed at the agent's step.
+fn agent_failed() -> Vec<Value> {
+    vec![agent_job(["success", "success", "success", "failure"])]
+}
+
+/// Run `id`'s jobs as [`Scheduler::before_agent`] reads them: the profile
+/// job passed, then `jobs`, the first that failed with the annotation
+/// `message`.
+fn failed_at(replay: &mut Replay, id: u64, jobs: Vec<Value>, message: &str) {
+    let get = |url: String, body: Value| json!({"request": {"get": url}, "answer": {"status": 200, "body": body}});
+    let repo = format!("{API_ROOT}repos/cgwalters-forge/tracker");
+    let check = id + 1;
+    let mut all = vec![json!({"name": "profile", "conclusion": "success", "steps": []})];
+    all.extend(jobs);
+    if let Some(failed) = all.iter_mut().find(|j| j["conclusion"] == "failure") {
+        failed["check_run_url"] = format!("{repo}/check-runs/{check}").into();
+    }
+    let jobs = json!({"total_count": all.len(), "jobs": all});
+    let url = format!("{repo}/actions/runs/{id}/jobs?per_page={JOBS_PER_PAGE}");
+    replay.requests.push(get(url, jobs));
+    let annotations = json!([
+        {"annotation_level": "failure", "message": message},
+        {"annotation_level": "failure", "message": "Process completed with exit code 4."},
+    ]);
+    let url = format!("{repo}/check-runs/{check}/annotations?per_page=50");
+    replay.requests.push(get(url, annotations));
+}
+
+/// A run of the caller's that ended with `conclusion`, created `minutes`
+/// before the recording.
+fn ended_run(replay: &Replay, id: u64, minutes: i64, conclusion: &str) -> Value {
+    let created = (replay.now - time::Duration::minutes(minutes)).format(&Rfc3339);
+    json!({"id": id, "status": "completed", "conclusion": conclusion, "run_attempt": 1,
+        "created_at": created.unwrap(), "display_title": format!("implement o/r#{id} (claude)"),
+        "html_url": format!("https://github.com/cgwalters-forge/tracker/actions/runs/{id}")})
+}
+
+/// An open alarm issue of the bot's in tracker, number 77, of `kind`.
+fn alarm_issue(kind: &str) -> Value {
+    json!({"number": 77, "html_url": "https://github.com/cgwalters-forge/tracker/issues/77",
+        "body": format!("<!-- agent-board-alarm: {kind} -->\nAn older text.")})
+}
+
+/// The writes to tracker's issue 77, or that file an issue there.
+fn alarm_writes(forge: &Forge) -> Vec<(String, Value)> {
+    let issues = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues");
+    (forge.writes.borrow().iter())
+        .filter(|(_, u, _)| *u == issues || *u == format!("{issues}/77"))
+        .map(|(m, _, b)| (m.clone(), b.clone()))
+        .collect()
+}
+
+#[test]
+fn apply_reruns_and_releases_runs_that_never_started() {
+    // tracker#468's implement plan was dispatched as run 39718949900.
+    const ID: u64 = 39718949900;
+    let url = format!("https://github.com/cgwalters-forge/tracker/actions/runs/{ID}");
+    let checkout = || vec![agent_job(["success", "failure", "skipped", "skipped"])];
+    // A runner lost before the agent's step: no step failed.
+    let lost_runner = || vec![agent_job(["success", "success", "", ""])];
+    // At its timeout the agent's step is cancelled: it had started.
+    let timed_out = || vec![agent_job(["success", "success", "success", "cancelled"])];
+    let policy = || {
+        let names = ["Set up job", "Run policy"];
+        vec![job("run / policy", &names, &["success", "failure"], true)]
+    };
+    // The agent ran; the apply job's runner then failed to set up.
+    let after = || {
+        let names = ["Set up job", "Run apply"];
+        let apply = job("run / apply", &names, &["failure", "skipped"], true);
+        vec![agent_job(["success"; 4]), apply]
+    };
+    let lost = "fatal: couldn't find remote ref main";
+    let state_4 = "agentic-job run ended with exit state 4";
+    let quoted = "the agent said: the run did not start";
+    let rerun = format!(
+        "run rerun cgwalters-forge/tracker#468: its implement run {url} failed before the agent started ({NOT_STARTED}), so its failed jobs run once more pool=claude run={url}"
+    );
+    let released = |why: &str| {
+        format!(
+            "hold cgwalters-forge/tracker#468: its implement run {url} failed before the agent started again after a rerun ({why}), so its record is released and its plan starts again"
+        )
+    };
+    let held = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already".to_owned();
+    let again = format!(
+        "hold cgwalters-forge/tracker#468: its implement run {url} ended (failure) again after a rerun"
+    );
+    let starts = json!({"starts": {}});
+    // Name, settings, the run's attempt, where it failed and why, the line,
+    // the reruns and the records released.
+    type Case<'a> = (
+        &'a str,
+        Value,
+        u64,
+        (Vec<Value>, &'a str),
+        String,
+        usize,
+        usize,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "a run that never started is re-run, reruns or not",
+            starts.clone(),
+            1,
+            (agent_failed(), NOT_STARTED),
+            rerun,
+            1,
+            0,
+        ),
+        (
+            "its rerun never started either: its plan is not spent",
+            starts.clone(),
+            2,
+            (agent_failed(), NOT_STARTED),
+            released(NOT_STARTED),
+            0,
+            1,
+        ),
+        (
+            "nor where agentic-job ended with exit state 4",
+            starts.clone(),
+            2,
+            (agent_failed(), state_4),
+            released(state_4),
+            0,
+            1,
+        ),
+        (
+            "nor where a step before the agent's failed",
+            starts.clone(),
+            2,
+            (checkout(), lost),
+            released(lost),
+            0,
+            1,
+        ),
+        (
+            "nor where the runner was lost before it",
+            starts.clone(),
+            2,
+            (lost_runner(), "The runner has received a shutdown signal."),
+            released("The runner has received a shutdown signal."),
+            0,
+            1,
+        ),
+        (
+            "an agent that started and failed is not re-run without reruns",
+            starts.clone(),
+            1,
+            (agent_failed(), "agentic-job run ended with exit state 2"),
+            held.clone(),
+            0,
+            0,
+        ),
+        (
+            "nor is one that quotes agentic-job",
+            starts.clone(),
+            2,
+            (agent_failed(), quoted),
+            held.clone(),
+            0,
+            0,
+        ),
+        (
+            "nor one cancelled at its timeout",
+            starts.clone(),
+            2,
+            (
+                timed_out(),
+                "The job has exceeded the maximum execution time",
+            ),
+            held.clone(),
+            0,
+            0,
+        ),
+        (
+            "nor one whose later job failed to set up",
+            starts.clone(),
+            2,
+            (after(), lost),
+            held.clone(),
+            0,
+            0,
+        ),
+        (
+            "nor a refusal at the caller's own steps",
+            starts.clone(),
+            1,
+            (policy(), "the task is outside the bounds"),
+            held,
+            0,
+            0,
+        ),
+        (
+            "with reruns, an agent that failed again waits for a person",
+            json!({"starts": {}, "reruns": true}),
+            2,
+            (agent_failed(), "agentic-job run ended with exit state 2"),
+            again,
+            0,
+            0,
+        ),
+    ];
+    for (name, settings, attempt, (jobs, message), expected, reruns, releases) in cases {
+        let config = config(settings);
+        let mut forge = Forge::new(None, false);
+        let mut run = ended_run(&forge.replay, ID, 60, "failure");
+        run["run_attempt"] = attempt.into();
+        run["display_title"] = "implement cgwalters-forge/tracker#468 (claude)".into();
+        failed(&mut forge.replay, vec![run]);
+        failed_at(&mut forge.replay, ID, jobs, message);
+        newest_runs(&mut forge.replay, vec![], vec![]);
+        // Without the recording's open tracker#889, which overlaps it.
+        let pulls = (forge.replay.requests.iter_mut())
+            .filter_map(|e| e["answer"].pointer_mut("/data/repository/pullRequests/nodes"))
+            .filter_map(Value::as_array_mut);
+        for nodes in pulls {
+            nodes.retain(|n| n["number"] != 889);
+        }
+        text_468(&mut forge.replay, "Work.");
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = (report.lines.iter())
+            .find(|l| l.contains("cgwalters-forge/tracker#468:"))
+            .map_or("", String::as_str);
+        assert!(line.starts_with(&expected), "{name}: {:#?}", report.lines);
+        let writes = forge.writes.borrow();
+        let sent = (writes.iter())
+            .filter(|(_, u, _)| u.ends_with(&format!("/runs/{ID}/rerun-failed-jobs")))
+            .count();
+        assert_eq!(sent, reruns, "{name}");
+        let record = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/comments/6332216967");
+        let edits: Vec<&Value> = (writes.iter())
+            .filter(|(m, u, _)| m == "PATCH" && *u == record)
+            .map(|(_, _, b)| b)
+            .collect();
+        assert_eq!(edits.len(), releases, "{name}");
+        for edit in edits {
+            let body = text(edit, "/body");
+            // No marker, so the plan is no longer recorded; no error, which
+            // the issue's readers may not see.
+            assert!(!body.contains("agent-board-dispatch"), "{name}: {body}");
+            assert!(!body.contains(message), "{name}: {body}");
+            assert!(body.ends_with("A later dispatch may take it."), "{body}");
+        }
+        drop(writes);
+        assert!(forge.dispatches().iter().all(|d| !d.ends_with("#468")));
+    }
+}
+
+#[test]
+fn apply_stops_starting_while_runs_never_start() {
+    let starts = json!({"starts": {}});
+    let urls = |ids: &[u64]| -> String {
+        let urls: Vec<String> = (ids.iter())
+            .map(|id| format!("https://github.com/cgwalters-forge/tracker/actions/runs/{id}"))
+            .collect();
+        urls.join(", ")
+    };
+    let said = format!(
+        "breaker: the newest 3 runs failed before the agent started: {NOT_STARTED} ({})",
+        urls(&[501, 502, 503])
+    );
+    let stopped = format!(
+        "{said}; stage 4 starts nothing until a run starts cleanly, and probes it from 2026-10-23T16:"
+    );
+    let probe = format!("{said}; one run starts to probe it");
+    // A run in flight newer than the three, or the newest of them re-run
+    // since.
+    const FLYING: &str = "flying";
+    const RESTARTED: &str = "restarted";
+    // How long ago the newest of the three was created, what else of them
+    // differs (a run's id and its message), what else happened, the open
+    // alarm issues, the breaker's line, the starts and the alarm writes.
+    type Case<'a> = (
+        &'a str,
+        i64,
+        Option<(u64, &'a str)>,
+        &'a str,
+        Vec<Value>,
+        Option<String>,
+        bool,
+        Vec<(&'a str, &'a str)>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "three that never started stop the starts and file the alarm",
+            10,
+            None,
+            "",
+            vec![],
+            Some(stopped.clone()),
+            false,
+            vec![(
+                "POST",
+                "<!-- agent-board-alarm: breaker -->\nThe board pass stopped",
+            )],
+        ),
+        (
+            "an open alarm is updated",
+            10,
+            None,
+            "",
+            vec![alarm_issue("breaker")],
+            Some(stopped.clone()),
+            false,
+            vec![(
+                "PATCH",
+                "<!-- agent-board-alarm: breaker -->\nThe board pass stopped",
+            )],
+        ),
+        (
+            "a run in flight does not clear it",
+            10,
+            None,
+            FLYING,
+            vec![],
+            Some(stopped.clone()),
+            false,
+            vec![("POST", "<!-- agent-board-alarm: breaker -->")],
+        ),
+        (
+            "an hour after the newest, one run starts to probe it",
+            70,
+            None,
+            "",
+            vec![alarm_issue("breaker")],
+            Some(probe),
+            true,
+            vec![("PATCH", "<!-- agent-board-alarm: breaker -->")],
+        ),
+        (
+            "a run re-run since is as new as its rerun: no probe yet",
+            70,
+            None,
+            RESTARTED,
+            vec![],
+            Some(stopped),
+            false,
+            vec![("POST", "<!-- agent-board-alarm: breaker -->")],
+        ),
+        (
+            "an agent that started clears it, and its alarm",
+            10,
+            Some((501, "agentic-job run ended with exit state 2")),
+            "",
+            vec![alarm_issue("breaker")],
+            None,
+            true,
+            vec![("PATCH", "closed")],
+        ),
+        (
+            "as do different errors",
+            10,
+            Some((503, "the run did not start: the broker is down")),
+            "",
+            vec![alarm_issue("breaker")],
+            None,
+            true,
+            vec![("PATCH", "closed")],
+        ),
+        (
+            "with nothing open, nothing is written",
+            10,
+            Some((502, "agentic-job run ended with exit state 2")),
+            "",
+            vec![],
+            None,
+            true,
+            vec![],
+        ),
+    ];
+    for (name, minutes, other, extra, alarms, expected, started, writes) in cases {
+        let mut forge = Forge::new(None, false);
+        let replay = &mut forge.replay;
+        let mut runs = Vec::new();
+        if extra == FLYING {
+            let mut run = ended_run(replay, 504, 5, "failure");
+            run["status"] = "in_progress".into();
+            run["conclusion"] = Value::Null;
+            runs.push(run);
+        }
+        for (n, id) in [501, 502, 503].into_iter().enumerate() {
+            let mut run = ended_run(replay, id, minutes + 10 * n as i64, "failure");
+            if extra == RESTARTED && id == 501 {
+                let started = (replay.now - time::Duration::minutes(5)).format(&Rfc3339);
+                run["run_started_at"] = started.unwrap().into();
+                run["run_attempt"] = 2.into();
+            }
+            runs.push(run);
+            let message = match other {
+                Some((other, message)) if other == id => message,
+                _ => NOT_STARTED,
+            };
+            failed_at(replay, id, agent_failed(), message);
+        }
+        newest_runs(replay, runs, alarms);
+        failed(replay, vec![]);
+        let report = apply(&forge, &config(starts.clone()));
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = report.lines.iter().find(|l| l.starts_with("breaker"));
+        match &expected {
+            Some(expected) => assert!(
+                line.is_some_and(|l| l.starts_with(expected.as_str())),
+                "{name}: {:#?}",
+                report.lines
+            ),
+            None => assert_eq!(line, None, "{name}"),
+        }
+        let starts = report.lines.iter().filter(|l| l.starts_with("start "));
+        match (started, expected.is_some()) {
+            // A probe takes one slot.
+            (true, true) => assert_eq!(starts.count(), 1, "{name}"),
+            (true, false) => assert!(starts.count() > 1, "{name}"),
+            (false, _) => assert_eq!(starts.count(), 0, "{name}"),
+        }
+        let written = alarm_writes(&forge);
+        assert_eq!(written.len(), writes.len(), "{name}: {written:#?}");
+        for ((method, body), (expected, has)) in written.iter().zip(&writes) {
+            assert_eq!(method, expected, "{name}");
+            let shown = body["body"]
+                .as_str()
+                .map_or(body.to_string(), str::to_owned);
+            assert!(shown.contains(has), "{name}: {body:#}");
+        }
+        if let Some(("POST", _)) = writes.first() {
+            assert_eq!(written[0].1["labels"], json!(["needs-human"]), "{name}");
+        }
+    }
+}
+
+#[test]
+fn apply_raises_an_alarm_when_nothing_starts() {
+    // tracker#446 alone, its closing pull requests more than the board's
+    // page and not read after: held as unreadable, which the pass does not
+    // expect to end by itself.
+    let unread = |replay: &mut Replay| {
+        only(replay, &["cgwalters-forge/tracker#446"]);
+        let nodes = (replay.requests.iter_mut())
+            .filter_map(|e| e["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
+            .filter_map(Value::as_array_mut)
+            .flatten();
+        for node in nodes.filter(|n| n["content"]["number"] == 446) {
+            node["content"]["closedByPullRequestsReferences"]["totalCount"] = 12.into();
+        }
+    };
+    type Edit = fn(&mut Replay);
+    let none: Edit = |_| {};
+    // Name, settings, the minutes since the newest run, the edit, the open
+    // alarm issues, whether it stalls and the alarm writes.
+    type Case<'a> = (&'a str, Value, i64, Edit, Vec<Value>, bool, Vec<&'a str>);
+    let cases: Vec<Case> = vec![
+        (
+            "nothing started for an hour with an unexplained hold",
+            json!({"starts": {}}),
+            61,
+            unread,
+            vec![],
+            true,
+            vec!["POST"],
+        ),
+        (
+            "an open alarm is updated to say so",
+            json!({"starts": {}}),
+            61,
+            unread,
+            vec![alarm_issue("stall")],
+            true,
+            vec!["PATCH"],
+        ),
+        (
+            "a run started since",
+            json!({"starts": {}}),
+            30,
+            unread,
+            vec![alarm_issue("stall")],
+            false,
+            vec!["PATCH"],
+        ),
+        (
+            "a longer wait",
+            json!({"starts": {"stallAfterMinutes": 120}}),
+            61,
+            unread,
+            vec![],
+            false,
+            vec![],
+        ),
+        (
+            "candidates that start",
+            json!({"starts": {}}),
+            61,
+            none,
+            vec![],
+            false,
+            vec![],
+        ),
+    ];
+    for (name, settings, minutes, edit, alarms, stalled, writes) in cases {
+        let mut forge = Forge::new(None, false);
+        edit(&mut forge.replay);
+        let run = ended_run(&forge.replay, 501, minutes, "success");
+        newest_runs(&mut forge.replay, vec![run], alarms);
+        failed(&mut forge.replay, vec![]);
+        let report = apply(&forge, &config(settings));
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let line = report.lines.iter().find(|l| l.starts_with("stall"));
+        assert_eq!(line.is_some(), stalled, "{name}: {:#?}", report.lines);
+        if let Some(line) = line {
+            assert!(
+                line.ends_with("free and 1 candidate(s) held as unreadable"),
+                "{line}"
+            );
+        }
+        let written = alarm_writes(&forge);
+        let methods: Vec<&str> = written.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(methods, writes, "{name}: {written:#?}");
+        for (method, body) in &written {
+            match method.as_str() {
+                "POST" => assert!(
+                    text(body, "/body").starts_with("<!-- agent-board-alarm: stall -->"),
+                    "{body:#}"
+                ),
+                _ if stalled => assert!(text(body, "/body").contains("held as unreadable")),
+                _ => assert_eq!(body["state"], "closed", "{name}"),
+            }
+        }
+    }
+}
+
 /// The board as a pass with `revisit` reads it: each recorded page again
 /// under [`board_query`]'s query with `updatedAt`, an item `days` (by
 /// `OWNER/REPO#N`) before the recording and the rest a day before, and
@@ -6605,6 +7183,20 @@ fn config_table() {
             json!({"overlap": {"staleDraftHour": 4}}),
             "unknown field `staleDraftHour`",
         ),
+        (json!({"starts": {}}), "starts needs epics"),
+        (
+            json!({"starts": {}, "epics": {"repository": "o/epics"}}),
+            "starts needs epics.repository to be dispatchRepo",
+        ),
+        (
+            json!({"starts": {"breakerRuns": 1}, "epics": {"repository": "O/Caller"}}),
+            "starts breakerRuns is not 2 to 10",
+        ),
+        (
+            json!({"starts": {"stallAfterMinutes": 5}, "epics": {"repository": "O/Caller"}}),
+            "starts stallAfterMinutes is not 10 to 10080",
+        ),
+        (json!({"starts": {"stall": 60}}), "unknown field `stall`"),
         (
             json!({"revisit": {"perPass": 1, "afterDays": 14}}),
             "revisit needs triage",

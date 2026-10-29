@@ -408,6 +408,10 @@ pub struct Config {
     /// and stage 4's triage and implement runs ([`Scheduler::rerun`]).
     #[serde(default)]
     pub reruns: bool,
+    /// Off unless set: a stage 4 run that failed before its agent started is
+    /// re-run once and leaves its plan unspent, a run of such failures stops
+    /// stage 4's starts, and a stall raises an alarm ([`starts`]).
+    pub starts: Option<starts::Starts>,
     /// Off unless set: the operator's direction, an issue whose body every
     /// brief the pass writes starts with ([`Scheduler::direction`]).
     pub direction: Option<DirectionAt>,
@@ -816,6 +820,9 @@ impl Config {
         }
         if let Some(maintain) = &self.maintain {
             maintain.check(self)?;
+        }
+        if let Some(starts) = &self.starts {
+            starts.check(self)?;
         }
         if let Some(overlap) = &self.overlap {
             ensure!(
@@ -1882,6 +1889,8 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         ended: RefCell::new(BTreeMap::new()),
         ignored: RefCell::default(),
         failed: BTreeMap::new(),
+        infra: RefCell::new(BTreeMap::new()),
+        alarms: None,
         direction: None,
         reviewing: 0,
     };
@@ -2157,8 +2166,14 @@ struct Scheduler<'a, C> {
     /// which its hold snapshot shows as `overlap-ignored`.
     ignored: RefCell<Vec<String>>,
     /// The caller's runs that failed in the last day, by id, where
-    /// [`Config::reruns`] is set ([`Self::failed_runs`]).
+    /// [`Config::reruns`] or [`Config::starts`] is set ([`Self::failed_runs`]).
     failed: BTreeMap<u64, Value>,
+    /// Whether each failed run looked at failed before its agent started,
+    /// and its first error line, by id ([`Self::before_agent`]).
+    infra: RefCell<BTreeMap<u64, Option<String>>>,
+    /// With [`Config::starts`], the bot's open alarm issues, read once a
+    /// pass ([`Self::alarms`]).
+    alarms: Option<BTreeMap<String, starts::Alarm>>,
     /// With [`Config::direction`], the operator's direction and its hash, read
     /// once a pass; none where it could not be trusted, which was reported.
     direction: Option<(String, String)>,
@@ -2345,7 +2360,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.board = Some(None);
             return board.map(|_| ());
         };
-        if config.reruns {
+        if config.reruns || config.starts.is_some() {
             match self.failed_runs(&target) {
                 Ok(failed) => self.failed = failed,
                 Err(error) => {
@@ -2363,8 +2378,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         }
+        let Some((free, newest)) = self.guarded(&target, wip - active) else {
+            self.board = Some(Some(board));
+            return Ok(());
+        };
+        let holds = self.report.holds.len();
         let candidates = self.candidates(&board);
-        let (free, started) = self.start(&candidates, &board, &mut slots, wip - active, context);
+        let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
         let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
         let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
         let taken = started + revisited + swept;
@@ -2375,6 +2395,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if taken == 0 && free > 0 {
             self.line(format!("idle: {free} slot(s) free and nothing started"));
         }
+        self.stall(holds, (earlier, taken, free), newest);
         Ok(())
     }
 
@@ -3094,10 +3115,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 None => (plan, id, None, None),
                 Some((_, record)) => {
                     // The run this plan's record names, where it failed: re-run
-                    // once its plan's item passes a start's checks below.
-                    let Some(run) =
-                        epics::record_run(&record.body).and_then(|r| self.failed.get(&r))
-                    else {
+                    // once its plan's item passes a start's checks below, with
+                    // `reruns`, or with `starts` where it failed before its
+                    // agent started.
+                    let run = epics::record_run(&record.body).and_then(|r| self.failed.get(&r));
+                    let early = match run.filter(|_| config.starts.is_some()) {
+                        Some(run) => self.before_agent(&target.caller, run)?,
+                        None => None,
+                    };
+                    let Some(run) = run.filter(|_| config.reruns || early.is_some()) else {
                         if plan.kind == "triage" && config.triage_follow_up_days > 0 {
                             return self.follow_up(read, (from, record), (snapshot, target, slots));
                         }
@@ -3112,7 +3138,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         let why = format!("plan {id}'s batched run failed; it is re-run by hand");
                         return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
                     }
-                    (plan, id, None, Some(run))
+                    // Its rerun never reached the agent either: the plan
+                    // was not spent.
+                    if let Some(first) = &early
+                        && plan.kind == "implement"
+                        && run["run_attempt"].as_u64() != Some(1)
+                    {
+                        return self.release(issue, (from, record), run, first);
+                    }
+                    (plan, id, None, Some((run, early)))
                 }
             }
         };
@@ -3130,6 +3164,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let waiver = self.waiver(&facts, board);
         // A triage run changes no files, and is checked as a triage start.
+        let failed = failed.as_ref().map(|(run, early)| (*run, early.as_deref()));
         if let Some(run) = failed.filter(|_| plan.kind != "implement") {
             if plan.kind != "triage" || dest != *issue {
                 let why = format!(
@@ -3271,12 +3306,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// pacing on the pool its title names, `--max-dispatch`, an implement
     /// plan's overlap check and a lease. A run that failed again after that,
     /// or a stacked plan's, whose base may have moved, holds the issue for a
-    /// person.
+    /// person. `early` is its first error line where it failed before its
+    /// agent started ([`Self::before_agent`]).
     fn rerun(
         &self,
         (issue, dest): (&ItemRef, &ItemRef),
         plan: &plan::JobPlan,
-        run: &Value,
+        (run, early): (&Value, Option<&str>),
         slots: &Slots,
         (snapshot, target, waiver): (Option<&Value>, &Target, &overlap::Waiver),
     ) -> Result<Step> {
@@ -3284,7 +3320,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let title = text(run, "/display_title");
         let kind = run_title(title).map_or("dispatched", |(kind, _, _)| kind);
         let url = format!("https://{DEFAULT_HOST}/{}/actions/runs/{id}", target.caller);
-        let ended = format!("its {kind} run {url} ended ({})", text(run, "/conclusion"));
+        let ended = match early {
+            Some(first) => {
+                format!("its {kind} run {url} failed before the agent started ({first})")
+            }
+            None => format!("its {kind} run {url} ended ({})", text(run, "/conclusion")),
+        };
         if run["run_attempt"].as_u64() != Some(1) {
             let why = format!("{ended} again after a rerun, so it waits for a person");
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
@@ -4521,6 +4562,7 @@ pub mod holds;
 pub mod lease;
 pub mod maintain;
 pub mod revisit;
+pub mod starts;
 mod status;
 pub mod sweep;
 mod usage;
