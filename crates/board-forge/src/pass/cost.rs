@@ -202,7 +202,7 @@ mod tests {
         assert_eq!(
             lines,
             [format!(
-                "cost: published {} to cgwalters-forge/tracker@data as commit1 (24 requests)",
+                "cost: published {} to cgwalters-forge/tracker@data as commit1 (25 requests)",
                 days.join(", ")
             )]
         );
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(paths, days);
         let last: Value =
             serde_json::from_str(tree["tree"][6]["content"].as_str().unwrap()).unwrap();
-        assert_eq!(last["totals"]["usd"], 0.96);
+        assert_eq!(last["totals"]["usd"], 1.02);
         assert_eq!(sent[3].2["parents"], json!([]));
         assert_eq!(
             sent[4].2,
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "cost: published cost/2026-10-28.json to cgwalters-forge/tracker@data as commit1 (13 requests)"
+                "cost: published cost/2026-10-28.json to cgwalters-forge/tracker@data as commit1 (14 requests)"
             ]
         );
         let api = "repos/cgwalters-forge/tracker/git";

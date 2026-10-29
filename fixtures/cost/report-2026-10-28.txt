@@ -1,16 +1,18 @@
-cost 2026-10-28: 3 run(s), $0.96 at list prices; 1 unpriced, 1 unread
+cost 2026-10-28: 4 run(s), $1.02 at list prices; 1 unpriced, 1 unread
 kind                                        runs unpriced       tokens        usd
+  fix                                          1        0        12000      $0.06
   implement                                    1        0       570000      $0.87
   review                                       1        1       413800          -
   triage                                       1        0        22000      $0.09
 model                                       runs unpriced       tokens        usd
-  anthropic/claude-x                           2        0       592000      $0.96
+  anthropic/claude-x                           3        0       604000      $1.02
   praxis/gpt-6.1-sol                           1        1       413800          -
 repository                                  runs unpriced       tokens        usd
   cgwalters-forge/agent-board                  1        1       413800          -
   cgwalters-forge/bootc                        1        0       570000      $0.87
-  cgwalters-forge/tracker                      1        0        22000      $0.09
+  cgwalters-forge/tracker                      2        0        34000      $0.15
 top items
   cgwalters-forge/bootc#12                     1        0       570000      $0.87
   cgwalters-forge/tracker#900                  1        0        22000      $0.09
+  cgwalters-forge/tracker#901                  1        0        12000      $0.06
 unpriced praxis/gpt-6.1-sol: 1 run(s), 344000 input, 68000 cache-read, 0 cache-write, 1800 output tokens
