@@ -98,7 +98,7 @@ fn is_name(name: &str) -> bool {
 }
 
 impl Config {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let url = &self.url;
         ensure!(
             matches!(url.scheme(), "http" | "https")
@@ -178,7 +178,7 @@ impl Config {
     }
 
     /// The instance URL as a directory, so joins keep a subpath install.
-    fn base(&self) -> Url {
+    pub(crate) fn base(&self) -> Url {
         let mut base = self.url.clone();
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
@@ -186,7 +186,7 @@ impl Config {
         base
     }
 
-    fn api_root(&self) -> Result<Url> {
+    pub(crate) fn api_root(&self) -> Result<Url> {
         Ok(self.base().join("api/v1/")?)
     }
 }
@@ -216,6 +216,11 @@ pub struct Response {
 pub trait Transport {
     /// GET a JSON body from a URL under the API root.
     fn get(&self, url: &Url) -> Result<Response>;
+
+    /// Mutation is opt-in; existing read transports cannot accidentally write.
+    fn send(&self, _method: &str, _url: &Url, _body: &Value) -> Result<(u16, Value)> {
+        bail!("Forgejo transport does not support writes")
+    }
 }
 
 pub struct Client {
@@ -227,6 +232,7 @@ pub struct Client {
 
 impl Client {
     pub fn from_env(config: &Config) -> Result<Self> {
+        config.validate()?;
         let token = std::env::var(&config.token_env)
             .ok()
             .filter(|t| !t.is_empty())
@@ -241,6 +247,42 @@ impl Client {
 }
 
 impl Transport for Client {
+    fn send(&self, method: &str, url: &Url, body: &Value) -> Result<(u16, Value)> {
+        ensure!(
+            url.as_str().starts_with(self.api.as_str()),
+            "refusing Forgejo token outside configured API root"
+        );
+        ensure!(
+            matches!(method, "POST" | "PUT"),
+            "unsupported Forgejo method"
+        );
+        let request = match method {
+            "POST" => self.agent.post(url.as_str()),
+            "PUT" => self.agent.put(url.as_str()),
+            _ => bail!("unsupported Forgejo method"),
+        };
+        let mut response = request
+            .header("Authorization", &format!("token {}", self.token))
+            .header("Accept", "application/json")
+            .header("User-Agent", "agent-board")
+            .config()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .send_json(body)
+            .map_err(|_| anyhow::anyhow!("Forgejo mutation reply lost; do not retry"))?;
+        let status = response.status().as_u16();
+        let body = if status == 204 {
+            Value::Null
+        } else {
+            response
+                .body_mut()
+                .read_json()
+                .context("decode Forgejo mutation reply; do not retry")?
+        };
+        Ok((status, body))
+    }
+
     fn get(&self, url: &Url) -> Result<Response> {
         ensure!(
             url.as_str().starts_with(self.api.as_str()),

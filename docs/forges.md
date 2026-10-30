@@ -10,12 +10,13 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels | No; [contract](#a-forgejo-pass) only ([#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
+| Forgejo | Issues of configured repositories, fields from labels | Native dispatch/run/lease library adapters; no CLI/pass writes or activation ([#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
-Dispatch itself is a GitHub Actions request today on every forge: agent jobs
-start through one backend interface whose only implementation is
-`workflow_dispatch`, with no status call on its handle ([dispatch](dispatch.md)).
+Existing dispatch callers still use GitHub Actions. The backend boundary also
+offers opt-in native Forgejo start, recovery, active inventory, status, rerun,
+admission, reservation binding and release ([dispatch](dispatch.md#native-forgejo-adapters-not-activated)).
+No scheduler or CLI selects them yet.
 The design's approach to other forges, capability
 negotiation rather than weakened guarantees, is in
 [Rust boundaries](design.md#7-rust-boundaries).
@@ -80,9 +81,11 @@ let a deleted or renamed label widen the board. The write side keeps that.
 
 This is the contract for a second, separate `agent-board pass` that drives a
 Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
-tracker#786). **None of it is built**: the CLI refuses a Forgejo board for
+tracker#786). **The end-to-end pass is not built**: the CLI refuses a Forgejo board for
 everything but the five reads above, nothing writes to Forgejo, and no option
-below turns it on. It is here to be reviewed before the write primitives
+below turns it on. Native dispatch/run/lease primitives implement the sections
+below independently of scheduler wiring; offline tests are not live proof.
+The remaining contract precedes the write primitives
 (#511), dispatch and run adapters (#512), scheduling (#513), epics (#514) and
 live CI (#515) are. [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
@@ -310,6 +313,15 @@ are instead one file a slot, `leases/SLOT.json`, on a branch of the private
 `dispatchRepo`, written through the contents API with the blob `sha` read
 before: a stale `sha` is refused with 409, and an existing path refuses a
 create with 422 ([update.go#L298-L321][fj-contents-sha], [update.go#L388-L391][fj-contents-create]).
+The blob check alone is not CAS. In this pinned version `ChangeRepoFiles`
+clones the old branch, checks its blob SHA, creates a commit with that snapshot
+as parent, then [`TemporaryUploadRepository.Push`][fj-contents-push] performs a
+**non-forced Git push**. The ref update decides the atomic winner: sibling
+commits cannot both fast-forward the branch. A writer cloning after replacement
+instead fails its blob check. The adapter supplies only `branch`, `sha`,
+`content` and `message`: no `last_commit_id`, `new_branch` or force flag that
+could change that argument. Refuse deployments without these guarantees;
+never substitute an unguarded PATCH followed by read-back.
 So of two admits racing for one slot exactly one writes it. A branch that moved
 between the read and the commit fails as 500 ([file.go#L775-L781][fj-contents-errors]):
 that is ambiguous, and the admit reads the slot again rather than assume either
@@ -321,7 +333,12 @@ never comes back for a slow writer to match; a free slot's may, which is
 harmless, as a stale admit that read it free finds it still free. The rest of the
 [lease rules](pass.md#leases) carry over: never delete, one lease a run, expiry
 after 24 hours, a run that cannot be read keeps its lease until expiry, and the
-send-boundary reservation with `run: 0` bound by the 201's run id.
+send-boundary reservation with `run: 0` bound by the confirmed run id.
+The library requires preprovisioned free slots and refuses missing ones; it
+never creates a branch or deletes a slot. Unknown write outcomes hold without
+retry, rather than treating read-back as proof of winning ownership. Race and
+expiry tests use an offline conditional-write model; the container proof
+remains #515.
 
 ### The caller
 
@@ -412,6 +429,7 @@ GitHub reads ([architecture](architecture.md#async-forge-io)).
 [fj-contents-sha]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/repository/files/update.go#L298-L321
 [fj-contents-create]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/repository/files/update.go#L388-L391
 [fj-contents-errors]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/file.go#L775-L781
+[fj-contents-push]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/repository/files/temp_repo.go
 
 ## GitLab
 
