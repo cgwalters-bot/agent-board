@@ -534,10 +534,10 @@ check and apply; that boundary is for what agents produce. Their guards are
 preview by default, caps per pass, and the replay gate below. The caps are
 two flags, unset by default: `--max-dispatch N` bounds the agent runs a pass
 starts, stage 2's fix, rebase, continuation and answer rounds and their
-reruns and its [review](#reviews) starts, stage 3's planning run and stage 4's starts and reruns together, and `--max-writes N` bounds its
+reruns and its [review](#reviews) starts and reruns, stage 3's planning run and stage 4's starts and reruns together, and `--max-writes N` bounds its
 other write steps, forge writes such as comments, labels and merges (stage
 1's usage comment, stage 2's comments, labels, retitles, retargets, enqueues,
-merges, branch updates, review reruns and required-check reruns, stage 3's
+merges, branch updates, review reruns without `pr.reviewPools` and required-check reruns, stage 3's
 epic apply, a step for its receipt and each action that writes, taken whole,
 and its recovery, stage 4's released records and alarm issues
 ([start failures](#start-failures)), and stage 5's Status changes).
@@ -673,7 +673,8 @@ ranked parent. Priority is the only readiness ordering; there is no Ready step.
 waiting, planning, triage, implement, review and fix runs. Include starts earlier
 in this pass even if the API has not listed them. With `pr.reviewPools`,
 the review job's runs the pass started in the followed repositories count
-while they run and their head waits for them ([reviews](#reviews)). A pre-existing excess is not
+until they complete, whatever head they review, and stage 2 starts and
+re-runs reviews only within `wip` ([reviews](#reviews)). A pre-existing excess is not
 cancelled; it leaves no new slots. PR repair retains its own existing bounds;
 if it consumes/exceeds WIP, later stages start nothing. No planning exemption.
 GitHub can leave a run `in_progress` after every job has completed
@@ -1116,7 +1117,8 @@ cancelled too.
   after a rerun, …`, and where ten were read, so that an older one re-run may
   have been left out, `needs-human: … which has more runs than the 10 read
   for an earlier rerun; …`. With `pr.reviewPools` it takes the runs the
-  pass started instead ([reviews](#reviews)).
+  pass started instead, and is a dispatch within `--max-dispatch` and
+  `wip` ([reviews](#reviews)).
 * **Required checks, stage 2 (agent-board#413).** Before spending a fix round
   or stopping the bot's pull request from its fork, rerun the Actions runs
   named by its failed checks once per head. This uses the existing failed-check
@@ -1427,31 +1429,87 @@ WIP: on 28 October about 95 reviews took a subscription to 79% of its weekly
 limit with six days left (agent-board#439). With `pr.reviewPools` (off
 unless set), stage 2 starts reviews itself.
 
+In each followed repository stage 2 reads the `pr.reviewWorkflow` runs on
+`workflow_dispatch` created since the start of the previous day (UTC), one
+page of 100, one request a repository a pass, whether or not a head waits
+for a review. Every one of them not completed whose title names a pull
+request of the repository (`review OWNER/REPO#…`) counts toward `wip`, the
+run of a head pushed over since or of a pull request closed since included,
+until GitHub says it completed or it was created before the read (one still
+running then is no longer counted, and one GitHub leaves `in_progress` after
+its jobs ended is not checked as stage 4's are); stage 4 lists only the
+caller's workflow, so stage 2 counts them, once.
+
 For the bot's pull request from its fork into a public repository, the only
 one whose review job's verdict counts, whose head waits with no verdict
-(`wait: no approving review of the head yet`), the pass reads the
-`pr.reviewWorkflow` runs on `workflow_dispatch` in its repository created
-since the start of the previous day (UTC), one page of 100, one request a
-repository a pass, and keeps those whose title is `review OWNER/REPO#N HEAD`
-for the current head, optionally followed by ` (POOL)`. With none, it starts
-one as the bot from the repository's default branch, with the inputs `pr`,
-`head` and `pool`:
+(`wait: no approving review of the head yet`), the pass keeps the runs whose
+title is `review OWNER/REPO#N HEAD` for the current head, optionally
+followed by ` (POOL)`. A run in flight is waited for (`wait: the review
+job's run URL reviews the head`). A run that ended with no review is not
+started again; with `reruns` its failed jobs run once more as
+[above](#reruns), paced on the pool its title names, else on
+`pr.reviewPools`. Where the runs fill more than a page the head waits,
+rather than get a second review. With no run for the head, it is due a
+start, unless one was reserved for it already (below).
+
+Starts and reruns are taken after every followed pull request is decided,
+in the board's Priority order: a pull request takes the best rank of the
+board issues it closes (`closingIssuesReferences`, the first 10), by the
+issue's own Priority option, its epic's not considered; an issue on the
+board with no Priority the board knows ranks after every option, and a pull
+request that closes no issue on the board goes after those; ties go by
+repository and number. The board is read for this before stage 2
+(and again by stage 4, as stage 3 may change it); where it cannot be read
+the line `review order: the board could not be read (…); by repository and
+number` says so. Each is a dispatch, a rerun as a start, admitted before
+anything is written: within `--max-dispatch` (`-> held by
+--max-dispatch`), the poll's three a pass, and, where the pass schedules
+work, `wip`. Its `wip` count is the caller's runs listed and leased before
+stage 2, as stage 4 counts them, the runs earlier stages started, the
+review runs above, a start reserved and not listed yet, and every run
+stage 2 started so far, fix rounds included; full, the line ends `-> not
+started: wip: N of M runs active` (a rerun's `-> not re-run: …`). There, a
+pass that finds another in progress, cannot list the runs in flight, or
+reads a repository's review runs cut short or not at all, starts and re-runs
+none (`-> not started: another pass is in progress, URL`). A repository
+whose open pull requests could not be listed, or outside
+`repositoriesPerPass`'s envelope, has its review runs neither read nor
+counted, which this does not catch. Without work to schedule (`wip` 0 or no
+`workRepositories`) only the dispatch caps bound them, as before.
+
+A start is claimed and reserved before it is sent, with the fix rounds'
+claim protocol ([poll](poll.md)): the pass posts a claim of `review:HEAD`
+on the pull request, reads the comments back without the cache, goes on
+only where its claim is the earliest (else `-> not started: another pass
+claimed it in comment ID`), writes the reservation (`review_head`,
+`review_at`) over its claim, and then dispatches it as the bot from the
+repository's default branch, with the inputs `pr`, `head` and `pool`:
 `review OWNER/REPO#N SHA: no run of the review job for the head, so it
 starts -> started on POOL`. The pool is chosen among `pr.reviewPools` as a
 fix round's is among `pr.fixPools`, by stage 1's reading; where every pool
 is held the line ends `-> not started: every pool is held (…)` and the head
-waits for a later pass. A start is a dispatch within `--max-dispatch` and the
-poll's three a pass, is counted in the tally, and takes a WIP slot from
-stages 3 and 4. A run in flight (`wait: the review job's run URL reviews the
-head`) keeps its slot on later passes while its head waits so: stage 4
-lists only the caller's workflow, so stage 2 counts it. A run that ended with no review is not
-started again; with `reruns` its failed jobs run once more as
-[above](#reruns), paced on the pool its title names, else on
-`pr.reviewPools`, a write step as before. Where the runs fill more than a
-page the head waits, rather than get a second review. A head still without
-a verdict once its run is older than the read, 24 to 48 hours, gets
-another. Heads are started in stage 2's order, by
-repository and number; Priority does not order them yet.
+waits for a later pass. A start whose answer was lost may have started, so
+it is never sent again: while no run for the head is listed, a later pass
+finds the reservation and waits for ten minutes (`wait: the review job's
+start for the head is reserved, its run not listed yet`), holding a `wip`
+slot, then stops it for a person (`needs-human: the review job was started
+for SHA and no run of it for the head is listed; …`). So does a claim whose
+pass died before the reservation (`review start claim is awaiting its
+reservation`, then `needs-human: a review start for SHA was claimed and
+never recorded; …`), and so does a head still without a verdict once its
+run is older than the read, 24 to 48 hours, which before reservations got
+another start. A start GitHub refused outright, such as a workflow that does
+not take the inputs, is reserved all the same and ends the same way, though
+the stop's wording says it was started. The reservation is read from every
+marker of the bot's on the pull request, so removing the label of such a
+stop does not start the head again; a push does. A rerun has no claim of
+its own: GitHub refuses to re-run a run still running, and a run re-run
+once is a person's, as above.
+
+The replay tests (`apply_starts_reviews_by_priority_within_wip` and
+`apply_sends_a_review_start_once` in `crates/board-forge/src/pass/tests.rs`)
+cover these paths on recorded responses only. None of this has run against
+the live review workflows, which do not take the dispatch inputs yet.
 
 The pass starts only the head it has just read. A later push leaves that
 run reviewing a superseded head, whose verdict counts for nothing; the

@@ -1254,6 +1254,10 @@ mod tests {
                 writes: 0,
                 review_runs: BTreeMap::new(),
                 reviewing: 0,
+                review_unread: None,
+                deferred: Vec::new(),
+                deferring: None,
+                planned: 0,
             };
             let mut outcome = Outcome::default();
             let next = pass
