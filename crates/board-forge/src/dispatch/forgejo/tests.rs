@@ -48,6 +48,7 @@ struct Fake {
     page_size: usize,
     reads: Cell<usize>,
     move_status: bool,
+    status_error: bool,
     jobs: RefCell<Value>,
 }
 
@@ -61,6 +62,7 @@ impl Fake {
             page_size: PAGE_SIZE,
             reads: Cell::new(0),
             move_status: false,
+            status_error: false,
             jobs: RefCell::new(json!([{"id":1,"run_id":42,"attempt":1,"status":"failure"}])),
         }
     }
@@ -75,6 +77,7 @@ impl Transport for Fake {
         } else if path.ends_with("/jobs") {
             self.jobs.borrow().clone()
         } else if path.ends_with("/runs/42") {
+            ensure!(!self.status_error, "status read failed");
             self.runs
                 .borrow()
                 .iter()
@@ -224,6 +227,78 @@ fn forgejo_start_outcomes_and_final_admission() {
         assert!(matches!(outcome, StartOutcome::NotStarted(_)));
         assert_eq!(fake.posts.borrow().len(), usize::from(admitted));
         assert_eq!(calls.get(), usize::from(fake.runs.borrow().len() < 500));
+    }
+}
+
+#[test]
+fn forgejo_start_same_second_claim_and_cancellation() {
+    let instance = instance();
+    let target = target();
+    let claim = clock().replace_nanosecond(700_000_000).unwrap();
+    for (case, created, trigger, read_error, cancelled, started) in [
+        (
+            "same second",
+            "2026-10-30T12:00:00Z",
+            "workflow_dispatch",
+            false,
+            false,
+            true,
+        ),
+        (
+            "previous second",
+            "2026-10-30T11:59:59Z",
+            "workflow_dispatch",
+            false,
+            true,
+            false,
+        ),
+        (
+            "identity mismatch",
+            "2026-10-30T12:00:00Z",
+            "push",
+            false,
+            true,
+            false,
+        ),
+        (
+            "read error",
+            "2026-10-30T12:00:00Z",
+            "workflow_dispatch",
+            true,
+            false,
+            false,
+        ),
+    ] {
+        let mut r = run();
+        r["created"] = created.into();
+        r["trigger_event"] = trigger.into();
+        let fake = Fake {
+            status_error: read_error,
+            ..Fake::new(vec![r])
+        };
+        let outcome = backend(&fake, &instance, &target).start(&start(), claim, || Ok(()));
+        assert_eq!(
+            matches!(outcome, StartOutcome::Started(_)),
+            started,
+            "{case}"
+        );
+        if !started {
+            assert!(matches!(outcome, StartOutcome::Ambiguous(_)), "{case}");
+        }
+        assert_eq!(
+            fake.posts
+                .borrow()
+                .iter()
+                .filter(|(url, _)| url.ends_with("/42/cancel"))
+                .count(),
+            usize::from(cancelled),
+            "{case}"
+        );
+        assert_eq!(
+            fake.posts.borrow().len(),
+            1 + usize::from(cancelled),
+            "{case}"
+        );
     }
 }
 
@@ -426,6 +501,11 @@ fn forgejo_two_contenders_late_release_replacement_and_expiry() {
             .unwrap(),
     };
     let a = backend.slot("admission", 0).unwrap();
+    let bound = Lease {
+        run: 42,
+        ..lease.clone()
+    };
+    assert!(backend.admit(&a, &bound, clock(), || panic!()).is_err());
     // Refusals before the final check: an oversized lease, and a public
     // caller (its read must precede the callback, which only the PUT follows).
     let oversized = Lease {

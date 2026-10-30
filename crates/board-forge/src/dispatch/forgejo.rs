@@ -233,7 +233,11 @@ impl<'a, T: Transport> Forgejo<'a, T> {
             run["created"].as_str().context("missing run created")?,
             &Rfc3339,
         )?;
-        ensure!(created >= claim, "run predates claim");
+        // Forgejo records `created` in whole seconds, unlike the durable claim.
+        ensure!(
+            created >= claim.replace_nanosecond(0)?,
+            "run predates claim"
+        );
         let body = self.body(start)?;
         let payload: Value = serde_json::from_str(
             run["event_payload"]
@@ -334,7 +338,12 @@ impl<'a, T: Transport> Forgejo<'a, T> {
         match reply {
             Ok((201, answer)) if answer["id"].as_u64().is_some_and(|id| id > 0) => {
                 let id = answer["id"].as_u64().unwrap_or_default();
-                match self.status(id).and_then(|r| self.verify(&r, start, claim)) {
+                let run = match self.status(id) {
+                    Ok(run) => run,
+                    // An unreadable status is not evidence of a wrong run.
+                    Err(e) => return StartOutcome::Ambiguous(e),
+                };
+                match self.verify(&run, start, claim) {
                     Ok(handle) => match self.recover(start, claim) {
                         Ok(found) if found == handle => StartOutcome::Started(handle),
                         _ => StartOutcome::Ambiguous(anyhow::anyhow!(
