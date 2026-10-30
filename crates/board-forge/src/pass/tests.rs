@@ -2020,6 +2020,10 @@ impl Transport for Forge {
             Err(_) if query == CLOSE_QUERY => {
                 close_read(&variables, Some("2026-10-01T00:00:00Z".into()), None)
             }
+            // A comment whose edits were not recorded: the bot's, unedited.
+            Err(_) if query == needs::EDITS_QUERY => {
+                json!({"node": {"author": {"login": "cgwalters-bot"}, "lastEditedAt": null, "editor": null}})
+            }
             data => data?,
         };
         if let Some(nodes) = data
@@ -2388,7 +2392,8 @@ fn apply_publishes_the_holds() {
         };
         if let Some(body) = comment {
             let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
-            let comment = json!({"id": 7, "user": {"login": "cgwalters-bot"}, "body": body});
+            let comment = json!({"id": 7, "node_id": "IC_7", "user": {"login": "cgwalters-bot"},
+                "body": body});
             comments.as_array_mut().unwrap().push(comment);
         }
         let reply = |body| json!({"status": 200, "link": null, "body": body});
@@ -2705,7 +2710,8 @@ fn apply_publishes_what_needs_you() {
         }
         if let Some(body) = comment {
             let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
-            let comment = json!({"id": 7, "user": {"login": "cgwalters-bot"}, "body": body});
+            let comment = json!({"id": 7, "node_id": "IC_7", "user": {"login": "cgwalters-bot"},
+                "body": body});
             comments.as_array_mut().unwrap().push(comment);
         }
         let reply = |body| json!({"status": 200, "link": null, "body": body});
@@ -2864,36 +2870,129 @@ fn apply_publishes_what_needs_you() {
         "{:#?}",
         report.lines
     );
+    // The list a pass rewrote, its count that of its items.
+    let edited = |forge: &Forge, report: &Report| {
+        let edited = (forge.writes.borrow().iter())
+            .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
+            .map(|(_, _, body)| text(body, "/body").to_owned());
+        let edited = edited.unwrap_or_else(|| panic!("{:#?}", report.lines));
+        let list = holds::parse(&edited).unwrap()["needs_you"].clone();
+        assert_eq!(list["count"], list["items"].as_array().unwrap().len());
+        list
+    };
+    let carried = |list: &Value| -> Vec<String> {
+        (list["items"].as_array().unwrap().iter())
+            .filter(|a| a["carried"] == true)
+            .map(|a| text(a, "/key").to_owned())
+            .collect()
+    };
+    let said = |report: &Report, line: &str| {
+        let lines = &report.lines;
+        assert!(lines.iter().any(|l| l.starts_with(line)), "{lines:#?}");
+    };
     // The proposals unreadable: those published are kept, carried, and the
-    // list says it is not complete rather than that none wait.
-    let mut forge = forge_with(Some(&body));
-    let listing = json!({"get": proposal_issues});
-    let entry = (forge.replay.requests.iter_mut()).find(|e| e["request"] == listing);
-    entry.unwrap()["answer"]["status"] = json!(502);
-    let report = apply(&forge, &config);
-    let edited = (forge.writes.borrow().iter())
-        .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
-        .map(|(_, _, body)| text(body, "/body").to_owned());
-    let edited = edited.unwrap_or_else(|| panic!("{:#?}", report.lines));
-    let list = &holds::parse(&edited).unwrap()["needs_you"];
-    assert_eq!(
-        json!([
-            list["sources"]["proposals"],
-            list["complete"],
-            list["count"]
-        ]),
-        json!(["unread", false, 5])
-    );
-    let carried: Vec<String> = (list["items"].as_array().unwrap().iter())
-        .filter(|a| a["carried"] == true)
-        .map(|a| text(a, "/key").to_owned())
+    // list says it is not complete rather than that none wait; but not
+    // from a hold comment another account last edited.
+    let foreign = json!({"author": {"login": "cgwalters-bot"},
+        "lastEditedAt": "2026-10-20T00:00:00Z", "editor": {"login": "cgwalters"}});
+    for (name, edit, kept) in [
+        (
+            "the bot's",
+            None,
+            vec![proposal(21), proposal(22), proposal(23)],
+        ),
+        ("edited by another", Some(foreign), vec![]),
+    ] {
+        let mut forge = forge_with(Some(&body));
+        let listing = json!({"get": proposal_issues});
+        let entry = (forge.replay.requests.iter_mut()).find(|e| e["request"] == listing);
+        entry.unwrap()["answer"]["status"] = json!(502);
+        if let Some(node) = edit {
+            let request = graphql_key(needs::EDITS_QUERY, &json!({"id": "IC_7"}));
+            let answer = json!({"data": {"node": node}});
+            forge
+                .replay
+                .requests
+                .push(json!({"request": request, "answer": answer}));
+        }
+        let report = apply(&forge, &config);
+        let list = edited(&forge, &report);
+        let read = json!([list["sources"]["proposals"], list["complete"]]);
+        assert_eq!(read, json!(["unread", false]), "{name}");
+        assert_eq!(carried(&list), kept, "{name}");
+        said(&report, "needs-you proposals error: ");
+        if kept.is_empty() {
+            said(
+                &report,
+                "needs-you: the published list carries nothing over: ",
+            );
+        }
+    }
+    // Too few requests left for the proposals' listing: it is not sent, and
+    // the proposals, read in part, keep what they published. Nor are the
+    // summaries read, and the holds keep their published questions. Every
+    // slot taken, stage 4 starts nothing, so spends as much on less.
+    let full = with_wip(2);
+    let within = |forge: &Forge, limit| {
+        let bounds = Bounds::new(limit, Instant::now() + Duration::from_secs(3600));
+        let state = (State::default(), Mode::Actions(&own()), Limits::default());
+        let within = (state.0, state.1, state.2, forge.replay.now);
+        let report = block(run_within(forge, forge, &full, within, &bounds)).unwrap();
+        (report, limit - bounds.left.get())
+    };
+    let (_, used) = within(&forge_with(Some(&body)), PASS_REQUEST_LIMIT);
+    // The hold comment's edits, the listing, its issue and two summaries
+    // are the last reads of an unchanged pass: leave room for the first.
+    let forge = forge_with(Some(&body));
+    let (report, _) = within(&forge, used - 5 + needs::NEEDS_READS - 4);
+    let list = edited(&forge, &report);
+    let read = json!([
+        list["sources"]["proposals"],
+        list["summaries"],
+        list["complete"]
+    ]);
+    assert_eq!(read, json!(["partial", "partial", false]));
+    assert_eq!(carried(&list), [proposal(21), proposal(22), proposal(23)]);
+    let asks: Vec<&Value> = (list["items"].as_array().unwrap().iter())
+        .map(|a| &a["ask"])
         .collect();
-    assert_eq!(carried, [proposal(21), proposal(22), proposal(23)]);
-    assert!(
-        (report.lines.iter()).any(|l| l.starts_with("needs-you proposals error: ")),
-        "{:#?}",
-        report.lines
+    let original: Vec<&Value> = (items.iter()).map(|a| &a["ask"]).collect();
+    assert_eq!(asks, original);
+    said(
+        &report,
+        "needs-you proposals error: the pass's request budget",
     );
+    // A later pass that reads the same list keeps its `changed_at`, and
+    // so does one that cannot read #446's summary: it keeps the question
+    // and recommendation published rather than fall back.
+    let earlier = "2026-10-01T00:00:00Z";
+    let older = ["changed_at", "validated_at"]
+        .iter()
+        .fold(body.clone(), |b, f| {
+            let now = format!("\"{f}\":{}", snapshot["at"]);
+            b.replace(&now, &format!("\"{f}\":\"{earlier}\""))
+        });
+    assert_ne!(older, body);
+    for (name, unread, summaries) in [("same", false, "complete"), ("unread", true, "partial")] {
+        let mut forge = forge_with(Some(&older));
+        if unread {
+            let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446,
+                "after": null});
+            let request = graphql_key(plan::COMMENTS_QUERY, &variables);
+            forge.replay.requests.retain(|e| e["request"] != request);
+        }
+        let report = apply(&forge, &config);
+        let list = edited(&forge, &report);
+        assert_eq!(list["changed_at"], earlier, "{name}");
+        assert_eq!(list["summaries"], summaries, "{name}");
+        assert_eq!(list["items"], snapshot["needs_you"]["items"], "{name}");
+        if unread {
+            said(
+                &report,
+                "needs-you summary error: cgwalters-forge/tracker#446",
+            );
+        }
+    }
     // A pass whose stages failed publishes no list at all.
     let forge = forge_with(Some(&body));
     let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();

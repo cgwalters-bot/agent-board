@@ -679,7 +679,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let comment = self.bot_comment(on, holds::HOLDS_MARKER, "hold snapshot");
         let changed = comment.and_then(|comment| {
             let published = comment.as_ref().map(|c| text(c, "/body"));
-            let snapshot = self.hold_snapshot(published.and_then(holds::published).as_ref());
+            let previous = published.and_then(holds::published);
+            let snapshot = self.hold_snapshot(previous.as_ref(), comment.as_ref());
             let (snapshot, body) = holds::fit(snapshot)?;
             Ok((holds::changed(published, &snapshot)?, body, comment))
         });
@@ -741,8 +742,14 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// Stages 3 and 4's holds as a snapshot at this pass's clock, with what
     /// carries over from `previous`, the published one's JSON, and the
     /// stall alarms, each said in a `stall …` line ([`holds::alarm`]), and
-    /// with `holds.needsYou` what waits on the operator.
-    fn hold_snapshot(&mut self, previous: Option<&Value>) -> holds::Snapshot {
+    /// with `holds.needsYou` what waits on the operator, carrying over
+    /// from the published list only where the bot last edited its
+    /// `comment`.
+    fn hold_snapshot(
+        &mut self,
+        previous: Option<&Value>,
+        comment: Option<&Value>,
+    ) -> holds::Snapshot {
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let tally = self.report.tally.clone();
         let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
@@ -776,6 +783,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             self.line(line);
         }
         if at.needs_you {
+            let listed = previous.is_some_and(|p| p.get("needs_you").is_some());
+            let own = listed && comment.is_some_and(|c| self.bot_edited(c));
+            let previous = previous.filter(|_| own);
             snapshot.needs_you = Some(self.needs_you(&snapshot, previous, &on));
         }
         snapshot

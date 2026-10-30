@@ -193,7 +193,8 @@ The asks come from five sources, each named by an item's `source`:
   (labelled `needs-operator-approval`, it waits on the operator's approval of
   the head), `review-withheld` (the review job withheld its approval, so a
   person approves) and `review-needs-human` (labelled `needs-human`, or
-  stopped so by this pass's step, a draft with no checkpoint among them).
+  stopped so by this pass's step, a draft with no checkpoint among them, or
+  a round outside the fix bounds it leaves to the operator, labelled or not).
   What the poll goes on with by itself is not listed: a run, check, review,
   queue or rerun it waits for, or an answer it already acts on.
 - `proposals` (with `holds.proposals`): each
@@ -216,8 +217,10 @@ request's `OWNER/REPO#N` in lower case for a hold or a review wait,
 held twice (the holds issue's two [stall alarms](#stall-alarms)) is listed
 once, where it ranks first, its asks joined by `; `. An issue held on the
 operator's approval of its pull request (`approve pull request REPO#N to
-merge`) and that pull request's review wait are one ask, the review's, with
-the hold's Priority and question and the earlier `waiting_since`.
+merge`) and that pull request's review wait, read this pass or carried, are
+one ask, the review's, with the hold's Priority and question and the earlier
+`waiting_since`. Two such holds on one pull request are one ask too, the one
+with the most urgent Priority, waiting since the earlier.
 
 `ask` is the one-line question and `recommendation` the one-line advice, or
 null. For a hold, they are the newest summary comment on its issue (a
@@ -227,7 +230,10 @@ as data: the rest of its first
 the bold). Such a line left empty is absent, and the ask falls back to the
 board Why's question (a Why starting `Q:`), else the hold's reason. The
 summaries of the 10 highest ranked held issues are read, and `summaries`
-says whether they all were (`complete` or `partial`); they enrich asks and
+says whether they all were (`complete` or `partial`). A hold whose summary
+was not read (past the 10, or the read failed) keeps the `ask` and
+`recommendation` published for it, while its `kind`, `since` and Why
+question stay the same, rather than fall back. Summaries enrich asks and
 are no source of them, so they do not make the list incomplete. A review
 wait asks its step's reason; a proposal its title, recommending the first
 line of its `why`; a digest entry what its group asks, recommending its
@@ -247,7 +253,8 @@ the hold's board Priority; the other sources' asks have none, unless joined
 with a hold. `waiting_since` is a hold's `since`; for a review wait, when the
 list first had it at that head (a new head starts it again); for a proposal
 or a digest entry, its comment's time. Items are sorted by Priority in the
-board's option order (one the board does not list after, none last), then
+board's option order (one the board does not list after, none last; where
+the pass did not read the board, the order the published list had), then
 the longest waiting, then `key`; past 100, the rest are counted in `omitted`
 and left out. `count` is the number of items listed.
 
@@ -256,14 +263,18 @@ and left out. `count` is the number of items listed.
 hold), in stage 4 a candidate it did not consider (the WIP limit, pools or
 the time bound stopped it partway, or the consideration failed), a followed
 repository outside the pass's envelope or not read, a labelled issue past
-the bound or not read, or a proposal or digest entry it did not accept, any
+the bound or not read, the proposals' listing left unread for the request
+or time bound, or a proposal or digest entry it did not accept, any
 of which may wait on the operator; `unread`, where it was not read at all
 (`live_epics` or `candidates` null, stage 2 failed, the proposals' listing
 failed, or no maintain day is known); or `off` (stage 3 without `epics`,
 stage 2 without `follow`, no `holds.proposals`, no `maintain`). Where a
 source is `unread`, the asks it published before are kept, and where it is
 `partial`, those of the repositories and issues it did not read; each has
-`"carried": true`, and is listed again only while well formed. Stage 4's
+`"carried": true`, and is listed again only while well formed. Nothing of a
+published list is carried, nor its `waiting_since`, questions or
+`changed_at`, unless GitHub says the bot both wrote and last edited its
+comment (one GraphQL read): anyone with write access may edit it. Stage 4's
 holds are carried as above. `complete` is true only where each source is
 `complete` or `off` and none was omitted, so an empty list is "nothing
 waits" only then. A pass whose stage 3 or 4 failed publishes nothing, as
@@ -271,8 +282,8 @@ above. A read that fails is a `needs-you … error: …` line, not a failure:
 the list says it. These reads leave the hold snapshot's own requests, and
 stop where the pass's request or time bound would not.
 `validated_at` is the clock of the pass that last wrote the list, and
-`changed_at` that of the pass that last changed it (`validated_at` aside),
-carried over while it stays the same. An unchanged list is written again,
+`changed_at` that of the pass that last changed it (`validated_at` and
+`summaries` aside), carried over while it stays the same. An unchanged list is written again,
 with the snapshot's `at`, once the published `validated_at` is an hour old,
 so a reader treats a list whose `validated_at` is older than that and a pass
 interval as unknown, not as current. So does a reader that finds no

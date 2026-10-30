@@ -247,6 +247,9 @@ const AUTO_MERGE: &str = "auto-merge already on";
 /// Why a head the review job withheld its approval of ([`WITHHELD`]) waits.
 const WITHHELD_WAIT: &str =
     "the review withheld its approval of the head; it needs a human approval";
+/// How a round outside the caller's fix bounds is skipped: the operator
+/// takes it, labelled or not.
+const LEFT_TO_OPERATOR: &str = "left to the operator: ";
 
 // Both writes admit only the head we approved. A queue is required by the base
 // branch's rules, not an auto-merge fallback; GitHub owns revalidation after
@@ -3341,7 +3344,8 @@ pub struct Outcome {
 /// A followed pull request that waits on the operator, at the head the
 /// pass read: `approve` (its approval of the head, under
 /// [`OPERATOR_APPROVAL_LABEL`]), `withheld` (the review job withheld its
-/// approval) or `needs-human` (labelled so, or stopped by this step).
+/// approval) or `needs-human` (labelled so, stopped by this step, or a
+/// round outside the fix bounds left to the operator).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Wait {
     pub repository: String,
@@ -3437,7 +3441,9 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
     let approval = format!("labelled {OPERATOR_APPROVAL_LABEL} ");
     match decision.action {
         "needs-human" => Some("needs-human"),
-        "skip" if labelled(pull) => Some("needs-human"),
+        "skip" if labelled(pull) || decision.reason.starts_with(LEFT_TO_OPERATOR) => {
+            Some("needs-human")
+        }
         "wait" if decision.reason == WITHHELD_WAIT => Some("withheld"),
         "wait" if decision.reason.starts_with(&approval) => Some("approve"),
         _ => None,
@@ -5926,7 +5932,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         .and_then(|b| b.refusal(repo, text(&pull, "/headRefName")));
         if let Some(why) = &left {
             answer.clear();
-            decision = step("skip", format!("left to the operator: {why}"));
+            decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
         }
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
@@ -12402,9 +12408,15 @@ mod tests {
             let got = outcome.lines.last().unwrap();
             assert!(got.ends_with(line), "{name}: {got}");
             assert_eq!(written(&fake.writes), writes, "{name}");
-            // Left to the operator, it is not the poll's in flight.
-            if got.contains("left to the operator") {
+            // Left to the operator, it is not the poll's in flight, but a
+            // wait on the operator, with its reason.
+            if let Some((_, why)) = got.split_once("skip: ") {
                 assert_eq!(outcome.in_flight, 0, "{name}");
+                let waits: Vec<(&str, &str)> = (outcome.waits.iter())
+                    .map(|w| (w.kind, w.reason.as_str()))
+                    .collect();
+                assert!(why.starts_with(LEFT_TO_OPERATOR), "{name}");
+                assert_eq!(waits, [("needs-human", why)], "{name}");
             }
             // Fix runs are started with the caller's token only.
             assert_eq!(dispatcher.writes.borrow().len(), dispatches, "{name}");

@@ -1113,8 +1113,9 @@ pub struct Reading<'a> {
     pub reviews: Collected,
     pub proposals: Collected,
     pub digest: Collected,
-    /// How much of the summaries was read, and each by its issue's key.
-    pub summaries: (Read, BTreeMap<String, Summary>),
+    /// How much of the summaries was read, and each read by its issue's
+    /// key, none where the issue has none.
+    pub summaries: (Read, BTreeMap<String, Option<Summary>>),
 }
 
 /// The bold lines of a bot summary [`summary`] reads.
@@ -1155,20 +1156,24 @@ fn approval_of(reason: &str) -> Option<&str> {
         .strip_suffix(APPROVE_SUFFIX)
 }
 
-/// The asks of the published list `previous` from the needs-you list's
-/// own sources, where each is still well formed: its references valid,
-/// its `target` made again from its action and its texts cut again.
-fn published_asks(previous: Option<&Value>) -> Vec<Ask> {
-    let list = (previous.filter(|s| s["schema"] == HOLDS_SCHEMA))
+/// The needs-you list of `previous`, the published snapshot's JSON, if any.
+fn published_list(previous: Option<&Value>) -> Option<&Value> {
+    (previous.filter(|s| s["schema"] == HOLDS_SCHEMA))
         .map(|s| &s["needs_you"])
-        .filter(|n| n["schema"] == NEEDS_YOU_SCHEMA);
-    let items = list
+        .filter(|n| n["schema"] == NEEDS_YOU_SCHEMA)
+}
+
+/// The asks of the published list `previous` from `sources`, where each is
+/// still well formed: its references valid, its `target` made again from
+/// its action and its texts cut again.
+fn published_asks(previous: Option<&Value>, sources: &[&str]) -> Vec<Ask> {
+    let items = published_list(previous)
         .and_then(|n| n["items"].as_array())
         .into_iter()
         .flatten();
     items
         .filter_map(|a| serde_json::from_value::<Ask>(a.clone()).ok())
-        .filter(|a| [REVIEWS, PROPOSALS, DIGEST].contains(&a.source.as_str()))
+        .filter(|a| sources.contains(&a.source.as_str()))
         .filter(|a| a.action.valid() && a.source_ref.valid())
         .filter(|a| parse_time(&a.waiting_since).is_some())
         .filter_map(|a| {
@@ -1193,17 +1198,21 @@ fn earlier(a: &str, b: &str) -> bool {
 /// itself (a run in flight or rerun, a cooldown, a retry), nor
 /// `needs-design` or board Blocked. A hold's ask is its issue's bot
 /// summary's question where it has one, else its board Why's, else its
-/// reason. A source's ask keeps the `waiting_since` published for the same
-/// key, kind and head; where a source was not read whole, the asks
-/// published from what it did not read are kept, marked `carried`. An
-/// issue's hold on the operator's approval of its pull request and that
-/// pull request's review wait are one ask, the review's with the hold's
-/// Priority and question. Ranked by Priority in the board's order (an
-/// unknown one after, none last), then the longest waiting, then key; a key
-/// listed twice (the holds issue's two alarms) is listed once, where it
-/// ranks first, its asks joined; past [`MAX_NEEDS_YOU`], the rest are
-/// counted in `omitted`. `changed_at` carries over from `previous`, the
-/// published snapshot's JSON, where the list was the same.
+/// reason; where its summary was not read, the same hold (key, kind and
+/// `since`) keeps the question and recommendation published. A source's ask
+/// keeps the `waiting_since` published for the same key, kind and head;
+/// where a source was not read whole, the asks published from what it did
+/// not read are kept, marked `carried`. Holds on the operator's approval of
+/// one pull request are one ask, the most urgent's, waiting since the
+/// earliest; with that pull request's review wait, live or carried, they are
+/// one ask, the review's with the hold's Priority and question. Ranked by
+/// Priority in the board's order (an unknown one after, none last; without
+/// the board, in the published list's order), then the longest waiting,
+/// then key; a key listed twice (the holds issue's two alarms) is listed
+/// once, where it ranks first, its asks joined; past [`MAX_NEEDS_YOU`], the
+/// rest are counted in `omitted`. `changed_at` carries over from
+/// `previous`, the published snapshot's JSON, where the list was the same
+/// but for `summaries`.
 pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Reading) -> NeedsYou {
     let at = &snapshot.at;
     let on = reading.on.display();
@@ -1231,6 +1240,29 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         proposals: reading.proposals.read,
         digest: reading.digest.read,
     };
+    // Without the board's options, the order the published list ranked its
+    // Priorities in stands in for them, so that the order does not move.
+    let mut options = reading.options.to_vec();
+    if options.is_empty() {
+        let listed = (published_list(previous).and_then(|n| n["items"].as_array())).into_iter();
+        for priority in listed.flatten().filter_map(|a| a["priority"].as_str()) {
+            if !options.iter().any(|o| o == priority) {
+                options.push(priority.to_owned());
+            }
+        }
+    }
+    let rank = |a: &Ask| {
+        let since = parse_time(&a.waiting_since);
+        let known = (a.priority.as_ref()).and_then(|p| options.iter().position(|o| o == p));
+        let priority = (
+            a.priority.is_none(),
+            known.is_none(),
+            known,
+            a.priority.clone(),
+        );
+        (priority, since.is_none(), since, a.key.clone())
+    };
+    let published_holds = published_asks(previous, &["epics", "items"]);
     // Each hold's ask, with the review wait it is the same ask as, if any.
     let mut approvals: BTreeMap<String, (Ask, bool)> = BTreeMap::new();
     let mut items: Vec<Ask> = Vec::new();
@@ -1249,7 +1281,27 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             true => "epics",
             false => "items",
         };
-        let said = reading.summaries.1.get(&key).cloned().unwrap_or_default();
+        let said = match reading.summaries.1.get(&key) {
+            Some(said) => said.clone().unwrap_or_default(),
+            // Unread: as last published for the same hold with the same Why
+            // question, where that was not the fallback to its reason.
+            None => (published_holds.iter())
+                .filter(|_| {
+                    previous_holds(previous).any(|p| {
+                        (p["item"] == item.as_str() && p["epic"] == h.epic)
+                            && p["question"].as_str() == h.question.as_deref()
+                    })
+                })
+                .find(|p| {
+                    (p.key == key && p.kind == h.kind.name() && p.waiting_since == h.since)
+                        && p.source_ref.kind == RefKind::Hold
+                })
+                .map(|p| Summary {
+                    question: Some(p.ask.clone()).filter(|q| *q != h.reason),
+                    recommendation: p.recommendation.clone(),
+                })
+                .unwrap_or_default(),
+        };
         let asked = said.question.clone().or_else(|| h.question.clone());
         let kind = match h.kind {
             HoldKind::Blocking => RefKind::PullRequest,
@@ -1275,43 +1327,31 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             action,
             carried: false,
         };
-        match approval_of(&h.reason) {
-            Some(pull) => drop(approvals.insert(pull.to_ascii_lowercase(), (ask, asked.is_some()))),
-            None => items.push(ask),
+        let Some(pull) = approval_of(&h.reason).map(str::to_ascii_lowercase) else {
+            items.push(ask);
+            continue;
+        };
+        // Another hold on the same approval: one ask, the most urgent's.
+        let mut joined = (ask, asked.is_some());
+        if let Some(mut other) = approvals.remove(&pull) {
+            if rank(&other.0) < rank(&joined.0) {
+                std::mem::swap(&mut joined, &mut other);
+            }
+            if earlier(&other.0.waiting_since, &joined.0.waiting_since) {
+                joined.0.waiting_since = other.0.waiting_since;
+            }
         }
+        approvals.insert(pull, joined);
     }
-    let published = published_asks(previous);
+    let published = published_asks(previous, &[REVIEWS, PROPOSALS, DIGEST]);
     let own = [
         (REVIEWS, &reading.reviews),
         (PROPOSALS, &reading.proposals),
         (DIGEST, &reading.digest),
     ];
-    for (_, collected) in own {
-        for ask in &collected.asks {
-            let mut ask = ask.clone();
-            let seen = (published.iter())
-                .find(|p| p.key == ask.key && p.kind == ask.kind && p.head == ask.head)
-                .and_then(|p| not_after(&Value::from(p.waiting_since.as_str()), at));
-            if let Some(since) = seen.filter(|s| earlier(s, &ask.waiting_since)) {
-                ask.waiting_since = since;
-            }
-            let hold = (ask.action.kind == RefKind::ApprovePullRequest && ask.source == REVIEWS)
-                .then(|| approvals.remove(&ask.item.to_ascii_lowercase()))
-                .flatten();
-            if let Some((hold, asked)) = hold {
-                ask.priority = ask.priority.or(hold.priority);
-                if earlier(&hold.waiting_since, &ask.waiting_since) {
-                    ask.waiting_since = hold.waiting_since;
-                }
-                if asked {
-                    ask.ask = hold.ask;
-                }
-                ask.recommendation = hold.recommendation.or(ask.recommendation);
-            }
-            items.push(ask);
-        }
-    }
-    items.extend(approvals.into_values().map(|(ask, _)| ask));
+    let mut asks: Vec<Ask> = (own.iter())
+        .flat_map(|(_, c)| c.asks.iter().cloned())
+        .collect();
     for (source, collected) in own {
         if matches!(collected.read, Read::Complete | Read::Off) {
             continue;
@@ -1322,25 +1362,40 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             let unread = collected.read == Read::Unread
                 || collected.unread.contains(&item)
                 || collected.unread.contains(repository);
-            if unread && !items.iter().any(|a| a.key == ask.key) {
-                items.push(Ask {
+            let listed = |a: &Ask| a.key == ask.key;
+            if unread && !items.iter().any(listed) && !asks.iter().any(listed) {
+                asks.push(Ask {
                     carried: true,
                     ..ask.clone()
                 });
             }
         }
     }
-    items.sort_by_key(|a| {
-        let since = parse_time(&a.waiting_since);
-        let known = (a.priority.as_ref()).and_then(|p| reading.options.iter().position(|o| o == p));
-        let priority = (
-            a.priority.is_none(),
-            known.is_none(),
-            known,
-            a.priority.clone(),
-        );
-        (priority, since.is_none(), since, a.key.clone())
-    });
+    // A carried ask is joined with its hold as a live one is.
+    for mut ask in asks {
+        let seen = (published.iter())
+            .find(|p| p.key == ask.key && p.kind == ask.kind && p.head == ask.head)
+            .and_then(|p| not_after(&Value::from(p.waiting_since.as_str()), at));
+        if let Some(since) = seen.filter(|s| earlier(s, &ask.waiting_since)) {
+            ask.waiting_since = since;
+        }
+        let hold = (ask.action.kind == RefKind::ApprovePullRequest && ask.source == REVIEWS)
+            .then(|| approvals.remove(&ask.item.to_ascii_lowercase()))
+            .flatten();
+        if let Some((hold, asked)) = hold {
+            ask.priority = ask.priority.or(hold.priority);
+            if earlier(&hold.waiting_since, &ask.waiting_since) {
+                ask.waiting_since = hold.waiting_since;
+            }
+            if asked {
+                ask.ask = hold.ask;
+            }
+            ask.recommendation = hold.recommendation.or(ask.recommendation);
+        }
+        items.push(ask);
+    }
+    items.extend(approvals.into_values().map(|(ask, _)| ask));
+    items.sort_by_key(rank);
     let mut first: BTreeMap<String, usize> = BTreeMap::new();
     let mut kept: Vec<Ask> = Vec::with_capacity(items.len());
     for ask in items {
@@ -1377,14 +1432,15 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         count: items.len(),
         items,
     };
-    let previous = (previous.filter(|s| s["schema"] == HOLDS_SCHEMA))
-        .map(|s| &s["needs_you"])
-        .filter(|n| n["schema"] == NEEDS_YOU_SCHEMA);
+    let previous = published_list(previous);
+    // How much of the summaries was read is no change: what they said is
+    // kept where they were not.
     let content = |list: &Value| {
         let mut list = list.clone();
         if let Some(fields) = list.as_object_mut() {
-            fields.remove("validated_at");
-            fields.remove("changed_at");
+            for field in ["validated_at", "changed_at", "summaries"] {
+                fields.remove(field);
+            }
         }
         list
     };
@@ -2553,14 +2609,26 @@ mod tests {
             hold.priority = Some(priority.into());
         }
         let (on, options) = (item("o/ops", 1), options(&["Urgent", "High", "Low"]));
-        let reading = reading(&on, &options);
-        let ranked: Vec<Option<String>> = (needs_you(&board, None, &reading).items.iter())
+        let read = needs_you(&board, None, &reading(&on, &options));
+        let ranked: Vec<Option<String>> = (read.items.iter())
             .map(|a| a.priority.clone())
             .take(3)
             .collect();
         assert_eq!(
             ranked,
             [Some("Urgent"), Some("Low"), Some("Odd")].map(|p| p.map(Into::into))
+        );
+        // A pass that does not read the board ranks as the published list
+        // did, not by name, so the list and its `changed_at` stay.
+        let later = Snapshot {
+            at: "2026-10-28T10:00:00Z".into(),
+            ..board
+        };
+        let previous = json!({"schema": HOLDS_SCHEMA, "needs_you": read});
+        let again = needs_you(&later, Some(&previous), &reading(&on, &[]));
+        assert_eq!(
+            (again.items, again.changed_at),
+            (read.items, read.changed_at)
         );
     }
 
@@ -2884,9 +2952,50 @@ mod tests {
         );
         assert_eq!(list.items[0].action.kind, RefKind::ApprovePullRequest);
         assert!(list.complete);
-        let list = own_listed(&[held], at, (none(), Collected::off()), None);
+        let list = own_listed(&[held.clone()], at, (none(), Collected::off()), None);
         let keys: Vec<&str> = list.items.iter().map(|a| a.key.as_str()).collect();
         assert_eq!(keys, ["o/t#7"]);
+        // Two holds on one approval are one ask, with the most urgent
+        // Priority, whichever comes first, with the review or without.
+        let mut urgent = entry(
+            Scope::Item(item("o/t", 8)),
+            HoldKind::PrOpen,
+            "approve pull request o/t#50 to merge",
+        );
+        urgent.hold.operator = true;
+        urgent.priority = Some("P0".into());
+        for entries in [
+            [held.clone(), urgent.clone()],
+            [urgent.clone(), held.clone()],
+        ] {
+            for (reviews, key) in [(vec![approve.clone()], "o/t#50"), (vec![], "o/t#8")] {
+                let reviews = collected(Read::Complete, reviews, &[]);
+                let list = own_listed(&entries, at, (reviews, Collected::off()), None);
+                let asks: Vec<(&str, Option<&str>)> = (list.items.iter())
+                    .map(|a| (a.key.as_str(), a.priority.as_deref()))
+                    .collect();
+                assert_eq!(asks, [(key, Some("P0"))], "{key}");
+                assert_eq!(list.count, 1, "{key}");
+            }
+        }
+        // A review wait carried over is joined with its hold as a live one
+        // is: one ask, not the review's and the hold's.
+        let reviews = collected(Read::Complete, vec![approve.clone()], &[]);
+        let first = own_listed(&[held.clone()], at, (reviews, Collected::off()), None);
+        let previous = as_published(&first);
+        for reviews in [
+            collected(Read::Unread, vec![], &[]),
+            collected(Read::Partial, vec![], &["o/t"]),
+        ] {
+            let read = reviews.read;
+            let list = own_listed(&[held.clone()], at, (reviews, none()), Some(&previous));
+            let asks: Vec<Value> = (list.items.iter())
+                .map(|a| json!([a.key, a.carried, a.priority, a.ask]))
+                .collect();
+            let expected = json!(["o/t#50", true, "P1", "Merge the fix?"]);
+            assert_eq!(asks, [expected], "{read:?}");
+            assert_eq!(list.count, 1, "{read:?}");
+        }
         // The same head an hour on waits since it was first seen; a new head
         // is a new ask.
         let wait = |head, since: &str| Ask {
@@ -3071,7 +3180,8 @@ mod tests {
             HoldKind::NeedsHuman,
             "labelled needs-human",
         );
-        let snapshot = snapshot(&[asked, plain], "2026-10-28T09:00:00Z".into(), tally());
+        let entries = [asked, plain];
+        let snapshot = super::snapshot(&entries, "2026-10-28T09:00:00Z".into(), tally());
         let (on, options) = (item("o/ops", 1), options(&["P0"]));
         let said = |question: Option<&str>| Summary {
             question: question.map(Into::into),
@@ -3085,7 +3195,10 @@ mod tests {
             let reading = Reading {
                 summaries: (
                     Read::Partial,
-                    summaries.into_iter().map(|(k, s)| (k.into(), s)).collect(),
+                    summaries
+                        .into_iter()
+                        .map(|(k, s)| (k.into(), Some(s)))
+                        .collect(),
                 ),
                 ..reading(&on, &options)
             };
@@ -3098,6 +3211,62 @@ mod tests {
                     .all(|a| a.recommendation.as_deref() == Some("Do it."))
             );
             assert_eq!(list.summaries, Read::Partial);
+        }
+        // A summary not read again keeps what the same hold published, and
+        // the list its `changed_at`, however much of the summaries was read;
+        // one read without a question, or a hold whose Why changed, falls
+        // back.
+        let read = |whole, summaries: &[(&str, Option<Summary>)]| Reading {
+            summaries: (
+                whole,
+                (summaries.iter())
+                    .map(|(k, s)| ((*k).to_owned(), s.clone()))
+                    .collect(),
+            ),
+            ..reading(&on, &options)
+        };
+        let shipped = Some(said(Some("Ship 1.0?")));
+        let summaries = [("o/t#1", shipped.clone()), ("o/t#2", shipped)];
+        let first = needs_you(&snapshot, None, &read(Read::Complete, &summaries));
+        let mut published = serde_json::to_value(&snapshot).unwrap();
+        published["needs_you"] = serde_json::to_value(&first).unwrap();
+        let later = |held: &[Entry]| {
+            let mut later = super::snapshot(held, "2026-10-28T10:00:00Z".into(), tally());
+            carry(&mut later, Some(&published), (false, true));
+            later
+        };
+        let mut why = entries.clone();
+        why[0].why = Some("Q: Which host?".into());
+        let (later, rewhy) = (later(&entries), later(&why));
+        let shipped = ["Ship 1.0?", "Ship 1.0?"];
+        let fallback = ["Which target?", "labelled needs-human"];
+        let cases = [
+            ("unread", &later, vec![], shipped, Some("Do it."), true),
+            (
+                "read, none",
+                &later,
+                vec![("o/t#1", None), ("o/t#2", None)],
+                fallback,
+                None,
+                false,
+            ),
+            (
+                "Why changed",
+                &rewhy,
+                vec![],
+                ["Which host?", "Ship 1.0?"],
+                None,
+                false,
+            ),
+        ];
+        for (name, snapshot, summaries, asks, recommendation, same) in cases {
+            let list = needs_you(snapshot, Some(&published), &read(Read::Partial, &summaries));
+            let said: Vec<&str> = list.items.iter().map(|a| a.ask.as_str()).collect();
+            assert_eq!(said, asks, "{name}");
+            let recommended = list.items[0].recommendation.as_deref();
+            assert_eq!(recommended, recommendation, "{name}");
+            let changed_at = if same { &first.changed_at } else { &later.at };
+            assert_eq!(&list.changed_at, changed_at, "{name}");
         }
     }
 
