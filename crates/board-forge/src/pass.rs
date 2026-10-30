@@ -560,7 +560,8 @@ const MAX_APPLIES_LIMIT: usize = 10;
 
 /// [`overlap::Waiver`]'s settings: set, a documentation-only overlap does
 /// not hold an issue in the board's first Priority option, and a draft
-/// unchanged for `staleDraftHours` (0: never) holds nothing. And the pull
+/// proved unpushed for `staleDraftHours` (0: never) holds nothing. Commit
+/// dates alone prove no idle time. And the pull
 /// requests that do hold work are moved on ([`blockers`]): one that has
 /// stood still for `staleHours` (0: never) and that only a person can move
 /// gets one needs-you card.
