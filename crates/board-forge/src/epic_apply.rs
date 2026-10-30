@@ -228,7 +228,14 @@ impl Config {
 
     /// The plan, checked against the bounds and the caller's opt-ins.
     fn validate(&self, value: &Value, epic: &Epic) -> Result<EpicPlan> {
-        let plan = EpicPlan::validate(value, &self.bounds, epic)?;
+        let validated = EpicPlan::validate(value, &self.bounds, epic);
+        let plan = match &validated {
+            Ok(plan) => plan,
+            Err(error) => match error.downcast_ref::<crate::epic::ClosedTargetsOnly>() {
+                Some(stale) => &stale.candidate,
+                None => return validated,
+            },
+        };
         ensure!(
             self.close_epic || !plan.closes_epic(),
             "the plan closes the epic, which the configuration does not allow (close_epic)"
@@ -237,7 +244,7 @@ impl Config {
             self.attach_sub_issue || !plan.attaches(),
             "the plan attaches an existing issue, which the configuration does not allow (attach_sub_issue)"
         );
-        Ok(plan)
+        validated
     }
 
     /// Whose plans count, as for `epic plan --operator --planner`. With a

@@ -231,6 +231,10 @@ one line an epic:
   each, held whole by `--max-writes`; `epics.maxAppliesPerPass` epics are
   applied a pass, counting only plans apply accepts, so each epic's unapplied
   plan is read on every pass until one is.
+  A refusal or changed-plan precondition during preview validation takes no
+  apply slot, so the next valid epic can apply in the same pass. Once validated,
+  the slot stays reserved even if a later check races or a write fails; preview
+  reserves the same slot and counts the same write steps.
 * `recover epic …` where the receipt was cut short (`claimed` or `stopped`)
   and every action's effect is proved by the identities it confirmed and the
   epic now; an applying pass rewrites the receipt as `recovered`, one write.
@@ -297,6 +301,18 @@ unchanged epic is not planned again (agent-board#383). Not noticed
 (agent-board#429): edits of the epic's or a sub-issue's text, label and
 Priority churn, and a comment by anyone but the operator, whose word alone
 decides an epic's plan.
+
+A pending plan refused only because actions target currently closed sub-issues
+is stale: the pass asks for a fresh **whole** epic plan, without touching those
+children or applying a subset. Classification requires the whole plan to pass
+validation, including configuration opt-ins, with only the closed-target
+restriction relaxed. Any other invalidity, including one hidden behind a closed
+target in the same action, keeps it held for the operator. A stale plan is
+planned again once: while its request waits, no new run starts; an unanswered
+request after a day or a replacement that is stale again is held for the operator.
+The new request reuses the bot's planning comment, with the usual edit recheck,
+and all planning caps and human holds still apply. A claimed or ambiguous apply
+is never classified this way: its receipt must be recovered or inspected.
 
 Stage 5 reads the whole board (closed issues and pull requests included, in
 about one request per hundred items) besides the runs and open issues that
