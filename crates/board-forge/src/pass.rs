@@ -7,7 +7,8 @@
 //! [`usage`]), stage 2 (pull request follow-up), stage 3 (epic apply,
 //! recovery and planning, in [`epics`]), stage 4 (scheduling) and stage 5
 //! (board Status, in [`status`]), and the maintain digest's plan, recorded
-//! but not yet run ([`maintain`]).
+//! but not yet run ([`maintain`]). Of stage 4b, promotion upstream, only
+//! the configuration and its line ([`promote`]).
 use crate::batch;
 use crate::caps::{Caps, Kind, Limits};
 use crate::epic::{EPIC_LABEL, epic_labelled_by};
@@ -477,6 +478,9 @@ pub struct Config {
     pub state: Option<String>,
     #[serde(default)]
     pub pr: Pr,
+    /// Off unless its `forks` are set: stage 4b, approved fork pull requests
+    /// promoted upstream ([`promote`]).
+    pub promote: Option<promote::Promote>,
     /// `--fix-bounds`, never the file's: the poll's [`PollPolicy::fix_bounds`].
     #[serde(skip)]
     pub fix_bounds: Option<poll::bounds::FixBounds>,
@@ -914,6 +918,9 @@ impl Config {
         }
         if let Some(starts) = &self.starts {
             starts.check(self)?;
+        }
+        if let Some(promote) = &self.promote {
+            promote.check(self)?;
         }
         crate::cost::check_prices(&self.prices)?;
         if let Some(cost) = &self.cost {
@@ -2092,6 +2099,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         scheduler.report.failures += 1;
         scheduler.line(format!("schedule error: {error:#}"));
     }
+    // Stage 4b: approved fork pull requests promoted upstream, after stage 2,
+    // which may move a head, and before Status, which sees its effects.
+    scheduler.line(promote::line(config.promote.as_ref()));
     // Stage 5: board Status from the facts read, this pass's starts included.
     if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
@@ -5074,6 +5084,7 @@ pub mod holds;
 pub mod lease;
 pub mod maintain;
 pub mod needs;
+pub mod promote;
 pub mod revisit;
 pub mod starts;
 mod status;

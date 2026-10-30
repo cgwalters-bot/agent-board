@@ -2496,6 +2496,92 @@ fn pass_replay_previews_without_credentials() {
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
 }
 
+/// A `promote` section changes nothing in a replay but stage 4b's line: it
+/// needs no token, reads nothing the recording lacks and writes nothing. A
+/// section the configuration refuses fails before any read.
+#[test]
+fn pass_replay_with_promote_reads_and_writes_nothing() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let dir = std::env::temp_dir().join(format!("agent-board-promote-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    let replay = |config: &Value, name: &str| {
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, config.to_string()).unwrap();
+        command()
+            .args(["pass", "--config"])
+            .arg(&path)
+            .args(["--replay", "fixtures/pass/board-2026-10-23.json"])
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+    };
+    let without = replay(&base, "without").success().get_output().clone();
+    let mut with = base.clone();
+    with["promote"] = serde_json::json!({
+        "forks": {"cgwalters-forge/bootc": {"upstream": "bootc-dev/bootc", "base": "main"}},
+        "signoff": {"name": "Op Erator", "email": "op@example.com"},
+        "policyRepository": "cgwalters-forge/tracker",
+        "policyPath": "upstream-policy",
+    });
+    let output = replay(&with, "with").success().get_output().clone();
+    let without = String::from_utf8(without.stdout).unwrap();
+    assert!(without.contains("\npromote: off\n"), "{without}");
+    // The same reads, decisions and previewed writes, the summary included.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        without.replace(
+            "\npromote: off\n",
+            "\npromote: 1 fork(s) configured; evaluation is not built\n"
+        )
+    );
+    // The case, its edit of the configuration, and the error.
+    type Case = (&'static str, fn(&mut Value), &'static str);
+    let cases: [Case; 5] = [
+        (
+            "unknown-key",
+            |v| v["promote"]["draft"] = true.into(),
+            "unknown field `draft`",
+        ),
+        (
+            "null",
+            |v| v["promote"]["policyPath"] = Value::Null,
+            "config.promote.policyPath is null; leave the key out instead",
+        ),
+        (
+            "fork-not-owner-repo",
+            |v| {
+                v["promote"]["forks"] =
+                    serde_json::json!({"bootc": {"upstream": "bootc-dev/bootc", "base": "main"}})
+            },
+            "promote forks: invalid repository \"bootc\": expected OWNER/REPO",
+        ),
+        (
+            "fork-in-follow",
+            |v| v["follow"] = serde_json::json!(["cgwalters-forge/bootc"]),
+            "promote fork cgwalters-forge/bootc is also in follow",
+        ),
+        (
+            "forks-without-signoff",
+            |v| {
+                v["promote"].as_object_mut().unwrap().remove("signoff");
+            },
+            "promote signoff is required with forks",
+        ),
+    ];
+    for (case, edit, error) in cases {
+        let mut config = with.clone();
+        edit(&mut config);
+        let output = replay(&config, case).code(1).get_output().clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(error), "{case}: {stderr}");
+        assert!(output.stdout.is_empty(), "{case}: {:?}", output.stdout);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// `prune` checks its configuration, options and cache before any token is
 /// read; past them, the next refusal is the missing token.
 #[test]

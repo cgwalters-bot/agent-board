@@ -253,12 +253,12 @@ const STARTED: &[&str] = &[
     "wip: no slot left; 270 more candidate(s) wait",
 ];
 
-/// The last line of scheduling, before the Status stage's.
+/// The last line of scheduling, before stage 4b's and the Status stage's.
 fn last_scheduled(report: &Report) -> &str {
     let lines = report.lines.iter().rev();
     lines
         .map(String::as_str)
-        .find(|l| !l.starts_with("status"))
+        .find(|l| !l.starts_with("status") && !l.starts_with("promote: "))
         .unwrap()
 }
 
@@ -323,8 +323,9 @@ fn replay_idle_board_starts_work() {
     expected.extend(not_live.iter().map(String::as_str));
     // No epic is planned, so stage 4 has every slot.
     expected.extend(STARTED);
-    // The recording's whole-board read is an empty board: the Status stage
-    // has its own recording.
+    // No promote section: stage 4b is off. The recording's whole-board read
+    // is an empty board: the Status stage has its own recording.
+    expected.push("promote: off");
     expected.push("status: 0 change(s) of 0 item(s) read");
     assert_eq!(report.lines, expected);
     assert_eq!(report.failures, 0);
@@ -389,7 +390,7 @@ fn triage_scope_epics_triages_only_epic_children() {
         let report = preview(&config, &replay);
         assert_eq!(report.failures, 0, "{setting}: {:#?}", report.lines);
         let from = (report.lines.iter()).position(|l| l.starts_with("candidates: "));
-        let to = (report.lines.iter()).position(|l| l.starts_with("status: "));
+        let to = (report.lines.iter()).position(|l| l.starts_with("promote: "));
         let lines = &report.lines[from.unwrap()..to.unwrap()];
         assert_eq!(lines, expected.as_slice(), "{setting}");
         let kinds: Vec<HoldKind> = (report.holds.iter())
@@ -8381,6 +8382,21 @@ fn maintain(edit: Value) -> Value {
         "maintain": maintain_section(edit)})
 }
 
+/// A `promote` section with one fork, `edit`'s keys replacing its own and
+/// a key set to `"-"` left out.
+fn promote(edit: Value) -> Value {
+    let mut section = json!({
+        "forks": {"o/fork": {"upstream": "up/project", "base": "main"}},
+        "signoff": {"name": "Op Erator", "email": "op@example.com"},
+        "policyRepository": "o/policy",
+        "policyPath": "upstream-policy",
+    });
+    let keys = section.as_object_mut().unwrap();
+    keys.extend(edit.as_object().unwrap().clone());
+    keys.retain(|_, value| *value != json!("-"));
+    json!({ "promote": section })
+}
+
 #[test]
 fn v1_representative_config() {
     // Synthetic deployment shape: public placeholders, no live endpoint or credentials.
@@ -8829,6 +8845,81 @@ fn config_table() {
             json!({"budget": {"source": "ledger"}}),
             "unknown variant `ledger`",
         ),
+        (promote(json!({"draft": true})), "unknown field `draft`"),
+        (
+            promote(
+                json!({"forks": {"o/fork": {"upstream": "up/project", "base": "main",
+                "draft": true}}}),
+            ),
+            "unknown field `draft`",
+        ),
+        (
+            promote(json!({"signoff": {"name": "Op", "email": "op@example.com", "key": "k"}})),
+            "unknown field `key`",
+        ),
+        (
+            promote(json!({"signoff": null})),
+            "config.promote.signoff is null",
+        ),
+        (
+            promote(json!({"forks": {"fork": {"upstream": "up/project", "base": "main"}}})),
+            "promote forks: invalid repository \"fork\": expected OWNER/REPO",
+        ),
+        (
+            promote(json!({"forks": {"o/fork": {"upstream": "up", "base": "main"}}})),
+            "promote forks o/fork upstream: invalid repository \"up\": expected OWNER/REPO",
+        ),
+        (
+            promote(
+                json!({"forks": {"o/fork": {"upstream": "up/a", "base": "main"},
+                "O/Fork": {"upstream": "up/b", "base": "main"}}}),
+            ),
+            "promote forks names o/fork twice",
+        ),
+        (
+            promote(json!({"forks": {}, "policyRepository": "policy"})),
+            "promote policyRepository: invalid repository \"policy\": expected OWNER/REPO",
+        ),
+        (
+            promote(json!({"forks": {"o/fork": {"upstream": "O/Fork", "base": "main"}}})),
+            "promote fork o/fork is its own upstream",
+        ),
+        (
+            promote(json!({"forks": {"o/fork": {"upstream": "up/project", "base": " "}}})),
+            "promote forks o/fork base is empty",
+        ),
+        (
+            promote(json!({"forks": {"o/fork": {"upstream": "up/project"}}})),
+            "missing field `base`",
+        ),
+        (
+            {
+                let mut both = promote(json!({}));
+                both["follow"] = json!(["O/FORK"]);
+                both
+            },
+            "promote fork o/fork is also in follow; a fork's pull requests are promoted, never merged",
+        ),
+        (
+            promote(json!({"signoff": "-"})),
+            "promote signoff is required with forks: the operator's Signed-off-by",
+        ),
+        (
+            promote(json!({"signoff": {"name": "Op", "email": ""}})),
+            "promote signoff name and email must not be empty",
+        ),
+        (
+            promote(json!({"signoff": {"name": " ", "email": "op@example.com"}})),
+            "promote signoff name and email must not be empty",
+        ),
+        (
+            promote(json!({"policyRepository": "-"})),
+            "promote policyRepository is required with forks: where contribution-policy records are read",
+        ),
+        (
+            promote(json!({"policyRepository": "policy"})),
+            "promote policyRepository: invalid repository \"policy\": expected OWNER/REPO",
+        ),
     ] {
         let mut value = minimal.clone();
         value
@@ -8870,6 +8961,24 @@ fn config_table() {
     assert!(
         format!("{:#}", Config::parse(duplicate).unwrap_err()).contains("pool a is named twice")
     );
+    // Promote is off when absent and with empty `forks`, which need nothing
+    // else; with forks it says how many, and that nothing evaluates them.
+    for (edit, line) in [
+        (json!({}), "promote: off"),
+        (json!({"promote": {}}), "promote: off"),
+        (json!({"promote": {"forks": {}}}), "promote: off"),
+        (
+            promote(json!({})),
+            "promote: 1 fork(s) configured; evaluation is not built",
+        ),
+        (
+            promote(json!({"policyPath": "-"})),
+            "promote: 1 fork(s) configured; evaluation is not built",
+        ),
+    ] {
+        let parsed = config(edit.clone());
+        assert_eq!(promote::line(parsed.promote.as_ref()), line, "{edit}");
+    }
     // The harness's repositories alone set no budget and need no broker.
     let mut harness = minimal.clone();
     harness["budget"] = json!({"harnessRepositories": ["o/r"]});
