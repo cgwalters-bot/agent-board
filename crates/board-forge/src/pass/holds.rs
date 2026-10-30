@@ -19,7 +19,7 @@ use super::lease::Held;
 use crate::github::DEFAULT_HOST;
 use crate::poll::validate_repository;
 use crate::supervise::health::json_block;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use board_core::ItemRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1046,7 +1046,8 @@ pub struct NeedsYou {
     /// How much of the bot's summaries of the held issues this pass read:
     /// they enrich asks, but are no source of them.
     pub summaries: Read,
-    /// The asks past [`MAX_NEEDS_YOU`] left out, the lowest ranked.
+    /// The asks left out, the lowest ranked: past [`MAX_NEEDS_YOU`], and
+    /// those [`fit`] cut.
     pub omitted: usize,
     /// How many `items`: always their number.
     pub count: usize,
@@ -1479,8 +1480,8 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// holds: no alarm is kept without its hold. The operator's own holds and
 /// the holds of every new run are always kept; past them, the needs-you
 /// list's lowest ranked asks are left out, counted in its `omitted`, so
-/// that what it can show is shown. If the holds alone do not fit, that is
-/// an error.
+/// that what it can show is shown, and with none left the list goes whole.
+/// If the holds alone do not fit, that is an error.
 pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let holds = &snapshot.holds;
     let on = |h: &Published| (h.item.clone(), h.epic);
@@ -1539,10 +1540,13 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         // which the next round sees.
         while over > 0 {
             let Some(group) = order.next() else {
+                // With no ask left to cut, the list's own fields go too.
                 let Some(ask) = needs_you.as_mut().and_then(NeedsYou::cut) else {
-                    bail!(
+                    ensure!(
+                        needs_you.take().is_some(),
                         "the hold snapshot is over {MAX_COMMENT_CHARS} characters with only the operator's holds and those of every new run left"
                     );
+                    break;
                 };
                 over = over.saturating_sub(serde_json::to_string(&ask)?.chars().count() + 1);
                 continue;
@@ -1794,6 +1798,22 @@ mod tests {
         assert_eq!(fitted.truncated, 1);
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         assert_eq!(parse(&body).unwrap()["truncated"], 1);
+        // Operator holds just under the cap, but not beside a needs-you
+        // list's fields: every ask is cut, then the list, and the holds
+        // are published.
+        let mut asked = bare(&board(0, 0));
+        let pad = MAX_COMMENT_CHARS - chars(&render(&asked).unwrap()) - 10;
+        asked
+            .holds
+            .last_mut()
+            .unwrap()
+            .reason
+            .push_str(&"p".repeat(pad));
+        let holds = asked.holds.len();
+        asked.needs_you = Some(listed(&waiting(), None, (true, true)));
+        let (listless, listless_body) = fit(asked).unwrap();
+        assert!(chars(&listless_body) <= MAX_COMMENT_CHARS);
+        assert_eq!((listless.holds.len(), listless.needs_you), (holds, None));
         let kept: BTreeSet<String> = fitted.holds.iter().filter_map(|h| h.item.clone()).collect();
         assert!(
             !kept.contains("o/work#55"),
@@ -2704,19 +2724,21 @@ mod tests {
 
     /// A board whose list [`fit`] cuts, and that does not change, publishes
     /// the same list again: its `changed_at` stays, and nothing is written
-    /// within the hour.
+    /// within the hour. One more ask past the cut, or a shown ask changed,
+    /// is a change.
     #[test]
     fn fit_cut_list_is_the_same_list_next_pass() {
         let at = |m: u32| format!("2026-10-28T09:{m:02}:00Z");
-        let pass_at = |minutes, previous: Option<&Value>| {
-            let entries: Vec<Entry> = (1..=80)
+        let pass = |holds, first: &str, minutes, previous: Option<&Value>| {
+            let entries: Vec<Entry> = (1..=holds)
                 .map(|n| {
                     let mut asked = entry(
                         Scope::Item(item("o/tracker", n)),
                         HoldKind::NeedsHuman,
                         "labelled needs-human",
                     );
-                    asked.why = Some(format!("Q: {n} {}?", "q".repeat(300)));
+                    let q = if n == 4 { first } else { "q" };
+                    asked.why = Some(format!("Q: {n} {}?", q.repeat(300)));
                     asked.priority = Some(format!("P{}", n % 4));
                     asked
                 })
@@ -2726,6 +2748,7 @@ mod tests {
             snapshot.needs_you = Some(listed(&snapshot, previous, (true, true)));
             fit(snapshot).unwrap()
         };
+        let pass_at = |minutes, previous: Option<&Value>| pass(80, "q", minutes, previous);
         let (first, body) = pass_at(0, None);
         assert_eq!((first.truncated, first.holds.len()), (0, 80));
         let list = first.needs_you.as_ref().unwrap();
@@ -2735,6 +2758,21 @@ mod tests {
         let list = again.needs_you.as_ref().unwrap();
         assert_eq!(list.changed_at, at(0));
         assert!(!changed(Some(&body), &again).unwrap());
+        // #4 is P0, so its ask is shown; #83 is P3 and new, so past the cut.
+        let shown = |s: &Snapshot, key: &str| {
+            (s.needs_you.as_ref().unwrap().items.iter()).any(|a| a.key == key)
+        };
+        assert!(shown(&first, "o/tracker#4"));
+        assert!(!shown(
+            &pass(83, "q", 30, published.as_ref()).0,
+            "o/tracker#83"
+        ));
+        for (holds, first) in [(83, "q"), (80, "r")] {
+            let (other, _) = pass(holds, first, 30, published.as_ref());
+            let list = other.needs_you.as_ref().unwrap();
+            assert_eq!(list.changed_at, at(30), "{holds} {first}");
+            assert!(changed(Some(&body), &other).unwrap(), "{holds} {first}");
+        }
     }
 
     const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
