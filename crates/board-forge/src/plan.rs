@@ -1613,8 +1613,9 @@ mod tests {
         overlap: Value,
         /// Items the collaborator check read, OWNER/REPO#N.
         checked: RefCell<Vec<String>>,
-        /// For a stacked plan, the lower issue's state and the open pull
-        /// requests ([`crate::stack::resolve`]); null when none is expected.
+        /// For a stacked plan, the lower issue's state and the open and
+        /// merged pull requests ([`crate::stack::resolve`]); null when none
+        /// is expected.
         stack: Value,
     }
 
@@ -2591,7 +2592,7 @@ mod tests {
         let mut forked = lower.clone();
         forked["isCrossRepository"] = true.into();
         let none_yet = "it stacks on ostreedev/ostree#3664, which has no open pull request of agentic-bot from a dispatch/ branch of ostreedev/ostree among the newest 50";
-        let stack = |state: &str, pulls: Value| json!({"repository": {"issue": {"state": state}, "pullRequests": {"nodes": pulls}}});
+        let stack = |state: &str, pulls: Value| json!({"repository": {"issue": {"state": state}, "pullRequests": {"nodes": pulls}, "merged": {"nodes": []}, "defaultBranchRef": {"name": "main"}}});
         let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
         let writers = [OPERATOR, PLANNER];
         // Name, the lower issue's state and pull requests; then the base sent

@@ -615,11 +615,8 @@ fn refusal_code(text: &str) -> bool {
 
 /// `^\s*part of\b`, on any line, in any case.
 fn says_part_of(body: &str) -> bool {
-    body.lines().any(|line| {
-        let line = line.trim_start().to_ascii_lowercase();
-        line.strip_prefix("part of")
-            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_'))
-    })
+    body.lines()
+        .any(|line| crate::stack::after_part_of(line).is_some())
 }
 
 /// The release tags `uses: {release}/.github/workflows/(policy|check|apply).yml@vX.Y.Z` pins.
