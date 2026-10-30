@@ -6,6 +6,15 @@
   "follow": ["example/control", "example/project"],
   "mergeAuthors": ["dependabot[bot]"],
   "kindPools": {"triage": "small"},
+  "pace": {
+    "repository": "example/usage",
+    "issue": 9,
+    "bot": "worker",
+    "overrides": [
+      {"pool": "fixture-spend", "until": "2026-10-18T00:00:00Z", "mode": "spend", "reason": "Synthetic allowance"},
+      {"pool": "fixture-hold", "until": "2026-10-19T00:00:00Z", "mode": "hold"}
+    ]
+  },
   "epics": {"repository": "example/control"},
   "coordinator": {"enabled": false},
   "schedule": {"repositories": ["example/control", "example/project"]}
