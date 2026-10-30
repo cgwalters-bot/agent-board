@@ -947,7 +947,21 @@ agent-board test [OPTIONS] <COMMAND>
 
 Commands:
 
+- [`deploy`](#agent-board-test-deploy): Read-only staging deployment preflight; emits a JSON readiness report
 - [`project`](#agent-board-test-project): Create and clean up scratch objects in the staging project (writes)
+
+## agent-board test deploy
+
+Read-only staging deployment preflight; emits a JSON readiness report
+
+```text
+agent-board test deploy [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: Trusted default-branch deployment configuration (never dispatcher input)
+- `--fixture <FILE>`: Offline JSON array of the four GraphQL responses; no credentials or network
 
 ## agent-board test project
 

@@ -1,0 +1,10 @@
+{
+  "owner": "cgwalters-forge-stage",
+  "repository": "cgwalters-forge-stage/scratch",
+  "project": 1,
+  "projectId": "PVT_fixture",
+  "workflow": "dispatch.yml",
+  "workflowRevision": "1111111111111111111111111111111111111111",
+  "agentBoardRevision": "2222222222222222222222222222222222222222",
+  "environment": "Main"
+}
