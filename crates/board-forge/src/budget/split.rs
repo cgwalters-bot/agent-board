@@ -21,12 +21,14 @@ use board_core::ItemRef;
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime, UtcOffset};
 
 /// The most results GitHub's search returns; a window with more is refused,
 /// never read in part.
 pub const SEARCH_LIMIT: u64 = 1000;
 const PAGE: u64 = 100;
+const COMPLETE_WEEKS: i64 = 4;
+const UPSTREAM_TARGET: f64 = 0.8;
 
 const SEARCH_QUERY: &str = r#"query($q: String!, $after: String) {
   search(query: $q, type: ISSUE, first: 100, after: $after) {
@@ -47,6 +49,112 @@ pub struct Split {
     pub upstream: Spend,
     pub harness: Spend,
     pub unpriced: usize,
+}
+
+/// One complete UTC Monday-to-Monday interval, using the window reader's
+/// status-comment-time and list-price accounting, not execution or billing time.
+#[derive(Debug)]
+pub struct Week {
+    pub since: OffsetDateTime,
+    pub until: OffsetDateTime,
+    pub split: Split,
+}
+
+/// Read four complete weeks preceding the UTC week containing `at`.
+/// The outer counter prevents four individually bounded reads from multiplying
+/// the request allowance. A refused read produces no successful partial report.
+pub fn four_weeks<T: Transport>(
+    client: &T,
+    config: &Config,
+    at: OffsetDateTime,
+) -> Result<Vec<Week>> {
+    let client = Counted {
+        inner: client,
+        used: Cell::new(0),
+    };
+    week_windows(at)?
+        .into_iter()
+        .map(|(since, until)| {
+            let split = read(&client, config, since, until).with_context(|| {
+                format!("reading complete week [{since}, {until}); four-week criterion unknown")
+            })?;
+            Ok(Week {
+                since,
+                until,
+                split,
+            })
+        })
+        .collect()
+}
+
+fn week_windows(at: OffsetDateTime) -> Result<Vec<(OffsetDateTime, OffsetDateTime)>> {
+    let utc = at.to_offset(UtcOffset::UTC);
+    let end = utc
+        .date()
+        .midnight()
+        .assume_utc()
+        .checked_sub(Duration::days(i64::from(
+            utc.weekday().number_days_from_monday(),
+        )))
+        .context("UTC week start out of range")?;
+    (1..=COMPLETE_WEEKS)
+        .rev()
+        .map(|n| {
+            let since = end
+                .checked_sub(Duration::weeks(n))
+                .context("complete week out of range")?;
+            Ok((since, since + Duration::weeks(1)))
+        })
+        .collect()
+}
+
+/// A known-cost comparison is not a claim about missing spend. Neither partial
+/// side nor an unpriced run bounds the ratio well enough to decide it here.
+fn criterion(split: &Split) -> &'static str {
+    let total = split.upstream.usd + split.harness.usd;
+    if !total.is_finite()
+        || total <= 0.0
+        || split.unpriced > 0
+        || split.upstream.partial
+        || split.harness.partial
+    {
+        "unknown"
+    } else if split.upstream.usd / total >= UPSTREAM_TARGET {
+        "met"
+    } else {
+        "not met"
+    }
+}
+
+/// Human-readable evidence, in percentages only. Health links are deliberately
+/// a placeholder, not an invented health definition or another forge read.
+pub fn report(weeks: &[Week]) -> Result<Vec<String>> {
+    let mut lines = vec!["Four complete UTC weeks; API list prices, status-comment last-change time (not effective billing or execution time).".into()];
+    for week in weeks {
+        let split = &week.split;
+        lines.push(format!("[{}, {}): {}; priced runs upstream={}, harness={}; unpriced={}; partial costs upstream={}, harness={}; observed >=80%: {}",
+            format_time(week.since)?, format_time(week.until)?, line(split),
+            split.upstream.runs, split.harness.runs, split.unpriced,
+            split.upstream.partial, split.harness.partial, criterion(split)));
+    }
+    let observed = if weeks.len() != COMPLETE_WEEKS as usize {
+        "unknown"
+    } else if weeks.iter().any(|w| criterion(&w.split) == "not met") {
+        "not met"
+    } else if weeks.iter().any(|w| criterion(&w.split) == "unknown") {
+        "unknown"
+    } else {
+        "met"
+    };
+    lines.push(format!(
+        "Four-week observed public-cost criterion (each week >=80%, unrounded): {observed}"
+    ));
+    lines.push("Coverage (all intervals): trusted bot status/cost markers on public search-visible items only; private repositories excluded; missing/deleted/replaced comments, other authors and unmarked runs are not measured. Deduplication is per window, at the first sorted item; edits can move a run between weeks. This is not a complete spend ledger.".into());
+    lines.push(
+        "Pass-health evidence links: unknown (none supplied; health criterion not defined).".into(),
+    );
+    lines.push("Overall criterion: unknown (coverage limitations and undefined pass health; observed shares alone do not establish success).".into());
+    Ok(lines)
 }
 
 /// The split of the runs whose status comment by the configuration's `bot`
@@ -237,18 +345,20 @@ mod tests {
     struct Forge {
         found: Vec<Value>,
         count: Option<u64>,
+        page_size: usize,
         comments: BTreeMap<String, Value>,
     }
 
     impl Transport for Forge {
         fn graphql(&self, query: &str, v: Value) -> Result<Value> {
             if query == SEARCH_QUERY {
-                assert_eq!(v["q"], format!("commenter:{BOT} updated:>={SINCE}"));
+                let prefix = format!("commenter:{BOT} updated:>=");
+                let since = v["q"].as_str().unwrap().strip_prefix(&prefix).unwrap();
                 let found: Vec<_> = (self.found.iter())
-                    .filter(|n| n["updatedAt"].as_str().unwrap() >= SINCE)
+                    .filter(|n| n["updatedAt"].as_str().unwrap() >= since)
                     .collect();
                 let start = v["after"].as_str().map_or(0, |a| a.parse().unwrap());
-                let end = found.len().min(start + 2);
+                let end = found.len().min(start + self.page_size);
                 let more = end < found.len();
                 return Ok(json!({"search": {
                     "issueCount": self.count.unwrap_or(found.len() as u64),
@@ -351,6 +461,7 @@ mod tests {
                 found("PullRequest", "cgwalters-forge/composefs-rs", 5, false, IN),
             ],
             count: None,
+            page_size: 2,
             comments: comments.into_iter().map(|(k, v)| (k.into(), v)).collect(),
         }
     }
@@ -432,5 +543,152 @@ mod tests {
             error.to_string().contains("budget.harnessRepositories"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn complete_week_boundaries_are_utc() {
+        for (clock, first, end) in [
+            ("2026-10-26T00:00:00Z", "2026-09-28T00:00:00Z", UNTIL),
+            ("2026-10-25T23:59:59Z", "2026-09-21T00:00:00Z", SINCE),
+            ("2026-10-26T01:00:00+02:00", "2026-09-21T00:00:00Z", SINCE),
+            ("2026-10-30T12:00:00Z", "2026-09-28T00:00:00Z", UNTIL),
+            (
+                "2027-01-01T00:00:00Z",
+                "2026-11-30T00:00:00Z",
+                "2026-12-28T00:00:00Z",
+            ),
+        ] {
+            let windows = week_windows(at(clock)).unwrap();
+            assert_eq!(windows.len(), 4, "{clock}");
+            assert_eq!(windows[0].0, at(first), "{clock}");
+            assert_eq!(windows[3].1, at(end), "{clock}");
+            for pair in windows.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0);
+                assert_eq!(pair[0].1 - pair[0].0, Duration::weeks(1));
+            }
+        }
+    }
+
+    #[test]
+    fn window_membership_and_duplicates() {
+        for (created, edited, expected) in [
+            ("2026-10-18T23:59:59Z", None, 0),
+            (SINCE, None, 1),
+            ("2026-10-25T23:59:59Z", None, 1),
+            (UNTIL, None, 0),
+            (BEFORE, Some(SINCE), 1),
+            (IN, Some(UNTIL), 0),
+        ] {
+            let mut f = forge();
+            f.found
+                .retain(|n| n["repository"]["nameWithOwner"] == "cgwalters-forge/bootc");
+            let comment = json!([
+                BOT,
+                status(1, Some(("8", false))),
+                edited.map(|_| BOT),
+                created,
+                edited
+            ]);
+            f.comments.insert(
+                "issue cgwalters-forge/bootc#1".into(),
+                json!([comment, comment]),
+            );
+            let split = read(&f, &config(), at(SINCE), at(UNTIL)).unwrap();
+            assert_eq!(split.upstream.runs, expected, "{created} {edited:?}");
+            assert_eq!(split.upstream.usd, expected as f64 * 8.0);
+        }
+    }
+
+    #[test]
+    fn unrounded_and_incomplete_criteria() {
+        for (upstream, harness, unpriced, partial_up, partial_harness, expected) in [
+            (79.9, 20.1, 0, false, false, "not met"),
+            (80.0, 20.0, 0, false, false, "met"),
+            (80.1, 19.9, 0, false, false, "met"),
+            (0.0, 0.0, 0, false, false, "unknown"),
+            (80.0, 20.0, 1, false, false, "unknown"),
+            (80.0, 20.0, 0, true, false, "unknown"),
+            (80.0, 20.0, 0, false, true, "unknown"),
+            (0.0, 20.0, 1, false, false, "unknown"),
+        ] {
+            let split = Split {
+                upstream: Spend {
+                    usd: upstream,
+                    runs: 1,
+                    partial: partial_up,
+                },
+                harness: Spend {
+                    usd: harness,
+                    runs: 1,
+                    partial: partial_harness,
+                },
+                unpriced,
+            };
+            assert_eq!(criterion(&split), expected, "{split:?}");
+            if upstream == 79.9 {
+                assert!(line(&split).contains("80% upstream"));
+            }
+            let weeks: Vec<_> = week_windows(at(UNTIL))
+                .unwrap()
+                .into_iter()
+                .map(|(since, until)| Week {
+                    since,
+                    until,
+                    split,
+                })
+                .collect();
+            let text = report(&weeks).unwrap().join("\n");
+            assert!(text.contains(&format!("unrounded): {expected}")), "{text}");
+            assert!(text.contains("Overall criterion: unknown"));
+            assert!(text.contains("Pass-health evidence links: unknown"));
+        }
+    }
+
+    #[test]
+    fn four_week_reads_reuse_window_accounting_and_refuse_bounds() {
+        for (too_many_items, too_many_requests, expected) in [
+            (false, false, None),
+            (true, false, Some("more than the 1000 a search returns")),
+            (false, true, Some("more than 1000 requests")),
+        ] {
+            let mut f = forge();
+            f.comments
+                .insert("issue cgwalters-forge/bootc#2".into(), json!([]));
+            if too_many_items {
+                f.count = Some(SEARCH_LIMIT + 1);
+            }
+            if too_many_requests {
+                f.page_size = 100;
+                f.found.clear();
+                for number in 1..=260 {
+                    f.found.push(found(
+                        "Issue",
+                        "cgwalters-forge/bootc",
+                        number,
+                        false,
+                        AFTER,
+                    ));
+                    f.comments.insert(
+                        format!("issue cgwalters-forge/bootc#{number}"),
+                        json!([[BOT, status(number, Some(("1", false))), null, IN, null]]),
+                    );
+                }
+            }
+            let result = four_weeks(&f, &config(), at(UNTIL));
+            if let Some(expected) = expected {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains(expected), "{error}");
+                assert!(error.contains("criterion unknown"), "{error}");
+            } else {
+                let weeks = result.unwrap();
+                assert_eq!(
+                    weeks[3].split,
+                    read(&f, &config(), at(SINCE), at(UNTIL)).unwrap()
+                );
+                assert_eq!(weeks[3].split.upstream.runs, 2);
+                assert!(weeks[3].split.upstream.partial);
+                assert_eq!(weeks[3].split.unpriced, 1);
+            }
+        }
     }
 }

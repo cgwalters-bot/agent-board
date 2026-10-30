@@ -12,13 +12,16 @@ pub struct Budget {
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
     /// Instead of the tree, print the share of the window's public spend on upstream work and on the harness (`budget.harnessRepositories`), in percentages only.
-    #[arg(long, requires = "since")]
+    #[arg(long, requires = "since", group = "report")]
     pub split: bool,
+    /// Report the last four complete UTC Monday-to-Monday weeks, read-only. No publishing or admission changes.
+    #[arg(long, conflicts_with_all = ["split", "since"], group = "report")]
+    pub four_weeks: bool,
     /// Start of the --split window, RFC 3339 (such as 2026-10-19T00:00:00Z).
     #[arg(long, value_name = "TIME", requires = "split")]
     pub since: Option<String>,
-    /// End of the --split window, RFC 3339; without it, the window runs to now.
-    #[arg(long, value_name = "TIME", requires = "split")]
+    /// End of the --split window, or reference clock for --four-weeks, RFC 3339; defaults to now.
+    #[arg(long, value_name = "TIME", requires = "report")]
     pub until: Option<String>,
 }
 
@@ -32,17 +35,24 @@ pub fn run<T: Transport>(
     let text = std::fs::read_to_string(&args.config)
         .with_context(|| format!("read {}", args.config.display()))?;
     let config = Config::parse(&text).with_context(|| format!("{}", args.config.display()))?;
-    if args.split {
+    if args.split || args.four_weeks {
         ensure!(
             config.harness_repositories().is_some(),
-            "--split needs budget.harnessRepositories in {}",
+            "--split/--four-weeks needs budget.harnessRepositories in {}",
             args.config.display()
         );
-        let since = parse_time(args.since.as_deref().context("--split needs --since")?)?;
         let until = match &args.until {
             Some(until) => parse_time(until)?,
             None => time::OffsetDateTime::now_utc(),
         };
+        if args.four_weeks {
+            let weeks = board_forge::budget::split::four_weeks(&transport()?, &config, until)?;
+            for line in board_forge::budget::split::report(&weeks)? {
+                writeln!(out, "{line}")?;
+            }
+            return Ok(());
+        }
+        let since = parse_time(args.since.as_deref().context("--split needs --since")?)?;
         ensure!(until > since, "the window must end after it starts");
         let split = board_forge::budget::split::read(&transport()?, &config, since, until)?;
         writeln!(out, "{}", board_forge::budget::split::line(&split))?;
@@ -101,6 +111,7 @@ mod tests {
         Budget {
             config: config.into(),
             split,
+            four_weeks: false,
             since: split.then(|| "2026-10-19T00:00:00Z".into()),
             until: split.then(|| "2026-10-26T00:00:00Z".into()),
         }
@@ -145,8 +156,46 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let error = format!("{:#}", error.unwrap_err());
         assert!(
-            error.contains("--split needs budget.harnessRepositories"),
+            error.contains("needs budget.harnessRepositories"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn prints_four_complete_weeks_without_writing() {
+        let mut args = args(CONFIG, false);
+        args.four_weeks = true;
+        args.until = Some("2026-10-30T12:00:00Z".into());
+        let mut out = Vec::new();
+        run(&args, || Ok(&Forge), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().filter(|l| l.starts_with('[')).count(), 4);
+        assert!(text.contains("[2026-09-28T00:00:00Z, 2026-10-05T00:00:00Z)"));
+        assert!(text.contains("[2026-10-19T00:00:00Z, 2026-10-26T00:00:00Z)"));
+        assert!(text.contains("unrounded): not met"));
+        assert!(text.contains("Overall criterion: unknown"));
+    }
+
+    #[test]
+    fn report_cli_arguments() {
+        use clap::Parser;
+        for (flags, valid) in [
+            (vec!["--four-weeks"], true),
+            (
+                vec!["--four-weeks", "--until", "2026-10-30T12:00:00Z"],
+                true,
+            ),
+            (
+                vec!["--four-weeks", "--since", "2026-10-01T00:00:00Z"],
+                false,
+            ),
+            (vec!["--four-weeks", "--split"], false),
+            (vec!["--split"], false),
+            (vec!["--until", "2026-10-30T12:00:00Z"], false),
+        ] {
+            let mut argv = vec!["agent-board", "budget", "--config", CONFIG];
+            argv.extend(flags);
+            assert_eq!(crate::Cli::try_parse_from(&argv).is_ok(), valid, "{argv:?}");
+        }
     }
 }
