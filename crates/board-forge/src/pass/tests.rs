@@ -428,6 +428,99 @@ fn overlap_setting_ignores_a_documentation_overlap() {
     assert_eq!(published, [json!(["overlap-ignored", false])]);
 }
 
+/// Apply through the offline forge, including the dispatch record and the
+/// actual published comment, not just a snapshot constructed from preview.
+#[test]
+fn apply_publishes_nonblocking_ignored_overlap() {
+    for (name, draft, pushed, starts) in [
+        ("documentation", false, 1, true),
+        ("idle draft", true, 5, true),
+        ("fresh push of old commit", true, 1, false),
+    ] {
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#527"]);
+        let now = forge.replay.now;
+        let ago = |h| (now - time::Duration::hours(h)).format(&Rfc3339).unwrap();
+        let mut settings = json!({"overlap": {}, "holds": {
+            "repository": "cgwalters-forge/bot-ops", "issue": 1}});
+        if draft {
+            // Disable only the documentation waiver by using another Priority.
+            for entry in &mut forge.replay.requests {
+                let nodes =
+                    entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+                for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                    node["priority"] = json!({"name": "P1"});
+                }
+            }
+            settings["overlap"]["staleHours"] = json!(0);
+            let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 832});
+            forge.replay.requests.push(json!({
+                "request": graphql_key(overlap::DRAFT_QUERY, &variables),
+                "answer": {"data": {"repository": {"pullRequest": {
+                    "isDraft": true, "createdAt": ago(20),
+                    "headRefOid": "a".repeat(40), "headRefName": "draft",
+                    "headRepository": {"nameWithOwner": "cgwalters-forge/fork"},
+                    "commits": {"nodes": [{"commit": {"committedDate": ago(100)}}]}
+                }}}}
+            }));
+            forge.replay.requests.push(json!({
+                "request": {"get": format!("{API_ROOT}repos/cgwalters-forge/fork/activity?ref=refs%2Fheads%2Fdraft&direction=desc&per_page=100")},
+                "answer": {"status": 200, "link": null, "body": [{
+                    "activity_type": "branch_creation", "ref": "refs/heads/draft",
+                    "timestamp": ago(pushed), "before": "0".repeat(40), "after": "a".repeat(40)
+                }]}
+            }));
+        }
+        for (url, body) in [
+            (
+                format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+                json!({"private": true}),
+            ),
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+        ] {
+            forge.replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        let report = apply(&forge, &config(settings));
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert_eq!(
+            forge
+                .dispatches()
+                .contains(&"cgwalters-forge/tracker#527".into()),
+            starts,
+            "{name}: {:#?}",
+            report.lines
+        );
+        let comments = forge.comments_on("cgwalters-forge/bot-ops", 1);
+        let body = comments
+            .iter()
+            .find(|c| c.starts_with(holds::HOLDS_MARKER))
+            .unwrap();
+        let snapshot = holds::parse(body).unwrap();
+        let entry = snapshot["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["item"] == "cgwalters-forge/tracker#527")
+            .unwrap();
+        assert_eq!(
+            entry["kind"],
+            if starts { "overlap-ignored" } else { "overlap" },
+            "{name}"
+        );
+        assert_eq!(entry["operator"], false, "{name}");
+        if starts {
+            assert!(
+                forge
+                    .comments_on("cgwalters-forge/tracker", 527)
+                    .iter()
+                    .any(|c| c.contains("overlap ignored:")),
+                "{name}"
+            );
+        }
+    }
+}
+
 /// Spend at the weekly budget holds stage 3's planning run as it holds
 /// stage 4's: a planning run is a new run too.
 #[test]

@@ -39,7 +39,7 @@ pub const PULL_READS: u64 = 50;
 pub const FILE_READS: u64 = 100;
 /// Running issues whose text is read, at most.
 pub const RUN_READS: usize = 10;
-/// Overlapping pull requests read for [`Waiver::stale_draft`], at most, so
+/// Requests spent on [`Waiver::stale_draft`], at most, so
 /// that the check's requests stay within what a start reserves; one past it
 /// holds.
 pub const DRAFT_READS: usize = 4;
@@ -58,11 +58,11 @@ pub(crate) const TEXT_QUERY: &str = r#"query($owner: String!, $name: String!, $n
   repository(owner: $owner, name: $name) { issue(number: $number) { title body } }
 }"#;
 
-/// Whether an overlapping pull request is a draft, when it was opened and
-/// when its head was committed; read only where [`Waiver::stale_draft`] asks.
+/// Draft identity and current head; commit dates cannot date a push of an
+/// old commit. Read only where [`Waiver::stale_draft`] asks.
 pub(crate) const DRAFT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    isDraft createdAt commits(last: 1) { nodes { commit { committedDate } } }
+    isDraft createdAt headRefOid headRefName headRepository { nameWithOwner }
   } }
 }"#;
 
@@ -99,7 +99,8 @@ impl Decision {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Waiver {
     /// The pass's clock and `overlap.staleDraftHours`: a draft opened and
-    /// last committed to at least that many hours before does not hold.
+    /// last pushed to at least that many hours before does not hold, only
+    /// with complete authenticated activity for its current head branch.
     pub stale_draft: Option<(OffsetDateTime, u64)>,
     /// Whether the waiting issue is in the board's first Priority option:
     /// then a pull request that shares only documentation does not hold.
@@ -116,7 +117,7 @@ impl Waiver {
     /// Why pull request `pull` of `dest`'s repository, which shares
     /// `theirs`, does not hold the run, if it does not. A draft read spends
     /// one of `reads`; with none left, it holds.
-    fn waives<T: Transport>(
+    fn waives<T: Transport + Rest>(
         &self,
         client: &T,
         (dest, pull): (&ItemRef, u64),
@@ -144,20 +145,101 @@ impl Waiver {
         if node["isDraft"] != Value::Bool(true) {
             return Ok(None);
         }
-        // Both must read: a draft whose age is unknown holds.
-        let at = |pointer: &str| {
-            node.pointer(pointer)
-                .and_then(Value::as_str)
-                .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        let Some(opened) = timestamp(&node["createdAt"]) else {
+            return Ok(None);
         };
-        let changed = at("/createdAt").zip(at("/commits/nodes/0/commit/committedDate"));
-        let Some(changed) = changed.map(|(opened, committed)| opened.max(committed)) else {
+        if (now - opened).whole_hours() < i64::try_from(hours)? || *reads == 0 {
+            return Ok(None);
+        }
+        let Some(repo) = node
+            .pointer("/headRepository/nameWithOwner")
+            .and_then(Value::as_str)
+        else {
+            return Ok(None);
+        };
+        validate_repository(repo)?;
+        let Some(branch) = node["headRefName"].as_str().filter(|b| !b.is_empty()) else {
+            return Ok(None);
+        };
+        let Some(head) = node["headRefOid"].as_str().filter(|h| oid(h)) else {
+            return Ok(None);
+        };
+        let reference = format!("refs/heads/{branch}");
+        let encoded: String = url::form_urlencoded::byte_serialize(reference.as_bytes()).collect();
+        *reads -= 1;
+        // Unlike the public Events feed or commit pushedDate, repository activity
+        // records branch changes, including force pushes back to an old commit.
+        // No actor/type/time filter: omissions could hide a newer head change.
+        let response = client.get(
+            &format!(
+                "{API_ROOT}repos/{repo}/activity?ref={encoded}&direction=desc&per_page={FILE_READS}"
+            ),
+            None,
+        )?;
+        if response.status != 200 || response.link.is_some() {
+            return Ok(None);
+        }
+        let Some(events) = response
+            .body
+            .as_array()
+            .filter(|e| !e.is_empty() && e.len() < FILE_READS as usize)
+        else {
+            return Ok(None);
+        };
+        // Require a complete, ordered chain ending at the PR head. A partial
+        // page, unknown activity, or a different branch/head proves no idle time.
+        let mut expected = head;
+        let mut previous = now;
+        for event in events {
+            let Some(at) = timestamp(&event["timestamp"]) else {
+                return Ok(None);
+            };
+            let Some(before) = event["before"].as_str().filter(|h| oid(h)) else {
+                return Ok(None);
+            };
+            if event["ref"] != reference
+                || event["after"] != expected
+                || at > previous
+                || !matches!(
+                    event["activity_type"].as_str(),
+                    Some(
+                        "push"
+                            | "force_push"
+                            | "branch_creation"
+                            | "branch_deletion"
+                            | "pr_merge"
+                            | "merge_queue_merge"
+                    )
+                )
+            {
+                return Ok(None);
+            }
+            expected = before;
+            previous = at;
+        }
+        if expected != "0".repeat(40)
+            || events.last().map(|e| &e["activity_type"]) != Some(&json!("branch_creation"))
+        {
+            return Ok(None);
+        }
+        let Some(changed) = timestamp(&events[0]["timestamp"]).map(|pushed| opened.max(pushed))
+        else {
             return Ok(None);
         };
         let idle = (now - changed).whole_hours();
         Ok((idle >= i64::try_from(hours)?)
             .then(|| format!("it is a draft whose head has not changed for {idle} hours")))
     }
+}
+
+fn timestamp(value: &Value) -> Option<OffsetDateTime> {
+    value
+        .as_str()
+        .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+}
+
+fn oid(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 pub(crate) fn shown(paths: &[String]) -> String {
@@ -577,6 +659,30 @@ mod tests {
 
     impl Rest for Forge {
         fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+            if url.contains("/activity?") {
+                let parsed = url::Url::parse(url)?;
+                assert_eq!(parsed.path(), "/repos/example/fork/activity");
+                let reference = parsed.query_pairs().find(|(k, _)| k == "ref").unwrap().1;
+                let number: u64 = reference
+                    .strip_prefix("refs/heads/draft-")
+                    .unwrap()
+                    .parse()?;
+                let pull = self
+                    .pulls
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p["number"] == number)
+                    .unwrap();
+                ensure!(pull["activityStatus"] != 0, "activity unreadable");
+                return Ok(RestResponse {
+                    status: pull["activityStatus"].as_u64().unwrap_or(200) as u16,
+                    etag: None,
+                    last_modified: None,
+                    link: pull["activityLink"].as_str().map(str::to_owned),
+                    body: pull["activity"].clone(),
+                });
+            }
             let runs: Vec<Value> = if url.contains("status=in_progress") {
                 (1..)
                     .zip(&self.runs)
@@ -899,17 +1005,25 @@ mod tests {
             number: 10,
         };
         let now = OffsetDateTime::parse("2026-10-28T18:00:00Z", &Rfc3339).unwrap();
-        // The bot's pull request, a draft or not, opened and last committed
-        // to the given hours before `now`.
-        let pull = |n: u64, files: &[&str], draft: bool, (opened, committed): (i64, i64)| {
+        // Commit dates are deliberately old even when the push is fresh.
+        // Activity belongs to the fork's branch, not the base repository.
+        let pull = |n: u64, files: &[&str], draft: bool, (opened, pushed): (i64, i64)| {
             let at = |h: i64| (now - time::Duration::hours(h)).format(&Rfc3339).unwrap();
             json!({"number": n, "author": {"login": "agentic-bot"}, "isDraft": draft,
                 "createdAt": at(opened),
-                "commits": {"nodes": [{"commit": {"committedDate": at(committed)}}]},
+                "headRefOid": "a".repeat(40), "headRefName": format!("draft-{n}"),
+                "headRepository": {"nameWithOwner": "example/fork"},
+                "activityLink": null, "activityStatus": 200,
+                "commits": {"nodes": [{"commit": {"committedDate": at(100)}}]},
+                "activity": [
+                    {"ref": format!("refs/heads/draft-{n}"), "activity_type": "push",
+                     "timestamp": at(pushed), "before": "b".repeat(40), "after": "a".repeat(40)},
+                    {"ref": format!("refs/heads/draft-{n}"), "activity_type": "branch_creation",
+                     "timestamp": at(100), "before": "0".repeat(40), "after": "b".repeat(40)}],
                 "files": {"nodes": files.iter().map(|p| json!({"path": p})).collect::<Vec<_>>()}})
         };
         let mut unknown = pull(5, &["src/a.rs"], true, (9, 9));
-        unknown["commits"]["nodes"] = json!([]);
+        unknown["activity"] = Value::Null;
         let off = Waiver::default();
         let stale = Waiver {
             stale_draft: Some((now, 4)),
@@ -932,7 +1046,7 @@ mod tests {
         let only_docs = "it shares only documentation, and the issue is in the first Priority";
         let (fix_code, fix_docs) = ("Fix src/a.rs.", "Fix docs/a.md and README.md.");
         // Name, the issue's text, the open pull requests, the waiver; the decision.
-        let cases = [
+        let mut cases = vec![
             (
                 "off, a stale draft holds",
                 fix_code,
@@ -950,7 +1064,7 @@ mod tests {
                 )),
             ),
             (
-                "draft committed to since",
+                "old commit freshly pushed to an old draft",
                 fix_code,
                 json!([pull(5, &["src/a.rs"], true, (9, 3))]),
                 both,
@@ -1016,18 +1130,85 @@ mod tests {
                 wait("example/work#6 changes `src/b.rs`", &[6]),
             ),
             (
-                "more stale drafts than are read",
+                "more stale drafts than the request allowance",
                 fix_code,
-                (5..=5 + DRAFT_READS as u64)
+                (5..=5 + (DRAFT_READS / 2) as u64)
                     .map(|n| pull(n, &["src/a.rs"], true, (9, 9)))
                     .collect(),
                 stale,
                 wait(
-                    &format!("example/work#{} changes `src/a.rs`", 5 + DRAFT_READS),
-                    &[5 + DRAFT_READS as u64],
+                    &format!("example/work#{} changes `src/a.rs`", 5 + DRAFT_READS / 2),
+                    &[5 + (DRAFT_READS / 2) as u64],
                 ),
             ),
         ];
+        for (name, field, value) in [
+            ("missing head", "/headRefOid", Value::Null),
+            ("missing fork", "/headRepository", Value::Null),
+            ("missing activity", "/activity", Value::Null),
+            ("empty activity", "/activity", json!([])),
+            ("truncated activity", "/activityLink", json!("next page")),
+            ("unreadable activity", "/activityStatus", json!(403)),
+            ("head mismatch", "/activity/0/after", json!("c".repeat(40))),
+            ("ref mismatch", "/activity/0/ref", json!("refs/heads/other")),
+            ("unknown timestamp", "/activity/0/timestamp", Value::Null),
+            (
+                "unknown activity",
+                "/activity/0/activity_type",
+                json!("unknown"),
+            ),
+            ("broken chain", "/activity/0/before", json!("c".repeat(40))),
+            (
+                "missing beginning",
+                "/activity/1/before",
+                json!("c".repeat(40)),
+            ),
+            (
+                "future push",
+                "/activity/0/timestamp",
+                json!("2026-10-29T18:00:00Z"),
+            ),
+            (
+                "unordered history",
+                "/activity/1/timestamp",
+                json!("2026-10-28T17:00:00Z"),
+            ),
+        ] {
+            let mut draft = pull(5, &["src/a.rs"], true, (9, 5));
+            *draft
+                .pointer_mut(field)
+                .unwrap_or_else(|| panic!("{field}")) = value;
+            cases.push((name, fix_code, json!([draft]), stale, wait(code, &[5])));
+        }
+        for (name, pushed, ignored_head) in [
+            ("fresh force push of an old commit", 1, false),
+            ("idle force-pushed head", 5, true),
+        ] {
+            let mut draft = pull(5, &["src/a.rs"], true, (9, pushed));
+            draft["activity"][0]["activity_type"] = json!("force_push");
+            cases.push((
+                name,
+                fix_code,
+                json!([draft]),
+                stale,
+                if ignored_head {
+                    ignored(&format!(
+                        "{code}, but it is a draft whose head has not changed for 5 hours"
+                    ))
+                } else {
+                    wait(code, &[5])
+                },
+            ));
+        }
+        let mut full = pull(5, &["src/a.rs"], true, (9, 5));
+        full["activity"] = vec![full["activity"][0].clone(); FILE_READS as usize].into();
+        cases.push((
+            "activity read cap exhausted",
+            fix_code,
+            json!([full]),
+            stale,
+            wait(code, &[5]),
+        ));
         for (name, text, pulls, waiver, expected) in cases {
             let forge = Forge {
                 runs: vec![],
@@ -1046,6 +1227,17 @@ mod tests {
                 checks,
             );
             assert_eq!(decision, expected, "{name}");
+            // Neither waiver may release an overlap with a run still in flight.
+            let forge = Forge {
+                runs: vec!["implement example/work#11"],
+                texts: [("example/work#10", text), ("example/work#11", text)].into(),
+                ..forge
+            };
+            assert!(
+                matches!(decide_strict(&forge, (&issue, &issue), "-", "agentic-bot", &target, checks),
+                Decision::Wait(why, pulls) if why.contains("in flight") && pulls.is_empty()),
+                "{name}"
+            );
         }
         assert_eq!(
             ignored(&format!("{docs}, but {only_docs}")).sentence(),

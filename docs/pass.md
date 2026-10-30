@@ -713,18 +713,26 @@ this is stricter than standalone dispatch's best-effort heuristic.
 
 With `overlap` set (agent-board#426), an open pull request of the bot's that
 overlaps a start does not hold it when it is a draft opened and last
-committed to at least `overlap.staleDraftHours` before the pass's clock (a
+pushed to at least `overlap.staleDraftHours` before the pass's clock (a
 draft nobody moves races no run), or when every path it shares is
 documentation (`*.md` or under `docs/`) and the issue is in the board's first
 Priority option (such a conflict is cheap to resolve, and P0 work should not
-wait on it). Its head's commit time stands in for its last push. Each overlapping
+wait on it). Commit authored/committed dates do not date head movement: an old
+commit pushed now is fresh, including a force push. The draft rule reads GitHub's
+authenticated repository activity for the current head repository and branch,
+without actor, activity-type or time filters. It requires a complete single page
+(fewer than 100 entries, no pagination link), an ordered change chain back to
+branch creation, and the newest activity's resulting commit matching the PR head.
+Missing, unreadable, truncated or inconsistent history retains the hold; labels,
+comments and their update times are not head-change evidence. Each overlapping
 pull request is judged alone, and any one not waived still holds the start;
 a run in flight is never waived. A waived overlap is said as
 `overlap ignored: OWNER/REPO#N: open pull request … changes …, but …`, kept
 in the hold snapshot as kind `overlap-ignored` (not blocking, not the
-operator's), and the dispatch record says it too. The draft rule reads one
-more request per overlapping pull request, for at most four of them, which
-a start's request reservation covers; any past those, and one that cannot
+operator's), and the dispatch record says it too. The draft rule spends the
+existing allowance of four requests: one for a PR's draft/head facts and one
+for its branch activity, so at most two drafts can be waived. A start's request
+reservation covers these reads; any past the allowance, and one that cannot
 read, holds the start, as any unreadable overlap check does. The overlap
 holds that remain move their pull requests on, or ask a person to, as
 [blockers](#blockers) says.
