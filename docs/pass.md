@@ -31,9 +31,12 @@ A preview then prints
 applying pass edits the bot's comment
 there (or adds one, as the bot), only in a private repository, and prints
 `usage: published URL`. That is one write step, and the pass's first,
-so `--max-writes 1` spends it there. A failed read is one line,
-`usage error: reading the broker: …`, counted as a failure, and pacing falls
-back to the published snapshot under the staleness rules below. Without
+so `--max-writes 1` spends it there. A failed read is one line, and pacing
+falls back to the published snapshot under the staleness rules below: with a
+fresh one, the line is `usage warning: reading the broker: …` and no failure;
+with none, or one that is not fresh, `usage error: reading the broker: …, but` why,
+counted as one failure (an unreadable snapshot is counted once, by its own
+`usage error` line). Without
 `usage.url` the line says pacing reads the published snapshot. Unlike
 `usage.cjs`, a pool the broker has no current week for (after a broker
 restart) is held (`no-reading`), not carried from the previous snapshot; and

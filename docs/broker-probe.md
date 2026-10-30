@@ -9,8 +9,9 @@ here. A scheduled workflow that can reach the broker runs it, for example
 every 15 minutes from the tailnet.
 
 It is still needed beside the [pass](pass.md): a pass that cannot read the
-broker's `/usage` prints one `usage error` line, counts a failure and paces
-on the published snapshot, but opens no issue. The outage issue is what a
+broker's `/usage` prints one line and paces on the published snapshot (a
+warning while that is fresh, otherwise a `usage error` counted as a failure),
+but opens no issue. The outage issue is what a
 person sees, and what [poll's `brokerOutage`](poll.md) reads to give back
 fix rounds; the [supervisor's](supervisor-requests.md) `broker` check reads
 the probe workflow's runs.

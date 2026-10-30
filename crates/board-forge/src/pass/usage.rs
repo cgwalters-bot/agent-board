@@ -465,7 +465,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// applying pass publishes it, one write, and a preview paces by it
     /// unpublished. A failed read is one line,
     /// and pacing falls back to the published snapshot, which holds once
-    /// it is stale; with a grant, to the grant alone.
+    /// it is stale; with a grant, to the grant alone. Falling back to a
+    /// fresh snapshot is a warning, and to none or one not fresh a failure.
     pub(super) fn refresh(&mut self) {
         let config = self.config;
         let Some(usage) = &config.usage else {
@@ -506,12 +507,29 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 }
                 snapshot
             }
-            Err(error) => {
-                // Left unset, the published snapshot is read when pacing needs it.
+            Err(error) if grant.is_some() => {
                 self.report.failures += 1;
                 self.line(format!(
                     "usage error: reading the broker: {error:#}; pacing reads the published snapshot"
                 ));
+                return;
+            }
+            Err(error) => {
+                // Read the published snapshot now: pacing by a fresh one is
+                // no failure, and one it cannot read is counted there, once.
+                let failures = self.report.failures;
+                let published = self.snapshot();
+                let said =
+                    format!("reading the broker: {error:#}; pacing reads the published snapshot");
+                match fresh(published.as_ref(), self.now) {
+                    Ok(_) => self.line(format!("usage warning: {said}")),
+                    Err(why) => {
+                        if self.report.failures == failures {
+                            self.report.failures += 1;
+                        }
+                        self.line(format!("usage error: {said}, but {why}"));
+                    }
+                }
                 return;
             }
         };
