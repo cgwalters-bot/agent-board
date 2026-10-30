@@ -2431,6 +2431,174 @@ fn preview_says_the_stalls() {
     );
 }
 
+/// The recorded board's `item` (`REPO#N` under `cgwalters-forge/`) at
+/// board Status Blocked, a person's hold.
+fn blocked(replay: &mut Replay, item: &str) {
+    let items = "/data/repositoryOwner/projectV2/items/nodes";
+    for entry in &mut replay.requests {
+        let nodes = entry["answer"].pointer_mut(items);
+        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+            let content = &node["content"];
+            let on = format!(
+                "{}#{}",
+                text(content, "/repository/nameWithOwner"),
+                content["number"]
+            );
+            if on == format!("cgwalters-forge/{item}") {
+                node["status"] = json!({"name": "Blocked"});
+            }
+        }
+    }
+}
+
+/// With `holds` and no `stall` setting, successive applying passes, each
+/// reading the snapshot the one before published to the bot's comment,
+/// keep each hold's `since` and the pass's `progress_at` until a threshold
+/// (agent-board#454, #459): the idle alarm at four hours without a start,
+/// tracker#527's P0 overlap's at six, each on the operator. A pass that
+/// would publish the same alarms writes nothing, and they clear once the
+/// hold changes (#527 board Blocked) or a run starts. tracker#446, board
+/// Blocked throughout, waits on a person and never alarms. `--max-dispatch
+/// 0` keeps the passes before the last from starting anything.
+#[test]
+fn apply_raises_and_clears_the_stalls() {
+    let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    // The forge's first write is the comment it adds, with the first id.
+    let comment = 9_000_000_001_u64;
+    let add = format!("POST {bot_ops}/issues/1/comments");
+    let edit = format!("PATCH {bot_ops}/issues/comments/{comment}");
+    let mut forge = Forge::new(None, false);
+    blocked(&mut forge.replay, "tracker#446");
+    let reply = |body| json!({"status": 200, "link": null, "body": body});
+    for (url, body) in [
+        (bot_ops.clone(), json!({"private": true})),
+        (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+    ] {
+        let request = json!({"request": {"get": url}, "answer": reply(body)});
+        forge.replay.requests.push(request);
+    }
+    let recorded = usage(&mut forge.replay);
+    let config = config(json!({"holds": {"repository": "cgwalters-forge/bot-ops", "issue": 1}}));
+    let start = forge.replay.now;
+    let stamp = |hours| {
+        (start + time::Duration::hours(hours))
+            .format(&Rfc3339)
+            .unwrap()
+    };
+    let (holds_issue, overlapped) = ("cgwalters-forge/bot-ops#1", "cgwalters-forge/tracker#527");
+    let overlap = "Waiting: open pull request cgwalters-forge/tracker#832 changes `README.md`.";
+    let held = format!(
+        "the same hold for 6 hours or more, since {}: {overlap}",
+        stamp(0)
+    );
+    let idle = |free: usize| {
+        format!(
+            "no apply, dispatch or merge for 4 hours or more, since {}, with {free} candidate(s) free to start; see the pass log https://github.com/cgwalters-forge/tracker/actions/runs/4242",
+            stamp(0)
+        )
+    };
+    // Hours after the first pass, whether it may start runs, whether #527
+    // is board Blocked, its write of the hold comment, the hours of its
+    // `progress_at` and of #527's `since`, and its alarms by item and reason,
+    // each since the first pass. Of the 9 candidates, the dispatched
+    // agentic-job#188 and tracker#468 and the Blocked ones are not free.
+    type Case<'a> = (
+        i64,
+        bool,
+        bool,
+        Option<&'a String>,
+        i64,
+        i64,
+        Vec<(&'a str, String)>,
+    );
+    let idle_only = vec![(holds_issue, idle(6))];
+    let both = vec![(overlapped, held), (holds_issue, idle(6))];
+    let changed_hold = vec![(holds_issue, idle(5))];
+    // Each threshold is reached exactly: four hours, then six.
+    let cases: Vec<Case> = vec![
+        (0, false, false, Some(&add), 0, 0, vec![]),
+        (3, false, false, None, 0, 0, vec![]),
+        (4, false, false, Some(&edit), 0, 0, idle_only),
+        (6, false, false, Some(&edit), 0, 0, both.clone()),
+        (8, false, false, None, 0, 0, both),
+        (9, false, true, Some(&edit), 0, 9, changed_hold),
+        (10, true, true, Some(&edit), 10, 9, vec![]),
+    ];
+    for (hours, starts, changed, wrote, progress, since, alarms) in cases {
+        if changed {
+            blocked(&mut forge.replay, "tracker#527");
+        }
+        // The broker's snapshot as fresh as when it was recorded.
+        let mut fresh = recorded.clone();
+        let updated = at(text(&recorded, "/updated_at")) + time::Duration::hours(hours);
+        fresh["updated_at"] = updated.format(&Rfc3339).unwrap().into();
+        set_usage(&mut forge.replay, &fresh);
+        let limits = Limits {
+            dispatch: (!starts).then_some(0),
+            ..Limits::default()
+        };
+        let before = forge.writes.borrow().len();
+        let mode = (Mode::Actions(&own()), limits);
+        let now = start + time::Duration::hours(hours);
+        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        assert_eq!(report.failures, 0, "{hours}: {:#?}", report.lines);
+        let stalls: Vec<&String> = (report.lines.iter())
+            .filter(|l| l.starts_with("stall "))
+            .collect();
+        let said: Vec<String> = (alarms.iter())
+            .map(|(item, reason)| match *item == holds_issue {
+                true => format!("stall idle: {reason}"),
+                false => format!("stall hold {item}: {reason}"),
+            })
+            .collect();
+        assert_eq!(stalls, said.iter().collect::<Vec<_>>(), "{hours}");
+        let writes = forge.writes.borrow()[before..].to_vec();
+        let published: Vec<(String, String)> = (writes.iter())
+            .filter(|(_, _, body)| text(body, "/body").starts_with(holds::HOLDS_MARKER))
+            .map(|(m, url, body)| (format!("{m} {url}"), text(body, "/body").to_owned()))
+            .collect();
+        let to: Vec<&String> = published.iter().map(|(w, _)| w).collect();
+        assert_eq!(to, Vec::from_iter(wrote), "{hours}: {:#?}", report.lines);
+        // A pass that starts nothing writes nothing else.
+        assert_eq!(forge.dispatches().is_empty(), !starts, "{hours}");
+        if !starts {
+            assert_eq!(writes.len(), published.len(), "{hours}: {writes:#?}");
+        }
+        let Some((_, body)) = published.into_iter().next() else {
+            assert!(report.lines.contains(&"holds: unchanged".into()), "{hours}");
+            continue;
+        };
+        let snapshot = holds::parse(&body).unwrap();
+        assert_eq!(snapshot["at"], stamp(hours), "{hours}");
+        assert_eq!(snapshot["pass"]["progress_at"], stamp(progress), "{hours}");
+        let entries = snapshot["holds"].as_array().unwrap();
+        let on = |item: &str, kind: &str| {
+            (entries.iter())
+                .find(|h| h["item"] == item && h["kind"] == kind)
+                .unwrap_or_else(|| panic!("{hours}: no {kind} on {item}: {body}"))
+        };
+        assert_eq!(
+            on("cgwalters-forge/tracker#446", "blocked")["operator"],
+            false
+        );
+        let kind = if changed { "blocked" } else { "overlap" };
+        assert_eq!(on(overlapped, kind)["since"], stamp(since), "{hours}");
+        let stalled: Vec<Value> = (entries.iter())
+            .filter(|h| h["kind"] == "stalled")
+            .map(|h| json!([h["item"], h["reason"], h["operator"], h["since"]]))
+            .collect();
+        let expected: Vec<Value> = (alarms.iter())
+            .map(|(item, reason)| json!([item, reason, true, stamp(0)]))
+            .collect();
+        assert_eq!(stalled, expected, "{hours}");
+        // The next pass reads what this one published.
+        let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+        let comments = comments.as_array_mut().unwrap();
+        comments.retain(|c| c["id"] != comment);
+        comments.push(json!({"id": comment, "user": {"login": "cgwalters-bot"}, "body": body}));
+    }
+}
+
 /// Two passes compete for the last slot, each with a different plan: the
 /// one that sees the other in progress starts nothing, as the other may
 /// take the slot it saw free; alone, it takes the slot.
