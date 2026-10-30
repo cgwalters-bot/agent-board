@@ -98,6 +98,86 @@ Why: upstream maintainers did not ask for a bot's ledger in their threads,
 while on our own issues the record is most useful where people already look,
 and a person should be able to read what the machine read.
 
+## Promote
+
+A fork pull request the operator approved is opened in the upstream project
+its fork tracks by the pass's [stage 4b](pass.md#order-and-effects), not a
+separate job; it replaces homegit's `bot-promote-due` and `bot-pr promote`
+(agent-board#308). Only its configuration is built so far.
+
+* **Approval.** Only the operator's approving review of the fork pull
+  request's current head counts; an approval of an older head does not, and
+  the stage says so once per approval. A later change request or dismissal
+  cancels it; a later comment-only review leaves it. The `/promote`,
+  `/draft` and `/ready` comment commands are gone: the approving review is
+  the whole signal.
+* **Where it goes.** `promote.forks` in the configuration, never the pull
+  request's body, which anyone can edit. At run time the fork's GitHub parent
+  or network root must be the configured upstream. A fork is never in
+  `follow`: its main moves only by sync.
+* **Kept.** The upstream contribution-policy gate; the operator's sign-off
+  added at promote where the upstream wants DCO; the stacked wait (a pull
+  request whose dependency is not yet upstream waits); one notice per reason
+  on the fork pull request; and `--human-text`, the one marker that the
+  operator wrote the text, in the approving review's body.
+* **Dropped.** The advisory comment quoting the upstream's rules, unless the
+  policy blocks the promotion: then the blocking notice says the verdict and
+  what it rests on, once. Also homegit's `--include-others` and
+  `--no-signoff`, which become refusals, its `--why`, its policy-cache issue
+  and its attempts cache.
+* **Commits.** Their existing trailers stay; no commit is rewritten to change
+  an older generated-by trailer. The one rewrite allowed is adding the
+  operator's sign-off for DCO, which refuses merge commits and commits by
+  neither the bot nor the operator.
+* **Noise.** The upstream repository gets the pull request and nothing else.
+  The fork pull request, first-party, gets readable state with its machine
+  detail alongside ([bookkeeping](#bookkeeping)).
+* **Writes.** `pass --apply` makes them directly within `--max-writes`
+  ([writes](#writes)), one promotion a pass taken whole or held whole, over
+  the forge API through the pass's budget and replay, never a `git` or `gh`
+  subprocess.
+
+The answers to the brief's open questions:
+
+1. **After promote.** The fork pull request is closed with a comment linking
+   the upstream one, as homegit did. The item's first-party state (its
+   hidden state comment) records the upstream pull request, and Status counts
+   an open one recorded there as In Progress and its merge as Done. A replay
+   scenario shows that before anything closes a fork pull request.
+2. **`--human-text`.** The marker in the approving review's body is enough.
+3. **Policy records.** Read from the configured repository's default
+   branch, with homegit's rule that a verdict is loosened only by the
+   operator, ported; never written.
+4. **Stacks.** The plan's `stacks_on` is the source; a pull request with none
+   is not stacked.
+5. **Drafts.** A draft fork pull request is never promoted.
+6. **Behind upstream.** Refused, with one notice, even where it would merge
+   cleanly: the approved head would go upstream untested against the new
+   base, and rebasing needs `git`.
+7. **A head in the bot's fork.** Whether an upstream takes a pull request
+   whose head is in the bot's fork is verified with one recorded call in a
+   staging organisation, not assumed. If it does not, the branch is pushed
+   into the midstream first, as a counted write.
+
+Three rules learned from reviewing the first attempt (agent-board#312):
+
+* **Re-read the decision.** The operator's latest decision is read again
+  immediately before the first write; the promotion holds unless it is still
+  the approval acted on and no `needs-human` label was added since.
+* **Move a ref only by compare-and-swap.** The branch ref is moved only by
+  an update that names the expected old object id (GraphQL `updateRefs`),
+  never by a read, a REST `PATCH` and a second read, which lose a push that
+  lands between them.
+* **Check the head published.** The upstream pull request is created from a
+  mutable `OWNER:BRANCH` head, so the stage checks the head sha in the
+  response against the approved one; on a mismatch it refuses, records no
+  success and closes nothing.
+
+Why: the approving review is one authenticated act on an exact head, and
+everything else the stage trusts is configuration or a fact it read itself;
+a pull request body, a comment or a local cache can say anything. An
+upstream sees only the pull request, as a person would have opened it.
+
 ## Async forge I/O
 
 Forge I/O moves to async in slices (#300). The first is in: the GitHub board
