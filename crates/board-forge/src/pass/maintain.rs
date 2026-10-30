@@ -55,7 +55,7 @@ pub const DIGEST_SCHEMA: &str = "agent-board/maintain-digest/v1";
 /// The info string of that block's fence.
 pub const DIGEST_FENCE: &str = "agent-board-maintain-digest";
 /// The digest's groups, and whether an entry of each names its head.
-const DIGEST_GROUPS: &[(&str, bool)] = &[
+pub(super) const DIGEST_GROUPS: &[(&str, bool)] = &[
     ("approve", true),
     ("closer", true),
     ("waiting", false),

@@ -733,17 +733,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             self.line(line);
         }
         if at.needs_you {
-            let options = match &self.board {
-                Some(Some(board)) => board.options.as_slice(),
-                _ => &[],
-            };
-            let reading = holds::Reading {
-                epics: self.config.epics.is_some(),
-                considered: self.unconsidered == 0,
-                options,
-                on: &on,
-            };
-            snapshot.needs_you = Some(holds::needs_you(&snapshot, previous, &reading));
+            snapshot.needs_you = Some(self.needs_you(&snapshot, previous, &on));
         }
         snapshot
     }

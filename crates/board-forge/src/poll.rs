@@ -222,6 +222,9 @@ const RUN_RERUN: &str = "run rerun";
 const RE_RUN: &str = "re-run";
 /// Why a head with no verdict waits, which [`Pass::review_rerun`] looks behind.
 const NO_REVIEW: &str = "no approving review of the head yet";
+/// Why a head the review job withheld its approval of ([`WITHHELD`]) waits.
+const WITHHELD_WAIT: &str =
+    "the review withheld its approval of the head; it needs a human approval";
 
 // Both writes admit only the head we approved. A queue is required by the base
 // branch's rules, not an auto-merge fallback; GitHub owns revalidation after
@@ -3037,12 +3040,7 @@ pub fn decide(
     }
     match review {
         Some(Review::Approved) => {}
-        Some(Review::Withheld) => {
-            return step(
-                "wait",
-                "the review withheld its approval of the head; it needs a human approval",
-            );
-        }
+        Some(Review::Withheld) => return step("wait", WITHHELD_WAIT),
         _ => return step("wait", NO_REVIEW),
     }
     // Every merge and re-queue ([`queue_step`]) is this step's, so none passes
@@ -3214,8 +3212,43 @@ pub struct Outcome {
     /// The review job's runs an earlier pass started that still run, outside
     /// the caller's workflow, which a caller counts against its capacity too.
     pub reviewing: usize,
+    /// The followed pull requests whose step waits on the operator
+    /// ([`operator_wait`]).
+    pub waits: Vec<Wait>,
+    /// The followed repositories, lower case, of which this pass decided no
+    /// step for some pull request: outside its envelope, or a read that
+    /// failed. Any of those may wait on the operator too.
+    pub undecided: BTreeSet<String>,
     /// The state to keep for the next pass; its interval is the next gap.
     pub state: State,
+}
+
+/// A followed pull request that waits on the operator, at the head the
+/// pass read: `approve` (its approval of the head, under
+/// [`OPERATOR_APPROVAL_LABEL`]), `withheld` (the review job withheld its
+/// approval) or `needs-human` (labelled so, or stopped by this step).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Wait {
+    pub repository: String,
+    pub number: u64,
+    pub head: String,
+    pub kind: &'static str,
+    /// The step's reason.
+    pub reason: String,
+}
+
+/// What, if anything, `decision` for `pull` leaves waiting on the operator.
+/// What the pass resolves by itself is not: a run, check, review or rerun
+/// it waits for, a queue, or an answer it already acts on.
+fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
+    let approval = format!("labelled {OPERATOR_APPROVAL_LABEL} ");
+    match decision.action {
+        "needs-human" => Some("needs-human"),
+        "skip" if labelled(pull) => Some("needs-human"),
+        "wait" if decision.reason == WITHHELD_WAIT => Some("withheld"),
+        "wait" if decision.reason.starts_with(&approval) => Some("approve"),
+        _ => None,
+    }
 }
 
 struct Pass<'a, R, G> {
@@ -5128,7 +5161,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         number: u64,
         merge_only: bool,
         required: &mut BTreeMap<String, (Vec<Value>, bool)>,
-    ) -> Result<(String, bool)> {
+    ) -> Result<(String, bool, Option<Wait>)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
         // The marker decides what is written, so a pass that applies reads it
         // whole and as it is, not from cached pages a 304 may leave standing.
@@ -5172,6 +5205,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok((
                 format!("{repo}#{number} skip: closed since the list was read"),
                 false,
+                None,
             ));
         }
         if !(text(&pull, "/author/login") == self.config.bot
@@ -5185,6 +5219,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok((
                 format!("{repo}#{number} skip: pull request author is not followed"),
                 false,
+                None,
             ));
         }
         if text(&pull, "/author/login") != self.config.bot {
@@ -5576,12 +5611,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         } else {
             format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
         };
+        let wait = operator_wait(&pull, &decision).map(|kind| Wait {
+            repository: repo.to_owned(),
+            number,
+            head: head.to_owned(),
+            kind,
+            reason: decision.reason.clone(),
+        });
         Ok((
             line,
             text(&pull, "/author/login") == self.config.bot
                 && left.is_none()
                 && (in_flight(&pull, &self.config.bot, decision.action)
                     || stale.is_some() && decision.action == "fix"),
+            wait,
         ))
     }
 
@@ -5623,12 +5666,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut required = BTreeMap::new();
         for (number, merge_only) in numbers {
             match self.pull(repo, number, merge_only, &mut required) {
-                Ok((line, flying)) => {
+                Ok((line, flying, wait)) => {
                     outcome.lines.push(line);
                     outcome.in_flight += usize::from(flying);
+                    outcome.waits.extend(wait);
                 }
                 Err(error) => {
                     outcome.errors += 1;
+                    outcome.undecided.insert(repo.to_ascii_lowercase());
                     outcome
                         .lines
                         .push(format!("{repo}#{number} error: {error:#}"));
@@ -5806,10 +5851,12 @@ pub fn run_capped<R: Rest, G: Transport>(
             outcome
                 .lines
                 .push(format!("{repo} skip: outside this pass's envelope"));
+            outcome.undecided.insert(repo.to_ascii_lowercase());
             continue;
         }
         if let Err(error) = pass.follow(repo, &mut outcome) {
             outcome.errors += 1;
+            outcome.undecided.insert(repo.to_ascii_lowercase());
             outcome.lines.push(format!("{repo} error: {error:#}"));
         }
     }
@@ -9102,6 +9149,44 @@ mod tests {
         .unwrap();
         assert!(fake.writes.borrow().is_empty(), "a preview wrote");
         outcome
+    }
+
+    /// A pass says which followed pull requests wait on the operator, each
+    /// at the head it read, and not those it goes on with by itself; and
+    /// which repositories it decided nothing in, whose waits are unknown.
+    #[test]
+    fn a_pass_says_what_waits_on_the_operator() {
+        let labels = |name: &str| json!({"labels": {"nodes": [{"name": name}]}});
+        let cases = [
+            ("approved and green", json!({}), None),
+            (
+                "for the operator's approval",
+                labels(OPERATOR_APPROVAL_LABEL),
+                Some("approve"),
+            ),
+            ("stopped", labels(LABEL), Some("needs-human")),
+            (
+                "a draft to mark ready",
+                json!({"isDraft": true}),
+                Some("needs-human"),
+            ),
+            ("no review yet", json!({"reviews": {"nodes": []}}), None),
+        ];
+        for (name, change, kind) in cases {
+            let mut fake = github();
+            fake.pulls.insert(470, pull("pull-470", change));
+            let outcome = pass(&fake, State::default(), &[], &[REPO]);
+            let waits: Vec<(&str, &str, u64)> = (outcome.waits.iter())
+                .map(|w| (w.kind, w.head.as_str(), w.number))
+                .collect();
+            let expected: Vec<(&str, &str, u64)> =
+                kind.map(|k| (k, HEAD, 470)).into_iter().collect();
+            assert_eq!(waits, expected, "{name}: {:?}", outcome.lines);
+            assert!(outcome.undecided.is_empty(), "{name}");
+        }
+        let outcome = pass(&github(), State::default(), &[], &["o/missing"]);
+        assert_eq!(outcome.undecided, ["o/missing".to_owned()].into());
+        assert!(outcome.waits.is_empty());
     }
 
     #[test]

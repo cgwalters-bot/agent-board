@@ -2367,19 +2367,86 @@ fn apply_publishes_the_holds() {
     );
 }
 
+/// `nodes` as the one page of comments [`plan::issue_comments`] reads of
+/// `repo#number`, in place of any recorded.
+fn comments_on(forge: &mut Forge, (repo, number): (&str, u64), nodes: Vec<Value>) {
+    let (owner, name) = repo.split_once('/').unwrap();
+    let variables = json!({"owner": owner, "name": name, "number": number, "after": null});
+    let request = graphql_key(plan::COMMENTS_QUERY, &variables);
+    forge.replay.requests.retain(|e| e["request"] != request);
+    let page = json!({"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}});
+    let answer = json!({"data": {"repository": {"issue": {"comments": page}}}});
+    let entry = json!({"request": request, "answer": answer});
+    forge.replay.requests.push(entry);
+}
+
+/// A comment `id` by `author`, unedited, written on 20 October.
+fn comment_node(id: u64, author: &str, body: &str) -> Value {
+    json!({"url": format!("https://github.com/o/r/issues/1#issuecomment-{id}"), "body": body,
+        "createdAt": "2026-10-20T00:00:00Z", "lastEditedAt": null,
+        "author": {"login": author}, "editor": null})
+}
+
 /// With `holds.needsYou`, the published snapshot lists the holds that wait
-/// on the operator, ranked by Priority then age and counted from that list,
-/// with stages 3 and 4 read whole; a pass that reads the same list again at
-/// once writes nothing, and one whose stages failed publishes none, so that
-/// its `validated_at` ages rather than say an empty list.
+/// on the operator, with their bot summaries' questions and
+/// recommendations, and each operator-action proposal, three on one issue
+/// three asks; ranked by Priority then age and counted from that list, with
+/// every source read whole. A pass that reads the same list again at once
+/// writes nothing; one that cannot read the proposals keeps those it
+/// published, carried, and is not complete; and one whose stages failed
+/// publishes none, so that its `validated_at` ages rather than say an empty
+/// list.
 #[test]
 fn apply_publishes_what_needs_you() {
     let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
-    let at = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true});
+    let broker = "cgwalters-bot/praxis-credential-broker";
+    let proposals = json!({"repository": "cgwalters-forge/bot-ops", "label": "operator-action",
+        "repositories": ["cgwalters-forge/tracker", broker]});
+    let at = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true,
+        "proposals": proposals});
     let with_wip = |wip: u64| config(json!({"holds": at, "wip": wip}));
     let config = with_wip(8);
+    let proposal_issues = format!(
+        "{bot_ops}/issues?state=open&labels=operator-action&sort=created&direction=asc&per_page=100"
+    );
     let forge_with = |comment: Option<&str>| {
         let mut forge = Forge::new(None, false);
+        // #446's summary asks and recommends; #527's bold lines are empty,
+        // so its hold's reason stands.
+        let summaries = [
+            (
+                446,
+                "**Decision needed:** Ship 1.0 today?\n- **Recommendation**: Yes, CI is green.\nMore.",
+            ),
+            (
+                527,
+                "Triage.\n\n**Decision needed:**\n**Recommendation:**   ",
+            ),
+        ];
+        for (number, body) in summaries {
+            let nodes = vec![comment_node(number, "cgwalters-bot", body)];
+            comments_on(&mut forge, ("cgwalters-forge/tracker", number), nodes);
+        }
+        // Three proposals on one issue, one acting on the broker's
+        // repository, and a visitor's, which is none.
+        let proposal = |title: &str, repo: &str| {
+            let action = json!({"type": "add_label", "repo": repo, "number": 3, "label": "ready"});
+            let value = json!({"schema": crate::action::ACTION_SCHEMA, "title": title,
+                "why": "Because.\nMore.", "actions": [action]});
+            format!("```agent-board-action\n{value}\n```")
+        };
+        let tracker = "cgwalters-forge/tracker";
+        let nodes = vec![
+            comment_node(21, "cgwalters-bot", &proposal("Label tracker#3", tracker)),
+            comment_node(22, "cgwalters", &proposal("Label the broker's #3", broker)),
+            comment_node(
+                23,
+                "cgwalters-bot",
+                &proposal("Label tracker#3 again", tracker),
+            ),
+            comment_node(24, "visitor", &proposal("A visitor's", tracker)),
+        ];
+        comments_on(&mut forge, ("cgwalters-forge/bot-ops", 5), nodes);
         // Two wait on the operator, #527 without a Priority; a parked
         // design does not.
         let labelled = [
@@ -2413,9 +2480,11 @@ fn apply_publishes_what_needs_you() {
             comments.as_array_mut().unwrap().push(comment);
         }
         let reply = |body| json!({"status": 200, "link": null, "body": body});
+        let issues = json!([{"number": 5}, {"number": 9, "pull_request": {}}]);
         for (url, body) in [
             (bot_ops.clone(), json!({"private": true})),
             (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+            (proposal_issues.clone(), issues),
         ] {
             let request = json!({"request": {"get": url}, "answer": reply(body)});
             forge.replay.requests.push(request);
@@ -2439,33 +2508,103 @@ fn apply_publishes_what_needs_you() {
             list["validated_at"],
             list["changed_at"],
             list["complete"],
-            list["sources"]
+            list["sources"],
+            list["summaries"],
+            list["omitted"],
         ]),
-        json!([snapshot["at"], snapshot["at"], true, {"epics": "complete", "items": "complete"}])
+        json!([snapshot["at"], snapshot["at"], true,
+            {"epics": "complete", "items": "complete", "reviews": "off", "proposals": "complete", "digest": "off"},
+            "complete", 0])
     );
     let items = list["items"].as_array().unwrap();
     assert_eq!(list["count"], items.len());
     let asks: Vec<Value> = (items.iter())
-        .map(|a| json!([a["item"], a["priority"], a["ask"], a["source"], a["head"]]))
+        .map(|a| {
+            json!([
+                a["key"],
+                a["priority"],
+                a["ask"],
+                a["recommendation"],
+                a["source"],
+                a["head"]
+            ])
+        })
         .collect();
     let tracker = |n| format!("cgwalters-forge/tracker#{n}");
+    let proposal = |n| format!("cgwalters-forge/bot-ops#5/comment-{n}");
+    let because = "Because.";
     assert_eq!(
         asks,
         [
-            json!([tracker(446), "P0", "Ship it?", "items", null]),
-            json!([tracker(527), null, "labelled needs-human", "items", null]),
+            json!([
+                tracker(446),
+                "P0",
+                "Ship 1.0 today?",
+                "Yes, CI is green.",
+                "items",
+                null
+            ]),
+            json!([
+                proposal(21),
+                null,
+                "Label tracker#3",
+                because,
+                "proposals",
+                null
+            ]),
+            json!([
+                proposal(22),
+                null,
+                "Label the broker's #3",
+                because,
+                "proposals",
+                null
+            ]),
+            json!([
+                proposal(23),
+                null,
+                "Label tracker#3 again",
+                because,
+                "proposals",
+                null
+            ]),
+            json!([
+                tracker(527),
+                null,
+                "labelled needs-human",
+                null,
+                "items",
+                null
+            ]),
         ]
+    );
+    // Each proposal is acted on by itself: its action names its comment,
+    // and its address is made from that.
+    assert_eq!(
+        json!([
+            items[2]["action"],
+            items[2]["source_ref"]["type"],
+            items[2]["target"]
+        ]),
+        json!([
+            {"type": "operator_action", "repository": "cgwalters-forge/bot-ops", "number": 5, "comment": 22},
+            "comment",
+            "https://github.com/cgwalters-forge/bot-ops/issues/5#issuecomment-22"
+        ])
     );
     let design =
         (snapshot["holds"].as_array().unwrap().iter()).find(|h| h["item"] == tracker(459).as_str());
     assert_eq!(design.map(|h| &h["kind"]), Some(&json!("needs-design")));
-    // Each is one of the operator's holds on an open item, and each of
-    // those is one, in rank order.
+    // Each hold ask is one of the operator's holds on an open item, and
+    // each of those is one, in rank order.
     let operator: BTreeSet<String> = (snapshot["holds"].as_array().unwrap().iter())
         .filter(|h| h["operator"] == true && h["kind"] != "closed")
         .filter_map(|h| h["item"].as_str().map(str::to_ascii_lowercase))
         .collect();
-    let keys: Vec<String> = items.iter().map(|a| text(a, "/key").to_owned()).collect();
+    let keys: Vec<String> = (items.iter())
+        .filter(|a| a["source_ref"]["type"] == "hold")
+        .map(|a| text(a, "/key").to_owned())
+        .collect();
     assert_eq!(keys.iter().cloned().collect::<BTreeSet<_>>(), operator);
     assert_eq!(keys.len(), operator.len());
     let ranks: Vec<(bool, &str, &str)> = (items.iter())
@@ -2493,6 +2632,36 @@ fn apply_publishes_what_needs_you() {
     let report = apply(&forge, &config);
     assert!(
         report.lines.contains(&"holds: unchanged".to_owned()),
+        "{:#?}",
+        report.lines
+    );
+    // The proposals unreadable: those published are kept, carried, and the
+    // list says it is not complete rather than that none wait.
+    let mut forge = forge_with(Some(&body));
+    let listing = json!({"get": proposal_issues});
+    let entry = (forge.replay.requests.iter_mut()).find(|e| e["request"] == listing);
+    entry.unwrap()["answer"]["status"] = json!(502);
+    let report = apply(&forge, &config);
+    let edited = (forge.writes.borrow().iter())
+        .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
+        .map(|(_, _, body)| text(body, "/body").to_owned());
+    let edited = edited.unwrap_or_else(|| panic!("{:#?}", report.lines));
+    let list = &holds::parse(&edited).unwrap()["needs_you"];
+    assert_eq!(
+        json!([
+            list["sources"]["proposals"],
+            list["complete"],
+            list["count"]
+        ]),
+        json!(["unread", false, 5])
+    );
+    let carried: Vec<String> = (list["items"].as_array().unwrap().iter())
+        .filter(|a| a["carried"] == true)
+        .map(|a| text(a, "/key").to_owned())
+        .collect();
+    assert_eq!(carried, [proposal(21), proposal(22), proposal(23)]);
+    assert!(
+        (report.lines.iter()).any(|l| l.starts_with("needs-you proposals error: ")),
         "{:#?}",
         report.lines
     );
@@ -7745,6 +7914,26 @@ fn config_table() {
         (
             json!({"stall": {"holdHour": 6}, "holds": {"repository": "o/ops", "issue": 1}}),
             "unknown field `holdHour`",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1,
+                "proposals": {"repository": "o/ops", "label": "act", "repositories": ["o/r"]}}}),
+            "holds proposals needs holds needsYou",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true,
+                "proposals": {"repository": "o/ops", "label": "a,b", "repositories": ["o/r"]}}}),
+            "holds proposals label is not 1 to 50 characters without a comma",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true,
+                "proposals": {"repository": "o/ops", "label": "act", "repositories": ["bad"]}}}),
+            "holds proposals",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true,
+                "proposals": {"repository": "o/ops", "label": "act", "repositories": []}}}),
+            "holds proposals",
         ),
         (
             json!({"revisit": {"perPass": 1, "afterDays": 14}}),
