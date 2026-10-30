@@ -21,6 +21,7 @@ use crate::poll::{
     RERUN_WINDOW_SECONDS, Rest, RestResponse, State, next_link, stale::STALE_DAYS_LIMIT, text,
     validate_repository, validate_workflow,
 };
+use crate::stack;
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
@@ -182,6 +183,28 @@ const FOLLOW_UP_SECONDS: i64 = 24 * 60 * 60;
 /// What a triage plan posted by [`Scheduler::replan`] says first.
 const REPLAN: &str = "The board pass asks a triage run to plan the rest of this issue: \
                       its last planned run ended and the issue is still open.";
+/// The head branch of agentic-job's implement run `ID`, from the bot's
+/// fork: `dispatch/implement/agent-run-ID`.
+const IMPLEMENT_BRANCH_PREFIX: &str = "dispatch/implement/agent-run-";
+/// How many merged pull requests of one implement run's head branch
+/// [`MERGED_QUERY`] reads: one run opens one, so a few cover a visitor's
+/// of the same name.
+const MERGED_PULL_READS: u64 = 5;
+/// The merged pull requests of a head branch, and the repository's default
+/// branch they must have merged into ([`Scheduler::merged_pull`]).
+const MERGED_QUERY: &str = r#"query($owner: String!, $name: String!, $branch: String!, $pulls: Int!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    pullRequests(headRefName: $branch, states: MERGED, first: $pulls) {
+      nodes { url body mergedAt baseRefName author { login } }
+    }
+  }
+}"#;
+/// The hidden first line of the comment [`Scheduler::merged`] posts as it
+/// closes an issue whose dispatched pull request finished it,
+/// `<!-- agent-board-merged: PULL-URL -->`: a pass whose close failed
+/// closes it without a second comment.
+const MERGED_MARKER: &str = "agent-board-merged";
 /// How many of the board's first Priority options (P0 and P1) are its top
 /// ([`top_priority`]): an issue's own body plan is taken for these, with
 /// [`Config::body_plans`], and a child held under a parent that is not a
@@ -274,7 +297,7 @@ const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!
 /// push one out of what is read.
 const CLOSE_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
-    url title body createdAt lastEditedAt author { login } editor { login } locked
+    url state title body createdAt lastEditedAt author { login } editor { login } locked
     locks: timelineItems(itemTypes: [LOCKED_EVENT], last: 1) { nodes { ... on LockedEvent { createdAt } } }
     unlocks: timelineItems(itemTypes: [UNLOCKED_EVENT], last: 1) { nodes { ... on UnlockedEvent { createdAt } } }
     renames: timelineItems(itemTypes: [RENAMED_TITLE_EVENT], last: 1) { nodes { ... on RenamedTitleEvent { createdAt } } }
@@ -324,6 +347,14 @@ impl IssueEvents {
 /// An issue's body plan ([`Scheduler::body_plan`]): the plan, its JSON block
 /// and the body it was read from.
 type BodyPlan = (plan::JobPlan, Value, plan::Comment);
+
+/// The bot's merged pull request of an implement run
+/// ([`Scheduler::merged_pull`]).
+struct MergedPull {
+    url: String,
+    body: String,
+    merged: OffsetDateTime,
+}
 
 /// An issue's open closing pull requests, past the ten [`FACTS`] reads.
 const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
@@ -3233,6 +3264,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         None => None,
                     };
                     let Some(run) = run.filter(|_| config.reruns || early.is_some()) else {
+                        // An extra's record is its batch's, whose run's pull
+                        // request need not say what it left of each extra.
+                        let own = plan.repo == issue.repository
+                            && plan.item == issue.number
+                            && !record.body.contains(batch::BATCH_MARKER);
+                        if plan.kind == "implement"
+                            && own
+                            && self.outside_epics(&facts).is_none()
+                            && let Some(step) =
+                                self.merged(read, (&id, record), (snapshot, target, slots))?
+                        {
+                            return Ok(step);
+                        }
                         if plan.kind == "triage" && config.triage_follow_up_days > 0 {
                             return self.follow_up(read, (from, record), (snapshot, target, slots));
                         }
@@ -4091,8 +4135,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// whose run has ended (one in flight, or an open bot or operator pull
     /// request, holds the issue before this): triaged again
     /// [`Config::replan_after_days`] after its `record` last changed, so that
-    /// the rest of the issue is planned. The triage's own plan is then the
-    /// newest, with its own record, so each record is acted on once.
+    /// the rest of the issue is planned; or at once, or closed instead, once
+    /// its run's pull request merged ([`Self::merged`]). The triage's own
+    /// plan is then the newest, with its own record, so each record is acted
+    /// on once.
     fn replan(
         &self,
         read: (&Facts, &[plan::Comment]),
@@ -4120,6 +4166,142 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             record.url
         );
         Ok(Step::Hold(Hold::new(HoldKind::TriageCooldown, why)))
+    }
+
+    /// An implement plan `id` for the open issue itself, dispatched
+    /// already as `record` (not as a batch's extra), whose run's pull
+    /// request merged into the default branch ([`Self::merged_pull`])
+    /// (agent-board#484). The job plan has no field saying whether a run
+    /// finishes its issue, but its pull request says so: agentic-job's apply
+    /// adds `Closes #N` to every implement pull request unless the agent
+    /// writes `Part of #N` because its plan covered only part, and a
+    /// reviewer merging only an incremental part removes the closing line.
+    /// So one that still closes the issue ([`stack::closes`]) finished it,
+    /// and the issue stayed open only because the close did not happen:
+    /// that closes it as completed, after one comment linking the pull
+    /// request that starts with [`MERGED_MARKER`], so that a pass whose
+    /// close failed does not comment again: two writes under
+    /// `--max-writes`, or one, neither made in a preview. An issue reopened
+    /// since the pull request merged is a person's call, and is not closed
+    /// again. Anything short of a close re-plans it now, with
+    /// [`Config::replan_after_days`], rather than days later; that triage
+    /// may still find it done. `None` where none of this applies: no merged
+    /// pull request, or a re-plan that is off.
+    fn merged(
+        &self,
+        read: (&Facts, &[plan::Comment]),
+        (id, record): (&str, &plan::Comment),
+        context: (Option<&Value>, &Target, &Slots),
+    ) -> Result<Option<Step>> {
+        let (facts, comments) = read;
+        let issue = &facts.issue;
+        let Some(run) = epics::record_run(&record.body) else {
+            return Ok(None);
+        };
+        let pull = match self.merged_pull(issue, run) {
+            Ok(Some(pull)) => pull,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                let why = format!(
+                    "plan {id} was dispatched already, {}; its run's pull request could not be read: {error:#}",
+                    record.url
+                );
+                return Ok(Some(Step::Hold(Hold::new(HoldKind::Unreadable, why))));
+            }
+        };
+        let said = format!("its dispatched pull request {} merged", pull.url);
+        if !stack::closes(&pull.body, &issue.repository, issue.number) {
+            if self.config.replan_after_days == 0 {
+                return Ok(None);
+            }
+            let intro = format!(
+                "{REPLAN} Its pull request {} merged without closing it.",
+                pull.url
+            );
+            return self.triage(read, &intro, context).map(Some);
+        }
+        let node = self.issue_read(issue, CLOSE_QUERY)?;
+        if node["state"] == "CLOSED" {
+            let why = format!("{said}; closed already");
+            return Ok(Some(Step::Hold(Hold::new(HoldKind::Closed, why))));
+        }
+        if IssueEvents::read(issue, &node)?.reopened > Some(pull.merged) {
+            return Ok(None);
+        }
+        let marker = format!("<!-- {MERGED_MARKER}: {} -->", pull.url);
+        let bot = [self.config.bot.as_str()];
+        let commented =
+            (comments.iter()).any(|c| is(c.author.as_deref(), &bot) && c.body.starts_with(&marker));
+        let writes = if commented { 1 } else { 2 };
+        let act = "close as completed";
+        if let Some(held) = self.caps.check_many(Kind::Write, writes) {
+            let why = format!("{said} and finishes it; {held}: {act}");
+            return Ok(Some(Step::Hold(Hold::new(HoldKind::Other, why))));
+        }
+        // Counted once sent, whether or not its answer comes back.
+        self.caps.count_many(Kind::Write, writes);
+        if self.apply {
+            let issue_url = format!(
+                "{API_ROOT}repos/{}/issues/{}",
+                issue.repository, issue.number
+            );
+            // The comment first: should the close fail, the next pass
+            // finds it and only closes.
+            if !commented {
+                let body = format!(
+                    "{marker}\nThe board pass closed this issue as completed: its dispatched pull request {} \
+                     merged and closes it, but the issue stayed open. Reopen it if that is wrong.\n\n{}",
+                    pull.url,
+                    crate::Footer::default()
+                );
+                let url = format!("{issue_url}/comments");
+                plan::send(&self.client, "POST", &url, &json!({"body": body}), 0)?;
+            }
+            let state = json!({"state": "closed", "state_reason": "completed"});
+            plan::send(&self.client, "PATCH", &issue_url, &state, 0)?;
+        }
+        let why = format!("{said} and finishes it; {act}");
+        Ok(Some(Step::Hold(Hold::new(HoldKind::Closed, why))))
+    }
+
+    /// The merged pull request of the bot's implement run `run` on
+    /// `issue`'s repository, from its head branch
+    /// ([`IMPLEMENT_BRANCH_PREFIX`]) into the default branch: only the
+    /// bot's counts, as anyone may open one from a branch of that name, and
+    /// one merged into another branch, as a stacked slice's base, has not
+    /// landed.
+    fn merged_pull(&self, issue: &ItemRef, run: u64) -> Result<Option<MergedPull>> {
+        let (owner, name) = issue.repository.split_once('/').context("repository")?;
+        let branch = format!("{IMPLEMENT_BRANCH_PREFIX}{run}");
+        let data = self.client.graphql(
+            MERGED_QUERY,
+            json!({"owner": owner, "name": name, "branch": branch, "pulls": MERGED_PULL_READS}),
+        )?;
+        let nodes = data
+            .pointer("/repository/pullRequests/nodes")
+            .and_then(Value::as_array)
+            .with_context(|| format!("{} has no pull requests", issue.repository))?;
+        let default = data
+            .pointer("/repository/defaultBranchRef/name")
+            .and_then(Value::as_str)
+            .with_context(|| format!("{} has no default branch", issue.repository))?;
+        let bot = [self.config.bot.as_str()];
+        let landed =
+            |n: &&Value| is(n["author"]["login"].as_str(), &bot) && n["baseRefName"] == default;
+        let Some(node) = nodes.iter().find(landed) else {
+            return Ok(None);
+        };
+        let field = |key: &str| {
+            node[key]
+                .as_str()
+                .with_context(|| format!("merged pull request of {branch} has no {key}"))
+        };
+        Ok(Some(MergedPull {
+            url: field("url")?.to_owned(),
+            body: node["body"].as_str().unwrap_or_default().to_owned(),
+            merged: OffsetDateTime::parse(field("mergedAt")?, &Rfc3339)
+                .context("merged pull request's mergedAt")?,
+        }))
     }
 
     /// A triage run on `issue` in `pool` with `brief`, its line `line`:

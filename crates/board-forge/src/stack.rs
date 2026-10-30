@@ -101,7 +101,7 @@ pub fn validate_branch(branch: &str) -> Result<()> {
 /// `https://github.com/OWNER/REPO/issues/N`. Each keyword closes the one
 /// reference after it, so `Closes #41, closes #42` closes both and
 /// `Closes #41, #42` only #41, as on GitHub.
-fn closes(body: &str, repo: &str, number: u64) -> bool {
+pub(crate) fn closes(body: &str, repo: &str, number: u64) -> bool {
     let references = references(repo, number);
     let mut words = body.split_whitespace().peekable();
     while let Some(word) = words.next() {

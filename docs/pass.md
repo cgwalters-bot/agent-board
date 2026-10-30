@@ -806,6 +806,48 @@ held with its due time. The triage posts its own plan, which becomes the
 newest and gets its own record, so each implement run is re-planned at most
 once; once that triage ends, it is handled as any triage above.
 
+Before either, when the dispatched implement plan is for the issue itself
+and the issue is not held outside every live epic, the pass looks for the
+pull request its run opened (agent-board#484): one GraphQL read of the
+plan's repository for a pull request by the bot from the run's head branch,
+`dispatch/implement/agent-run-ID`, `ID` being the run its dispatch record
+names, merged into the default branch. One merged into another branch, as a
+stacked slice's base, has not landed. Without one, nothing above changes; a
+failed read holds the issue as unreadable. A batch's extra is left to its
+batch, whose pull request is asked only to name the extras it left
+unfinished. The job plan has no field saying whether a run finishes its
+issue, but the run's pull request declares it: agentic-job's apply adds
+`Closes #N` to every implement pull request unless the agent writes
+`Part of #N` because its plan covered only part, and a reviewer merging
+only an incremental part removes the closing line
+([agentic-job's dispatch](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md)).
+So:
+
+- A merged pull request that still closes the issue, as GitHub reads it (a
+  closing keyword then `#N`, `OWNER/REPO#N` or the issue's URL, by number,
+  so `Closes #410` is not #41), said it finishes it, and the issue stayed
+  open only because the close did not happen. The pass posts one comment
+  linking the pull request, on a hidden first line
+  `<!-- agent-board-merged: PULL-URL -->`, and closes the issue as
+  completed, logging `hold OWNER/REPO#N: its dispatched pull request URL
+  merged and finishes it; close as completed`. This needs no setting. It is
+  two writes under `--max-writes`, or one where the comment is there
+  already, as when an earlier pass's close failed, so the comment is never
+  posted twice; a preview logs the same line and writes nothing. An issue
+  closed already gets no comment, and one reopened since the pull request
+  merged is a person's call: it is not closed again, and is handled as
+  above.
+- Anything short of a close (`Part of`, `Refs`, or no reference at all) is
+  re-planned at once with `replanAfterDays`, rather than when the days are
+  due, its triage plan's intro naming the pull request; without
+  `replanAfterDays` it stays held as dispatched. A re-plan's triage may
+  still find the issue done and say so in its verdict.
+
+Before this, a finished issue whose close did not happen stayed open: a
+plan stacked on it waited, and `replanAfterDays` spent a triage run to find
+it done. A merged slice that did only part of an issue waited the whole
+`replanAfterDays` before the rest was planned.
+
 With `bodyPlans` (agent-board#342), an issue in the board's first two Priority
 options (P0 and P1) that has no plan comment is first read for a plan in its
 own body: one `agent-board-plan` block, weighed as a plan comment is. The
@@ -1960,7 +2002,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
-| `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, see [scheduling](#scheduling); needs `triage`; `0` (off) |
+| `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs the triage scope `epics`; section absent (off) |
