@@ -599,6 +599,9 @@ pub struct HoldsAt {
     /// ([`holds::needs_you`]) to the snapshot.
     #[serde(default, rename = "needsYou")]
     pub needs_you: bool,
+    /// Off unless set: the issues whose operator-action proposals the
+    /// needs-you list includes; needs `needsYou`.
+    pub proposals: Option<needs::ProposalsAt>,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -883,6 +886,10 @@ impl Config {
         if let Some(holds) = &self.holds {
             validate_repository(&holds.repository).context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
+            if let Some(proposals) = &holds.proposals {
+                ensure!(holds.needs_you, "holds proposals needs holds needsYou");
+                proposals.check(self)?;
+            }
         }
         if let Some(stall) = &self.stall {
             ensure!(self.holds.is_some(), "stall needs holds");
@@ -1515,7 +1522,8 @@ fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) ->
                 .iter()
                 .any(|l| l.eq_ignore_ascii_case(OPERATOR_APPROVAL_LABEL));
         if approval {
-            let why = format!("approve pull request {repo}#{number} to merge");
+            let (prefix, suffix) = (holds::APPROVE_PREFIX, holds::APPROVE_SUFFIX);
+            let why = format!("{prefix}{repo}#{number}{suffix}");
             return Some(Hold::new(HoldKind::PrOpen, why).operator(true));
         }
         let why = format!("pull request {repo}#{number} is open");
@@ -1960,6 +1968,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         not_started: 0,
         free: None,
         top: None,
+        followed: None,
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
@@ -2270,6 +2279,9 @@ struct Scheduler<'a, C> {
     /// The board's first [`TOP_PRIORITIES`] Priority options, once stage 4
     /// read the board.
     top: Option<Vec<String>>,
+    /// Stage 2's review waits and the repositories it left undecided
+    /// ([`poll::Outcome::waits`]), once it ran.
+    followed: Option<(Vec<poll::Wait>, BTreeSet<String>)>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2351,6 +2363,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.report.state = Some(outcome.state);
                 self.reviewing = outcome.reviewing;
                 self.progressed += outcome.merged;
+                self.followed = Some((outcome.waits, outcome.undecided));
                 outcome.dispatched
             }
             Err(error) => {
@@ -4686,6 +4699,7 @@ mod epics;
 pub mod holds;
 pub mod lease;
 pub mod maintain;
+pub mod needs;
 pub mod revisit;
 pub mod starts;
 mod status;

@@ -154,39 +154,108 @@ it as absent in an older comment.
 
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
-on the operator, for review's needs-you view. It goes only where the hold
-snapshot goes, the bot's own comment in a private repository, and is made
-from the published holds alone, nothing inferred:
+on the operator, for review's needs-you view, so that review need not work
+out its own. It goes only where the hold snapshot goes, the bot's own
+comment in a private repository, and is made from the published holds and
+from what the pass read of its followed pull requests, proposals and
+digest, nothing inferred. Its schema is `agent-board/needs-you/v2` (v1 had
+only the holds; a reader that knows only v1 treats v2 as unknown):
 
 ```json
-{"schema":"agent-board/needs-you/v1","complete":true,"validated_at":"2026-10-30T09:30:00Z","changed_at":"2026-10-30T09:00:00Z","sources":{"epics":"complete","items":"complete"},"count":1,"items":[{"key":"cgwalters-forge/tracker#446","item":"cgwalters-forge/tracker#446","source":"items","kind":"needs-human","priority":"P0","waiting_since":"2026-10-29T18:24:18Z","ask":"Ship it?","target":"https://github.com/cgwalters-forge/tracker/issues/446","head":null}]}
+{"schema":"agent-board/needs-you/v2","complete":true,"validated_at":"2026-10-30T09:30:00Z","changed_at":"2026-10-30T09:00:00Z","sources":{"epics":"complete","items":"complete","reviews":"complete","proposals":"complete","digest":"off"},"summaries":"complete","omitted":0,"count":2,"items":[
+{"key":"cgwalters-forge/tracker#446","item":"cgwalters-forge/tracker#446","source":"items","kind":"needs-human","priority":"P0","waiting_since":"2026-10-29T18:24:18Z","ask":"Ship 1.0 today?","recommendation":"Yes, CI is green.","target":"https://github.com/cgwalters-forge/tracker/issues/446","head":null,"action":{"type":"issue","repository":"cgwalters-forge/tracker","number":446},"source_ref":{"type":"hold","repository":"cgwalters-forge/tracker","number":446}},
+{"key":"cgwalters-forge/bot-ops#5/comment-21","item":"cgwalters-forge/bot-ops#5","source":"proposals","kind":"operator-action","priority":null,"waiting_since":"2026-10-20T00:00:00Z","ask":"Label tracker#3","recommendation":"Because.","target":"https://github.com/cgwalters-forge/bot-ops/issues/5#issuecomment-21","head":null,"action":{"type":"operator_action","repository":"cgwalters-forge/bot-ops","number":5,"comment":21},"source_ref":{"type":"comment","repository":"cgwalters-forge/bot-ops","number":5,"comment":21}}]}
 ```
 
-Each item is a hold above with `operator` true on an issue that is not
-`closed`: not a hold the pass releases itself (a run in flight or rerun, a
-cooldown, an epic it retries), nor `needs-design` or board Blocked. An
-answered question stays listed until its hold goes (its label is removed or
-its Why changes): the holds record no answer. `key` is the issue's
-`OWNER/REPO#N` in lower case, the same from pass to pass; an issue held twice
-(the holds issue's two [stall alarms](#stall-alarms)) is listed once, where it
-ranks first, its asks joined by `; `. `source` is `epics` (stage 3), `items`
-(stage 4) or `pass` (an alarm on the holds issue); `waiting_since` is the
-hold's `since`; `ask` is its board Why's question where it asks one, else its
-reason, cut to 500 characters (the hold's entry has it whole, unless it is a
-stall alarm left out to fit below); `target` is the held issue's address;
-`head` is null, as no hold reads a head commit. Items are sorted by Priority
-in the board's option order (one the board does not list after, none last),
-then the longest waiting, then `key`, and `count` is their number.
+The asks come from five sources, each named by an item's `source`:
+
+- `epics` (stage 3), `items` (stage 4) and `pass` (an alarm on the holds
+  issue): a hold above with `operator` true on an issue that is not
+  `closed`; not a hold the pass releases itself (a run in flight or rerun, a
+  cooldown, an epic it retries), nor `needs-design` or board Blocked. An
+  answered question stays listed until its hold goes (its label is removed
+  or its Why changes): the holds record no answer. `kind` is the hold's.
+- `reviews` (stage 2, where `follow` is set): each followed pull request
+  whose step waits on the operator, at the head the poll read: `review-approve`
+  (labelled `needs-operator-approval`, it waits on the operator's approval of
+  the head), `review-withheld` (the review job withheld its approval, so a
+  person approves) and `review-needs-human` (labelled `needs-human`, or
+  stopped so by this pass's step, a draft with no checkpoint among them).
+  What the poll goes on with by itself is not listed: a run, check, review,
+  queue or rerun it waits for, or an answer it already acts on.
+- `proposals` (with `holds.proposals`): each
+  [operator-action](cli.md#agent-board-action-check) proposal, `operator-action`, on the open issues of
+  `holds.proposals.repository` labelled `holds.proposals.label`, oldest
+  first, at most 10 issues and 10 proposals an issue. A proposal counts only
+  in a comment by the operator or the bot, last edited by them, and only
+  where `action check` would accept it under `holds.proposals.repositories`
+  and `org`. Each proposal is its own ask, keyed by its comment, so one
+  issue's three proposals are three asks to act on one by one.
+- `digest` (with `maintain`): each entry of the newest
+  [maintain digest](#maintain) the bot wrote and last edited on the digest
+  issue, at most 50, `digest-approve`, `digest-closer`, `digest-waiting` or
+  `digest-stale` by its group, on a pull request of the day's maintain
+  repositories (an entry on another is left out).
+
+`key` is the same for an ask from pass to pass: the issue's or pull
+request's `OWNER/REPO#N` in lower case for a hold or a review wait,
+`…/comment-ID` for a proposal and `…/digest` for a digest entry. An issue
+held twice (the holds issue's two [stall alarms](#stall-alarms)) is listed
+once, where it ranks first, its asks joined by `; `. An issue held on the
+operator's approval of its pull request (`approve pull request REPO#N to
+merge`) and that pull request's review wait are one ask, the review's, with
+the hold's Priority and question and the earlier `waiting_since`.
+
+`ask` is the one-line question and `recommendation` the one-line advice, or
+null. For a hold, they are the newest summary comment on its issue that the
+bot wrote and last edited, read as data: the rest of its first
+`**Decision needed:**` and `**Recommendation:**` lines (the colon may follow
+the bold). Such a line left empty is absent, and the ask falls back to the
+board Why's question (a Why starting `Q:`), else the hold's reason. The
+summaries of the 10 highest ranked held issues are read, and `summaries`
+says whether they all were (`complete` or `partial`); they enrich asks and
+are no source of them, so they do not make the list incomplete. A review
+wait asks its step's reason; a proposal its title, recommending the first
+line of its `why`; a digest entry what its group asks, recommending its
+reason, concern or drafted reply. Every text is its first line, cut to 500
+characters.
+
+`action` says what to act on and `source_ref` where the ask was read, each
+`{"type", "repository", "number"}` with `comment` and `head` where they
+apply: `issue`, `pull_request`, `approve_pull_request`,
+`review_pull_request`, `reply_pull_request`, `close_pull_request` or
+`operator_action` for an action, and `hold`, `pull_request` or `comment` for
+a source. They are data: the pass makes each from validated parts, and
+`target` is the address it makes from `action`, never a link read from a
+comment. `head` is the full head commit an approval or review is at: the
+head stage 2 read, or the head the digest assessed, else null. `priority` is
+the hold's board Priority; the other sources' asks have none, unless joined
+with a hold. `waiting_since` is a hold's `since`; for a review wait, when the
+list first had it at that head (a new head starts it again); for a proposal
+or a digest entry, its comment's time. Items are sorted by Priority in the
+board's option order (one the board does not list after, none last), then
+the longest waiting, then `key`; past 100, the rest are counted in `omitted`
+and left out. `count` is the number of items listed.
 
 `sources` says how much of each source the pass read: `complete`;
 `partial`, read but not whole: an issue it could not read (an `unreadable`
-hold), or in stage 4 a candidate it did not consider (the WIP limit, pools or
-the time bound stopped it partway, or the consideration failed), any of
-which may wait on the operator; `unread`, where its stage did not get that
-far (`live_epics` or `candidates` null; stage 4's holds are then those last
-read, as above); or `off` (stage 3 without `epics`). `complete` is true only
-where each is `complete` or `off`, so an empty list is "nothing waits" only
-then. A pass whose stage 3 or 4 failed publishes nothing, as above.
+hold), in stage 4 a candidate it did not consider (the WIP limit, pools or
+the time bound stopped it partway, or the consideration failed), a followed
+repository outside the pass's envelope or not read, a labelled issue past
+the bound or not read, or a proposal or digest entry it did not accept, any
+of which may wait on the operator; `unread`, where it was not read at all
+(`live_epics` or `candidates` null, stage 2 failed, the proposals' listing
+failed, or no maintain day is known); or `off` (stage 3 without `epics`,
+stage 2 without `follow`, no `holds.proposals`, no `maintain`). Where a
+source is `unread`, the asks it published before are kept, and where it is
+`partial`, those of the repositories and issues it did not read; each has
+`"carried": true`, and is listed again only while well formed. Stage 4's
+holds are carried as above. `complete` is true only where each source is
+`complete` or `off` and none was omitted, so an empty list is "nothing
+waits" only then. A pass whose stage 3 or 4 failed publishes nothing, as
+above. A read that fails is a `needs-you … error: …` line, not a failure:
+the list says it. These reads leave the hold snapshot's own requests, and
+stop where the pass's request or time bound would not.
 `validated_at` is the clock of the pass that last wrote the list, and
 `changed_at` that of the pass that last changed it (`validated_at` aside),
 carried over while it stays the same. An unchanged list is written again,
@@ -1906,7 +1975,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
-| `holds.needsYou` | Add the ranked [needs-you list](#what-is-built) (`agent-board/needs-you/v1`) to the hold snapshot; needs `holds`; `false` |
+| `holds.needsYou` | Add the ranked [needs-you list](#what-is-built) (`agent-board/needs-you/v2`) to the hold snapshot; needs `holds`; `false` |
+| `holds.proposals` | `{"repository", "label", "repositories", "org"?}`: list in the needs-you list the operator-action proposals on that repository's open issues with that label, checked as `action check` would with those `repositories` and `org`; needs `holds.needsYou`; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
