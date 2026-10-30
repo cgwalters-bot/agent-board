@@ -8479,6 +8479,10 @@ fn config_table() {
         ),
         (json!({"pr": {"staleDays": 31}}), "staleDays is not 0 to 30"),
         (
+            json!({"pr": {"headOwners": ["cgwalters-forge", "not a login"]}}),
+            "pr headOwners names \"not a login\", not a login",
+        ),
+        (
             json!({"pr": {"mergeQueue": {"tries": 6}}}),
             "mergeQueue tries is not 1 to 5",
         ),

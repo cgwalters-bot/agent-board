@@ -49,7 +49,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if days == 0
             || !stop.stopped
             || !labelled(pull)
-            || !is_harness(pull, &self.config.bot)
+            || !is_harness(pull, self.config)
             || stop.sha.as_deref() != Some(head)
             || self.now - at < time::Duration::days(days as i64)
             || !truncated(pull).is_empty()
