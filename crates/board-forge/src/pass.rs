@@ -595,6 +595,10 @@ pub struct Usage {
 pub struct HoldsAt {
     pub repository: String,
     pub issue: u64,
+    /// Off unless set: adds the ranked list of what waits on the operator
+    /// ([`holds::needs_you`]) to the snapshot.
+    #[serde(default, rename = "needsYou")]
+    pub needs_you: bool,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -1944,6 +1948,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         considered: false,
         probes: BTreeMap::new(),
         holds_whole: true,
+        unconsidered: 0,
         ended: RefCell::new(BTreeMap::new()),
         ignored: RefCell::default(),
         failed: BTreeMap::new(),
@@ -2228,6 +2233,10 @@ struct Scheduler<'a, C> {
     /// Whether stages 3 and 4 decided every hold they would have, so that
     /// the holds may be published.
     holds_whole: bool,
+    /// Stage 4's ranked candidates it decided no hold for: those past where
+    /// it stopped starting, and those whose consideration failed. Any may
+    /// wait on the operator ([`holds::needs_you`]).
+    unconsidered: usize,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
     /// The overlaps [`Config::overlap`] waived for the candidate considered,
@@ -2497,8 +2506,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let pools = &self.config.pools;
         let all: Vec<String> = pools.0.iter().map(|(n, _)| n.clone()).collect();
         for (n, (_, facts)) in candidates.iter().enumerate() {
+            let left = candidates.len() - n;
             if free == 0 {
-                let left = candidates.len() - n;
+                self.unconsidered += left;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
                 break;
             }
@@ -2506,14 +2516,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             if let Err(why) = choose(snapshot, pools, &all, self.now)
                 && slots.probes.is_empty()
             {
-                let left = candidates.len() - n;
+                self.unconsidered += left;
                 let why = format!("{why}; {left} more candidate(s) wait");
                 self.pass_held(HoldKind::Pools, why);
                 break;
             }
             if Instant::now() > self.client.bounds.admit_by {
                 self.report.failures += 1;
-                let left = candidates.len() - n;
+                self.unconsidered += left;
                 self.line(format!(
                     "time: the pass ran past {PASS_SECONDS_LIMIT} seconds; {left} candidate(s) deferred"
                 ));
@@ -2531,6 +2541,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Ok(step) => step,
                 Err(error) => {
                     self.report.failures += 1;
+                    self.unconsidered += 1;
                     self.line(format!("fail {issue}: {error:#}"));
                     continue;
                 }
@@ -2542,7 +2553,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
                 Step::Stop(why, halt) => {
                     self.report.failures += usize::from(halt.failed(earlier));
-                    let left = candidates.len() - n;
+                    self.unconsidered += left;
                     let line = format!("{why}; {left} more candidate(s) wait");
                     // A recheck that finds every slot taken holds new runs.
                     match line.strip_prefix(WIP_HOLD) {

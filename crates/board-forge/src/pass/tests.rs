@@ -2367,6 +2367,146 @@ fn apply_publishes_the_holds() {
     );
 }
 
+/// With `holds.needsYou`, the published snapshot lists the holds that wait
+/// on the operator, ranked by Priority then age and counted from that list,
+/// with stages 3 and 4 read whole; a pass that reads the same list again at
+/// once writes nothing, and one whose stages failed publishes none, so that
+/// its `validated_at` ages rather than say an empty list.
+#[test]
+fn apply_publishes_what_needs_you() {
+    let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    let at = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true});
+    let with_wip = |wip: u64| config(json!({"holds": at, "wip": wip}));
+    let config = with_wip(8);
+    let forge_with = |comment: Option<&str>| {
+        let mut forge = Forge::new(None, false);
+        // Two wait on the operator, #527 without a Priority; a parked
+        // design does not.
+        let labelled = [
+            (446, NEEDS_HUMAN),
+            (527, NEEDS_HUMAN),
+            (459, "needs-design"),
+        ];
+        for entry in &mut forge.replay.requests {
+            let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+            for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                let number = node["content"]["number"].as_u64();
+                let Some((_, label)) = labelled.iter().find(|(n, _)| Some(*n) == number) else {
+                    continue;
+                };
+                let labels = &mut node["content"]["labels"];
+                labels["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name": label}));
+                labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+                if number == Some(527) {
+                    node["priority"] = Value::Null;
+                } else if number == Some(446) {
+                    node["why"] = json!({"text": "Q: Ship it?"});
+                }
+            }
+        }
+        if let Some(body) = comment {
+            let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+            let comment = json!({"id": 7, "user": {"login": "cgwalters-bot"}, "body": body});
+            comments.as_array_mut().unwrap().push(comment);
+        }
+        let reply = |body| json!({"status": 200, "link": null, "body": body});
+        for (url, body) in [
+            (bot_ops.clone(), json!({"private": true})),
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+        ] {
+            let request = json!({"request": {"get": url}, "answer": reply(body)});
+            forge.replay.requests.push(request);
+        }
+        forge
+    };
+    let published = |config: &Config| {
+        let forge = forge_with(None);
+        let report = apply(&forge, config);
+        (forge.writes.borrow().iter())
+            .find(|(m, url, _)| m == "POST" && url.starts_with(&bot_ops))
+            .map(|(_, _, body)| text(body, "/body").to_owned())
+            .unwrap_or_else(|| panic!("{:#?}", report.lines))
+    };
+    let body = published(&config);
+    let snapshot = holds::parse(&body).unwrap();
+    let list = &snapshot["needs_you"];
+    assert_eq!(list["schema"], holds::NEEDS_YOU_SCHEMA);
+    assert_eq!(
+        json!([
+            list["validated_at"],
+            list["changed_at"],
+            list["complete"],
+            list["sources"]
+        ]),
+        json!([snapshot["at"], snapshot["at"], true, {"epics": "complete", "items": "complete"}])
+    );
+    let items = list["items"].as_array().unwrap();
+    assert_eq!(list["count"], items.len());
+    let asks: Vec<Value> = (items.iter())
+        .map(|a| json!([a["item"], a["priority"], a["ask"], a["source"], a["head"]]))
+        .collect();
+    let tracker = |n| format!("cgwalters-forge/tracker#{n}");
+    assert_eq!(
+        asks,
+        [
+            json!([tracker(446), "P0", "Ship it?", "items", null]),
+            json!([tracker(527), null, "labelled needs-human", "items", null]),
+        ]
+    );
+    let design =
+        (snapshot["holds"].as_array().unwrap().iter()).find(|h| h["item"] == tracker(459).as_str());
+    assert_eq!(design.map(|h| &h["kind"]), Some(&json!("needs-design")));
+    // Each is one of the operator's holds on an open item, and each of
+    // those is one, in rank order.
+    let operator: BTreeSet<String> = (snapshot["holds"].as_array().unwrap().iter())
+        .filter(|h| h["operator"] == true && h["kind"] != "closed")
+        .filter_map(|h| h["item"].as_str().map(str::to_ascii_lowercase))
+        .collect();
+    let keys: Vec<String> = items.iter().map(|a| text(a, "/key").to_owned()).collect();
+    assert_eq!(keys.iter().cloned().collect::<BTreeSet<_>>(), operator);
+    assert_eq!(keys.len(), operator.len());
+    let ranks: Vec<(bool, &str, &str)> = (items.iter())
+        .map(|a| {
+            let priority = a["priority"].as_str();
+            (
+                priority.is_none(),
+                priority.unwrap_or_default(),
+                text(a, "/waiting_since"),
+            )
+        })
+        .collect();
+    assert!(ranks.is_sorted(), "{ranks:?}");
+    // Fewer slots than candidates: stage 4 stops partway, so the
+    // candidates past it may wait on the operator too. Every slot taken: it
+    // reads none, and its holds are the last published.
+    for (wip, items) in [(3, "partial"), (2, "unread")] {
+        let snapshot = holds::parse(&published(&with_wip(wip))).unwrap();
+        let list = &snapshot["needs_you"];
+        let read = json!([list["sources"]["items"], list["complete"]]);
+        assert_eq!(read, json!([items, false]), "wip {wip}");
+    }
+    // The same list read again at once: nothing to write.
+    let forge = forge_with(Some(&body));
+    let report = apply(&forge, &config);
+    assert!(
+        report.lines.contains(&"holds: unchanged".to_owned()),
+        "{:#?}",
+        report.lines
+    );
+    // A pass whose stages failed publishes no list at all.
+    let forge = forge_with(Some(&body));
+    let past = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let state = (State::default(), Mode::Actions(&own()), Limits::default());
+    let within = (state.0, state.1, state.2, forge.replay.now);
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, past);
+    let report = block(run_within(&forge, &forge, &config, within, &bounds)).unwrap();
+    assert!(report.lines.iter().all(|l| !l.starts_with("holds")));
+    assert!(forge.writes.borrow().is_empty());
+}
+
 /// With `holds`, a pass whose published snapshot has had its holds for
 /// seven hours, and no progress for five, says each stall: a preview, which
 /// makes no progress of its own, on the holds issue with no log to name,

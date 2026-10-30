@@ -696,7 +696,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
 
     /// Stages 3 and 4's holds as a snapshot at this pass's clock, with what
     /// carries over from `previous`, the published one's JSON, and the
-    /// stall alarms, each said in a `stall …` line ([`holds::alarm`]).
+    /// stall alarms, each said in a `stall …` line ([`holds::alarm`]), and
+    /// with `holds.needsYou` what waits on the operator.
     fn hold_snapshot(&mut self, previous: Option<&Value>) -> holds::Snapshot {
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let tally = self.report.tally.clone();
@@ -730,6 +731,19 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         };
         for line in holds::alarm(&mut snapshot, previous, &watch) {
             self.line(line);
+        }
+        if at.needs_you {
+            let options = match &self.board {
+                Some(Some(board)) => board.options.as_slice(),
+                _ => &[],
+            };
+            let reading = holds::Reading {
+                epics: self.config.epics.is_some(),
+                considered: self.unconsidered == 0,
+                options,
+                on: &on,
+            };
+            snapshot.needs_you = Some(holds::needs_you(&snapshot, previous, &reading));
         }
         snapshot
     }

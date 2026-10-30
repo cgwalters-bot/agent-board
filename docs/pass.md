@@ -152,14 +152,57 @@ it so; absent otherwise, and where stage 3 or 4 did not get as far as
 reading them. It too was added to v1 later, and a reader treats
 it as absent in an older comment.
 
+With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
+has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
+on the operator, for review's needs-you view. It goes only where the hold
+snapshot goes, the bot's own comment in a private repository, and is made
+from the published holds alone, nothing inferred:
+
+```json
+{"schema":"agent-board/needs-you/v1","complete":true,"validated_at":"2026-10-30T09:30:00Z","changed_at":"2026-10-30T09:00:00Z","sources":{"epics":"complete","items":"complete"},"count":1,"items":[{"key":"cgwalters-forge/tracker#446","item":"cgwalters-forge/tracker#446","source":"items","kind":"needs-human","priority":"P0","waiting_since":"2026-10-29T18:24:18Z","ask":"Ship it?","target":"https://github.com/cgwalters-forge/tracker/issues/446","head":null}]}
+```
+
+Each item is a hold above with `operator` true on an issue that is not
+`closed`: not a hold the pass releases itself (a run in flight or rerun, a
+cooldown, an epic it retries), nor `needs-design` or board Blocked. An
+answered question stays listed until its hold goes (its label is removed or
+its Why changes): the holds record no answer. `key` is the issue's
+`OWNER/REPO#N` in lower case, the same from pass to pass; an issue held twice
+(the holds issue's two [stall alarms](#stall-alarms)) is listed once, where it
+ranks first, its asks joined by `; `. `source` is `epics` (stage 3), `items`
+(stage 4) or `pass` (an alarm on the holds issue); `waiting_since` is the
+hold's `since`; `ask` is its board Why's question where it asks one, else its
+reason, cut to 500 characters (the hold's entry has it whole, unless it is a
+stall alarm left out to fit below); `target` is the held issue's address;
+`head` is null, as no hold reads a head commit. Items are sorted by Priority
+in the board's option order (one the board does not list after, none last),
+then the longest waiting, then `key`, and `count` is their number.
+
+`sources` says how much of each source the pass read: `complete`;
+`partial`, read but not whole: an issue it could not read (an `unreadable`
+hold), or in stage 4 a candidate it did not consider (the WIP limit, pools or
+the time bound stopped it partway, or the consideration failed), any of
+which may wait on the operator; `unread`, where its stage did not get that
+far (`live_epics` or `candidates` null; stage 4's holds are then those last
+read, as above); or `off` (stage 3 without `epics`). `complete` is true only
+where each is `complete` or `off`, so an empty list is "nothing waits" only
+then. A pass whose stage 3 or 4 failed publishes nothing, as above.
+`validated_at` is the clock of the pass that last wrote the list, and
+`changed_at` that of the pass that last changed it (`validated_at` aside),
+carried over while it stays the same. An unchanged list is written again,
+with the snapshot's `at`, once the published `validated_at` is an hour old,
+so a reader treats a list whose `validated_at` is older than that and a pass
+interval as unknown, not as current. So does a reader that finds no
+`needs_you` where it is on: past the cap below, the list is left out whole.
+
 The JSON is compact, one entry a line, so that a board of a few hundred holds
 fits GitHub's 65,536-character comment. The comment is also capped at 60,000
 characters: past that, item holds that do not wait on the operator are left
 out until it fits, those without a Priority first, then the lowest Priority
 (`P3` before `P0`), then the newest (the highest number), and `truncated`
 counts them (otherwise 0). The operator's holds and the holds of every new
-run are always kept; should they alone not fit, nothing is published and the
-line is `holds error: …`.
+run are always kept; past them the needs-you list is left out, and should
+they alone not fit, nothing is published and the line is `holds error: …`.
 
 With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
 broker's `spend.runs`, the trailing week's cost of runs' requests at API list
@@ -1863,6 +1906,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `usage.repository`, `usage.issue` | Private snapshot destination; required when pools are configured; writer is `bot` |
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
+| `holds.needsYou` | Add the ranked [needs-you list](#what-is-built) (`agent-board/needs-you/v1`) to the hold snapshot; needs `holds`; `false` |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |

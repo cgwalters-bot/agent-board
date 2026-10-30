@@ -9,10 +9,14 @@
 //! snapshot (agent-board#454): `since` and `progress_at` carry over from the
 //! published one ([`carry`]), and the alarms are worked out again from them
 //! each pass ([`alarm`]), so that one clears itself once its cause is gone.
+//!
+//! With `holds.needsYou` the snapshot also lists what waits on the operator
+//! (tracker#976), ranked, from the same holds ([`needs_you`]): nothing is
+//! inferred that the holds do not say.
 
 use super::lease::Held;
 use crate::supervise::health::json_block;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use board_core::ItemRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,6 +61,15 @@ const MAX_STALLS: usize = 10;
 const MAX_STALL_REASON: usize = 300;
 /// How the idle alarm's reason names the pass log ([`alarm`]).
 const PASS_LOG: &str = "; see the pass log ";
+/// The schema of the needs-you list in the hold snapshot ([`needs_you`]).
+pub const NEEDS_YOU_SCHEMA: &str = "agent-board/needs-you/v1";
+/// How long an unchanged needs-you list goes unwritten ([`changed`]): past
+/// it, the pass writes it again for its `validated_at` alone.
+const NEEDS_YOU_REFRESH_HOURS: u64 = 1;
+/// The most characters of a hold's question or reason an ask repeats; the
+/// hold's entry has it whole. The list doubles the operator's holds, which
+/// [`fit`] never leaves out.
+const MAX_ASK: usize = 500;
 
 /// What keeps the pass off an item, or off every new run (`Wip`, `Pools`,
 /// `Budget`):
@@ -357,6 +370,10 @@ pub struct Snapshot {
     /// The live leases ([`super::Config::leases`]); absent where it is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leases: Option<Vec<Held>>,
+    /// What waits on the operator ([`needs_you`]); absent unless
+    /// `holds.needsYou`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_you: Option<NeedsYou>,
     pub holds: Vec<Published>,
 }
 
@@ -490,6 +507,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
         wip,
         pass,
         leases: None,
+        needs_you: None,
         holds,
     }
 }
@@ -555,6 +573,12 @@ fn time_len(text: &[u8]) -> Option<usize> {
 
 fn parse_time(at: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(at, &Rfc3339).ok()
+}
+
+/// `since`, a published time, where it is one no later than `at`.
+fn not_after(since: &Value, at: &str) -> Option<String> {
+    let since = since.as_str()?;
+    (parse_time(since)? <= parse_time(at)?).then(|| since.to_owned())
 }
 
 /// Whether `hours` or more went by from `since` to `at`; not where either
@@ -636,10 +660,7 @@ pub fn carry(
     (progressed, considered): (bool, bool),
 ) {
     let at = snapshot.at.clone();
-    let carried = |since: &Value| {
-        let since = since.as_str()?;
-        (parse_time(since)? <= parse_time(&at)?).then(|| since.to_owned())
-    };
+    let carried = |since: &Value| not_after(since, &at);
     if !considered {
         let had: BTreeSet<(Option<String>, bool)> = (snapshot.holds.iter())
             .map(|h| (h.item.clone(), h.epic))
@@ -816,14 +837,213 @@ pub fn alarm(snapshot: &mut Snapshot, previous: Option<&Value>, watch: &Watch) -
     lines
 }
 
+/// How much of one source of the needs-you list this pass read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Read {
+    /// Read whole: nothing from it waits on the operator but what is listed.
+    Complete,
+    /// Read, but some of its issues not (`unreadable` holds), or, in stage
+    /// 4, some candidates not considered; any of them may wait on the
+    /// operator.
+    Partial,
+    /// Not read by this pass; for stage 4, what it lists is the last a pass
+    /// read ([`carry`]).
+    Unread,
+    /// Not configured.
+    Off,
+}
+
+/// Each source of the needs-you list: stage 3's epics and stage 4's items.
+/// The pass's own alarms on the holds issue are read whenever it publishes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Sources {
+    pub epics: Read,
+    pub items: Read,
+}
+
+/// One thing that waits on the operator: a hold of theirs, one an item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Ask {
+    /// `owner/repo#n`, lower case: the same for the item from pass to pass.
+    pub key: String,
+    /// `OWNER/REPO#N`, as the hold has it.
+    pub item: String,
+    /// `epics`, `items`, or `pass` for an alarm on the holds issue.
+    pub source: &'static str,
+    pub kind: HoldKind,
+    pub priority: Option<String>,
+    /// The hold's `since` ([`carry`]).
+    pub waiting_since: String,
+    /// The board Why's question where it asks one, else the hold's reason.
+    pub ask: String,
+    /// The held issue's address.
+    pub target: String,
+    /// The head commit the ask is on; null, as no hold reads one.
+    pub head: Option<String>,
+}
+
+/// The needs-you list ([`NEEDS_YOU_SCHEMA`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NeedsYou {
+    pub schema: &'static str,
+    /// Whether every source was read whole ([`Read::Complete`] or off), so
+    /// that an empty list means nothing waits.
+    pub complete: bool,
+    /// The clock of the pass that last read it, which may only confirm it.
+    pub validated_at: String,
+    /// The clock of the pass that last changed it, `validated_at` aside.
+    pub changed_at: String,
+    pub sources: Sources,
+    /// How many `items`: always their number.
+    pub count: usize,
+    pub items: Vec<Ask>,
+}
+
+/// What [`needs_you`] knows of the pass besides its snapshot.
+pub struct Reading<'a> {
+    /// Whether stage 3 is configured (`epics`).
+    pub epics: bool,
+    /// Whether stage 4 decided a hold, or a start, for each of its ranked
+    /// candidates.
+    pub considered: bool,
+    /// The board's Priority options in order; none where it was not read.
+    pub options: &'a [String],
+    /// The holds issue.
+    pub on: &'a ItemRef,
+}
+
+/// What `snapshot`, once [`alarm`] has added its alarms, has wait on the
+/// operator: each hold with `operator` true on an item, but not on a closed
+/// one; so not the holds the pass releases itself (a run in flight or
+/// rerun, a cooldown, a retry), nor `needs-design` or board Blocked. Ranked
+/// by Priority in the board's order (an unknown one after, none last), then
+/// the longest waiting, then key; an item held twice (the holds issue's two
+/// alarms) is listed once, where it ranks first, its asks joined.
+/// `changed_at` carries over from `previous`, the published snapshot's
+/// JSON, where the list was the same.
+pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Reading) -> NeedsYou {
+    let at = &snapshot.at;
+    let on = reading.on.display();
+    let unreadable = |epic: bool| {
+        (snapshot.holds.iter())
+            .any(|h| h.item.is_some() && h.epic == epic && h.kind == HoldKind::Unreadable)
+    };
+    let read = |listed: bool, epic: bool, whole: bool| match listed {
+        false => Read::Unread,
+        true if !whole || unreadable(epic) => Read::Partial,
+        true => Read::Complete,
+    };
+    let sources = Sources {
+        epics: match reading.epics {
+            false => Read::Off,
+            true => read(snapshot.pass.live_epics.is_some(), true, true),
+        },
+        // Where stage 4 did not get to its candidates, its holds are carried.
+        items: read(
+            snapshot.pass.candidates.is_some(),
+            false,
+            reading.considered,
+        ),
+    };
+    let mut items: Vec<Ask> = (snapshot.holds.iter())
+        .filter(|h| h.operator && h.kind != HoldKind::Closed)
+        .filter_map(|h| {
+            let (item, target) = (h.item.clone()?, h.url.clone()?);
+            let source = match h.epic && h.kind != HoldKind::EpicNotLive {
+                _ if item == on => "pass",
+                true => "epics",
+                false => "items",
+            };
+            Some(Ask {
+                key: item.to_ascii_lowercase(),
+                item,
+                source,
+                kind: h.kind,
+                priority: h.priority.clone(),
+                waiting_since: h.since.clone(),
+                ask: h.question.clone().unwrap_or_else(|| h.reason.clone()),
+                target,
+                head: None,
+            })
+        })
+        .collect();
+    items.sort_by_key(|a| {
+        let since = parse_time(&a.waiting_since);
+        let known = (a.priority.as_ref()).and_then(|p| reading.options.iter().position(|o| o == p));
+        let priority = (
+            a.priority.is_none(),
+            known.is_none(),
+            known,
+            a.priority.clone(),
+        );
+        (priority, since.is_none(), since, a.key.clone())
+    });
+    let mut first: BTreeMap<String, usize> = BTreeMap::new();
+    let mut kept: Vec<Ask> = Vec::with_capacity(items.len());
+    for ask in items {
+        match first.get(&ask.key) {
+            Some(&n) => kept[n].ask = format!("{}; {}", kept[n].ask, ask.ask),
+            None => {
+                first.insert(ask.key.clone(), kept.len());
+                kept.push(ask);
+            }
+        }
+    }
+    for ask in &mut kept {
+        ask.ask = clip(&ask.ask, MAX_ASK);
+    }
+    let items = kept;
+    let mut list = NeedsYou {
+        schema: NEEDS_YOU_SCHEMA,
+        complete: [sources.epics, sources.items]
+            .iter()
+            .all(|r| matches!(r, Read::Complete | Read::Off)),
+        validated_at: at.clone(),
+        changed_at: at.clone(),
+        sources,
+        count: items.len(),
+        items,
+    };
+    let previous = (previous.filter(|s| s["schema"] == HOLDS_SCHEMA))
+        .map(|s| &s["needs_you"])
+        .filter(|n| n["schema"] == NEEDS_YOU_SCHEMA);
+    let content = |list: &Value| {
+        let mut list = list.clone();
+        if let Some(fields) = list.as_object_mut() {
+            fields.remove("validated_at");
+            fields.remove("changed_at");
+        }
+        list
+    };
+    let same = previous
+        .filter(|p| serde_json::to_value(&list).is_ok_and(|now| content(p) == content(&now)));
+    if let Some(since) = same.and_then(|p| not_after(&p["changed_at"], at)) {
+        list.changed_at = since;
+    }
+    list
+}
+
 /// Whether `snapshot` says something other than the published comment
-/// `body`, if any: its time alone is no change.
+/// `body`, if any: its time alone is no change, nor the needs-you list's
+/// `validated_at` until [`NEEDS_YOU_REFRESH_HOURS`] after the published one,
+/// so that a list nothing changes is written again that often.
 pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
     let mut now = serde_json::to_value(snapshot)?;
+    let validated = |s: &mut Value| {
+        let list = s.get_mut("needs_you").and_then(Value::as_object_mut)?;
+        list.remove("validated_at")?.as_str().map(str::to_owned)
+    };
+    let refresh = validated(&mut now);
     Ok(body.and_then(published).is_none_or(|mut s| {
+        let last = validated(&mut s);
+        let due = refresh.as_ref().is_some_and(|at| {
+            let last = last.unwrap_or_default();
+            parse_time(&last).is_none() || over(&last, at, NEEDS_YOU_REFRESH_HOURS)
+        });
         s["at"] = Value::Null;
         now["at"] = Value::Null;
-        s != now
+        due || s != now
     }))
 }
 
@@ -841,8 +1061,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         Some(leases) => format!(",\"leases\":{}", serde_json::to_string(leases)?),
         None => String::new(),
     };
+    let needs_you = match &snapshot.needs_you {
+        Some(list) => format!(",\"needs_you\":{}", serde_json::to_string(list)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -872,7 +1096,9 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// in [`left_out_first`] order, then the stall alarms likewise, until it
 /// fits, and counted in `truncated`, so that alarms never keep the holds
 /// from being published. The operator's own holds and the holds of every
-/// new run are always kept; if they alone do not fit, that is an error.
+/// new run are always kept; past them, the needs-you list is left out
+/// whole, so that its `validated_at` ages rather than the holds go
+/// unpublished. If they alone do not fit, that is an error.
 pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let holds = &snapshot.holds;
     let stalled = |n: usize| holds[n].kind == HoldKind::Stalled;
@@ -882,6 +1108,7 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     order.sort_by_key(|&n| (stalled(n), left_out_first(&holds[n])));
     let mut order = order.into_iter();
     let mut dropped = BTreeSet::new();
+    let mut needs_you = snapshot.needs_you.clone();
     loop {
         let kept = (holds.iter().enumerate())
             .filter(|(n, _)| !dropped.contains(n))
@@ -894,6 +1121,7 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
             wip: snapshot.wip.clone(),
             pass: snapshot.pass.clone(),
             leases: snapshot.leases.clone(),
+            needs_you: needs_you.clone(),
             holds: kept,
         };
         let body = render(&fitted)?;
@@ -904,11 +1132,13 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         // Each entry is its JSON and a ",\n"; the count may grow a digit,
         // which the next round sees.
         while over > 0 {
-            let n = order.next().with_context(|| {
-                format!(
+            let Some(n) = order.next() else {
+                ensure!(
+                    needs_you.take().is_some(),
                     "the hold snapshot is over {MAX_COMMENT_CHARS} characters with only the operator's holds and those of every new run left"
-                )
-            })?;
+                );
+                break;
+            };
             let len = serde_json::to_string(&holds[n])?.chars().count() + 2;
             over = over.saturating_sub(len);
             dropped.insert(n);
@@ -1748,6 +1978,283 @@ mod tests {
                 .all(|h| h["item"] != "o/t#12")
         );
     }
+    /// A board with holds of every sort, read whole by stages 3 and 4: each
+    /// item hold with its Priority, and its `since` at the given hour.
+    fn waiting() -> Snapshot {
+        let held = |scope, kind, priority: Option<&str>, operator: bool| Entry {
+            scope,
+            hold: Hold::new(kind, format!("{} reason", kind.name())).operator(operator),
+            priority: priority.map(Into::into),
+            why: None,
+        };
+        let t = |n| item("o/t", n);
+        let mut asked = held(Scope::Item(t(1)), HoldKind::NeedsHuman, Some("P1"), true);
+        asked.why = Some("Q: Which target?".into());
+        let entries = vec![
+            asked,
+            held(Scope::Item(t(2)), HoldKind::NeedsOperator, Some("P0"), true),
+            held(Scope::Item(t(3)), HoldKind::NeedsOperator, Some("P1"), true),
+            // The epic the pass retries by itself.
+            held(
+                Scope::Epic(t(4)),
+                HoldKind::EpicUnplanned,
+                Some("P0"),
+                false,
+            ),
+            held(Scope::Item(t(5)), HoldKind::NeedsDesign, Some("P0"), false),
+            // A rerun in flight.
+            held(Scope::Item(t(6)), HoldKind::InFlight, Some("P0"), false),
+            held(Scope::Item(t(7)), HoldKind::Closed, Some("P0"), true),
+            held(Scope::Item(t(8)), HoldKind::PrOpen, None, true),
+            held(Scope::Epic(t(9)), HoldKind::NeedsOperator, None, true),
+            held(Scope::Pass, HoldKind::Wip, None, false),
+        ];
+        let (wip, mut pass) = tally();
+        pass.live_epics = Some(2);
+        let mut snapshot = snapshot(&entries, "2026-10-28T09:00:00Z".into(), (wip, pass));
+        // Two alarms on the holds issue: one ask.
+        let alarm = |since: &str, reason: &str| Published {
+            item: Some("o/ops#1".into()),
+            url: Some(url(&item("o/ops", 1))),
+            epic: false,
+            kind: HoldKind::Stalled,
+            reason: reason.into(),
+            operator: true,
+            priority: None,
+            question: None,
+            since: since.into(),
+            carried: false,
+        };
+        snapshot
+            .holds
+            .push(alarm("2026-10-28T06:00:00Z", "3 more hold(s)"));
+        snapshot
+            .holds
+            .push(alarm("2026-10-28T04:00:00Z", "no apply"));
+        let hours = [(1, 3), (2, 5), (3, 1), (8, 0), (9, 2)];
+        for hold in &mut snapshot.holds {
+            let n = hold.item.as_deref().and_then(|i| i.strip_prefix("o/t#"));
+            let n: Option<u64> = n.and_then(|n| n.parse().ok());
+            if let Some((_, h)) = hours.iter().find(|(m, _)| Some(*m) == n) {
+                hold.since = format!("2026-10-28T{h:02}:00:00Z");
+            }
+        }
+        snapshot
+    }
+
+    fn options(names: &[&str]) -> Vec<String> {
+        names.iter().map(|&n| n.to_owned()).collect()
+    }
+
+    /// The needs-you list of `snapshot` on the holds issue o/ops#1, on a
+    /// board of P0 to P3, with stage 3 on or not and every candidate
+    /// considered or not.
+    fn listed(
+        snapshot: &Snapshot,
+        previous: Option<&Value>,
+        (epics, considered): (bool, bool),
+    ) -> NeedsYou {
+        let (on, options) = (item("o/ops", 1), options(&["P0", "P1", "P2", "P3"]));
+        let reading = Reading {
+            epics,
+            considered,
+            options: &options,
+            on: &on,
+        };
+        needs_you(snapshot, previous, &reading)
+    }
+
+    /// Only the operator's holds on open items, one an item, by Priority,
+    /// then the longest waiting; counted from the list itself.
+    #[test]
+    fn needs_you_ranks_the_operators_holds() {
+        let list = listed(&waiting(), None, (true, true));
+        let ranked: Vec<Value> = (list.items.iter())
+            .map(|a| json!([a.key, a.source, a.kind, a.priority, a.waiting_since]))
+            .collect();
+        let at = |h: u32| format!("2026-10-28T{h:02}:00:00Z");
+        assert_eq!(
+            ranked,
+            [
+                json!(["o/t#2", "items", "needs-operator", "P0", at(5)]),
+                json!(["o/t#3", "items", "needs-operator", "P1", at(1)]),
+                json!(["o/t#1", "items", "needs-human", "P1", at(3)]),
+                json!(["o/t#8", "items", "pr-open", null, at(0)]),
+                json!(["o/t#9", "epics", "needs-operator", null, at(2)]),
+                json!(["o/ops#1", "pass", "stalled", null, at(4)]),
+            ]
+        );
+        assert_eq!(list.count, list.items.len());
+        assert!(list.complete);
+        let asks: Vec<&str> = list.items.iter().map(|a| a.ask.as_str()).collect();
+        let operator = "needs-operator reason";
+        assert_eq!(asks[..3], [operator, operator, "Which target?"]);
+        assert_eq!(asks[5], "no apply; 3 more hold(s)", "the two alarms' asks");
+        let first = &list.items[0];
+        assert_eq!(first.item, "o/t#2");
+        assert_eq!(first.target, "https://github.com/o/t/issues/2");
+        assert_eq!(first.head, None);
+        // Its order decided changes nothing.
+        let mut reordered = waiting();
+        reordered.holds.reverse();
+        assert_eq!(listed(&reordered, None, (true, true)), list);
+        // Priority goes in the board's order, an unknown one after: not by
+        // name. The first hold is of every new run, #4 not the operator's.
+        let mut board = waiting();
+        let priorities = ["-", "Low", "Urgent", "Odd", "High"];
+        for (hold, priority) in board.holds.iter_mut().zip(priorities) {
+            hold.priority = Some(priority.into());
+        }
+        let (on, options) = (item("o/ops", 1), options(&["Urgent", "High", "Low"]));
+        let reading = Reading {
+            epics: true,
+            considered: true,
+            options: &options,
+            on: &on,
+        };
+        let ranked: Vec<Option<String>> = (needs_you(&board, None, &reading).items.iter())
+            .map(|a| a.priority.clone())
+            .take(3)
+            .collect();
+        assert_eq!(
+            ranked,
+            [Some("Urgent"), Some("Low"), Some("Odd")].map(|p| p.map(Into::into))
+        );
+    }
+
+    /// Complete and empty is not the same as unread or partly read: each
+    /// source says which, and `complete` only where all were read whole.
+    #[test]
+    fn needs_you_says_what_it_read() {
+        let unreadable = |scope| entry(scope, HoldKind::Unreadable, "labels not read whole");
+        type Case = (&'static str, Vec<Entry>, bool, bool, (Read, Read));
+        let cases: Vec<Case> = vec![
+            (
+                "empty",
+                vec![],
+                true,
+                true,
+                (Read::Complete, Read::Complete),
+            ),
+            (
+                "epics off",
+                vec![],
+                false,
+                true,
+                (Read::Off, Read::Complete),
+            ),
+            (
+                "stage 3 unread",
+                vec![],
+                true,
+                false,
+                (Read::Unread, Read::Complete),
+            ),
+            (
+                "an item unread",
+                vec![unreadable(Scope::Item(item("o/t", 1)))],
+                true,
+                true,
+                (Read::Complete, Read::Partial),
+            ),
+            (
+                "an epic unread",
+                vec![unreadable(Scope::Epic(item("o/t", 1)))],
+                true,
+                true,
+                (Read::Partial, Read::Complete),
+            ),
+        ];
+        for (name, entries, epics, listed_epics, (on_epics, on_items)) in cases {
+            let (wip, mut pass) = tally();
+            pass.live_epics = listed_epics.then_some(1);
+            let snapshot = snapshot(&entries, "2026-10-28T09:00:00Z".into(), (wip, pass));
+            let list = listed(&snapshot, None, (epics, true));
+            let expected = Sources {
+                epics: on_epics,
+                items: on_items,
+            };
+            assert_eq!(list.sources, expected, "{name}");
+            let whole = [on_epics, on_items]
+                .iter()
+                .all(|r| matches!(r, Read::Complete | Read::Off));
+            assert_eq!(list.complete, whole, "{name}");
+            assert_eq!((list.count, list.items.len()), (0, 0), "{name}");
+        }
+        // Stage 4 stopped partway through its candidates, or a candidate's
+        // consideration failed: the rest may wait on the operator.
+        let list = listed(&waiting(), None, (true, false));
+        assert_eq!(list.sources.items, Read::Partial);
+        assert!(!list.complete);
+        // Stage 4 did not get to its candidates: what it lists is carried.
+        let mut full = waiting();
+        full.pass.candidates = None;
+        let list = listed(&full, None, (true, true));
+        assert_eq!(list.sources.items, Read::Unread);
+        assert!(!list.complete);
+        assert_eq!(list.count, 6);
+    }
+
+    /// A pass that reads the same list again validates it without changing
+    /// it, and writes it again only once the last write is an hour old; a
+    /// change is a change at once.
+    #[test]
+    fn needs_you_validated_apart_from_changed() {
+        let at = |m: u32| format!("2026-10-28T{:02}:{:02}:00Z", 9 + m / 60, m % 60);
+        let pass_at = |snapshot: Snapshot, minutes, previous: Option<&Value>| {
+            let mut snapshot = Snapshot {
+                at: at(minutes),
+                ..snapshot
+            };
+            carry(&mut snapshot, previous, (false, true));
+            snapshot.needs_you = Some(listed(&snapshot, previous, (true, true)));
+            snapshot
+        };
+        let first = pass_at(waiting(), 0, None);
+        let body = render(&first).unwrap();
+        assert_eq!(parse(&body), Some(serde_json::to_value(&first).unwrap()));
+        let published = parse(&body);
+        let again = pass_at(waiting(), 30, published.as_ref());
+        let list = again.needs_you.as_ref().unwrap();
+        assert_eq!(
+            (list.validated_at.as_str(), list.changed_at.as_str()),
+            (at(30).as_str(), at(0).as_str())
+        );
+        assert!(!changed(Some(&body), &again).unwrap());
+        let hour = pass_at(waiting(), 60, published.as_ref());
+        assert_eq!(hour.needs_you.as_ref().unwrap().changed_at, at(0));
+        assert!(changed(Some(&body), &hour).unwrap(), "due again");
+        let mut fewer = waiting();
+        fewer.holds.retain(|h| h.item.as_deref() != Some("o/t#2"));
+        let fewer = pass_at(fewer, 30, published.as_ref());
+        assert_eq!(fewer.needs_you.as_ref().unwrap().changed_at, at(30));
+        assert!(changed(Some(&body), &fewer).unwrap());
+        // A comment without the list, or with a validation time that is
+        // none, is written.
+        let mut old = first;
+        old.needs_you = None;
+        assert!(changed(Some(&render(&old).unwrap()), &again).unwrap());
+        let unparsed = body.replace(
+            &format!("\"validated_at\":\"{}\"", at(0)),
+            "\"validated_at\":\"soon\"",
+        );
+        assert_ne!(unparsed, body);
+        assert!(changed(Some(&unparsed), &again).unwrap());
+        // `fit` keeps it; one that cannot fit beside the operator's holds is
+        // left out whole, and the holds are published all the same.
+        let (fitted, _) = fit(again).unwrap();
+        assert_eq!(fitted.needs_you.unwrap().count, 6);
+        let mut over = pass_at(waiting(), 30, published.as_ref());
+        let list = over.needs_you.as_mut().unwrap();
+        let mut long = list.items[0].clone();
+        long.ask = "a".repeat(MAX_ASK);
+        list.items = vec![long; 200];
+        let (fitted, body) = fit(over).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        assert_eq!(fitted.needs_you, None);
+        assert!(fitted.holds.iter().any(|h| h.operator));
+    }
+
     /// Many stuck holds at once, as in a label outage, raise at most
     /// [`MAX_STALLS`] alarms of their own, each repeating at most
     /// [`MAX_STALL_REASON`] characters of its hold's reason, and one that
