@@ -204,11 +204,16 @@ fn said_done(replay: &mut Replay, author: &str) {
 
 /// Labels tracker#596 with each of `labels`.
 fn label_596(replay: &mut Replay, labels: &[&str]) {
+    label(replay, 596, labels);
+}
+
+/// Labels the epic tracker#`n` with each of `labels`.
+fn label(replay: &mut Replay, n: u64, labels: &[&str]) {
     let nodes = (replay.requests.iter_mut())
         .filter_map(|e| e["answer"].pointer_mut("/data/repository/issues/nodes"))
         .filter_map(Value::as_array_mut)
         .flatten();
-    for node in nodes.filter(|n| n["number"] == 596) {
+    for node in nodes.filter(|n2| n2["number"] == n) {
         let held = &mut node["labels"];
         for label in labels {
             held["nodes"]
@@ -1648,14 +1653,14 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![],
             "2026-10-23T15:00:00Z",
-            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+            "Wait { why: \"its sub-issues changed",
         ),
         (
             &facts,
             &recorded,
             vec![say("cgwalters-bot", "2026-10-23T14:50:00Z")],
             "2026-10-23T15:00:00Z",
-            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+            "Wait { why: \"its sub-issues changed",
         ),
         (
             &facts,
@@ -1669,7 +1674,7 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![],
             "2026-10-23T16:35:00Z",
-            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+            "Wait { why: \"its sub-issues changed",
         ),
         (
             &facts,
@@ -1773,7 +1778,7 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![nothing(1)],
             "3 2026-10-25T13:00:00Z",
-            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+            "Wait { why: \"its sub-issues changed",
         ),
         (
             &facts,
@@ -1787,7 +1792,7 @@ fn decide_coalesces_changes_but_not_direction() {
             &recorded,
             vec![nothing(1), nothing(2)],
             "3 2026-10-26T13:00:00Z",
-            "Hold(Hold { kind: TriageCooldown, reason: \"its sub-issues changed",
+            "Wait { why: \"its sub-issues changed",
         ),
         (
             &facts,
@@ -1907,5 +1912,138 @@ fn board_fields_refuse_a_partial_membership_read() {
             Err(_) => Some("error".into()),
         };
         assert_eq!(got.as_deref(), want, "{total} boards");
+    }
+}
+
+/// tracker#766 without its labels that hold it, and planned four days later than recorded, so
+/// that like tracker#890 it waits a day after its last request.
+fn waiting_766(replay: &mut Replay) {
+    let before = OffsetDateTime::parse("2026-10-20T00:00:00Z", &Rfc3339).unwrap();
+    let comments = comments(replay, r#""after":null,"name":"tracker","number":766,"#);
+    for comment in comments.iter_mut() {
+        let created = OffsetDateTime::parse(text(comment, "/createdAt"), &Rfc3339).unwrap();
+        if created < before {
+            moved(comment, time::Duration::days(4));
+            // The plan its receipt names, by its time.
+            let body = text(comment, "/body").replace("2026-10-19T", "2026-10-23T");
+            comment["body"] = body.into();
+        }
+    }
+    let nodes = (replay.requests.iter_mut())
+        .filter_map(|e| e["answer"].pointer_mut("/data/repository/issues/nodes"))
+        .filter_map(Value::as_array_mut)
+        .flatten();
+    for node in nodes.filter(|n| n["number"] == 766) {
+        let held = &mut node["labels"];
+        let labels = held["nodes"].as_array_mut().unwrap();
+        labels.retain(|l| l["name"] != NEEDS_HUMAN && l["name"] != "needs-design");
+        held["totalCount"] = labels.len().into();
+    }
+}
+
+/// An epic held only by the day's wait after its last planning request is
+/// planned at once by a pass that would otherwise be idle: one a pass, the
+/// highest in Priority, never one a person holds, and never while slots
+/// are taken.
+#[test]
+fn idle_pass_plans_a_waiting_epic_early() {
+    const WAIT_890: &str = "hold epic cgwalters-forge/tracker#890: its sub-issues changed";
+    const EARLY_890: &str =
+        "start planning cgwalters-forge/tracker#890 pool=claude: its sub-issues changed";
+    const IDLE: &str = "idle: 6 slot(s) free and nothing started";
+    // Stage 4 with one candidate, which waits: an idle pass.
+    let idle = |r: &mut Replay, c: &mut Value| {
+        crate::pass::tests::only(r, &["cgwalters-forge/tracker#446"]);
+        c["triage"] = false.into();
+    };
+    // tracker#596 held by a person, so that stage 3 plans nothing.
+    let quiet = |r: &mut Replay| label_596(r, &["needs-human"]);
+    type Case = (
+        &'static str,
+        Box<dyn Fn(&mut Replay, &mut Value)>,
+        Vec<&'static str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "idle: tracker#890 is planned now",
+            Box::new(move |r, c| {
+                quiet(r);
+                idle(r, c);
+            }),
+            vec![WAIT_890, EARLY_890],
+        ),
+        (
+            "busy: stage 4 takes every slot and tracker#890 waits its day",
+            Box::new(move |r, _| quiet(r)),
+            vec![WAIT_890],
+        ),
+        (
+            "needs-design: a person holds tracker#890",
+            Box::new(move |r, c| {
+                quiet(r);
+                label(r, 890, &["needs-design"]);
+                idle(r, c);
+            }),
+            vec![
+                "hold epic cgwalters-forge/tracker#890: labelled needs-design; otherwise its sub-issues changed",
+                IDLE,
+            ],
+        ),
+        (
+            "one a pass: tracker#766 waits too, behind tracker#890 in Priority",
+            Box::new(move |r, c| {
+                quiet(r);
+                waiting_766(r);
+                idle(r, c);
+            }),
+            vec![
+                WAIT_890,
+                "hold epic cgwalters-forge/tracker#766: its sub-issues changed",
+                EARLY_890,
+            ],
+        ),
+        (
+            "one a pass: stage 3 planned tracker#596",
+            Box::new(idle),
+            vec![
+                "start planning cgwalters-forge/tracker#596 pool=claude: ",
+                WAIT_890,
+                "idle: 5 slot(s) free and nothing started",
+            ],
+        ),
+    ];
+    for (name, edit, expected) in cases {
+        let mut replay = replay();
+        unfinished(&mut replay);
+        let mut settings = json!({});
+        edit(&mut replay, &mut settings);
+        let report = preview(&config(settings), &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let lines: Vec<&str> = (report.lines.iter())
+            .filter(|l| !l.contains(": labelled needs-human;"))
+            .filter(|l| {
+                l.contains("epic cgwalters-forge/tracker#890")
+                    || l.contains("epic cgwalters-forge/tracker#766")
+                    || l.starts_with("start planning")
+                    || l.starts_with("idle:")
+            })
+            .map(String::as_str)
+            .collect();
+        assert_eq!(lines.len(), expected.len(), "{name}: {lines:#?}");
+        for (line, start) in lines.iter().zip(&expected) {
+            assert!(line.starts_with(start), "{name}: {line}");
+        }
+        // The early start's hold is taken back; a waiting one stays.
+        let early = expected.contains(&EARLY_890);
+        let held = (report.holds.iter())
+            .any(|e| e.line().starts_with(WAIT_890) && e.hold.kind == HoldKind::TriageCooldown);
+        assert_eq!(held, expected.contains(&WAIT_890) && !early, "{name}");
+        if early {
+            let line = lines.iter().find(|l| l.starts_with(EARLY_890)).unwrap();
+            assert!(
+                line.ends_with("; early, with 6 slot(s) free and nothing started"),
+                "{line}"
+            );
+        }
     }
 }

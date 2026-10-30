@@ -2020,6 +2020,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         snapshot: None,
         other: None,
         epic_starts: Vec::new(),
+        waited: None,
         considered: false,
         probes: BTreeMap::new(),
         holds_whole: true,
@@ -2303,6 +2304,8 @@ struct Scheduler<'a, C> {
     other: Option<std::result::Result<Option<String>, String>>,
     /// The epics stage 3 started planning runs on.
     epic_starts: Vec<ItemRef>,
+    /// The epic stage 4 plans early where it would be idle.
+    waited: Option<epics::Waited>,
     /// Whether stage 4 has considered a candidate, after which a budget
     /// stop defers the rest ([`Halt::Budget`]).
     considered: bool,
@@ -2635,12 +2638,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
         let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
         let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
-        let taken = started + revisited + swept;
+        let mut taken = started + revisited + swept;
         let ranked: Vec<ItemRef> = candidates.iter().map(|(_, f)| f.issue.clone()).collect();
         drop(candidates);
         self.free = holds::free(Some(&ranked), &self.report.holds[holds..]);
         self.blockers(&board);
         self.board = Some(Some(board));
+        let mut holds = holds;
+        if taken == 0 && free > 0 {
+            taken = self.replan_idle(free, &mut holds);
+        }
+        let free = free - taken.min(free);
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
         if taken == 0 && free > 0 {

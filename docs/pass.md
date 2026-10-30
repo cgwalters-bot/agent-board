@@ -429,7 +429,17 @@ removed, closed or reopened against the receipt's fingerprint; a merged
 pull request counts through the issue it closes. That wait doubles for each
 applied plan in a row that had no actions, up to `triageFollowUpDays`. So
 a plan with nothing to do ends planning until a sub-issue changes, and an
-unchanged epic is not planned again (agent-board#383). Not noticed
+unchanged epic is not planned again (agent-board#383). The wait saves runs
+while slots are taken, not while they sit empty: where stage 4 would end
+`idle: N slot(s) free and nothing started` and stage 3 planned no epic, the
+highest-Priority live epic held only by that wait (`hold epic …: its
+sub-issues changed (…); planned again from T, …`) is planned at once, if
+`planPools` and the budget allow a run now, as `start planning OWNER/REPO#N
+pool=P: its sub-issues changed (…); early, with N slot(s) free and nothing
+started`, and its hold is taken back. Still one epic a pass: the rest keep
+their wait, and an epic a person holds (`needs-human`, `needs-design`,
+board Blocked) or with a planning run or request in flight is never one.
+Where stage 4 starts anything, the wait stands. Not noticed
 (agent-board#429): edits of the epic's or a sub-issue's text, label and
 Priority churn, and a comment by anyone but the operator, whose word alone
 decides an epic's plan.
