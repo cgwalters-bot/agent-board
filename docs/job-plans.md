@@ -215,8 +215,17 @@ an [epic plan](epic-plans.md)) is dispatched only with `--bot`, and then:
   on and asks the pull request description to begin with `Stacks on #P.`, and
   the record says `Stacked on URL (branch)`. The run is neither checked for
   overlap, as it shares the files of the stack below it by design, nor batched;
-- with #N open and no such pull request, it waits, as an overlap does, naming
-  why; with two, it is refused;
+- with #N open and no open pull request of the bot from a `dispatch/` branch,
+  from its fork or not, that closes #N or has a line beginning `Part of #N`
+  (or `OWNER/REPO#N`, or the issue's URL), but a merged one of the bot from a
+  `dispatch/` branch into the default branch, among the repository's 50 most
+  recently updated merged ones, with such a `Part of` line, it runs on the
+  default branch, and the record names that pull request: a slice that does
+  not finish #N says `Part of`, so its merge leaves #N open. One from the
+  bot's fork counts here, as its branch is not used. A merged one that closes
+  #N does not count, since #N open again was reopened as unfinished;
+- with #N open and neither, it waits, as an overlap does, naming why; with two
+  open ones, it is refused;
 - with #N closed, it runs on the default branch like any plan, and the record
   says it was not stacked.
 
