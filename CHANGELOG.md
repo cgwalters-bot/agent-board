@@ -1,0 +1,34 @@
+# Changelog
+
+User-visible changes to the `agent-board` and `gh-agent-board` binaries,
+their configuration files and the records they write on the forge, newest
+first. agent-board has no release yet; deployments pin a reviewed commit
+(docs/setup.md#pinned-callers). The [v1 readiness checklist](docs/release.md)
+lists what v1.0 waits on and what a caller may rely on.
+
+## Unreleased
+
+The first release will be v1.0.0, once every gate in docs/release.md is met.
+Since the workspace started at 0.1.0 it has gained:
+
+- `agent-board pass`, one scheduled pass from one configuration file
+  (docs/pass.md): pull request follow-up with bounded fix, rebase and
+  continuation rounds, epic planning and apply, scheduled starts by
+  Priority, WIP and pool pacing, board Status, reviews, reruns, start-failure
+  and stall alarms, the weekly sweep, the maintain digest, leases and the
+  hold snapshot for the review app. It previews unless `--apply`, within
+  `--max-dispatch` and `--max-writes`, and `--replay` previews a recorded
+  pass offline.
+- The pull request poll, `agent-board poll` (docs/poll.md), and the
+  supervisor's health pass, trigger and executor, `agent-board supervise`
+  (docs/supervisor-requests.md).
+- Job and epic plans, `agent-board dispatch`, `epic plan` and `epic apply`
+  (docs/job-plans.md, docs/epic-plans.md), and operator actions and asks
+  (docs/operator.md).
+- Read-only reports: `budget`, `cost` (docs/cost.md), `prune`
+  (docs/prune.md), `changes` and `status`.
+- `release-train`, `broker probe`, `apps create` and `review send`
+  (docs/release-train.md, docs/broker-probe.md, docs/apps.md,
+  docs/review-drafts.md).
+- Offline board snapshots, item queries with gh-style `--json` and `--jq`,
+  and preview-only reconciliation (docs/cli.md).
