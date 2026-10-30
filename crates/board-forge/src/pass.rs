@@ -287,6 +287,13 @@ const FRESH_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int
 }
 "#;
 
+/// The type of a GraphQL error for a number that is no issue, after which
+/// [`KIND_QUERY`] asks whether it is a pull request.
+const NOT_FOUND: &str = "NOT_FOUND";
+/// Whether a number is an issue's or a pull request's.
+const KIND_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { __typename } }
+}"#;
 /// An issue's own text, as a comment's is read ([`plan::comment`]), for the
 /// plan in its body ([`Config::body_plans`]).
 const BODY_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
@@ -3107,6 +3114,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(facts)
     }
 
+    /// Whether `item` reads as a pull request; not where it reads as
+    /// anything else or not at all.
+    fn pull_request(&self, item: &ItemRef) -> bool {
+        let Some((owner, name)) = item.repository.split_once('/') else {
+            return false;
+        };
+        let variables = json!({"owner": owner, "name": name, "number": item.number});
+        (self.client.graphql(KIND_QUERY, variables)).is_ok_and(|data| {
+            data.pointer("/repository/issueOrPullRequest/__typename") == Some(&json!("PullRequest"))
+        })
+    }
+
     fn issue(&self, query: &str, issue: &ItemRef) -> Result<Value> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
         let data = self.client.graphql(
@@ -3381,6 +3400,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if dest != *issue {
             let target_facts = match self.facts(&dest, board) {
                 Ok(facts) => facts,
+                // A plan names the issue it implements, never a pull
+                // request, which the issue read finds no issue for
+                // (tracker#318's named composefs-rs#17).
+                Err(error)
+                    if format!("{error:#}").contains(NOT_FOUND) && self.pull_request(&dest) =>
+                {
+                    let dest = dest.display();
+                    let why = format!(
+                        "its plan's {dest} is a pull request; a plan names the issue it implements"
+                    );
+                    return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+                }
                 Err(error) => {
                     let dest = dest.display();
                     let why = format!("its plan's {dest} could not be read: {error:#}");

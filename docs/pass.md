@@ -78,7 +78,8 @@ where there is none; `since` is when the snapshots first had the hold
 `priority` and `question`. `operator` is true for the kinds only the operator
 releases: `needs-human` (labelled so, by a person or a triage verdict),
 `epic-unplanned` (an epic's planning request got no plan) and
-`needs-operator` (an invalid or refused plan, an apply cut short and not
+`needs-operator` (an invalid or refused plan, a plan that names a pull
+request, an apply cut short and not
 proved, a plan dispatched by hand, no plan with triage off, or a run that
 failed again after its [rerun](#reruns)), and `pr-open` on an issue labelled
 `needs-operator-approval` (below). The one
@@ -689,7 +690,11 @@ PR for the issue or plan target, a run in flight, and the existing bot-PR/path
 overlap hold, including draft rescue PRs. Keep explicit stacking semantics;
 never guess a stack from overlap. An unreadable hold is not permission to start.
 Check both the board issue and a plan's target; neither may escape configured
-repositories. To avoid duplicate/conflicting work, pass always enables the
+repositories. A plan names the issue it implements: one whose `item` is a
+pull request is held for the operator (`needs-operator`, `its plan's
+OWNER/REPO#N is a pull request; a plan names the issue it implements`), not
+read as an unreadable issue; that is known only from one more read where
+the issue read fails with `NOT_FOUND`. To avoid duplicate/conflicting work, pass always enables the
 existing bot overlap check and conservatively waits when it cannot complete it;
 this is stricter than standalone dispatch's best-effort heuristic.
 
