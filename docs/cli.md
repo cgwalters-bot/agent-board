@@ -947,12 +947,12 @@ agent-board test [OPTIONS] <COMMAND>
 
 Commands:
 
-- [`deploy`](#agent-board-test-deploy): Read-only staging deployment preflight; emits a JSON readiness report
+- [`deploy`](#agent-board-test-deploy): Read-only staging deployment preflight, and with --apply the smoke path (writes); emits a JSON report
 - [`project`](#agent-board-test-project): Create and clean up scratch objects in the staging project (writes)
 
 ## agent-board test deploy
 
-Read-only staging deployment preflight; emits a JSON readiness report
+Read-only staging deployment preflight, and with --apply the smoke path (writes); emits a JSON report
 
 ```text
 agent-board test deploy [OPTIONS] --config <FILE>
@@ -962,6 +962,7 @@ Options:
 
 - `--config <FILE>`: Trusted default-branch deployment configuration (never dispatcher input)
 - `--fixture <FILE>`: Offline JSON array of the four GraphQL responses; no credentials or network
+- `--apply`: After a ready preflight, run the smoke path (writes): a fresh scratch repository and project, one fake-engine task, its result and derived Status, then cleanup by creation receipt
 
 ## agent-board test project
 
