@@ -126,7 +126,12 @@ changed them, goes to the bot's own comment on
 `holds.repository`'s issue `holds.issue`, found again by its first line
 `<!-- agent-board-holds v1 -->`, under the same checks as the usage
 comment's: a private repository, and a new comment only as the bot. It is one
-write step within `--max-writes` (`holds: published URL`); where the comment
+write step within `--max-writes` (`holds: published URL`), except that a
+pass that made progress ([stall alarms](#stall-alarms)) may publish one past
+a cap above zero, so the summary may read `writes 21/20` (`holds: published
+URL, one past --max-writes: it has this pass's progress`): its `progress_at`
+is kept nowhere else. `--max-writes 0` still writes nothing, and a preview
+says what its apply would. Where the comment
 already has the same holds the line is `holds: unchanged` and nothing is
 written, and a preview prints
 `holds: publish to OWNER/REPO#N; a preview does not write it`. An applying
@@ -272,7 +277,9 @@ fits GitHub's 65,536-character comment. The comment is also capped at 60,000
 characters: past that, item holds that do not wait on the operator are left
 out until it fits, those without a Priority first, then the lowest Priority
 (`P3` before `P0`), then the newest (the highest number), and `truncated`
-counts them (otherwise 0). The operator's holds and the holds of every new
+counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
+are left out only after the rest, then the alarms, each together with its
+hold, and the alarms on the holds issue last. The operator's holds and the holds of every new
 run are always kept; past them the needs-you list is left out, and should
 they alone not fit, nothing is published and the line is `holds error: …`.
 
@@ -1281,10 +1288,27 @@ Neither reason counts the hours gone by, so a snapshot that stays stalled
 stays the same and is not published again. Each pass works the alarms out
 afresh, so one clears itself once its hold changes, or once a pass makes
 progress or has no candidate free to start. A preview says them too but never makes
-progress of its own. Past the comment's 60,000-character cap, the alarms
-are left out after every other hold that does not wait on the operator,
-so that they never keep the holds from being published; item holds left
-out lose their `since`, though a P0 or P1 one is among the last left out.
+progress of its own.
+
+Past the comment's 60,000-character cap, the holds the first alarm watches
+(of a kind that stalls, on an epic or at P0 or P1, not waiting on the
+operator) are left out only after every other hold that does not wait on
+the operator, and the alarms after them, each together with the hold it is
+on, then the two on the holds issue, so that alarms never keep the holds
+from being published and no alarm is kept without its hold. A hold left out
+loses its `since`, so its clock starts again, but only once every hold that
+goes before it is out. The stalled holds past ten, which only the holds
+issue's alarm counts, go with the watched holds, before any alarm, and that
+alarm's count falls as they are left out.
+
+`progress_at` is kept only in the published comment, so the holds publish
+of a pass that made progress may go one past `--max-writes`
+([what is built](#what-is-built)), which an epic plan's apply often fills.
+A pass that made progress and publishes nothing all the same (stage 3 or 4
+failed, its request or time budget is spent, `--max-writes 0` held it, the
+write failed) loses it: the next pass that publishes may raise an idle
+alarm from the older `progress_at`, which the next pass that makes progress
+clears.
 
 ## Reviews
 

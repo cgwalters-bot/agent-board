@@ -331,6 +331,7 @@ impl Entry {
             question: self.why.as_deref().and_then(question),
             since: String::new(),
             carried: false,
+            watched: false,
         }
     }
 }
@@ -413,6 +414,11 @@ pub struct Published {
     /// again ([`carry`]), which raises no alarm on it; not published.
     #[serde(skip)]
     pub carried: bool,
+    /// One whose `since` a stall alarm is raised from ([`alarm`]), so that
+    /// [`fit`] keeps it, and so its `since`, past the other holds; not
+    /// published.
+    #[serde(skip)]
+    pub watched: bool,
 }
 
 /// What makes two passes' holds the same: the item, whether it is an epic,
@@ -479,6 +485,7 @@ fn not_live(epic: &ItemRef, children: &[&Entry]) -> Published {
         question: None,
         since: String::new(),
         carried: false,
+        watched: false,
     }
 }
 
@@ -770,15 +777,18 @@ pub fn alarm(snapshot: &mut Snapshot, previous: Option<&Value>, watch: &Watch) -
         question: None,
         since,
         carried: false,
+        watched: false,
     };
     let mut lines = Vec::new();
     let mut holds = Vec::with_capacity(snapshot.holds.len());
     let (mut raised, mut more) = (0, Vec::new());
     for hold in std::mem::take(&mut snapshot.holds) {
         let priority = (hold.priority.as_ref()).is_some_and(|p| watch.top.contains(p));
+        let watched =
+            hold.item.is_some() && hold.kind.stalls() && !hold.operator && (hold.epic || priority);
+        let hold = Published { watched, ..hold };
         let stalled = (hold.item.clone())
-            .filter(|_| hold.kind.stalls() && !hold.operator && !hold.carried)
-            .filter(|_| (hold.epic || priority) && over(&hold.since, &at, hold_hours));
+            .filter(|_| watched && !hold.carried && over(&hold.since, &at, hold_hours));
         let Some(stalled) = stalled else {
             holds.push(hold);
             continue;
@@ -1416,19 +1426,47 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 
 /// `snapshot` within [`MAX_COMMENT_CHARS`] and its comment: where the whole
 /// is longer, the item holds that do not wait on the operator are left out,
-/// in [`left_out_first`] order, then the stall alarms likewise, until it
-/// fits, and counted in `truncated`, so that alarms never keep the holds
-/// from being published. The operator's own holds and the holds of every
-/// new run are always kept; past them, the needs-you list is left out
-/// whole, so that its `validated_at` ages rather than the holds go
-/// unpublished. If they alone do not fit, that is an error.
+/// in [`left_out_first`] order, then the holds a stall alarm watches
+/// ([`Published::watched`]), then the stall alarms, each with the hold it
+/// is on, then those on the holds issue, likewise, until it fits, and
+/// counted in `truncated`. So alarms
+/// never keep the holds from being published, and a hold's stall clock,
+/// the `since` the next pass carries over ([`carry`]), outlasts the other
+/// holds: no alarm is kept without its hold. The operator's own holds and
+/// the holds of every new run are always kept; past them, the needs-you
+/// list is left out whole, so that its `validated_at` ages rather than the
+/// holds go unpublished. If they alone do not fit, that is an error.
 pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let holds = &snapshot.holds;
-    let stalled = |n: usize| holds[n].kind == HoldKind::Stalled;
-    let mut order: Vec<usize> = (0..holds.len())
-        .filter(|&n| holds[n].item.is_some() && (!holds[n].operator || stalled(n)))
-        .collect();
-    order.sort_by_key(|&n| (stalled(n), left_out_first(&holds[n])));
+    let on = |h: &Published| (h.item.clone(), h.epic);
+    let stalled = |h: &Published| h.kind == HoldKind::Stalled;
+    let alarms: BTreeSet<_> = holds.iter().filter(|h| stalled(h)).map(on).collect();
+    let bases: BTreeSet<_> = holds.iter().filter(|h| !stalled(h)).map(on).collect();
+    // An alarm and the hold it is on go together, as one group, by the
+    // first of them; any other entry is a group of its own.
+    let tied = |h: &Published| alarms.contains(&on(h)) && bases.contains(&on(h));
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (n, hold) in holds.iter().enumerate() {
+        if hold.item.is_none() || (hold.operator && !stalled(hold)) {
+            continue;
+        }
+        let first = (holds.iter()).position(|h| on(h) == on(hold));
+        let group = first.filter(|_| tied(hold)).unwrap_or(n);
+        groups.entry(group).or_default().push(n);
+    }
+    // The alarms on the holds issue (idle, and the one that counts the
+    // stalled holds past [`MAX_STALLS`]) last: each speaks for many.
+    let rank = |n: usize| match &holds[n] {
+        h if stalled(h) && !tied(h) => 3,
+        h if tied(h) => 2,
+        h if h.watched => 1,
+        _ => 0,
+    };
+    let mut order: Vec<Vec<usize>> = groups.into_values().collect();
+    order.sort_by_key(|group| {
+        let n = group[0];
+        (rank(n), left_out_first(&holds[n]))
+    });
     let mut order = order.into_iter();
     let mut dropped = BTreeSet::new();
     let mut needs_you = snapshot.needs_you.clone();
@@ -1455,16 +1493,18 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         // Each entry is its JSON and a ",\n"; the count may grow a digit,
         // which the next round sees.
         while over > 0 {
-            let Some(n) = order.next() else {
+            let Some(group) = order.next() else {
                 ensure!(
                     needs_you.take().is_some(),
                     "the hold snapshot is over {MAX_COMMENT_CHARS} characters with only the operator's holds and those of every new run left"
                 );
                 break;
             };
-            let len = serde_json::to_string(&holds[n])?.chars().count() + 2;
-            over = over.saturating_sub(len);
-            dropped.insert(n);
+            for n in group {
+                let len = serde_json::to_string(&holds[n])?.chars().count() + 2;
+                over = over.saturating_sub(len);
+                dropped.insert(n);
+            }
         }
     }
 }
@@ -2347,6 +2387,7 @@ mod tests {
             question: None,
             since: since.into(),
             carried: false,
+            watched: false,
         };
         snapshot
             .holds
@@ -2951,6 +2992,11 @@ mod tests {
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         let kept = (fitted.holds.iter()).filter(|h| h.kind == HoldKind::Stalled);
         assert_eq!(kept.count(), MAX_STALLS + 1, "the holds go first");
+        // Each kept alarm keeps its hold, and so its `since`.
+        let of = |kind| (fitted.holds.iter()).filter(move |h| h.kind == kind);
+        for alarm in of(HoldKind::Stalled).take(MAX_STALLS) {
+            assert!(of(HoldKind::Unreadable).any(|h| h.item == alarm.item));
+        }
         // Alarms alone past the limit are left out rather than fail.
         let alarm = Published {
             kind: HoldKind::Stalled,
@@ -2963,5 +3009,77 @@ mod tests {
         let (fitted, body) = fit(flood).unwrap();
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         assert!(fitted.truncated > 0);
+        // Past the item alarms too, the one on the holds issue, which
+        // speaks for many, is kept longest.
+        let longer = "labels not read whole ".repeat(400);
+        let held: Vec<Entry> = (1..=MAX_STALLS as u64 + 2)
+            .map(|n| {
+                let mut e = entry(Scope::Item(item("o/t", n)), HoldKind::Unreadable, &longer);
+                e.priority = Some("P0".into());
+                e
+            })
+            .collect();
+        let (first, _) = pass_at(&held, "2026-10-28T00:00:00Z", (0, false), None);
+        let (stalled, _) = alarmed(&held, "2026-10-28T07:00:00Z", (0, false), Some(&first));
+        let (fitted, body) = fit(stalled).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        let alarms: Vec<&str> = (fitted.holds.iter())
+            .filter(|h| h.kind == HoldKind::Stalled)
+            .filter_map(|h| h.item.as_deref())
+            .collect();
+        assert!(alarms.len() < MAX_STALLS, "{alarms:?}");
+        assert_eq!(alarms.last(), Some(&"o/ops#1"), "{alarms:?}");
+    }
+
+    /// Past the comment's cap, the holds a stall alarm watches outlast the
+    /// rest, and each alarm its hold, so that the stall clock goes on
+    /// across truncated snapshots: P1 holds the pass is stuck on are left
+    /// out after P0 ones that wait by design, their alarm is raised on time
+    /// and stays, `since` the first pass, pass after pass.
+    #[test]
+    fn truncation_keeps_the_stall_clock() {
+        let mut held: Vec<Entry> = (1..=40)
+            .map(|n| {
+                let reason = format!("plan {n} was dispatched already, {}", "r".repeat(2000));
+                let mut e = entry(Scope::Item(item("o/w", n)), HoldKind::Dispatched, &reason);
+                e.priority = Some("P0".into());
+                e
+            })
+            .collect();
+        for n in 1..=3 {
+            let mut e = entry(Scope::Item(item("o/t", n)), HoldKind::Unreadable, "labels");
+            e.priority = Some("P1".into());
+            held.push(e);
+        }
+        let first = "2026-10-28T00:00:00Z";
+        let mut previous: Option<Value> = None;
+        for at in [
+            first,
+            "2026-10-28T03:00:00Z",
+            "2026-10-28T07:00:00Z",
+            "2026-10-28T08:00:00Z",
+        ] {
+            let (snapshot, _) = alarmed(&held, at, (0, false), previous.as_ref());
+            let (fitted, body) = fit(snapshot).unwrap();
+            assert!(fitted.truncated > 0, "{at}");
+            let published = parse(&body).unwrap();
+            let on = |kind: HoldKind| -> Vec<(String, String)> {
+                (published["holds"].as_array().unwrap().iter())
+                    .filter(|h| h["kind"] == kind.name())
+                    .map(|h| (text(h, "item"), text(h, "since")))
+                    .collect()
+            };
+            let stuck: Vec<(String, String)> = (1..=3)
+                .map(|n| (format!("o/t#{n}"), first.into()))
+                .collect();
+            assert_eq!(on(HoldKind::Unreadable), stuck, "{at}");
+            let alarms = if at < "2026-10-28T06:00:00Z" {
+                vec![]
+            } else {
+                stuck
+            };
+            assert_eq!(on(HoldKind::Stalled), alarms, "{at}");
+            previous = Some(published);
+        }
     }
 }
