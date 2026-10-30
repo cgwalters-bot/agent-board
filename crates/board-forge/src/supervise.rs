@@ -773,33 +773,52 @@ pub(crate) mod tests {
 
     #[test]
     fn v1_limit_boundaries() {
-        for (key, max) in [
-            ("pageSize", 100),
-            ("maxRequests", 10_000),
-            ("collectionTimeoutSeconds", 3600),
-            ("pollFailures", 10_000),
-            ("maxPages", 10_000),
-            ("maxItems", 10_000),
-            ("maxEvidence", 10_000),
-            ("idlePasses", 10_000),
-            ("maxDownloadBytes", 64 << 20),
-        ] {
+        type IntegerLimit = (&'static str, u64, u64, fn(&Limits) -> u64);
+        let cases: &[IntegerLimit] = &[
+            ("pageSize", 100, 100, |l| l.page_size),
+            ("maxRequests", 500, 10_000, |l| u64::from(l.max_requests)),
+            ("collectionTimeoutSeconds", 420, 3600, |l| {
+                l.collection_timeout_seconds
+            }),
+            ("pollFailures", 3, 10_000, |l| l.poll_failures as u64),
+            ("maxPages", 6, 10_000, |l| l.max_pages as u64),
+            ("maxItems", 25, 10_000, |l| l.max_items as u64),
+            ("maxEvidence", 10, 10_000, |l| l.max_evidence as u64),
+            ("idlePasses", 2, 10_000, |l| l.idle_passes as u64),
+            ("maxDownloadBytes", 8_388_608, 64 << 20, |l| {
+                l.max_download_bytes
+            }),
+        ];
+        for &(key, default, max, read) in cases {
+            let mut omitted = supervisor();
+            omitted.as_object_mut().unwrap().remove(key);
+            let decoded = Settings::from_json(&board(), &omitted, None).unwrap();
+            assert_eq!(read(&decoded.limits), default, "{key} omitted");
             for (value, valid) in [
                 (json!(1), true),
+                (json!(max / 2), true),
                 (json!(max), true),
                 (json!(0), false),
                 (json!(max + 1), false),
+                (json!(-1), false),
                 (Value::Null, false),
                 (json!("1"), false),
                 (json!(1.5), false),
+                (json!(true), false),
+                (json!([]), false),
+                (json!({}), false),
             ] {
                 let mut cfg = supervisor();
                 cfg[key] = value.clone();
-                assert_eq!(
-                    Settings::from_json(&board(), &cfg, None).is_ok(),
-                    valid,
-                    "{key}={value}"
-                );
+                let result = Settings::from_json(&board(), &cfg, None);
+                assert_eq!(result.is_ok(), valid, "{key}={value}");
+                if valid {
+                    assert_eq!(
+                        read(&result.unwrap().limits),
+                        value.as_u64().unwrap(),
+                        "{key}={value}"
+                    );
+                }
             }
         }
         for key in ["maxDispatchesPerPass", "maxDispatchesPerDay"] {
@@ -828,6 +847,128 @@ pub(crate) mod tests {
                 valid,
                 "{action}={cap}"
             );
+        }
+    }
+
+    #[test]
+    fn v1_pace_overrides() {
+        use crate::poll::pace::OverrideMode;
+
+        let fixture = board();
+        let decoded = Settings::from_json(&fixture, &supervisor(), None).unwrap();
+        assert_eq!(decoded.pace_overrides.len(), 2);
+        for (entry, pool, until, mode, reason) in [
+            (
+                &decoded.pace_overrides[0],
+                "fixture-spend",
+                "2026-10-18T00:00:00Z",
+                OverrideMode::Spend,
+                "Synthetic allowance",
+            ),
+            (
+                &decoded.pace_overrides[1],
+                "fixture-hold",
+                "2026-10-19T00:00:00Z",
+                OverrideMode::Hold,
+                "",
+            ),
+        ] {
+            assert_eq!(entry.pool, pool);
+            assert_eq!(
+                entry.until,
+                time::OffsetDateTime::parse(until, &time::format_description::well_known::Rfc3339)
+                    .unwrap()
+            );
+            assert_eq!(entry.mode, mode);
+            assert_eq!(entry.reason, reason);
+        }
+
+        let mut omitted = fixture.clone();
+        omitted.as_object_mut().unwrap().remove("pace");
+        assert!(
+            Settings::from_json(&omitted, &supervisor(), None)
+                .unwrap()
+                .pace_overrides
+                .is_empty()
+        );
+        // Settings reads only pace.overrides, not the poll's full Pace contract.
+        for pace in [
+            Value::Null,
+            json!({}),
+            json!({"overrides": []}),
+            json!(false),
+        ] {
+            let mut cfg = fixture.clone();
+            cfg["pace"] = pace;
+            assert!(
+                Settings::from_json(&cfg, &supervisor(), None)
+                    .unwrap()
+                    .pace_overrides
+                    .is_empty()
+            );
+        }
+        for overrides in [
+            Value::Null,
+            json!({}),
+            json!("overrides"),
+            json!(1),
+            json!(false),
+        ] {
+            let mut cfg = fixture.clone();
+            cfg["pace"]["overrides"] = overrides.clone();
+            assert!(
+                Settings::from_json(&cfg, &supervisor(), None).is_err(),
+                "{overrides}"
+            );
+        }
+
+        let entry = fixture["pace"]["overrides"][0].clone();
+        for key in ["pool", "until", "mode"] {
+            let mut invalid = entry.clone();
+            invalid.as_object_mut().unwrap().remove(key);
+            let mut cfg = fixture.clone();
+            cfg["pace"]["overrides"] = json!([invalid]);
+            assert!(
+                Settings::from_json(&cfg, &supervisor(), None).is_err(),
+                "missing {key}"
+            );
+        }
+        for (key, value) in [
+            ("pool", json!("")),
+            ("pool", Value::Null),
+            ("until", json!("not a time")),
+            ("until", Value::Null),
+            ("mode", json!("SPEND")),
+            ("mode", Value::Null),
+            ("reason", Value::Null),
+            ("reason", json!(1)),
+            ("reason", json!("a\nb")),
+            ("reason", json!("a\u{7f}b")),
+            ("reason", json!("é".repeat(101))),
+            ("unknown", json!(true)),
+        ] {
+            let mut invalid = entry.clone();
+            invalid[key] = value.clone();
+            let mut cfg = fixture.clone();
+            cfg["pace"]["overrides"] = json!([invalid]);
+            assert!(
+                Settings::from_json(&cfg, &supervisor(), None).is_err(),
+                "{key}={value}"
+            );
+        }
+        for overrides in [json!([null]), json!([entry.clone(), entry])] {
+            let mut cfg = fixture.clone();
+            cfg["pace"]["overrides"] = overrides;
+            assert!(Settings::from_json(&cfg, &supervisor(), None).is_err());
+        }
+        // Clock/pool checks belong to poll::pace::check_overrides, not Settings.
+        for until in ["2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z"] {
+            let mut cfg = fixture.clone();
+            cfg["pace"] = json!({"ignored": true, "overrides": [{
+                "pool": "not-a-configured-pool", "until": until, "mode": "hold", "reason": "é".repeat(100)
+            }]});
+            let decoded = Settings::from_json(&cfg, &supervisor(), None).unwrap();
+            assert_eq!(decoded.pace_overrides[0].reason.len(), 200);
         }
     }
 
@@ -1004,7 +1145,7 @@ pub(crate) mod tests {
         let s = settings();
         let mut expected: Vec<String> = POLL_OPTIONS
             .iter()
-            .filter(|k| !["mergeAuthors", "kindPools", "dispatchWorkflow"].contains(k))
+            .filter(|k| !["mergeAuthors", "kindPools", "dispatchWorkflow", "pace"].contains(k))
             .map(|k| (*k).to_owned())
             .collect();
         expected.extend(

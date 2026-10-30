@@ -218,8 +218,11 @@ Sanitized representative fixtures
 [`config-v1.json`](../fixtures/supervise/config-v1.json) pin the existing test
 configuration, with synthetic repository/logins, issue numbers and profile pin.
 They are not fetched production settings. The existing `supervise::tests`
-settings/optional/unset/name tests now load them; `v1_limit_boundaries` and
-`v1_legacy_tolerance_and_disabled_defaults` pin caps and omission behavior.
+settings/optional/unset/name tests load them; `v1_pace_overrides` pins the shared
+override parser and the supervisor's narrower read. `v1_limit_boundaries` checks
+every integer health limit's explicit omission default and decoded boundary and
+interior values, as well as refusals; `v1_legacy_tolerance_and_disabled_defaults`
+pins disabled executor defaults.
 Requests and ledger replay tests continue to test the independent write boundary.
 
 These files, the optional usage file and `agent.passConfig` must come from the
@@ -255,7 +258,34 @@ From agent-board.json the supervisor requires `operator`, `bot`,
 `dispatchRepo`, `dispatchWorkflow` and `epics.repository`: the repository whose
 open `epic`-labeled issues are the plans, which the poll does not read. It
 also reads `follow`, `schedule.repositories` (whose implement runs the dispatch
-check reads), `mergeAuthors`, `kindPools` and `generatedBy` when they are set.
+check reads), `mergeAuthors`, `kindPools`, `generatedBy` and `pace.overrides` when
+they are set.
+
+`pace.overrides` reuses the [poll's pace contract](poll.md#configuration) and its
+`poll::pace::overrides` parser, not a second override format. Its accepted shape
+is an array of objects like
+`{"pool":"small","until":"2026-10-18T00:00:00Z","mode":"spend","reason":"Use allowance"}`.
+Each object allows only `pool`, `until`, `mode` and `reason`: `pool` must be a
+nonempty string, `until` an RFC 3339 timestamp, and `mode` exactly `spend` or
+`hold`. `reason` is optional (default empty string); when present it must be a
+string of at most 200 bytes with no control characters. Empty reasons are valid;
+null is not. Duplicate pool names are rejected, as are non-object entries.
+
+Omitting `pace`, setting it to null, or omitting its `overrides` yields no
+overrides; an empty array does too. Explicit `overrides: null` or any other
+non-array value fails. Unlike the poll's full `Pace` reader, the supervisor reads
+only this nested key: it does not require or validate `pace.repository`, `issue`,
+`bot`, `marginPercent` or other pace fields, and a non-object `pace` with no
+`overrides` also yields none. These are current loader tolerances, not extensions
+to rely on. The supervisor does not check configured-pool membership or the
+poll's seven-day future bound; those require the poll's clock/configuration
+check. Expired and far-future timestamps therefore decode here.
+
+With a fresh usage snapshot from `--usage-config`, the supervisor's `pace` check
+matches each snapshot pool by name to an override whose `until` is later than
+the report time. It shows the mode, expiry and reason as evidence and warns
+rather than fails for that pool; expired overrides contribute no such evidence.
+This read does not select pools, enable pacing or authorize executor writes.
 
 A complete supervisor file:
 
