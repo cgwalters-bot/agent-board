@@ -666,8 +666,9 @@ Options:
 
 - `--config <FILE>`: The pass configuration (docs/pass.md), from a trusted default-branch checkout: its `epics.repository`, `board`, `bot`, `budget.weeklyUsd` and, for --split, `budget.harnessRepositories`. GH_TOKEN reads
 - `--split`: Instead of the tree, print the share of the window's public spend on upstream work and on the harness (`budget.harnessRepositories`), in percentages only
+- `--four-weeks`: Report the last four complete UTC Monday-to-Monday weeks, read-only. No publishing or admission changes
 - `--since <TIME>`: Start of the --split window, RFC 3339 (such as 2026-10-19T00:00:00Z)
-- `--until <TIME>`: End of the --split window, RFC 3339; without it, the window runs to now
+- `--until <TIME>`: End of the --split window, or reference clock for --four-weeks, RFC 3339; defaults to now
 
 ## agent-board cost
 

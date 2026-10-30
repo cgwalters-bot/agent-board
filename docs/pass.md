@@ -1704,6 +1704,48 @@ and so is a search that finds more than 1000 items or a read past 1000 requests.
 The supervisor's daily status update can carry the same line (see
 [supervisor](supervisor-requests.md#lines), `agent.passConfig`).
 
+For four complete UTC Monday-to-Monday weeks, run this read-only report
+(off unless explicitly invoked; no caller configuration or scheduled use):
+
+```sh
+agent-board budget --config FILE --four-weeks --until 2026-10-30T12:00:00Z
+```
+
+The fixed reference clock makes the intervals repeatable: here they are
+`[2026-09-28T00:00:00Z, 2026-10-05T00:00:00Z)` through
+`[2026-10-19T00:00:00Z, 2026-10-26T00:00:00Z)`. Without `--until`, the
+reference clock is now. This is an alternative to `--split`, not a change
+to its single-window output. It uses that same window reader four times,
+retaining trusted markers, per-window deduplication, private exclusion and
+comment/search bounds. To prevent repeated scans from multiplying request
+use, all four reads together have the existing 1000-request allowance.
+Any failed or bounded-out read refuses the report whole, with an error and
+nonzero exit, never a successful partial report.
+
+Each interval shows upstream/harness shares of known cost, priced run counts,
+unpriced run counts, whether either side has partial costs, and its comparison
+to 80%. Comparisons use unrounded values: 79.9% displayed as 80% is **not met**.
+Zero total known cost, any unpriced run or either side's partial costs makes
+that interval's comparison **unknown**. The four-week observed public-cost
+criterion requires each week to meet 80%, not a pooled average; an established
+failing week makes it not met, otherwise any unknown week leaves it unknown.
+
+These are current **API list prices**, not effective bills, subscription spend
+or discounted prices, and **status-comment last-change time**, not run execution
+time. Edits can move a run between weeks; replacing a rerun's comment can erase
+earlier evidence. Copies are deduplicated within each window, at the first
+sorted item, not reconciled into a new cross-window ledger. Private repositories,
+unmarked runs, missing/deleted comments and other authors are outside coverage;
+even a fully read search is not proof of complete spend. Live reads can change
+between invocations. Thus the report explicitly leaves the overall criterion
+unknown rather than declaring four weeks successful from known shares alone.
+
+The output reserves `Pass-health evidence links` for linked evidence in a
+saved report. It is explicitly unknown, with no links supplied and no
+operator-agreed health criterion defined; links alone would not define one.
+This command publishes nothing, comments nowhere, and changes neither schedules
+nor admission. Defining health and supplying its evidence remain separate work.
+
 ## One configuration file
 
 The v1 JSON field inventory below is exhaustive; reject unknown keys and nulls.
