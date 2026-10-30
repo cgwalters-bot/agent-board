@@ -65,6 +65,7 @@ runs agent-board; the records stay on the forge.
 - [Operator interaction](../docs/operator.md): the `needs-human` label, operator actions and status updates.
 - [Review drafts](../docs/review-drafts.md): sending an agent-drafted review of another project's pull request once the operator approves it.
 - [Release train](../docs/release-train.md): cutting a release and moving its callers' pins, a step a pass.
+- [v1 release readiness](../docs/release.md): the gates v1.0 waits on, their evidence, and the interfaces it would support.
 - [Broker probe](../docs/broker-probe.md): one outage issue, open while the inference broker is unreachable.
 - [Per-role GitHub Apps](../docs/apps.md): one app per automation role; so far only `apps create` exists.
 - [Design](../docs/design.md): the original design and research, with its [current implementation limits](../docs/design.md#current-implementation-limits).
