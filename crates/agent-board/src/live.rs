@@ -35,6 +35,8 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
             .is_some()
     {
         4
+    } else if error.downcast_ref::<crate::deploy::Cancelled>().is_some() {
+        2
     } else if error
         .downcast_ref::<board_forge::epic_apply::PlanChanged>()
         .is_some()
@@ -96,7 +98,7 @@ pub(crate) fn validate_stage_scope(owner: &str, repo: &str) -> Result<()> {
     Ok(())
 }
 
-struct Borrowed<'a, T>(&'a T);
+pub(crate) struct Borrowed<'a, T>(pub(crate) &'a T);
 
 impl<T: Transport> Transport for Borrowed<'_, T> {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {

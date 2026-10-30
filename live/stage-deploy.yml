@@ -1,0 +1,64 @@
+# Staging-side template for `agent-board test deploy` (docs/setup.md#the-stage-deploy-smoke-path).
+# Not installed: an operator copies it into the staging repository once #282's
+# credential, environment and release decisions are made. Without the
+# STAGE_DEPLOY_APPLY variable it runs only the read-only preflight.
+name: stage deploy smoke
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Approved agent-board commit; must equal agentBoardRevision in the trusted config
+        default: ''
+  schedule:
+    - cron: '41 6 * * 1'
+permissions: {}
+concurrency:
+  group: stage-deploy-smoke
+  cancel-in-progress: false
+jobs:
+  smoke:
+    # Only the default branch's workflow and config are trusted.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    environment: stage-deploy
+    timeout-minutes: 20
+    # Reads this (possibly private) staging repository's config.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: config
+          persist-credentials: false
+      - id: pin
+        run: |
+          rev=$(jq -er .agentBoardRevision config/.github/agent-board/stage-deploy.json)
+          [[ $rev =~ ^[0-9a-f]{40}$ ]] || { echo "::error::agentBoardRevision must be a full commit"; exit 1; }
+          [[ -z $RELEASE || $RELEASE == "$rev" ]] || { echo "::error::release is not the trusted pin"; exit 1; }
+          # GitHub serves pull request heads by SHA too: require one already on main.
+          status=$(gh api "repos/cgwalters-forge/agent-board/compare/main...$rev" --jq .status)
+          [[ $status == behind || $status == identical ]] || { echo "::error::pin is not on agent-board main"; exit 1; }
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE: ${{ inputs.release }}
+          GH_TOKEN: ${{ github.token }}
+      # Merged code at the trusted pin, never a pull request's; built without the stage token.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: cgwalters-forge/agent-board
+          ref: ${{ steps.pin.outputs.rev }}
+          path: agent-board
+          persist-credentials: false
+      - run: cargo build --locked --release -p agent-board
+        working-directory: agent-board
+      - run: agent-board/target/release/agent-board test deploy --config config/.github/agent-board/stage-deploy.json ${APPLY:+--apply} > report.json
+        env:
+          # Stage-only: resource owner cgwalters-forge-stage; see docs/setup.md.
+          GH_TOKEN: ${{ secrets.STAGE_DEPLOY_TOKEN }}
+          APPLY: ${{ vars.STAGE_DEPLOY_APPLY == 'true' && 'true' || '' }}
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stage-deploy-report
+          path: report.json
+          if-no-files-found: warn

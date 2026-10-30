@@ -317,8 +317,8 @@ numbers must fit a positive GraphQL Int (at most 2147483647). The report is alwa
 printed in full; global `--json`, `--jq` and `--board-config` are unsupported.
 It attempts four logical non-paginated GraphQL queries (the normal client's
 bounded transport retries may make additional requests), uses `GH_TOKEN` via
-the normal client only without `--fixture`, and has no apply flag or mutation
-path. Environment provisioning is reported separately from stage access and from
+the normal client only without `--fixture`, and without `--apply` (below) has no
+mutation path. Environment provisioning is reported separately from stage access and from
 inference/broker prerequisites; it reads no secret values and does not test writer
 tokens by mutation. Actions policy, workflow contents/transitive pins, protected
 environment restrictions and effective token permissions require operator review.
@@ -352,6 +352,80 @@ Report the date, workflow revision, non-secret configuration names, issue, plan,
 run and pull request links, exact commands and exit statuses, expected versus
 actual results, and every guess or workaround. Mark unattempted steps
 unverified, and remove only scratch objects the trial created.
+
+### The stage deploy smoke path
+
+`test deploy --apply` runs the same preflight live (it refuses `--fixture`), and
+writes only if all four reads are `ready`. It then runs one fixed sequence in
+the staging organization, each step checked against what GitHub returns:
+
+1. creates a fresh private scratch repository and a Project v2 linked to it,
+   both named by a random `agent-board-smoke-…` nonce;
+2. creates one issue there and adds it at Status `Todo`;
+3. runs the pass's reconciliation over a complete snapshot of the new project,
+   which must propose nothing;
+4. dispatches one `research` task through the normal dispatch interface to an
+   in-process fake engine, which checks the exact `workflow_dispatch` request
+   for the configured workflow and answers a run ID, sending nothing and running
+   no model;
+5. performs the fake engine's harmless result (one comment, then closing the issue
+   as completed) and reads both back exactly;
+6. has reconciliation derive `Done` from the closed issue, writes it, and reads
+   it back.
+
+At most 8 writes come before cleanup. A 10-minute deadline is checked before
+each step and also bounds rate-limit waits. Cleanup always follows and acts only
+through creation receipts: it deletes the project by its returned ID, then
+deletes the repository by name only after reading that name back from the
+returned node ID. A creation whose returned owner or name is not the one
+requested is never cleaned up, and neither is one whose answer was lost: both
+are reported as leftovers, the latter by the nonce name to look for. Nothing is
+ever deleted by prefix, or by a name not read back from a receipt. Receipts go to stderr as they are made, so a run
+killed outright still leaves its IDs in the log. The threats these bounds stop
+are stage credentials reaching production and deletion of resources this run
+did not create.
+
+The `agent-board.deploy-smoke.v1` report adds `writes` (cleanup included) and a
+`smoke` object with `steps` (`ok`, `failed` or `cancelled`), `receipts`, `cleanup`
+(`deleted` or `failed`) and `leftovers`, which are to be removed by hand using
+the IDs or names in the report. Exit status 0 means every step passed and nothing
+was left, 2 means the deadline stopped the run (cleanup still ran), 4 means
+GitHub refused the credentials, and 1 means any other failure, a refused
+preflight included. Errors go to stderr only.
+[`live/stage-deploy.yml`](../live/stage-deploy.yml) is the staging-side template:
+manual, weekly and release dispatch from the default branch only, environment
+`stage-deploy`, and the report uploaded as an artifact. agent-board is built at
+the trusted config's `agentBoardRevision`, which must already be on
+agent-board's `main`, so a pull request's head is refused even by SHA. A release
+dispatch's `release` input must equal that pin; approving a release means
+reviewing the config change that moves the pin. `STAGE_DEPLOY_TOKEN` is passed
+only to the run step. Live mutation stays off until `STAGE_DEPLOY_APPLY` is `true`; without
+it the template runs the read-only preflight.
+
+None of this is installed or has run live. The remaining steps, after #282's
+decisions:
+
+1. Choose the staging repository (owner `cgwalters-forge-stage`) and commit a
+   trusted `.github/agent-board/stage-deploy.json` to its protected default
+   branch, in the shape of [the fixture](../fixtures/deploy-config.json), with
+   reviewed values. Its `workflow` is only named to the fake engine and checked
+   to exist: `stage-deploy.yml` itself will do.
+2. Copy `live/stage-deploy.yml` to that repository's `.github/workflows/`, and
+   allow the pinned `actions/checkout` and `actions/upload-artifact`.
+3. Create environment `stage-deploy` with a deployment branch restriction to the
+   default branch. Required reviewers would make each weekly run wait for
+   approval; whether to have them is one of #282's decisions. Give it secret `STAGE_DEPLOY_TOKEN`:
+   a fine-grained token with resource owner `cgwalters-forge-stage`, all
+   repositories (it must delete the repositories it creates), Administration,
+   Issues and Metadata access for repositories, and Projects read and write for
+   the organization. Also allow members to create and delete repositories.
+4. Dispatch it once without `STAGE_DEPLOY_APPLY` and check that the preflight
+   report's reads are `ready`.
+5. Set environment variable `STAGE_DEPLOY_APPLY=true`, dispatch once, and confirm
+   the artifact has every step `ok`, both cleanups `deleted` and no leftovers;
+   check the organization for anything named by the report's nonce.
+6. Only then rely on the weekly schedule, and on release-time dispatch with
+   `release` set to the commit the trusted config was updated to.
 
 ## Scheduled reconciliation
 

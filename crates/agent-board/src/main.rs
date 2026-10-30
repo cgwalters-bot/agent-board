@@ -372,7 +372,7 @@ enum Apps {
 
 #[derive(Subcommand)]
 enum Test {
-    /// Read-only staging deployment preflight; emits a JSON readiness report.
+    /// Read-only staging deployment preflight, and with --apply the smoke path (writes); emits a JSON report.
     Deploy(deploy::Options),
     /// Create and clean up scratch objects in the staging project (writes).
     Project(live::Options),
@@ -1239,7 +1239,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                     && cli.hostname == board_forge::github::DEFAULT_HOST,
                 "test deploy takes identities only from its trusted config on github.com"
             );
-            deploy::run(options)
+            deploy::run(options, runtime)
         }
         Command::Test {
             command: Test::Project(options),

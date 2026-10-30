@@ -53,7 +53,22 @@ fn deploy_preflight_report_is_offline_and_preview_only() {
         assert_eq!(report["writes"], 0);
         assert_eq!(report["checks"][0]["state"], "blocked");
     }
+    // The smoke path is live only, and without credentials its preflight
+    // cannot be ready, so it writes nothing.
     command()
+        .current_dir(root)
+        .args([
+            "test",
+            "deploy",
+            "--config",
+            "fixtures/deploy-config.json",
+            "--fixture",
+            "fixtures/deploy-reads.json",
+            "--apply",
+        ])
+        .assert()
+        .code(1);
+    let output = command()
         .current_dir(root)
         .args([
             "test",
@@ -62,8 +77,17 @@ fn deploy_preflight_report_is_offline_and_preview_only() {
             "fixtures/deploy-config.json",
             "--apply",
         ])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
         .assert()
-        .code(1);
+        .code(1)
+        .get_output()
+        .clone();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "agent-board.deploy-smoke.v1");
+    assert_eq!(report["writes"], 0);
+    assert_eq!(report["smoke"], Value::Null);
+    assert_eq!(report["checks"][1]["state"], "unverified");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

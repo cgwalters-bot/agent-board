@@ -1,10 +1,24 @@
-//! Read-only, bounded staging diagnostics, never an authorization to deploy.
+//! Bounded staging diagnostics, never an authorization to deploy, and the
+//! opt-in smoke path ([`smoke`]) that runs only after they are ready.
 use anyhow::{Context, Result, ensure};
 use board_forge::github::{Client, Transport};
 use clap::Args;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::runtime::Runtime;
+
+mod smoke;
+
+pub use smoke::Cancelled;
+
+/// The smoke path's own deadline, checked before each step and well inside
+/// the template's job timeout, so that its cleanup still runs.
+const SMOKE_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The preflight reads that must all be ready before the smoke path writes.
+const SMOKE_READS: [&str; 4] = ["repository", "project", "workflow", "agent-board-pin"];
 
 #[derive(Args)]
 pub struct Options {
@@ -14,6 +28,9 @@ pub struct Options {
     /// Offline JSON array of the four GraphQL responses; no credentials or network.
     #[arg(long, value_name = "FILE")]
     fixture: Option<PathBuf>,
+    /// After a ready preflight, run the smoke path (writes): a fresh scratch repository and project, one fake-engine task, its result and derived Status, then cleanup by creation receipt.
+    #[arg(long, conflicts_with = "fixture")]
+    apply: bool,
 }
 
 #[derive(Deserialize)]
@@ -198,14 +215,20 @@ fn inspect(config: &Config, mut read: impl FnMut(&str, Value) -> Result<Value>) 
     checks
 }
 
-pub fn run(options: &Options) -> Result<()> {
-    let config = (|| -> Result<Config> {
-        let bytes = std::fs::read(&options.config).context("read deploy config")?;
-        let config: Config = serde_json::from_slice(&bytes).context("decode deploy config")?;
-        config.validate()?;
-        Ok(config)
-    })();
-    let checks = match config {
+/// Whether every stage-access read the smoke path depends on is ready.
+fn ready_for_smoke(checks: &[Value]) -> bool {
+    SMOKE_READS.iter().all(|name| {
+        checks
+            .iter()
+            .any(|c| c["group"] == "stage-access" && c["check"] == *name && c["state"] == "ready")
+    })
+}
+
+pub fn run(options: &Options, runtime: &Runtime) -> Result<()> {
+    if options.apply {
+        return apply(options, runtime);
+    }
+    let checks = match load(options) {
         Err(error) => vec![
             json!({"group":"configuration","check":"identities-and-pins","state":"blocked","detail":format!("{error:#}")}),
         ],
@@ -247,6 +270,64 @@ pub fn run(options: &Options) -> Result<()> {
     );
     ensure!(!blocked, "deploy preflight blocked; no writes attempted");
     Ok(())
+}
+
+fn load(options: &Options) -> Result<Config> {
+    let bytes = std::fs::read(&options.config).context("read deploy config")?;
+    let config: Config = serde_json::from_slice(&bytes).context("decode deploy config")?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// The smoke path, live only: it starts only after every read it depends on
+/// is ready, and its report is printed whatever happened, receipts and
+/// leftovers included.
+fn apply(options: &Options, runtime: &Runtime) -> Result<()> {
+    let config = load(options);
+    let started = Instant::now();
+    // No rate-limit wait runs past the deadline either, so a run ends, cleanup
+    // included, inside the template's job timeout.
+    let client = Client::from_env().map(|client| client.retry_within(started + SMOKE_DEADLINE));
+    let checks = match &config {
+        Err(error) => vec![
+            json!({"group":"configuration","check":"identities-and-pins","state":"blocked","detail":format!("{error:#}")}),
+        ],
+        Ok(config) => inspect(config, |query, vars| match &client {
+            Ok(client) => client.graphql(query, vars),
+            Err(_) => anyhow::bail!("credentials unavailable"),
+        }),
+    };
+    let (smoke, writes, result) = match (&config, &client) {
+        (Ok(config), Ok(client)) if ready_for_smoke(&checks) => {
+            let mut bytes = [0; 8];
+            getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate smoke nonce"))?;
+            let nonce = format!(
+                "agent-board-smoke-{}",
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            );
+            smoke::run(runtime, config, client, client, &nonce, &mut || {
+                started.elapsed() >= SMOKE_DEADLINE
+            })
+        }
+        _ => (
+            Value::Null,
+            0,
+            Err(anyhow::anyhow!(
+                "deploy preflight not ready; no writes attempted"
+            )),
+        ),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "schema":"agent-board.deploy-smoke.v1",
+            "mode":"apply",
+            "writes":writes,
+            "checks":checks,
+            "smoke":smoke,
+        }))?
+    );
+    result
 }
 
 #[cfg(test)]
@@ -349,6 +430,8 @@ mod tests {
                 case == "ready",
                 "{case}"
             );
+            // The smoke path writes only after this exact preflight is ready.
+            assert_eq!(ready_for_smoke(&checks), case == "ready", "{case}");
             assert!(
                 checks
                     .iter()
