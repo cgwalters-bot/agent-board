@@ -147,9 +147,14 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
 
 - an issue that is neither new nor a current sub-issue of the epic (read from
   GitHub at check time), and a closed sub-issue, which a plan may not revive
-  (a `close_sub_issue` of one is not refused but satisfied: it makes no
-  mutations, and the dry run and status list it as `satisfied`, so a plan that
-  went stale when its pull request merged still applies);
+  (a `close_sub_issue` or `set_priority` of one is not refused but satisfied:
+  it makes no mutations, and the dry run and status list it as `satisfied`, so
+  a plan that went stale when its pull request merged still applies; the pass
+  plans an epic again, rather than holding it for a person, whose plan is
+  refused only for naming sub-issues closed since: while that request waits
+  for its plan (a day) the epic is held as `other`, and a stale plan that
+  answers such a request, or that request getting no plan in a day, is held
+  for the operator);
 - a repository not given with `--allow-repo`;
 - any change to the epic itself, whose text, priority and labels are the
   operator's, and an `epic` label on a new issue, which would let the planner

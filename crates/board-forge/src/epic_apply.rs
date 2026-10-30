@@ -770,7 +770,9 @@ pub fn unproved(
                     .as_deref()
                     .and_then(|t| priorities.get(&t.to_ascii_lowercase()))
                     .map(String::as_str);
-                (!whole && (value.is_none() || shown != value)).then(|| {
+                // A sub-issue closed since needs no Priority, as apply has it.
+                let moot = target.as_deref().is_some_and(closed);
+                (!whole && !moot && (value.is_none() || shown != value)).then(|| {
                     format!(
                         "{} is not {}",
                         target.as_deref().unwrap_or("its new sub-issue"),
@@ -993,7 +995,9 @@ pub fn planned<T: Transport>(
             }
             Action::Attach { issue } => format!("Attach {issue}"),
             Action::Close { issue, .. } => format!("Close {issue} as not planned"),
-            Action::AlreadyClosed { issue } => format!("{issue} is already closed"),
+            Action::AlreadyClosed { issue } | Action::ClosedPriority { issue } => {
+                format!("{issue} is already closed")
+            }
             Action::Rescope { issue, .. } => format!("Rescope {issue}"),
             Action::SetPriority {
                 target: Target::Issue(issue),
@@ -1010,6 +1014,7 @@ pub fn planned<T: Transport>(
         matches!(
             a,
             Action::AlreadyClosed { .. }
+                | Action::ClosedPriority { .. }
                 | Action::SetPriority {
                     target: Target::New(_),
                     ..
@@ -1191,7 +1196,7 @@ fn kind(action: &Action) -> &'static str {
         Action::Attach { .. } => "attach_sub_issue",
         Action::Close { .. } | Action::AlreadyClosed { .. } => "close_sub_issue",
         Action::Rescope { .. } => "rescope_sub_issue",
-        Action::SetPriority { .. } => "set_priority",
+        Action::SetPriority { .. } | Action::ClosedPriority { .. } => "set_priority",
         Action::CloseEpic { .. } => "close_epic",
     }
 }
@@ -1224,7 +1229,7 @@ fn execute<C: Transport + Rest>(
                 Action::Create {
                     plan, blocked_by, ..
                 } => needs(kind(action), plan.is_some(), blocked_by.is_some()),
-                Action::AlreadyClosed { .. } => vec!["satisfied"],
+                Action::AlreadyClosed { .. } | Action::ClosedPriority { .. } => vec!["satisfied"],
                 _ => needs(kind(action), false, false),
             };
             confirmed.push(Confirmed {
@@ -1243,7 +1248,7 @@ fn execute<C: Transport + Rest>(
             }
         };
         if mutation["satisfied"].is_string() {
-            if let Action::AlreadyClosed { issue } = action {
+            if let Action::AlreadyClosed { issue } | Action::ClosedPriority { issue } = action {
                 record(confirmed, "satisfied", Some(issue.to_string()));
             }
         } else if let Some(method) = mutation["method"].as_str() {
@@ -2839,6 +2844,10 @@ mod tests {
         let cases: Vec<Case> = vec![
             // Retitled, closed or reprioritised since: proved all the same.
             (&[1, 2, 3, 4, 5], &[2], &[3, 10], &none, vec![]),
+            // A Priority cut short is proved once its sub-issue has closed,
+            // as apply satisfies it then (agent-board#453); open, it is not
+            // (the last case).
+            (&[1, 2, 3, 4], &[10], &[2, 3], &none, vec![]),
             (
                 &[1, 2, 4],
                 &[2, 3, 10],

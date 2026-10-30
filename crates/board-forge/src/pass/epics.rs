@@ -41,6 +41,19 @@ const RETRY_INTRO: &str =
     "The board pass asks a triage run to plan this epic once more: its planning request ";
 /// How the bot's planning request plan on an epic starts, a retry's too.
 const PLAN_INTRO: &str = "The board pass asks a triage run to plan this epic";
+/// The start of a planning request's plan comment where the epic's plan
+/// went stale ([`Replan`]): how the next pass tells that its answer was
+/// asked for so, and leaves one stale again to the operator.
+const STALE_INTRO: &str = "The board pass asks a triage run to plan this epic again: its plan names sub-issues that have closed since";
+
+/// How a planning request's plan comment starts: the first, a retry of the
+/// request named, or one asked for because the epic's plan went stale.
+#[derive(Clone, Copy)]
+enum Intro<'a> {
+    First,
+    Retry(&'a str),
+    Stale,
+}
 /// What the bot asks the operator of an epic whose sub-issues are all closed.
 const DONE_QUESTION: &str =
     "Q: Every sub-issue of this epic is closed. Close it, or comment with what is left?";
@@ -399,11 +412,13 @@ pub(super) enum Next {
     Hold(Hold),
     /// Its newest accepted plan has no receipt: apply it. `direction`: the
     /// operator commented since, which plans it again if it cannot apply.
+    /// `replan`: whether a plan gone stale may be planned again.
     Apply {
         id: String,
         url: String,
         changed: OffsetDateTime,
         direction: bool,
+        replan: Replan,
     },
     /// Its newest plan's apply was cut short: prove it from the receipt, or
     /// leave it for a person. `direction`: the operator commented since.
@@ -470,15 +485,26 @@ pub(super) fn record_run(body: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// The earlier planning request that `record` retried: the one its plan's
-/// comment names after [`RETRY_INTRO`], where a writer posted that plan.
-fn retried(comments: &[Comment], writers: &[&str], record: &Comment) -> Option<String> {
+/// The plan comment the planning request `record` dispatched, where a
+/// writer posted it.
+fn asked_by<'c>(
+    comments: &'c [Comment],
+    writers: &[&str],
+    record: &Comment,
+) -> Option<&'c Comment> {
     let marker = format!("<!-- {DISPATCH_MARKER}: ");
     let (id, _) = record.body.strip_prefix(&marker)?.split_once('@')?;
     let id: u64 = id.parse().ok()?;
-    let posted = (comments.iter())
-        .find(|c| plan::comment_id(&c.url) == Some(id) && is(c.author.as_deref(), writers))?;
-    let rest = posted.body.strip_prefix(RETRY_INTRO)?;
+    (comments.iter())
+        .find(|c| plan::comment_id(&c.url) == Some(id) && is(c.author.as_deref(), writers))
+}
+
+/// The earlier planning request that `record` retried: the one its plan's
+/// comment names after [`RETRY_INTRO`], where a writer posted that plan.
+fn retried(comments: &[Comment], writers: &[&str], record: &Comment) -> Option<String> {
+    let rest = asked_by(comments, writers, record)?
+        .body
+        .strip_prefix(RETRY_INTRO)?;
     rest.split_whitespace().next().map(str::to_owned)
 }
 
@@ -566,11 +592,28 @@ pub(super) fn decide(i: &Inputs) -> Next {
             .min_by_key(|r| r.id);
         match claim {
             None => {
+                // Once, so that a planner that keeps naming closed
+                // sub-issues is not started on every pass.
+                let stale_asked = request
+                    .and_then(|q| asked_by(i.comments, &writers, q))
+                    .is_some_and(|c| c.body.starts_with(STALE_INTRO));
+                let replan = match request.map(|q| q.changed) {
+                    _ if i.busy.is_some() => Replan::Asked,
+                    Some(q) if q < from.changed && stale_asked => Replan::Answered,
+                    // Asked for and not answered: a day, then asked again,
+                    // unless that request was itself the one to plan again.
+                    Some(q) if q >= from.changed && (i.now - q).whole_seconds() < DAY_SECONDS => {
+                        Replan::Asked
+                    }
+                    Some(q) if q >= from.changed && stale_asked => Replan::Unanswered,
+                    _ => Replan::Now,
+                };
                 return Next::Apply {
                     id,
                     url: from.url.clone(),
                     changed: from.changed,
                     direction: anew(from.changed),
+                    replan,
                 };
             }
             Some(r) if r.detail.outcome.applied() => {
@@ -659,6 +702,28 @@ pub(super) fn decide(i: &Inputs) -> Next {
         return Next::Hold(Hold::new(HoldKind::TriageCooldown, why));
     }
     Next::Plan(why)
+}
+
+/// Whether a stale plan ([`Refusal::stale`]) may be planned again: now; not
+/// while a planning request of the last day waits for its plan (`Asked`);
+/// or not at all (`Answered`) where it answers a request made because the
+/// plan before it went stale, so that a planner that keeps naming closed
+/// sub-issues, or answers nothing, is asked once, and then left to the
+/// operator (`Unanswered`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Replan {
+    Now,
+    Asked,
+    Answered,
+    /// Its request to plan again got no plan in a day.
+    Unanswered,
+}
+
+/// Why an epic's newest plan was refused, in words, and whether only
+/// because a sub-issue it names closed since ([`crate::epic::ClosedSince`]).
+struct Refusal {
+    error: String,
+    stale: bool,
 }
 
 /// What one stage 3 has taken: at most one apply and one planning start a
@@ -991,12 +1056,47 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 url,
                 changed,
                 direction,
+                replan,
             } => {
                 let pages = comments.len() / 100 + 1;
-                let refused = self.apply_epic(facts, project, (&id, &url, changed), pages, turn);
-                if refused && direction {
+                let Some(refused) =
+                    self.apply_epic(facts, project, (&id, &url, changed), pages, turn)
+                else {
+                    return;
+                };
+                let not = format!("plan {id} is not applied: {}", refused.error);
+                if direction {
+                    let why = format!("{not}; a person replaces it");
+                    self.epic_held(facts, Hold::new(HoldKind::NeedsOperator, why));
                     let why = "operator direction since its plan, which cannot be applied";
-                    self.plan_epic(facts, (why, None, reuse), project, slots, target, turn);
+                    self.plan_epic(
+                        facts,
+                        (why, Intro::First, reuse),
+                        project,
+                        slots,
+                        target,
+                        turn,
+                    );
+                } else if refused.stale && replan == Replan::Now {
+                    let why = format!("plan {id} names a sub-issue that has closed since");
+                    let ask = (why.as_str(), Intro::Stale, reuse);
+                    self.plan_epic(facts, ask, project, slots, target, turn);
+                } else if refused.stale && replan == Replan::Asked {
+                    let why = format!("{not}; it was planned again, which it waits for");
+                    self.epic_held(facts, Hold::new(HoldKind::Other, why));
+                } else if refused.stale {
+                    let why = match replan {
+                        Replan::Unanswered => format!(
+                            "{not}; the request to plan it again got no plan in a day, so a person replaces it"
+                        ),
+                        _ => format!(
+                            "{not}; it answers a request to plan again because the plan before it went stale, so a person replaces it"
+                        ),
+                    };
+                    self.epic_held(facts, Hold::new(HoldKind::NeedsOperator, why));
+                } else {
+                    let why = format!("{not}; a person replaces it");
+                    self.epic_held(facts, Hold::new(HoldKind::NeedsOperator, why));
                 }
             }
             Next::Recover {
@@ -1038,7 +1138,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     self.recover_epic(facts, &receipt, &url, outcome);
                 } else if direction {
                     let why = "operator direction since its apply was cut short";
-                    self.plan_epic(facts, (why, None, reuse), project, slots, target, turn);
+                    self.plan_epic(
+                        facts,
+                        (why, Intro::First, reuse),
+                        project,
+                        slots,
+                        target,
+                        turn,
+                    );
                 } else {
                     let why = format!(
                         "the apply of plan {id} was {outcome}, and is not proved: {}; it is never replayed: a person inspects {}, then replaces the plan or comments",
@@ -1106,12 +1213,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     return;
                 }
                 let why = format!("{none}, retried once");
-                let ask = (why.as_str(), Some(record.as_str()), reuse);
+                let ask = (why.as_str(), Intro::Retry(record.as_str()), reuse);
                 self.plan_epic(facts, ask, project, slots, target, turn);
             }
-            Next::Plan(why) => {
-                self.plan_epic(facts, (&why, None, reuse), project, slots, target, turn)
-            }
+            Next::Plan(why) => self.plan_epic(
+                facts,
+                (&why, Intro::First, reuse),
+                project,
+                slots,
+                target,
+                turn,
+            ),
             Next::Done(why) => self.finish_epic(facts, &why),
         }
     }
@@ -1141,7 +1253,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// The newest accepted plan applied, once: previewed in words, or
     /// applied with its comment and change time pinned, as one step of
     /// writes per action and one for the receipt, taken whole or held whole.
-    /// Whether the plan was refused, which a person, or new direction, mends.
+    /// The plan's refusal, which the caller holds or plans again for; a
+    /// refused plan does not take the pass's one apply (agent-board#453).
     fn apply_epic(
         &mut self,
         facts: &EpicFacts,
@@ -1149,27 +1262,27 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         (id, url, changed): (&str, &str, OffsetDateTime),
         pages: usize,
         turn: &mut Turn,
-    ) -> bool {
+    ) -> Option<Refusal> {
         let name = facts.issue.display();
         let wait = |why: &str| Hold::new(HoldKind::Other, format!("plan {id} waits; {why}"));
         if turn.applied {
             self.epic_held(facts, wait("one epic plan is applied a pass"));
-            return false;
+            return None;
         }
         let Some(project) = project else {
             self.epic_held(facts, wait("there is no board to set Priority on"));
-            return false;
+            return None;
         };
         if let Some(why) = self.other_holds() {
             self.epic_held(facts, wait(&why));
-            return false;
+            return None;
         }
         let config = match self.apply_config(project) {
             Ok(config) => config,
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("fail epic {name}: {error:#}"));
-                return false;
+                return None;
             }
         };
         let expected = Preconditions {
@@ -1181,24 +1294,26 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!("plan {id} changed since it was read; the next pass reads it again");
             Hold::new(HoldKind::Other, why)
         };
-        turn.applied = true;
         let planned = match epic_apply::planned(&self.client, &facts.issue, &config, &expected) {
             Ok(planned) => planned,
             Err(error) if error.downcast_ref::<epic_apply::PlanChanged>().is_some() => {
                 self.epic_held(facts, changed_since());
-                return false;
+                return None;
             }
             Err(error) if error.downcast_ref::<epic_apply::Refused>().is_some() => {
-                let why = format!("plan {id} is not applied: {error:#}; a person replaces it");
-                self.epic_held(facts, Hold::new(HoldKind::NeedsOperator, why));
-                return true;
+                return Some(Refusal {
+                    stale: error.downcast_ref::<crate::epic::ClosedSince>().is_some(),
+                    error: format!("{error:#}"),
+                });
             }
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("fail epic {name}: plan {id}: {error:#}"));
-                return false;
+                return None;
             }
         };
+        // Only a plan apply accepts takes the pass's one apply.
+        turn.applied = true;
         let words = match planned.lines.is_empty() {
             true => "no changes".to_owned(),
             false => planned.lines.join("; "),
@@ -1206,12 +1321,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let line = format!("apply epic {name} plan={id}: {words}");
         if let Some(held) = self.caps.check_many(Kind::Write, planned.writes) {
             self.line(format!("{held}: {line}"));
-            return false;
+            return None;
         }
         if !self.apply {
             self.caps.count_many(Kind::Write, planned.writes);
             self.line(line);
-            return false;
+            return None;
         }
         let bounds = self.client.bounds;
         // Apply reads the comments three times, each as many pages as now.
@@ -1223,7 +1338,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 bounds.left.get()
             );
             self.epic_held(facts, wait(&why));
-            return false;
+            return None;
         }
         // Its reads were in time, so its writes may finish past the bound.
         bounds.finishing.set(true);
@@ -1265,7 +1380,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.line(format!("{line} failed: {error:#}"));
             }
         }
-        false
+        None
     }
 
     /// A receipt cut short whose every effect is proved: rewritten as
@@ -1584,7 +1699,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn plan_epic(
         &mut self,
         facts: &EpicFacts,
-        (why, retry, reuse): (&str, Option<&str>, Option<&Comment>),
+        (why, intro, reuse): (&str, Intro, Option<&Comment>),
         project: Option<&Project>,
         slots: Option<&(BTreeSet<u64>, Slots)>,
         target: &Target,
@@ -1642,9 +1757,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .collect();
         let brief = self.planning_brief(&facts.issue, why, &options);
         let line = format!("start planning {name} pool={pool}: {why}");
-        let intro = match retry {
-            Some(record) => format!("{RETRY_INTRO}{record} got no plan."),
-            None => format!("{PLAN_INTRO}."),
+        let intro = match intro {
+            Intro::Retry(record) => format!("{RETRY_INTRO}{record} got no plan."),
+            Intro::Stale => format!("{STALE_INTRO}."),
+            Intro::First => format!("{PLAN_INTRO}."),
         };
         let context = (slots, target, hold as HoldRule);
         let start = (pool.as_str(), brief, intro.as_str());

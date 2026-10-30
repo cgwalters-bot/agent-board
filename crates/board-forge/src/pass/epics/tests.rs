@@ -1,5 +1,5 @@
 use super::*;
-use crate::epic::SUB_ISSUES_QUERY;
+use crate::epic::{EPIC_PLAN_SCHEMA, SUB_ISSUES_QUERY};
 use crate::pass::tests::{
     answer, block, config, preview, replay as board, set_usage, unfinished, usage,
 };
@@ -154,16 +154,35 @@ fn census(replay: &mut Replay, n: u64) {
     }));
 }
 
-/// A plan on tracker#596 five minutes before the recording that apply
-/// refuses, with the epic as `epic apply` reads it.
-fn invalid_596(replay: &mut Replay) {
+/// A plan on tracker#596 five minutes before the recording, of `schema`
+/// and with `actions`, with the epic as `epic apply` reads it.
+fn plan_596(replay: &mut Replay, schema: &str, actions: Value) {
     let body = format!(
         "```agent-board-epic-plan\n{}\n```",
-        json!({"schema": "nope", "epic": "cgwalters-forge/tracker#596", "actions": []})
+        json!({"schema": schema, "epic": "cgwalters-forge/tracker#596", "actions": actions})
     );
     let plan = posted(replay, 596, 7_000_000_003, "cgwalters-bot", 5, &body);
     comments(replay, COMMENTS_596).push(plan);
     census(replay, 596);
+}
+
+/// A plan on tracker#596 that apply refuses.
+fn invalid_596(replay: &mut Replay) {
+    plan_596(replay, "nope", json!([]));
+}
+
+/// A plan on tracker#596 with `action` on agentic-job#630, a sub-issue
+/// that closed after it was written.
+fn stale_596(replay: &mut Replay, action: Value) {
+    let mut action = action;
+    action["issue"] = "cgwalters-forge/agentic-job#630".into();
+    plan_596(replay, EPIC_PLAN_SCHEMA, json!([action]));
+}
+
+/// [`stale_596`] rescoping agentic-job#630, which apply refuses.
+fn rescoped_596(replay: &mut Replay) {
+    let rescope = json!({"type": "rescope_sub_issue", "body": "Smaller.", "reason": "Split."});
+    stale_596(replay, rescope);
 }
 
 /// tracker#890 without its receipt: its plan as if never applied, which
@@ -417,6 +436,106 @@ fn replay_epic_scenarios() {
             "hold epic cgwalters-forge/tracker#596: plan 7000000003@2026-10-23T20:59:10.085106014Z is not applied: the plan cannot be applied: unsupported epic plan schema",
             0,
             Some((HoldKind::NeedsOperator, true)),
+        ),
+        (
+            "a refused plan does not take the one apply a pass (agent-board#453)",
+            Box::new(|r| {
+                invalid_596(r);
+                unapplied(r);
+            }),
+            "apply epic cgwalters-forge/tracker#890 plan=6366132099@2026-10-23T13:34:49Z: Create a sub-issue",
+            0,
+            None,
+        ),
+        (
+            "a Priority for a sub-issue closed since the plan is satisfied, and the plan applies",
+            Box::new(|r| {
+                stale_596(r, json!({"type": "set_priority", "value": "P1"}));
+                unapplied(r);
+            }),
+            "apply epic cgwalters-forge/tracker#596 plan=7000000003@2026-10-23T20:59:10.085106014Z: cgwalters-forge/agentic-job#630 is already closed",
+            0,
+            None,
+        ),
+        (
+            "a plan refused for a sub-issue closed since is planned again, not held for a person",
+            Box::new(rescoped_596),
+            "start planning cgwalters-forge/tracker#596 pool=claude: plan 7000000003@2026-10-23T20:59:10.085106014Z names a sub-issue that has closed since",
+            0,
+            None,
+        ),
+        (
+            "and while that planning is asked for, it waits without the operator",
+            Box::new(|r| {
+                rescoped_596(r);
+                requested(r, 1);
+            }),
+            "hold epic cgwalters-forge/tracker#596: plan 7000000003@2026-10-23T20:59:10.085106014Z is not applied: the plan cannot be applied: epic plan refused:\n  action 1 (rescope_sub_issue): cgwalters-forge/agentic-job#630 is a closed sub-issue; a plan may not change it; it was planned again, which it waits for",
+            0,
+            Some((HoldKind::Other, false)),
+        ),
+        (
+            "a stale plan that answers an ordinary request is planned again, as tracker#939's is",
+            Box::new(|r| {
+                requested(r, 60);
+                rescoped_596(r);
+            }),
+            "start planning cgwalters-forge/tracker#596 pool=claude: plan 7000000003@2026-10-23T20:59:10.085106014Z names a sub-issue that has closed since",
+            0,
+            None,
+        ),
+        (
+            "but one that answers a request to plan again because its plan went stale is the operator's",
+            Box::new(|r| {
+                let intro = posted(
+                    r,
+                    596,
+                    7_000_000_000,
+                    "cgwalters-bot",
+                    61,
+                    &format!("{STALE_INTRO}."),
+                );
+                comments(r, COMMENTS_596).push(intro);
+                requested(r, 60);
+                rescoped_596(r);
+            }),
+            "hold epic cgwalters-forge/tracker#596: plan 7000000003@2026-10-23T20:59:10.085106014Z is not applied: the plan cannot be applied: epic plan refused:\n  action 1 (rescope_sub_issue): cgwalters-forge/agentic-job#630 is a closed sub-issue; a plan may not change it; it answers a request to plan again because the plan before it went stale, so a person replaces it",
+            0,
+            Some((HoldKind::NeedsOperator, true)),
+        ),
+        (
+            "and a request to plan again that got no plan in a day is the operator's",
+            Box::new(|r| {
+                rescoped_596(r);
+                let plan = comments(r, COMMENTS_596).last_mut().unwrap();
+                moved(plan, -time::Duration::days(2));
+                let intro = posted(
+                    r,
+                    596,
+                    7_000_000_000,
+                    "cgwalters-bot",
+                    24 * 60 + 1,
+                    &format!("{STALE_INTRO}."),
+                );
+                comments(r, COMMENTS_596).push(intro);
+                requested(r, 24 * 60);
+            }),
+            "hold epic cgwalters-forge/tracker#596: plan 7000000003@2026-10-21T20:59:10.085106014Z is not applied: the plan cannot be applied: epic plan refused:\n  action 1 (rescope_sub_issue): cgwalters-forge/agentic-job#630 is a closed sub-issue; a plan may not change it; the request to plan it again got no plan in a day, so a person replaces it",
+            0,
+            Some((HoldKind::NeedsOperator, true)),
+        ),
+        (
+            "and a day after that request, it is planned again",
+            Box::new(|r| {
+                rescoped_596(r);
+                // The plan two days old, and its request after it a day old.
+                let plan = comments(r, COMMENTS_596).last_mut().unwrap();
+                moved(plan, -time::Duration::days(2));
+                requested(r, 24 * 60);
+            }),
+            "start planning cgwalters-forge/tracker#596 pool=claude: plan 7000000003@2026-10-21T20:59:10.085106014Z names a sub-issue that has closed since",
+            0,
+            None,
         ),
         (
             "and the operator's direction since plans it again",

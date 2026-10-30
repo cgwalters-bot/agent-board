@@ -137,6 +137,13 @@ pub enum Action {
     AlreadyClosed {
         issue: IssueRef,
     },
+    /// A Priority for a sub-issue that closed after the plan was written:
+    /// done work needs no Priority, so it is satisfied as
+    /// [`Action::AlreadyClosed`] is, rather than refusing the whole plan
+    /// (agent-board#453).
+    ClosedPriority {
+        issue: IssueRef,
+    },
     Rescope {
         issue: IssueRef,
         body: String,
@@ -157,6 +164,37 @@ pub enum Action {
         moved_to: Option<IssueRef>,
     },
 }
+
+/// A plan action names a sub-issue that is closed now, which it may not
+/// change.
+#[derive(Debug)]
+struct ClosedSubIssue(IssueRef);
+
+impl fmt::Display for ClosedSubIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is a closed sub-issue; a plan may not change it",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ClosedSubIssue {}
+
+/// A plan's refusal, in words, where it names a sub-issue closed since:
+/// stale rather than wrong, so a new plan, not a person, mends it
+/// (agent-board#453).
+#[derive(Debug)]
+pub struct ClosedSince(String);
+
+impl fmt::Display for ClosedSince {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ClosedSince {}
 
 /// Action types, with the fields each takes besides `type`.
 const ACTIONS: &[(&str, &[&str])] = &[
@@ -376,18 +414,26 @@ impl EpicPlan {
             seen: BTreeMap::new(),
         };
         let mut errors = Vec::new();
+        let mut closed = 0;
         for (index, value) in actions.iter().enumerate() {
             let kind = value["type"].as_str().unwrap_or("?");
             match checker.action(value) {
                 Ok(action) => checker.done.push(Some(action)),
                 Err(error) => {
+                    closed += usize::from(error.downcast_ref::<ClosedSubIssue>().is_some());
                     errors.push(format!("action {} ({kind}): {error:#}", index + 1));
                     checker.done.push(None);
                 }
             }
         }
         if !errors.is_empty() {
-            bail!("epic plan refused:\n  {}", errors.join("\n  "));
+            let error = format!("epic plan refused:\n  {}", errors.join("\n  "));
+            // Stale only where nothing else is wrong with it: a plan that
+            // also breaks a rule is the operator's to see.
+            return Err(match closed == errors.len() {
+                true => ClosedSince(error).into(),
+                false => anyhow::anyhow!(error),
+            });
         }
         Ok(Self {
             request: request(value)?,
@@ -489,7 +535,7 @@ impl EpicPlan {
                 // Neither comment nor re-close: the reason was written for an
                 // open issue, and closing again would change how it closed.
                 // Listed, not sent, so a dry run and apply's status say so.
-                Action::AlreadyClosed { issue } => out
+                Action::AlreadyClosed { issue } | Action::ClosedPriority { issue } => out
                     .push(json!({"action": n, "satisfied": format!("{issue} is already closed")})),
                 Action::Rescope {
                     issue,
@@ -578,10 +624,9 @@ impl Checker<'_> {
             !issue.same(&self.epic.issue),
             "{issue} is the epic itself; a plan may not change the epic's text, priority or labels"
         );
-        ensure!(
-            !self.epic.closed.iter().any(|s| s.same(&issue)),
-            "{issue} is a closed sub-issue; a plan may not change it"
-        );
+        if self.epic.closed.iter().any(|s| s.same(&issue)) {
+            return Err(ClosedSubIssue(issue).into());
+        }
         // Spelled as GitHub has it, not as the plan does.
         let issue = self
             .epic
@@ -898,7 +943,24 @@ impl Checker<'_> {
                 action
             }
             "set_priority" => {
-                let target = self.target(object)?;
+                // Stale as a close of a closed sub-issue is (tracker#939):
+                // its sub-issue closed since the plan was written.
+                let stale = match object.get("issue") {
+                    Some(_) => self.closed_sub_issue(text(object, "issue")?)?,
+                    None => None,
+                };
+                let target = match &stale {
+                    // Still bounded as an open one would be.
+                    Some(issue) => {
+                        self.repository(&issue.repo)?;
+                        ensure!(
+                            object.get("new").is_none(),
+                            "needs exactly one of issue or new"
+                        );
+                        Target::Issue(issue.clone())
+                    }
+                    None => self.target(object)?,
+                };
                 let value = text(object, "value")?;
                 ensure!(
                     self.bounds.priorities.iter().any(|p| p == value),
@@ -906,9 +968,12 @@ impl Checker<'_> {
                     self.bounds.priorities.join(", ")
                 );
                 self.once(kind, target_key(&target))?;
-                Action::SetPriority {
-                    target,
-                    value: value.into(),
+                match (stale, target) {
+                    (Some(issue), _) => Action::ClosedPriority { issue },
+                    (None, target) => Action::SetPriority {
+                        target,
+                        value: value.into(),
+                    },
                 }
             }
             "close_epic" => {
@@ -1355,35 +1420,58 @@ mod tests {
         );
     }
 
-    /// A plan written while a sub-issue was open, which closed before apply
-    /// (tracker#596), is satisfied there rather than refused on every pass.
+    /// A plan written while a sub-issue was open, which closed before apply,
+    /// is satisfied there rather than refused on every pass: a close of it
+    /// (tracker#596), or a Priority for it (tracker#939).
     #[test]
-    fn closing_an_already_closed_sub_issue_is_satisfied() {
+    fn acting_on_an_already_closed_sub_issue_is_satisfied() {
         let epic = epic();
+        let issue = IssueRef::parse("cgwalters-forge/tracker#574").unwrap();
+        for (action, expected) in [
+            (
+                json!({"type": "close_sub_issue", "issue": "CGWalters-Forge/tracker#574", "reason": "Done."}),
+                Action::AlreadyClosed {
+                    issue: issue.clone(),
+                },
+            ),
+            (
+                json!({"type": "set_priority", "issue": "CGWalters-Forge/tracker#574", "value": "P0"}),
+                Action::ClosedPriority {
+                    issue: issue.clone(),
+                },
+            ),
+        ] {
+            let mut actions = valid();
+            actions.insert(1, action);
+            let checked = EpicPlan::validate(&plan(actions), &bounds(), &epic).unwrap();
+            assert_eq!(checked.actions[1], expected);
+            // Listed but no writes, and the `new` of the set_priority after it
+            // still names the create before it.
+            let mutations = checked.mutations(&epic);
+            let of = |n: usize| -> Vec<&Value> {
+                mutations.iter().filter(|m| m["action"] == n).collect()
+            };
+            assert_eq!(
+                of(2),
+                [
+                    &json!({"action": 2, "satisfied": "cgwalters-forge/tracker#574 is already closed"})
+                ]
+            );
+            assert_eq!(of(3).len(), 1);
+            assert_eq!(of(3)[0]["issue"], "cgwalters-forge/agent-board#NEW-1");
+            assert_eq!(mutations.len(), 10, "{mutations:?}");
+        }
+        // Still bounded as any Priority is.
         let mut actions = valid();
         actions.insert(
             1,
-            json!({"type": "close_sub_issue", "issue": "CGWalters-Forge/tracker#574", "reason": "Done."}),
+            json!({"type": "set_priority", "issue": "cgwalters-forge/tracker#574", "value": "P9"}),
         );
-        let checked = EpicPlan::validate(&plan(actions), &bounds(), &epic).unwrap();
-        assert_eq!(
-            checked.actions[1],
-            Action::AlreadyClosed {
-                issue: IssueRef::parse("cgwalters-forge/tracker#574").unwrap()
-            }
+        let error = EpicPlan::validate(&plan(actions), &bounds(), &epic).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Priority \"P9\" is not one of"),
+            "{error:#}"
         );
-        // Listed but no writes, and the `new` of the set_priority after it
-        // still names the create before it.
-        let mutations = checked.mutations(&epic);
-        let of =
-            |n: usize| -> Vec<&Value> { mutations.iter().filter(|m| m["action"] == n).collect() };
-        assert_eq!(
-            of(2),
-            [&json!({"action": 2, "satisfied": "cgwalters-forge/tracker#574 is already closed"})]
-        );
-        assert_eq!(of(3).len(), 1);
-        assert_eq!(of(3)[0]["issue"], "cgwalters-forge/agent-board#NEW-1");
-        assert_eq!(mutations.len(), 10, "{mutations:?}");
     }
 
     /// agent-board#200: a plan closes its epic only as its last action, once
@@ -1845,12 +1933,18 @@ mod tests {
                 ],
                 "action 7 (set_priority): new names action 6, which is refused",
             ),
+            // A plan that names a closed sub-issue and breaks a rule too is
+            // not stale (below), but the operator's.
             (
-                vec![priority("cgwalters-forge/tracker#574")],
-                "cgwalters-forge/tracker#574 is a closed sub-issue; a plan may not change it",
+                vec![
+                    json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/tracker#574", "body": "b", "reason": "r"}),
+                    json!({"type": "close_sub_issue", "issue": "elsewhere/repo#2", "reason": "Moved."}),
+                ],
+                "action 7 (close_sub_issue): repository elsewhere/repo is not in the configured list",
             ),
-            // Only a close of a closed sub-issue is satisfied; it is checked
-            // as any close is, and still counts as the issue's one action.
+            // Only a close or a Priority of a closed sub-issue is satisfied;
+            // each is checked as any is, and still counts as the issue's one
+            // action.
             (
                 vec![
                     json!({"type": "rescope_sub_issue", "issue": "cgwalters-forge/tracker#574", "body": "b", "reason": "r"}),
@@ -2018,12 +2112,16 @@ mod tests {
         ] {
             let mut actions = valid();
             actions.extend(extra);
-            let message = format!(
-                "{:#}",
-                EpicPlan::validate(&plan(actions), &bounds(), &epic()).unwrap_err()
-            );
+            let refused = EpicPlan::validate(&plan(actions), &bounds(), &epic()).unwrap_err();
+            let message = format!("{refused:#}");
             assert!(message.starts_with("epic plan refused:"), "{message}");
             assert!(message.contains(error), "{error}: {message}");
+            // Stale, not wrong, only where it names a closed sub-issue.
+            assert_eq!(
+                refused.downcast_ref::<ClosedSince>().is_some(),
+                error.contains("is a closed sub-issue"),
+                "{message}"
+            );
         }
     }
 
@@ -2270,7 +2368,7 @@ mod tests {
             ),
             (vec![first()], full, Err("more than 100 sub-issues")),
             // A closed one the plan rescopes is refused; one it closes is
-            // satisfied (closing_an_already_closed_sub_issue_is_satisfied).
+            // satisfied (acting_on_an_already_closed_sub_issue_is_satisfied).
             (
                 vec![first()],
                 {
@@ -2278,7 +2376,10 @@ mod tests {
                     closed["subIssues"]["nodes"][0]["state"] = json!("CLOSED");
                     closed
                 },
-                Err("cgwalters-forge/agent-board#63 is a closed sub-issue"),
+                // Its Priority is satisfied too; its rescope is refused.
+                Err(
+                    "action 4 (rescope_sub_issue): CGWalters-Forge/agent-board#63 is a closed sub-issue",
+                ),
             ),
             (
                 vec![first()],

@@ -225,7 +225,8 @@ one line an epic:
   `set_priority` of it, else the board's last option. An applying pass ends
   the line with what the [receipt](epic-plans.md#apply) says and
   `receipt=URL`. Its receipt and each action that writes are one write step
-  each, held whole by `--max-writes`; one epic is applied a pass.
+  each, held whole by `--max-writes`; one epic is applied a pass, which a
+  plan apply refuses does not take.
 * `recover epic …` where the receipt was cut short (`claimed` or `stopped`)
   and every action's effect is proved by the identities it confirmed and the
   epic now; an applying pass rewrites the receipt as `recovered`, one write.
