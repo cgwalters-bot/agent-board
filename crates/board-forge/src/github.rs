@@ -484,7 +484,7 @@ const CONTENT_FACTS: [(&str, &str); 2] = [("labels", "name"), ("assignees", "log
 /// The selection of an item's field values, nesting `nested` values in each.
 fn field_values_selection(page: usize, nested: usize, after: &str) -> String {
     format!(
-        "fieldValues(first:{page}{after}){{nodes{{__typename ... on ProjectV2ItemFieldSingleSelectValue{{name optionId field{{... on ProjectV2SingleSelectField{{name}}}}}} ... on ProjectV2ItemFieldTextValue{{text field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldNumberValue{{number field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldDateValue{{date field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldIterationValue{{title iterationId field{{... on ProjectV2IterationField{{name}}}}}} ... on ProjectV2ItemFieldRepositoryValue{{repository{{id nameWithOwner}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldMilestoneValue{{milestone{{id title state dueOn}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldLabelValue{{labels(first:{nested}){{nodes{{id name}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldUserValue{{users(first:{nested}){{nodes{{id login}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldPullRequestValue{{pullRequests(first:{nested}){{nodes{{id number url title state}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldReviewerValue{{reviewers(first:{nested}){{nodes{{__typename ... on User{{id login}} ... on Team{{id name}}}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}}}} pageInfo{{hasNextPage endCursor}}}}"
+        "fieldValues(first:{page}{after}){{nodes{{__typename ... on ProjectV2ItemFieldSingleSelectValue{{name optionId field{{... on ProjectV2SingleSelectField{{name}}}}}} ... on ProjectV2ItemFieldTextValue{{text field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldNumberValue{{number field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldDateValue{{date field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldIterationValue{{title iterationId field{{... on ProjectV2IterationField{{name}}}}}} ... on ProjectV2ItemFieldRepositoryValue{{repository{{id nameWithOwner}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldMilestoneValue{{milestone{{id title state dueOn}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldLabelValue{{labels(first:{nested}){{nodes{{id name}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldUserValue{{users(first:{nested}){{nodes{{id login}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldPullRequestValue{{pullRequests(first:{nested}){{nodes{{id number url title state}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}} ... on ProjectV2ItemFieldReviewerValue{{reviewers(first:{nested}){{nodes{{__typename ... on User{{id login}} ... on Bot{{id login}} ... on Team{{id name}}}} pageInfo{{hasNextPage}}}} field{{... on ProjectV2Field{{name}}}}}}}} pageInfo{{hasNextPage endCursor}}}}"
     )
 }
 
@@ -2169,7 +2169,8 @@ impl<T: GraphQl> GitHub<T> {
                                                 )
                                         }
                                         "reviewers" => match node["__typename"].as_str() {
-                                            Some("User") => node["login"].is_string(),
+                                            // A bot reviewer, such as Copilot, has a login too.
+                                            Some("User" | "Bot") => node["login"].is_string(),
                                             Some("Team") => node["name"].is_string(),
                                             _ => false,
                                         },
@@ -3249,6 +3250,7 @@ mod tests {
         let more = json!({"hasNextPage":true,"endCursor":"c"});
         let values = json!([{"__typename":"ProjectV2ItemFieldSingleSelectValue","name":"Done","optionId":"done","field":{"name":"Status"}}]);
         let label_value = |next: bool| json!([{"__typename":"ProjectV2ItemFieldLabelValue","field":{"name":"Labels"},"labels":{"nodes":[{"id":"L","name":"bug"}],"pageInfo":{"hasNextPage":next}}}]);
+        let reviewer_value = |reviewer: Value| json!([{"__typename":"ProjectV2ItemFieldReviewerValue","field":{"name":"Reviewers"},"reviewers":{"nodes":[reviewer],"pageInfo":{"hasNextPage":false}}}]);
         // What of item 7 is longer than the page holds, and the follow-up
         // read that brings the rest: the request it makes and its response.
         let cases = [
@@ -3269,6 +3271,24 @@ mod tests {
                 "nested values still truncated",
                 Some(("/fieldValues/nodes", label_value(true))),
                 Some((json!({"id":"M7"}), conn("fieldValues", label_value(true)))),
+                false,
+            ),
+            (
+                "a bot reviewer",
+                Some((
+                    "/fieldValues/nodes",
+                    reviewer_value(json!({"__typename":"Bot","id":"B","login":"copilot"})),
+                )),
+                None,
+                true,
+            ),
+            (
+                "a reviewer not seen",
+                Some((
+                    "/fieldValues/nodes",
+                    reviewer_value(json!({"__typename":"Bot"})),
+                )),
+                None,
                 false,
             ),
             (
