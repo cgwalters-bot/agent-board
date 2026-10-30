@@ -1128,7 +1128,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .as_ref()
             .and_then(|b| b.refusal(repo, text(&pull, "/head/ref")))
         {
-            return Ok((true, format!("left to the operator: {why}")));
+            return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
         }
         let marker = find_marker(read, &self.config.bot);
         // A stop whose label is gone was reset, as decide reads it.

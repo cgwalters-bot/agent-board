@@ -29,7 +29,11 @@ const MAX_SUMMARIES: usize = 10;
 const LABEL_LIMIT: usize = 50;
 /// Requests left before each read for the hold snapshot's own: its reads,
 /// its write, and a comment read's pages.
-const NEEDS_READS: usize = WRITE_RESERVE + HOLDS_READS + plan::PLAN_COMMENT_PAGES;
+pub(super) const NEEDS_READS: usize = WRITE_RESERVE + HOLDS_READS + plan::PLAN_COMMENT_PAGES;
+/// Who wrote and last edited the comment of a REST `node_id`.
+pub(super) const EDITS_QUERY: &str = r#"query($id: ID!) {
+  node(id: $id) { ... on IssueComment { author { login } lastEditedAt editor { login } } }
+}"#;
 /// What each digest group asks, and the text field its entry recommends by.
 const DIGEST_ASKS: &[(&str, &str, &str, RefKind)] = &[
     (
@@ -378,11 +382,54 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         holds::needs_you(snapshot, previous, &reading)
     }
 
+    /// Whether the published hold `comment`, as the REST API lists it, is
+    /// the bot's as it last edited it, so that its needs-you list may carry
+    /// over: anyone with write access may edit the bot's comment, and so
+    /// plant asks the bot never read. One that cannot be checked is not.
+    pub(super) fn bot_edited(&mut self, comment: &Value) -> bool {
+        // One read, before the other sources': skipped, nothing they did
+        // not read could be carried.
+        let bounds = self.client.bounds;
+        let room =
+            bounds.left.get() > WRITE_RESERVE + HOLDS_READS && Instant::now() <= bounds.admit_by;
+        let read = match (comment["node_id"].as_str(), room) {
+            (Some(id), true) => self.client.graphql(EDITS_QUERY, json!({"id": id})),
+            (None, _) => Err(anyhow::anyhow!("it has no node id")),
+            (_, false) => Err(anyhow::anyhow!(
+                "the pass's request budget or time is spent"
+            )),
+        };
+        let why = match read {
+            Ok(data) => {
+                let (node, bot) = (&data["node"], [self.config.bot.as_str()]);
+                let login = |field: &str| node[field]["login"].as_str();
+                let edited = !node["lastEditedAt"].is_null() || login("editor").is_some();
+                match is(login("author"), &bot) && (!edited || is(login("editor"), &bot)) {
+                    true => return true,
+                    false => "it is not the bot's as last edited".to_owned(),
+                }
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        self.line(format!(
+            "needs-you: the published list carries nothing over: {why}"
+        ));
+        false
+    }
+
     /// The proposals on the open issues `at` labels, oldest first.
     fn proposals(&mut self, at: &ProposalsAt) -> Collected {
         let (config, bot) = (self.config, self.config.bot.as_str());
         let writers = [config.operator.as_str(), bot];
         let mut collected = Collected::of(Read::Complete);
+        // Skipped, it is read in part: what it published is kept.
+        if !self.room() {
+            let why = "the pass's request budget or time is spent";
+            self.line(format!("needs-you proposals error: {why}"));
+            collected.read = Read::Partial;
+            collected.unread.insert(at.repository.to_ascii_lowercase());
+            return collected;
+        }
         let label: String = url::form_urlencoded::byte_serialize(at.label.as_bytes()).collect();
         let url = format!(
             "{API_ROOT}repos/{}/issues?state=open&labels={label}&sort=created&direction=asc&per_page=100",
@@ -468,8 +515,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     }
 
     /// The bot's summaries of the first [`MAX_SUMMARIES`] held issues and
-    /// blocking pull requests of `list`, by key.
-    fn summaries(&mut self, list: &NeedsYou) -> (Read, BTreeMap<String, Summary>) {
+    /// blocking pull requests of `list`, by key, each read, none where it
+    /// has none.
+    fn summaries(&mut self, list: &NeedsYou) -> (Read, BTreeMap<String, Option<Summary>>) {
         let (mut read, mut said) = (Read::Complete, BTreeMap::new());
         let held = (list.items.iter())
             .filter(|a| a.source_ref.kind == RefKind::Hold && a.source != "pass");
@@ -487,9 +535,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             };
             match comments {
                 Ok(comments) => {
-                    if let Some(summary) = bot_summary(&comments, &self.config.bot) {
-                        said.insert(ask.key.clone(), summary);
-                    }
+                    let summary = bot_summary(&comments, &self.config.bot);
+                    said.insert(ask.key.clone(), summary);
                 }
                 Err(error) => {
                     read = Read::Partial;

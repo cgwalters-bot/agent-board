@@ -206,7 +206,9 @@ or whose head branch is not in its `outputs.push_to_pull_request_branch.branches
 gets none of them: no claim, marker, label or dispatch (only an earlier
 answer round's interrupted stop is still finished), and the line says
 `skip: left to the operator: head branch "ci-drop-grub-cc" is outside the fix bounds`
-(or `repository OWNER/REPO is outside …`). It is not counted in flight. On the
+(or `repository OWNER/REPO is outside …`). It is not counted in flight, and
+it is a `needs-human` wait on the operator, as the pass's needs-you list
+reads it. On the
 operator's comments the thread's line says the same and the comments are
 handled, as for a `left to a person` thread. Merges and every other step are
 unchanged. Only those two keys are read; the rest is agentic-job's. A glob is
