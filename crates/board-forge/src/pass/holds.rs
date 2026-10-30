@@ -333,10 +333,9 @@ impl Entry {
 
     fn published(&self) -> Published {
         let item = self.item();
-        let pull = self.hold.kind == HoldKind::Blocking;
         Published {
             item: item.map(ItemRef::display),
-            url: item.map(|i| if pull { pull_url(i) } else { url(i) }),
+            url: item.map(url),
             epic: matches!(self.scope, Scope::Epic(_)),
             kind: self.hold.kind,
             reason: self.hold.reason.clone(),
@@ -451,13 +450,6 @@ impl Published {
 pub fn question(why: &str) -> Option<String> {
     let asked = why.trim().strip_prefix(QUESTION_PREFIX)?.trim();
     (!asked.is_empty()).then(|| asked.to_owned())
-}
-
-fn pull_url(pull: &ItemRef) -> String {
-    format!(
-        "https://{}/{}/pull/{}",
-        pull.host, pull.repository, pull.number
-    )
 }
 
 fn url(item: &ItemRef) -> String {
@@ -1260,7 +1252,11 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             waiting_since: h.since.clone(),
             ask: asked.clone().unwrap_or_else(|| h.reason.clone()),
             recommendation: said.recommendation,
-            target: h.url.clone().unwrap_or_else(|| action.url()),
+            // A blocking hold's url is its pull request's issue address.
+            target: match h.kind {
+                HoldKind::Blocking => action.url(),
+                _ => h.url.clone().unwrap_or_else(|| action.url()),
+            },
             head: None,
             source_ref: Reference::new(RefKind::Hold, &repository, number),
             action,
