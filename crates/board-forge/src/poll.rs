@@ -1440,28 +1440,37 @@ type ReviewStep = (Decision, Option<(u64, Option<String>)>);
 /// The operator's newest verdict on the head, and the review job's where it
 /// may count, before its run is checked.
 fn verdicts<'a>(pull: &'a Value, config: &Config) -> (Verdict<'a>, Verdict<'a>) {
-    let head = text(pull, "/headRefOid");
-    let at_head: Vec<&Value> = nodes(pull, "/reviews/nodes")
-        .iter()
-        .filter(|r| !head.is_empty() && text(r, "/commit/oid") == head)
-        .collect();
+    let at_head = reviews_at_head(pull);
     // An app's slug may be a user's login too: the type tells them apart.
     let operator_review = |r: &Value| {
         text(r, "/author/__typename") == "User" && text(r, "/author/login") == config.operator
-    };
-    let job_review = |r: &Value| {
-        text(r, "/author/__typename") == "Bot"
-            && r.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
     };
     let job_counts = config.review_workflow.is_some()
         && is_harness(pull, &config.bot)
         && pull["baseRepository"]["isPrivate"] == false;
     (
         newest_verdict(&at_head, operator_review, false),
-        job_counts
-            .then(|| newest_verdict(&at_head, job_review, true))
-            .flatten(),
+        job_counts.then(|| job_verdict(pull)).flatten(),
     )
+}
+
+/// The pull request's reviews of its head.
+fn reviews_at_head(pull: &Value) -> Vec<&Value> {
+    let head = text(pull, "/headRefOid");
+    nodes(pull, "/reviews/nodes")
+        .iter()
+        .filter(|r| !head.is_empty() && text(r, "/commit/oid") == head)
+        .collect()
+}
+
+/// The review job's newest verdict on the head, whether or not it counts
+/// ([`verdicts`] says where it may).
+fn job_verdict(pull: &Value) -> Verdict<'_> {
+    let job_review = |r: &Value| {
+        text(r, "/author/__typename") == "Bot"
+            && r.pointer("/author/databaseId").and_then(Value::as_u64) == Some(ACTIONS_BOT_ID)
+    };
+    newest_verdict(&reviews_at_head(pull), job_review, true)
 }
 
 /// The repository and id of the run named by the one gh-aw marker in a
@@ -3037,6 +3046,20 @@ pub fn decide(
         } else {
             step("skip", format!("draft, {not_ours}"))
         };
+    }
+    // The bot's own pull request from a branch of the base repository, or
+    // of a fork it does not own: only the operator's review counts there,
+    // and it gets no fix round, so no verdict of the review job's moves it.
+    // Waiting as for a verdict hid that (tracker#968, whose job requested
+    // changes); it is left to a person, as its failures are.
+    if !harness && !merge_only && review.is_none() {
+        let why = match job_verdict(pull) {
+            Some((Review::ChangesRequested, _)) => {
+                "the review job's change request does not count".to_owned()
+            }
+            _ => format!("only {}'s counts", config.operator),
+        };
+        return step("skip", format!("{NO_REVIEW}, and {why}: {not_ours}"));
     }
     match review {
         Some(Review::Approved) => {}
@@ -7189,12 +7212,12 @@ mod tests {
             ),
             // A branch of the repository could add a workflow that approves it.
             (
-                "an Actions approval of a green branch of the repository itself waits",
+                "an Actions approval of a green branch of the repository itself is left to a person",
                 "pull-143",
                 json!({"isDraft": false, "headRefOid": HEAD, "contexts": {"ci": {"conclusion": "SUCCESS"}}, "reviews": {"nodes": [review("APPROVED", job(), HEAD, "")]}}),
                 json!({"rounds": 0}),
                 none.clone(),
-                "wait",
+                "skip",
                 None,
             ),
             (
@@ -8300,7 +8323,7 @@ mod tests {
                 json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"}}),
                 json!({}),
                 Some("review.yml"),
-                "wait",
+                "skip",
             ),
             // The bot's other branches, such as the release train's bumps,
             // are its own as much as a dispatch run's (agent-board#142).
@@ -8316,7 +8339,7 @@ mod tests {
                 json!({"headRefName": "release-train/v1.2.3", "headRepositoryOwner": {"login": "someone"}}),
                 json!({}),
                 Some("review.yml"),
-                "wait",
+                "skip",
             ),
             (
                 "a private repository",
@@ -8348,6 +8371,42 @@ mod tests {
                 now(),
             );
             assert_eq!(got.action, action, "{name}: {}", got.reason);
+        }
+        // The bot's pull request from a branch of the base repository gets no
+        // fix round, so neither the job's verdict nor its absence is waited
+        // on (tracker#968): it is left to a person, and says why.
+        let not_ours = "not a pull request from the bot's fork, left to its author";
+        for (reviews, says) in [
+            (
+                vec![review("CHANGES_REQUESTED", job(), HEAD, "VERDICT: CHANGES")],
+                format!(
+                    "{NO_REVIEW}, and the review job's change request does not count: {not_ours}"
+                ),
+            ),
+            (
+                vec![],
+                format!("{NO_REVIEW}, and only cgwalters's counts: {not_ours}"),
+            ),
+        ] {
+            let config = Config {
+                review_workflow: Some("review.yml".into()),
+                ..config()
+            };
+            let p = pull(
+                "pull-470",
+                json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"},
+                    "reviews": {"nodes": reviews}}),
+            );
+            let got = decide(
+                &config,
+                &p,
+                &classify_checks(&p, &required()),
+                &Marker::default(),
+                (None, None),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!((got.action, got.reason), ("skip", says));
         }
         // A run the pass started (`reviewPools`): from the default branch,
         // so its `head_sha` is that branch's, and named for the head by its

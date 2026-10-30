@@ -68,6 +68,12 @@ review workflow calls) can still produce a verdict that counts: a push workflow
 can copy the marker while the job runs, and a branch can be the base of a pull
 request with the same head. Without the flag, and elsewhere,
 only the operator's verdict counts; a `review` commit status is not a verdict.
+The bot's own pull request from a branch of the base repository, or of a fork
+it does not own, gets no fix round either, so without the operator's approval
+it is not waited on as if a verdict were coming (tracker#968): its step is
+`skip: no approving review of the head yet, and only OPERATOR's counts: not a
+pull request from the bot's fork, left to its author`, or `…, and the review
+job's change request does not count: …` where the job asked for changes.
 The operator's verdict of the head outranks the job's either way. A pull
 request labelled `needs-operator-approval` (any case), or that closes an issue
 so labelled, is not merged or re-queued on the job's approval: it waits for the
