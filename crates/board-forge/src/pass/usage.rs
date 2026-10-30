@@ -770,6 +770,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 )
             }),
             free: self.free,
+            blocked: &self.blocked,
         };
         for line in holds::alarm(&mut snapshot, previous, &watch) {
             self.line(line);

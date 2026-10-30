@@ -8110,6 +8110,7 @@ fn v1_representative_config() {
     assert_eq!(cfg.board.as_ref().unwrap().priority_field, "Priority");
     assert_eq!(cfg.epics.as_ref().unwrap().max_applies_per_pass, 1);
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_draft_hours, 4);
+    assert_eq!(cfg.overlap.as_ref().unwrap().stale_hours, 24);
     assert_eq!(cfg.pr.merge_queue.as_ref().unwrap().tries, 3);
     assert!(cfg.grant().is_some());
     assert!(!cfg.leases && !cfg.triage_close && !cfg.body_plans);
@@ -8257,6 +8258,10 @@ fn config_table() {
         (
             json!({"overlap": {"staleDraftHours": 169}}),
             "overlap staleDraftHours is not 0 to 168",
+        ),
+        (
+            json!({"overlap": {"staleHours": 169}}),
+            "overlap staleHours is not 0 to 168",
         ),
         (
             json!({"overlap": {"staleDraftHour": 4}}),
@@ -9154,16 +9159,28 @@ fn replay_refuses_writes_and_unrecorded_reads() {
 /// is the bot's draft that stopped at a checkpoint: stage 2 continues it
 /// where pacing lets it.
 fn followed_draft(replay: &mut Replay, settings: &mut Value) {
-    const REPO: &str = "cgwalters-forge/agentic-job";
     let checkpoint =
         json!({"reason": "budget", "done": "half", "left": "half", "next": "the rest"});
-    let pull = json!({
-        "id": "PR_9", "number": 9, "url": format!("https://github.com/{REPO}/pull/9"),
-        "title": "Do the thing", "state": "OPEN", "isDraft": true, "mergeable": "MERGEABLE",
-        "body": format!("Closes #8.\n\n```checkpoint\n{checkpoint}\n```\n"),
-        "headRefOid": "abc", "headRefName": "dispatch/implement/agent-run-1",
+    let draft = json!({"isDraft": true,
+        "body": format!("Closes #8.\n\n```checkpoint\n{checkpoint}\n```\n")});
+    followed(replay, ("cgwalters-forge/agentic-job", 9), draft, json!([]));
+    settings["follow"] = json!(["cgwalters-forge/agentic-job"]);
+    settings["pr"] = json!({"fixPools": ["claude"]});
+}
+
+/// The bot's open pull request `number` of `repo` from its fork, the one
+/// open pull request there, as stage 2 reads it once `repo` is followed:
+/// mergeable, unreviewed, with no checks, committed when the recording was
+/// made and with its fields replaced by `change`, and `comments` on it.
+fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, comments: Value) {
+    let committed = replay.now.format(&Rfc3339).unwrap();
+    let mut pull = json!({
+        "id": format!("PR_{number}"), "number": number,
+        "url": format!("https://github.com/{repo}/pull/{number}"),
+        "title": "Do the thing", "state": "OPEN", "isDraft": false, "mergeable": "MERGEABLE",
+        "body": "Closes #8.", "headRefOid": "abc", "headRefName": "dispatch/implement/agent-run-1",
         "baseRefName": "main", "isCrossRepository": true,
-        "baseRepository": {"nameWithOwner": REPO, "isPrivate": false, "defaultBranchRef": {"name": "main"}},
+        "baseRepository": {"nameWithOwner": repo, "isPrivate": false, "defaultBranchRef": {"name": "main"}},
         "author": {"__typename": "User", "login": "cgwalters-bot"},
         "headRepositoryOwner": {"login": "cgwalters-bot"},
         "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
@@ -9174,31 +9191,36 @@ fn followed_draft(replay: &mut Replay, settings: &mut Value) {
         "reviews": {"nodes": [], "pageInfo": {"hasPreviousPage": false}},
         "series": {"nodes": [{"commit": {"oid": "abc", "messageHeadline": "Do half the thing"}}],
             "pageInfo": {"hasNextPage": false}},
-        "commits": {"nodes": [{"commit": {"oid": "abc", "committedDate": "2026-10-23T12:00:00Z",
+        "commits": {"nodes": [{"commit": {"oid": "abc", "committedDate": committed,
             "message": "Do half the thing", "statusCheckRollup": null}}]},
     });
-    let variables = json!({"owner": "cgwalters-forge", "name": "agentic-job", "number": 9});
+    for (key, value) in change.as_object().unwrap() {
+        pull[key] = value.clone();
+    }
+    let (owner, name) = repo.split_once('/').unwrap();
+    let variables = json!({"owner": owner, "name": name, "number": number});
     replay.requests.push(json!({
         "request": graphql_key(poll::PULL_QUERY, &variables),
         "answer": {"data": {"repository": {"pullRequest": pull}}},
     }));
     for (path, body) in [
-        ("events?per_page=100", json!([])),
+        ("events?per_page=100".into(), json!([])),
         (
-            "pulls?state=open&per_page=100",
-            json!([{"number": 9, "user": {"login": "cgwalters-bot"}}]),
+            "pulls?state=open&per_page=100".into(),
+            json!([{"number": number, "user": {"login": "cgwalters-bot"}}]),
         ),
-        ("issues/9/comments?per_page=100", json!([])),
-        ("rules/branches/main", json!([])),
-        ("branches/main", json!({"name": "main", "protected": false})),
+        (format!("issues/{number}/comments?per_page=100"), comments),
+        ("rules/branches/main".into(), json!([])),
+        (
+            "branches/main".into(),
+            json!({"name": "main", "protected": false}),
+        ),
     ] {
         replay.requests.push(json!({
-            "request": {"get": format!("{API_ROOT}repos/{REPO}/{path}")},
+            "request": {"get": format!("{API_ROOT}repos/{repo}/{path}")},
             "answer": {"status": 200, "link": null, "body": body},
         }));
     }
-    settings["follow"] = json!([REPO]);
-    settings["pr"] = json!({"fixPools": ["claude"]});
 }
 
 /// 23 October, live: a pass whose published snapshot was stale refused
@@ -9271,6 +9293,360 @@ fn budget_past_its_margin_holds_pull_request_rounds() {
             line.is_some_and(|l| l.contains(outcome)),
             "{total}: {lines:#?}"
         );
+    }
+}
+
+/// The recording's open tracker#889, which tracker#468's plan overlaps,
+/// made to change `README.md` as well and left the only open pull request
+/// there, so that it holds tracker#527 too, which is at P1 so that the
+/// `overlap` setting's documentation waiver does not let it start. #468's
+/// run failed, so that with `reruns` its rerun is checked for overlap.
+fn blocking_889(replay: &mut Replay) {
+    only(
+        replay,
+        &["cgwalters-forge/tracker#468", "cgwalters-forge/tracker#527"],
+    );
+    for entry in &mut replay.requests {
+        let pulls = entry["answer"].pointer_mut("/data/repository/pullRequests/nodes");
+        if let Some(nodes) = pulls.and_then(Value::as_array_mut) {
+            nodes.retain(|n| n["number"] == 889);
+            for node in nodes.iter_mut() {
+                let files = node["files"]["nodes"].as_array_mut().unwrap();
+                files.push(json!({"path": "README.md"}));
+            }
+        }
+        let items = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in items.and_then(Value::as_array_mut).into_iter().flatten() {
+            if node["content"]["number"] == 527 {
+                node["priority"] = json!({"name": "P1"});
+            }
+        }
+    }
+    let run = json!({"id": 39718949900_u64, "display_title": "implement cgwalters-forge/tracker#468 (claude)",
+        "conclusion": "failure", "run_attempt": 1,
+        "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/39718949900"});
+    failed(replay, vec![run]);
+    text_468(replay, "Work.");
+    // Not a draft, which `overlap.staleDraftHours` would waive.
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 889});
+    let pull = json!({"isDraft": false, "createdAt": "2026-10-20T00:00:00Z",
+        "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T00:00:00Z"}}]}});
+    replay.requests.push(json!({
+        "request": graphql_key(overlap::DRAFT_QUERY, &variables),
+        "answer": {"data": {"repository": {"pullRequest": pull}}},
+    }));
+}
+
+/// Blockers (agent-board#482): the pull request an overlap holds two items
+/// on is moved on once, by stage 2's own step where the pass follows its
+/// repository, or is one needs-you card where only a person moves it, in
+/// place of a stall alarm per item. Each case's pass applies after one
+/// that published the same holds seven hours before, so that #527's hold
+/// would stall. Its settings, the open pull request's fields and comments
+/// where tracker is followed, else the blocker's own read, the cap on
+/// dispatches; then the lines the pass prints (each the start of one), the
+/// runs it dispatches, and whether it publishes a card.
+#[test]
+fn blockers_move_or_are_carded() {
+    const REPO: &str = "cgwalters-forge/tracker";
+    let now = replay().now;
+    let ago = |hours: i64| {
+        (now - time::Duration::hours(hours))
+            .format(&Rfc3339)
+            .unwrap()
+    };
+    let marker = json!([{"id": 1, "user": {"login": "cgwalters-bot"},
+        "body": "<!-- tracker-poll: {\"rounds\":1,\"sha\":\"abc\",\"run\":7} -->"}]);
+    let fix_run = format!("{API_ROOT}repos/{REPO}/actions/runs/7");
+    let reviews = format!(
+        "{API_ROOT}repos/{REPO}/actions/workflows/review.yml/runs?event=workflow_dispatch&created=%3E%3D{}&per_page=100",
+        (now - time::Duration::days(1)).date()
+    );
+    let unread = |state: &str, mergeable: &str, hours: i64| {
+        json!({"state": state, "isDraft": false, "mergeable": mergeable, "headRefOid": "abc",
+            "createdAt": ago(hours + 1), "reviewDecision": null,
+            "commits": {"nodes": [{"commit": {"committedDate": ago(hours)}}]},
+            "reviews": {"nodes": []}})
+    };
+    let follow = json!({"follow": [REPO], "pr": {"fixPools": ["claude"]}});
+    let reviewed = json!({"follow": [REPO], "pr": {"fixPools": ["claude"],
+        "reviewPools": ["claude"], "reviewWorkflow": "review.yml"}});
+    let conflicting = json!({"mergeable": "CONFLICTING"});
+    let still = json!({"commits": {"nodes": [{"commit": {"oid": "abc", "committedDate": ago(30),
+        "message": "Do the thing", "statusCheckRollup": null}}]}});
+    let mut stuck = still.clone();
+    stuck["mergeable"] = conflicting["mergeable"].clone();
+    let holds = "it holds cgwalters-forge/tracker#468, cgwalters-forge/tracker#527";
+    let moves = |how: &str| format!("blocker {REPO}#889: stage 2 moves it ({how}); {holds}");
+    let card = |why: &str| {
+        format!("blocker {REPO}#889: only a person moves it at abc ({why}); {holds} by overlap")
+    };
+    let outside =
+        "it conflicts with its base, and the pass does not follow cgwalters-forge/tracker";
+    // Followed: the open pull request's change and comments, and a read
+    // besides; or the blocker read outside `follow`.
+    enum Read {
+        Followed(Value, Value, Option<(String, Value)>),
+        Outside(Value),
+    }
+    type Case = (
+        &'static str,
+        Value,
+        Read,
+        Option<usize>,
+        Vec<String>,
+        usize,
+        bool,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "a conflicting followed blocker gets one fix round for both its items",
+            follow.clone(),
+            Read::Followed(conflicting.clone(), json!([]), None),
+            None,
+            vec![
+                format!("{REPO}#889 abc fix: conflicts with main -> "),
+                moves("fix: conflicts with main"),
+                format!("hold {REPO}#468: Waiting: open pull request {REPO}#889 changes "),
+                format!(
+                    "hold {REPO}#527: Waiting: open pull request {REPO}#889 changes `README.md`."
+                ),
+            ],
+            1,
+            false,
+        ),
+        (
+            "the same head again: its round runs, and nothing more starts",
+            follow.clone(),
+            Read::Followed(
+                conflicting.clone(),
+                marker.clone(),
+                Some((fix_run.clone(), json!({"id": 7, "status": "in_progress"}))),
+            ),
+            None,
+            vec![moves("wait: fix round 1 is running for abc")],
+            0,
+            false,
+        ),
+        (
+            "but a wait as long as staleHours is not moving it",
+            follow.clone(),
+            Read::Followed(
+                stuck,
+                marker.clone(),
+                Some((fix_run.clone(), json!({"id": 7, "status": "in_progress"}))),
+            ),
+            None,
+            vec![
+                format!(
+                    "blocker {REPO}#889: stage 2's step has not moved it in 30 hours (wait: fix round 1 is running for abc); {holds}"
+                ),
+                format!("stall hold {REPO}#527: "),
+            ],
+            0,
+            false,
+        ),
+        (
+            "with the dispatch cap spent its round waits, and nothing is written",
+            follow.clone(),
+            Read::Followed(conflicting, json!([]), None),
+            Some(0),
+            vec![
+                format!("{REPO}#889 abc fix: conflicts with main -> held by --max-dispatch"),
+                format!(
+                    "blocker {REPO}#889: stage 2's step did not run this pass (fix: conflicts with main); {holds}"
+                ),
+                // Not moved, so its items' holds stall as before.
+                format!("stall hold {REPO}#527: "),
+            ],
+            0,
+            false,
+        ),
+        (
+            "an unreviewed followed blocker gets the review job started",
+            reviewed,
+            Read::Followed(
+                still.clone(),
+                json!([]),
+                Some((reviews, json!({"total_count": 0, "workflow_runs": []}))),
+            ),
+            None,
+            vec![
+                format!(
+                    "review {REPO}#889 abc: no run of the review job for the head, so it starts -> "
+                ),
+                moves("review: no run of the review job for the head, so it starts"),
+            ],
+            1,
+            false,
+        ),
+        (
+            "one whose review nothing starts is a card after a day",
+            follow.clone(),
+            Read::Followed(still, json!([]), None),
+            None,
+            vec![card(
+                "wait: no approving review of the head yet, and no review of it has come",
+            )],
+            0,
+            true,
+        ),
+        (
+            "a blocker outside follow is one card",
+            json!({}),
+            Read::Outside(unread("OPEN", "CONFLICTING", 30)),
+            None,
+            vec![card(outside)],
+            0,
+            true,
+        ),
+        (
+            "but not before it has stood still for staleHours",
+            json!({}),
+            Read::Outside(unread("OPEN", "CONFLICTING", 5)),
+            None,
+            vec![format!(
+                "blocker {REPO}#889: {outside}; it has stood still for 5 hour(s) of the 24 before a card; {holds}"
+            )],
+            0,
+            false,
+        ),
+        (
+            "nor once it is merged",
+            json!({}),
+            Read::Outside(unread("MERGED", "UNKNOWN", 30)),
+            None,
+            vec![
+                format!("blocker {REPO}#889: it is merged now; {holds}"),
+                format!("stall hold {REPO}#527: "),
+            ],
+            0,
+            false,
+        ),
+        (
+            "staleHours 0 leaves the overlap holds to stall as before",
+            json!({"overlap": {"staleHours": 0}}),
+            Read::Outside(unread("OPEN", "CONFLICTING", 30)),
+            None,
+            vec![format!("stall hold {REPO}#527: ")],
+            0,
+            false,
+        ),
+    ];
+    for (name, edit, read, cap, lines, dispatched, carded) in cases {
+        let mut forge = Forge::new(None, false);
+        let mut settings = json!({"reruns": true, "overlap": {},
+            "holds": {"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true}});
+        with_broker(
+            &mut forge.replay,
+            &mut settings,
+            json!({"body": usage::tests::broker()}),
+        );
+        for (key, value) in edit.as_object().unwrap() {
+            settings[key] = value.clone();
+        }
+        blocking_889(&mut forge.replay);
+        match read {
+            Read::Followed(change, comments, besides) => {
+                followed(&mut forge.replay, (REPO, 889), change, comments);
+                if let Some((url, body)) = besides {
+                    let answer = json!({"status": 200, "link": null, "body": body});
+                    forge
+                        .replay
+                        .requests
+                        .push(json!({"request": {"get": url}, "answer": answer}));
+                }
+            }
+            Read::Outside(node) => {
+                let variables =
+                    json!({"owner": "cgwalters-forge", "name": "tracker", "number": 889});
+                forge.replay.requests.push(json!({
+                    "request": graphql_key(blockers::PULL_QUERY, &variables),
+                    "answer": {"data": {"repository": {"pullRequest": node}}},
+                }));
+            }
+        }
+        for (url, body) in [
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+            (
+                format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+                json!({"private": true}),
+            ),
+        ] {
+            let answer = json!({"status": 200, "link": null, "body": body});
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": url}, "answer": answer}));
+        }
+        let config = config(settings);
+        // The holds as a pass seven hours before published them.
+        let before = preview(&config, &forge.replay);
+        let mut published = holds::snapshot(&before.holds, ago(7), before.tally.clone());
+        published.pass.progress_at = ago(0);
+        let body = holds::render(&published).unwrap();
+        let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+        let comment = json!({"id": 7, "user": {"login": "cgwalters-bot"}, "body": body});
+        comments.as_array_mut().unwrap().push(comment);
+        let limits = Limits {
+            dispatch: cap,
+            ..Limits::default()
+        };
+        let mode = (Mode::Actions(&own()), limits);
+        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        let said = &report.lines;
+        assert_eq!(report.failures, 0, "{name}: {said:#?}");
+        for line in &lines {
+            assert!(
+                said.iter().any(|l| l.starts_with(line.as_str())),
+                "{name}: no {line:?} in {said:#?}"
+            );
+        }
+        // One line a blocker, and a stall only where the case says so.
+        let blocker = said.iter().filter(|l| l.starts_with("blocker ")).count();
+        let off = name.starts_with("staleHours 0");
+        assert_eq!(blocker, usize::from(!off), "{name}: {said:#?}");
+        let stalls: Vec<&String> = said
+            .iter()
+            .filter(|l| l.starts_with("stall hold "))
+            .collect();
+        let stalled = lines.iter().any(|l| l.starts_with("stall hold "));
+        assert_eq!(!stalls.is_empty(), stalled, "{name}: {stalls:#?}");
+        let writes = forge.writes.borrow();
+        let sent = (writes.iter())
+            .filter(|(_, url, _)| url.ends_with("/dispatches"))
+            .count();
+        assert_eq!(sent, dispatched, "{name}: {writes:#?}");
+        if cap.is_some() {
+            let on_889 = (writes.iter()).filter(|(_, url, _)| url.contains("/issues/889/"));
+            assert_eq!(on_889.count(), 0, "{name}: {writes:#?}");
+        }
+        let snapshot = (writes.iter())
+            .map(|(_, _, body)| text(body, "/body"))
+            .find(|b| b.starts_with(holds::HOLDS_MARKER))
+            .map(|b| holds::parse(b).unwrap())
+            .unwrap_or_else(|| panic!("{name}: no holds published: {said:#?}"));
+        let pull = format!("{REPO}#889");
+        let cards: Vec<Value> = (snapshot["holds"].as_array().unwrap().iter())
+            .filter(|h| h["kind"] == "blocking")
+            .map(|h| json!([h["item"], h["url"], h["operator"], h["priority"]]))
+            .collect();
+        let asks: Vec<Value> = (snapshot["needs_you"]["items"].as_array().unwrap().iter())
+            .filter(|a| a["kind"] == "blocking")
+            .map(|a| json!([a["key"], a["action"]["type"], a["priority"]]))
+            .collect();
+        match carded {
+            true => {
+                let url = format!("https://github.com/{REPO}/pull/889");
+                assert_eq!(cards, [json!([pull, url, true, "P0"])], "{name}");
+                assert_eq!(
+                    asks,
+                    [json!([pull.to_lowercase(), "pull_request", "P0"])],
+                    "{name}"
+                );
+            }
+            false => assert!(cards.is_empty() && asks.is_empty(), "{name}: {cards:?}"),
+        }
     }
 }
 
