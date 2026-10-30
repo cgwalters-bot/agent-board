@@ -359,11 +359,10 @@ the same entries. A `weeklyUsd`, or a pool's `target` or `burst`, beside it
 is refused: the grant replaces them.
 
 Stage 3 reads the open `epic` issues of `epics.repository` (10 a request),
-then each one's sub-issues with their board Priority (50 a request, and only
-for an epic that has any), the board's Priority options, and each live epic's
-comments, and takes the live epics in Priority order. Its first line counts
-them, such as `epics: 7 live of 17 open in example/tracker`, then
-one line an epic:
+then each one's sub-issues with their board Priority (50 a request), the
+board's Priority options, and each live epic's comments, and takes the live
+epics in Priority order. Its first line counts them, such as
+`epics: 7 live of 17 open in example/tracker`, then one line an epic:
 
 * `apply epic OWNER/REPO#N plan=ID: Create a sub-issue in example/work (P0);
   Close example/work#9 as not planned` where the newest accepted plan has no
