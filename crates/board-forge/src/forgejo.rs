@@ -1,19 +1,53 @@
-//! Read-only Forgejo board. Forgejo's v1 API has no projects, so the board is
+//! Forgejo board. Forgejo's v1 API has no projects, so the board is
 //! the issues of configured repositories: Priority and Turn come from scoped
-//! labels, Run and Result from marker comments. Nothing here writes to Forgejo.
+//! labels, Run and Result from append-only recorder comments.
 use anyhow::{Context, Result, bail, ensure};
-use board_core::{Coverage, Evidence, Item, ItemRef, Priority, Snapshot, Turn};
+use board_core::{Coverage, Evidence, Item, ItemRef, Priority, Snapshot, Status, Turn};
 use serde::Deserialize;
 use serde_json::Value;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
+mod writes;
+
+impl<T: Transport> crate::Forge for Forgejo<T> {
+    async fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_with_policy(&board_core::AgentPolicy::parse(
+            board_core::DEFAULT_AGENT_POLICY,
+        )?)
+    }
+
+    fn capabilities(&self) -> Result<Vec<board_core::Capability>> {
+        // A read is not proof of mutation authority.
+        Ok(vec![])
+    }
+
+    fn board_write(
+        &self,
+        write: &crate::BoardWrite,
+        apply: bool,
+        remaining: &mut usize,
+    ) -> Result<()> {
+        self.write_board(write, apply, remaining)
+    }
+
+    fn plan_claim(
+        &self,
+        target: &ItemRef,
+        marker: &str,
+        plan: u64,
+    ) -> Result<Option<crate::PlanClaim>> {
+        self.read_plan_claim(target, marker, plan)
+    }
+}
+
 /// Exactly one label of each of these scopes per item; zero or two leave the
 /// item's fields incomplete. Forgejo's exclusive flag is not relied on: a
 /// label created without it would let two through unnoticed.
 pub const PRIORITY_SCOPE: &str = "priority/";
 pub const TURN_SCOPE: &str = "turn/";
+pub const STATUS_SCOPE: &str = "status/";
 /// Any number of `blocked/<reason>` labels, read into the item's Blocked field.
 pub const BLOCKED_SCOPE: &str = "blocked/";
 /// A comment's first line `<!-- agent-board-run: URL -->` (or `-result:`)
@@ -73,6 +107,10 @@ pub struct Config {
     /// renamed and taken over, so ids; with none, comments are not read.
     #[serde(default)]
     pub recorders: Vec<u64>,
+    /// Opt in to the reviewed Status label representation. Absent, preserve
+    /// the old read-only board's lack of a Status field.
+    #[serde(default)]
+    pub status_labels: bool,
 }
 
 fn default_token_env() -> String {
@@ -135,7 +173,7 @@ impl Config {
             ensure!(
                 !label.trim().is_empty()
                     && !label.contains(',')
-                    && ![PRIORITY_SCOPE, TURN_SCOPE, BLOCKED_SCOPE]
+                    && ![PRIORITY_SCOPE, TURN_SCOPE, BLOCKED_SCOPE, STATUS_SCOPE]
                         .iter()
                         .any(|scope| label.starts_with(scope)),
                 "invalid board membership label"
@@ -207,6 +245,17 @@ impl std::fmt::Display for AuthenticationRequired {
 
 impl std::error::Error for AuthenticationRequired {}
 
+#[derive(Debug)]
+pub struct NotFound;
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Forgejo object not found")
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 pub struct Response {
     pub body: Value,
     /// The listing's `X-Total-Count`, where the server sent one.
@@ -220,6 +269,12 @@ pub trait Transport {
     /// Mutation is opt-in; existing read transports cannot accidentally write.
     fn send(&self, _method: &str, _url: &Url, _body: &Value) -> Result<(u16, Value)> {
         bail!("Forgejo transport does not support writes")
+    }
+
+    /// Unsupported by read-only transports. Callers must not retry an error:
+    /// it may mean the server committed a write but lost the response.
+    fn write(&self, _method: &str, _url: &Url, _body: &Value) -> Result<Value> {
+        bail!("Forgejo writes unsupported by this transport")
     }
 }
 
@@ -283,6 +338,50 @@ impl Transport for Client {
         Ok((status, body))
     }
 
+    fn write(&self, method: &str, url: &Url, body: &Value) -> Result<Value> {
+        ensure!(
+            url.as_str().starts_with(self.api.as_str()),
+            "refusing to send the token outside {}",
+            self.api
+        );
+        ensure!(
+            matches!(method, "POST" | "PATCH" | "PUT"),
+            "unsupported Forgejo write method"
+        );
+        let request = match method {
+            "POST" => self.agent.post(url.as_str()),
+            "PATCH" => self.agent.patch(url.as_str()),
+            _ => self.agent.put(url.as_str()),
+        };
+        let mut response = request
+            .header("Authorization", &format!("token {}", self.token))
+            .header("Accept", "application/json")
+            .header("User-Agent", "agent-board")
+            .config()
+            .max_redirects(0)
+            .build()
+            .send_json(body)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{method}: Forgejo write failed; hold and read back before recovery"
+                )
+            })?;
+        match response.status().as_u16() {
+            200..300 => {
+                if response.status().as_u16() == 204 {
+                    Ok(Value::Null)
+                } else {
+                    response
+                        .body_mut()
+                        .read_json()
+                        .context("decode Forgejo write; hold before recovery")
+                }
+            }
+            401 | 403 => Err(AuthenticationRequired(self.token_env.clone()).into()),
+            status => bail!("{method}: Forgejo HTTP status {status}; hold before recovery"),
+        }
+    }
+
     fn get(&self, url: &Url) -> Result<Response> {
         ensure!(
             url.as_str().starts_with(self.api.as_str()),
@@ -319,6 +418,7 @@ impl Transport for Client {
                 anyhow::Error::from(AuthenticationRequired(self.token_env.clone()))
                     .context(format!("GET {path}: Forgejo refused the token")),
             ),
+            404 => Err(NotFound.into()),
             status => bail!("GET {path}: Forgejo HTTP status {status}"),
         }
     }
@@ -439,7 +539,7 @@ impl<T: Transport> Forgejo<T> {
             items,
             fields: vec![],
             // Forgejo has no project board here, only labels.
-            status_field_absent: true,
+            status_field_absent: !config.status_labels,
         };
         snapshot.items.sort_by(|a, b| a.identity.cmp(&b.identity));
         snapshot.validate()?;
@@ -493,6 +593,12 @@ fn item(
         );
     }
     let mut errors = Vec::new();
+    let status =
+        if config.status_labels && labels.iter().any(|label| label.starts_with(STATUS_SCOPE)) {
+            exclusive(&labels, STATUS_SCOPE, &mut errors, parse_status)
+        } else {
+            None
+        };
     let priority = exclusive(&labels, PRIORITY_SCOPE, &mut errors, |value| {
         serde_json::from_value::<Priority>(value.into()).ok()
     });
@@ -563,8 +669,7 @@ fn item(
         state: state.into(),
         // Forgejo records no close reason.
         state_reason: None,
-        // Forgejo has no Status; a label board does not invent one.
-        status: None,
+        status,
         priority,
         turn,
         fields_complete: errors.is_empty(),
@@ -624,6 +729,7 @@ fn markers(
 ) -> Result<BTreeMap<&'static str, String>> {
     let mut newest: BTreeMap<&'static str, (u64, Option<String>)> = BTreeMap::new();
     let mut seen = BTreeSet::new();
+    let mut edited = false;
     for comment in comments {
         let id = comment["id"].as_u64().context("missing comment id")?;
         ensure!(seen.insert(id), "comment {id} listed twice");
@@ -634,6 +740,12 @@ fn markers(
             .is_some_and(|author| recorders.contains(&author))
         {
             continue;
+        }
+        // The current body cannot tell us whether an edited recorder comment
+        // used to contain a marker. Hold even when an editor removed it.
+        if !unedited(comment) {
+            edited = true;
+            errors.push(format!("comment {id}: edited recorder record"));
         }
         let first = text(comment, "body")?.lines().next().unwrap_or_default();
         let Some(inner) = first
@@ -647,6 +759,13 @@ fn markers(
             let Some(value) = inner.trim().strip_prefix(marker) else {
                 continue;
             };
+            if !unedited(comment) {
+                // Do not fall back to an older apparently valid record.
+                if newest.get(name).is_none_or(|(at, _)| *at < id) {
+                    newest.insert(name, (id, None));
+                }
+                continue;
+            }
             let value = Url::parse(value.trim())
                 .ok()
                 .filter(|url| url.scheme() == "https")
@@ -655,6 +774,9 @@ fn markers(
                 newest.insert(name, (id, value));
             }
         }
+    }
+    if edited {
+        return Ok(BTreeMap::new());
     }
     let mut fields = BTreeMap::new();
     for (name, (id, value)) in newest {
@@ -666,6 +788,25 @@ fn markers(
         }
     }
     Ok(fields)
+}
+
+pub(super) fn unedited(comment: &Value) -> bool {
+    comment["created_at"].as_str().is_some_and(|created| {
+        time::OffsetDateTime::parse(created, &time::format_description::well_known::Rfc3339).is_ok()
+            && comment["updated_at"].as_str() == Some(created)
+    })
+}
+
+fn parse_status(value: &str) -> Option<Status> {
+    Some(match value {
+        "todo" => Status::Todo,
+        "backlog" => Status::Backlog,
+        "blocked" => Status::Blocked,
+        "in-progress" => Status::InProgress,
+        "needs-human" => Status::NeedsHuman,
+        "done" => Status::Done,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -690,7 +831,7 @@ mod tests {
     const API: &str = "https://forge.example/api/v1/repos/sample/board/issues";
     const BOT: u64 = 9;
 
-    fn config(extra: Value) -> Config {
+    pub(super) fn config(extra: Value) -> Config {
         let mut value = json!({
             "url": "https://forge.example/",
             "repositories": ["sample/board"],
@@ -704,7 +845,7 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
-    fn issues() -> Value {
+    pub(super) fn issues() -> Value {
         serde_json::from_str(include_str!("../../../fixtures/forgejo/issues.json")).unwrap()
     }
 
@@ -834,7 +975,7 @@ mod tests {
     #[test]
     fn marker_table() {
         // The login is display text; only the user id is trusted.
-        let comment = |id: u64, user: u64, body: &str| json!({"id": id, "user": {"id": user, "login": "board-bot"}, "body": body});
+        let comment = |id: u64, user: u64, body: &str| json!({"id": id, "user": {"id": user, "login": "board-bot"}, "body": body, "created_at": "2026-10-02T08:00:00Z", "updated_at": "2026-10-02T08:00:00Z"});
         let run = "<!-- agent-board-run: https://forge.example/sample/runs/1 -->\nRun started";
         let newer = "<!-- agent-board-run: https://forge.example/sample/runs/2 -->";
         for (comments, expected, errors) in [
@@ -887,6 +1028,78 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn edited_recorder_markers_hold_instead_of_falling_back() {
+        for (created, updated) in [
+            (Value::Null, Value::Null),
+            ("not a time".into(), "not a time".into()),
+            ("2026-10-02T08:00:00Z".into(), "2026-10-02T09:00:00Z".into()),
+        ] {
+            let mut comments: Value =
+                serde_json::from_str(include_str!("../../../fixtures/forgejo/comments-1.json"))
+                    .unwrap();
+            comments[2]["created_at"] = created;
+            comments[2]["updated_at"] = updated;
+            let mut errors = vec![];
+            let fields = markers(comments.as_array().unwrap(), &[BOT], &mut errors).unwrap();
+            assert!(!fields.contains_key("Run"));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("edited recorder record"))
+            );
+        }
+        for body in [
+            "ordinary text",
+            "<!-- renamed-marker: https://forge.example/run/1 -->",
+        ] {
+            let mut comments: Value =
+                serde_json::from_str(include_str!("../../../fixtures/forgejo/comments-1.json"))
+                    .unwrap();
+            comments[2]["body"] = body.into();
+            comments[2]["updated_at"] = "2026-10-03T00:00:00Z".into();
+            let mut errors = vec![];
+            assert!(
+                markers(comments.as_array().unwrap(), &[BOT], &mut errors)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!errors.is_empty());
+        }
+    }
+
+    #[test]
+    fn status_representation_table() {
+        for (names, expected, complete) in [
+            (vec![], None, true),
+            (vec!["status/todo"], Some(Status::Todo), true),
+            (vec!["status/backlog"], Some(Status::Backlog), true),
+            (vec!["status/blocked"], Some(Status::Blocked), true),
+            (vec!["status/in-progress"], Some(Status::InProgress), true),
+            (vec!["status/needs-human"], Some(Status::NeedsHuman), true),
+            (vec!["status/done"], Some(Status::Done), true),
+            (vec!["status/cancelled"], None, false),
+            (vec!["status/todo", "status/done"], None, false),
+        ] {
+            for enabled in [false, true] {
+                let mut pages = fixture_pages();
+                for name in &names {
+                    pages.get_mut(&page(1)).unwrap().0[0]["labels"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"name": name}));
+                }
+                let snapshot = snapshot(config(json!({"statusLabels": enabled})), pages).unwrap();
+                assert_eq!(snapshot.status_field_absent, !enabled);
+                assert_eq!(
+                    snapshot.items[0].status,
+                    if enabled { expected.clone() } else { None }
+                );
+                assert_eq!(snapshot.items[0].fields_complete, !enabled || complete);
+            }
+        }
     }
 
     #[test]

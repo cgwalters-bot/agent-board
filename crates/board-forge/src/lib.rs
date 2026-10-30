@@ -88,6 +88,76 @@ impl Footer {
 pub trait Forge {
     async fn snapshot(&self) -> Result<Snapshot>;
     fn capabilities(&self) -> Result<Vec<Capability>>;
+    /// Deterministic controller writes only, not an agent-output applier.
+    /// Read-only backends refuse rather than silently dropping a primitive.
+    fn board_write(&self, _write: &BoardWrite, _apply: bool, _remaining: &mut usize) -> Result<()> {
+        anyhow::bail!("board writes unsupported by this forge")
+    }
+
+    /// The earliest recorder claim of plan comment `plan` under `marker` on
+    /// `target`, with its receipts, for recovery; `None` when unclaimed.
+    fn plan_claim(
+        &self,
+        _target: &board_core::ItemRef,
+        _marker: &str,
+        _plan: u64,
+    ) -> Result<Option<PlanClaim>> {
+        anyhow::bail!("plan claims unsupported by this forge")
+    }
+}
+
+/// A claim found on an issue. One without receipts is ambiguous: its run
+/// may have started, so recovery looks for that run or holds the plan for a
+/// person, and never claims or dispatches it again.
+#[derive(Debug, PartialEq)]
+pub struct PlanClaim {
+    /// `COMMENT-ID@CREATED`, as the claim's first line names it.
+    pub plan: String,
+    pub claim: u64,
+    /// The claim author's id, the only author whose receipts count.
+    pub recorder: u64,
+    /// Each receipt's text after its marker line, oldest first.
+    pub receipts: Vec<String>,
+}
+
+/// A fresh issue observation is the precondition, not mutation authority.
+/// The configured forge and authenticated recorder establish authority.
+pub struct BoardWrite {
+    pub observed: board_core::Item,
+    /// The caller's trusted active policy, also used when reading the board.
+    pub policy: board_core::AgentPolicy,
+    pub operation: BoardOperation,
+}
+
+pub enum BoardOperation {
+    /// Replace one field scope, preserving every label outside that scope.
+    Label {
+        scope: String,
+        name: String,
+    },
+    State {
+        state: String,
+    },
+    /// Append-only deterministic record; exact existing text is a replay.
+    /// Claim and receipt marker lines are refused here.
+    Comment {
+        body: String,
+    },
+    /// Claim plan comment `plan` before acting on it, with an append-only
+    /// record whose first line is `<!-- MARKER: ID@CREATED -->`. It succeeds
+    /// only where this call's record is the plan's earliest; any existing
+    /// claim, a repeated apply included, holds instead.
+    Claim {
+        marker: String,
+        plan: u64,
+    },
+    /// Append an outcome (run, refusal, receipt) to the authenticated
+    /// recorder's claim of `plan`. Exact existing text is a replay.
+    Receipt {
+        marker: String,
+        plan: u64,
+        body: String,
+    },
 }
 
 pub trait OutputBackend {
