@@ -467,8 +467,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         }
     }
 
-    /// The bot's summaries of the first [`MAX_SUMMARIES`] held issues of
-    /// `list`, by key.
+    /// The bot's summaries of the first [`MAX_SUMMARIES`] held issues and
+    /// blocking pull requests of `list`, by key.
     fn summaries(&mut self, list: &NeedsYou) -> (Read, BTreeMap<String, Summary>) {
         let (mut read, mut said) = (Read::Complete, BTreeMap::new());
         let held = (list.items.iter())
@@ -479,7 +479,13 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 read = Read::Partial;
                 break;
             }
-            match plan::issue_comments(&self.client, &issue) {
+            // A blocking hold is on a pull request, whose summary an issue
+            // read cannot find.
+            let comments = match ask.action.kind {
+                RefKind::PullRequest => plan::pull_request_comments(&self.client, &issue),
+                _ => plan::issue_comments(&self.client, &issue),
+            };
+            match comments {
                 Ok(comments) => {
                     if let Some(summary) = bot_summary(&comments, &self.config.bot) {
                         said.insert(ask.key.clone(), summary);

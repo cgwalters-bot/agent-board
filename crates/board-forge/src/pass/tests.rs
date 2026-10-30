@@ -9603,6 +9603,19 @@ fn blockers_move_or_are_carded() {
             settings[key] = value.clone();
         }
         blocking_889(&mut forge.replay);
+        // A card's pull request has the bot's summary, which only a pull
+        // request's read finds; a followed one's comments are stage 2's.
+        if carded {
+            let (owner, name) = REPO.split_once('/').unwrap();
+            let variables = json!({"owner": owner, "name": name, "number": 889, "after": null});
+            let summary = comment_node(9, "cgwalters-bot", "**Decision needed:** Close #889?");
+            let page =
+                json!({"nodes": [summary], "pageInfo": {"hasNextPage": false, "endCursor": null}});
+            forge.replay.requests.push(json!({
+                "request": graphql_key(plan::PULL_REQUEST_COMMENTS_QUERY, &variables),
+                "answer": {"data": {"repository": {"pullRequest": {"comments": page}}}},
+            }));
+        }
         match read {
             Read::Followed(change, comments, besides) => {
                 followed(&mut forge.replay, (REPO, 889), change, comments);
@@ -9697,7 +9710,15 @@ fn blockers_move_or_are_carded() {
             .collect();
         let asks: Vec<Value> = (snapshot["needs_you"]["items"].as_array().unwrap().iter())
             .filter(|a| a["kind"] == "blocking")
-            .map(|a| json!([a["key"], a["action"]["type"], a["target"], a["priority"]]))
+            .map(|a| {
+                json!([
+                    a["key"],
+                    a["action"]["type"],
+                    a["target"],
+                    a["priority"],
+                    a["ask"]
+                ])
+            })
             .collect();
         match carded {
             true => {
@@ -9706,7 +9727,13 @@ fn blockers_move_or_are_carded() {
                 let target = format!("https://github.com/{REPO}/pull/889");
                 assert_eq!(
                     asks,
-                    [json!([pull.to_lowercase(), "pull_request", target, "P0"])],
+                    [json!([
+                        pull.to_lowercase(),
+                        "pull_request",
+                        target,
+                        "P0",
+                        "Close #889?"
+                    ])],
                     "{name}"
                 );
             }
