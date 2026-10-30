@@ -15,7 +15,18 @@ boards are read-only, and GitLab is not supported yet.
 
     cargo install --locked --git https://github.com/cgwalters-forge/agent-board agent-board
 
-Then follow [setup](docs/setup.md) to try it offline and connect a board.
+With a repository checkout, try the model-free first pass (no forge token):
+
+```sh
+agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json --max-dispatch 1 --max-writes 3 --max-status-changes 5
+```
+
+`pass: preview` means nothing is written or dispatched; the final counts are
+proposals against recorded facts, not live successes. Follow
+[setup](docs/setup.md#try-it-offline) for the checkout, executable rehearsal and
+output interpretation, then [connect one lane](docs/setup.md#connect-one-lane)
+for operator-only live prerequisites. Leave writes and schedules off; the offline
+rehearsal does not verify a live deployment.
 
 ## License
 
