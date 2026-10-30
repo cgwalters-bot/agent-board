@@ -487,6 +487,7 @@ mod tests {
             remaining: 1 + ITEM_REQUESTS,
             apply: None,
             dispatched: 0,
+            merged: 0,
             queues: BTreeMap::new(),
             updated: Default::default(),
             outages: None,

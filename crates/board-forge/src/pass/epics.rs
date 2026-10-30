@@ -1374,6 +1374,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                             .any(|p| l.starts_with(p))
                     })
                     .collect();
+                // A plan that changed nothing moved no work on.
+                self.progressed += usize::from(!done.is_empty());
                 let done = match done.is_empty() {
                     true => "no changes".to_owned(),
                     false => done.join("; "),
@@ -1786,6 +1788,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         if let Step::Failed(..) = step {
             self.report.failures += 1;
+            self.not_started += 1;
         }
         match step {
             Step::Hold(hold) => self.epic_held(facts, hold),
@@ -1796,6 +1799,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             Step::Capped(line) => {
                 turn.starts += 1;
+                // Counted in `started` with what was sent, but nothing was.
+                self.not_started += 1;
                 self.line(line);
             }
             Step::Started(line, _) | Step::Failed(line, _) => {

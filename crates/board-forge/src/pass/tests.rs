@@ -2236,7 +2236,7 @@ fn apply_publishes_the_holds() {
         let tally = json!({
             "wip": {"limit": wip, "in_flight": in_flight},
             "pass": {"mode": "actions", "candidates": candidates, "started": started,
-                     "live_epics": 0},
+                     "live_epics": 0, "progress_at": snapshot["at"]},
         });
         assert_eq!(
             json!({"wip": snapshot["wip"], "pass": snapshot["pass"]}),
@@ -2364,6 +2364,70 @@ fn apply_publishes_the_holds() {
     assert_eq!(
         held.unwrap().reason,
         "not a live epic, so its 4 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#650 (P0), cgwalters-forge/tracker#659 (P0), cgwalters-forge/tracker#666 (P0) and 1 more"
+    );
+}
+
+/// With `holds`, a pass whose published snapshot has had its holds for
+/// seven hours, and no progress for five, says each stall: a preview, which
+/// makes no progress of its own, on the holds issue with no log to name,
+/// and on each epic or P0 and P1 item held by something the pass is stuck
+/// on, not on those that wait on a person.
+#[test]
+fn preview_says_the_stalls() {
+    let at = json!({"repository": "cgwalters-forge/bot-ops", "issue": 1});
+    let config = config(json!({"holds": at}));
+    let report = preview(&config, &replay());
+    let now = replay().now;
+    let hours_ago = |h: i64| {
+        (now - Duration::from_secs(h as u64 * 3600))
+            .format(&Rfc3339)
+            .unwrap()
+    };
+    let mut published = holds::snapshot(&report.holds, hours_ago(7), report.tally.clone());
+    published.pass.progress_at = hours_ago(5);
+    let stuck: Vec<String> = (published.holds.iter())
+        .filter(|h| h.kind.stalls() && !h.operator)
+        .filter(|h| h.epic || matches!(h.priority.as_deref(), Some("P0" | "P1")))
+        .filter_map(|h| h.item.clone())
+        .collect();
+    assert!(!stuck.is_empty(), "the board has a hold to stall on");
+    let mut replay = replay();
+    let body = holds::render(&published).unwrap();
+    let comments = &mut answer(&mut replay, "bot-ops/issues/1/comments")["body"];
+    let comment = json!({"id": 7, "user": {"login": "cgwalters-bot"}, "body": body});
+    comments.as_array_mut().unwrap().push(comment);
+    let report = preview(&config, &replay);
+    let stalls: Vec<&String> = (report.lines.iter())
+        .filter(|l| l.starts_with("stall "))
+        .collect();
+    // Stage 4's candidates less those waiting by design.
+    let idle = format!(
+        "stall idle: no apply, dispatch or merge for 4 hours or more, since {}, with ",
+        hours_ago(5)
+    );
+    let free: usize = (stalls.last().and_then(|l| l.strip_prefix(&idle)))
+        .and_then(|l| l.strip_suffix(" candidate(s) free to start"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{stalls:#?}"));
+    assert!((1..report.tally.1.candidates.unwrap()).contains(&free));
+    let held: Vec<String> = (stalls.iter())
+        .filter_map(|l| l.strip_prefix("stall hold "))
+        .map(|l| {
+            l.trim_start_matches("epic ")
+                .split(':')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(held, stuck);
+    let since = format!(
+        "the same hold for 6 hours or more, since {}: ",
+        hours_ago(7)
+    );
+    assert!(
+        stalls[..held.len()].iter().all(|l| l.contains(&since)),
+        "{stalls:#?}"
     );
 }
 
@@ -7323,6 +7387,19 @@ fn config_table() {
             "starts stallAfterMinutes is not 10 to 10080",
         ),
         (json!({"starts": {"stall": 60}}), "unknown field `stall`"),
+        (json!({"stall": {}}), "stall needs holds"),
+        (
+            json!({"stall": {"holdHours": 0}, "holds": {"repository": "o/ops", "issue": 1}}),
+            "stall holdHours is not 1 to 168",
+        ),
+        (
+            json!({"stall": {"idleHours": 169}, "holds": {"repository": "o/ops", "issue": 1}}),
+            "stall idleHours is not 1 to 168",
+        ),
+        (
+            json!({"stall": {"holdHour": 6}, "holds": {"repository": "o/ops", "issue": 1}}),
+            "unknown field `holdHour`",
+        ),
         (
             json!({"revisit": {"perPass": 1, "afterDays": 14}}),
             "revisit needs triage",

@@ -654,18 +654,13 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             return;
         }
         let on = (at.repository.as_str(), at.issue);
-        let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let said = format!("holds: publish to {}#{}", at.repository, at.issue);
-        let tally = self.report.tally.clone();
-        let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
-        snapshot.leases = self.report.leases.clone();
-        let fitted = holds::fit(snapshot);
-        let comment = fitted.and_then(|fitted| {
-            let comment = self.bot_comment(on, holds::HOLDS_MARKER, "hold snapshot")?;
-            Ok((fitted, comment))
-        });
-        let changed = comment.and_then(|((snapshot, body), comment)| {
+        // The published snapshot first: its holds' times carry over.
+        let comment = self.bot_comment(on, holds::HOLDS_MARKER, "hold snapshot");
+        let changed = comment.and_then(|comment| {
             let published = comment.as_ref().map(|c| text(c, "/body"));
+            let snapshot = self.hold_snapshot(published.and_then(holds::published).as_ref());
+            let (snapshot, body) = holds::fit(snapshot)?;
             Ok((holds::changed(published, &snapshot)?, body, comment))
         });
         let (body, comment) = match changed {
@@ -697,6 +692,46 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 self.line(format!("holds error: {said}: {error:#}"));
             }
         }
+    }
+
+    /// Stages 3 and 4's holds as a snapshot at this pass's clock, with what
+    /// carries over from `previous`, the published one's JSON, and the
+    /// stall alarms, each said in a `stall …` line ([`holds::alarm`]).
+    fn hold_snapshot(&mut self, previous: Option<&Value>) -> holds::Snapshot {
+        let stamp = self.now.format(&Rfc3339).unwrap_or_default();
+        let tally = self.report.tally.clone();
+        let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
+        snapshot.leases = self.report.leases.clone();
+        let started = snapshot.pass.started.saturating_sub(self.not_started);
+        let progressed = self.apply && (started > 0 || self.progressed > 0);
+        let considered = snapshot.pass.candidates.is_some();
+        holds::carry(&mut snapshot, previous, (progressed, considered));
+        let Some(at) = &self.config.holds else {
+            return snapshot;
+        };
+        let on = ItemRef {
+            host: DEFAULT_HOST.into(),
+            repository: at.repository.clone(),
+            number: at.issue,
+        };
+        let top = (self.top.clone()).unwrap_or_else(|| DEFAULT_TOP.map(str::to_owned).to_vec());
+        let default = holds::Stall::default();
+        let watch = holds::Watch {
+            stall: self.config.stall.as_ref().unwrap_or(&default),
+            top: &top,
+            on: &on,
+            log: (self.own).map(|own| {
+                format!(
+                    "https://{DEFAULT_HOST}/{}/actions/runs/{}",
+                    own.repository, own.id
+                )
+            }),
+            free: self.free,
+        };
+        for line in holds::alarm(&mut snapshot, previous, &watch) {
+            self.line(line);
+        }
+        snapshot
     }
 }
 

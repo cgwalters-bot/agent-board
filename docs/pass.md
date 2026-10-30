@@ -65,12 +65,13 @@ candidate stage 4 holds (`hold OWNER/REPO#N: R`), each epic stage 3 holds
 wip|pools|budget: R`) is one entry:
 
 ```json
-{"item":"cgwalters-forge/tracker#596","url":"https://github.com/cgwalters-forge/tracker/issues/596","epic":true,"kind":"epic-unplanned","reason":"its planning request URL got no plan, nor did URL0 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (its run 77 ended failure). What should change?","operator":true,"priority":"P1","question":null}
+{"item":"cgwalters-forge/tracker#596","url":"https://github.com/cgwalters-forge/tracker/issues/596","epic":true,"kind":"epic-unplanned","reason":"its planning request URL got no plan, nor did URL0 before it; a person comments on the epic to plan it again; label needs-human, Why Q: Planning this epic got no plan twice (its run 77 ended failure). What should change?","operator":true,"priority":"P1","question":null,"since":"2026-10-28T18:24:18Z"}
 ```
 
 `reason` is the text after `hold …: ` on its line, `priority` the item's board
 Priority and `question` what its board Why asks after a leading `Q:`, each null
-where there is none; a hold of every new run has a null `item`, `url`,
+where there is none; `since` is when the snapshots first had the hold
+([stall alarms](#stall-alarms)); a hold of every new run has a null `item`, `url`,
 `priority` and `question`. `operator` is true for the kinds only the operator
 releases: `needs-human` (labelled so, by a person or a triage verdict),
 `epic-unplanned` (an epic's planning request got no plan) and
@@ -109,7 +110,8 @@ an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),
 `unreadable` (labels, pull
 requests, a parent epic, a plan's target or the runs not read whole), `wip`,
 `pools`, `budget` (the week's spend reached `budget.weeklyUsd`, or has no
-reading; see below) and `other`; a reader shows a kind it does not know as
+reading; see below), `other` and `stalled` (not a hold but a
+[stall alarm](#stall-alarms), with `operator` true); a reader shows a kind it does not know as
 `other`. Entries are sorted by repository and number, the holds of every new
 run first. A candidate whose consideration failed (`fail …`) or that the pass
 did not reach has none.
@@ -133,9 +135,10 @@ goes on. The holds issue, like the usage issue, is never a candidate.
 `wip` is `{"limit", "in_flight"}`: the `wip` setting, and the runs holding
 a slot once stage 4 counted them, its own starts included (null where it
 did not get that far). `pass` is `{"mode", "candidates", "started",
-"live_epics"}`: `preview`, `actions` or `local`; stage 4's
+"live_epics", "progress_at"}`: `preview`, `actions` or `local`; stage 4's
 `candidates: N …`; the runs stages 2 to 4 started, or in a preview would
-start; and the sum of stage 3's `epics: N live …`. `candidates` and
+start; the sum of stage 3's `epics: N live …`; and when an applying pass
+last made progress ([stall alarms](#stall-alarms)). `candidates` and
 `live_epics` are null where their stage did not get that far. With
 `revisit` set, `pass` also has `revisited`, the [revisits](#revisits) among
 `started` (null where stage 4 did not get that far); without it the key is
@@ -1088,6 +1091,70 @@ one write within `--max-writes`, only with the bot's token, and none in a
 preview. A pass that stops before its candidates (WIP full, no pool, the
 budget, another pass) leaves the stall's issue as it is.
 
+## Stall alarms
+
+Holds the pass logs accurately on every run can still be a stall nobody
+sees: one refused epic plan once held nine others for over 30 hours
+(agent-board#453). So, wherever `holds` is set (agent-board#454), the pass
+reads its published snapshot before it builds the next, and carries two
+times over from it. Each hold's `since` is the published one's where the
+same hold was there: the same `item`, `epic` and `kind`, and the same
+`reason` once each RFC 3339 time in it (`2026-10-28T18:24:18Z`, with or
+without fractional seconds or an offset) is set aside, so that a hold whose
+only change is a time is not new, while a new plan (`plan 6477159836@T`
+after `6477159835@T`) is. Otherwise `since` is the snapshot's `at`. A pass
+whose stage 4 did not get as far as its candidates (`candidates` null: the
+WIP limit, pools or the budget held every new run) keeps the published
+item holds, and the entries for parents that are not live epics, as they
+were, as the last it read, with any alarms already raised on them, so that
+a WIP-full pass does not start their `since` again; it raises no new alarm
+on a hold it did not read. The pass's `progress_at` is the snapshot's `at`
+where this pass, applying, started a run that did not fail to start and
+that `--max-dispatch` did not hold (stages 2 to 4, `started` above), applied an epic plan that changed something, or merged
+a pull request or added it to a merge queue; otherwise the published
+one's, or `at` where there is none. A time that does not parse, or is later than
+`at`, carries nothing over. Either alarm is one more entry of kind
+`stalled`, with `operator` true so that the review app shows it as the
+operator's, and a `stall …` line in the pass's log:
+
+- **The same hold too long.** A hold of kind `other`, `unreadable` or
+  `overlap`, the ones that say the pass itself is stuck, on an epic stage 3
+  holds or on a candidate at the board's first two Priority options (P0
+  and P1; those names where stage 4 did not read the board), that has had
+  the same `since` for `stall.holdHours` or more. Its alarm follows it, on
+  the same `item`, `url`, `epic` and `priority`, `since` the hold's, and
+  says `stall hold [epic ]OWNER/REPO#N: the same hold for H hours or more,
+  since T: REASON`, the reason with its times as `<time>` and cut to 300
+  characters. Past ten such alarms, one more entry on the holds issue
+  counts and names the rest, which have their lines. Holds that wait by design are exempt: every hold that
+  already waits on the operator, and `needs-human`, `needs-design`,
+  `blocked`, `closed`, `waiting-on`, `pr-open`, `in-flight`, `dispatched`,
+  `triage-cooldown`, `epic-not-live`, `outside-epics` and
+  `overlap-ignored`.
+- **No progress.** Where stage 4 has candidates free to start and
+  `progress_at` is `stall.idleHours` or more before `at`, one entry on the holds issue
+  itself (`item` `holds.repository#holds.issue`, its `url`), `since`
+  `progress_at`: `stall idle: no apply, dispatch or merge for H hours or
+  more, since T, with N candidate(s) free to start; see the pass log URL`.
+  A candidate is one stage 4 ranked (not a child under a parent that is
+  not a live epic, nor an item it could not read before ranking), and it
+  is free unless held for a reason that waits by design, or on the
+  operator, as above: one in flight, with a pull request open, or
+  waiting on another is no stall. Past a hold of every new run (`pools`
+  partway through, say) only those held for a reason that stalls count. The log is the
+  GitHub Actions run of the pass that first said so (none outside one),
+  kept while the alarm stands, since the review app links only an
+  item's own issue.
+
+Neither reason counts the hours gone by, so a snapshot that stays stalled
+stays the same and is not published again. Each pass works the alarms out
+afresh, so one clears itself once its hold changes, or once a pass makes
+progress or has no candidate free to start. A preview says them too but never makes
+progress of its own. Past the comment's 60,000-character cap, the alarms
+are left out after every other hold that does not wait on the operator,
+so that they never keep the holds from being published; item holds left
+out lose their `since`, though a P0 or P1 one is among the last left out.
+
 ## Reviews
 
 The review job starts on every `pull_request_target` push, on the model the
@@ -1664,6 +1731,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `usage.probe` | Let a pool with no reading and no request since the broker started take one run a pass; `false` |
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
+| `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
 | `reruns` | Re-run failed required checks once per head, or a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
 | `starts.breakerRuns`, `starts.stallAfterMinutes` | Re-run a stage 4 run that failed before its agent started and leave its plan unspent; stop starting where this many (2–10) of the newest ended runs failed so with the same first error line; raise an alarm where nothing started for this many minutes (10–10080) with slots free, see [start failures](#start-failures); needs `epics.repository` to be `dispatchRepo`; `3`, `60`; section absent (off) |

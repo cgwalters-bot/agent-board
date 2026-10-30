@@ -1244,6 +1244,7 @@ mod tests {
                     git_ref: None,
                 }),
                 dispatched: 0,
+                merged: 0,
                 queues: BTreeMap::new(),
                 updated: Default::default(),
                 outages: None,

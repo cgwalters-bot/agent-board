@@ -3209,6 +3209,8 @@ pub struct Outcome {
     pub in_flight: usize,
     /// The runs this pass started, which a caller counts against its capacity.
     pub dispatched: usize,
+    /// The pull requests this pass merged or added to a merge queue.
+    pub merged: usize,
     /// The review job's runs an earlier pass started that still run, outside
     /// the caller's workflow, which a caller counts against its capacity too.
     pub reviewing: usize,
@@ -3227,6 +3229,8 @@ struct Pass<'a, R, G> {
     remaining: usize,
     apply: Option<Apply<'a, R>>,
     dispatched: usize,
+    /// See [`Outcome::merged`].
+    merged: usize,
     /// Each merge queue read, by repository and base branch: whether all its
     /// entries were read, and the entries and their files, with what this pass
     /// added to it after.
@@ -3913,6 +3917,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     if let Some((_, entries)) = self.queues.get_mut(&(repo.to_owned(), base)) {
                         entries.push((number, changed(pull)));
                     }
+                    self.merged += 1;
                     Ok(Some("added to the merge queue".into()))
                 } else if !checks.every {
                     // The queue was removed since the checks were judged on
@@ -3940,6 +3945,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         &MERGE.replace("mergeMethod: REBASE", &format!("mergeMethod: {method}")),
                         json!({"id": id, "head": head}),
                     )?;
+                    self.merged += 1;
                     Ok(Some("merged".into()))
                 }
             }
@@ -5729,6 +5735,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         remaining: POLL_REQUEST_LIMIT,
         apply,
         dispatched: 0,
+        merged: 0,
         queues: BTreeMap::new(),
         updated: BTreeSet::new(),
         outages: None,
@@ -5865,6 +5872,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         state.interval_seconds
     };
     outcome.dispatched = pass.dispatched;
+    outcome.merged = pass.merged;
     outcome.reviewing = pass.reviewing;
     outcome.state = State {
         interval_seconds: next_interval(previous, active),
@@ -9524,6 +9532,7 @@ mod tests {
                     "{queue} {login} {oid} {ci}: {:?}",
                     outcome.lines
                 );
+                assert_eq!(outcome.merged, usize::from(merged));
                 if merged {
                     assert_eq!(
                         writes[0].1,
@@ -14377,6 +14386,7 @@ mod tests {
             remaining: POLL_REQUEST_LIMIT,
             apply: None,
             dispatched: 0,
+            merged: 0,
             queues: BTreeMap::new(),
             updated: BTreeSet::new(),
             outages: None,

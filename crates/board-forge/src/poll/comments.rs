@@ -2840,6 +2840,7 @@ pub(super) mod tests {
                 remaining,
                 apply: Some(apply),
                 dispatched: 0,
+                merged: 0,
                 queues: BTreeMap::new(),
                 updated: Default::default(),
                 outages: None,

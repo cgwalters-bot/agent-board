@@ -185,8 +185,12 @@ const REPLAN: &str = "The board pass asks a triage run to plan the rest of this 
 /// How many of the board's first Priority options (P0 and P1) are its top
 /// ([`top_priority`]): an issue's own body plan is taken for these, with
 /// [`Config::body_plans`], and a child held under a parent that is not a
-/// live epic waits on the operator at these.
+/// live epic waits on the operator at these, as does a hold that stays the
+/// same too long ([`holds::alarm`]).
 const TOP_PRIORITIES: usize = 2;
+/// The board's first [`TOP_PRIORITIES`] Priority options where the pass did
+/// not read the board.
+const DEFAULT_TOP: [&str; TOP_PRIORITIES] = ["P0", "P1"];
 /// What the copy of an issue's body plan posted by [`Scheduler::consider`]
 /// says first.
 const BODY_PLAN: &str = "The board pass takes this issue's plan from its body.";
@@ -399,6 +403,9 @@ pub struct Config {
     pub usage: Option<Usage>,
     /// Off unless set.
     pub holds: Option<HoldsAt>,
+    /// The stall alarms in the hold snapshot, on wherever `holds` is: this
+    /// only tunes them ([`holds::alarm`]).
+    pub stall: Option<holds::Stall>,
     /// Off unless set: stage 4 reaps the leases in `dispatchRepo` and counts
     /// the rest toward `wip` ([`lease`]).
     #[serde(default)]
@@ -872,6 +879,10 @@ impl Config {
         if let Some(holds) = &self.holds {
             validate_repository(&holds.repository).context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
+        }
+        if let Some(stall) = &self.stall {
+            ensure!(self.holds.is_some(), "stall needs holds");
+            stall.check()?;
         }
         if let Some(direction) = &self.direction {
             let at = &direction.repository;
@@ -1544,11 +1555,17 @@ pub fn rank(options: &[String], epic: Option<&str>, own: Option<&str>, facts: &F
     )
 }
 
+/// The board's first [`TOP_PRIORITIES`] Priority options of `options`.
+fn top(options: &[String]) -> &[String] {
+    &options[..options.len().min(TOP_PRIORITIES)]
+}
+
 /// Whether `facts`'s own Priority is among the board's first
 /// [`TOP_PRIORITIES`] options.
 fn top_priority(options: &[String], facts: &Facts) -> bool {
-    let top = &options[..options.len().min(TOP_PRIORITIES)];
-    top.iter().any(|p| facts.priority.as_ref() == Some(p))
+    top(options)
+        .iter()
+        .any(|p| facts.priority.as_ref() == Some(p))
 }
 
 // ---- The forge, bounded ----
@@ -1934,6 +1951,10 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         alarms: None,
         direction: None,
         reviewing: 0,
+        progressed: 0,
+        not_started: 0,
+        free: None,
+        top: None,
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
@@ -2228,6 +2249,18 @@ struct Scheduler<'a, C> {
     /// ([`poll::Outcome::reviewing`]): outside the caller's workflow, so
     /// counted toward `wip` here rather than listed.
     reviewing: usize,
+    /// The epic plans applied with changes and the pull requests merged or
+    /// added to a merge queue; with the runs started, but for those that
+    /// failed to start or that `--max-dispatch` held (`not_started`), what
+    /// an applying pass counts as progress ([`holds::alarm`]).
+    progressed: usize,
+    not_started: usize,
+    /// Stage 4's candidates free to start ([`holds::free`]), once it
+    /// considered them.
+    free: Option<usize>,
+    /// The board's first [`TOP_PRIORITIES`] Priority options, once stage 4
+    /// read the board.
+    top: Option<Vec<String>>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2308,6 +2341,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.report.failures += outcome.errors;
                 self.report.state = Some(outcome.state);
                 self.reviewing = outcome.reviewing;
+                self.progressed += outcome.merged;
                 outcome.dispatched
             }
             Err(error) => {
@@ -2407,6 +2441,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.board = Some(None);
             return board.map(|_| ());
         };
+        self.top = Some(top(&board.options).to_vec());
         if config.reruns || config.starts.is_some() {
             match self.failed_runs(&target) {
                 Ok(failed) => self.failed = failed,
@@ -2435,7 +2470,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
         let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
         let taken = started + revisited + swept;
+        let ranked: Vec<ItemRef> = candidates.iter().map(|(_, f)| f.issue.clone()).collect();
         drop(candidates);
+        self.free = holds::free(Some(&ranked), &self.report.holds[holds..]);
         self.board = Some(Some(board));
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
@@ -2544,6 +2581,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.caps.count(Kind::Dispatch);
         if failed {
             self.report.failures += 1;
+            self.not_started += 1;
         }
         for held in holds {
             let started = || "started in this pass".to_owned();
