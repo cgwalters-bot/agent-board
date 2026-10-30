@@ -689,6 +689,9 @@ struct Forge {
     /// the pass went through them.
     relisted: Cell<Option<fn(&mut Value)>>,
     listings: Cell<usize>,
+    comment_reads: RefCell<BTreeMap<u64, usize>>,
+    changed_plan: Cell<Option<(u64, usize)>>,
+    link_fails: Cell<bool>,
 }
 
 impl Forge {
@@ -701,6 +704,9 @@ impl Forge {
             why_fails: Cell::new(false),
             relisted: Cell::new(None),
             listings: Cell::new(0),
+            comment_reads: RefCell::new(BTreeMap::new()),
+            changed_plan: Cell::new(None),
+            link_fails: Cell::new(false),
         }
     }
 
@@ -788,6 +794,9 @@ impl Transport for Forge {
         .iter()
         .find(|m| query.contains(*m))
         {
+            if self.link_fails.get() && *name == "addSubIssue(" {
+                bail!("link refused after create");
+            }
             if self.why_fails.get() && variables["field"] == "F_why" {
                 bail!("{WHY_FIELD} update refused");
             }
@@ -818,12 +827,379 @@ impl Transport for Forge {
             .pointer_mut("/repository/issue/comments/nodes")
             .and_then(Value::as_array_mut)
         {
+            let number = variables["number"].as_u64().unwrap();
+            let mut reads = self.comment_reads.borrow_mut();
+            let count = reads.entry(number).or_default();
+            *count += 1;
+            if self
+                .changed_plan
+                .get()
+                .is_some_and(|(n, at)| n == number && *count >= at)
+            {
+                for node in nodes
+                    .iter_mut()
+                    .filter(|n| has_fence(text(n, "/body"), EPIC_PLAN_FENCE))
+                {
+                    node["lastEditedAt"] = self.replay.now.format(&Rfc3339).unwrap().into();
+                    node["editor"] = json!({"login": "cgwalters-bot"});
+                }
+            }
             let on = format!("/issues/{}#", variables["number"]);
             let added = self.added.borrow();
             let here = added.iter().filter(|c| text(c, "/url").contains(&on));
             nodes.extend(here.cloned());
         }
         Ok(data)
+    }
+}
+
+/// Three pending plans in scheduling order. Only the first is invalid.
+fn queued_plans() -> Replay {
+    let mut replay = replay();
+    invalid_596(&mut replay);
+    let third = {
+        let mut node = node(&replay, 890).clone();
+        node["number"] = 891.into();
+        node
+    };
+    for entry in &mut replay.requests {
+        if let Some(nodes) = entry["answer"].pointer_mut("/data/repository/issues/nodes") {
+            let nodes = nodes.as_array_mut().unwrap();
+            nodes.retain(|n| n["number"] != 766);
+            nodes.push(third.clone());
+        }
+    }
+    let mut third_comments = replay
+        .requests
+        .iter()
+        .find(|e| e["request"].to_string().contains(COMMENTS_890))
+        .unwrap()
+        .clone();
+    third_comments["request"]["variables"]["number"] = 891.into();
+    third_comments["answer"]["data"]["repository"]["issue"]["comments"]["nodes"] = json!([]);
+    replay.requests.push(third_comments);
+    let third_reads: Vec<_> = replay
+        .requests
+        .iter()
+        .filter(|e| {
+            e["request"]["variables"]["number"] == 890
+                && e["answer"]
+                    .pointer("/data/repository/issue/comments")
+                    .is_none()
+        })
+        .map(|e| {
+            let mut copy = e.clone();
+            copy["request"]["variables"]["number"] = 891.into();
+            copy
+        })
+        .collect();
+    replay.requests.extend(third_reads);
+    for (number, needle) in [
+        (890, COMMENTS_890),
+        (891, "\"after\":null,\"name\":\"tracker\",\"number\":891,"),
+    ] {
+        let body = format!(
+            "```{EPIC_PLAN_FENCE}\n{}\n```",
+            json!({
+                "schema": crate::epic::EPIC_PLAN_SCHEMA,
+                "epic": format!("cgwalters-forge/tracker#{number}"), "actions": []
+            })
+        );
+        let plan = posted(
+            &replay,
+            number,
+            number + 7_000_000_000,
+            "cgwalters-bot",
+            5,
+            &body,
+        );
+        *comments(&mut replay, needle) = vec![plan];
+        census(&mut replay, number);
+    }
+    replay
+}
+
+#[test]
+fn refused_first_valid_second_and_third_waits() {
+    for apply in [false, true] {
+        let forge = Forge::new(queued_plans());
+        let report = if apply {
+            local(&forge, 10)
+        } else {
+            preview(&config(json!({})), &forge.replay)
+        };
+        let lines = stage(&report);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("#596: plan") && l.contains("is not applied")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("apply epic cgwalters-forge/tracker#890")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("#891:") && l.contains("one epic plan is applied a pass")),
+            "{lines:#?}"
+        );
+        assert_eq!(report.failures, 0, "{lines:#?}");
+        assert_eq!(forge.written().len(), if apply { 2 } else { 0 });
+    }
+}
+
+fn closed_target_596(replay: &mut Replay, minutes: i64, extra: Value) {
+    invalid_596(replay);
+    let target = &epic_answer(replay, 596)["repository"]["issue"]["subIssues"]["nodes"][0];
+    let mut action = json!({"type": "rescope_sub_issue", "issue": format!("{}#{}",
+        target["repository"]["nameWithOwner"].as_str().unwrap(), target["number"]),
+        "body": "Smaller.", "reason": "Split."});
+    action
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let body = format!(
+        "```{EPIC_PLAN_FENCE}\n{}\n```",
+        json!({
+            "schema": crate::epic::EPIC_PLAN_SCHEMA, "epic": "cgwalters-forge/tracker#596", "actions": [action]
+        })
+    );
+    let plan = posted(replay, 596, 7_000_000_003, "cgwalters-bot", minutes, &body);
+    *comment(replay, COMMENTS_596, "-7000000003") = plan;
+}
+
+#[test]
+fn closed_targets_request_a_whole_new_plan_then_wait() {
+    let mut snapshot = replay();
+    closed_target_596(&mut snapshot, 2 * 24 * 60, json!({}));
+    // Preview requests a new whole plan, not a subset or a write on a child.
+    {
+        let report = preview(&config(json!({})), &snapshot);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            stage(&report).iter().any(|l| l
+                .starts_with("start planning cgwalters-forge/tracker#596")
+                && l.contains("has closed since")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            !stage(&report)
+                .iter()
+                .any(|l| l.starts_with("apply epic cgwalters-forge/tracker#596"))
+        );
+        // The resulting dispatch record is the state the next pass sees.
+        requested(&mut snapshot, 1);
+        run_77(&mut snapshot, None);
+        for _ in 0..2 {
+            let waiting = preview(&config(json!({})), &snapshot);
+            assert!(
+                stage(&waiting)
+                    .iter()
+                    .any(|l| l.contains("#596:") && l.contains("waits for")),
+                "{:#?}",
+                waiting.lines
+            );
+            assert!(
+                !stage(&waiting)
+                    .iter()
+                    .any(|l| l.starts_with("start planning") && l.contains("#596"))
+            );
+        }
+    }
+    // An unanswered stale-plan request is held for the operator after a day,
+    // rather than repeatedly asking a planner that keeps naming closed issues.
+    let mut retry = replay();
+    closed_target_596(&mut retry, 3 * 24 * 60, json!({}));
+    requested(&mut retry, 2 * 24 * 60);
+    let ask = posted(
+        &retry,
+        596,
+        7_000_000_000,
+        "cgwalters-bot",
+        2 * 24 * 60 + 1,
+        &format!("{STALE_INTRO}."),
+    );
+    comments(&mut retry, COMMENTS_596).push(ask);
+    run_77(&mut retry, Some(2 * 24 * 60 - 60));
+    let report = preview(&config(json!({})), &retry);
+    assert!(
+        stage(&report)
+            .iter()
+            .any(|l| l.contains("#596:") && l.contains("a person replaces it")),
+        "{:#?}",
+        report.lines
+    );
+}
+
+#[test]
+fn closed_target_mixed_invalidity_and_human_holds() {
+    for (minutes, extra, held, expected) in [
+        (
+            2 * 24 * 60,
+            json!({"value": "not-a-priority"}),
+            false,
+            "a person replaces it",
+        ),
+        (
+            2 * 24 * 60,
+            json!({"unknown": true}),
+            false,
+            "a person replaces it",
+        ),
+        (2 * 24 * 60, json!({}), true, "labelled needs-design"),
+    ] {
+        let mut replay = replay();
+        closed_target_596(&mut replay, minutes, extra);
+        if held {
+            label_596(&mut replay, &["needs-design"]);
+        }
+        for apply in [false, true] {
+            let forge = Forge::new(Replay {
+                now: replay.now,
+                requests: replay.requests.clone(),
+            });
+            let report = if apply {
+                local(&forge, 0)
+            } else {
+                preview(&config(json!({})), &forge.replay)
+            };
+            assert!(
+                stage(&report)
+                    .iter()
+                    .any(|l| l.contains("#596:") && l.contains(expected)),
+                "{:#?}",
+                report.lines
+            );
+            assert!(
+                !stage(&report)
+                    .iter()
+                    .any(|l| l.starts_with("start planning") && l.contains("#596"))
+            );
+            assert!(forge.written().is_empty());
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        }
+    }
+}
+
+#[test]
+fn stale_plans_preserve_in_flight_requests_and_configuration_refusals() {
+    for busy in [false, true] {
+        let mut replay = replay();
+        closed_target_596(&mut replay, 2 * 24 * 60, json!({}));
+        if busy {
+            requested(&mut replay, 60);
+            let body = &mut answer(&mut replay, "status=queued")["body"];
+            body["total_count"] = 1.into();
+            body["workflow_runs"] = json!([{"id": 77, "display_title": "triage cgwalters-forge/tracker#596 (claude)",
+                "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/77"}]);
+        } else {
+            // Also structurally valid with closed targets relaxed, but not
+            // permitted by pass's apply configuration: not stale-only.
+            let plan = comment(&mut replay, COMMENTS_596, "-7000000003");
+            let mut value = fenced_json(text(plan, "/body"), EPIC_PLAN_FENCE)
+                .unwrap()
+                .unwrap();
+            value["actions"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": "close_epic", "reason": "Done"}));
+            plan["body"] = format!("```{EPIC_PLAN_FENCE}\n{value}\n```").into();
+        }
+        let report = preview(&config(json!({})), &replay);
+        let expected = if busy {
+            "it was planned again, which it waits for"
+        } else {
+            "configuration does not allow"
+        };
+        assert!(
+            stage(&report)
+                .iter()
+                .any(|l| l.contains("#596:") && l.contains(expected)),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            !stage(&report)
+                .iter()
+                .any(|l| l.starts_with("start planning") && l.contains("#596"))
+        );
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    }
+}
+
+#[test]
+fn changed_plan_before_validation_does_not_take_slot() {
+    let forge = Forge::new(queued_plans());
+    forge.changed_plan.set(Some((596, 2)));
+    let report = local(&forge, 10);
+    let lines = stage(&report);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("#596:") && l.contains("changed since it was read")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("apply epic cgwalters-forge/tracker#890")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("#891:") && l.contains("one epic plan")),
+        "{lines:#?}"
+    );
+    assert_eq!(report.failures, 0, "{lines:#?}");
+}
+
+#[test]
+fn failure_after_admission_never_admits_another_apply() {
+    for race in [false, true] {
+        let mut replay = queued_plans();
+        if !race {
+            let plan = &mut comments(&mut replay, COMMENTS_890)[0];
+            let body = text(plan, "/body").replace("\"actions\":[]", "\"actions\":[{\"type\":\"create_sub_issue\",\"repo\":\"cgwalters-forge/agent-board\",\"title\":\"Slice\",\"body\":\"Work\"}]");
+            plan["body"] = body.into();
+        }
+        let forge = Forge::new(replay);
+        if race {
+            // Selection, preview validation, apply selection, pre-claim, post-claim.
+            forge.changed_plan.set(Some((890, 5)));
+        } else {
+            forge.link_fails.set(true);
+        }
+        let report = local(&forge, 10);
+        let lines = stage(&report);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("#891:") && l.contains("one epic plan")),
+            "{lines:#?}"
+        );
+        assert!(
+            forge
+                .written()
+                .iter()
+                .any(|w| w == "POST repos/cgwalters-forge/tracker/issues/890/comments"),
+            "{lines:#?}"
+        );
+        assert!(!forge.written().iter().any(|w| w.contains("/891/")));
+        assert_eq!(report.failures, usize::from(!race), "{lines:#?}");
+        let before = forge.written().len();
+        let again = local(&forge, 0);
+        assert_eq!(forge.written().len(), before, "{:#?}", again.lines);
+        assert!(
+            !stage(&again)
+                .iter()
+                .any(|l| l.starts_with("start planning") && l.contains("#890"))
+        );
     }
 }
 

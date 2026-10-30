@@ -269,6 +269,22 @@ pub struct EpicPlan {
     pub actions: Vec<Action>,
 }
 
+/// Validation succeeds only when the closed-target restriction is relaxed.
+/// The candidate is for classification only, never for execution.
+#[derive(Debug)]
+pub(crate) struct ClosedTargetsOnly {
+    pub candidate: EpicPlan,
+    diagnostic: String,
+}
+
+impl fmt::Display for ClosedTargetsOnly {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for ClosedTargetsOnly {}
+
 /// Correlation metadata only, never authority or a replay key. Restrict it to
 /// bounded ASCII so exposing it cannot inject output lines or comment markup.
 pub(crate) fn request(value: &Value) -> Result<Option<String>> {
@@ -372,6 +388,26 @@ impl EpicPlan {
     /// Errors in the plan as a whole stop at the first; each action is checked
     /// in full and every refused action named, so a planner sees all at once.
     pub fn validate(value: &Value, bounds: &Bounds, epic: &Epic) -> Result<Self> {
+        Self::validate_inner(value, bounds, epic, false).map_err(|error| {
+            if !epic.closed.is_empty()
+                && let Ok(candidate) = Self::validate_inner(value, bounds, epic, true)
+            {
+                let stale = ClosedTargetsOnly {
+                    candidate,
+                    diagnostic: format!("{error:#}"),
+                };
+                return error.context(stale);
+            }
+            error
+        })
+    }
+
+    fn validate_inner(
+        value: &Value,
+        bounds: &Bounds,
+        epic: &Epic,
+        allow_closed: bool,
+    ) -> Result<Self> {
         let object = value
             .as_object()
             .context("epic plan is not a JSON object")?;
@@ -410,6 +446,7 @@ impl EpicPlan {
         let mut checker = Checker {
             bounds,
             epic,
+            allow_closed,
             done: Vec::new(),
             seen: BTreeMap::new(),
         };
@@ -597,6 +634,7 @@ const CLOSE: &str = "close_sub_issue";
 struct Checker<'a> {
     bounds: &'a Bounds,
     epic: &'a Epic,
+    allow_closed: bool,
     /// The actions so far; `None` for a refused one.
     done: Vec<Option<Action>>,
     /// Each (type, issue) acted on, and the action that did; a slice stacked
@@ -624,7 +662,7 @@ impl Checker<'_> {
             !issue.same(&self.epic.issue),
             "{issue} is the epic itself; a plan may not change the epic's text, priority or labels"
         );
-        if self.epic.closed.iter().any(|s| s.same(&issue)) {
+        if !self.allow_closed && self.epic.closed.iter().any(|s| s.same(&issue)) {
             return Err(ClosedSubIssue(issue).into());
         }
         // Spelled as GitHub has it, not as the plan does.
@@ -632,6 +670,7 @@ impl Checker<'_> {
             .epic
             .sub_issues
             .iter()
+            .chain(self.epic.closed.iter().filter(|_| self.allow_closed))
             .find(|s| s.same(&issue))
             .with_context(|| {
                 format!(

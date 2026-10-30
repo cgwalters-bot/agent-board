@@ -720,7 +720,7 @@ pub(super) enum Replan {
 }
 
 /// Why an epic's newest plan was refused, in words, and whether only
-/// because a sub-issue it names closed since ([`crate::epic::ClosedSince`]).
+/// because a sub-issue it names closed since ([`crate::epic::ClosedTargetsOnly`]).
 struct Refusal {
     error: String,
     stale: bool,
@@ -1311,9 +1311,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return None;
             }
             Err(error) if error.downcast_ref::<epic_apply::Refused>().is_some() => {
+                let stale = error
+                    .downcast_ref::<crate::epic::ClosedTargetsOnly>()
+                    .is_some();
                 return Some(Refusal {
-                    stale: error.downcast_ref::<crate::epic::ClosedSince>().is_some(),
-                    error: format!("{error:#}"),
+                    stale,
+                    error: if stale {
+                        format!("{error}: {}", error.root_cause())
+                    } else {
+                        format!("{error:#}")
+                    },
                 });
             }
             Err(error) => {
@@ -1323,6 +1330,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         };
         // Only a plan apply accepts counts against the pass's applies.
+        // Admission is never released, even if later reads race or writes fail.
+        // Preview reserves the same slot and accounts the same write steps.
         turn.applied += 1;
         let words = match planned.lines.is_empty() {
             true => "no changes".to_owned(),

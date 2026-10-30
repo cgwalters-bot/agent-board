@@ -184,6 +184,19 @@ epic: a sub-issue that is itself an epic is treated as any sub-issue. Refused ar
 - more than 20 actions, titles over 256 characters, bodies over 60,000 and
   reasons over 4,000, and empty text.
 
+The pass treats an unclaimed plan whose only validation failures are actions
+targeting currently closed sub-issues as stale and requests a fresh whole plan.
+It never drops those actions, changes the closed children, or applies a subset.
+The classification checks the entire plan again with only the closed-target
+restriction relaxed, including the caller's opt-ins; mixed invalidity stays
+held for the operator. This does not relax `epic apply` or its preview: both
+still refuse the plan. The pass uses its existing planning-comment reuse and
+in-flight detection. It asks once for a stale plan to be replaced; an unanswered
+request after a day or a replacement that is stale again is held for the
+operator, not dispatched on every pass.
+Human holds and request, write and dispatch caps remain in force. Partial or
+ambiguous apply receipts remain held for recovery or operator inspection.
+
 ## Who may write one
 
 As for job plans: only the operator's (`--operator`) and the planner's
