@@ -93,6 +93,15 @@ impl Caps {
         limit.is_some_and(|limit| spent.get() >= limit)
     }
 
+    /// Whether one more step of `kind` would be exactly one past a cap
+    /// above zero: a step that may go past the cap ([`Kind::Write`]'s hold
+    /// snapshot of a pass that made progress) goes at most that far, and
+    /// never past a cap of zero, which allows nothing.
+    pub fn one_past(&self, kind: Kind) -> bool {
+        let (spent, limit) = self.of(kind);
+        limit.is_some_and(|limit| limit > 0 && spent.get() == limit)
+    }
+
     /// Before a step of `kind`: `None` where it may go ahead, else the
     /// words for its line, `held by --max-…`, and it is counted as held.
     pub fn check(&self, kind: Kind) -> Option<String> {

@@ -2176,8 +2176,9 @@ fn apply_publishes_the_refreshed_usage() {
 
 /// With `holds`, an applying pass publishes stages 3 and 4's holds by kind,
 /// sorted by item, to the bot's own comment on that issue: one write that
-/// `--max-writes` holds, only to a private repository, and none where the
-/// comment already has the same holds. tracker#446 is board Blocked and asks
+/// `--max-writes` holds, but for one past a cap above zero where the pass
+/// made progress, only to a private repository, and none where the comment
+/// already has the same holds. tracker#446 is board Blocked and asks
 /// a question in its Why, #527 has no Priority; at WIP 2 the two runs in
 /// flight hold every new run, and stage 3 still holds its epics. Spend at
 /// the weekly budget (WIP 0 below, which reads 8) holds every new run too,
@@ -2190,6 +2191,7 @@ fn apply_publishes_the_holds() {
     let publish = "holds: publish to cgwalters-forge/bot-ops#1";
     let not_private = format!("holds error: {publish}: cgwalters-forge/bot-ops is not private");
     let published = "holds: published ".to_owned();
+    let one_past = ", one past --max-writes: it has this pass's progress";
     // The WIP limit, the --max-writes cap, whether the repository is
     // private, the holds of the bot's hold comment if it has one ("same" as
     // the first case published), and what the pass says and writes.
@@ -2205,8 +2207,39 @@ fn apply_publishes_the_holds() {
         (8, None, true, None, published.clone(), Some(&add)),
         (8, None, true, Some("same"), "holds: unchanged".into(), None),
         (8, None, true, Some("old"), published.clone(), Some(&edit)),
+        // One past a cap the usage comment filled (a cap of 1 reads the
+        // broker) where the pass made progress, which is in this comment
+        // alone: here its starts.
         (
             8,
+            Some(1),
+            true,
+            None,
+            format!(
+                "{published}https://github.com/cgwalters-forge/bot-ops/issues/1#issuecomment-9000000022{one_past}"
+            ),
+            Some(&add),
+        ),
+        // Never past a cap of zero, nor a full one where nothing moved
+        // (at WIP 2 nothing starts).
+        (
+            2,
+            Some(1),
+            true,
+            None,
+            format!("held by --max-writes: {publish}"),
+            None,
+        ),
+        (
+            8,
+            Some(0),
+            true,
+            None,
+            format!("held by --max-writes: {publish}"),
+            None,
+        ),
+        (
+            2,
             Some(0),
             true,
             None,
@@ -2259,6 +2292,10 @@ fn apply_publishes_the_holds() {
             forge.replay.requests.push(request);
         }
         let mut settings = json!({"wip": wip, "holds": at});
+        if writes == Some(1) {
+            let broker = json!({"body": usage::tests::broker()});
+            with_broker(&mut forge.replay, &mut settings, broker);
+        }
         if budget {
             with_spend(&mut forge.replay, &mut settings, spend(1003.0));
         }
@@ -2269,6 +2306,14 @@ fn apply_publishes_the_holds() {
         let now = forge.replay.now;
         let mode = (Mode::Actions(&own()), limits);
         let config = config(settings);
+        if writes == Some(1) && wrote.is_some() {
+            // A preview says what its apply would.
+            let preview = (Mode::Preview, limits);
+            let report = block(run(&forge, &forge, &config, State::default(), preview, now));
+            let said = format!("{publish}{one_past}; a preview does not write it");
+            let lines = report.unwrap().lines;
+            assert!(lines.contains(&said), "{said}: {lines:#?}");
+        }
         let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
         assert!(
             report.lines.iter().any(|l| l.starts_with(&line)),
@@ -2276,6 +2321,9 @@ fn apply_publishes_the_holds() {
             report.lines
         );
         assert_eq!(report.failures, usize::from(!private), "{line}");
+        if writes == Some(1) && wrote.is_some() {
+            assert!(report.summary.contains("writes 2/1"), "{}", report.summary);
+        }
         let writes = forge.writes.borrow();
         let holds = writes
             .iter()

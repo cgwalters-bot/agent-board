@@ -23,7 +23,7 @@ pub struct Pass {
     /// Start at most N agent runs in this pass: pull request fix, rebase and continuation rounds, an epic's planning run, and scheduled starts. The rest are held, each line saying so.
     #[arg(long, value_name = "N")]
     pub max_dispatch: Option<usize>,
-    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage and hold snapshots, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage and hold comments' edits, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together.
+    /// Take at most N other write steps in this pass: forge writes such as comments, labels, merges, the usage and hold snapshots, epic plans and Status (a pull request's comment, label, retitle, retarget, enqueue or merge step, the usage and hold comments' edits, an epic plan's receipt and each of its actions that writes, and each item's Status change). A step is taken whole or held whole, and an epic plan's steps together. A pass that made progress publishes its hold snapshot one past a full cap above 0, so its progress is kept.
     #[arg(long, value_name = "N")]
     pub max_writes: Option<usize>,
     /// Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through.

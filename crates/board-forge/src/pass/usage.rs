@@ -654,7 +654,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
 
     /// Publishes stages 3 and 4's holds where [`Config::holds`] is set: one
     /// write step, skipped where the bot's hold comment already has the
-    /// same holds. A failure is one line, and the pass goes on.
+    /// same holds, and one past a `--max-writes` above zero where this pass
+    /// made progress, which the comment alone keeps. A failure is one line, and the pass
+    /// goes on.
     pub(in crate::pass) fn publish_holds(&mut self) {
         let Some(at) = &self.config.holds else {
             return;
@@ -693,23 +695,47 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 return;
             }
         };
-        if let Some(held) = self.caps.check(Kind::Write) {
+        // This pass's progress is in this comment and nowhere else: held, a
+        // later pass would raise the idle alarm from an older one. So it
+        // may go one past a cap, never past `--max-writes 0`; a preview
+        // says what its apply would.
+        let past = self.progress() && self.caps.one_past(Kind::Write);
+        let past_cap = match past {
+            true => ", one past --max-writes: it has this pass's progress",
+            false => "",
+        };
+        if !past && let Some(held) = self.caps.check(Kind::Write) {
             self.line(format!("{held}: {said}"));
             return;
         }
         if !self.apply {
             self.caps.count(Kind::Write);
-            self.line(format!("{said}; a preview does not write it"));
+            self.line(format!("{said}{past_cap}; a preview does not write it"));
             return;
         }
         let published = self.publish(on, comment.as_ref(), "hold", body);
         match published {
-            Ok(url) => self.line(format!("holds: published {url}")),
+            Ok(url) => self.line(format!("holds: published {url}{past_cap}")),
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("holds error: {said}: {error:#}"));
             }
         }
+    }
+
+    /// Whether this pass made progress for the idle alarm, or in a preview
+    /// would: started a run that did not fail to start and that
+    /// `--max-dispatch` did not hold, applied an epic plan that changed
+    /// something, or merged a pull request.
+    fn progress(&self) -> bool {
+        let started = (self.report.tally.1.started).saturating_sub(self.not_started);
+        started > 0 || self.progressed > 0
+    }
+
+    /// [`Self::progress`] that counts for the idle alarm ([`holds::carry`]):
+    /// only an applying pass's.
+    fn made_progress(&self) -> bool {
+        self.apply && self.progress()
     }
 
     /// Stages 3 and 4's holds as a snapshot at this pass's clock, with what
@@ -721,10 +747,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let tally = self.report.tally.clone();
         let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
         snapshot.leases = self.report.leases.clone();
-        let started = snapshot.pass.started.saturating_sub(self.not_started);
-        let progressed = self.apply && (started > 0 || self.progressed > 0);
         let considered = snapshot.pass.candidates.is_some();
-        holds::carry(&mut snapshot, previous, (progressed, considered));
+        holds::carry(&mut snapshot, previous, (self.made_progress(), considered));
         let Some(at) = &self.config.holds else {
             return snapshot;
         };
