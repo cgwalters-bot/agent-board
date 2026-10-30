@@ -5,7 +5,9 @@ const CONFIG: &str = include_str!("../../../../fixtures/pass/config.json");
 /// synthetic usage snapshot (the live one is private): claude under its
 /// pace, openai held over it. Stage 3's reads of the live epics tracker#596,
 /// #766 and #890 were recorded that evening, seeded with this recording,
-/// and appended to it ([`epics`]'s tests replay them at that time).
+/// and appended to it ([`epics`]'s tests replay them at that time). The
+/// reads of its two dispatched implement runs' merged pull requests were
+/// appended by hand, finding none ([`merged`] gives tracker#468's one).
 const BOARD: &str = include_str!("../../../../fixtures/pass/board-2026-10-23.json");
 
 fn at(stamp: &str) -> OffsetDateTime {
@@ -20,6 +22,39 @@ pub(super) fn replay() -> Replay {
     let mut replay = Replay::from_json(&serde_json::from_str(BOARD).unwrap()).unwrap();
     started(&mut replay, "2026-10-23T15:03:00Z");
     replay
+}
+
+/// tracker#468's implement run, whose dispatch record the recording has.
+const MERGED_RUN: u64 = 39718949900;
+
+/// tracker#468's implement run's head branch with one merged pull request
+/// by `author` saying `body`, merged into `base`.
+fn merged(replay: &mut Replay, author: &str, body: &str, base: &str) {
+    let branch = format!("{IMPLEMENT_BRANCH_PREFIX}{MERGED_RUN}\"");
+    answer(replay, &branch)["data"]["repository"]["pullRequests"]["nodes"] = json!([{
+        "url": "https://github.com/cgwalters-forge/tracker/pull/901", "body": body,
+        "mergedAt": "2026-10-22T12:00:00Z", "baseRefName": base, "author": {"login": author}}]);
+}
+
+/// [`merged`]: the bot's pull request closing tracker#468, into its default branch.
+fn closing(replay: &mut Replay) {
+    merged(replay, "cgwalters-bot", "Does it.\n\nCloses #468", "main");
+}
+
+/// tracker#468's recorded comments.
+fn comments_468(replay: &mut Replay) -> &mut Vec<Value> {
+    (replay.requests.iter_mut())
+        .filter_map(|e| e["answer"].pointer_mut("/data/repository/issue/comments/nodes"))
+        .filter_map(Value::as_array_mut)
+        .find(|n| (n.iter()).any(|c| text(c, "/url").ends_with("#issuecomment-6332112108")))
+        .unwrap()
+}
+
+/// tracker#468's variables and its [`close_read`], open and unlocked.
+fn close_read_468() -> (Value, Value) {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468});
+    let read = close_read(&variables, None, None);
+    (variables, read)
 }
 
 /// The recording's stuck run (see [`replay`]), started at `at`.
@@ -3208,7 +3243,7 @@ fn close_read(variables: &Value, locked: Option<String>, edited: Option<String>)
     let locks: Vec<Value> = (locked.iter()).map(|at| json!({"createdAt": at})).collect();
     json!({"repository": {"issue": {
         "url": format!("https://github.com/cgwalters-forge/{repo}/issues/{number}"),
-        "title": "Work", "body": "Work.", "createdAt": "2026-10-01T00:00:00Z",
+        "state": "OPEN", "title": "Work", "body": "Work.", "createdAt": "2026-10-01T00:00:00Z",
         "lastEditedAt": edited, "author": {"login": "cgwalters"},
         "editor": edited.as_ref().map(|_| json!({"login": "cgwalters"})),
         "locked": locked.is_some(), "locks": {"nodes": locks}, "unlocks": {"nodes": []},
@@ -4089,10 +4124,14 @@ fn closing_pull(replay: &mut Replay, (repo, number): (&str, u64), author: &str) 
 /// With `replanAfterDays`, an issue whose implement plan's run ended and
 /// that is still open is triaged once, that many days after the plan's
 /// dispatch record; a triage plan's record is left to `triageFollowUpDays`.
+/// Once the run's pull request merged, it is closed when that closes it, or
+/// else re-planned at once (agent-board#484).
 /// tracker#468's record last changed 2026-10-22T03:49:24Z, a day and a half
 /// before the recording. Each case: its settings, its edit of the
-/// recording, the issue, the start of its line in a first and in a second
-/// applying pass, and the intro of the one triage plan posted, if any.
+/// recording, the issue, how its two passes run, the start of its
+/// line in each, the start of the first comment posted, if any (the intro
+/// of the one triage plan dispatched, or the close's marker), and how many
+/// closes were sent.
 #[test]
 fn apply_replans_an_open_issue_after_its_run() {
     type Case = (
@@ -4100,41 +4139,236 @@ fn apply_replans_an_open_issue_after_its_run() {
         Value,
         fn(&mut Replay),
         (&'static str, u64),
-        [&'static str; 2],
+        (Pass, [&'static str; 2]),
         Option<&'static str>,
+        usize,
     );
+    /// How a case's passes run: applying, in a preview, or applying under
+    /// `--max-writes`.
+    #[derive(Clone, Copy)]
+    enum Pass {
+        Apply,
+        Preview,
+        Writes(usize),
+    }
+    use Pass::*;
     let held = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967";
+    let cooldown = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; re-planned from 2026-10-24T03:49:24Z";
+    let close = "hold cgwalters-forge/tracker#468: its dispatched pull request https://github.com/cgwalters-forge/tracker/pull/901 merged and finishes it; close as completed";
+    let capped = "hold cgwalters-forge/tracker#468: its dispatched pull request https://github.com/cgwalters-forge/tracker/pull/901 merged and finishes it; held by --max-writes: close as completed";
+    let closed = "hold cgwalters-forge/tracker#468: its dispatched pull request https://github.com/cgwalters-forge/tracker/pull/901 merged; closed already";
+    let outside = "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic";
+    let replanned = [
+        "start triage cgwalters-forge/tracker#468 pool=claude record=",
+        "hold cgwalters-forge/tracker#468: plan ",
+    ];
+    let marker = "<!-- agent-board-merged: https://github.com/cgwalters-forge/tracker/pull/901 -->";
     let tracker = |n| ("cgwalters-forge/tracker", n);
     let cases: Vec<Case> = vec![
+        (
+            "its pull request merged and closes it: closed, with one comment",
+            json!({}),
+            closing,
+            tracker(468),
+            (Apply, [close, close]),
+            Some(marker),
+            2,
+        ),
+        (
+            "a preview says it closes it, and writes nothing",
+            json!({}),
+            closing,
+            tracker(468),
+            (Preview, [close, close]),
+            None,
+            0,
+        ),
+        (
+            "--max-writes holds the close and its comment together",
+            json!({}),
+            closing,
+            tracker(468),
+            (Writes(1), [capped, capped]),
+            None,
+            0,
+        ),
+        (
+            "the pass's comment is there already: closed without another",
+            json!({}),
+            |r| {
+                closing(r);
+                let body = "<!-- agent-board-merged: https://github.com/cgwalters-forge/tracker/pull/901 -->\nThe board pass closed this issue as completed.";
+                let mut node = comment_node(1, "cgwalters-bot", body);
+                node["createdAt"] = "2026-10-23T00:00:00Z".into();
+                comments_468(r).push(node);
+            },
+            tracker(468),
+            (Apply, [close, close]),
+            None,
+            2,
+        ),
+        (
+            "closed already, it is not commented on",
+            json!({}),
+            |r| {
+                closing(r);
+                let (variables, mut read) = close_read_468();
+                read["repository"]["issue"]["state"] = "CLOSED".into();
+                r.requests
+                    .push(json!({"request": graphql_key(CLOSE_QUERY, &variables),
+                    "answer": {"data": read}}));
+            },
+            tracker(468),
+            (Apply, [closed, closed]),
+            None,
+            0,
+        ),
+        (
+            "reopened since it merged, it is not closed again",
+            json!({"replanAfterDays": 2}),
+            |r| {
+                closing(r);
+                let (variables, mut read) = close_read_468();
+                add_event(&mut read, "ReopenedEvent", "2026-10-23T00:00:00Z");
+                r.requests
+                    .push(json!({"request": graphql_key(CLOSE_QUERY, &variables),
+                    "answer": {"data": read}}));
+            },
+            tracker(468),
+            (Apply, [cooldown, cooldown]),
+            None,
+            0,
+        ),
+        (
+            "one by anyone but the bot does not count",
+            json!({"replanAfterDays": 2}),
+            |r| merged(r, "visitor", "Closes #468", "main"),
+            tracker(468),
+            (Apply, [cooldown, cooldown]),
+            None,
+            0,
+        ),
+        (
+            "one merged into another branch than the default does not count",
+            json!({"replanAfterDays": 2}),
+            |r| {
+                merged(
+                    r,
+                    "cgwalters-bot",
+                    "Closes #468",
+                    "dispatch/implement/agent-run-1",
+                )
+            },
+            tracker(468),
+            (Apply, [cooldown, cooldown]),
+            None,
+            0,
+        ),
+        (
+            "a batch's extra is left to its batch",
+            json!({"replanAfterDays": 2}),
+            |r| {
+                merged(r, "cgwalters-bot", "Does #540.", "main");
+                for node in comments_468(r) {
+                    if text(node, "/url").ends_with("#issuecomment-6332216967") {
+                        let body = format!(
+                            "{}\n<!-- {}: cgwalters-forge/tracker#540 -->",
+                            text(node, "/body"),
+                            batch::BATCH_MARKER
+                        );
+                        node["body"] = body.into();
+                    }
+                }
+            },
+            tracker(468),
+            (Apply, [cooldown, cooldown]),
+            None,
+            0,
+        ),
+        (
+            "outside every live epic under the triage scope epics, it is not closed",
+            json!({"replanAfterDays": 1, "triage": {"scope": "epics"}}),
+            closing,
+            tracker(468),
+            (Apply, [outside, outside]),
+            None,
+            0,
+        ),
+        (
+            "one `Part of` it re-plans it before its days",
+            json!({"replanAfterDays": 2}),
+            |r| merged(r, "cgwalters-bot", "Does some.\n\nPart of #468", "main"),
+            tracker(468),
+            (Apply, replanned),
+            Some(REPLAN),
+            0,
+        ),
+        (
+            "one that closes no issue re-plans it before its days too",
+            json!({"replanAfterDays": 2}),
+            |r| merged(r, "cgwalters-bot", "Does it.", "main"),
+            tracker(468),
+            (Apply, replanned),
+            Some(REPLAN),
+            0,
+        ),
+        (
+            "as does one closing another issue (#4680 is not #468)",
+            json!({"replanAfterDays": 2}),
+            |r| merged(r, "cgwalters-bot", "Closes #4680", "main"),
+            tracker(468),
+            (Apply, replanned),
+            Some(REPLAN),
+            0,
+        ),
+        (
+            "one short of a close, with re-planning off, is dispatched already",
+            json!({}),
+            |r| {
+                merged(
+                    r,
+                    "cgwalters-bot",
+                    "Part of cgwalters-forge/tracker#468.",
+                    "main",
+                )
+            },
+            tracker(468),
+            (Apply, [held, held]),
+            None,
+            0,
+        ),
         (
             "off, it is dispatched already",
             json!({}),
             |_| {},
             tracker(468),
-            [held, held],
+            (Apply, [held, held]),
             None,
+            0,
         ),
         (
-            "before its days, it waits for them",
+            "before its days, with no merged pull request, it waits for them",
             json!({"replanAfterDays": 2}),
             |_| {},
             tracker(468),
-            [
-                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; re-planned from 2026-10-24T03:49:24Z",
-                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; re-planned from 2026-10-24T03:49:24Z",
-            ],
+            (Apply, [cooldown, cooldown]),
             None,
+            0,
         ),
         (
             "past them, a triage plans the rest once",
             json!({"replanAfterDays": 1}),
             |_| {},
             tracker(468),
-            [
-                "start triage cgwalters-forge/tracker#468 pool=claude record=",
-                "hold cgwalters-forge/tracker#468: plan ",
-            ],
+            (
+                Apply,
+                [
+                    "start triage cgwalters-forge/tracker#468 pool=claude record=",
+                    "hold cgwalters-forge/tracker#468: plan ",
+                ],
+            ),
             Some(REPLAN),
+            0,
         ),
         (
             "a run in flight holds it",
@@ -4148,53 +4382,86 @@ fn apply_replans_an_open_issue_after_its_run() {
                 )
             },
             tracker(468),
-            [
-                "hold cgwalters-forge/tracker#468: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
-                "hold cgwalters-forge/tracker#468: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
-            ],
+            (
+                Apply,
+                [
+                    "hold cgwalters-forge/tracker#468: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
+                    "hold cgwalters-forge/tracker#468: a run is in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7",
+                ],
+            ),
             None,
+            0,
         ),
         (
             "an open bot pull request holds it",
             json!({"replanAfterDays": 1}),
             |r| closing_pull(r, ("cgwalters-forge/tracker", 468), "cgwalters-bot"),
             tracker(468),
-            [
-                "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
-                "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
-            ],
+            (
+                Apply,
+                [
+                    "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
+                    "hold cgwalters-forge/tracker#468: pull request cgwalters-forge/tracker#900 is open",
+                ],
+            ),
             None,
+            0,
         ),
         (
             "outside every live epic under the triage scope epics, it is not",
             json!({"replanAfterDays": 1, "triage": {"scope": "epics"}}),
             |_| {},
             tracker(468),
-            [
-                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic",
-                "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic",
-            ],
+            (
+                Apply,
+                [
+                    "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic",
+                    "hold cgwalters-forge/tracker#468: plan 6332112108@2026-10-22T03:40:56Z was dispatched already, https://github.com/cgwalters-forge/tracker/issues/468#issuecomment-6332216967; outside every live epic",
+                ],
+            ),
             None,
+            0,
         ),
         (
             "a triage plan's record is followed up as before",
             json!({"replanAfterDays": 1, "triageFollowUpDays": 3}),
             |_| {},
             tracker(446),
-            [
-                "start triage cgwalters-forge/tracker#446 pool=claude record=",
-                "hold cgwalters-forge/tracker#446: its triage, ",
-            ],
+            (
+                Apply,
+                [
+                    "start triage cgwalters-forge/tracker#446 pool=claude record=",
+                    "hold cgwalters-forge/tracker#446: its triage, ",
+                ],
+            ),
             Some("The board pass asks a triage run to plan this issue."),
+            0,
         ),
     ];
-    for (name, settings, edit, (repo, number), expected, intro) in cases {
+    for (name, settings, edit, (repo, number), (mode, expected), intro, closes) in cases {
         let config = config(settings);
         let mut forge = Forge::new(None, false);
         edit(&mut forge.replay);
         let item = format!("{repo}#{number}");
         for (pass, expected) in expected.into_iter().enumerate() {
-            let report = apply(&forge, &config);
+            let (mode, writes) = match mode {
+                Apply => (Mode::Actions(&own()), None),
+                Preview => (Mode::Preview, None),
+                Writes(n) => (Mode::Actions(&own()), Some(n)),
+            };
+            let limits = Limits {
+                writes,
+                ..Limits::default()
+            };
+            let report = block(run(
+                &forge,
+                &forge,
+                &config,
+                State::default(),
+                (mode, limits),
+                forge.replay.now,
+            ))
+            .unwrap();
             assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
             let line = report
                 .lines
@@ -4208,11 +4475,32 @@ fn apply_replans_an_open_issue_after_its_run() {
                 report.lines
             );
         }
+        // A close dispatches nothing, and a triage closes nothing.
         let started = forge.dispatches().iter().filter(|d| **d == item).count();
-        assert_eq!(started, usize::from(intro.is_some()), "{name}");
+        assert_eq!(
+            started,
+            usize::from(intro.is_some() && closes == 0),
+            "{name}"
+        );
         let comments = forge.comments_on(repo, number);
         let posted = comments.first().and_then(|c| c.lines().next());
-        assert_eq!(posted, intro, "{name}");
+        assert_eq!(
+            posted.map(|p| p.starts_with(intro.unwrap_or_default())),
+            intro.map(|_| true),
+            "{name}: {comments:#?}"
+        );
+        let markers = comments
+            .iter()
+            .filter(|c| c.starts_with("<!-- agent-board-merged"));
+        assert!(markers.count() <= 1, "{name}: {comments:#?}");
+        let issue = format!("{API_ROOT}repos/{repo}/issues/{number}");
+        let writes = forge.writes.borrow();
+        let closed = writes.iter().filter(|(m, url, body)| {
+            m == "PATCH"
+                && *url == issue
+                && *body == json!({"state": "closed", "state_reason": "completed"})
+        });
+        assert_eq!(closed.count(), closes, "{name}: {writes:#?}");
     }
 }
 
@@ -7316,7 +7604,7 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     let config = config(json!({"wip": 8}));
     let cases = [
         (
-            168,
+            170,
             "budget: 61 requests left, fewer than a start may take (68); 1 more candidate(s) wait",
             0,
         ),

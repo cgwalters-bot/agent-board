@@ -62,7 +62,7 @@ two lines are:
 
 ```text
 status: 0 change(s) of 0 item(s) read
-summary: dispatched 1/1, writes 3/3, held 5, requests 52, points ~38
+summary: dispatched 1/1, writes 3/3, held 5, requests 54, points ~40
 ```
 
 These are **planned** dispatch/write steps, not completed mutations. `held` counts
