@@ -628,9 +628,14 @@ A pass captures one clock and performs these stages in order:
    from this pass's facts and its own starts, and write each one that differs:
    * closed issue, or merged or closed pull request: **Done**;
    * otherwise, the `needs-human` label on the item: **Needs human**;
-   * otherwise, a run in flight for it, or an open pull request for it (the
-     item itself, or one that says it closes the issue, in any repository and
-     by any author; draft or not): **In Progress**;
+   * otherwise, our work moving on it: a run in flight for it, or an open
+     pull request of ours for it (the item itself, or one that says it closes
+     the issue, in any repository; draft or not): **In Progress**. Ours means
+     by `operator`, or by `bot` and updated within the last `pr.staleDays`
+     days (any age where that is 0); a bot pull request standing still longer
+     waits on someone, not on us. Anyone else's open pull request, a
+     dependency bot's or an upstream contributor's, is not our work under
+     way: such an item falls through to the rules below;
    * otherwise, a derived value that no longer holds (Needs human, In
      Progress, or Done on an issue open again), or no Status at all, goes
      to **Todo**;
@@ -643,7 +648,8 @@ A pass captures one clock and performs these stages in order:
      thus becomes Todo on the next pass that reads its runs and pull
      requests whole.
 
-   The rules' precedence is shared with poll's `statusReconcile` preview.
+   The rules' precedence is shared with poll's `statusReconcile` preview,
+   whose work under way is its own (a draft pull request or a run in flight).
    No person or agent sets the derived values, `agent-board ask` included,
    which only sets and clears the label; an edit to one is overwritten on the
    next pass. An item whose facts were not read whole keeps its Status:
@@ -2221,7 +2227,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
-| `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; `0` (off) |
+| `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
 
 The PR stage otherwise uses today's default poll policy, including two fix
 rounds and existing default continuation handling. Its runs use the same inline

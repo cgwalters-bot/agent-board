@@ -535,6 +535,7 @@ fn item(
         content_kind: "issue".into(),
         labels,
         assignees,
+        author: None,
         timestamps,
         fields,
     })

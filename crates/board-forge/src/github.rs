@@ -502,7 +502,7 @@ fn snapshot_items_query() -> String {
         .join(" ");
     let values = field_values_selection(VALUE_PAGE, NESTED_VALUE_PAGE, "");
     format!(
-        "query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2{{items(first:{ITEM_PAGE},after:$cursor){{nodes{{id content{{__typename ... on Issue{{id number title state stateReason createdAt updatedAt closedAt repository{{nameWithOwner}} {facts}}} ... on PullRequest{{id number title state createdAt updatedAt closedAt mergedAt repository{{nameWithOwner}} {facts}}}}} {values}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
+        "query($id:ID!,$cursor:String){{node(id:$id){{... on ProjectV2{{items(first:{ITEM_PAGE},after:$cursor){{nodes{{id content{{__typename ... on Issue{{id number title state stateReason createdAt updatedAt closedAt repository{{nameWithOwner}} {facts}}} ... on PullRequest{{id number title state createdAt updatedAt closedAt mergedAt repository{{nameWithOwner}} author{{login}} {facts}}}}} {values}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
     )
 }
 
@@ -2301,6 +2301,10 @@ impl<T: GraphQl> GitHub<T> {
                 .into(),
                 labels: facts.remove("labels").unwrap_or_default(),
                 assignees: facts.remove("assignees").unwrap_or_default(),
+                author: content
+                    .pointer("/author/login")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 timestamps: ["createdAt", "updatedAt", "closedAt", "mergedAt"]
                     .into_iter()
                     .filter_map(|k| {

@@ -154,6 +154,9 @@ pub struct Item {
     pub labels: Vec<String>,
     #[serde(default)]
     pub assignees: Vec<String>,
+    /// A pull request's author, where the reader kept it: whose work it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
     #[serde(default)]
     pub timestamps: BTreeMap<String, Option<String>>,
     #[serde(default)]

@@ -230,7 +230,7 @@ const FACTS: &str = r#"fragment Facts on Issue {
   labels(first: 50) { nodes { name } totalCount }
   issueDependenciesSummary { blockedBy }
   closedByPullRequestsReferences(first: 10, includeClosedPrs: false) {
-    nodes { number state repository { nameWithOwner } author { login } } totalCount
+    nodes { number state updatedAt repository { nameWithOwner } author { login } } totalCount
   }
   parent { number state repository { nameWithOwner } labels(first: 50) { nodes { name } totalCount } }
 }"#;
@@ -372,7 +372,7 @@ struct MergedPull {
 const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
     closedByPullRequestsReferences(first: 100, after: $cursor, includeClosedPrs: false) {
-      nodes { number state repository { nameWithOwner } author { login } } totalCount
+      nodes { number state updatedAt repository { nameWithOwner } author { login } } totalCount
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -1337,14 +1337,24 @@ pub struct Facts {
     pub labels: Vec<String>,
     pub labels_complete: bool,
     pub blocked_by: u64,
-    /// Open pull requests that close it: number, repository and author.
-    pub pulls: Vec<(u64, String, Option<String>)>,
+    /// Open pull requests that close it.
+    pub pulls: Vec<ClosingPull>,
     pub pulls_complete: bool,
     pub parent: Option<Parent>,
     /// The board's Priority, Status and Why, for an issue on the board.
     pub priority: Option<String>,
     pub status: Option<String>,
     pub why: Option<String>,
+}
+
+/// An open pull request that closes an issue.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosingPull {
+    pub number: u64,
+    pub repository: String,
+    pub author: Option<String>,
+    /// When anything about it last changed, where read.
+    pub updated: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1385,7 +1395,7 @@ fn issue_ref(node: &Value) -> Result<ItemRef> {
 /// The open pull requests of a page of closing references, how many
 /// references the page read and how many there are. A reference GitHub
 /// answers as null (one the token may not see) is not read: it could be open.
-type Pulls = (Vec<(u64, String, Option<String>)>, u64, u64);
+type Pulls = (Vec<ClosingPull>, u64, u64);
 
 fn pulls(refs: &Value) -> Result<Pulls> {
     let nodes = refs["nodes"]
@@ -1395,10 +1405,16 @@ fn pulls(refs: &Value) -> Result<Pulls> {
         .iter()
         .filter(|p| p["state"] == "OPEN")
         .map(|p| {
-            let number = p["number"].as_u64().context("pull request has no number")?;
-            let repo = text(p, "/repository/nameWithOwner").to_owned();
-            let author = p.pointer("/author/login").and_then(Value::as_str);
-            Ok((number, repo, author.map(str::to_owned)))
+            let updated = (p["updatedAt"].as_str())
+                .map(|at| OffsetDateTime::parse(at, &Rfc3339))
+                .transpose()
+                .context("pull request has an invalid updatedAt")?;
+            Ok(ClosingPull {
+                number: p["number"].as_u64().context("pull request has no number")?,
+                repository: text(p, "/repository/nameWithOwner").to_owned(),
+                author: (p.pointer("/author/login").and_then(Value::as_str)).map(str::to_owned),
+                updated,
+            })
         })
         .collect::<Result<_>>()?;
     let total = refs["totalCount"]
@@ -1486,7 +1502,7 @@ fn fingerprint(
         .collect();
     let labels: BTreeSet<&str> = facts.labels.iter().map(String::as_str).collect();
     let pulls: BTreeSet<String> = (facts.pulls.iter())
-        .map(|(number, repository, _)| format!("{repository}#{number}"))
+        .map(|p| format!("{}#{}", p.repository, p.number))
         .collect();
     let read = json!([
         title,
@@ -1578,10 +1594,11 @@ pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> 
 /// operator's approval of its pull request, as the poll's merge gate does;
 /// labels not all read say nothing.
 fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Hold> {
-    if let Some((number, repo, _)) = facts
-        .pulls
-        .iter()
-        .find(|(_, _, author)| is(author.as_deref(), people))
+    if let Some(ClosingPull {
+        number,
+        repository: repo,
+        ..
+    }) = (facts.pulls.iter()).find(|p| is(p.author.as_deref(), people))
     {
         let approval = facts.labels_complete
             && facts

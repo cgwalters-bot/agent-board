@@ -8911,7 +8911,7 @@ fn room_table() {
     );
 }
 
-fn facts(repo: &str, number: u64, created: &str) -> Facts {
+pub(super) fn facts(repo: &str, number: u64, created: &str) -> Facts {
     Facts {
         issue: ItemRef {
             host: DEFAULT_HOST.into(),
@@ -9008,14 +9008,14 @@ fn hold_table() {
         ),
         (
             "bot pull request",
-            |f| f.pulls = vec![(9, "o/r".into(), Some("bot".into()))],
+            |f| f.pulls = vec![pull_by("bot")],
             Some((HoldKind::PrOpen, "pull request o/r#9 is open", false)),
         ),
         (
             "bot pull request awaiting approval",
             |f| {
                 f.labels = vec![OPERATOR_APPROVAL_LABEL.into()];
-                f.pulls = vec![(9, "o/r".into(), Some("bot".into()))];
+                f.pulls = vec![pull_by("bot")];
             },
             Some((
                 HoldKind::PrOpen,
@@ -9027,7 +9027,7 @@ fn hold_table() {
             "approval label in another case",
             |f| {
                 f.labels = vec!["Needs-Operator-Approval".into()];
-                f.pulls = vec![(9, "o/r".into(), Some("bot".into()))];
+                f.pulls = vec![pull_by("bot")];
             },
             Some((
                 HoldKind::PrOpen,
@@ -9037,7 +9037,7 @@ fn hold_table() {
         ),
         (
             "visitor pull request",
-            |f| f.pulls = vec![(9, "o/r".into(), Some("visitor".into()))],
+            |f| f.pulls = vec![pull_by("visitor")],
             None,
         ),
         (
@@ -9052,7 +9052,7 @@ fn hold_table() {
         (
             "a trusted pull request among those read",
             |f| {
-                f.pulls = vec![(9, "o/r".into(), Some("op".into()))];
+                f.pulls = vec![pull_by("op")];
                 f.pulls_complete = false;
             },
             Some((HoldKind::PrOpen, "pull request o/r#9 is open", false)),
@@ -9071,7 +9071,7 @@ fn hold_table() {
     let mut f = base.clone();
     f.labels = vec![OPERATOR_APPROVAL_LABEL.into()];
     f.labels_complete = false;
-    f.pulls = vec![(9, "o/r".into(), Some("bot".into()))];
+    f.pulls = vec![pull_by("bot")];
     let open = Hold::new(HoldKind::PrOpen, "pull request o/r#9 is open");
     assert_eq!(under_way(&f, &BTreeMap::new(), &people), Some(open));
     let why = "a run is in flight, https://run";
@@ -11300,5 +11300,15 @@ fn apply_sends_a_review_start_once() {
         ];
         assert_eq!(said, lines, "{name}: {:#?}", report.lines);
         assert!(wrote.is_empty(), "{name}: {wrote:?}");
+    }
+}
+
+/// An open pull request of `author`'s, o/r#9, that closes the issue.
+fn pull_by(author: &str) -> ClosingPull {
+    ClosingPull {
+        number: 9,
+        repository: "o/r".into(),
+        author: Some(author.into()),
+        updated: None,
     }
 }
