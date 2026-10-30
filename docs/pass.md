@@ -513,7 +513,8 @@ than hold each other. Outside Actions, `--apply` is refused unless both
 that it is not serialized against the scheduled workflow: a capped local apply
 is how a person tries new write behavior on a live board one step at a time,
 for example `--max-dispatch 1 --max-writes 3`, and the caps bound what a race
-with the scheduled pass can cost. Both stages start runs from `dispatchRef`, or the caller's
+with the scheduled pass can cost (writes to N+1, where a pass that made
+progress publishes its hold snapshot one past a full `--max-writes`). Both stages start runs from `dispatchRef`, or the caller's
 default branch. Past 15 minutes no new request is sent; writes, and a start that
 passed its last check in time, have two minutes more to finish, after which
 what was written is observed by the next pass.
