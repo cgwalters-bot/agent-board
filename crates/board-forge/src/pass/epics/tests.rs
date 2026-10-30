@@ -372,24 +372,6 @@ fn replay_pages_an_epics_sub_issues() {
         report.lines
     );
     assert_eq!(report.failures, 1, "{:#?}", report.lines);
-    // An epic with no sub-issues costs no read: tracker#766's is gone.
-    let mut empty = replay;
-    let request = subs_request(766, Value::Null);
-    empty.requests.retain(|e| e["request"] != request);
-    let nodes = (empty.requests.iter_mut())
-        .filter_map(|e| e["answer"].pointer_mut("/data/repository/issues/nodes"))
-        .filter_map(Value::as_array_mut)
-        .flatten();
-    for node in nodes.filter(|n| n["number"] == 766) {
-        node["subIssuesSummary"]["total"] = 0.into();
-    }
-    let report = preview(&config(json!({})), &empty);
-    assert_eq!(report.failures, 0, "{:#?}", report.lines);
-    assert!(
-        (report.lines.iter()).any(|l| l == "hold epic cgwalters-forge/tracker#766: labelled needs-human; otherwise due to be planned (its sub-issues changed (cgwalters-forge/actions#83 removed, cgwalters-forge/agent-board#167 removed, cgwalters-forge/agent-board#168 removed and 6 more))"),
-        "{:#?}",
-        report.lines
-    );
 }
 
 type Edit = Box<dyn Fn(&mut Replay)>;

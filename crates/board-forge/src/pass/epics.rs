@@ -83,8 +83,7 @@ const ACTION_REQUESTS: usize = 11;
 const NAMED: usize = 3;
 
 /// A page of the open epics of a repository, with the board's Priority,
-/// Status and Why of each and how many sub-issues it has, which
-/// [`EPIC_SUBS_QUERY`] reads.
+/// Status and Why of each; [`EPIC_SUBS_QUERY`] reads their sub-issues.
 pub(super) const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!, $field: String!, $first: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
     issues(first: $first, after: $cursor, states: OPEN, labels: [$label], orderBy: {field: CREATED_AT, direction: ASC}) {
@@ -93,7 +92,6 @@ pub(super) const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $
         repository { nameWithOwner }
         labels(first: 50) { nodes { name } totalCount }
         projectItems(first: 10) { nodes { ...Fields } totalCount }
-        subIssuesSummary { total }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -1028,12 +1026,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .context("epics have no nodes")?
             {
                 let issue = issue_ref(node).context("an epic could not be read")?;
-                // One with no sub-issues, or not the one asked for, costs no read.
-                let wanted = only.is_none_or(|at| at == key(&issue))
-                    && node
-                        .pointer("/subIssuesSummary/total")
-                        .and_then(Value::as_u64)
-                        != Some(0);
+                // Every epic's sub-issues are read, even where GitHub's
+                // summary counts none: a summary that lags would read as
+                // every sub-issue removed.
+                let wanted = only.is_none_or(|at| at == key(&issue));
                 // A failed read fails the stage, as the listing's does; only
                 // sub-issues that cannot be read whole hold the one epic.
                 let subs = match wanted {
