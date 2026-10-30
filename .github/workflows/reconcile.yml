@@ -90,7 +90,7 @@ jobs:
   apply:
     needs: propose
     if: needs.propose.outputs.proposals == 'true'
-    uses: cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml@db6f8e67b0855ba342c3f32a7083b4243a8ae995 # v0.6.3
+    uses: cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml@732db8c24295ee8d4a79de19f588e6f871d35fe0 # v0.6.4
     # docs/workflow.md "Proposals from a non-agent job": GitHub validates the
     # skipped agent and register jobs' grants too, so these reads and
     # id-token stay although no agent runs and no OIDC token is requested.
