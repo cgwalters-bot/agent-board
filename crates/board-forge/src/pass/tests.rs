@@ -4637,6 +4637,27 @@ fn apply_reruns_a_failed_run_once() {
         )
     };
     let stacked: Edit = |r| replan_468(r, r#""item":468,"#, r#""item":468,"stacks_on":467,"#);
+    // #468's plan names tracker#17, a pull request, whose issue read fails
+    // as GitHub's does, `answer` its error; only a NOT_FOUND asks what it is.
+    fn target_17(r: &mut Replay, error: &str) {
+        replan_468(r, r#""item":468,"#, r#""item":17,"#);
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 17});
+        r.requests.push(json!({
+            "request": graphql_key(&format!("{ISSUE_QUERY}{FACTS}"), &variables),
+            "answer": {"error": error},
+        }));
+        r.requests.push(json!({
+            "request": graphql_key(KIND_QUERY, &variables),
+            "answer": {"data": {"repository": {"issueOrPullRequest": {"__typename": "PullRequest"}}}},
+        }));
+    }
+    let pull_17: Edit = |r| {
+        target_17(
+            r,
+            "GitHub GraphQL: NOT_FOUND: Could not resolve to an Issue with the number of 17.; response may be partial",
+        );
+    };
+    let transient_17: Edit = |r| target_17(r, "GitHub GraphQL: connection reset");
     let triage: Edit = |r| replan_468(r, r#""kind":"implement","#, r#""kind":"triage","#);
     // The recording's open tracker#889 changes paths its plan names: the
     // rerun waits for it, as a start would. Without it, it is re-run.
@@ -4700,6 +4721,23 @@ fn apply_reruns_a_failed_run_once() {
             vec![run(1)],
             elsewhere,
             "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/elsewhere#468 is not in a work repository",
+            0,
+        ),
+        // tracker#318's plan named the closed pull request composefs-rs#17.
+        (
+            "a plan that names a pull request waits for the operator",
+            json!({"reruns": true}),
+            vec![run(1)],
+            pull_17,
+            "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#17 is a pull request; a plan names the issue it implements",
+            0,
+        ),
+        (
+            "one whose target cannot be read is unreadable",
+            json!({"reruns": true}),
+            vec![run(1)],
+            transient_17,
+            "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#17 could not be read: GitHub GraphQL: connection reset",
             0,
         ),
         (
