@@ -2850,6 +2850,10 @@ pub(super) mod tests {
                 writes: 0,
                 review_runs: BTreeMap::new(),
                 reviewing: 0,
+                review_unread: None,
+                deferred: Vec::new(),
+                deferring: None,
+                planned: 0,
             };
             let events = "repos/upstream/app/issues/7/events?per_page=100";
             fake.page(

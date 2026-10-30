@@ -1649,6 +1649,11 @@ struct Forge {
     /// Fails the first write whose method and URL contain it before it is
     /// made, unlike `fail`, which loses the answer to one that was.
     refuse: RefCell<Option<String>>,
+    /// A comment another pass posted on an issue or pull request, which a
+    /// read of its comments shows once this pass has posted one there: an
+    /// overlapping pass's claim, posted between this one's read and its
+    /// read-back.
+    rival: Option<Value>,
 }
 
 /// The workflow run an applying pass runs in, a run of workflow 77.
@@ -1689,6 +1694,7 @@ impl Forge {
             passes: vec![],
             dispatch_status: None,
             refuse: RefCell::new(None),
+            rival: None,
         }
     }
 
@@ -1860,6 +1866,15 @@ impl Rest for Forge {
         }
         let mut response = self.replay.get(url, validator)?;
         self.late(url, &mut response.body);
+        let posted = |(method, to, _): &(String, String, Value)| {
+            method == "POST" && to.ends_with("/comments") && url.starts_with(&format!("{to}?"))
+        };
+        if let Some(rival) = &self.rival
+            && self.writes.borrow().iter().any(posted)
+            && let Some(comments) = response.body.as_array_mut()
+        {
+            comments.push(rival.clone());
+        }
         Ok(response)
     }
 
@@ -10727,5 +10742,431 @@ fn sweep_config_table() {
                 assert!(got.contains(error), "{section}: {got}");
             }
         }
+    }
+}
+
+/// tracker#889 closes tracker#468, at P0, and agentic-job#9 closes
+/// tracker#527, at P2: the bot's pull requests from its fork, followed with
+/// `pr.reviewPools`, whose head `abc` has no review yet. Repository and
+/// number order would take agentic-job#9 first. Each repository's review
+/// job runs on `workflow_dispatch` are `runs`; tracker#889 has `comments`.
+fn reviews_due(wip: u64, runs: [Vec<Value>; 2], comments: Value) -> (Forge, Config) {
+    let mut forge = Forge::new(None, false);
+    let replay = &mut forge.replay;
+    let mut settings = json!({"wip": wip, "reruns": true,
+        "follow": [REVIEWED[0].0.0, REVIEWED[1].0.0],
+        "pr": {"fixPools": ["claude"], "reviewWorkflow": "review.yml", "reviewPools": ["claude"]}});
+    with_broker(
+        replay,
+        &mut settings,
+        json!({"body": usage::tests::broker()}),
+    );
+    failed(replay, vec![]);
+    for (((repo, number), (closes, priority)), runs) in REVIEWED.into_iter().zip(runs) {
+        let closing = json!({"closingIssuesReferences": {"nodes": [{"number": closes,
+            "repository": {"nameWithOwner": "cgwalters-forge/tracker"},
+            "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}}}],
+            "pageInfo": {"hasNextPage": false}}});
+        let on = if number == 889 {
+            comments.clone()
+        } else {
+            json!([])
+        };
+        followed(replay, (repo, number), closing, on);
+        for entry in &mut replay.requests {
+            let items = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+            for node in items.and_then(Value::as_array_mut).into_iter().flatten() {
+                if node["content"]["number"] == closes
+                    && text(&node["content"], "/repository/nameWithOwner")
+                        == "cgwalters-forge/tracker"
+                {
+                    node["priority"] = json!({"name": priority});
+                }
+            }
+        }
+        let url = format!(
+            "{API_ROOT}repos/{repo}/actions/workflows/review.yml/runs?event=workflow_dispatch&created=%3E%3D{}&per_page=100",
+            (replay.now - time::Duration::days(1)).date()
+        );
+        let answer = json!({"status": 200, "link": null, "body": {"workflow_runs": runs}});
+        replay
+            .requests
+            .push(json!({"request": {"get": url}, "answer": answer}));
+    }
+    for (url, body) in [
+        (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+        (
+            format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+            json!({"private": true}),
+        ),
+    ] {
+        let answer = json!({"status": 200, "link": null, "body": body});
+        replay
+            .requests
+            .push(json!({"request": {"get": url}, "answer": answer}));
+    }
+    (forge, config(settings))
+}
+
+/// A pull request, by repository and number.
+type Pull = (&'static str, u64);
+
+/// The pull requests of [`reviews_due`], each with the issue it closes and
+/// that issue's Priority.
+const REVIEWED: [(Pull, (u64, &str)); 2] = [
+    (("cgwalters-forge/agentic-job", 9), (527, "P2")),
+    (("cgwalters-forge/tracker", 889), (468, "P0")),
+];
+
+/// The review job's run on `workflow_dispatch` in `repo` for pull request
+/// `number`'s head `head`, created an hour before the recording, as
+/// `fields` change it.
+fn review_run(replay: &Replay, (repo, number, head): (&str, u64, &str), fields: Value) -> Value {
+    let created = (replay.now - time::Duration::hours(1))
+        .format(&Rfc3339)
+        .unwrap();
+    let mut run = json!({"id": 77, "path": ".github/workflows/review.yml",
+        "event": "workflow_dispatch", "head_sha": "f".repeat(40), "head_branch": "main",
+        "display_title": format!("review {repo}#{number} {head} (claude)"),
+        "status": "completed", "conclusion": "failure", "run_attempt": 1,
+        "created_at": created, "run_started_at": created, "updated_at": created,
+        "repository": {"full_name": repo}});
+    for (key, value) in fields.as_object().unwrap() {
+        run[key] = value.clone();
+    }
+    run
+}
+
+/// What an applying pass did of stage 2's review steps: their lines, and
+/// its review job writes, the dispatches by pull request and the reruns.
+fn review_steps(forge: &Forge, report: &Report) -> (Vec<String>, Vec<String>) {
+    let lines = (report.lines.iter())
+        .filter(|l| {
+            l.starts_with("review ")
+                || l.contains(" abc wait: ")
+                || l.contains(" abc needs-human: ")
+        })
+        .cloned()
+        .collect();
+    let writes = (forge.writes.borrow().iter())
+        .filter_map(|(_, url, body)| {
+            let path = url.trim_start_matches(API_ROOT);
+            if path.ends_with("review.yml/dispatches") {
+                let repo = path
+                    .split('/')
+                    .take(3)
+                    .skip(1)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                Some(format!("start {repo}#{}", text(body, "/inputs/pr")))
+            } else {
+                path.ends_with("/rerun-failed-jobs")
+                    .then(|| format!("rerun {path}"))
+            }
+        })
+        .collect();
+    (lines, writes)
+}
+
+/// Stage 2's review starts and reruns with `pr.reviewPools`
+/// (agent-board#439), each case one applying pass over [`reviews_due`]:
+/// taken by the board's Priority, not repository and number, each admitted
+/// within `wip` and `--max-dispatch` before anything is written, a rerun as
+/// a start, and a review run still going for a head pushed over since
+/// holding its slot. The case's `wip`, `--max-dispatch`, the review runs of
+/// tracker and agentic-job, then each review line (its start) and the
+/// review job writes in order.
+#[test]
+fn apply_starts_reviews_by_priority_within_wip() {
+    let replay = replay();
+    let ran = |fields: Value| review_run(&replay, ("cgwalters-forge/tracker", 889, "abc"), fields);
+    let superseded = review_run(
+        &replay,
+        ("cgwalters-forge/tracker", 889, &"e".repeat(40)),
+        json!({"status": "in_progress", "conclusion": null}),
+    );
+    let start = |repo: &str, done: &str| {
+        format!("review {repo} abc: no run of the review job for the head, so it starts -> {done}")
+    };
+    let (tracker, agentic) = (
+        "cgwalters-forge/tracker#889",
+        "cgwalters-forge/agentic-job#9",
+    );
+    type Case = (
+        &'static str,
+        u64,
+        Option<usize>,
+        [Vec<Value>; 2],
+        Vec<String>,
+        Vec<&'static str>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "with room both start, the P0 issue's pull request first",
+            8,
+            None,
+            [vec![], vec![]],
+            vec![
+                start(agentic, "started on claude"),
+                start(tracker, "started on claude"),
+            ],
+            vec![
+                "start cgwalters-forge/tracker#889",
+                "start cgwalters-forge/agentic-job#9",
+            ],
+        ),
+        (
+            "--max-dispatch takes the P0 one",
+            8,
+            Some(1),
+            [vec![], vec![]],
+            vec![
+                start(agentic, "held by --max-dispatch"),
+                start(tracker, "started on claude"),
+            ],
+            vec!["start cgwalters-forge/tracker#889"],
+        ),
+        (
+            "the last slot goes to the P0 one, and its start fills it",
+            WIP_BASE + 1,
+            None,
+            [vec![], vec![]],
+            vec![
+                start(
+                    agentic,
+                    &format!("not started: wip: {0} of {0} runs active", WIP_BASE + 1),
+                ),
+                start(tracker, "started on claude"),
+            ],
+            vec!["start cgwalters-forge/tracker#889"],
+        ),
+        (
+            "a full wip starts neither",
+            WIP_BASE,
+            None,
+            [vec![], vec![]],
+            vec![
+                start(
+                    agentic,
+                    &format!("not started: wip: {0} of {0} runs active", WIP_BASE),
+                ),
+                start(
+                    tracker,
+                    &format!("not started: wip: {0} of {0} runs active", WIP_BASE),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "a review still running for a head pushed over since holds its slot",
+            WIP_BASE + 1,
+            None,
+            [vec![], vec![superseded]],
+            vec![
+                start(
+                    agentic,
+                    &format!("not started: wip: {0} of {0} runs active", WIP_BASE + 1),
+                ),
+                start(
+                    tracker,
+                    &format!("not started: wip: {0} of {0} runs active", WIP_BASE + 1),
+                ),
+            ],
+            vec![],
+        ),
+        (
+            "a rerun is a dispatch: it takes --max-dispatch from the start after it",
+            8,
+            Some(1),
+            [vec![], vec![ran(json!({}))]],
+            vec![
+                start(agentic, "held by --max-dispatch"),
+                format!(
+                    "review rerun {tracker} abc: the review job's run https://github.com/cgwalters-forge/tracker/actions/runs/77 ended (failure) with no review of the head, so its failed jobs run once more -> re-run"
+                ),
+            ],
+            vec!["rerun repos/cgwalters-forge/tracker/actions/runs/77/rerun-failed-jobs"],
+        ),
+        (
+            "and a slot of wip",
+            WIP_BASE + 1,
+            None,
+            [vec![], vec![ran(json!({}))]],
+            vec![
+                start(
+                    agentic,
+                    &format!("not started: wip: {0} of {0} runs active", WIP_BASE + 1),
+                ),
+                format!(
+                    "review rerun {tracker} abc: the review job's run https://github.com/cgwalters-forge/tracker/actions/runs/77 ended (failure) with no review of the head, so its failed jobs run once more -> re-run"
+                ),
+            ],
+            vec!["rerun repos/cgwalters-forge/tracker/actions/runs/77/rerun-failed-jobs"],
+        ),
+    ];
+    for (name, wip, cap, runs, lines, writes) in cases {
+        let (forge, config) = reviews_due(wip, runs, json!([]));
+        let limits = Limits {
+            dispatch: cap,
+            ..Limits::default()
+        };
+        let mode = (Mode::Actions(&own()), limits);
+        let now = forge.replay.now;
+        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let (said, wrote) = review_steps(&forge, &report);
+        assert_eq!(said, lines, "{name}: {:#?}", report.lines);
+        assert_eq!(wrote, writes, "{name}");
+    }
+}
+
+/// The runs active before stage 2 in [`reviews_due`]'s recording: the
+/// caller's listed runs, the stuck one included.
+const WIP_BASE: u64 = 2;
+
+/// A review start is sent once a head, whatever happens to its answer or
+/// whichever passes overlap. One whose answer is lost may have started: the
+/// pass that sent it says the error; the next one finds its reservation on
+/// the pull request and no run listed, so it waits for the run, counted
+/// toward `wip`, and once the run should be listed asks a person. A pass
+/// that overlaps another in progress starts none, and one whose claim lost
+/// to an overlapping pass's sends none.
+#[test]
+fn apply_sends_a_review_start_once() {
+    let tracker = "cgwalters-forge/tracker#889";
+    let start = |repo: &str, done: &str| {
+        format!("review {repo} abc: no run of the review job for the head, so it starts -> {done}")
+    };
+    let applied = |forge: &Forge, config: &Config| {
+        let mode = (Mode::Actions(&own()), Limits::default());
+        let now = forge.replay.now;
+        block(run(forge, forge, config, State::default(), mode, now)).unwrap()
+    };
+    // The answer to tracker#889's start is lost, after it was sent.
+    let (forge, config) = reviews_due(8, [vec![], vec![]], json!([]));
+    *forge.fail.borrow_mut() = Some("tracker/actions/workflows/review.yml/dispatches".into());
+    let report = applied(&forge, &config);
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    let error = format!("{tracker} error: ");
+    assert!(
+        report.lines.iter().any(|l| l.starts_with(&error)),
+        "{:#?}",
+        report.lines
+    );
+    let (_, wrote) = review_steps(&forge, &report);
+    assert_eq!(
+        wrote,
+        [
+            format!("start {tracker}"),
+            "start cgwalters-forge/agentic-job#9".into()
+        ]
+    );
+    // Its claim, rewritten as the reservation, as the next pass reads it.
+    let reserved: Vec<Value> = (forge.added.borrow()[&("cgwalters-forge/tracker".into(), 889)]
+        .iter())
+    .map(|c| {
+        json!({"id": c["id"], "user": {"login": "cgwalters-bot"},
+            "created_at": c["createdAt"], "body": c["body"]})
+    })
+    .collect();
+    assert_eq!(reserved.len(), 1);
+    assert!(
+        text(&reserved[0], "/body").contains(r#""review_head":"abc""#),
+        "{reserved:?}"
+    );
+    let wait = format!(
+        "{tracker} abc wait: the review job's start for the head is reserved, its run not listed yet"
+    );
+    let person = format!(
+        "{tracker} abc needs-human: the review job was started for abc and no run of it for the head is listed; inspect its runs, or review it -> labelled needs-human"
+    );
+    let full = format!("not started: wip: {0} of {0} runs active", WIP_BASE + 1);
+    // The reservation as a pass `minutes` later reads it: made that long
+    // before the recording's clock.
+    let aged = |minutes: i64| {
+        let at = (forge.replay.now - time::Duration::minutes(minutes))
+            .format(&Rfc3339)
+            .unwrap();
+        let mut comment = reserved[0].clone();
+        let body = text(&comment, "/body").to_owned();
+        let (state, rest) = body
+            .strip_prefix("<!-- tracker-poll: ")
+            .and_then(|b| b.split_once(" -->"))
+            .unwrap();
+        let mut state: Value = serde_json::from_str(state).unwrap();
+        state["review_at"] = at.clone().into();
+        comment["body"] = format!("<!-- tracker-poll: {state} -->{rest}").into();
+        comment["created_at"] = at.into();
+        json!([comment])
+    };
+    // The case, its `wip`, minutes after the lost answer, then the review
+    // lines and the review job writes.
+    for (name, wip, minutes, lines, writes) in [
+        (
+            "while it may yet be listed, it waits, and nothing is sent again",
+            8,
+            2,
+            vec![
+                start("cgwalters-forge/agentic-job#9", "started on claude"),
+                wait.clone(),
+            ],
+            vec!["start cgwalters-forge/agentic-job#9"],
+        ),
+        (
+            "and it holds a slot of wip",
+            WIP_BASE + 1,
+            2,
+            vec![start("cgwalters-forge/agentic-job#9", &full), wait],
+            vec![],
+        ),
+        (
+            "then it is a person's",
+            8,
+            15,
+            vec![
+                start("cgwalters-forge/agentic-job#9", "started on claude"),
+                person,
+            ],
+            vec!["start cgwalters-forge/agentic-job#9"],
+        ),
+    ] {
+        let (forge, config) = reviews_due(wip, [vec![], vec![]], aged(minutes));
+        let report = applied(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let (said, wrote) = review_steps(&forge, &report);
+        assert_eq!(said, lines, "{name}: {:#?}", report.lines);
+        assert_eq!(wrote, writes, "{name}");
+    }
+    // Overlapping passes: one in progress already, or one whose claim
+    // comes first, posted between this pass's read and its read-back.
+    let other = "https://github.com/cgwalters-forge/tracker/actions/runs/4243";
+    let claim = json!({"id": 1, "user": {"login": "cgwalters-bot"}, "created_at": "2026-10-23T15:00:00Z",
+        "body": "<!-- agent-board-fix-claim: {\"from\":\"review:abc\"} -->\nReview start: claimed."});
+    for (name, passes, rival, done) in [
+        (
+            "another pass in progress takes the slots",
+            vec![json!({"id": 4243, "html_url": other})],
+            None,
+            format!("not started: another pass is in progress, {other}"),
+        ),
+        (
+            "a claim of another pass first wins",
+            vec![],
+            Some(claim),
+            "not started: another pass claimed it in comment 1".into(),
+        ),
+    ] {
+        let (mut forge, config) = reviews_due(8, [vec![], vec![]], json!([]));
+        forge.passes = passes;
+        forge.rival = rival;
+        let report = applied(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let (said, wrote) = review_steps(&forge, &report);
+        let lines = [
+            start("cgwalters-forge/agentic-job#9", &done),
+            start(tracker, &done),
+        ];
+        assert_eq!(said, lines, "{name}: {:#?}", report.lines);
+        assert!(wrote.is_empty(), "{name}: {wrote:?}");
     }
 }

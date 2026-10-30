@@ -63,7 +63,9 @@ while the review was submitted, which keeps out the repository's other
 workflows. With the pass's `pr.reviewPools`, a `workflow_dispatch` run of it
 from the repository's default branch whose title names the pull request and
 head counts too ([pass](pass.md#reviews)); whoever can dispatch it can write
-to the repository. Anyone who can push a branch to the repository (or change what the
+to the repository. The pass claims each such start with the same protocol, a
+claim of `review:HEAD`, and writes its reservation over the claim before it
+dispatches, so no pass sends a head's start twice. Anyone who can push a branch to the repository (or change what the
 review workflow calls) can still produce a verdict that counts: a push workflow
 can copy the marker while the job runs, and a branch can be the base of a pull
 request with the same head. Without the flag, and elsewhere,

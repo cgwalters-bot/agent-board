@@ -2049,7 +2049,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // Without stage 2's state, the incoming one keeps the maintain stage's.
     let kept = scheduler.report.maintain.is_some().then(|| state.clone());
     // Stage 2: pull request follow-up, today's poll.
-    let mut earlier = maintained + scheduler.follow(state, &git_ref);
+    let mut earlier = maintained + scheduler.follow(state, &git_ref, maintained);
     if let Some(day) = scheduler.report.maintain.clone() {
         let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
         state.maintain = Some(day);
@@ -2387,9 +2387,68 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         [&self.config.operator, &self.config.bot]
     }
 
+    /// With `pr.reviewPools`, what stage 2's review starts and reruns go by:
+    /// the board's Priority ranks, and with work to schedule the `wip` they
+    /// fit in, read before stage 2 as stage 4 reads it, with the `earlier`
+    /// runs the pass started. A board that cannot be read leaves them in
+    /// repository and number order; capacity that cannot be read, or another
+    /// pass in progress, holds them all.
+    fn review_bounds(
+        &mut self,
+        git_ref: &str,
+        earlier: usize,
+    ) -> (Option<poll::ReviewWip>, BTreeMap<String, usize>) {
+        let config = self.config;
+        let mut ranks = BTreeMap::new();
+        if config.board.is_some() {
+            match self.board() {
+                Ok(board) => {
+                    for (key, facts) in &board.items {
+                        let own = facts.priority.as_deref();
+                        let rank = own.and_then(|p| board.options.iter().position(|o| o == p));
+                        ranks.insert(key.clone(), rank.unwrap_or(board.options.len()));
+                    }
+                }
+                Err(error) => self.line(format!(
+                    "review order: the board could not be read ({error:#}); by repository and number"
+                )),
+            }
+        }
+        if !config.work() {
+            return (None, ranks);
+        }
+        let wip = config.wip as usize;
+        let mut bound = poll::ReviewWip {
+            wip,
+            active: wip,
+            held: self.other_holds(),
+        };
+        if bound.held.is_none() {
+            let listed = self.listed(&config.target(git_ref));
+            match listed.and_then(|(runs, _, _)| Ok((runs, self.leased()?))) {
+                Ok((runs, leased)) => {
+                    let slots = Slots {
+                        wip,
+                        earlier,
+                        mine: Vec::new(),
+                        busy: BTreeMap::new(),
+                        probes: BTreeMap::new(),
+                        leased,
+                    };
+                    bound.active = slots.active(&runs);
+                }
+                Err(error) => {
+                    bound.held = Some(format!("the runs in flight could not be read: {error:#}"));
+                }
+            }
+        }
+        (Some(bound), ranks)
+    }
+
     /// Stage 2: the followed pull requests, paced by stage 1's reading where
-    /// it has one. How many runs it started.
-    fn follow(&mut self, state: State, git_ref: &str) -> usize {
+    /// it has one, after the `earlier` runs this pass started. How many runs
+    /// it started.
+    fn follow(&mut self, state: State, git_ref: &str, earlier: usize) -> usize {
         let config = self.config;
         if config.follow.is_empty() {
             self.line("follow: no repositories".into());
@@ -2407,6 +2466,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let at = self.now.format(&Rfc3339).unwrap_or_default();
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
+        let mut poll = config.poll(fresh.as_ref());
+        if !config.pr.review_pools.is_empty() {
+            let (wip, ranks) = self.review_bounds(git_ref, earlier);
+            poll.policy.review_wip = wip;
+            poll.policy.review_ranks = ranks;
+        }
         let apply = self.apply.then(|| poll::Apply {
             dispatcher: &self.dispatcher,
             workflow: config.dispatch_workflow.clone(),
@@ -2417,7 +2482,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         match poll::run_capped(
             &self.client,
             &self.client,
-            &config.poll(fresh.as_ref()),
+            &poll,
             state,
             (follow, follow),
             apply,
