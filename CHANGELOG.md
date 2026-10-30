@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Forgejo Status label reads behind `board.statusLabels` (off by default),
+  and edit-provenance checks for recorder Run/Result markers. The library
+  has bounded, previewable board label/state/comment primitives and
+  append-only plan claims and receipts with a recovery read; no Forgejo
+  CLI write path, plan apply or dispatch is enabled yet (docs/forges.md).
 - `agent-board pass`, one scheduled pass from one configuration file
   (docs/pass.md): pull request follow-up with bounded fix, rebase and
   continuation rounds, epic planning and apply, scheduled starts by

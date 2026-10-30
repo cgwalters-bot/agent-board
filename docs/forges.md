@@ -10,7 +10,7 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels | Native dispatch/run/lease library adapters; no CLI/pass writes or activation ([#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
+| Forgejo | Issues of configured repositories, fields from labels | Library board-write primitives and native dispatch/run/lease adapters; no CLI/pass writes or activation ([contract](#a-forgejo-pass)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Existing dispatch callers still use GitHub Actions. The backend boundary also
@@ -33,7 +33,7 @@ Every command works here. Only `github.com` is supported for live reads.
 Forgejo's API has no projects, so `--board-config agent-board.json` (trusted,
 default branch) can make the board the issues of some Forgejo repositories
 instead. It is read by `snapshot create`, `project view`, `item list`,
-`item view` and `reconcile plan`; nothing writes to Forgejo.
+`item view` and `reconcile plan`; these commands do not write to Forgejo.
 
 ```json
 {
@@ -57,9 +57,17 @@ zero, two or an unknown value leaves the item's fields incomplete and
 Result come from the newest comment by a `recorders` user id (not login, which
 can be renamed and re-registered) whose first line is
 `<!-- agent-board-run: URL -->` or `<!-- agent-board-result: URL -->`; with no
-recorders, comments are not read. Coverage is complete only when the issues read
-match the listing's `X-Total-Count`. Status and close reasons do not exist there,
-so they are null. The GitHub token variables are never sent to the Forgejo host.
+recorders, comments are not read. A recorder marker must have valid, equal
+`created_at` and `updated_at` timestamps; an edited marker makes the item
+incomplete rather than falling back to an older record. This stops an ordinary
+issue writer editing a recorder's comment; the administrator and same-second
+limitations [below](#comments-recorders-and-editors) still apply.
+Coverage is complete only when the issues read match the listing's
+`X-Total-Count`. Close reasons are null. Status is also null by default;
+`board.statusLabels: true` opts into the six [Status labels](#labels-and-status).
+Missing Status is null, while duplicate or unknown Status labels make the item
+incomplete. Old boards ignore Status labels and retain `status_field_absent`.
+The GitHub token variables are never sent to the Forgejo host.
 Without `board`, or with `"forge": "github"`, the board is a GitHub project.
 
 `url` may be `https://` or `http://` and may carry a port, as for a Forgejo
@@ -77,15 +85,57 @@ with none left lists every issue ([issue.go#L448-L461][fj-labels-filter]), so
 the reader refuses a listed issue without the membership label rather than
 let a deleted or renamed label widen the board. The write side keeps that.
 
+### Board-write library boundary
+
+`Forge::board_write` is a deterministic controller primitive, not an
+agent-output publisher. It refuses by default on other backends. Forgejo
+implements one scoped label replacement, issue open/close, append-only
+comments, and plan claims with their receipts. Nothing calls it from the CLI
+or a deployed caller yet. Its explicit
+`apply` argument previews when false; each attempted mutation consumes the
+caller's remaining write cap, including an ambiguous failure. Each operation
+has at most 32 read requests and each comment at most 16,000 characters.
+
+The authenticated `/user` id must be a configured recorder. Targets must be
+configured issue identities, not pull requests. Membership labels remain
+required. Label names resolve to one exclusive id from complete bounded
+repository and organization listings; no labels are created. Labels are read
+again immediately before writing and read back afterward, preserving unrelated
+labels. State and comments are also read back. Repeating an observed effect
+does not write again; errors hold rather than retrying automatically. Any
+edited recorder comment on the issue holds every comment, claim and receipt
+write, a replay included, and open membership is checked on the last issue
+read before the write. There is no atomic compare-and-swap in Forgejo, so a
+concurrent change after the final read is still possible.
+
+A claim names a recorder's unedited plan comment, a job plan with
+`agent-board-dispatch` or an epic plan with `agent-board-epic-apply`, as
+`COMMENT-ID@CREATED`, its creation time in UTC
+([below](#claims-and-recovery)). It is refused where any
+recorder already claimed that plan, a repeated or ambiguous claim included,
+and after writing it counts only if the thread read again shows it as the
+earliest. A concurrent writer's comment can get a lower id and become visible
+only later, so this needs one pass per board, as the pass's lease gives.
+Receipts are further comments by the claim's author whose first line
+is `<!-- agent-board-receipt: CLAIM-ID -->`; plain comments may not start with
+a claim or receipt line. `Forge::plan_claim` reads a plan's earliest claim and
+its receipts back for recovery. Choosing which plan to claim, dispatch (#512),
+scheduling (#513) and epic issues outside the board's membership (#514) are
+not built. Arbitrary
+agent proposals must still go through independent check/apply; the CLI's
+`output check` and `output apply` remain unsupported. No caller settings or
+deployment are changed here.
+
 ## A Forgejo pass
 
 This is the contract for a second, separate `agent-board pass` that drives a
 Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
 tracker#786). **The end-to-end pass is not built**: the CLI refuses a Forgejo board for
-everything but the five reads above, nothing writes to Forgejo, and no option
-below turns it on. Native dispatch/run/lease primitives implement the sections
-below independently of scheduler wiring; offline tests are not live proof.
-The remaining contract precedes the write primitives
+everything but the five reads above, and no option below turns a pass on.
+The library board primitives above implement only part of the write contract;
+native dispatch/run/lease primitives implement the sections below independently
+of scheduler wiring. Offline tests are not live proof.
+The remaining contract covers the write primitives
 (#511), dispatch and run adapters (#512), scheduling (#513), epics (#514) and
 live CI (#515) are. [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
@@ -179,8 +229,9 @@ as today. The API takes no If-Match and labels have no version: the pass reads
 the issue's labels again just before a write and leaves one a person changed,
 as stage 5 does with Status.
 
-Status round-trips through its label: the snapshot reads `status/…` as Status
-(today it is null). No `status/` label is no Status, which stage 5 makes Todo;
+Status round-trips through its label when `board.statusLabels` is true:
+the snapshot reads `status/…` as Status. No `status/` label is no Status,
+which the future Forgejo stage 5 makes Todo;
 two, or an unknown value, is incomplete and keeps whatever is there. Stage 5
 writes the derived value with one label write, and the next read must show it.
 Blocked and Backlog stay a person's holds; `status/blocked` is the board's
@@ -212,8 +263,8 @@ either; #515 measures whether a fresh comment's two times can differ. The pass
 therefore never edits a record: where the GitHub pass edits in place (the
 claim's outcome, the usage and hold snapshots, the planning request), a Forgejo
 pass appends a new comment and reads the newest valid one. A writer replaces a
-plan by replying with another, not by editing it. Today's Run and Result reads
-check the author only; #511 adds the edit check before anything relies on them.
+plan by replying with another, not by editing it. Run and Result reads now
+check both the author id and matching creation/update timestamps.
 The issue body has the same problem, and an issue's `updated_at` moves with
 every comment and label too, so an edit of its body cannot be told apart:
 direction (`direction.*`), which needs its body last edited by the operator or
