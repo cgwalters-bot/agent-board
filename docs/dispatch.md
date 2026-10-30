@@ -9,9 +9,9 @@ issue should be able to take its place. In code, every caller below starts a
 job through one interface (`board_forge::dispatch`): a start request (target
 repository, item, kind, brief, pool, runner, optional base) and a trusted route
 from configuration, answered with a run handle, a start without one, a refusal
-that started nothing, or an unknown outcome. Its only backend is a GitHub
-Actions `workflow_dispatch` request to a caller workflow. Status queries on a
-handle, and other backends, are not built; closed
+that started nothing, or an unknown outcome. Existing callers use GitHub
+Actions `workflow_dispatch`. Native Forgejo library adapters are also available
+but not wired to any CLI or scheduler (see below); closed
 [agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295)
 delivered only the start request.
 This page describes the interface as it exists.
@@ -179,11 +179,65 @@ caller workflow has one runner. Batched plans add their briefs to `task`.
 agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md)
 is a workflow of this shape.
 
-On Forgejo none of this is built. The contract for a Forgejo caller (the
-same inputs with `return_run_info`, each new run checked against what was sent,
-run listings that include `waiting` and `blocked`, reruns that reuse the run's
-id, and leases on the contents API) is in [forges](forges.md#dispatch-and-runs),
-with the caller and deployment it still needs.
+### Native Forgejo adapters (not activated)
+
+`board_forge::dispatch::Forgejo` sits alongside `GitHub`. No existing caller
+selects it and no pass option enables it. Construction takes the trusted
+instance `forgejo::Config`, `dispatch::Target`, accepted input names and bot
+recorder id; `/user` must confirm that id. No response supplies routing or
+credentials. Unsupported kinds (including PR follow-up), runners and inputs
+refuse before dispatch. The client refuses redirects and requests outside the
+configured API root, including port and subpath, and never uses GitHub tokens.
+
+The concrete threat is duplicate or wrongly attributed work after an uncertain
+start. One POST sends `return_run_info`, never `return_run_details`; 204,
+missing ids, lost replies and server errors hold without retry. A 201's id is
+read and checked against the [identity protocol](forges.md#dispatch-and-runs),
+including the explicit workflow-dispatch trigger, the configured ref (the
+run's `prettyref`), nonempty sent inputs and exact title/pool. A start is
+refused before admission while the workflow's history already fills the
+500-run listing cap, since its confirmation could not list it. A named mismatch gets best-effort cancellation and stays
+held. Confirmation requires exactly one verified match in two complete
+inventories with the same ids, then a fresh run read. Read-only recovery uses
+the same protocol; zero or duplicate verified matches never authorize POST.
+Run URLs use `index_in_repo`, not the global API id.
+
+Active inventory uses `/actions/runs`, never `/actions/tasks`: `waiting` is
+queued, `blocked` includes approval and `running` is active. Each active status
+is paged twice in lifecycle order. Terminal states are success, failure,
+cancelled and skipped; unknown statuses hold. Pages use `limit=50`, body
+`total_count`, and at most ten pages per listing. Moving totals, duplicate ids,
+empty incomplete pages and oversized inventories hold. One backend shares
+500 requests and 15 minutes, including mutations and lease I/O. Two sweeps
+are bounded observation, not a lock or protection against arbitrary backward
+transitions or indexing delays. Rerun accepts only a verified failed run with
+a complete nonempty array of at most 500 terminal jobs, all at attempt 1.
+Forgejo reuses its id; jobs, not runs, supply attempts.
+
+The other concrete threat is two schedulers spending one capacity slot, or a
+late release freeing a replacement owner. Admission uses one contents-file
+protocol ([atomicity evidence](forges.md#admission-and-release)), not
+read-PATCH-read. Slots must already exist on a dedicated branch in the private
+caller repository: `leases/SLOT.json`, initially `{"free":"initial"}`.
+The ceiling is 100 slots, as for GitHub WIP. Admit takes a free observed slot;
+bind attaches a returned run id to its `run: 0` reservation; release requires
+the observed claim/run and a terminal run or expiry. Unreadable runs hold
+until expiry. Leases last exactly 24 hours and serialize to at most 1 KiB, so
+every write stays readable. Admit reads the caller's privacy before its final
+callback, leaving only the write after it. Writes carry the observed blob
+SHA; stale ownership loses with 409. Lost write replies and other failures
+hold, even if read-back shows the proposed value. Free markers retain the old
+owner, and claims must be globally unique and never reused, preventing ABA.
+
+These are primitives, not a scheduler or durable journal. Final admission
+callbacks must preserve WIP, pool pacing, dispatch/write caps, one lease per
+run, unexpired ownership and durable plan/rerun claims immediately before POST.
+A lost rerun reply holds even if jobs still show attempt 1. Ambiguous
+reservations must not be released or reused. Missing slots, unsupported
+transports and deployments without the pinned contents-write guarantees
+refuse, with no GitHub fallback. The [caller and live CI prerequisites](forges.md#the-caller)
+remain. Offline source-shaped fixtures validate the pinned API contract, not
+a deployed server, runner or production activation.
 
 ## Recording a run on the board
 

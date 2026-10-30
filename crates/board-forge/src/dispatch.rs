@@ -1,12 +1,15 @@
 //! Starting an agent job: the one request `dispatch ISSUE --apply`, the poll
 //! and `supervise execute` share ([docs/dispatch.md](../../../docs/dispatch.md)).
-//! [`GitHub`], a `workflow_dispatch` request to the caller's workflow, is its
-//! only backend. Each caller keeps its own transport and passes it as a
+//! [`GitHub`] and the opt-in native [`Forgejo`] use the caller's workflow.
+//! Each caller keeps its own transport and passes it as a
 //! closure, so what its fakes record is unchanged.
 use crate::poll::{validate_repository, validate_workflow};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+mod forgejo;
+pub use forgejo::{Forgejo, Lease as ForgejoLease, Slot as ForgejoSlot};
 
 /// The job to start: the plan's or the caller's content, never its route.
 #[derive(Clone, Copy, Debug)]
