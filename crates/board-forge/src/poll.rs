@@ -222,6 +222,20 @@ const RUN_RERUN: &str = "run rerun";
 const RE_RUN: &str = "re-run";
 /// Why a head with no verdict waits, which [`Pass::review_rerun`] looks behind.
 const NO_REVIEW: &str = "no approving review of the head yet";
+/// What the waits the poll follows by itself say ([`Stepped::progress`]):
+/// a round's run, a broker outage, checks, mergeability, the merge queue,
+/// a check rerun and the review job's run.
+const RUNNING: &str = " is running for ";
+const OUTAGE_OPEN: &str = ", which is still open";
+const CHECKS_PENDING: &str = "checks pending: ";
+const MERGEABILITY: &str = "mergeability with ";
+const AHEAD_IN_QUEUE: &str = " and is ahead in the merge queue; ";
+const CLAIM_AWAITING: &str = "check rerun claim is awaiting its reservation";
+const RERUN_UNFINISHED: &str = "reserved check rerun has not finished";
+const REVIEWS_THE_HEAD: &str = " reviews the head";
+/// The skips of a pull request already on its way to a merge.
+const QUEUED: &str = "already queued";
+const AUTO_MERGE: &str = "auto-merge already on";
 /// Why a head the review job withheld its approval of ([`WITHHELD`]) waits.
 const WITHHELD_WAIT: &str =
     "the review withheld its approval of the head; it needs a human approval";
@@ -2758,7 +2772,7 @@ fn started(
                             window.issue
                         );
                         return match window.to {
-                            None => step("wait", format!("{ended}, which is still open")),
+                            None => step("wait", format!("{ended}{OUTAGE_OPEN}")),
                             Some(_) => {
                                 step("refund", format!("{ended}, so the round is given back"))
                             }
@@ -2811,7 +2825,7 @@ fn started(
             ),
         );
     }
-    step("wait", format!("{round} is running for {}", short(head)))
+    step("wait", format!("{round}{RUNNING}{}", short(head)))
 }
 
 /// The one step for a pull request, as poll.cjs's `decide`, except that the
@@ -2834,10 +2848,10 @@ pub fn decide(
         return step("skip", format!("labelled {LABEL}"));
     }
     if !pull["mergeQueueEntry"].is_null() {
-        return step("skip", "already queued");
+        return step("skip", QUEUED);
     }
     if !pull["autoMergeRequest"].is_null() {
-        return step("skip", "auto-merge already on");
+        return step("skip", AUTO_MERGE);
     }
     let partial = truncated(pull);
     if !partial.is_empty() {
@@ -3082,13 +3096,13 @@ pub fn decide(
     if !checks.pending.is_empty() {
         return step(
             "wait",
-            format!("checks pending: {}", checks.pending.join(", ")),
+            format!("{CHECKS_PENDING}{}", checks.pending.join(", ")),
         );
     }
     // GitHub works mergeability out again after every push to either side; an
     // answer that is not in yet is neither a conflict nor a go-ahead.
     if pull["mergeable"] != "MERGEABLE" {
-        return step("wait", format!("mergeability with {base} not known yet"));
+        return step("wait", format!("{MERGEABILITY}{base} not known yet"));
     }
     // A stacked pull request merged into its lower one's branch would carry
     // its change into that one's unreviewed head; it waits to be retargeted
@@ -3238,6 +3252,9 @@ pub struct Outcome {
     /// The followed pull requests whose step waits on the operator
     /// ([`operator_wait`]).
     pub waits: Vec<Wait>,
+    /// The step this pass decided for each followed pull request of the
+    /// bot it decided one for.
+    pub steps: Vec<Stepped>,
     /// The followed repositories, lower case, of which this pass decided no
     /// step for some pull request: outside its envelope, or a read that
     /// failed. Any of those may wait on the operator too.
@@ -3258,6 +3275,82 @@ pub struct Wait {
     pub kind: &'static str,
     /// The step's reason.
     pub reason: String,
+}
+
+/// The step a pass decided for a followed pull request of the bot, at the
+/// head it read: what a caller reads to tell whether the pull request moves
+/// by itself (the pass's blockers, agent-board#482).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stepped {
+    pub repository: String,
+    pub number: u64,
+    pub head: String,
+    /// [`Decision::action`] and its reason.
+    pub action: &'static str,
+    pub reason: String,
+    /// Whether the step was taken, or in a preview would be: not held by
+    /// `--max-dispatch` or `--max-writes`, nor turned down where it was
+    /// taken (pacing, the poll's dispatch limit, a merge GitHub refused,
+    /// another pass first: `not …`). A wait or a skip takes nothing.
+    pub ran: bool,
+    /// When the head was committed or last reviewed, the later, where
+    /// either reads.
+    pub moved_at: Option<OffsetDateTime>,
+}
+
+/// How a [`Stepped`] pull request goes on, as one that waits on it sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// Its step was taken this pass: it moved.
+    Moving,
+    /// It waits on what the poll follows by itself: a round's run, checks,
+    /// mergeability, the merge queue, an outage, a check rerun or the
+    /// review job's run. Such a wait may still last, which a caller bounds.
+    Waiting,
+    /// Its step was not taken this pass: held by a cap or turned down.
+    Held,
+    /// Its head waits for a review the poll does not start ([`NO_REVIEW`]).
+    Unreviewed,
+    /// Only a person moves it: it is stopped or labelled, left to its
+    /// author or the operator, waits on the operator's approval, or waits
+    /// for anything the poll does not follow by itself.
+    Person,
+}
+
+impl Stepped {
+    pub fn progress(&self) -> Progress {
+        let reason = self.reason.as_str();
+        let followed = reason.contains(RUNNING)
+            || reason.ends_with(OUTAGE_OPEN)
+            || reason.starts_with(CHECKS_PENDING)
+            || (reason.starts_with(MERGEABILITY) && reason.ends_with(" not known yet"))
+            || reason.contains(AHEAD_IN_QUEUE)
+            || reason == CLAIM_AWAITING
+            || reason == RERUN_UNFINISHED
+            || (reason.starts_with("the review job's run ") && reason.ends_with(REVIEWS_THE_HEAD));
+        match self.action {
+            "needs-human" => Progress::Person,
+            "skip" if matches!(reason, QUEUED | AUTO_MERGE) => Progress::Waiting,
+            "skip" => Progress::Person,
+            "wait" if followed => Progress::Waiting,
+            "wait" if reason.starts_with(NO_REVIEW) => Progress::Unreviewed,
+            // Anything else a wait says only a person moves: unknown is
+            // never taken for moving.
+            "wait" => Progress::Person,
+            _ if self.ran => Progress::Moving,
+            _ => Progress::Held,
+        }
+    }
+}
+
+/// When `pull`'s head was committed or last reviewed, the later.
+fn moved_at(pull: &Value) -> Option<OffsetDateTime> {
+    let committed = timestamp(pull["commits"]["nodes"][0]["commit"]["committedDate"].as_str());
+    let reviewed = nodes(pull, "/reviews/nodes")
+        .iter()
+        .filter_map(|r| timestamp(r["submittedAt"].as_str()))
+        .max();
+    committed.max(reviewed)
 }
 
 /// What, if anything, `decision` for `pull` leaves waiting on the operator.
@@ -4165,7 +4258,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok(earliest_claim(comments, &self.config.bot, &format!("check-rerun:{head}"))
                 .map(|(_, at)| {
                     if age(at.as_deref()).is_some_and(|age| age < CHECK_RERUN_START_SECONDS) {
-                        step("wait", "check rerun claim is awaiting its reservation")
+                        step("wait", CLAIM_AWAITING)
                     } else {
                         step("needs-human", "check rerun claim was interrupted; inspect the runs before retrying")
                     }
@@ -4215,7 +4308,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             RERUN_WINDOW_SECONDS
         };
         Ok(Some(if elapsed.is_some_and(|age| age < limit) {
-            step("wait", "reserved check rerun has not finished")
+            step("wait", RERUN_UNFINISHED)
         } else {
             step(
                 "needs-human",
@@ -4420,7 +4513,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if newest["status"] != "completed" {
             self.reviewing += 1;
             let why = format!(
-                "the review job's run https://github.com/{repo}/actions/runs/{id} reviews the head"
+                "the review job's run https://github.com/{repo}/actions/runs/{id}{REVIEWS_THE_HEAD}"
             );
             return Ok(Some((step("wait", why), None)));
         }
@@ -5184,7 +5277,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         number: u64,
         merge_only: bool,
         required: &mut BTreeMap<String, (Vec<Value>, bool)>,
-    ) -> Result<(String, bool, Option<Wait>)> {
+    ) -> Result<(String, bool, Option<Wait>, Option<Stepped>)> {
         let (owner, name) = repo.split_once('/').context("repository")?;
         // The marker decides what is written, so a pass that applies reads it
         // whole and as it is, not from cached pages a 304 may leave standing.
@@ -5229,6 +5322,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 format!("{repo}#{number} skip: closed since the list was read"),
                 false,
                 None,
+                None,
             ));
         }
         if !(text(&pull, "/author/login") == self.config.bot
@@ -5242,6 +5336,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok((
                 format!("{repo}#{number} skip: pull request author is not followed"),
                 false,
+                None,
                 None,
             ));
         }
@@ -5400,7 +5495,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             decision = step(
                 "wait",
                 format!(
-                    "{ahead} and is ahead in the merge queue; {} after it",
+                    "{ahead}{AHEAD_IN_QUEUE}{} after it",
                     if rebase { "rebased" } else { "queued" }
                 ),
             );
@@ -5624,7 +5719,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         {
             caps.count(kind);
         }
-        let done = done?.map(|d| format!(" -> {d}")).unwrap_or_default();
+        let done = done?;
+        // Taken, or in a preview to be taken: not held, nor turned down.
+        let ran = !capped
+            && match (&self.apply, &done) {
+                (None, _) => true,
+                (Some(_), Some(done)) => !done.starts_with("not "),
+                (Some(_), None) => false,
+            };
+        let done = done.map(|d| format!(" -> {d}")).unwrap_or_default();
         let (action, reason) = (decision.action, &decision.reason);
         // A rerun's line leads with it, `review rerun OWNER/REPO#N …`.
         let line = if action == "merge" && reason.starts_with("approved by the operator at ") {
@@ -5641,6 +5744,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind,
             reason: decision.reason.clone(),
         });
+        let stepped = (text(&pull, "/author/login") == self.config.bot).then(|| Stepped {
+            repository: repo.to_owned(),
+            number,
+            head: head.to_owned(),
+            action: decision.action,
+            reason: decision.reason.clone(),
+            ran,
+            moved_at: moved_at(&pull),
+        });
         Ok((
             line,
             text(&pull, "/author/login") == self.config.bot
@@ -5648,6 +5760,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 && (in_flight(&pull, &self.config.bot, decision.action)
                     || stale.is_some() && decision.action == "fix"),
             wait,
+            stepped,
         ))
     }
 
@@ -5689,10 +5802,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut required = BTreeMap::new();
         for (number, merge_only) in numbers {
             match self.pull(repo, number, merge_only, &mut required) {
-                Ok((line, flying, wait)) => {
+                Ok((line, flying, wait, stepped)) => {
                     outcome.lines.push(line);
                     outcome.in_flight += usize::from(flying);
                     outcome.waits.extend(wait);
+                    outcome.steps.extend(stepped);
                 }
                 Err(error) => {
                     outcome.errors += 1;
@@ -14229,6 +14343,104 @@ mod tests {
 
     /// The steps that write nothing are not capped; runs are dispatches,
     /// and every other step is a write, an action added later included.
+    /// Every wait the poll decides, by what a caller waiting on the pull
+    /// request makes of it ([`Stepped::progress`]): only those the poll
+    /// follows by itself move it, and one it does not know does not.
+    #[test]
+    fn wait_progress_table() {
+        use Progress::*;
+        let url = "https://github.com/o/r/actions/runs/7";
+        let approval = format!(
+            "labelled {OPERATOR_APPROVAL_LABEL} (it or an issue it closes); it needs cgwalters's approval of the head"
+        );
+        let waits = [
+            (
+                format!(
+                    "fix round 1's run {url} ended (failure) during the broker outage https://github.com/o/t/issues/9{OUTAGE_OPEN}"
+                ),
+                Waiting,
+            ),
+            (format!("fix round 1{RUNNING}abc"), Waiting),
+            (
+                "more checks than one query reads; not decided on part of them".into(),
+                Person,
+            ),
+            (
+                "undescribed; waiting for approval and green checks before retitling".into(),
+                Person,
+            ),
+            (WITHHELD_WAIT.into(), Person),
+            (NO_REVIEW.into(), Unreviewed),
+            (approval, Person),
+            (format!("{CHECKS_PENDING}ci"), Waiting),
+            (format!("{MERGEABILITY}main not known yet"), Waiting),
+            (
+                "the default branch is not known; merged only into it".into(),
+                Person,
+            ),
+            (
+                "its base b is not the default branch main; merged only into that".into(),
+                Person,
+            ),
+            (
+                "approved before its base became b; the head needs a review against it".into(),
+                Person,
+            ),
+            (CLAIM_AWAITING.into(), Waiting),
+            (RERUN_UNFINISHED.into(), Waiting),
+            (
+                format!(
+                    "{NO_REVIEW}, and the review job has more runs since yesterday than the {REVIEW_DISPATCH_READS} read"
+                ),
+                Unreviewed,
+            ),
+            (
+                format!("the review job's run {url}{REVIEWS_THE_HEAD}"),
+                Waiting,
+            ),
+            (format!("o/r#3{AHEAD_IN_QUEUE}rebased after it"), Waiting),
+            ("a wait nobody wrote yet".into(), Person),
+        ];
+        // One case a wait the poll decides, and one it does not know.
+        let source = include_str!("poll.rs");
+        let code: String = source[..source.find("mod tests {").unwrap()]
+            .split_whitespace()
+            .collect();
+        let decided = code.matches(r#"step("wait","#).count() + code.matches(r#"{"wait"}"#).count();
+        assert_eq!(waits.len(), decided + 1, "a wait without a case");
+        let stepped = |action, reason: &str, ran| Stepped {
+            repository: "o/r".into(),
+            number: 1,
+            head: "abc".into(),
+            action,
+            reason: reason.into(),
+            ran,
+            moved_at: None,
+        };
+        for (reason, progress) in &waits {
+            assert_eq!(
+                stepped("wait", reason, false).progress(),
+                *progress,
+                "{reason}"
+            );
+        }
+        for (action, reason, ran, progress) in [
+            ("fix", "conflicts with main", true, Moving),
+            ("fix", "conflicts with main", false, Held),
+            ("merge", "review approved and checks green", false, Held),
+            ("skip", QUEUED, false, Waiting),
+            ("skip", AUTO_MERGE, false, Waiting),
+            ("skip", "labelled needs-human", false, Person),
+            ("needs-human", "2 fix rounds used", true, Person),
+        ] {
+            assert_eq!(
+                stepped(action, reason, ran).progress(),
+                progress,
+                "{action}: {reason}"
+            );
+        }
+    }
+
     #[test]
     fn step_kind_table() {
         use caps::Kind::{Dispatch, Write};
