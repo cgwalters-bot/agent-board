@@ -110,6 +110,9 @@ epic's planning request waits for its plan), `triage-cooldown` (triaged or
 planned too recently to ask again), `outside-epics` (no triage under the
 triage scope `epics`, see [Scheduling](#scheduling)), `overlap`, `overlap-ignored` (not a hold:
 an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),
+`blocking` (not a hold of an item but a card on the open pull request that
+overlap holds name and that only a person moves, with `operator` true and
+the pull request's `url`; see [blockers](#blockers)),
 `unreadable` (labels, pull
 requests, a parent epic, a plan's target or the runs not read whole), `wip`,
 `pools`, `budget` (the week's spend reached `budget.weeklyUsd`, or has no
@@ -703,7 +706,9 @@ in the hold snapshot as kind `overlap-ignored` (not blocking, not the
 operator's), and the dispatch record says it too. The draft rule reads one
 more request per overlapping pull request, for at most four of them, which
 a start's request reservation covers; any past those, and one that cannot
-read, holds the start, as any unreadable overlap check does.
+read, holds the start, as any unreadable overlap check does. The overlap
+holds that remain move their pull requests on, or ask a person to, as
+[blockers](#blockers) says.
 
 With no accepted plan, start one triage run if enabled and a slot/pool is
 available, for an issue in the triage scope (below). It proposes an
@@ -1310,7 +1315,10 @@ operator's, and a `stall …` line in the pass's log:
   already waits on the operator, and `needs-human`, `needs-design`,
   `blocked`, `closed`, `waiting-on`, `pr-open`, `in-flight`, `dispatched`,
   `triage-cooldown`, `epic-not-live`, `outside-epics` and
-  `overlap-ignored`.
+  `overlap-ignored`. So is an `overlap` hold whose every pull request this
+  pass saw move, or wait on a person ([blockers](#blockers)): the pull
+  request's own line, and then its one card, says it in place of an alarm
+  on each item it holds.
 - **No progress.** Where stage 4 has candidates free to start and
   `progress_at` is `stall.idleHours` or more before `at`, one entry on the holds issue
   itself (`item` `holds.repository#holds.issue`, its `url`), `since`
@@ -1351,6 +1359,58 @@ failed, its request or time budget is spent, `--max-writes 0` held it, the
 write failed) loses it: the next pass that publishes may raise an idle
 alarm from the older `progress_at`, which the next pass that makes progress
 clears.
+
+## Blockers
+
+An overlap hold keeps an issue waiting for the bot's open pull request that
+changes what its run would. Once that pull request stops moving, nothing
+released the issue: `overlap.staleDraftHours` waives only drafts, and the
+stall alarm said the same thing once for every item it held (agent-board#482:
+a broker pull request conflicting since 19 October held three issues). With
+`overlap` set, each pull request stage 4's overlap holds name is looked at
+once a pass, however many items it holds, after the candidates, and either
+moves on or gets one card. The hold itself stays: its items wait as before.
+
+The pass moves only what it follows. In a repository in `follow`, stage 2
+has already decided the pull request's step, and that is its one action
+this pass: a fix round where it conflicts or changes were requested (a
+rebase round where only a conflict stands on an approved head), within the
+fix rounds, `pr.rebaseRounds`, `--fix-bounds` and pacing, a review start
+with `pr.reviewPools`, or a merge, under `--max-dispatch` and `--max-writes`.
+Its marker keeps a head from getting a second round on a later pass. The
+line is `blocker OWNER/REPO#N: stage 2 moves it (ACTION: REASON); it holds
+ITEMS`. A wait stage 2 follows by itself (a round's run, checks pending,
+mergeability not known yet, ahead in the merge queue, a broker outage, a
+check rerun, the review job's run, or a pull request already queued or set
+to auto-merge) counts as moving only until the head has stood still for
+`overlap.staleHours`: then the line is `… stage 2's step has not moved it in
+H hours (…)` and its items' holds stall as before. So do they where the
+step was not taken (`… stage 2's step did not run this pass (…)`: a cap,
+pacing, the poll's dispatch limit, a refused merge, another pass first).
+Any other wait is a person's. The pass starts and writes nothing of its own
+here.
+
+Otherwise only a person moves it: stage 2 stopped it, left it to its author
+(the bot's pull request from a branch of the base repository, which gets no
+fix round), it waits on the operator's approval or on a review against a changed
+base, or its head waits for a review that has not come (the pass starts
+none without `pr.reviewPools`); or its repository is outside
+`follow`, so the pass reads it (state, mergeability, review decision and
+times, one request, at most ten pull requests a pass) and never acts on it.
+Once it has stood still for `overlap.staleHours` (since its head's commit
+or its last review, the later, and its opening where the pass reads it
+itself; an age that does not read is no younger), it gets one entry of
+kind `blocking` in the hold snapshot, on the pull request: `only a person moves it at HEAD (WHY)`, with
+the board's first Priority among the items it holds, and the line `blocker
+OWNER/REPO#N: … ; it holds ITEMS by overlap`. It waits on the operator, so
+the needs-you list carries it as an `items` ask with a `pull_request`
+action. Its `since` holds while its head and why stay the same, whatever
+items it holds; a repository named in another case is the same pull
+request. Before then the line
+says for how many hours it has stood still. A pull request merged or closed
+since the check is said so, and one stage 2 decided nothing for, or that
+was not read, is said too; the holds of its items may still stall.
+`overlap.staleHours` 0 turns this off, and the holds stall as before.
 
 ## Reviews
 
@@ -2038,6 +2098,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, outside `maintain.repos.include`; its run is dispatched where the repository is public, else only planned; required |
 | `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
 | `overlap.staleDraftHours` | With `overlap` set, an overlapping draft unchanged this many hours (0–168; 0 never) does not hold a start, nor does a documentation-only overlap of a first-Priority issue, see [scheduling](#scheduling); `4`; section absent (off) |
+| `overlap.staleHours` | With `overlap` set, how long (0–168 hours; 0 off) a pull request that overlap holds name, and that only a person moves, may stand still before it gets one needs-you card in place of its items' stall alarms, see [blockers](#blockers); `24`; section absent (off) |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
 | `usage.url` | Broker usage endpoint; absent reads the published snapshot instead of refreshing |

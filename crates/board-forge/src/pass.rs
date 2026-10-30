@@ -133,6 +133,11 @@ const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// be: a week, past which a draft nobody moves holds nothing anyway.
 const STALE_DRAFT_HOURS: u64 = 4;
 const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
+/// `overlap.staleHours` when the key is left out, a day, and the most it
+/// may be, a week: how long a pull request that holds work by overlap may
+/// stand still before it gets a needs-you card ([`blockers`]).
+const STALE_HOURS: u64 = 24;
+const STALE_HOURS_LIMIT: u64 = 7 * 24;
 /// Triage verdicts that ask the operator, which label the issue
 /// [`NEEDS_HUMAN`]: `done` and `obsolete` for a close, which the pass makes
 /// only with [`Config::triage_close`] ([`CLOSE_VERDICTS`]), and the others
@@ -548,16 +553,25 @@ const MAX_APPLIES_LIMIT: usize = 10;
 
 /// [`overlap::Waiver`]'s settings: set, a documentation-only overlap does
 /// not hold an issue in the board's first Priority option, and a draft
-/// unchanged for `staleDraftHours` (0: never) holds nothing.
+/// unchanged for `staleDraftHours` (0: never) holds nothing. And the pull
+/// requests that do hold work are moved on ([`blockers`]): one that has
+/// stood still for `staleHours` (0: never) and that only a person can move
+/// gets one needs-you card.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Overlap {
     #[serde(default = "stale_draft_hours")]
     pub stale_draft_hours: u64,
+    #[serde(default = "stale_hours")]
+    pub stale_hours: u64,
 }
 
 fn stale_draft_hours() -> u64 {
     STALE_DRAFT_HOURS
+}
+
+fn stale_hours() -> u64 {
+    STALE_HOURS
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -898,6 +912,10 @@ impl Config {
             ensure!(
                 overlap.stale_draft_hours <= STALE_DRAFT_HOURS_LIMIT,
                 "overlap staleDraftHours is not 0 to {STALE_DRAFT_HOURS_LIMIT}"
+            );
+            ensure!(
+                overlap.stale_hours <= STALE_HOURS_LIMIT,
+                "overlap staleHours is not 0 to {STALE_HOURS_LIMIT}"
             );
         }
         if !self.pools.0.is_empty() {
@@ -2000,6 +2018,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         free: None,
         top: None,
         followed: None,
+        stepped: Vec::new(),
+        blocking: RefCell::default(),
+        blocked: BTreeSet::new(),
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
@@ -2313,6 +2334,14 @@ struct Scheduler<'a, C> {
     /// Stage 2's review waits and the repositories it left undecided
     /// ([`poll::Outcome::waits`]), once it ran.
     followed: Option<(Vec<poll::Wait>, BTreeSet<String>)>,
+    /// Stage 2's step for each followed pull request ([`poll::Outcome::steps`]).
+    stepped: Vec<poll::Stepped>,
+    /// The pull requests stage 4's overlap holds named, and the items each
+    /// holds ([`Self::blockers`]).
+    blocking: RefCell<blockers::Blocking>,
+    /// The items of the blockers [`Self::blockers`] saw move or wait on a
+    /// person, `OWNER/REPO#N`, which raise no stall alarm of their own.
+    blocked: BTreeSet<String>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -2395,6 +2424,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.reviewing = outcome.reviewing;
                 self.progressed += outcome.merged;
                 self.followed = Some((outcome.waits, outcome.undecided));
+                self.stepped = outcome.steps;
                 outcome.dispatched
             }
             Err(error) => {
@@ -2526,6 +2556,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let ranked: Vec<ItemRef> = candidates.iter().map(|(_, f)| f.issue.clone()).collect();
         drop(candidates);
         self.free = holds::free(Some(&ranked), &self.report.holds[holds..]);
+        self.blockers(&board);
         self.board = Some(Some(board));
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
@@ -3411,7 +3442,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     target,
                     (&self.ended_runs(), &waiver),
                 );
-                if let Some(step) = self.overlap_hold(decision) {
+                if let Some(step) = self.overlap_hold((issue, &dest), decision) {
                     return Ok(step);
                 }
             }
@@ -3510,7 +3541,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 target,
                 checks,
             );
-            if let Some(step) = self.overlap_hold(decision) {
+            if let Some(step) = self.overlap_hold((issue, dest), decision) {
                 return Ok(step);
             }
         }
@@ -3642,19 +3673,42 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
     }
 
-    /// An overlap check's `decision` as the step it holds a start with, if
-    /// it does; the overlap it ignored is kept for [`HoldKind::OverlapIgnored`].
-    fn overlap_hold(&self, decision: Decision) -> Option<Step> {
+    /// An overlap check's `decision` for `issue`, whose plan changes
+    /// `dest`, as the step it holds a start with, if it does; the overlap it
+    /// ignored is kept for [`HoldKind::OverlapIgnored`], and the pull
+    /// requests that hold it for [`Self::blockers`].
+    fn overlap_hold(
+        &self,
+        (issue, dest): (&ItemRef, &ItemRef),
+        decision: Decision,
+    ) -> Option<Step> {
         match decision {
-            Decision::Wait(..) => Some(Step::Hold(Hold::new(
-                HoldKind::Overlap,
-                decision.sentence(),
-            ))),
+            Decision::Wait(_, ref pulls) => {
+                self.blocked_by(issue, dest, pulls);
+                Some(Step::Hold(Hold::new(
+                    HoldKind::Overlap,
+                    decision.sentence(),
+                )))
+            }
             Decision::Ignored(why) => {
                 self.ignored.borrow_mut().push(why);
                 None
             }
             Decision::Independent(_) => None,
+        }
+    }
+
+    /// Notes that `pulls`, of `dest`'s repository, hold `issue`.
+    fn blocked_by(&self, issue: &ItemRef, dest: &ItemRef, pulls: &[u64]) {
+        let mut blocking = self.blocking.borrow_mut();
+        for &number in pulls {
+            // GitHub's names are case-insensitive: one pull request, one card.
+            let pull = ItemRef {
+                number,
+                repository: dest.repository.to_ascii_lowercase(),
+                host: dest.host.clone(),
+            };
+            blocking.entry(pull).or_default().insert(issue.clone());
         }
     }
 
@@ -3671,7 +3725,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 overlap,
                 ..
             }) => match overlap {
-                Some(decision) => Step::Hold(Hold::new(HoldKind::Overlap, decision.sentence())),
+                Some(decision) => {
+                    if let (Decision::Wait(_, pulls), [issue, dest, ..]) = (&decision, &holds[..]) {
+                        self.blocked_by(issue, dest, pulls);
+                    }
+                    Step::Hold(Hold::new(HoldKind::Overlap, decision.sentence()))
+                }
                 None => Step::Hold(Hold::new(HoldKind::Other, "the dispatch waited")),
             },
             Ok(done) => {
@@ -4876,6 +4935,7 @@ impl crate::github::GraphQl for Replay {
     }
 }
 
+mod blockers;
 mod cost;
 mod epics;
 pub mod holds;

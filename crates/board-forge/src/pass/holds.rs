@@ -120,6 +120,11 @@ pub enum HoldKind {
     /// `epics`: no triage run plans it.
     OutsideEpics,
     Overlap,
+    /// Not a hold of an item: an open pull request that holds items by
+    /// overlap, has stood still for `overlap.staleHours` and that only a
+    /// person can move, so that it is one card rather than a stall alarm
+    /// on each item it holds ([`super::blockers`]).
+    Blocking,
     /// Not a hold: an open pull request overlaps it, but the pass's
     /// `overlap` setting let it start anyway, so the overlap stays visible.
     OverlapIgnored,
@@ -155,6 +160,7 @@ impl HoldKind {
             Self::EpicNotLive => "epic-not-live",
             Self::OutsideEpics => "outside-epics",
             Self::Overlap => "overlap",
+            Self::Blocking => "blocking",
             Self::OverlapIgnored => "overlap-ignored",
             Self::Unreadable => "unreadable",
             Self::Wip => "wip",
@@ -176,6 +182,7 @@ impl HoldKind {
                 | Self::EpicUnplanned
                 | Self::NeedsOperator
                 | Self::EpicNotLive
+                | Self::Blocking
                 | Self::Stalled
         )
     }
@@ -299,8 +306,14 @@ impl Entry {
     /// The pass's line for it.
     pub fn line(&self) -> String {
         let reason = &self.hold.reason;
-        if let (HoldKind::OverlapIgnored, Some(item)) = (self.hold.kind, self.item()) {
-            return format!("overlap ignored: {}: {reason}", item.display());
+        match (self.hold.kind, self.item()) {
+            (HoldKind::OverlapIgnored, Some(item)) => {
+                return format!("overlap ignored: {}: {reason}", item.display());
+            }
+            (HoldKind::Blocking, Some(pull)) => {
+                return format!("blocker {}: {reason}", pull.display());
+            }
+            _ => {}
         }
         match &self.scope {
             Scope::Pass => format!("hold {}: {reason}", self.hold.kind.name()),
@@ -320,9 +333,10 @@ impl Entry {
 
     fn published(&self) -> Published {
         let item = self.item();
+        let pull = self.hold.kind == HoldKind::Blocking;
         Published {
             item: item.map(ItemRef::display),
-            url: item.map(url),
+            url: item.map(|i| if pull { pull_url(i) } else { url(i) }),
             epic: matches!(self.scope, Scope::Epic(_)),
             kind: self.hold.kind,
             reason: self.hold.reason.clone(),
@@ -437,6 +451,13 @@ impl Published {
 pub fn question(why: &str) -> Option<String> {
     let asked = why.trim().strip_prefix(QUESTION_PREFIX)?.trim();
     (!asked.is_empty()).then(|| asked.to_owned())
+}
+
+fn pull_url(pull: &ItemRef) -> String {
+    format!(
+        "https://{}/{}/pull/{}",
+        pull.host, pull.repository, pull.number
+    )
 }
 
 fn url(item: &ItemRef) -> String {
@@ -742,6 +763,10 @@ pub struct Watch<'a> {
     /// Stage 4's candidates free to start ([`free`]); none where it did not
     /// get as far as its candidates.
     pub free: Option<usize>,
+    /// The items, `OWNER/REPO#N`, held only by pull requests the pass saw
+    /// move or that wait on a person ([`super::blockers`]), whose holds
+    /// raise no alarm of their own.
+    pub blocked: &'a BTreeSet<String>,
 }
 
 /// Adds the stall alarms to `snapshot`, once [`carry`] has carried over its
@@ -788,7 +813,8 @@ pub fn alarm(snapshot: &mut Snapshot, previous: Option<&Value>, watch: &Watch) -
             hold.item.is_some() && hold.kind.stalls() && !hold.operator && (hold.epic || priority);
         let hold = Published { watched, ..hold };
         let stalled = (hold.item.clone())
-            .filter(|_| watched && !hold.carried && over(&hold.since, &at, hold_hours));
+            .filter(|_| watched && !hold.carried && over(&hold.since, &at, hold_hours))
+            .filter(|item| !watch.blocked.contains(item));
         let Some(stalled) = stalled else {
             holds.push(hold);
             continue;
@@ -1220,7 +1246,11 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         };
         let said = reading.summaries.1.get(&key).cloned().unwrap_or_default();
         let asked = said.question.clone().or_else(|| h.question.clone());
-        let action = Reference::new(RefKind::Issue, &repository, number);
+        let kind = match h.kind {
+            HoldKind::Blocking => RefKind::PullRequest,
+            _ => RefKind::Issue,
+        };
+        let action = Reference::new(kind, &repository, number);
         let ask = Ask {
             key,
             item,
@@ -1973,12 +2003,14 @@ mod tests {
         static ON: std::sync::LazyLock<ItemRef> = std::sync::LazyLock::new(|| item("o/ops", 1));
         static TOP: std::sync::LazyLock<Vec<String>> =
             std::sync::LazyLock::new(|| vec!["P0".into(), "P1".into()]);
+        static NONE: BTreeSet<String> = BTreeSet::new();
         Watch {
             stall,
             top: &TOP,
             on: &ON,
             log: Some("https://github.com/o/caller/actions/runs/9".into()),
             free,
+            blocked: &NONE,
         }
     }
 
