@@ -34,8 +34,8 @@ impl Config {
         // Stops a staging rehearsal from inspecting or later targeting production.
         crate::live::validate_stage_scope(&self.owner, &self.repository)?;
         ensure!(
-            self.project > 0 && !self.project_id.is_empty(),
-            "exact project number and node ID required"
+            self.project > 0 && self.project <= i32::MAX as u64 && !self.project_id.is_empty(),
+            "exact project number (positive GraphQL Int) and node ID required"
         );
         ensure!(
             self.workflow.ends_with(".yml") || self.workflow.ends_with(".yaml"),
@@ -106,7 +106,8 @@ fn inspect(config: &Config, mut read: impl FnMut(&str, Value) -> Result<Value>) 
             json!({"revision":config.agent_board_revision}),
         ),
     ];
-    // Exactly four non-paginated reads, even on partial failures; no write API.
+    // Four logical non-paginated queries, even on partial failures; the live
+    // transport may retry each one within its own bounds. No write API.
     for (name, query, vars) in queries {
         let result = read(query, vars);
         let state = match &result {
@@ -210,15 +211,24 @@ pub fn run(options: &Options) -> Result<()> {
         ],
         Ok(config) => {
             if let Some(path) = &options.fixture {
-                let values: Vec<Value> =
-                    serde_json::from_slice(&std::fs::read(path).context("read deploy fixture")?)
-                        .context("decode deploy fixture")?;
-                ensure!(
-                    values.len() == 4,
-                    "deploy fixture requires exactly four responses"
-                );
-                let mut values = values.into_iter();
-                inspect(&config, |_, _| values.next().context("incomplete fixture"))
+                let fixture = (|| -> Result<Vec<Value>> {
+                    let values: Vec<Value> = serde_json::from_slice(
+                        &std::fs::read(path).context("read deploy fixture")?,
+                    )
+                    .context("decode deploy fixture")?;
+                    ensure!(values.len() == 4, "expected four responses");
+                    Ok(values)
+                })();
+                match fixture {
+                    Ok(values) => {
+                        let mut values = values.into_iter();
+                        inspect(&config, |_, _| values.next().context("incomplete fixture"))
+                    }
+                    // Keep file contents and paths out of the public report.
+                    Err(_) => vec![
+                        json!({"group":"fixture","check":"responses","state":"blocked","detail":"fixture must be a readable JSON array of exactly four responses; no live reads attempted"}),
+                    ],
+                }
             } else {
                 let client = Client::from_env();
                 inspect(&config, |query, vars| match &client {
@@ -261,6 +271,8 @@ mod tests {
             ("repository", json!("production/board")),
             ("repository", json!("cgwalters-forge-stage/../board")),
             ("project", json!(0)),
+            ("project", json!(i32::MAX as u64 + 1)),
+            ("project", json!(u64::MAX)),
             ("projectId", json!("")),
             ("workflow", json!("../dispatch.yml")),
             ("workflowRevision", json!("main")),
@@ -278,6 +290,13 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn config_accepts_largest_graphql_project_number() {
+        let mut config = config();
+        config.project = i32::MAX as u64;
+        config.validate().unwrap();
     }
 
     #[test]

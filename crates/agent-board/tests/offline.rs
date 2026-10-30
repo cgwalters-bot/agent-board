@@ -68,6 +68,80 @@ fn deploy_preflight_report_is_offline_and_preview_only() {
 }
 
 #[test]
+fn deploy_preflight_fixture_failures_produce_blocked_reports() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let dir =
+        std::env::temp_dir().join(format!("agent-board-deploy-fixture-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("reads.json");
+    for contents in [
+        None,
+        Some("["),
+        Some("{}"),
+        Some("[]"),
+        Some("[{}, {}, {}]"),
+        Some("[{}, {}, {}, {}, {}]"),
+    ] {
+        if let Some(contents) = contents {
+            std::fs::write(&path, contents).unwrap();
+        }
+        let output = command()
+            .current_dir(root)
+            .args([
+                "test",
+                "deploy",
+                "--config",
+                "fixtures/deploy-config.json",
+                "--fixture",
+            ])
+            .arg(&path)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["schema"], "agent-board.deploy-preflight.v1");
+        assert_eq!(report["writes"], 0);
+        assert_eq!(report["checks"].as_array().unwrap().len(), 1);
+        assert_eq!(report["checks"][0]["group"], "fixture");
+        assert_eq!(report["checks"][0]["state"], "blocked");
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains(path.to_str().unwrap())
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn deploy_preflight_rejects_unsupported_global_options() {
+    for flags in [
+        vec!["--json", "checks"],
+        vec!["--json", "checks", "--jq", ".checks"],
+        vec!["--board-config", "does-not-exist.json"],
+        vec!["--template", "{{.checks}}"],
+    ] {
+        let output = command()
+            .args(["test", "deploy", "--config", "does-not-exist.json"])
+            .args(&flags)
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(output.stdout.is_empty(), "{flags:?}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("unsupported"),
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
 fn setup_credential_free_rehearsal() {
     let setup = include_str!("../../../docs/setup.md");
     let section = setup

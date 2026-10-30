@@ -492,6 +492,17 @@ fn load(cli: &Cli, runtime: &Runtime) -> Result<Snapshot> {
 }
 
 fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
+    if matches!(
+        cli.command,
+        Command::Test {
+            command: Test::Deploy(_)
+        }
+    ) {
+        ensure!(
+            cli.json.is_none() && cli.jq.is_none() && cli.board_config.is_none(),
+            "test deploy prints its full report directly; --json, --jq and --board-config are unsupported"
+        );
+    }
     ensure!(
         cli.template.is_none(),
         "unsupported_capability: --template is not implemented"

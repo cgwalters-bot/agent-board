@@ -311,8 +311,12 @@ has put production data in the staging organization.
 The `agent-board.deploy-preflight.v1` JSON report has `mode: "preview"`, `writes: 0`
 and ordered `checks`, each with `group`, `check`, `state` (`ready`, `blocked` or
 `unverified`) and a non-secret `detail`. Configuration failures and mismatched or
-missing returned facts are blocked (exit 1); failed reads are unverified, never
-ready. It attempts at most four non-paginated GraphQL reads, uses `GH_TOKEN` via
+missing returned facts and unreadable, malformed or wrongly sized fixture files
+are blocked (exit 1); failed live reads are unverified, never ready. Project
+numbers must fit a positive GraphQL Int (at most 2147483647). The report is always
+printed in full; global `--json`, `--jq` and `--board-config` are unsupported.
+It attempts four logical non-paginated GraphQL queries (the normal client's
+bounded transport retries may make additional requests), uses `GH_TOKEN` via
 the normal client only without `--fixture`, and has no apply flag or mutation
 path. Environment provisioning is reported separately from stage access and from
 inference/broker prerequisites; it reads no secret values and does not test writer
