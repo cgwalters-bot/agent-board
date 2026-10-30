@@ -1,0 +1,21 @@
+{
+  "pollWorkflow": "poll.yml",
+  "probeWorkflow": "broker-probe.yml",
+  "supervisorWorkflow": "supervisor.yml",
+  "schedulerJob": "board",
+  "implementBranchPrefix": "dispatch/implement/agent-run-",
+  "releaseRepository": "example/agentic-job",
+  "wrapperRepository": "example/actions",
+  "wrapperPath": ".github/workflows/wrapper.yml",
+  "agent": {
+    "pool": "large",
+    "cooldownHours": 1,
+    "requests": {"repository": "example/control", "issue": 5},
+    "log": {"repository": "example/operator", "issue": 7},
+    "kinds": ["triage", "research"],
+    "maxDispatchesPerPass": 2,
+    "maxDispatchesPerDay": 3,
+    "profile": {"repository": "example/home", "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    "skipUnchangedFailures": false
+  }
+}

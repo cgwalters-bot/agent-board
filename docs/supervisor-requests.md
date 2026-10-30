@@ -170,6 +170,82 @@ API endpoint, configuration file, credential, assignee or arbitrary label.
 
 ## Configuration
 
+### v1 compatibility baseline
+
+Here **v1** names the current loader contract, not a new `schema` or `version`
+field. `Settings::from_json` in `crates/board-forge/src/supervise.rs` reads the
+poll file and supervisor file, not the pass's distinct configuration format.
+The required/optional names below, all `agent` keys in the example, and the
+threshold table are the supported field inventory. `agent.dailyCaps` accepts only
+the judgment action names shown in the example; dispatch kinds are `triage`,
+`research` and `implement`, never `fix` or arbitrary job kinds.
+
+Compatibility includes the loader's current asymmetries, not an invented strict
+schema: unknown poll-file top-level keys and unknown `agent` keys are rejected;
+unknown supervisor top-level keys and extra issue-reference/usage fields are
+ignored. `profile` rejects extra keys. Unknown request fields still refuse the
+request batch; that is a different parser. Do not depend on ignored fields as
+extensions: tightening them requires an explicit migration, not an undocumented
+patch. `unset` lists only its known option tables, not every threshold or typo.
+
+Missing or null optional supervisor strings are absent; empty strings are errors.
+The release group must still be complete. Missing limits use the defaults below;
+null limits, wrong types, quoted numbers and negative values fail. Count limits
+require integers. Threshold numbers must be finite and nonnegative, with no
+additional policy maximum; zero is valid for them. JSON itself rejects NaN and
+infinity. Required names have no defaults: workflows and repositories are
+validated, wrapper paths are relative repository paths (at most 200 bytes, no
+empty/dot components or query), and the nonempty implement prefix is at most
+100 ASCII letters/digits or `._-/` characters.
+
+Missing/null `agent`, or either missing/null agent issue, disables the agent.
+Unknown agent keys and provided issue references are checked before that early
+return, but the remaining unused agent settings are not validated when off.
+When on, missing kinds/caps mean no executor dispatches or judgment writes;
+`skipUnchangedFailures` defaults false, and tracker, state, project, profile and
+passConfig are absent. Null is not a general substitute for omission: null
+state/profile is absent, but null kinds, caps, tracker, project, passConfig or
+skipUnchangedFailures fails for an enabled agent. Issue references accept
+`repository` (preferred) or `repo`, with a positive integer `issue`; when both
+names are strings, `repository` wins. The profile ref is exactly 40 lowercase
+hex characters. Pool availability/kind assignments and tracker/state membership
+in `follow` are checked by the executor, not all by this settings loader. An
+agent being enabled is not permission for any write without its matching caps
+and the request's evidence checks.
+
+Sanitized representative fixtures
+[`board-v1.json`](../fixtures/supervise/board-v1.json) and
+[`config-v1.json`](../fixtures/supervise/config-v1.json) pin the existing test
+configuration, with synthetic repository/logins, issue numbers and profile pin.
+They are not fetched production settings. The existing `supervise::tests`
+settings/optional/unset/name tests now load them; `v1_limit_boundaries` and
+`v1_legacy_tolerance_and_disabled_defaults` pin caps and omission behavior.
+Requests and ledger replay tests continue to test the independent write boundary.
+
+These files, the optional usage file and `agent.passConfig` must come from the
+caller's trusted default-branch checkout, with a pinned executable. Loading JSON
+does not authenticate its source. Never substitute agent-controlled files, PR
+checkouts or workflow inputs; keep credentials out of configuration. The example's
+repositories, pools and nonzero caps are caller choices, not defaults or new
+authority. Health collection is read-only; the executor's writes remain off by
+default, even though health checks have working defaults.
+
+Compatible additions preserve omission behavior and the old fixtures. Changes to
+accepted input, defaults, authority or write semantics require an explicit
+successor contract and documented caller migration, retaining a pinned old reader
+during transition rather than silently reinterpreting an unversioned file. The
+successor's version selector is not chosen here. No settings are removed or
+deployment migrated in this baseline. The old closure receipt described below
+is already unsupported; it is not a configuration alias to revive.
+
+Unresolved (not stability promises): retirement of health/check-driven starts or
+executor dispatches, stricter unknown-field/null handling, policy maxima for
+numeric thresholds, and the cross-controller concurrency model. Existing caller
+serialization, evidence and accounting requirements remain necessary. See the
+[architecture's open questions](architecture.md#open-questions).
+
+### Files and supported fields
+
 Every `supervise` command reads two files: the poll's agent-board.json
 (`--config`) and the supervisor's own file (`--supervisor-config`). `health`,
 `trigger` and `execute` may also take `--usage-config`, the usage snapshot's
@@ -276,6 +352,34 @@ dispatcher/workflow, `follow` repositories and epics repository still come from
 files, never agent-provided files or workflow inputs. Tracker and state must
 belong to `follow`; the project is a trusted Projects v2 node ID, not a request
 field. State must be distinct from requests and log.
+
+### Health defaults and finite collection bounds
+
+These are omission defaults, not recommendations to copy into every caller file.
+Integer bounds are inclusive and positive (unlike executor caps, which allow zero).
+The collection deadline and request cap also bound checks whose time thresholds
+have no policy maximum.
+
+| Key | Default | Accepted range |
+| --- | --- | --- |
+| `pageSize` | 100 | integer 1–100 |
+| `maxRequests` | 500 | integer 1–10000 |
+| `collectionTimeoutSeconds` | 420 | integer 1–3600 |
+| `pollFailures` | 3 | integer 1–10000 |
+| `maxPages` | 6 | integer 1–10000 |
+| `maxItems` | 25 | integer 1–10000 |
+| `maxEvidence` | 10 | integer 1–10000 |
+| `idlePasses` | 2 | integer 1–10000 |
+| `maxDownloadBytes` | 8388608 (8 MiB) | integer 1–67108864 (64 MiB) |
+| `runTimeoutMinutes` | 360 | finite number ≥ 0 |
+| `probeStaleMinutes`, `usageStaleMinutes` | 45 each | finite number ≥ 0 |
+| `epicStaleHours` | 48 | finite number ≥ 0 |
+| `epicFailures` | 3 | finite number ≥ 0 (not integer-only) |
+| `approvedWaitHours` | 2 | finite number ≥ 0 |
+| `decisionWaitHours`, `eventLookbackHours`, `releaseIntervalHours` | 24 each | finite number ≥ 0 |
+| `unavailableFailHours`, `unqueuedWaitHours`, `unclosedWaitHours`, `releaseOverdueHours` | 1 each | finite number ≥ 0 |
+| `holdWaitHours` | 12 | finite number ≥ 0 |
+| `paceMarginPercent` | 25 | finite number ≥ 0 |
 
 ## Lines
 

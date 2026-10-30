@@ -1,0 +1,12 @@
+{
+  "operator": "owner",
+  "bot": "worker",
+  "dispatchRepo": "example/control",
+  "dispatchWorkflow": "dispatch.yml",
+  "follow": ["example/control", "example/project"],
+  "mergeAuthors": ["dependabot[bot]"],
+  "kindPools": {"triage": "small"},
+  "epics": {"repository": "example/control"},
+  "coordinator": {"enabled": false},
+  "schedule": {"repositories": ["example/control", "example/project"]}
+}

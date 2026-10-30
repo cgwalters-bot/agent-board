@@ -7249,11 +7249,49 @@ fn maintain(edit: Value) -> Value {
 }
 
 #[test]
+fn v1_representative_config() {
+    // Synthetic deployment shape: public placeholders, no live endpoint or credentials.
+    let text = include_str!("../../../../fixtures/pass/config-v1.json");
+    let cfg = Config::parse(text).unwrap();
+    assert!(cfg.work());
+    assert_eq!(cfg.triage, Some(TriageScope::Epics));
+    assert_eq!(cfg.triage_pools(), &cfg.plan_pools);
+    assert_eq!(cfg.board.as_ref().unwrap().priority_field, "Priority");
+    assert_eq!(cfg.epics.as_ref().unwrap().max_applies_per_pass, 1);
+    assert_eq!(cfg.overlap.as_ref().unwrap().stale_draft_hours, 4);
+    assert_eq!(cfg.pr.merge_queue.as_ref().unwrap().tries, 3);
+    assert!(cfg.grant().is_some());
+    assert!(!cfg.leases && !cfg.triage_close && !cfg.body_plans);
+    for (pointer, value) in [
+        ("/wip", json!(101)),
+        ("/usage/issue", json!(0)),
+        ("/budget/pools/claude", Value::Null),
+        ("/pools/claude", json!({"target": 0.95})),
+        (
+            "/epics",
+            json!({"repository": "example/control", "unknown": true}),
+        ),
+    ] {
+        let mut value_config: Value = serde_json::from_str(text).unwrap();
+        *value_config.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            Config::parse(&value_config.to_string()).is_err(),
+            "{pointer}"
+        );
+    }
+}
+
+#[test]
 fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
     let parsed = Config::parse(&minimal.to_string()).unwrap();
     assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
     assert!(parsed.pools.0.is_empty() && parsed.dispatch_ref.is_none());
+    assert_eq!(parsed.wip, 0);
+    assert!(!parsed.reruns && !parsed.leases && !parsed.body_plans && !parsed.triage_close);
+    assert!(parsed.starts.is_none() && parsed.holds.is_none() && parsed.direction.is_none());
+    assert!(parsed.revisit.is_none() && parsed.sweep.is_none() && parsed.maintain.is_none());
+    assert!(parsed.cost.is_none() && parsed.budget.is_none() && parsed.overlap.is_none());
     // Pools keep the file's order, which breaks ties.
     let ordered = Config::parse(
         r#"{"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml",

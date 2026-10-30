@@ -764,35 +764,150 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn board() -> Value {
-        json!({
-            "operator": "owner", "bot": "worker",
-            "dispatchRepo": "example/control", "dispatchWorkflow": "dispatch.yml",
-            "follow": ["example/control", "example/project"],
-            "mergeAuthors": ["dependabot[bot]"],
-            "kindPools": {"triage": "small"},
-            "epics": {"repository": "example/control"},
-            "coordinator": {"enabled": false},
-            "schedule": {"repositories": ["example/control", "example/project"]},
-        })
+        serde_json::from_str(include_str!("../../../fixtures/supervise/board-v1.json")).unwrap()
     }
 
     pub(crate) fn supervisor() -> Value {
-        json!({
-            "pollWorkflow": "poll.yml", "probeWorkflow": "broker-probe.yml",
-            "supervisorWorkflow": "supervisor.yml", "schedulerJob": "board",
-            "implementBranchPrefix": "dispatch/implement/agent-run-",
-            "releaseRepository": "example/agentic-job", "wrapperRepository": "example/actions",
-            "wrapperPath": ".github/workflows/wrapper.yml",
-            "agent": {
-                "pool": "large", "cooldownHours": 1,
-                "requests": {"repository": "example/control", "issue": 5},
-                "log": {"repository": "example/operator", "issue": 7},
-                "kinds": ["triage", "research"],
-                "maxDispatchesPerPass": 2, "maxDispatchesPerDay": 3,
-                "profile": {"repository": "example/home", "ref": "a".repeat(40)},
-                "skipUnchangedFailures": false,
-            },
-        })
+        serde_json::from_str(include_str!("../../../fixtures/supervise/config-v1.json")).unwrap()
+    }
+
+    #[test]
+    fn v1_limit_boundaries() {
+        for (key, max) in [
+            ("pageSize", 100),
+            ("maxRequests", 10_000),
+            ("collectionTimeoutSeconds", 3600),
+            ("pollFailures", 10_000),
+            ("maxPages", 10_000),
+            ("maxItems", 10_000),
+            ("maxEvidence", 10_000),
+            ("idlePasses", 10_000),
+            ("maxDownloadBytes", 64 << 20),
+        ] {
+            for (value, valid) in [
+                (json!(1), true),
+                (json!(max), true),
+                (json!(0), false),
+                (json!(max + 1), false),
+                (Value::Null, false),
+                (json!("1"), false),
+                (json!(1.5), false),
+            ] {
+                let mut cfg = supervisor();
+                cfg[key] = value.clone();
+                assert_eq!(
+                    Settings::from_json(&board(), &cfg, None).is_ok(),
+                    valid,
+                    "{key}={value}"
+                );
+            }
+        }
+        for key in ["maxDispatchesPerPass", "maxDispatchesPerDay"] {
+            for (value, valid) in [(0, true), (100, true), (101, false)] {
+                let mut cfg = supervisor();
+                cfg["agent"][key] = json!(value);
+                assert_eq!(
+                    Settings::from_json(&board(), &cfg, None).is_ok(),
+                    valid,
+                    "{key}={value}"
+                );
+            }
+        }
+        for (action, cap, valid) in [
+            ("comment", 0, true),
+            ("comment", 100, true),
+            ("comment", 101, false),
+            ("status_update", 1, true),
+            ("status_update", 2, false),
+            ("unknown", 0, false),
+        ] {
+            let mut cfg = supervisor();
+            cfg["agent"]["dailyCaps"] = json!({action: cap});
+            assert_eq!(
+                Settings::from_json(&board(), &cfg, None).is_ok(),
+                valid,
+                "{action}={cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_threshold_defaults_and_types() {
+        type Threshold = (&'static str, f64, fn(&Limits) -> f64);
+        let cases: &[Threshold] = &[
+            ("runTimeoutMinutes", 360.0, |l| l.run_timeout_minutes),
+            ("probeStaleMinutes", 45.0, |l| l.probe_stale_minutes),
+            ("epicStaleHours", 48.0, |l| l.epic_stale_hours),
+            ("epicFailures", 3.0, |l| l.epic_failures),
+            ("approvedWaitHours", 2.0, |l| l.approved_wait_hours),
+            ("decisionWaitHours", 24.0, |l| l.decision_wait_hours),
+            ("eventLookbackHours", 24.0, |l| l.event_lookback_hours),
+            ("unavailableFailHours", 1.0, |l| l.unavailable_fail_hours),
+            ("holdWaitHours", 12.0, |l| l.hold_wait_hours),
+            ("unqueuedWaitHours", 1.0, |l| l.unqueued_wait_hours),
+            ("unclosedWaitHours", 1.0, |l| l.unclosed_wait_hours),
+            ("paceMarginPercent", 25.0, |l| l.pace_margin_percent),
+            ("usageStaleMinutes", 45.0, |l| l.usage_stale_minutes),
+            ("releaseIntervalHours", 24.0, |l| l.release_interval_hours),
+            ("releaseOverdueHours", 1.0, |l| l.release_overdue_hours),
+        ];
+        for &(key, default, read) in cases {
+            assert_eq!(read(&settings().limits), default, "{key}");
+            for (value, valid) in [
+                (json!(0), true),
+                (json!(1.5), true),
+                (json!(1_000_000), true),
+                (json!(-1), false),
+                (json!("1"), false),
+                (Value::Null, false),
+            ] {
+                let mut cfg = supervisor();
+                cfg[key] = value.clone();
+                let result = Settings::from_json(&board(), &cfg, None);
+                assert_eq!(result.is_ok(), valid, "{key}={value}");
+                if valid {
+                    assert_eq!(
+                        read(&result.unwrap().limits),
+                        value.as_f64().unwrap(),
+                        "{key}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v1_legacy_tolerance_and_disabled_defaults() {
+        let mut cfg = supervisor();
+        cfg["unknown"] = json!(true);
+        cfg["agent"]["requests"]["unknown"] = json!(true);
+        assert!(Settings::from_json(&board(), &cfg, None).is_ok());
+        for key in [
+            "kinds",
+            "maxDispatchesPerPass",
+            "maxDispatchesPerDay",
+            "dailyCaps",
+        ] {
+            cfg["agent"].as_object_mut().unwrap().remove(key);
+        }
+        let agent = Settings::from_json(&board(), &cfg, None)
+            .unwrap()
+            .agent
+            .unwrap();
+        assert!(agent.kinds.is_empty() && agent.daily_caps.is_empty());
+        assert_eq!(
+            (agent.max_dispatches_per_pass, agent.max_dispatches_per_day),
+            (0, 0)
+        );
+        // An incomplete agent is off; its unused settings are not validated.
+        cfg["agent"].as_object_mut().unwrap().remove("log");
+        cfg["agent"]["cooldownHours"] = json!(-1);
+        assert!(
+            Settings::from_json(&board(), &cfg, None)
+                .unwrap()
+                .agent
+                .is_none()
+        );
     }
 
     pub(crate) fn settings() -> Settings {
