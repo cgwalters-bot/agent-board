@@ -412,6 +412,43 @@ fn budget_holds_epic_planning() {
     assert!(!report.lines.iter().any(|l| l.starts_with("start ")));
 }
 
+/// A budget without `usage.url`, as a pass whose broker is out of reach
+/// runs (agent-board#457), holds on the published snapshot's spend: below
+/// the budget runs start, and at it, or with no reading, they wait.
+#[test]
+fn budget_without_usage_url_holds_on_the_published_spend() {
+    let planned = "cgwalters-forge/tracker#596";
+    for (spent, expected) in [
+        (Some(json!(100.0)), None),
+        (Some(json!(1000.0)), Some("budget: weekly budget reached")),
+        (
+            None,
+            Some("budget: the usage snapshot has no spend reading"),
+        ),
+    ] {
+        let mut replay = replay();
+        unfinished(&mut replay);
+        let mut snapshot = usage(&mut replay);
+        if let Some(spent) = &spent {
+            snapshot["budget"] = json!({"weekly_usd": 1000.0, "spent_usd": spent});
+        }
+        set_usage(&mut replay, &snapshot);
+        let config = config(json!({"budget": {"weeklyUsd": 1000}}));
+        assert!(config.usage.as_ref().unwrap().url.is_none());
+        let report = preview(&config, &replay);
+        let line = (report.lines.iter())
+            .find(|l| {
+                l.contains(planned)
+                    && (l.starts_with("start planning") || l.starts_with("hold epic"))
+            })
+            .unwrap_or_else(|| panic!("{spent:?}: {:#?}", report.lines));
+        match expected {
+            None => assert!(line.starts_with("start planning"), "{spent:?}: {line}"),
+            Some(why) => assert!(line.ends_with(why), "{spent:?}: {line}"),
+        }
+    }
+}
+
 /// Gives tracker#596 an open sub-issue, tracker#9999, so that it is planned
 /// for its closed ones rather than asked about (agent-board#429).
 pub(super) fn unfinished(replay: &mut Replay) {
@@ -7414,8 +7451,8 @@ fn config_table() {
             "pr pool mistral is not in pools",
         ),
         (
-            json!({"budget": {"weeklyUsd": 1000}, "usage": {"repository": "o/ops", "issue": 1}}),
-            "budget needs usage.url",
+            json!({"budget": {"weeklyUsd": 1000}}),
+            "budget needs usage, the snapshot",
         ),
         (
             json!({"budget": {"weeklyUsd": 0}, "usage": {"url": "http://b.example/usage", "repository": "o/ops", "issue": 1}}),
@@ -7461,7 +7498,7 @@ fn config_table() {
             json!({"budget": {"source": "broker", "url": "http://b.example/usage/grant",
                 "pools": {"claude": "anthropic"}},
                 "pools": {"claude": {}}, "usage": {"repository": "o/ops", "issue": 1}}),
-            "budget needs usage.url",
+            "budget source broker needs usage.url",
         ),
         (
             json!({"budget": {"weeklyUsd": 1000, "pools": {"claude": "anthropic"}},
@@ -7501,7 +7538,7 @@ fn config_table() {
         ),
         (
             json!({"budget": {"harnessRepositories": ["o/r"], "weeklyUsd": 1000}}),
-            "budget needs usage.url",
+            "budget needs usage, the snapshot",
         ),
         (
             json!({"budget": {"source": "ledger"}}),

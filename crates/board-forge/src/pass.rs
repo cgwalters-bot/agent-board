@@ -905,6 +905,13 @@ impl Config {
                         budget.weekly_usd.is_none(),
                         "budget weeklyUsd is refused with source broker, whose grant is the budget"
                     );
+                    // A grant is read with the broker's usage, and pacing
+                    // never falls back to a snapshot that may be paced
+                    // otherwise.
+                    ensure!(
+                        self.usage.as_ref().is_some_and(|u| u.url.is_some()),
+                        "budget source broker needs usage.url, the broker that grants it"
+                    );
                     let url = budget.url.as_deref().unwrap_or_default();
                     ensure!(
                         broker_url(url),
@@ -925,10 +932,13 @@ impl Config {
                     }
                 }
             }
-            // Only stage 1's reading of the broker records the spend.
+            // Runs wait on the spend in the usage snapshot. A pass with
+            // usage.url records it there; one without (a pass whose broker
+            // is out of reach) reads what was published, and a stale or
+            // missing reading holds runs as reaching the budget does.
             ensure!(
-                self.usage.as_ref().is_some_and(|u| u.url.is_some()),
-                "budget needs usage.url, the broker that meters spend"
+                self.usage.is_some(),
+                "budget needs usage, the snapshot that records the week's spend"
             );
         }
         if let Some(workflow) = &self.pr.review_workflow {
