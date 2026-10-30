@@ -726,11 +726,11 @@ struct Refusal {
     stale: bool,
 }
 
-/// What one stage 3 has taken: at most one apply and one planning start a
-/// pass, and the runs it started or the cap held.
+/// What one stage 3 has taken: at most `epics.maxAppliesPerPass` applies
+/// and one planning start a pass, and the runs it started or the cap held.
 #[derive(Default)]
 struct Turn {
-    applied: bool,
+    applied: usize,
     planned: bool,
     starts: usize,
 }
@@ -1254,7 +1254,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// applied with its comment and change time pinned, as one step of
     /// writes per action and one for the receipt, taken whole or held whole.
     /// The plan's refusal, which the caller holds or plans again for; a
-    /// refused plan does not take the pass's one apply (agent-board#453).
+    /// refused plan does not count against the pass's applies
+    /// (agent-board#453).
     fn apply_epic(
         &mut self,
         facts: &EpicFacts,
@@ -1265,8 +1266,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     ) -> Option<Refusal> {
         let name = facts.issue.display();
         let wait = |why: &str| Hold::new(HoldKind::Other, format!("plan {id} waits; {why}"));
-        if turn.applied {
-            self.epic_held(facts, wait("one epic plan is applied a pass"));
+        let most = self
+            .config
+            .epics
+            .as_ref()
+            .map_or(1, |e| e.max_applies_per_pass);
+        if turn.applied >= most {
+            let why = match most {
+                1 => "one epic plan is applied a pass".to_owned(),
+                n => format!("{n} epic plans are applied a pass"),
+            };
+            self.epic_held(facts, wait(&why));
             return None;
         }
         let Some(project) = project else {
@@ -1312,8 +1322,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return None;
             }
         };
-        // Only a plan apply accepts takes the pass's one apply.
-        turn.applied = true;
+        // Only a plan apply accepts counts against the pass's applies.
+        turn.applied += 1;
         let words = match planned.lines.is_empty() {
             true => "no changes".to_owned(),
             false => planned.lines.join("; "),

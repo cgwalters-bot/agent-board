@@ -225,8 +225,9 @@ one line an epic:
   `set_priority` of it, else the board's last option. An applying pass ends
   the line with what the [receipt](epic-plans.md#apply) says and
   `receipt=URL`. Its receipt and each action that writes are one write step
-  each, held whole by `--max-writes`; one epic is applied a pass, which a
-  plan apply refuses does not take.
+  each, held whole by `--max-writes`; `epics.maxAppliesPerPass` epics are
+  applied a pass, counting only plans apply accepts, so each epic's unapplied
+  plan is read on every pass until one is.
 * `recover epic …` where the receipt was cut short (`claimed` or `stopped`)
   and every action's effect is proved by the identities it confirmed and the
   epic now; an applying pass rewrites the receipt as `recovered`, one write.
@@ -1637,6 +1638,7 @@ The pinned executable/build reference belongs in the workflow, not this file.
 | `board.priorityField` | Priority single-select field; `"Priority"` |
 | `epics.repository` | Repository containing live epics; absent disables epic planning |
 | `epics.inWorkRepositories` | Also take operator-labelled epics in every work repository as live, for candidates only; `false` |
+| `epics.maxAppliesPerPass` | The most accepted epic plans a pass applies (1–10), in Priority order; a refused plan does not count, and `--max-writes` still holds what they write; `1` |
 | `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |

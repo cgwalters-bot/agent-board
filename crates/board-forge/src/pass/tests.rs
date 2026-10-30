@@ -7455,6 +7455,14 @@ fn config_table() {
             "budget needs usage, the snapshot",
         ),
         (
+            json!({"epics": {"repository": "o/tracker", "maxAppliesPerPass": 0}}),
+            "epics maxAppliesPerPass is not from 1 to 10",
+        ),
+        (
+            json!({"epics": {"repository": "o/tracker", "maxAppliesPerPass": 11}}),
+            "epics maxAppliesPerPass is not from 1 to 10",
+        ),
+        (
             json!({"budget": {"weeklyUsd": 0}, "usage": {"url": "http://b.example/usage", "repository": "o/ops", "issue": 1}}),
             "budget weeklyUsd is not above 0",
         ),

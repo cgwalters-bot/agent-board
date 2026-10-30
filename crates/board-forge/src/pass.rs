@@ -495,7 +495,18 @@ pub struct Epics {
     /// completed, rather than asked about once ([`Scheduler::finish_epic`]).
     #[serde(default)]
     pub close: bool,
+    /// The most accepted epic plans one pass applies, in Priority order;
+    /// `--max-writes` and `--max-status-changes` still bound what they write.
+    #[serde(default = "max_applies_per_pass")]
+    pub max_applies_per_pass: usize,
 }
+
+fn max_applies_per_pass() -> usize {
+    1
+}
+
+/// The most `epics.maxAppliesPerPass` may be.
+const MAX_APPLIES_LIMIT: usize = 10;
 
 /// [`overlap::Waiver`]'s settings: set, a documentation-only overlap does
 /// not hold an issue in the board's first Priority option, and a draft
@@ -767,6 +778,10 @@ impl Config {
         }
         if let Some(epics) = &self.epics {
             validate_repository(&epics.repository).context("epics repository")?;
+            ensure!(
+                (1..=MAX_APPLIES_LIMIT).contains(&epics.max_applies_per_pass),
+                "epics maxAppliesPerPass is not from 1 to {MAX_APPLIES_LIMIT}"
+            );
         }
         for (name, settings) in &self.pools.0 {
             ensure!(valid_pool(name), "pool {name:?} is not a pool name");

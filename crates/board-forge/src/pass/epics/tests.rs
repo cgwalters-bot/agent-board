@@ -458,6 +458,26 @@ fn replay_epic_scenarios() {
             None,
         ),
         (
+            "by default one accepted plan is applied a pass, and the next waits",
+            Box::new(|r| {
+                stale_596(r, json!({"type": "set_priority", "value": "P1"}));
+                unapplied(r);
+            }),
+            "hold epic cgwalters-forge/tracker#890: plan 6366132099@2026-10-23T13:34:49Z waits; one epic plan is applied a pass",
+            0,
+            Some((HoldKind::Other, false)),
+        ),
+        (
+            "with epics.maxAppliesPerPass 2, both apply in one pass (agent-board#455)",
+            Box::new(|r| {
+                stale_596(r, json!({"type": "set_priority", "value": "P1"}));
+                unapplied(r);
+            }),
+            "apply epic cgwalters-forge/tracker#890 plan=6366132099@2026-10-23T13:34:49Z: Create a sub-issue",
+            0,
+            None,
+        ),
+        (
             "a plan refused for a sub-issue closed since is planned again, not held for a person",
             Box::new(rescoped_596),
             "start planning cgwalters-forge/tracker#596 pool=claude: plan 7000000003@2026-10-23T20:59:10.085106014Z names a sub-issue that has closed since",
@@ -635,6 +655,8 @@ fn replay_epic_scenarios() {
         edit(&mut replay);
         let settings = if name.starts_with("no planning") {
             json!({"wip": 0})
+        } else if name.contains("maxAppliesPerPass") {
+            json!({"epics": {"repository": "cgwalters-forge/tracker", "maxAppliesPerPass": 2}})
         } else if name.contains("epics.close") {
             json!({"epics": {"repository": "cgwalters-forge/tracker", "close": true}})
         } else {
