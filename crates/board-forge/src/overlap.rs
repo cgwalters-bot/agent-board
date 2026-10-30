@@ -75,8 +75,11 @@ pub enum Decision {
     /// Only open pull requests a [`Waiver`] waives overlap: run
     /// independently, and say which and why.
     Ignored(String),
-    /// Dispatch nothing now: the next pass decides again.
-    Wait(String),
+    /// Dispatch nothing now: the next pass decides again. With the open
+    /// pull requests of the destination's repository that hold it, by
+    /// number: none where a run in flight holds it or the check could not
+    /// read.
+    Wait(String, Vec<u64>),
 }
 
 impl Decision {
@@ -85,7 +88,7 @@ impl Decision {
         match self {
             Self::Independent(why) => format!("Run independently: {why}."),
             Self::Ignored(why) => format!("Run independently: overlap ignored: {why}."),
-            Self::Wait(why) => format!("Waiting: {why}."),
+            Self::Wait(why, _) => format!("Waiting: {why}."),
         }
     }
 }
@@ -281,7 +284,10 @@ pub fn decide_strict<C: Transport + Rest>(
     (ended, waiver): (&BTreeSet<u64>, &Waiver),
 ) -> Decision {
     check(client, (source, dest), brief, bot, target, (ended, waiver)).unwrap_or_else(|error| {
-        Decision::Wait(format!("the overlap check could not read ({error:#})"))
+        Decision::Wait(
+            format!("the overlap check could not read ({error:#})"),
+            Vec::new(),
+        )
     })
 }
 
@@ -314,11 +320,14 @@ fn check<C: Transport + Rest>(
             .filter(|o| named.iter().any(|n| overlaps(n, o) && !(n == o && bare(n))))
             .collect();
         if !theirs.is_empty() {
-            return Ok(Decision::Wait(format!(
-                "the run for {} in flight names {}",
-                running.display(),
-                shown(&theirs)
-            )));
+            return Ok(Decision::Wait(
+                format!(
+                    "the run for {} in flight names {}",
+                    running.display(),
+                    shown(&theirs)
+                ),
+                Vec::new(),
+            ));
         }
     }
     let (mut overlapping, mut ignored) = (Vec::new(), Vec::new());
@@ -333,12 +342,13 @@ fn check<C: Transport + Rest>(
             let changes = format!("{} changes {}", pull.display(), shown(&theirs));
             match waiver.waives(client, (dest, number), &theirs, &mut reads)? {
                 Some(why) => ignored.push(format!("{changes}, but {why}")),
-                None => overlapping.push(changes),
+                None => overlapping.push((number, changes)),
             }
         }
     }
     Ok(if !overlapping.is_empty() {
-        Decision::Wait(format!("open pull request {}", overlapping.join("; ")))
+        let (pulls, changes): (Vec<u64>, Vec<String>) = overlapping.into_iter().unzip();
+        Decision::Wait(format!("open pull request {}", changes.join("; ")), pulls)
     } else if !ignored.is_empty() {
         Decision::Ignored(format!("open pull request {}", ignored.join("; ")))
     } else {
@@ -613,7 +623,7 @@ mod tests {
         // Name, the issue's text, the runs in flight, the open pull requests; the decision.
         type Case<'a> = (&'a str, &'static str, Vec<&'static str>, Value, Decision);
         let independent = |why: &str| Decision::Independent(why.into());
-        let wait = |why: &str| Decision::Wait(why.into());
+        let wait = |why: &str, pulls: &[u64]| Decision::Wait(why.into(), pulls.to_vec());
         let none = "no open pull request of agentic-bot changes a path it names";
         let cases: Vec<Case> = vec![
             (
@@ -640,7 +650,7 @@ mod tests {
                     pull(5, bot, &["src/a.rs", "src/b.rs"]),
                     pull(6, bot, &["docs/x.md"])
                 ]),
-                wait("open pull request example/work#5 changes `src/a.rs`"),
+                wait("open pull request example/work#5 changes `src/a.rs`", &[5]),
             ),
             // A path git allows but the record must not quote is skipped.
             (
@@ -648,14 +658,14 @@ mod tests {
                 "Fix a.rs.",
                 vec![],
                 json!([pull(5, bot, &["src/`x`\n/a.rs", "x/a.rs"])]),
-                wait("open pull request example/work#5 changes `x/a.rs`"),
+                wait("open pull request example/work#5 changes `x/a.rs`", &[5]),
             ),
             (
                 "Bot login case",
                 "Fix src/a.rs.",
                 vec![],
                 json!([pull(5, "Agentic-Bot", &["src/a.rs"])]),
-                wait("open pull request example/work#5 changes `src/a.rs`"),
+                wait("open pull request example/work#5 changes `src/a.rs`", &[5]),
             ),
             // Only the bot's pull requests are waited for.
             (
@@ -673,6 +683,7 @@ mod tests {
                 wait(
                     "open pull request example/work#5 changes `src/a.rs`; \
                      example/work#6 changes `docs/x.md`",
+                    &[5, 6],
                 ),
             ),
             // A hidden directory keeps its dot, and so overlaps.
@@ -681,7 +692,10 @@ mod tests {
                 "Fix ./.github/workflows/ci.yml.",
                 vec![],
                 json!([pull(5, bot, &[".github/workflows/ci.yml"])]),
-                wait("open pull request example/work#5 changes `.github/workflows/ci.yml`"),
+                wait(
+                    "open pull request example/work#5 changes `.github/workflows/ci.yml`",
+                    &[5],
+                ),
             ),
             // A run in flight on the same repository waits for its pull request.
             (
@@ -694,7 +708,7 @@ mod tests {
                     "implement example/work#10",
                 ],
                 json!([pull(5, bot, &["src/a.rs"])]),
-                wait("the run for example/work#11 in flight names `a.rs`"),
+                wait("the run for example/work#11 in flight names `a.rs`", &[]),
             ),
             (
                 "run elsewhere",
@@ -726,7 +740,10 @@ mod tests {
                 "Add target/ to .gitignore.",
                 vec!["implement example/work#16"],
                 json!([]),
-                wait("the run for example/work#16 in flight names `sub/.gitignore`"),
+                wait(
+                    "the run for example/work#16 in flight names `sub/.gitignore`",
+                    &[],
+                ),
             ),
             // ...and the file a pull request changes.
             (
@@ -734,7 +751,10 @@ mod tests {
                 "Add target/ to .gitignore.",
                 vec![],
                 json!([pull(5, bot, &[".gitignore"])]),
-                wait("open pull request example/work#5 changes `.gitignore`"),
+                wait(
+                    "open pull request example/work#5 changes `.gitignore`",
+                    &[5],
+                ),
             ),
         ];
         let texts = |text| {
@@ -788,13 +808,13 @@ mod tests {
                 "target's pull request",
                 vec![],
                 json!([pull(7, bot, &["src/a.rs"])]),
-                wait("open pull request example/work#7 changes `src/a.rs`"),
+                wait("open pull request example/work#7 changes `src/a.rs`", &[7]),
             ),
             (
                 "target's run",
                 vec!["implement example/work#11"],
                 json!([]),
-                wait("the run for example/work#11 in flight names `a.rs`"),
+                wait("the run for example/work#11 in flight names `a.rs`", &[]),
             ),
         ] {
             let forge = Forge {
@@ -850,7 +870,7 @@ mod tests {
                 (ended, &waiver),
             )
         };
-        let running = wait("the run for example/work#11 in flight names `a.rs`");
+        let running = wait("the run for example/work#11 in flight names `a.rs`", &[]);
         assert_eq!(strict(&BTreeSet::new()), running);
         assert_eq!(strict(&BTreeSet::from([1])), independent(none));
         let many = format!(
@@ -858,7 +878,7 @@ mod tests {
             shown(&["a/1.rs", "a/2.rs", "a/3.rs", "a/4.rs"].map(String::from))
         );
         assert_eq!(
-            wait(&many).sentence(),
+            wait(&many, &[]).sentence(),
             "Waiting: open pull request example/work#5 changes `a/1.rs`, `a/2.rs`, `a/3.rs`, 1 more."
         );
     }
@@ -903,7 +923,9 @@ mod tests {
             stale_draft: Some((now, 4)),
             top: true,
         };
-        let wait = |why: &str| Decision::Wait(format!("open pull request {why}"));
+        let wait = |why: &str, pulls: &[u64]| {
+            Decision::Wait(format!("open pull request {why}"), pulls.to_vec())
+        };
         let ignored = |why: &str| Decision::Ignored(format!("open pull request {why}"));
         let code = "example/work#5 changes `src/a.rs`";
         let docs = "example/work#5 changes `README.md`, `docs/a.md`";
@@ -916,7 +938,7 @@ mod tests {
                 fix_code,
                 json!([pull(5, &["src/a.rs"], true, (9, 5))]),
                 off,
-                wait(code),
+                wait(code, &[5]),
             ),
             (
                 "stale draft",
@@ -932,35 +954,35 @@ mod tests {
                 fix_code,
                 json!([pull(5, &["src/a.rs"], true, (9, 3))]),
                 both,
-                wait(code),
+                wait(code, &[5]),
             ),
             (
                 "draft opened since",
                 fix_code,
                 json!([pull(5, &["src/a.rs"], true, (2, 9))]),
                 stale,
-                wait(code),
+                wait(code, &[5]),
             ),
             (
                 "draft of unknown age",
                 fix_code,
                 json!([unknown]),
                 stale,
-                wait(code),
+                wait(code, &[5]),
             ),
             (
                 "not a draft",
                 fix_code,
                 json!([pull(5, &["src/a.rs"], false, (9, 9))]),
                 stale,
-                wait(code),
+                wait(code, &[5]),
             ),
             (
                 "off, documentation holds",
                 fix_docs,
                 json!([pull(5, &["docs/a.md", "README.md"], false, (1, 1))]),
                 off,
-                wait(docs),
+                wait(docs, &[5]),
             ),
             (
                 "documentation, first Priority",
@@ -974,14 +996,14 @@ mod tests {
                 fix_docs,
                 json!([pull(5, &["docs/a.md", "README.md"], false, (1, 1))]),
                 stale,
-                wait(docs),
+                wait(docs, &[5]),
             ),
             (
                 "documentation and code",
                 "Fix docs/a.md and src/a.rs.",
                 json!([pull(5, &["docs/a.md", "src/a.rs"], false, (1, 1))]),
                 top,
-                wait("example/work#5 changes `docs/a.md`, `src/a.rs`"),
+                wait("example/work#5 changes `docs/a.md`, `src/a.rs`", &[5]),
             ),
             (
                 "one waived, one holds",
@@ -991,7 +1013,7 @@ mod tests {
                     pull(6, &["src/b.rs"], false, (1, 1))
                 ]),
                 both,
-                wait("example/work#6 changes `src/b.rs`"),
+                wait("example/work#6 changes `src/b.rs`", &[6]),
             ),
             (
                 "more stale drafts than are read",
@@ -1000,10 +1022,10 @@ mod tests {
                     .map(|n| pull(n, &["src/a.rs"], true, (9, 9)))
                     .collect(),
                 stale,
-                wait(&format!(
-                    "example/work#{} changes `src/a.rs`",
-                    5 + DRAFT_READS
-                )),
+                wait(
+                    &format!("example/work#{} changes `src/a.rs`", 5 + DRAFT_READS),
+                    &[5 + DRAFT_READS as u64],
+                ),
             ),
         ];
         for (name, text, pulls, waiver, expected) in cases {

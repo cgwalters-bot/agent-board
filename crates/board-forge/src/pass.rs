@@ -3646,7 +3646,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// it does; the overlap it ignored is kept for [`HoldKind::OverlapIgnored`].
     fn overlap_hold(&self, decision: Decision) -> Option<Step> {
         match decision {
-            Decision::Wait(_) => Some(Step::Hold(Hold::new(
+            Decision::Wait(..) => Some(Step::Hold(Hold::new(
                 HoldKind::Overlap,
                 decision.sentence(),
             ))),
