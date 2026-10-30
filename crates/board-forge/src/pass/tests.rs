@@ -598,7 +598,7 @@ pub(super) fn unfinished(replay: &mut Replay) {
 /// Keeps only `issues` (`OWNER/REPO#N`) and the epics on every recorded board page,
 /// so a scenario that scans past what the recording read stops where it does,
 /// and children keep their epics' Priority.
-fn only(replay: &mut Replay, issues: &[&str]) {
+pub(super) fn only(replay: &mut Replay, issues: &[&str]) {
     for entry in &mut replay.requests {
         let Some(nodes) = entry["answer"]
             .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")

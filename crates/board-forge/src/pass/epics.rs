@@ -410,6 +410,13 @@ pub(super) enum Next {
     /// Nothing to do, and why.
     Idle(String),
     Hold(Hold),
+    /// Due because its sub-issues changed, and why, but held by the wait
+    /// after its last planning request: planned early by an idle pass
+    /// ([`Scheduler::replan_idle`]).
+    Wait {
+        why: String,
+        hold: Hold,
+    },
     /// Its newest accepted plan has no receipt: apply it. `direction`: the
     /// operator commented since, which plans it again if it cannot apply.
     /// `replan`: whether a plan gone stale may be planned again.
@@ -451,7 +458,7 @@ impl Next {
     fn otherwise(&self) -> String {
         match self {
             Self::Idle(why) => why.clone(),
-            Self::Hold(hold) => hold.reason.clone(),
+            Self::Hold(hold) | Self::Wait { hold, .. } => hold.reason.clone(),
             Self::Apply { id, .. } => format!("plan {id} waits to be applied"),
             Self::Recover { receipt, .. } => {
                 format!("the apply of plan {} was cut short", receipt.detail.plan)
@@ -694,12 +701,13 @@ pub(super) fn decide(i: &Inputs) -> Next {
     let wait = backoff(DAY_SECONDS, empty, cap);
     let until = last + time::Duration::seconds(wait);
     if i.now < until {
-        let why = format!(
+        let held = format!(
             "{why}; planned again from {}, {} hours after its last request",
             stamp(until),
             wait / 3600
         );
-        return Next::Hold(Hold::new(HoldKind::TriageCooldown, why));
+        let hold = Hold::new(HoldKind::TriageCooldown, held);
+        return Next::Wait { why, hold };
     }
     Next::Plan(why)
 }
@@ -729,10 +737,27 @@ struct Refusal {
 /// What one stage 3 has taken: at most `epics.maxAppliesPerPass` applies
 /// and one planning start a pass, and the runs it started or the cap held.
 #[derive(Default)]
-struct Turn {
+pub(super) struct Turn {
     applied: usize,
     planned: bool,
     starts: usize,
+}
+
+/// Stage 3's board, the runs in flight, if they were read, and its target.
+type Later = (Option<Project>, Option<(BTreeSet<u64>, Slots)>, Target);
+
+/// The highest-Priority live epic stage 3 held only by the wait to plan it
+/// again ([`Next::Wait`]), and what planning it takes, for stage 4 to plan
+/// when it would leave slots free and start nothing.
+pub(super) struct Waited {
+    /// Its hold's index in the report's holds.
+    at: usize,
+    facts: EpicFacts,
+    why: String,
+    reuse: Option<Comment>,
+    /// Stage 3's board, runs in flight and target, once it finished.
+    later: Option<Later>,
+    turn: Turn,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -746,10 +771,68 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut turn = Turn::default();
         if let Err(error) = self.epics_within(&epics.repository, earlier, git_ref, &mut turn) {
             self.holds_whole = false;
+            self.waited = None;
             self.report.failures += 1;
             self.line(format!("epics error: {error:#}"));
         }
-        turn.starts
+        let starts = turn.starts;
+        if let Some(waited) = &mut self.waited {
+            waited.turn = turn;
+        }
+        starts
+    }
+
+    /// Plans [`Waited`]'s epic now, where stage 4 would leave `free` slots
+    /// and start nothing: the wait after a planning request saves runs
+    /// while slots are taken, not while they sit empty. Only where planning's
+    /// pools and the budget allow it now, else its hold stands. Returns the
+    /// runs it started or `--max-dispatch` held; `holds`, where stage 4's
+    /// holds start, moves down when its hold is taken back.
+    pub(super) fn replan_idle(&mut self, free: usize, holds: &mut usize) -> usize {
+        let Some(mut waited) = self.waited.take() else {
+            return 0;
+        };
+        let Some((project, slots, target)) = waited.later.take() else {
+            return 0;
+        };
+        if waited.turn.planned || !self.epic_starts.is_empty() {
+            return 0;
+        }
+        let config = self.config;
+        let snapshot = self.snapshot();
+        let pool = choose(
+            snapshot.as_ref(),
+            &config.pools,
+            &config.plan_pools,
+            self.now,
+        );
+        if pool.is_err() || self.budget_hold(1.0).is_some() {
+            return 0;
+        }
+        let scope = Scope::Epic(waited.facts.issue.clone());
+        if !(self.report.holds.get(waited.at)).is_some_and(|e| e.scope == scope)
+            || waited.at >= *holds
+        {
+            return 0;
+        }
+        self.report.holds.remove(waited.at);
+        *holds -= 1;
+        let why = format!(
+            "{}; early, with {free} slot(s) free and nothing started",
+            waited.why
+        );
+        let ask = (why.as_str(), Intro::First, waited.reuse.as_ref());
+        let before = waited.turn.starts;
+        let turn = &mut waited.turn;
+        self.plan_epic(
+            &waited.facts,
+            ask,
+            project.as_ref(),
+            slots.as_ref(),
+            &target,
+            turn,
+        );
+        waited.turn.starts - before
     }
 
     fn epics_within(
@@ -844,6 +927,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             self.epic(facts, project.as_ref(), slots.as_ref(), &target, turn);
+        }
+        if let Some(waited) = &mut self.waited {
+            waited.later = Some((project, slots, target));
         }
         Ok(())
     }
@@ -1051,6 +1137,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         match next {
             Next::Idle(why) | Next::Said(why) => self.line(format!("epic {name}: {why}")),
             Next::Hold(hold) => self.epic_held(facts, hold),
+            Next::Wait { why, hold } => {
+                let at = self.report.holds.len();
+                self.epic_held(facts, hold);
+                if self.waited.is_none() && busy.is_none() && !turn.planned {
+                    self.waited = Some(Waited {
+                        at,
+                        facts: facts.clone(),
+                        why,
+                        reuse: reuse.cloned(),
+                        later: None,
+                        turn: Turn::default(),
+                    });
+                }
+            }
             Next::Apply {
                 id,
                 url,
