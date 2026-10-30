@@ -438,6 +438,11 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
     pub merge_authors: Vec<String>,
+    /// The pass's `pr.headOwners`: the owners of the head repositories the bot may push
+    /// to, besides its own fork, where a pull request it opened is its own
+    /// ([`is_harness`]): such as an organization whose forks hold its
+    /// branches. Empty (the default) is its fork alone.
+    pub head_owners: Vec<String>,
     pub toil_fix_pool: String,
     /// `conflictFixPool`: the pool for a toil or rebase round whose pull
     /// request conflicts with its base, where conflicts and the other toil
@@ -820,6 +825,7 @@ impl PollPolicy {
             // The CLI's `--fix-bounds`, never the config's.
             fix_bounds: None,
             // The pass's only.
+            head_owners: Vec::new(),
             stale_days: 0,
             reruns: false,
             review_pools: Vec::new(),
@@ -1415,7 +1421,7 @@ pub fn review_at_head(pull: &Value, config: &Config, review_run: Option<&Value>)
 /// approve itself, and any of them may edit what another wrote. So it counts
 /// only where the caller named the review workflow
 /// ([`Config::review_workflow`]), on a pull request from the bot's fork
-/// ([`is_harness`]) into a public repository, and where the run its marker
+/// ([`from_fork`]) into a public repository, and where the run its marker
 /// names is that workflow's, run from the base repository's own branch on
 /// `pull_request_target` for this head while the review was submitted
 /// ([`review_run_matches`]). There the pull request's own workflows get a
@@ -1491,7 +1497,7 @@ fn verdicts<'a>(pull: &'a Value, config: &Config) -> (Verdict<'a>, Verdict<'a>) 
         text(r, "/author/__typename") == "User" && text(r, "/author/login") == config.operator
     };
     let job_counts = config.review_workflow.is_some()
-        && is_harness(pull, &config.bot)
+        && from_fork(pull, &config.bot)
         && pull["baseRepository"]["isPrivate"] == false;
     (
         newest_verdict(&at_head, operator_review, false),
@@ -2077,7 +2083,29 @@ fn labelled(pull: &Value) -> bool {
 /// bot's fork (the bot, and the base's maintainers where it allows their
 /// edits) does not depend on the branch's name, so the review job's verdict,
 /// fix rounds and rebases apply to all of them alike.
-pub fn is_harness(pull: &Value, bot: &str) -> bool {
+///
+/// So is the bot's pull request whose head is in a repository of one of
+/// `headOwners` ([`PollPolicy::head_owners`]), forks the caller gives the bot
+/// write to, such as a midstream organization's: a promoted upstream pull
+/// request whose head is the organization's fork, or a branch within that
+/// fork. A head in the bot's own account still has to be a fork's, as before.
+pub fn is_harness(pull: &Value, config: &Config) -> bool {
+    let owner = text(pull, "/headRepositoryOwner/login");
+    from_fork(pull, &config.bot)
+        || text(pull, "/author/login") == config.bot
+            && !owner.is_empty()
+            && config
+                .policy
+                .head_owners
+                .iter()
+                .any(|o| o.eq_ignore_ascii_case(owner))
+}
+
+/// The bot's pull request from its own fork: the one whose review job
+/// verdict can count ([`head_review`]), as the fork's workflows cannot
+/// review it. A branch of a `headOwners` repository is not, since its own
+/// workflows there could approve it.
+pub fn from_fork(pull: &Value, bot: &str) -> bool {
     text(pull, "/author/login") == bot
         && pull["isCrossRepository"].as_bool().unwrap_or(false)
         && text(pull, "/headRepositoryOwner/login") == bot
@@ -2087,8 +2115,8 @@ pub fn is_harness(pull: &Value, bot: &str) -> bool {
 /// `action` for it, which keeps the interval short: an open pull request of
 /// the bot's fork that is not (and was not just) handed to a human, or whose label
 /// the operator's answer just took off.
-pub fn in_flight(pull: &Value, bot: &str, action: &str) -> bool {
-    is_harness(pull, bot) && (action == "answer" || action != "needs-human" && !labelled(pull))
+pub fn in_flight(pull: &Value, config: &Config, action: &str) -> bool {
+    is_harness(pull, config) && (action == "answer" || action != "needs-human" && !labelled(pull))
 }
 
 /// Whether the pull request or an issue it closes carries
@@ -2936,7 +2964,7 @@ pub fn decide(
         .merge_authors
         .iter()
         .any(|a| a == text(pull, "/author/login"));
-    let harness = !merge_only && is_harness(pull, &config.bot);
+    let harness = !merge_only && is_harness(pull, config);
     let not_ours = "not a pull request from the bot's fork, left to its author";
     let review = review_at_head(pull, config, review_run);
     let mut failing = Vec::new();
@@ -5500,7 +5528,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             || base == default
             || !base.starts_with(crate::stack::STACK_BRANCH_PREFIX)
             || labelled(pull)
-            || !is_harness(pull, &self.config.bot)
+            || !is_harness(pull, self.config)
         {
             return Ok(None);
         }
@@ -5664,7 +5692,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let removal = match tries {
             Some(_)
                 if !merge_only
-                    && is_harness(&pull, &self.config.bot)
+                    && is_harness(&pull, self.config)
                     && !labelled(&pull)
                     && pull["mergeQueueEntry"].is_null() =>
             {
@@ -5720,7 +5748,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             && !merge_only
             && self.apply.is_some()
             && labelled(&pull)
-            && is_harness(&pull, &self.config.bot)
+            && is_harness(&pull, self.config)
             && let Some(stop) = self.recover_answer_stop(repo, number, &comments, &marker)?
         {
             comments.push(stop);
@@ -5730,7 +5758,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             && !merge_only
             && marker.stopped
             && labelled(&pull)
-            && is_harness(&pull, &self.config.bot)
+            && is_harness(&pull, self.config)
         {
             self.answer(repo, number, &comments, &marker)?
         } else {
@@ -5812,13 +5840,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             };
             retarget = onto;
         }
-        // Read only where the head waits for its review and nothing else.
+        // Read only where the head waits for its review and nothing else,
+        // and only from the bot's fork, the one head whose review job verdict
+        // counts: a `headOwners` head waits for the operator's.
         let mut review_rerun = None;
         let unreviewed = !merge_only
             && retarget.is_none()
             && decision.action == "wait"
             && decision.reason == NO_REVIEW
-            && is_harness(&pull, &self.config.bot);
+            && from_fork(&pull, &self.config.bot);
         let review_step = if unreviewed && !self.config.policy.review_pools.is_empty() {
             self.review_dispatch(repo, &pull, &comments)?
         } else if unreviewed && self.config.policy.reruns {
@@ -5842,7 +5872,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             && !queue_stop
             && answer.is_empty()
             && !labelled(&pull)
-            && is_harness(&pull, &self.config.bot);
+            && is_harness(&pull, self.config);
         let retry_wait =
             if retry_scope && matches!(decision.action, "fix" | "needs-human" | "merge" | "wait") {
                 self.check_retry_wait(repo, head, &comments, !checks.failed.is_empty())?
@@ -6077,7 +6107,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             line,
             text(&pull, "/author/login") == self.config.bot
                 && left.is_none()
-                && (in_flight(&pull, &self.config.bot, decision.action)
+                && (in_flight(&pull, self.config, decision.action)
                     || stale.is_some() && decision.action == "fix"),
             wait,
             stepped,
@@ -7278,6 +7308,65 @@ mod tests {
                 "skip",
                 None,
             ),
+            // A head the bot may push to outside its fork is its own only
+            // where `headOwners` names that head's owner: the promoted
+            // upstream pull request from the midstream organization's fork,
+            // and a `bot/` branch within that fork.
+            (
+                "a head in a headOwners fork gets a fix",
+                "pull-470",
+                json!({"headRepositoryOwner": {"login": "cgwalters-forge"}, "headRefName": "bot/fsck-layout",
+                    "reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "")]},
+                    "headOwners": ["cgwalters-bot", "cgwalters-forge"]}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "fix",
+                Some(1),
+            ),
+            (
+                "a head in that fork gets no fix without headOwners",
+                "pull-470",
+                json!({"headRepositoryOwner": {"login": "cgwalters-forge"}, "headRefName": "bot/fsck-layout",
+                    "reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "skip",
+                None,
+            ),
+            (
+                "a bot/ branch within a headOwners repository gets a fix",
+                "pull-470",
+                json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"}, "headRefName": "bot/lint-erofs",
+                    "reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "")]},
+                    "headOwners": ["cgwalters-forge"]}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "fix",
+                Some(1),
+            ),
+            (
+                "another author's head in a headOwners fork gets no fix",
+                "pull-470",
+                json!({"author": {"login": "someone"}, "headRepositoryOwner": {"login": "cgwalters-forge"},
+                    "reviews": {"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "")]},
+                    "headOwners": ["cgwalters-forge"]}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "skip",
+                None,
+            ),
+            // The review job's approval counts from the bot's fork alone:
+            // a branch of the repository could approve itself.
+            (
+                "a headOwners branch of the repository approving itself is not merged",
+                "pull-470",
+                json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"},
+                    "headOwners": ["cgwalters-forge"]}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "wait",
+                None,
+            ),
             (
                 "an approved and green placeholder gets a fix for its messages, not a merge",
                 "pull-511",
@@ -8206,6 +8295,9 @@ mod tests {
                 cfg.policy = PollPolicy::from_json(&policy).unwrap();
             }
             cfg.policy.reruns = fields.remove("reruns").is_some();
+            if let Some(owners) = fields.remove("headOwners") {
+                cfg.policy.head_owners = serde_json::from_value(owners).unwrap();
+            }
             let message = fields.remove("message");
             let outages = match (fields.remove("outage"), &cfg.policy.broker_outage) {
                 (Some(Value::String(error)), Some(_)) => Outages::Unread(error),
@@ -8310,10 +8402,22 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                in_flight(&pull(fixture, change), BOT, action),
+                in_flight(&pull(fixture, change.clone()), &config(), action),
                 expected,
                 "{name}"
             );
+            // A head in a `headOwners` fork is in flight as the bot's own
+            // fork's is, once that owner is named.
+            let mut forked = pull(fixture, change);
+            if !from_fork(&forked, BOT) {
+                continue;
+            }
+            forked["isCrossRepository"] = true.into();
+            forked["headRepositoryOwner"] = json!({"login": "cgwalters-forge"});
+            let mut cfg = config();
+            assert!(!in_flight(&forked, &cfg, action), "{name}");
+            cfg.policy.head_owners = vec!["cgwalters-forge".into()];
+            assert_eq!(in_flight(&forked, &cfg, action), expected, "{name}");
         }
     }
 

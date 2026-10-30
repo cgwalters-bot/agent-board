@@ -576,7 +576,13 @@ A pass captures one clock and performs these stages in order:
 2. Follow up PRs using today's `poll` decisions: read followed repositories,
    PR heads, reviews, checks, comments and runs; dispatch bounded fixes/reviews,
    merge only an approved head with green required checks, or comment/label for
-   a person. For a harness PR (the bot's PR from its fork), an `APPROVED`
+   a person. A harness PR is the bot's PR from its fork, or, with
+   `pr.headOwners`, the bot's PR whose head repository one of those owners
+   holds, such as a midstream organization whose forks the bot pushes to:
+   a promoted upstream PR from that organization's fork, or a branch within
+   the fork itself. Only the bot's own fork makes the review job's approval
+   count, as a branch within a repository could approve itself. For a
+   harness PR, an `APPROVED`
    review by the configured `operator` at the current head suffices in place
    of the review job's approval. An operator approval at an older head and a
    visitor's approval count for nothing. This uses the same merge path,
@@ -2189,6 +2195,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
+| `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; `0` (off) |
