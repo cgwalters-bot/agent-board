@@ -113,7 +113,8 @@ triage scope `epics`, see [Scheduling](#scheduling)), `overlap`, `overlap-ignore
 an overlap the `overlap` setting let start, see [Scheduling](#scheduling)),
 `blocking` (not a hold of an item but a card on the open pull request that
 overlap holds name and that only a person moves, with `operator` true and
-the pull request's `url`; see [blockers](#blockers)),
+a `url` in the `/issues/N` form like every hold's, which GitHub
+redirects to the pull request; see [blockers](#blockers)),
 `unreadable` (labels, pull
 requests, a parent epic, a plan's target or the runs not read whole), `wip`,
 `pools`, `budget` (the week's spend reached `budget.weeklyUsd`, or has no

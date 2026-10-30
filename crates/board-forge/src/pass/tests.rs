@@ -9664,6 +9664,13 @@ fn blockers_move_or_are_carded() {
             .find(|b| b.starts_with(holds::HOLDS_MARKER))
             .map(|b| holds::parse(b).unwrap())
             .unwrap_or_else(|| panic!("{name}: no holds published: {said:#?}"));
+        // Every hold's url is its item's issue address, a pull request's
+        // too, as the review app requires of the whole snapshot.
+        for h in snapshot["holds"].as_array().unwrap() {
+            let issue = (h["item"].as_str())
+                .map(|i| format!("https://github.com/{}", i.replace('#', "/issues/")));
+            assert_eq!(h["url"].as_str(), issue.as_deref(), "{name}: {h}");
+        }
         let pull = format!("{REPO}#889");
         let cards: Vec<Value> = (snapshot["holds"].as_array().unwrap().iter())
             .filter(|h| h["kind"] == "blocking")
@@ -9671,15 +9678,16 @@ fn blockers_move_or_are_carded() {
             .collect();
         let asks: Vec<Value> = (snapshot["needs_you"]["items"].as_array().unwrap().iter())
             .filter(|a| a["kind"] == "blocking")
-            .map(|a| json!([a["key"], a["action"]["type"], a["priority"]]))
+            .map(|a| json!([a["key"], a["action"]["type"], a["target"], a["priority"]]))
             .collect();
         match carded {
             true => {
-                let url = format!("https://github.com/{REPO}/pull/889");
+                let url = format!("https://github.com/{REPO}/issues/889");
                 assert_eq!(cards, [json!([pull, url, true, "P0"])], "{name}");
+                let target = format!("https://github.com/{REPO}/pull/889");
                 assert_eq!(
                     asks,
-                    [json!([pull.to_lowercase(), "pull_request", "P0"])],
+                    [json!([pull.to_lowercase(), "pull_request", target, "P0"])],
                     "{name}"
                 );
             }
