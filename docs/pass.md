@@ -287,7 +287,9 @@ counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
 are left out only after the rest, then the alarms, each together with its
 hold, and the alarms on the holds issue last. The operator's holds and the holds of every new
 run are always kept. Past them, the needs-you list's lowest ranked asks are
-left out and counted in its `omitted`, which leaves it not `complete`.
+left out and counted in its `omitted`, which leaves it not `complete`; as
+they are not published, a later pass that does not read their source
+whole cannot carry them.
 Should the holds alone not fit, nothing is published and the line is
 `holds error: …`.
 
