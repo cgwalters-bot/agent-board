@@ -879,14 +879,52 @@ fn replay_scenarios() {
             0,
         ),
         (
-            "an unreadable broker is one line, and the stale snapshot holds",
+            "an unreadable broker with a stale snapshot is one failure, and it holds",
             Box::new(|r, c| {
                 r.now += time::Duration::minutes(45);
                 with_broker(r, c, json!({"error": "GET /usage: HTTP status 502"}));
             }),
             vec![
-                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the published snapshot",
+                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the published snapshot, but the usage snapshot is stale, from 2026-10-23T15:09:10Z",
                 "hold pools: the usage snapshot is stale",
+            ],
+            0,
+            1,
+        ),
+        (
+            "an unreadable broker with a fresh snapshot is a warning, and paces by it",
+            Box::new(|r, c| {
+                with_broker(r, c, json!({"error": "GET /usage: timeout: global"}));
+            }),
+            vec![
+                "usage warning: reading the broker: GET /usage: timeout: global; pacing reads the published snapshot",
+                "start triage cgwalters-forge/tracker#446 pool=claude",
+            ],
+            6,
+            0,
+        ),
+        (
+            "an unreadable broker without a snapshot is one failure",
+            Box::new(|r, c| {
+                with_broker(r, c, json!({"error": "GET /usage: HTTP status 502"}));
+                answer(r, "bot-ops/issues/1/comments")["body"] = json!([]);
+            }),
+            vec![
+                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the published snapshot, but there is no usage snapshot",
+                "hold pools: there is no usage snapshot; new runs wait",
+            ],
+            0,
+            1,
+        ),
+        (
+            "an unreadable broker and an unreadable snapshot are one failure",
+            Box::new(|r, c| {
+                with_broker(r, c, json!({"error": "GET /usage: HTTP status 502"}));
+                answer(r, "bot-ops/issues/1/comments")["status"] = 404.into();
+            }),
+            vec![
+                "usage error: reading the usage snapshot: GitHub HTTP status 404",
+                "usage error: reading the broker: GET /usage: HTTP status 502; pacing reads the published snapshot, but there is no usage snapshot",
             ],
             0,
             1,
@@ -1093,11 +1131,11 @@ fn replay_scenarios() {
                 broker_down(r);
             }),
             vec![
-                "usage error: reading the broker",
+                "usage warning: reading the broker",
                 "hold budget: the usage snapshot has no spend reading; new runs wait",
             ],
             0,
-            1,
+            0,
         ),
         (
             "a published snapshot's spend under the budget starts runs",
@@ -1110,7 +1148,7 @@ fn replay_scenarios() {
             }),
             vec!["start triage cgwalters-forge/tracker#446 pool=claude"],
             6,
-            1,
+            0,
         ),
         (
             "spend just under the budget lets pull requests' rounds and new runs go",
