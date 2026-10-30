@@ -276,7 +276,7 @@ carried over while it stays the same. An unchanged list is written again,
 with the snapshot's `at`, once the published `validated_at` is an hour old,
 so a reader treats a list whose `validated_at` is older than that and a pass
 interval as unknown, not as current. So does a reader that finds no
-`needs_you` where it is on: past the cap below, the list is left out whole.
+`needs_you` where it is on, as after a pass whose stages failed.
 
 The JSON is compact, one entry a line, so that a board of a few hundred holds
 fits GitHub's 65,536-character comment. The comment is also capped at 60,000
@@ -286,8 +286,12 @@ out until it fits, those without a Priority first, then the lowest Priority
 counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
 are left out only after the rest, then the alarms, each together with its
 hold, and the alarms on the holds issue last. The operator's holds and the holds of every new
-run are always kept; past them the needs-you list is left out, and should
-they alone not fit, nothing is published and the line is `holds error: …`.
+run are always kept. Past them, the needs-you list's lowest ranked asks are
+left out and counted in its `omitted`, which leaves it not `complete`; as
+they are not published, a later pass that does not read their source
+whole cannot carry them.
+Should the holds alone not fit, nothing is published and the line is
+`holds error: …`.
 
 With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
 broker's `spend.runs`, the trailing week's cost of runs' requests at API list
