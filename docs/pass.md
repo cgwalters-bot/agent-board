@@ -358,10 +358,11 @@ the grant`), never by the published snapshot. Pull requests' fix rounds pace by
 the same entries. A `weeklyUsd`, or a pool's `target` or `burst`, beside it
 is refused: the grant replaces them.
 
-Stage 3 reads the open `epic` issues of `epics.repository` with their
-sub-issues (20 epics a request), the board's Priority options, and each live
-epic's comments, and takes the live epics in Priority order. Its first line
-counts them, such as `epics: 7 live of 17 open in example/tracker`, then
+Stage 3 reads the open `epic` issues of `epics.repository` (10 a request),
+then each one's sub-issues with their board Priority (50 a request, and only
+for an epic that has any), the board's Priority options, and each live epic's
+comments, and takes the live epics in Priority order. Its first line counts
+them, such as `epics: 7 live of 17 open in example/tracker`, then
 one line an epic:
 
 * `apply epic OWNER/REPO#N plan=ID: Create a sub-issue in example/work (P0);
@@ -427,6 +428,13 @@ one line an epic:
   request, else how the run ended), two write steps held whole by
   `--max-writes`. A person takes the label off and comments to plan it
   again; without a comment it is labelled again.
+
+The reads are kept small because GitHub refuses a query it judges too costly
+(`RESOURCE_LIMITS_EXCEEDED`), as it refused one read of every epic's
+sub-issues once there were 19 epics. An epic whose sub-issues change between
+pages is held as unreadable. Where a read fails, the listing's or an epic's
+sub-issues', the pass prints `epics error: …` and counts a failure, stage 3
+does nothing more that pass, and stages 4 and 5 run as usual.
 
 An applied plan is recognised from its receipt, older receipts (the hidden
 claim and fingerprint comment) included, never from titles: a sub-issue

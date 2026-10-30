@@ -16,8 +16,18 @@ use crate::plan::{
     Comment, DISPATCH_MARKER, PLAN_FENCE, fenced_json, has_fence, newest_fenced, no_fenced, plan_id,
 };
 
-/// Pages of open epics read, 20 each; more is an error.
-const EPIC_PAGES: usize = 5;
+/// Open epics listed a request. Each brings its labels and board items, so
+/// the page is kept small; its sub-issues are read apart ([`SUBS_PER_PAGE`]).
+pub(super) const EPICS_PER_PAGE: usize = 10;
+/// Pages of open epics read; more is an error.
+const EPIC_PAGES: usize = 10;
+/// Sub-issues of one epic read a request, each with its board items: well
+/// under GitHub's resource limits, which one query of every epic's
+/// sub-issues and their fields went over once tracker#333 made 19 epics.
+pub(super) const SUBS_PER_PAGE: usize = 50;
+/// Pages of one epic's sub-issues read; more is an error. GitHub allows an
+/// issue 100 sub-issues.
+const SUB_PAGES: usize = 2;
 /// Sub-issue changes within a day of a planning request wait, so that an
 /// epic is planned at most once a day however often its sub-issues move
 /// (agent-board#429); each plan in a row that had nothing to do doubles
@@ -72,24 +82,18 @@ const ACTION_REQUESTS: usize = 11;
 /// Changed sub-issues a line names before it counts the rest.
 const NAMED: usize = 3;
 
-/// The open epics of a repository, with their sub-issues and the board's
-/// Priority, Status and Why of each.
-pub(super) const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!, $field: String!, $cursor: String) {
+/// A page of the open epics of a repository, with the board's Priority,
+/// Status and Why of each and how many sub-issues it has, which
+/// [`EPIC_SUBS_QUERY`] reads.
+pub(super) const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!, $field: String!, $first: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
-    issues(first: 20, after: $cursor, states: OPEN, labels: [$label], orderBy: {field: CREATED_AT, direction: ASC}) {
+    issues(first: $first, after: $cursor, states: OPEN, labels: [$label], orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes {
-        number state lastEditedAt
+        number state
         repository { nameWithOwner }
         labels(first: 50) { nodes { name } totalCount }
         projectItems(first: 10) { nodes { ...Fields } totalCount }
-        subIssues(first: 100) {
-          nodes {
-            number state lastEditedAt
-            repository { nameWithOwner }
-            projectItems(first: 10) { nodes { ...Fields } totalCount }
-          }
-          totalCount
-        }
+        subIssuesSummary { total }
       }
       pageInfo { hasNextPage endCursor }
     }
@@ -100,6 +104,30 @@ fragment Fields on ProjectV2Item {
   priority: fieldValueByName(name: $field) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
   status: fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
   why: fieldValueByName(name: "Why") { ... on ProjectV2ItemFieldTextValue { text } }
+}"#;
+
+/// A page of one epic's sub-issues, open and closed, with the board's
+/// Priority of each: all stage 3 reads of them.
+pub(super) const EPIC_SUBS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $field: String!, $first: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: $first, after: $cursor) {
+        nodes {
+          number state
+          repository { nameWithOwner }
+          projectItems(first: 10) {
+            nodes {
+              project { number owner { ... on Organization { login } ... on User { login } } }
+              priority: fieldValueByName(name: $field) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+            }
+            totalCount
+          }
+        }
+        totalCount
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
 }"#;
 
 /// The board's node id and its Priority field's, with the options in board
@@ -261,6 +289,43 @@ impl EpicFacts {
             census,
             priorities,
         })
+    }
+}
+
+/// One page of an epic's sub-issues, added to `out`: the cursor of the
+/// next, if there is one, or why they cannot be read whole. Sub-issues
+/// added or removed between pages would leave one unread or read twice.
+fn sub_page(
+    data: &Value,
+    issue: &ItemRef,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<Value>,
+) -> Result<Option<Value>> {
+    let at = issue.display();
+    let changed = || format!("the sub-issues of {at} changed while they were read");
+    let subs = (data.pointer("/repository/issue/subIssues"))
+        .filter(|c| c.is_object())
+        .with_context(|| format!("the sub-issues of {at} could not be read"))?;
+    let nodes = subs["nodes"]
+        .as_array()
+        .context("sub-issues have no nodes")?;
+    ensure!(
+        nodes.iter().all(Value::is_object),
+        "the sub-issues of {at} could not all be read"
+    );
+    for node in nodes {
+        if !seen.insert(key(&issue_ref(node)?)) {
+            bail!(changed());
+        }
+        out.push(node.clone());
+    }
+    let info = &subs["pageInfo"];
+    match info["hasNextPage"].as_bool() {
+        Some(false) if subs["totalCount"].as_u64() == Some(out.len() as u64) => Ok(None),
+        Some(false) => bail!(changed()),
+        Some(true) if info["endCursor"].is_string() => Ok(Some(info["endCursor"].clone())),
+        Some(true) => bail!("the sub-issues of {at} have no end cursor"),
+        None => bail!("the sub-issues of {at} have no pageInfo"),
     }
 }
 
@@ -842,7 +907,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         git_ref: &str,
         turn: &mut Turn,
     ) -> Result<()> {
-        let listed = self.open_epics(repository)?;
+        let listed = self.open_epics(repository, None)?;
         let open = listed.len();
         let mut live = Vec::new();
         for facts in listed {
@@ -934,11 +999,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(())
     }
 
-    /// The open epics of `repository`, each read whole or why not.
+    /// The open epics of `repository`, each read whole or why not; the
+    /// sub-issues only of the epic `only` (`OWNER/REPO#N`, lower case) where
+    /// it is given, the others' left empty.
     #[allow(clippy::type_complexity)]
     fn open_epics(
         &self,
         repository: &str,
+        only: Option<&str>,
     ) -> Result<Vec<std::result::Result<EpicFacts, (ItemRef, anyhow::Error)>>> {
         let (owner, name) = repository.split_once('/').context("epics repository")?;
         let board = self.config.board.as_ref();
@@ -948,7 +1016,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         for _ in 0..EPIC_PAGES {
             let data = self.client.graphql(
                 EPICS_QUERY,
-                json!({"owner": owner, "name": name, "label": EPIC_LABEL, "field": field, "cursor": cursor}),
+                json!({"owner": owner, "name": name, "label": EPIC_LABEL, "field": field,
+                    "first": EPICS_PER_PAGE, "cursor": cursor}),
             )?;
             let connection = data
                 .pointer("/repository/issues")
@@ -959,7 +1028,25 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 .context("epics have no nodes")?
             {
                 let issue = issue_ref(node).context("an epic could not be read")?;
-                out.push(EpicFacts::from_node(node, board).map_err(|e| (issue, e)));
+                // One with no sub-issues, or not the one asked for, costs no read.
+                let wanted = only.is_none_or(|at| at == key(&issue))
+                    && node
+                        .pointer("/subIssuesSummary/total")
+                        .and_then(Value::as_u64)
+                        != Some(0);
+                // A failed read fails the stage, as the listing's does; only
+                // sub-issues that cannot be read whole hold the one epic.
+                let subs = match wanted {
+                    true => self.sub_issues(&issue, field)?,
+                    false => Ok(Vec::new()),
+                };
+                let facts = subs.and_then(|subs| {
+                    let mut node = node.clone();
+                    let total = subs.len();
+                    node["subIssues"] = json!({"nodes": subs, "totalCount": total});
+                    EpicFacts::from_node(&node, board)
+                });
+                out.push(facts.map_err(|e| (issue, e)));
             }
             match connection["pageInfo"]["hasNextPage"].as_bool() {
                 Some(false) => return Ok(out),
@@ -967,7 +1054,37 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 None => bail!("epics have no pageInfo"),
             }
         }
-        bail!("{repository} has more than {} open epics", EPIC_PAGES * 20)
+        bail!(
+            "{repository} has more than {} open epics",
+            EPIC_PAGES * EPICS_PER_PAGE
+        )
+    }
+
+    /// The sub-issues of the epic `issue`, open and closed, a page of
+    /// [`SUBS_PER_PAGE`] a request, with the board's `field` of each: an
+    /// error where a read fails, else why they cannot be read whole.
+    fn sub_issues(&self, issue: &ItemRef, field: &str) -> Result<Result<Vec<Value>>> {
+        let (owner, name) = (issue.repository.split_once('/')).context("epic repository")?;
+        let mut cursor = Value::Null;
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for _ in 0..SUB_PAGES {
+            let data = self.client.graphql(
+                EPIC_SUBS_QUERY,
+                json!({"owner": owner, "name": name, "number": issue.number, "field": field,
+                    "first": SUBS_PER_PAGE, "cursor": cursor}),
+            )?;
+            match sub_page(&data, issue, &mut seen, &mut out) {
+                Ok(Some(next)) => cursor = next,
+                Ok(None) => return Ok(Ok(out)),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        Ok(Err(anyhow::anyhow!(
+            "{} has more than {} sub-issues",
+            issue.display(),
+            SUB_PAGES * SUBS_PER_PAGE
+        )))
     }
 
     /// The board's ids.
@@ -1756,7 +1873,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// hold.
     fn changed_since(&self, facts: &EpicFacts) -> Result<Option<String>> {
         let at = key(&facts.issue);
-        let listed = self.open_epics(&facts.issue.repository)?;
+        let listed = self.open_epics(&facts.issue.repository, Some(&at))?;
         let fresh = listed.into_iter().find_map(|f| match f {
             Ok(fresh) if key(&fresh.issue) == at => Some(Ok(fresh)),
             Err((issue, error)) if key(&issue) == at => Some(Err(error)),

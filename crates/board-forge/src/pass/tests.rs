@@ -75,7 +75,7 @@ const LONG_DONE: &str = "2026-10-23T13:30:00Z";
 /// stages; the board's children still qualify through their epics.
 pub(super) fn without_epics(mut replay: Replay) -> Replay {
     let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "label": EPIC_LABEL,
-        "field": "Priority", "cursor": null});
+        "field": "Priority", "first": epics::EPICS_PER_PAGE, "cursor": null});
     let request = graphql_key(epics::EPICS_QUERY, &variables);
     let none = json!({"data": {"repository": {"issues": {"nodes": [],
         "pageInfo": {"hasNextPage": false, "endCursor": null}}}}});
@@ -577,22 +577,32 @@ fn budget_without_usage_url_holds_on_the_published_spend() {
     }
 }
 
+/// Stage 3's read of the first page of tracker#`n`'s sub-issues.
+pub(super) fn subs_request(n: u64, cursor: Value) -> Value {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": n,
+        "field": "Priority", "first": epics::SUBS_PER_PAGE, "cursor": cursor});
+    graphql_key(epics::EPIC_SUBS_QUERY, &variables)
+}
+
+/// The recorded first page of tracker#`n`'s sub-issues, as stage 3 reads them.
+pub(super) fn subs_mut(replay: &mut Replay, n: u64) -> &mut Value {
+    let request = subs_request(n, Value::Null);
+    (replay.requests.iter_mut())
+        .find(|e| e["request"] == request)
+        .and_then(|e| e["answer"].pointer_mut("/data/repository/issue/subIssues"))
+        .unwrap_or_else(|| panic!("no recorded sub-issues of tracker#{n}"))
+}
+
 /// Gives tracker#596 an open sub-issue, tracker#9999, so that it is planned
 /// for its closed ones rather than asked about (agent-board#429).
 pub(super) fn unfinished(replay: &mut Replay) {
-    let nodes = (replay.requests.iter_mut())
-        .filter_map(|e| e["answer"].pointer_mut("/data/repository/issues/nodes"))
-        .filter_map(Value::as_array_mut)
-        .flatten();
-    for node in nodes.filter(|n| n["number"] == 596) {
-        let subs = &mut node["subIssues"];
-        let mut open = subs["nodes"][0].clone();
-        open["number"] = 9999.into();
-        open["state"] = "OPEN".into();
-        open["repository"] = json!({"nameWithOwner": "cgwalters-forge/tracker"});
-        subs["nodes"].as_array_mut().unwrap().push(open);
-        subs["totalCount"] = (subs["totalCount"].as_u64().unwrap() + 1).into();
-    }
+    let subs = subs_mut(replay, 596);
+    let mut open = subs["nodes"][0].clone();
+    open["number"] = 9999.into();
+    open["state"] = "OPEN".into();
+    open["repository"] = json!({"nameWithOwner": "cgwalters-forge/tracker"});
+    subs["nodes"].as_array_mut().unwrap().push(open);
+    subs["totalCount"] = (subs["totalCount"].as_u64().unwrap() + 1).into();
 }
 
 /// Keeps only `issues` (`OWNER/REPO#N`) and the epics on every recorded board page,
@@ -3256,6 +3266,33 @@ fn apply_starts_nothing_while_another_pass_is_in_progress() {
     let report = apply(&forge, &config);
     assert_eq!(forge.dispatches(), ["cgwalters-forge/tracker#446"]);
     assert_eq!(report.failures, 0, "{:#?}", report.lines);
+}
+
+/// An epics read GitHub refuses, as it refused one query of every epic's
+/// sub-issues once tracker#333 made 19 epics, holds stage 3 for the pass,
+/// with the reason, and stage 4 dispatches as it would have without it.
+#[test]
+fn epics_error_still_dispatches() {
+    const REFUSED: &str =
+        "GitHub GraphQL: RESOURCE_LIMITS_EXCEEDED: Resource limits for this query exceeded.";
+    let config = config(json!({}));
+    let clean = Forge::new(None, false);
+    assert_eq!(apply(&clean, &config).failures, 0);
+    let mut forge = Forge::new(None, false);
+    let listing = graphql_key(epics::EPICS_QUERY, &json!({}))["graphql"].clone();
+    let entry = (forge.replay.requests.iter_mut())
+        .find(|e| e["request"]["graphql"] == listing)
+        .unwrap();
+    entry["answer"] = json!({"error": REFUSED});
+    let report = apply(&forge, &config);
+    assert!(
+        report.lines.contains(&format!("epics error: {REFUSED}")),
+        "{:#?}",
+        report.lines
+    );
+    assert!(!clean.dispatches().is_empty());
+    assert_eq!(forge.dispatches(), clean.dispatches());
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
 }
 
 /// A pass past its time bound starts nothing more, and sends nothing; a
