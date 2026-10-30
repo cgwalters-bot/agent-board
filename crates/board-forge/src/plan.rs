@@ -75,7 +75,7 @@ pub(crate) const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!
   }
 }"#;
 
-const PULL_REQUEST_COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
+pub(crate) const PULL_REQUEST_COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       comments(first: 100, after: $after) {

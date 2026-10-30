@@ -220,8 +220,9 @@ merge`) and that pull request's review wait are one ask, the review's, with
 the hold's Priority and question and the earlier `waiting_since`.
 
 `ask` is the one-line question and `recommendation` the one-line advice, or
-null. For a hold, they are the newest summary comment on its issue that the
-bot wrote and last edited, read as data: the rest of its first
+null. For a hold, they are the newest summary comment on its issue (a
+`blocking` hold's pull request) that the bot wrote and last edited, read
+as data: the rest of its first
 `**Decision needed:**` and `**Recommendation:**` lines (the colon may follow
 the bold). Such a line left empty is absent, and the ask falls back to the
 board Why's question (a Why starting `Q:`), else the hold's reason. The
