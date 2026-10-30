@@ -1,7 +1,8 @@
 use super::*;
 use crate::epic::{EPIC_PLAN_SCHEMA, SUB_ISSUES_QUERY};
 use crate::pass::tests::{
-    answer, block, config, preview, replay as board, set_usage, unfinished, usage,
+    answer, block, config, preview, replay as board, set_usage, subs_mut, subs_request, unfinished,
+    usage,
 };
 use std::cell::{Cell, RefCell};
 
@@ -124,13 +125,26 @@ fn run_77(replay: &mut Replay, minutes: Option<i64>) {
     }));
 }
 
-/// The recorded census of tracker#`n`.
-fn node(replay: &Replay, n: u64) -> &Value {
+/// The recorded listing of the epic tracker#`n`, without its sub-issues.
+fn listed(replay: &Replay, n: u64) -> &Value {
     (replay.requests.iter())
         .filter_map(|e| e["answer"].pointer("/data/repository/issues/nodes"))
         .flat_map(|nodes| nodes.as_array().unwrap())
         .find(|node| node["number"] == n)
         .unwrap()
+}
+
+/// The recorded census of tracker#`n`: its listing with its sub-issues, as
+/// stage 3 puts them together for [`EpicFacts::from_node`].
+fn node(replay: &Replay, n: u64) -> Value {
+    let mut node = listed(replay, n).clone();
+    let request = subs_request(n, Value::Null);
+    let subs = (replay.requests.iter())
+        .find(|e| e["request"] == request)
+        .and_then(|e| e["answer"].pointer("/data/repository/issue/subIssues"))
+        .unwrap();
+    node["subIssues"] = json!({"nodes": subs["nodes"], "totalCount": subs["totalCount"]});
+    node
 }
 
 /// The epic as `epic apply` reads it, from the recorded census.
@@ -196,7 +210,7 @@ fn unapplied(replay: &mut Replay) {
 /// its recorded sub-issues are all closed.
 fn said_done(replay: &mut Replay, author: &str) {
     let board = config(json!({})).board.unwrap();
-    let facts = EpicFacts::from_node(node(replay, 596), Some(&board)).unwrap();
+    let facts = EpicFacts::from_node(&node(replay, 596), Some(&board)).unwrap();
     let body = format!("{}\nEvery sub-issue is closed.", done_marker(&facts.census));
     let said = posted(replay, 596, 7_000_000_009, author, 1, &body);
     comments(replay, COMMENTS_596).push(said);
@@ -283,6 +297,81 @@ fn replay_plans_one_epic_and_recreates_nothing() {
         lines[2].ends_with(", 24 hours after its last request"),
         "{lines:#?}"
     );
+}
+
+/// tracker#596 with 60 sub-issues, more than a page of them: 9 recorded and
+/// closed, and 51 open ones, read in two pages after the cursor of the
+/// first. All are planned for; were the second page lost, or read twice,
+/// the epic could not be read.
+#[test]
+fn replay_pages_an_epics_sub_issues() {
+    const SUBS: usize = 60;
+    const CURSOR: &str = "Y3Vyc29yOjUw";
+    let mut replay = replay();
+    let subs = subs_mut(&mut replay, 596);
+    let recorded = subs["nodes"].as_array().unwrap().clone();
+    let mut nodes = recorded.clone();
+    nodes.extend((recorded.len()..SUBS).map(|i| {
+        let mut open = recorded[0].clone();
+        open["number"] = (10_000 + i).into();
+        open["state"] = "OPEN".into();
+        open["repository"] = json!({"nameWithOwner": "cgwalters-forge/tracker"});
+        open
+    }));
+    let (first, second) = nodes.split_at(SUBS_PER_PAGE);
+    *subs = json!({"nodes": first, "totalCount": SUBS,
+        "pageInfo": {"hasNextPage": true, "endCursor": CURSOR}});
+    let page = |nodes: &[Value]| {
+        json!({"data": {"repository": {"issue": {"subIssues": {"nodes": nodes, "totalCount": SUBS,
+            "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}})
+    };
+    (replay.requests)
+        .push(json!({"request": subs_request(596, CURSOR.into()), "answer": page(second)}));
+    let report = preview(&config(json!({})), &replay);
+    let lines = stage(&report);
+    let planned = (lines.iter())
+        .find(|l| l.starts_with("start planning cgwalters-forge/tracker#596 "))
+        .unwrap_or_else(|| panic!("{lines:#?}"));
+    // Each of the 51 added, and the 6 closed since its plan, counted.
+    let changed = SUBS - recorded.len() + 6;
+    assert!(
+        planned.ends_with(&format!(" and {} more)", changed - 3)),
+        "{planned}"
+    );
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    // Its second page changed between the reads, one fewer or one read
+    // again: the epic is not read whole, and is held for it.
+    let changed = "the sub-issues of cgwalters-forge/tracker#596 changed while they were read";
+    for edit in [&second[1..], &[first[0].clone()]] {
+        let mut moved = Replay {
+            now: replay.now,
+            requests: replay.requests.clone(),
+        };
+        moved.requests.last_mut().unwrap()["answer"] = page(edit);
+        let report = preview(&config(json!({})), &moved);
+        assert!(
+            (report.lines.iter()).any(|l| l.starts_with("hold epic cgwalters-forge/tracker#596: ")
+                && l.ends_with(changed)),
+            "{:#?}",
+            report.lines
+        );
+    }
+    // A read that fails, here the second page's, fails the stage rather than
+    // hold the one epic, as a failed listing does.
+    let mut failed = Replay {
+        now: replay.now,
+        requests: replay.requests.clone(),
+    };
+    failed.requests.last_mut().unwrap()["answer"] = json!({"error": "rate limited"});
+    let report = preview(&config(json!({})), &failed);
+    assert!(
+        report
+            .lines
+            .contains(&"epics error: rate limited".to_owned()),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
 }
 
 type Edit = Box<dyn Fn(&mut Replay)>;
@@ -690,8 +779,8 @@ struct Forge {
     ids: Cell<u64>,
     /// Refuses a board Why update.
     why_fails: Cell<bool>,
-    /// Edits each listing of the epics after the first: what changed while
-    /// the pass went through them.
+    /// Edits each listing of the epics after the first, and each read of
+    /// sub-issues after it: what changed while the pass went through them.
     relisted: Cell<Option<fn(&mut Value)>>,
     listings: Cell<usize>,
     comment_reads: RefCell<BTreeMap<u64, usize>>,
@@ -824,9 +913,11 @@ impl Transport for Forge {
         let mut data = self.replay.graphql(query, variables.clone())?;
         if query == EPICS_QUERY {
             self.listings.set(self.listings.get() + 1);
-            if let Some(edit) = self.relisted.get().filter(|_| self.listings.get() > 1) {
-                edit(&mut data);
-            }
+        }
+        if (query == EPICS_QUERY || query == EPIC_SUBS_QUERY)
+            && let Some(edit) = self.relisted.get().filter(|_| self.listings.get() > 1)
+        {
+            edit(&mut data);
         }
         if let Some(nodes) = data
             .pointer_mut("/repository/issue/comments/nodes")
@@ -863,10 +954,13 @@ fn queued_plans() -> Replay {
     let mut replay = replay();
     invalid_596(&mut replay);
     let third = {
-        let mut node = node(&replay, 890).clone();
+        let mut node = listed(&replay, 890).clone();
         node["number"] = 891.into();
         node
     };
+    let subs = subs_mut(&mut replay, 890).clone();
+    (replay.requests).push(json!({"request": subs_request(891, Value::Null),
+        "answer": {"data": {"repository": {"issue": {"subIssues": subs}}}}}));
     for entry in &mut replay.requests {
         if let Some(nodes) = entry["answer"].pointer_mut("/data/repository/issues/nodes") {
             let nodes = nodes.as_array_mut().unwrap();
@@ -1406,7 +1500,7 @@ fn done_epic_is_asked_or_closed_once() {
     }));
     let board = config(json!({})).board.unwrap();
     let marker = done_marker(
-        &EpicFacts::from_node(node(&replay, 596), Some(&board))
+        &EpicFacts::from_node(&node(&replay, 596), Some(&board))
             .unwrap()
             .census,
     );
@@ -1500,17 +1594,21 @@ fn done_epic_is_asked_or_closed_once() {
     );
     // A sub-issue reopened, or a hold put on, after the epics were listed:
     // read again before the writes, it waits, asked or closed.
-    fn epic_596(data: &mut Value) -> &mut Value {
-        let nodes = data["repository"]["issues"]["nodes"].as_array_mut();
-        (nodes.unwrap().iter_mut())
-            .find(|n| n["number"] == 596)
-            .unwrap()
+    fn epic_596(data: &mut Value) -> Option<&mut Value> {
+        let nodes = data.pointer_mut("/repository/issues/nodes")?.as_array_mut();
+        (nodes.unwrap().iter_mut()).find(|n| n["number"] == 596)
     }
+    // Only tracker#596's sub-issues are read again.
     let reopened: fn(&mut Value) = |data| {
-        epic_596(data)["subIssues"]["nodes"][0]["state"] = "OPEN".into();
+        if let Some(sub) = data.pointer_mut("/repository/issue/subIssues/nodes/0") {
+            sub["state"] = "OPEN".into();
+        }
     };
     let held: fn(&mut Value) = |data| {
-        let labels = &mut epic_596(data)["labels"];
+        let Some(epic) = epic_596(data) else {
+            return;
+        };
+        let labels = &mut epic["labels"];
         labels["nodes"]
             .as_array_mut()
             .unwrap()
@@ -1555,7 +1653,7 @@ fn done_epic_is_asked_or_closed_once() {
 fn decide_coalesces_changes_but_not_direction() {
     let replay = replay();
     let board = config(json!({})).board.unwrap();
-    let facts = EpicFacts::from_node(node(&replay, 890), Some(&board)).unwrap();
+    let facts = EpicFacts::from_node(&node(&replay, 890), Some(&board)).unwrap();
     let recorded: Vec<Comment> = {
         let mut replay = Replay {
             now: replay.now,
