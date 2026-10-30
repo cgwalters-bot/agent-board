@@ -1,0 +1,33 @@
+{
+  "operator": "owner",
+  "bot": "worker",
+  "dispatchRepo": "example/control",
+  "dispatchWorkflow": "dispatch.yml",
+  "follow": ["example/project"],
+  "workRepositories": ["example/control", "example/project"],
+  "board": {"owner": "example", "project": 1},
+  "epics": {"repository": "example/control", "inWorkRepositories": true},
+  "wip": 8,
+  "triage": {"scope": "epics"},
+  "triageFollowUpDays": 7,
+  "planPools": ["claude", "openai"],
+  "pools": {"claude": {}, "openai": {}},
+  "usage": {"url": "https://broker.example/usage", "repository": "example/ops", "issue": 1, "probe": true},
+  "budget": {
+    "source": "broker",
+    "url": "https://broker.example/usage/grant",
+    "pools": {"claude": "anthropic", "openai": "codex"},
+    "harnessRepositories": ["example/control"]
+  },
+  "holds": {"repository": "example/ops", "issue": 1},
+  "stall": {},
+  "starts": {},
+  "overlap": {},
+  "reruns": true,
+  "pr": {
+    "fixPools": ["claude", "openai"],
+    "reviewWorkflow": "review.yml",
+    "reviewPools": ["claude"],
+    "mergeQueue": {}
+  }
+}
