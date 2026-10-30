@@ -11,8 +11,9 @@ repository, item, kind, brief, pool, runner, optional base) and a trusted route
 from configuration, answered with a run handle, a start without one, a refusal
 that started nothing, or an unknown outcome. Its only backend is a GitHub
 Actions `workflow_dispatch` request to a caller workflow. Status queries on a
-handle, and other backends, are still
-[agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295).
+handle, and other backends, are not built; closed
+[agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295)
+delivered only the start request.
 This page describes the interface as it exists.
 
 ## Who dispatches
@@ -177,6 +178,12 @@ caller workflow has one runner. Batched plans add their briefs to `task`.
 
 agentic-job's [dispatch caller](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/dispatch.md)
 is a workflow of this shape.
+
+On Forgejo none of this is built. The contract for a Forgejo caller (the
+same inputs with `return_run_info`, each new run checked against what was sent,
+run listings that include `waiting` and `blocked`, reruns that reuse the run's
+id, and leases on the contents API) is in [forges](forges.md#dispatch-and-runs),
+with the caller and deployment it still needs.
 
 ## Recording a run on the board
 

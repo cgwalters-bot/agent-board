@@ -2164,6 +2164,12 @@ input. The parser validates contents, not checkout provenance. Credentials stay
 in the environment. Endpoints, repositories, pools, thresholds and paths are
 caller policy, not compiled-in production values.
 
+A Forgejo pass is not built; each option below has a Forgejo verdict (the
+same, a native mechanism, or refused) in
+[`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json),
+which a test keeps complete, so an option added here needs one there
+([forges](forges.md#a-forgejo-pass)).
+
 Regression anchors are `pass::tests::config_table`, `sweep_config_table` and the
 cost configuration tests, plus `v1_representative_config`. The latter loads
 [`fixtures/pass/config-v1.json`](../fixtures/pass/config-v1.json), a synthetic,

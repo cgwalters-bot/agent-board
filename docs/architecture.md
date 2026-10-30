@@ -125,7 +125,9 @@ own reads (the board they load is the snapshot), the project schema read
 before a write, dispatch, epics, the rest of the pass, the writes, and
 Forgejo. They share the snapshot's paging through an adapter
 whose reads never wait. The conditional-request cache comes later, as client
-middleware; a forge crate is extracted then.
+middleware; a forge crate is extracted then. A Forgejo write side and
+dispatch, when built, extend Forgejo's sync transport and do not wait for
+this migration ([forges](forges.md#io)).
 
 Why: a pass reads many independent things, and sequential requests make its
 time grow with the board. Slices keep each change small, with its tests green.
