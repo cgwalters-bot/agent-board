@@ -1,0 +1,6 @@
+[
+  {"repository":{"id":"R_fixture","nameWithOwner":"cgwalters-forge-stage/scratch","hasIssuesEnabled":true,"viewerPermission":"WRITE"}},
+  {"organization":{"login":"cgwalters-forge-stage","projectV2":{"id":"PVT_fixture","number":1,"viewerCanUpdate":true}}},
+  {"repository":{"nameWithOwner":"cgwalters-forge-stage/scratch","revision":{"__typename":"Commit","oid":"1111111111111111111111111111111111111111"},"object":{"__typename":"Blob","oid":"fixture-blob"}}},
+  {"repository":{"nameWithOwner":"cgwalters-forge/agent-board","object":{"__typename":"Commit","oid":"2222222222222222222222222222222222222222"}}}
+]

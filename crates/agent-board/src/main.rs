@@ -6,6 +6,7 @@ mod budget;
 mod cli_docs;
 mod cost;
 mod decisions;
+mod deploy;
 mod dispatch;
 mod epic;
 mod item;
@@ -371,6 +372,8 @@ enum Apps {
 
 #[derive(Subcommand)]
 enum Test {
+    /// Read-only staging deployment preflight; emits a JSON readiness report.
+    Deploy(deploy::Options),
     /// Create and clean up scratch objects in the staging project (writes).
     Project(live::Options),
 }
@@ -1212,6 +1215,20 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 board_forge::github::DEFAULT_HOST
             );
             apps::create(args)
+        }
+        Command::Test {
+            command: Test::Deploy(options),
+        } => {
+            ensure!(
+                cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.repo.is_none()
+                    && cli.project.is_none()
+                    && cli.policy.is_none()
+                    && cli.hostname == board_forge::github::DEFAULT_HOST,
+                "test deploy takes identities only from its trusted config on github.com"
+            );
+            deploy::run(options)
         }
         Command::Test {
             command: Test::Project(options),

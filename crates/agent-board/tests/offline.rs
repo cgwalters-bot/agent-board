@@ -10,6 +10,64 @@ fn fixture() -> String {
 }
 
 #[test]
+fn deploy_preflight_report_is_offline_and_preview_only() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let output = command()
+        .current_dir(root)
+        .args([
+            "test",
+            "deploy",
+            "--config",
+            "fixtures/deploy-config.json",
+            "--fixture",
+            "fixtures/deploy-reads.json",
+        ])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "agent-board.deploy-preflight.v1");
+    assert_eq!(report["mode"], "preview");
+    assert_eq!(report["writes"], 0);
+    assert_eq!(report["checks"].as_array().unwrap().len(), 8);
+    assert!(output.stderr.is_empty());
+
+    let dir = std::env::temp_dir().join(format!("agent-board-deploy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json");
+    for contents in ["{", "{}", r#"{"owner":"production"}"#] {
+        std::fs::write(&path, contents).unwrap();
+        let output = command()
+            .args(["test", "deploy", "--config"])
+            .arg(&path)
+            // A missing fixture proves invalid config is refused before any reads.
+            .args(["--fixture", "does-not-exist.json"])
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["writes"], 0);
+        assert_eq!(report["checks"][0]["state"], "blocked");
+    }
+    command()
+        .current_dir(root)
+        .args([
+            "test",
+            "deploy",
+            "--config",
+            "fixtures/deploy-config.json",
+            "--apply",
+        ])
+        .assert()
+        .code(1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn setup_credential_free_rehearsal() {
     let setup = include_str!("../../../docs/setup.md");
     let section = setup

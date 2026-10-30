@@ -66,6 +66,17 @@ pub fn run(
         project.is_none_or(|n| n > 0),
         "project number must be positive"
     );
+    validate_stage_scope(owner, repo)?;
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate fixture nonce"))?;
+    let title = format!(
+        "agent-board-ci-{}",
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
+    lifecycle(runtime, &Client::from_env()?, owner, repo, &title, project)
+}
+
+pub(crate) fn validate_stage_scope(owner: &str, repo: &str) -> Result<()> {
     ensure!(
         owner == "cgwalters-forge-stage",
         "live fixture owner must be cgwalters-forge-stage"
@@ -75,13 +86,14 @@ pub fn run(
         repo_owner == owner && !name.is_empty() && !name.contains('/'),
         "scratch repository must belong to the staging owner"
     );
-    let mut bytes = [0; 16];
-    getrandom::fill(&mut bytes).map_err(|_| anyhow::anyhow!("generate fixture nonce"))?;
-    let title = format!(
-        "agent-board-ci-{}",
-        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ensure!(
+        name.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            && name != "."
+            && name != "..",
+        "invalid scratch repository name"
     );
-    lifecycle(runtime, &Client::from_env()?, owner, repo, &title, project)
+    Ok(())
 }
 
 struct Borrowed<'a, T>(&'a T);

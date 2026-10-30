@@ -285,6 +285,43 @@ by hand.
 
 ## Repeat a staging trial
 
+Before provisioning, preview the deployment prerequisites with the opt-in,
+read-only test runner (from the checkout root):
+
+```sh
+agent-board test deploy --config fixtures/deploy-config.json --fixture fixtures/deploy-reads.json
+```
+
+This offline example exits 0, reports simulated repository/project/workflow and
+source-pin reads as `ready`, and still marks environment provisioning, effective
+credential capabilities and inference/broker admission `unverified`. Fixture pins
+and node IDs are invented; never use them live. A report is not deployment
+authorization, and exit 0 does not mean all prerequisites are ready.
+
+For live reads, copy that config to a trusted default-branch file, replace every
+identity and both full lowercase 40-hex commit pins with reviewed values, then
+omit `--fixture`. The workflow is a basename in that same staging repository's
+`.github/workflows/`; `projectId` and `project` must both match the organization
+project. The source pin is in `cgwalters-forge/agent-board`. The command rejects
+owners other than `cgwalters-forge-stage`, repository owner mismatches, unknown
+keys, nulls and moving refs before requesting anything. This stage-only restriction
+prevents a rehearsal from targeting production; it cannot tell whether an operator
+has put production data in the staging organization.
+
+The `agent-board.deploy-preflight.v1` JSON report has `mode: "preview"`, `writes: 0`
+and ordered `checks`, each with `group`, `check`, `state` (`ready`, `blocked` or
+`unverified`) and a non-secret `detail`. Configuration failures and mismatched or
+missing returned facts are blocked (exit 1); failed reads are unverified, never
+ready. It attempts at most four non-paginated GraphQL reads, uses `GH_TOKEN` via
+the normal client only without `--fixture`, and has no apply flag or mutation
+path. Environment provisioning is reported separately from stage access and from
+inference/broker prerequisites; it reads no secret values and does not test writer
+tokens by mutation. Actions policy, workflow contents/transitive pins, protected
+environment restrictions and effective token permissions require operator review.
+No resources, secrets, workflows or schedules are installed or enabled. The
+unanswered operator decisions remain in
+[#282](https://github.com/cgwalters-forge/agent-board/issues/282), not in this report.
+
 **Unverified:** this walkthrough's offline rehearsal is not the live staging
 trial. Live provisioning, model-free workflow dispatch, inference, review,
 protected apply and scheduled operation remain unattempted here; satisfy the
