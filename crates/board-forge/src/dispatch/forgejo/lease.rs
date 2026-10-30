@@ -153,6 +153,9 @@ impl<T: Transport> Forgejo<'_, T> {
             observed.lease.is_none(),
             "slot occupied; reap separately if expired"
         );
+        // Admission must reserve before dispatch; an existing run cannot skip
+        // the send-boundary reservation and subsequent ownership-checked bind.
+        ensure!(lease.run == 0, "admission requires an unbound reservation");
         let taken = OffsetDateTime::parse(&lease.taken_at, &Rfc3339)?;
         let expires = OffsetDateTime::parse(&lease.expires_at, &Rfc3339)?;
         ensure!(

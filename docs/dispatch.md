@@ -196,11 +196,16 @@ read and checked against the [identity protocol](forges.md#dispatch-and-runs),
 including the explicit workflow-dispatch trigger, the configured ref (the
 run's `prettyref`), nonempty sent inputs and exact title/pool. A start is
 refused before admission while the workflow's history already fills the
-500-run listing cap, since its confirmation could not list it. A named mismatch gets best-effort cancellation and stays
-held. Confirmation requires exactly one verified match in two complete
-inventories with the same ids, then a fresh run read. Read-only recovery uses
+500-run listing cap, since its confirmation could not list it. A named mismatch
+gets best-effort cancellation and stays held; a status or transport read error
+stays ambiguous without cancellation. Creation time is compared at whole-second
+precision, matching Forgejo's timestamp. Confirmation requires exactly one
+verified match in two complete inventories with the same ids, then a fresh run
+read. Read-only recovery uses
 the same protocol; zero or duplicate verified matches never authorize POST.
 Run URLs use `index_in_repo`, not the global API id.
+Concurrent starts can change those inventories and turn even verified starts
+ambiguous, so the caller must serialize starts.
 
 Active inventory uses `/actions/runs`, never `/actions/tasks`: `waiting` is
 queued, `blocked` includes approval and `running` is active. Each active status
@@ -228,6 +233,9 @@ callback, leaving only the write after it. Writes carry the observed blob
 SHA; stale ownership loses with 409. Lost write replies and other failures
 hold, even if read-back shows the proposed value. Free markers retain the old
 owner, and claims must be globally unique and never reused, preventing ABA.
+Slots sharing a branch can fail each other's non-forced push even when updating
+different files. Such failures hold the reservation: this affects liveness,
+not ownership safety, and is another reason for the caller to serialize starts.
 
 These are primitives, not a scheduler or durable journal. Final admission
 callbacks must preserve WIP, pool pacing, dispatch/write caps, one lease per

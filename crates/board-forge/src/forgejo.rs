@@ -1154,6 +1154,185 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_client_send_refusal_table() {
+        use std::io::{Cursor, Read};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use ureq::unversioned::{
+            resolver::{ResolvedSocketAddrs, Resolver},
+            transport::{
+                Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout,
+                Transport as HttpTransport,
+            },
+        };
+
+        #[derive(Clone, Debug)]
+        struct Reply {
+            url: &'static str,
+            bytes: Vec<u8>,
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl Resolver for Reply {
+            fn resolve(
+                &self,
+                _: &ureq::http::Uri,
+                _: &ureq::config::Config,
+                _: NextTimeout,
+            ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+                let mut addresses = self.empty();
+                addresses.push("127.0.0.1:1".parse().unwrap());
+                Ok(addresses)
+            }
+        }
+
+        impl Connector for Reply {
+            type Out = Wire;
+
+            fn connect(
+                &self,
+                details: &ConnectionDetails,
+                _: Option<()>,
+            ) -> std::result::Result<Option<Wire>, ureq::Error> {
+                assert_eq!(
+                    details.uri.to_string(),
+                    self.url,
+                    "must not follow a redirect"
+                );
+                self.requests.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Wire {
+                    bytes: Cursor::new(self.bytes.clone()),
+                    buffers: LazyBuffers::new(4096, 4096),
+                }))
+            }
+        }
+
+        #[derive(Debug)]
+        struct Wire {
+            bytes: Cursor<Vec<u8>>,
+            buffers: LazyBuffers,
+        }
+
+        impl HttpTransport for Wire {
+            fn buffers(&mut self) -> &mut dyn Buffers {
+                &mut self.buffers
+            }
+
+            fn transmit_output(
+                &mut self,
+                _: usize,
+                _: NextTimeout,
+            ) -> std::result::Result<(), ureq::Error> {
+                Ok(())
+            }
+
+            fn await_input(&mut self, _: NextTimeout) -> std::result::Result<bool, ureq::Error> {
+                let read = self.bytes.read(self.buffers.input_append_buf())?;
+                self.buffers.input_appended(read);
+                Ok(read > 0)
+            }
+
+            fn is_open(&mut self) -> bool {
+                false
+            }
+
+            fn is_tls(&self) -> bool {
+                true
+            }
+        }
+
+        // Exercise the real Client with an isolated fake HTTP transport: no
+        // network or credential is needed, including for a foreign destination.
+        let api = "https://forge.example/git/api/v1/";
+        let oversized = format!("\"{}\"", "x".repeat(10 * 1024 * 1024));
+        for (case, url, status, body, expected_requests) in [
+            (
+                "redirect",
+                "https://forge.example/git/api/v1/redirect",
+                302,
+                "{}",
+                1,
+            ),
+            (
+                "host",
+                "https://elsewhere.example/git/api/v1/host",
+                201,
+                "{}",
+                0,
+            ),
+            (
+                "port",
+                "https://forge.example:8443/git/api/v1/port",
+                201,
+                "{}",
+                0,
+            ),
+            (
+                "subpath",
+                "https://forge.example/api/v1/subpath",
+                201,
+                "{}",
+                0,
+            ),
+            (
+                "root prefix",
+                "https://forge.example/git/api/v1-evil/root",
+                201,
+                "{}",
+                0,
+            ),
+            (
+                "non-JSON",
+                "https://forge.example/git/api/v1/non-json",
+                201,
+                "not JSON",
+                1,
+            ),
+            (
+                "oversized",
+                "https://forge.example/git/api/v1/oversized",
+                201,
+                oversized.as_str(),
+                1,
+            ),
+        ] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let reply = Reply {
+                url,
+                bytes: format!("HTTP/1.1 {status} Reply\r\nLocation: https://elsewhere.example/redirected\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+                requests: requests.clone(),
+            };
+            let client = Client {
+                api: Url::parse(api).unwrap(),
+                token: "test-token-not-secret".into(),
+                token_env: DEFAULT_TOKEN_ENV.into(),
+                agent: ureq::Agent::with_parts(
+                    ureq::Agent::config_builder().proxy(None).build(),
+                    reply.clone(),
+                    reply,
+                ),
+            };
+            let result = client.send("POST", &Url::parse(url).unwrap(), &json!({}));
+            if case == "redirect" {
+                // Report the refusal to the adapter (which holds it), never
+                // follow Location or mistake it for a successful dispatch.
+                assert_eq!(result.unwrap().0, 302);
+            } else {
+                let error = result.unwrap_err();
+                let expected = if expected_requests == 0 {
+                    "refusing"
+                } else {
+                    "decode Forgejo mutation reply"
+                };
+                assert!(error.to_string().contains(expected), "{case}: {error:#}");
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), expected_requests, "{case}");
+        }
+    }
+
+    #[test]
     fn client_keeps_the_token_on_the_api_root() {
         let client = Client {
             api: config(json!({})).api_root().unwrap(),
