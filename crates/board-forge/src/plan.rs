@@ -695,7 +695,7 @@ pub fn stack<T: Transport>(
         "a plan that stacks_on another issue needs --bot, whose pull request its run starts from",
     )?;
     Ok(match crate::stack::resolve(client, dest, lower, bot)? {
-        crate::stack::Stack::Wait(why) => Err(Decision::Wait(why)),
+        crate::stack::Stack::Wait(why) => Err(Decision::Wait(why, Vec::new())),
         crate::stack::Stack::Unstacked(why) => Ok((
             JobPlan {
                 stacks_on: None,
@@ -904,7 +904,7 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         false => overlap::decide(client, issue, &dest, &plan.brief, bot, target),
     };
     let overlap = bot.filter(|_| base.is_none()).map(check);
-    if let Some(Decision::Wait(_)) = overlap {
+    if let Some(Decision::Wait(..)) = overlap {
         // Unrecorded, so the next pass decides again on fresh state.
         return Ok(Dispatched {
             record: None,
@@ -2548,7 +2548,7 @@ mod tests {
             if !ran {
                 // A wait writes nothing, so the next pass decides again.
                 assert_eq!(forge.bodies().len(), 1, "{name}");
-                assert!(matches!(done.overlap, Some(Decision::Wait(_))), "{name}");
+                assert!(matches!(done.overlap, Some(Decision::Wait(..))), "{name}");
                 continue;
             }
             let record = forge.bodies().last().unwrap().clone();
@@ -2653,7 +2653,11 @@ mod tests {
                 // Nothing is written, so the next pass decides again.
                 assert!(dispatches.is_empty(), "{name}");
                 assert_eq!(forge.bodies().len(), 1, "{name}");
-                assert_eq!(done.overlap, Some(Decision::Wait(says.into())), "{name}");
+                assert_eq!(
+                    done.overlap,
+                    Some(Decision::Wait(says.into(), Vec::new())),
+                    "{name}"
+                );
                 continue;
             };
             let inputs = &dispatches[0]["inputs"];

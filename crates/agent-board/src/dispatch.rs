@@ -466,7 +466,7 @@ pub fn from_plan<T: Transport + Rest>(
         }
         // Ready for `$GITHUB_OUTPUT`; GitHub does not always name the run.
         match &done.overlap {
-            Some(decision @ Decision::Wait(_)) => {
+            Some(decision @ Decision::Wait(..)) => {
                 eprintln!("{}", decision.sentence());
                 writeln!(out, "waiting=true")?;
             }
@@ -547,7 +547,7 @@ pub fn from_plan<T: Transport + Rest>(
     if let Some(decision) = &overlap {
         eprintln!("{}", decision.sentence());
     }
-    if let Some(Decision::Wait(_)) = overlap {
+    if let Some(Decision::Wait(..)) = overlap {
         eprintln!(
             "Dry run: the plan in {} would wait; nothing was sent.",
             from.url
