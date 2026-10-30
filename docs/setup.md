@@ -25,22 +25,57 @@ certificate and hostname verification stay on.
 
 ## Try it offline
 
-The sample board is in the repository, so clone it
-(`git clone https://github.com/cgwalters-forge/agent-board`) and, from its
-root, with no token:
+The fixtures are in the repository, not the installed package. Clone with
+`git clone https://github.com/cgwalters-forge/agent-board`, then open that checkout's
+root. To test that checkout rather than the latest upstream binary, install with
+`cargo install --locked --path crates/agent-board`. Ensure Cargo's bin directory
+(normally `~/.cargo/bin`) is on `PATH`. Installation needs network access for
+source/dependencies; the commands below do not. Unset `GH_TOKEN`, `GITHUB_TOKEN`
+and `DISPATCH_TOKEN` before this rehearsal; no `gh auth login`, model, broker,
+container or board provisioning is needed.
 
 ```sh
 agent-board item list --snapshot fixtures/board.json
 agent-board reconcile plan --snapshot fixtures/board.json --emit
 agent-board project view --snapshot fixtures/board.json --json project,coverage
+agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json --max-dispatch 1 --max-writes 3 --max-status-changes 5
 ```
 
-All three should exit 0 without `GH_TOKEN` or `GITHUB_TOKEN`. The fixture is
-sample data: listing it proves the CLI works, the plan is a proposal rather than
-a write, and coverage describes which facts the snapshot contains. It does not
-prove live token access, dispatch, inference, review or container isolation.
-The offline CLI test runs these commands, so this starting point stays
-reproducible. Every command and flag is in the [CLI reference](cli.md).
+All four should exit 0. Interpret them in order:
+
+- `item list` lists the sample issues; it proves the binary can read a snapshot.
+- `reconcile plan --emit` prints a JSON safe-output proposal (a Status update to
+  `Triage`), not an applied repair. `project view` prints the project identity and
+  coverage; complete coverage here is a fixture fact, not a live access check.
+- `pass` starts with `pass: preview`. `--replay` supplies recorded API answers
+  and a fixed clock, not the simpler `--snapshot` format. Do not add `--record`:
+  that combines replay seeds with live reads. `--apply` conflicts with replay.
+  The fixture config names historical repositories and enables simulated work;
+  **do not copy it into a live caller** or drop `--replay` to try those identities.
+
+The first pass includes `usage: no usage.url; pacing reads the published snapshot`
+(the snapshot is also recorded), `follow: no repositories` (PR follow-up is not
+exercised), `start triage … pool=claude` (would start, no model is invoked), and
+`held by --max-dispatch: start …` (the cap deferred it). Other `hold …` lines
+explain dependencies or operator work; they are not command failures. The last
+two lines are:
+
+```text
+status: 0 change(s) of 0 item(s) read
+summary: dispatched 1/1, writes 3/3, held 5, requests 52, points ~38
+```
+
+These are **planned** dispatch/write steps, not completed mutations. `held` counts
+cap-held steps, not every `hold` line; requests are replayed reads and `~` marks
+estimated GraphQL points. This recording does not exercise Status changes.
+The caps limit the proposal; preview is what prevents writes. A `fail …` or
+`… error: …` line means an operation failed; the pass exits nonzero after its
+summary, and a partial preview is not an approval to apply.
+
+The existing offline CLI test executes this exact command block in `just check`
+in CI and checks the pass's decisions and summary. Nothing here proves live
+token access, dispatch, inference, review, container isolation or a scheduled
+loop. Every flag is in the [CLI reference](cli.md).
 
 ## Connect one lane
 
@@ -101,7 +136,54 @@ dispatch caller (step 2) and the review caller (step 4); each says so.
    `permissions` and `GITHUB_TOKEN` do not grant organization Projects writes.
    The [live template](../live/board-test.yml) shows a protected staging test.
 
-6. **Preview a plan, then wire scheduling deliberately.** Use
+6. **Preview the first live pass, then wire scheduling deliberately.** Put a
+   separate `pass.json` in a trusted default-branch checkout of your caller.
+   For a read-only board preview, replace every example identity below with your
+   own (project is the positive organization project number, not its node ID):
+
+   ```json
+   {
+     "operator": "your-operator",
+     "bot": "your-bot",
+     "dispatchRepo": "your-org/your-caller",
+     "dispatchWorkflow": "dispatch.yml",
+     "dispatchRef": "main",
+     "board": {"owner": "your-org", "project": 1},
+     "workRepositories": ["your-org/your-target"],
+     "wip": 0,
+     "triage": false
+   }
+   ```
+
+   The real Config parser requires `operator`, `bot`, `dispatchRepo` and
+   `dispatchWorkflow` even with work off. It rejects unknown keys and explicit
+   nulls; omit unused sections. `wip: 0` disables new work, absent `follow`
+   disables PR follow-up, and absent `epics` disables epic planning. The board
+   section still lets the Status stage preview repairs. With a read-only
+   `GH_TOKEN` for the bot (Projects read plus Issues/Pull requests read on the
+   exact repositories it must inspect, and Actions read on `dispatchRepo` to
+   list runs in flight even with `wip: 0`), from that checkout run:
+
+   ```sh
+   agent-board snapshot create --owner your-org --project 1 > board.json
+   agent-board reconcile plan --snapshot board.json --emit
+   agent-board pass --config pass.json --max-dispatch 0 --max-writes 0 --max-status-changes 5
+   ```
+
+   No `--apply`, no `--record`, no scheduled caller and no dispatch token yet.
+   Zero caps also bound proposals; Status changes over five refuse the stage
+   whole rather than silently applying a subset. Inspect errors and held lines,
+   not just exit 0. A live preview proves reads and planning, not writer access
+   or dispatch. To preview candidates later, `wip` must be positive and
+   `workRepositories` exact; automatic runs need `pools` and `usage.repository`
+   plus `usage.issue`. Refreshing usage additionally needs `usage.url`; without
+   it the pass reads the published snapshot. Triage needs `triage` and
+   `triagePools` or `planPools` naming configured pools; scope `epics` also needs
+   `epics`. Keep all optional features absent until their prerequisites are met.
+   See the [configuration reference](pass.md#one-configuration-file); the setup
+   CLI test also parses the minimal example above with the real Config parser.
+
+   Use
    [job-plan dispatch](job-plans.md#dispatch), starting with
    `dispatch ISSUE --dry-run`; apply needs a writer's user token and records the
    plan before dispatching. Write the callers' configuration on the caller's
@@ -118,6 +200,17 @@ identity and its ACLs, admit the specific repository and workflow identities and
 finite budgets at the broker, keep model credentials only at the broker, and
 provision the protected apply, reconcile and live-test secrets with effective
 Projects access.
+
+Before any live dispatch, the operator must also approve the organization's
+Actions/reusable-workflow policy, the bot's repository/project access and any
+token SSO approval. The dispatch credential needs Actions write in the caller;
+`DISPATCH_TOKEN` can separate that identity from `GH_TOKEN` (otherwise the pass
+uses `GH_TOKEN`). Applying passes need the configured bot's effective write
+access described in step 5; PR follow-up/merges and agentic-job apply have their
+own repository permissions and protected environments. A read token that can
+preview is not evidence that any of those writers are provisioned. Review callers,
+broker admission, network ACLs and protected secrets are separate installations,
+not side effects of `cargo install` or `project init`.
 
 ### Pinned callers
 
@@ -191,6 +284,13 @@ by hand.
 [review]: https://github.com/cgwalters-forge/tracker/blob/bb8363a8cc856cbdb5538b1089d3d175385a3a91/.github/workflows/review.yml
 
 ## Repeat a staging trial
+
+**Unverified:** this walkthrough's offline rehearsal is not the live staging
+trial. Live provisioning, model-free workflow dispatch, inference, review,
+protected apply and scheduled operation remain unattempted here; satisfy the
+operator prerequisites above (the work tracked by
+[#282](https://github.com/cgwalters-forge/agent-board/issues/282)) before trying
+them independently.
 
 With the prerequisites satisfied, use a disposable staging repository and
 project selected by the trusted configuration; do not reuse a production board

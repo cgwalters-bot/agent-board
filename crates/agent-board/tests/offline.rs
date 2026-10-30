@@ -30,14 +30,41 @@ fn setup_credential_free_rehearsal() {
             .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
+            .env_remove("DISPATCH_TOKEN")
             .assert()
             .success()
             .get_output()
             .clone();
         assert!(!output.stdout.is_empty(), "{line}");
+        if line.starts_with("agent-board pass ") {
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.starts_with("pass: preview\n"), "{text}");
+            assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 1);
+            assert!(text.contains("held by --max-dispatch: start "), "{text}");
+            assert!(text.ends_with("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, requests 52, points ~38\n"), "{text}");
+            assert!(output.stderr.is_empty(), "{line}");
+        }
         count += 1;
     }
-    assert_eq!(count, 3);
+    assert_eq!(count, 4);
+
+    // Keep the separate, work-off live starter valid without contacting a forge.
+    let live = setup
+        .split_once("6. **Preview the first live pass")
+        .unwrap()
+        .1;
+    let json = live
+        .split_once("```json\n")
+        .unwrap()
+        .1
+        .split_once("```")
+        .unwrap()
+        .0;
+    let config = board_forge::pass::Config::parse(json).unwrap();
+    assert_eq!(config.wip, 0);
+    assert!(config.follow.is_empty());
+    assert!(config.epics.is_none());
+    assert!(config.triage.is_none());
 }
 
 #[test]
