@@ -1,0 +1,238 @@
+{
+  "schema": "agent-board/forgejo-pass-contract/v1",
+  "built": false,
+  "doc": "docs/forges.md#a-forgejo-pass",
+  "forgejo": {
+    "release": "v17.0.1",
+    "commit": "363f3dc30beef902b187af5a5244ff7af44901e6",
+    "checked": "2026-10-30"
+  },
+  "instance": {
+    "board": {
+      "forge": "forgejo",
+      "url": "https://forge.example/",
+      "tokenEnv": "FORGEJO_TOKEN",
+      "repositories": ["example/work"],
+      "membership": {"label": "agent-board"},
+      "recorders": [1234, 5678]
+    },
+    "requests": "only under board.url's scheme, host, port and path",
+    "repositories": "board.repositories, workRepositories, epics.repository, dispatchRepo and the publication issues' repositories, all on this instance",
+    "token": {
+      "from": "board.tokenEnv",
+      "scopes": ["read:user", "read:issue", "write:issue", "read:repository", "write:repository"],
+      "refused": ["GH_TOKEN", "GITHUB_TOKEN", "the Actions automatic token", "admin, organization or all scopes"],
+      "identity": "GET /user names bot, whose id is in recorders, before an applying pass writes"
+    },
+    "crossInstance": "none: no GitHub reads, writes, tokens or fallback; publication only to this instance"
+  },
+  "labels": {
+    "exclusive": true,
+    "scopes": {
+      "priority/": ["P0", "P1", "P2", "P3"],
+      "turn/": ["coordinator", "operator", "worker", "external", "none"],
+      "status/": ["todo", "backlog", "blocked", "in-progress", "needs-human", "done"]
+    },
+    "turnIdentities": "turn/<policy identity>, read as Worker, as today",
+    "missing": "refused before writing; never created",
+    "write": "add one label by id, then read the issue back: exactly one label of the scope, or the write did not happen",
+    "status": "no status/ label is no Status; two or an unknown value is incomplete"
+  },
+  "records": {
+    "counts": "author id in recorders and updated_at equal to created_at, in whole seconds",
+    "trusted": "the board repositories' admins and owners, who can backdate an edit",
+    "edits": "never: a new comment replaces a record",
+    "markers": {
+      "dispatch": "<!-- agent-board-dispatch: COMMENT-ID@TIME -->",
+      "children": "<!-- agent-board-epic-children: N -->",
+      "parent": "<!-- agent-board-epic-parent: OWNER/REPO#N -->"
+    }
+  },
+  "dispatch": {
+    "request": {
+      "method": "POST",
+      "path": "/api/v1/repos/example/control/actions/workflows/agent.yml/dispatches",
+      "body": {
+        "ref": "main",
+        "inputs": {
+          "task": "Implement example/work#7",
+          "repo": "example/work",
+          "item": "7",
+          "kind": "implement",
+          "pool": "claude"
+        },
+        "return_run_info": true
+      }
+    },
+    "started": {"status": 201, "body": {"id": 41, "run_number": 12, "jobs": ["agent"]}},
+    "check": {
+      "path": "/api/v1/repos/example/control/actions/runs/41",
+      "trigger_user.id": "the bot's id",
+      "workflow_id": "agent.yml",
+      "event_payload.inputs": "each input sent non-empty, with its value; others absent or at the workflow's default",
+      "title": "implement example/work#7 (claude), for listings only"
+    },
+    "ambiguous": ["timeout", "5xx", "lost connection", "204", "201 without an id"],
+    "recovery": "never retried; the next pass checks the runs titled for the item created after the claim, and records exactly one that passes the check",
+    "active": ["waiting", "blocked", "running"],
+    "unreadable": ["unknown"],
+    "listing": {"pageLimit": 50, "total": "body total_count", "pagesPerStatus": 10, "reads": 2},
+    "rerun": "POST .../actions/runs/{id}/rerun once, recorded with the jobs' attempt; same run id"
+  },
+  "leases": {
+    "path": "leases/SLOT.json on a branch of the private dispatchRepo",
+    "take": "PUT /contents with the read blob sha, or create where absent",
+    "bodies": "a lease names its run, claim and taken_at, so is unique; a free slot names the run it freed",
+    "refused": [409, 422],
+    "ambiguous": [500],
+    "release": "PUT the free content with the read blob sha; never DELETE"
+  },
+  "stages": [
+    {
+      "stage": 1,
+      "name": "usage",
+      "capabilities": [
+        {"capability": "broker usage and grant reads", "verdict": "same"},
+        {"capability": "usage snapshot publication", "verdict": "native", "forgejo": "a new bot comment on usage.issue in a private repository of this instance (GET /repos private)"},
+        {"capability": "previous snapshot read", "verdict": "native", "forgejo": "the newest unedited bot comment with the marker"}
+      ]
+    },
+    {
+      "stage": 2,
+      "name": "follow pull requests",
+      "capabilities": [
+        {"capability": "fix, rebase, continuation and answer rounds", "verdict": "refused", "reason": "PR follow-up reads GitHub reviews, checks, fork heads and fix bounds; no reviewed Forgejo equivalent"},
+        {"capability": "review job starts and reruns", "verdict": "refused", "reason": "no Forgejo review caller"},
+        {"capability": "required checks and their reruns", "verdict": "refused", "reason": "Forgejo commit statuses and branch protection are unreviewed"},
+        {"capability": "merges and merge queues", "verdict": "refused", "reason": "no reviewed approval-at-head and green-check rule on Forgejo"}
+      ]
+    },
+    {
+      "stage": 3,
+      "name": "epics",
+      "capabilities": [
+        {"capability": "live epics", "verdict": "native", "forgejo": "epic label whose newest timeline label event is by the operator's or bot's id"},
+        {"capability": "children", "verdict": "native", "forgejo": "the epic's bot children comment and each child's bot parent comment, agreeing"},
+        {"capability": "sub-issue APIs", "verdict": "refused", "reason": "Forgejo has no sub-issues or projects"},
+        {"capability": "plans and receipts", "verdict": "native", "forgejo": "agent-board/epic-plan/v1 comments, appended and unedited"},
+        {"capability": "create, link, Priority and close", "verdict": "native", "forgejo": "POST issues, relationship comments, exclusive priority/ labels, PATCH state, each read back"},
+        {"capability": "planning run", "verdict": "native", "forgejo": "the dispatch below"}
+      ]
+    },
+    {
+      "stage": 4,
+      "name": "schedule",
+      "capabilities": [
+        {"capability": "candidates and Priority", "verdict": "native", "forgejo": "today's label board read, which refuses an issue without the membership label"},
+        {"capability": "holds", "verdict": "native", "forgejo": "needs-human and needs-design labels, status/blocked, open /dependencies"},
+        {"capability": "replanning after a merged pull request", "verdict": "refused", "reason": "Forgejo's API does not name a pull request's closing issues"},
+        {"capability": "plans in issue bodies", "verdict": "refused", "reason": "an issue body's last editor cannot be read"},
+        {"capability": "open pull request for an item", "verdict": "native", "forgejo": "GET pulls, matched to its issue as #513 specifies; unreadable holds"},
+        {"capability": "WIP and runs in flight", "verdict": "native", "forgejo": "caller runs in waiting, blocked and running, listed whole twice"},
+        {"capability": "pool pacing", "verdict": "same"},
+        {"capability": "plan claims and dispatch", "verdict": "native", "forgejo": "appended claim, dispatch with return_run_info, run checked by trigger user, workflow and inputs"},
+        {"capability": "one rerun", "verdict": "native", "forgejo": "POST runs/{id}/rerun, recorded with the jobs' attempt"},
+        {"capability": "leases", "verdict": "native", "forgejo": "contents API blob-sha compare and swap"},
+        {"capability": "overlap waivers", "verdict": "refused", "reason": "reads GitHub branch activity"},
+        {"capability": "start breaker", "verdict": "refused", "reason": "classifies start failures from GitHub job data; Forgejo job logs are unreviewed"},
+        {"capability": "operator direction", "verdict": "refused", "reason": "no last editor of an issue body"}
+      ]
+    },
+    {
+      "stage": 5,
+      "name": "status",
+      "capabilities": [
+        {"capability": "derived Status", "verdict": "native", "forgejo": "one exclusive status/ label, read back"},
+        {"capability": "close reasons", "verdict": "refused", "reason": "Forgejo issues have none; closed is Done"}
+      ]
+    },
+    {
+      "stage": 6,
+      "name": "cost",
+      "capabilities": [
+        {"capability": "cost report publication", "verdict": "refused", "reason": "writes a GitHub data branch from GitHub run summaries"}
+      ]
+    }
+  ],
+  "options": {
+    "operator": {"verdict": "native", "forgejo": "a login resolved to its id once a pass, which must be in recorders"},
+    "bot": {"verdict": "native", "forgejo": "the token's GET /user login, its id in recorders"},
+    "dispatchRepo": {"verdict": "native", "forgejo": "the caller repository on this instance"},
+    "dispatchWorkflow": {"verdict": "native", "forgejo": "the caller's Forgejo Actions workflow file"},
+    "dispatchRef": {"verdict": "native", "forgejo": "the dispatch ref"},
+    "follow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "workRepositories": {"verdict": "native", "forgejo": "repositories of this instance's board"},
+    "board.owner": {"verdict": "refused", "reason": "no Projects; the Forgejo board section replaces it"},
+    "board.project": {"verdict": "refused", "reason": "no Projects; the Forgejo board section replaces it"},
+    "board.priorityField": {"verdict": "refused", "reason": "Priority is the priority/ label scope"},
+    "epics.repository": {"verdict": "native", "forgejo": "relationship comments, not sub-issues"},
+    "epics.inWorkRepositories": {"verdict": "native", "forgejo": "the same epic rule in each work repository"},
+    "epics.maxAppliesPerPass": {"verdict": "same"},
+    "epics.close": {"verdict": "native", "forgejo": "PATCH state closed with a comment; no close reason"},
+    "wip": {"verdict": "native", "forgejo": "complete caller run listings"},
+    "triage": {"verdict": "native", "forgejo": "triage plans dispatched as below"},
+    "planPools": {"verdict": "same"},
+    "triagePools": {"verdict": "same"},
+    "triageFollowUpDays": {"verdict": "native", "forgejo": "verdict blocks in unedited bot comments"},
+    "triageClose": {"verdict": "native", "forgejo": "close with a comment naming the verdict; no close reason"},
+    "replanAfterDays": {"verdict": "refused", "reason": "needs a merged pull request's closing issues, which Forgejo's API does not name"},
+    "bodyPlans": {"verdict": "refused", "reason": "an issue body's last editor cannot be read"},
+    "revisit.perPass": {"verdict": "native", "forgejo": "issue updated_at"},
+    "revisit.afterDays": {"verdict": "native", "forgejo": "issue updated_at"},
+    "revisit.heldAfterDays": {"verdict": "native", "forgejo": "issue updated_at"},
+    "revisit.pools": {"verdict": "same"},
+    "sweep.weekday": {"verdict": "native", "forgejo": "files one issue on this instance"},
+    "sweep.hourUtc": {"verdict": "same"},
+    "sweep.max": {"verdict": "same"},
+    "sweep.repository": {"verdict": "native", "forgejo": "a work repository of this instance"},
+    "maintain.repos.sinceDays": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.repos.min": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.repos.max": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.repos.include": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.repos.exclude": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.share": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.digest.repository": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.digest.issue": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "maintain.hourUtc": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
+    "overlap.staleDraftHours": {"verdict": "refused", "reason": "reads GitHub branch activity"},
+    "overlap.staleHours": {"verdict": "refused", "reason": "moves blocking pull requests on, which is PR follow-up"},
+    "pools": {"verdict": "same"},
+    "pools.NAME.target": {"verdict": "same"},
+    "pools.NAME.burst": {"verdict": "same"},
+    "usage.url": {"verdict": "same"},
+    "usage.repository": {"verdict": "native", "forgejo": "a private repository of this instance"},
+    "usage.issue": {"verdict": "native", "forgejo": "appended unedited bot comments"},
+    "usage.probe": {"verdict": "native", "forgejo": "runs in flight from the caller listing"},
+    "holds.repository": {"verdict": "native", "forgejo": "a private repository of this instance"},
+    "holds.issue": {"verdict": "native", "forgejo": "appended unedited bot comments"},
+    "holds.needsYou": {"verdict": "native", "forgejo": "epics, items and pass sources; reviews, proposals and digest off"},
+    "holds.proposals": {"verdict": "refused", "reason": "action check validates GitHub repositories and org"},
+    "direction.repository": {"verdict": "refused", "reason": "an issue body's last editor cannot be read"},
+    "direction.issue": {"verdict": "refused", "reason": "an issue body's last editor cannot be read"},
+    "stall.holdHours": {"verdict": "same"},
+    "stall.idleHours": {"verdict": "same"},
+    "leases": {"verdict": "native", "forgejo": "contents API blob-sha compare and swap"},
+    "reruns": {"verdict": "native", "forgejo": "stage 4's one rerun only; stage 2's are refused with it"},
+    "starts.breakerRuns": {"verdict": "refused", "reason": "start failures are classified from GitHub job data"},
+    "starts.stallAfterMinutes": {"verdict": "refused", "reason": "part of the start breaker"},
+    "budget.weeklyUsd": {"verdict": "same"},
+    "budget.source": {"verdict": "same"},
+    "budget.url": {"verdict": "same"},
+    "budget.pools": {"verdict": "same"},
+    "budget.harnessRepositories": {"verdict": "same"},
+    "prices": {"verdict": "same"},
+    "cost.hourUtc": {"verdict": "refused", "reason": "publishes to a GitHub data branch"},
+    "cost.cache": {"verdict": "refused", "reason": "caches GitHub run summaries"},
+    "state": {"verdict": "refused", "reason": "the poll's cache, PR follow-up"},
+    "pr.reviewWorkflow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.reviewPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.fixPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.toilFixPool": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.conflictFixPool": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.mergeAuthors": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.headOwners": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.rebaseRounds": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.mergeQueue.tries": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.staleDays": {"verdict": "refused", "reason": "PR follow-up (stage 2)"}
+  }
+}

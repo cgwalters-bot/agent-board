@@ -10,14 +10,13 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels | No ([#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
+| Forgejo | Issues of configured repositories, fields from labels | No; [contract](#a-forgejo-pass) only ([#271](https://github.com/cgwalters-forge/agent-board/issues/271)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Dispatch itself is a GitHub Actions request today on every forge: agent jobs
 start through one backend interface whose only implementation is
-`workflow_dispatch`; status queries and other backends are
-[#295](https://github.com/cgwalters-forge/agent-board/issues/295)
-([dispatch](dispatch.md)). The design's approach to other forges, capability
+`workflow_dispatch`, with no status call on its handle ([dispatch](dispatch.md)).
+The design's approach to other forges, capability
 negotiation rather than weakened guarantees, is in
 [Rust boundaries](design.md#7-rust-boundaries).
 
@@ -72,7 +71,347 @@ address, a single-label name, or a name ending in `.svc`, `.cluster.local`,
 scheme or port, so two instances on one host cannot share a board. Run and Result
 marker URLs must still be `https://`.
 
-Open: there is no write side or dispatch (#271).
+Forgejo drops a label name the repository does not have from `labels=`, and
+with none left lists every issue ([issue.go#L448-L461][fj-labels-filter]), so
+the reader refuses a listed issue without the membership label rather than
+let a deleted or renamed label widen the board. The write side keeps that.
+
+## A Forgejo pass
+
+This is the contract for a second, separate `agent-board pass` that drives a
+Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
+tracker#786). **None of it is built**: the CLI refuses a Forgejo board for
+everything but the five reads above, nothing writes to Forgejo, and no option
+below turns it on. It is here to be reviewed before the write primitives
+(#511), dispatch and run adapters (#512), scheduling (#513), epics (#514) and
+live CI (#515) are. [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
+holds its per-stage capability inventory and a verdict for every
+[pass option](pass.md#one-configuration-file); a test fails when an option is
+added to that table without one.
+
+Native semantics were checked against Forgejo
+[v17.0.1][fj-tag] (`363f3dc30beef902b187af5a5244ff7af44901e6`, the newest
+stable release on 30 October 2026; v15.0 is the LTS) and its v17.0 Actions
+docs; the links below are that commit. A deployment on another version proves
+these again before it is enabled. Nothing assumes GitHub's GraphQL, Projects,
+sub-issues, `lastEditedBy` or ref updates; where Forgejo has no equivalent,
+the feature is refused, not approximated.
+
+### One instance, one host, one token
+
+The instance is the configuration's `board`, as for the reads (`url`,
+`tokenEnv`, `repositories`, `membership`, `recorders`), in the pass's own
+trusted file, with `"forge": "forgejo"`. The v1 file refuses it today. Its
+scope is fixed by that file alone:
+
+* **Host.** Every request goes to the canonical `url` (scheme, host and port
+  as given, under its path). A URL from a response (an `html_url`, a run link,
+  a marker) is data: it is checked to be on that instance before it is
+  followed or written anywhere, and it never carries the token elsewhere. There
+  is no GitHub request, no GitHub fallback and no GitHub token: the token
+  variables `GH_TOKEN` and `GITHUB_TOKEN` are neither read nor sent, as today.
+  The broker's `/usage` and grant are read without any forge token, as today.
+* **Repositories.** Reads and writes stay within the board's `repositories`,
+  `workRepositories`, `epics.repository`, `dispatchRepo` and the publication
+  issues, all repositories of this instance. A plan, issue, comment or run that
+  names anything else is held, not followed.
+* **Token.** One bot user's access token from `tokenEnv`, with the scopes
+  `read:user`, `read:issue`, `write:issue`, `read:repository` and
+  `write:repository` ([scopes][fj-scopes], [route groups][fj-api-scopes]) and
+  no admin, organization or `all` scope. At the start of an applying pass,
+  `GET /user` must name `bot` with an id in `recorders`; otherwise nothing is
+  written. Not the Actions automatic token: its user's id is negative, so it
+  can be no recorder, and the comments it writes wake no workflow
+  ([notifier_helper.go#L137-L150][fj-actions-user]).
+* **Identities.** `operator` and `bot` stay logins, each resolved to its user
+  id once a pass (`GET /users/{login}`), and each id must be in `recorders`, or
+  nothing the pass reads counts as theirs: a login can be renamed and
+  registered again, an id cannot. Every trust decision compares ids.
+
+Two instances are two configurations, crons, callers and tokens. A Forgejo
+pass reads nothing of a GitHub board and publishes nothing there, and the
+other way round. Its usage and hold snapshots, where set, go only to an issue
+of a private repository on its own instance.
+
+### Capabilities by stage
+
+Each verdict is `same` (forge-independent), `native` (the Forgejo mechanism
+below, to be built) or `refused`: a Forgejo pass refuses a configuration that
+sets a refused option, and what depends on a refused capability holds until a
+reviewed mechanism replaces it.
+
+| Stage | Forgejo | Refused |
+| --- | --- | --- |
+| 1 Usage | Broker read unchanged; the snapshot is a new comment in a private repository (`GET /repos` `private`) | |
+| 2 Follow pull requests | Nothing | All of it: fix, rebase, continuation and answer rounds, reviews, required checks and their reruns, merges and merge queues, `--fix-bounds` |
+| 3 Epics | `epic` issues, children from relationship comments (below), plan and receipt comments, creating issues, Priority labels, closing, a planning run | Sub-issue APIs (none exist) |
+| 4 Schedule | Candidates, Priority, holds from labels and [dependencies][fj-deps], WIP from complete run listings, pool pacing, plan claims, dispatch, one rerun, file-based leases | Overlap waivers, the start breaker, `replanAfterDays`, `bodyPlans`, direction |
+| 5 Status | Derived as on GitHub, round-tripped through `status/` labels | Close reasons |
+| 6 Cost | Nothing | Publishing to a `data` branch |
+
+PR follow-up is the largest gap: a Forgejo pass follows no pull request, and
+every option of it (`follow`, `pr.*`, `state`) is refused, with `maintain`,
+whose digest reads the operator's pull requests across GitHub. Work whose run
+opens a pull request must still hold its issue until a person merges or closes
+it. GitHub names a pull request's closing issues; no such field was found in
+Forgejo's pull request API, so #513 specifies and tests how an open pull
+request (`GET /repos/{o}/{r}/pulls`) is matched to its issue, and an item whose
+match cannot be read is held, as an unreadable hold is today.
+
+### Labels and Status
+
+Priority, Turn and Status are one label each in an exclusive scope:
+`priority/P0`..`priority/P3`, `turn/…` and `status/todo`, `status/backlog`,
+`status/blocked`, `status/in-progress`, `status/needs-human`, `status/done`.
+The labels must exist, with `exclusive` set, before a pass writes: Forgejo
+silently drops a name it does not know ([issue_label.go#L359-L368][fj-label-names]),
+so a pass resolves names to ids from the repository's and its organization's
+labels, refuses a missing or non-exclusive one, and never creates labels.
+Adding a label to an exclusive scope removes the others in it
+([RemoveDuplicateExclusiveIssueLabels][fj-exclusive]), but one path swallows
+that removal's error, so every label write is read back: the write counts only
+when the issue then has exactly the one label of its scope. Priority and Turn
+read with two labels of their scope, none or an unknown value are incomplete,
+as today. The API takes no If-Match and labels have no version: the pass reads
+the issue's labels again just before a write and leaves one a person changed,
+as stage 5 does with Status.
+
+Status round-trips through its label: the snapshot reads `status/…` as Status
+(today it is null). No `status/` label is no Status, which stage 5 makes Todo;
+two, or an unknown value, is incomplete and keeps whatever is there. Stage 5
+writes the derived value with one label write, and the next read must show it.
+Blocked and Backlog stay a person's holds; `status/blocked` is the board's
+Blocked, and the `blocked/<reason>` labels keep filling the Blocked list. Forgejo
+has no close reason ([issue.go#L121][fj-close]), so a closed issue is Done and
+nothing reads Cancelled from it; `triageClose` closes with a comment that says
+the verdict. Closing an issue with open dependencies fails with 412
+([issue.go#L939-L940][fj-close-412]) and is reported, not forced.
+
+### Comments, recorders and editors
+
+Forgejo's API names a comment's author but not who last edited it; the edit
+history is only in the web UI ([content_history.go#L20-L29][fj-history]), and
+any user with issue write access may edit anyone's comment
+([issue_comment.go#L596][fj-edit]). So a comment counts as a record (a plan, a
+dispatch claim, a receipt, a run or result marker, a snapshot) only where its
+author's id is in `recorders` (for an operator plan, the operator's id) and its
+`updated_at` equals its `created_at`: never edited, by anyone. A recorder's
+comment edited since is held as edited by someone else, as GitHub's
+`lastEditedBy` check holds a writer's plan edited by another. That check stops
+an ordinary writer, not an administrator: a repository's admins and owners,
+and site admins, may edit a comment and set its `updated_at` to any time since
+the issue opened ([issue.go#L329-L346][fj-backdate], used by
+[issue_comment.go#L611][fj-edit-backdate]). So a Forgejo board trusts its
+repositories' admins and owners as it trusts the operator; provisioning keeps
+those to the operator and the bot, which the pass cannot check. The times are
+whole seconds, so an edit within the second the comment was made is not seen
+either; #515 measures whether a fresh comment's two times can differ. The pass
+therefore never edits a record: where the GitHub pass edits in place (the
+claim's outcome, the usage and hold snapshots, the planning request), a Forgejo
+pass appends a new comment and reads the newest valid one. A writer replaces a
+plan by replying with another, not by editing it. Today's Run and Result reads
+check the author only; #511 adds the edit check before anything relies on them.
+The issue body has the same problem, and an issue's `updated_at` moves with
+every comment and label too, so an edit of its body cannot be told apart:
+direction (`direction.*`), which needs its body last edited by the operator or
+the bot, and `bodyPlans` are refused.
+
+A comment deleted by someone with write access takes its record with it, as on
+GitHub; recovery reads what remains.
+
+### Epics
+
+Forgejo has no sub-issues or projects ([api.go][fj-api]). An epic is an issue
+labelled `epic` in `epics.repository` whose newest `epic` label event in its
+[timeline][fj-timeline] is by the operator's or the bot's id. Its children are
+the epic's own relationship comments: one comment by the bot,
+`<!-- agent-board-epic-children: N -->` and a JSON list of `OWNER/REPO#N`,
+appended with each change and read by the rule above, newest first. Each
+child carries a `parent` back-reference in its own bot comment,
+`<!-- agent-board-epic-parent: OWNER/REPO#N -->`, and a child counts only
+where both sides agree, so a person cannot attach work to an epic by editing
+one issue. Forgejo's dependency links ([`/dependencies`, `/blocks`][fj-deps])
+keep their meaning, blocking, and are never used as parentage. The existing
+`agent-board/epic-plan/v1` and its receipts apply unchanged; create, link,
+Priority and close each read back before the receipt says so.
+
+### Claims and recovery
+
+The job-plan claim is unchanged in shape: before dispatch, the bot appends
+`<!-- agent-board-dispatch: COMMENT-ID@TIME -->`, reads the comments again and
+dispatches only if the plan is unchanged, unedited and no earlier valid record
+names it. The run link or refusal is a second comment, never an edit of the
+first. A pass that died between the two leaves a claim with no outcome: the
+next pass looks for its run (below) and records it if found, and holds the
+plan for a person if not; it never dispatches it again. Epic receipts are
+recovered as on GitHub, from the identities they confirmed and the issues as
+read now.
+
+### Dispatch and runs
+
+The caller is a Forgejo Actions workflow in `dispatchRepo` on the same
+instance. A start is `POST /repos/{caller}/actions/workflows/{workflow}/dispatches`
+with `{"ref", "inputs", "return_run_info": true}` ([workflow.go#L8-L18][fj-dispatch-body])
+and the same string inputs as on GitHub: `task`, `repo`, `item`, `kind`,
+`pool` and, for a stacked plan, `base` ([dispatch](dispatch.md#the-request)).
+With `return_run_info`, Forgejo answers 201 with the run's `id`, `run_number`
+and job names ([action.go#L862-L872][fj-dispatch-answer]). Forgejo has
+created the run before it chooses between that and a bare 204, so a 204, or a
+201 without an id, is a start with no handle: ambiguous, like a lost response,
+never a refusal that would let the plan be dispatched again.
+
+A 201 is not proof of the right start either: Forgejo creates the run even
+when the workflow has no `workflow_dispatch` trigger, and drops inputs it does
+not declare ([workflows.go#L100-L160][fj-dispatch-inputs]). So the pass reads
+the new run (`GET …/actions/runs/{id}`) right after, and it is the start only
+where its `trigger_user` is the bot's id, its `workflow_id` is the caller's
+workflow, and its `event_payload`'s `inputs`, which hold only the inputs the
+workflow declared, agree with those sent: each one sent non-empty is there with
+its value. Forgejo fills an input sent empty or not sent with its declared
+default, or drops it ([workflows.go#L55-L76][fj-dispatch-defaults]), so those
+may be absent or anything; the run's title, below, still has to carry the pool
+sent. Forgejo evaluates `run-name` when it
+creates the run ([workflows.go#L251-L266][fj-run-name]), so the caller's
+`run-name` is `KIND OWNER/REPO#N (POOL)` from its inputs, as on GitHub, for the
+listings below; the title alone proves nothing, as anyone who may dispatch the
+caller can choose it. A mismatch is recorded as a start that went wrong, the
+run is cancelled (`POST …/runs/{id}/cancel`) and the item held for a person.
+
+Runs in flight are the caller's runs with status `waiting`, `blocked` or
+`running` (`unknown` is unreadable; [status.go#L17-L37][fj-status]), listed by
+`workflow_id` and `status` ([action.go#L941-L969][fj-runs]). Pages hold at most
+50 and the total is the body's `total_count`, not a header, so each status is
+read whole, page by page to that total, then once more, as the GitHub
+admission reads twice; a listing whose total moves, that does not fit 10 pages
+a status, or that fails is unreadable and holds new starts. `waiting` is a job
+queued for a runner, not yet on one: `actions/tasks` lists only picked-up jobs
+and must not be used for WIP. `blocked` also covers a run waiting on
+approval (`need_approval`), which holds a slot like any other.
+
+A rerun is `POST …/actions/runs/{id}/rerun` ([rerun.go][fj-rerun]): it reuses
+the run's id and resets it to `waiting`, and each job's `attempt` grows by
+one; the run has no attempt of its own ([run.go#L284-L298][fj-rerun-run]). The
+one rerun a failed run gets is therefore recorded as a comment naming the run
+and the attempt seen in `…/runs/{id}/jobs`, and a run whose jobs already show
+attempt 2 is never rerun again. A run still running refuses a rerun with 400.
+
+An ambiguous POST (a timeout, a 5xx, a dropped connection, a start with no
+handle) is recorded as ambiguous and never retried, as on GitHub. The next pass
+lists the caller's runs titled for the item and created after the claim, and
+checks each as above; exactly one that passes is recorded as found, and none
+or several hold the plan for a person.
+
+### Admission and release
+
+Forgejo has no API that moves a git ref against an expected value: `git/refs`
+is read-only and creating a branch fails only when it exists
+([api.go#L1080-L1081][fj-refs], [branch.go#L253-L256][fj-branch]). The leases
+are instead one file a slot, `leases/SLOT.json`, on a branch of the private
+`dispatchRepo`, written through the contents API with the blob `sha` read
+before: a stale `sha` is refused with 409, and an existing path refuses a
+create with 422 ([update.go#L298-L321][fj-contents-sha], [update.go#L388-L391][fj-contents-create]).
+So of two admits racing for one slot exactly one writes it. A branch that moved
+between the read and the commit fails as 500 ([file.go#L775-L781][fj-contents-errors]):
+that is ambiguous, and the admit reads the slot again rather than assume either
+outcome. Release and reap write the slot back to free with the `sha` they
+read, so a stale reap cannot free a lease taken since. The `sha` names content,
+not a version, so every lease body is unique: it names its run, claim and
+`taken_at`, and a free slot names the run it freed. A lease's content then
+never comes back for a slow writer to match; a free slot's may, which is
+harmless, as a stale admit that read it free finds it still free. The rest of the
+[lease rules](pass.md#leases) carry over: never delete, one lease a run, expiry
+after 24 hours, a run that cannot be read keeps its lease until expiry, and the
+send-boundary reservation with `run: 0` bound by the 201's run id.
+
+### The caller
+
+No agentic-job Forgejo caller exists. Audited on 30 October 2026: agentic-job
+`a45f34a50bf58b5de70bd00a0881e8272f8c8d96` has no `.forgejo/` or `.gitea/`
+workflows; its `dispatch.yml` is a GitHub workflow (inputs `task`, `repo`,
+`item`, `item-repo`, `kind`, `status-comment`; no `pool` or `base`). What it has
+for Forgejo is `agentic-job apply --forge forgejo` (comments, pull requests,
+labels, issues, closing, statuses; agentic-job#2122, #2123), the prose of its
+off-GitHub collect, check and apply flow, and a CI job that applies to a
+Forgejo service container (agentic-job#2109): a test, not a caller. Tracker,
+actions, agenthome, forge-infra and infra have no Forgejo workflow either, and
+no deployed instance URL is recorded anywhere.
+
+Before any Forgejo dispatch is enabled, these are needed, and none is in this
+repository:
+
+1. A caller workflow on Forgejo Actions taking the inputs above, with the
+   `run-name` above, runner labels from its own configuration, and no
+   `concurrency` group shared by its runs: Forgejo queues a group's runs one
+   behind another ([workflows.go#L268-L302][fj-concurrency]), so with a fixed
+   group every run but one would sit `waiting`, holding a slot without running.
+   A group keyed by item,
+   with `cancel-in-progress: false`, is allowed.
+2. Its collect, check and apply jobs, with apply's token in a protected step the
+   agent cannot reach, and fork pushes separate from upstream writes
+   (agentic-job#2130, tracker#766).
+3. The agent sandbox on a Forgejo runner (agentic-job#1347), and a registered,
+   disposable runner for CI.
+4. A bot user and its scoped token, the `recorders` ids, the exclusive labels
+   and the private lease and publication repositories, provisioned by the
+   operator, with admin and owner rights on the board's repositories kept to
+   the operator and the bot. A run does not provision them.
+
+### Live CI
+
+Two proofs, kept apart (#515):
+
+* **API proof, in CI.** A pinned Forgejo v17.0.1 service container in an
+  unprivileged job, as agentic-job#2109 runs one, with a throwaway admin
+  created at start and a bot user and token made from it; nothing leaves the
+  job. Its caller is an inert workflow, `workflow_dispatch` with the six
+  inputs and the `run-name` above and one job that prints them, on a runner
+  registered in the job. It proves the start (201 and id), the run check,
+  listing in every status including `waiting` (before the runner starts),
+  rerun attempts, cancellation, label and comment round trips and lease races.
+  It proves nothing about agents.
+* **Caller smoke, separately approved.** One no-mutation research run through
+  the real caller above, once it exists, on an isolated instance and
+  repositories, checking the receipt, run accounting and that check and apply
+  wrote nothing. Not in CI, and not production activation.
+
+### I/O
+
+The write side extends today's sync `Transport` (ureq) with the other methods,
+under the read side's request budget and the pass's 500 requests and 15
+minutes. It does not wait for, or take part in, the async migration of the
+GitHub reads ([architecture](architecture.md#async-forge-io)).
+
+[fj-tag]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6
+[fj-api]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/api.go
+[fj-api-scopes]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/api.go#L293-L300
+[fj-scopes]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/models/auth/access_token_scope.go#L56-L84
+[fj-actions-user]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/actions/notifier_helper.go#L137-L150
+[fj-labels-filter]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/issue.go#L448-L461
+[fj-label-names]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/issue_label.go#L359-L368
+[fj-exclusive]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/models/issues/issue_label.go#L66-L110
+[fj-close]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/modules/structs/issue.go#L121
+[fj-close-412]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/issue.go#L939-L940
+[fj-history]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/models/issues/content_history.go#L20-L29
+[fj-edit]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/issue_comment.go#L596
+[fj-backdate]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/issue/issue.go#L329-L346
+[fj-edit-backdate]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/issue_comment.go#L611
+[fj-timeline]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/api.go#L1183
+[fj-deps]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/api.go#L1223-L1230
+[fj-dispatch-body]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/modules/structs/workflow.go#L8-L18
+[fj-dispatch-answer]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/action.go#L862-L872
+[fj-dispatch-inputs]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/actions/workflows.go#L100-L160
+[fj-dispatch-defaults]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/actions/workflows.go#L55-L76
+[fj-run-name]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/actions/workflows.go#L251-L266
+[fj-concurrency]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/actions/workflows.go#L268-L302
+[fj-status]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/models/actions/status.go#L17-L37
+[fj-runs]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/action.go#L941-L969
+[fj-rerun]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/actions/rerun.go#L54-L63
+[fj-rerun-run]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/models/actions/run.go#L284-L298
+[fj-refs]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/api.go#L1080-L1081
+[fj-branch]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/branch.go#L253-L256
+[fj-contents-sha]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/repository/files/update.go#L298-L321
+[fj-contents-create]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/services/repository/files/update.go#L388-L391
+[fj-contents-errors]: https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/routers/api/v1/repo/file.go#L775-L781
 
 ## GitLab
 
