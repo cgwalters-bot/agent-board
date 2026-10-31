@@ -770,17 +770,44 @@ Two proofs, kept apart (#515):
   as edited, which holds rather than trusts. None did in the runs made when
   it was added.
 
-  Two things only the live server showed. v17.0.1 serializes a dispatched
+  Then stage 3 (#544), with `epics.repository` a fourth repository, whose
+  `epic` label the operator makes and adds, so its timeline names the
+  operator's id. Two fixture children of the work repository, each with a
+  job plan, are related on both sides by bot comments; the second is blocked
+  by an open issue. The operator posts an unedited epic plan: a create with
+  an implement job plan, its `set_priority`, and the close of the first
+  child. The preview names the apply and changes nothing in the fixture
+  repositories (each issue's state, labels and comment count, and the
+  caller's runs). With `--max-dispatch 0`, `--max-writes` one short of the
+  plan's ten writes holds it whole, unclaimed; the full ten apply it. The
+  test reads back the bot's new issue, its `priority/P1` label, its parent
+  comment and job plan, the epic's children comment, the closed child with
+  its reason, and the bot's claim with its two receipts (`claimed` naming
+  the create, then `applied`). A second pass writes nothing, and stage 4
+  holds the new issue, an agreeing child, only by the dispatch cap. A second
+  plan's close of the blocked child gets Forgejo's 412 after its reason
+  comment: the apply stops with the create confirmed. The next pass holds
+  it as not proved and writes nothing; once the operator closes the blocker
+  and the child, a pass records `recovered` with one write and creates
+  nothing, and the pass after it writes nothing.
+
+  Three things only the live server showed. v17.0.1 serializes a dispatched
   run's `event` as `""` (`HookEventType.Event()` has no case for
   `workflow_dispatch`); only `trigger_event` names it. The adapter had
   required `event` to name it too, so every real start was cancelled as a
   wrong run; it now accepts `""` or `workflow_dispatch` there. And
   label resolution's `GET /orgs/{owner}` needs `read:organization`, now in
-  the token's scopes above.
+  the token's scopes above. And v17.0.1 answers a timeline page past its end
+  with `null`, not `[]`, and an `X-Total-Count` of that page alone, so every
+  epic read as unreadable; the timeline read now takes `null` as its end.
 
   It proves nothing about agents, the real caller, Status, snapshots or a
   pass inside Forgejo Actions (it runs as a local pass, with both caps), and
-  nothing about other Forgejo or runner versions.
+  nothing about other Forgejo or runner versions. Of stage 3 it leaves out
+  the planning run, closing a finished epic, the sweep and every refusal:
+  a lost or ambiguous create, edited or foreign records, unsupported
+  actions and plans cut short at a chosen write are proved offline, against
+  fakes, rather than by timing races here.
 * **Caller smoke, separately approved.** One no-mutation research run through
   the real caller above, once it exists, on an isolated instance and
   repositories, checking the receipt, run accounting and that check and apply

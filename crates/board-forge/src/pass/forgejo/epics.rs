@@ -335,7 +335,18 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     pub(super) fn live_epic(&self, issue: &ItemRef) -> Result<bool> {
         let path = format!("issues/{}/timeline", issue.number);
         let url = api(self.board, &issue.repository, &path, &[])?;
-        let (events, whole) = pages_to_end(url, TIMELINE_PAGES, |url| listing(self.client, url))?;
+        // Forgejo v17.0.1 answers a page past the timeline's end with
+        // `null`, not `[]` (docs/forges.md "Live CI"): that is its end.
+        let page = |url: &url::Url| {
+            let response = self.client.get(url)?;
+            let events = match response.body {
+                Value::Null => Vec::new(),
+                Value::Array(events) => events,
+                _ => bail!("Forgejo timeline is not an array"),
+            };
+            Ok((events, response.total))
+        };
+        let (events, whole) = pages_to_end(url, TIMELINE_PAGES, page)?;
         ensure!(
             whole,
             "the timeline of {} could not all be read in {TIMELINE_PAGES} pages",

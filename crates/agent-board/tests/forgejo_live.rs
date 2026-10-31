@@ -1,6 +1,7 @@
 //! The Forgejo pass against a real, disposable Forgejo (#515, docs/forges.md
 //! "Live CI"), where the other tests have fakes: `agent-board pass` preview
-//! and capped `--apply`, the board writes, the dispatch adapter and leases.
+//! and capped `--apply`, the board writes, the dispatch adapter and leases,
+//! and stage 3's epic apply and its recovery (#544).
 //!
 //! Needs a fresh Forgejo at `AGENT_BOARD_TEST_FORGEJO` (`http://127.0.0.1:3000`)
 //! in the container `AGENT_BOARD_TEST_FORGEJO_CONTAINER`, where `docker exec`
@@ -17,6 +18,9 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use board_core::{AgentPolicy, DEFAULT_AGENT_POLICY, Item, ItemRef};
 use board_forge::dispatch::{Forgejo as Actions, ForgejoLease, Target};
+use board_forge::epic::{EPIC_LABEL, EPIC_PLAN_FENCE, IssueRef};
+use board_forge::epic_apply::APPLY_MARKER;
+use board_forge::forgejo::epics::{children as children_of, children_comment, parent_comment};
 use board_forge::forgejo::{Client, Config, Forgejo};
 use board_forge::plan::{DISPATCH_MARKER, JOB_PLAN_SCHEMA, PLAN_FENCE};
 use board_forge::{BoardOperation, BoardWrite, Forge};
@@ -51,6 +55,12 @@ const SCOPES: &str =
 const WORK: &str = "forge-admin/work";
 const CALLER: &str = "forge-admin/control";
 const PUBLICATION: &str = "forge-admin/publication";
+/// `epics.repository`, apart from the work as a deployment's would be.
+const PLANS: &str = "forge-admin/plans";
+/// The writes of each epic plan here: its claim and final receipt; the
+/// create, its receipt, two relationship comments, Priority and job plan;
+/// and the close's comment and state.
+const EPIC_PLAN_WRITES: usize = 10;
 const WORKFLOW: &str = "agent.yml";
 const UNTRIGGERED: &str = "untriggered.yml";
 const LEASE_BRANCH: &str = "agent-board-leases";
@@ -136,6 +146,11 @@ impl Api {
             ("PUT", Some(body)) => self
                 .http
                 .put(&url)
+                .header("authorization", &authorization)
+                .send_json(body),
+            ("PATCH", Some(body)) => self
+                .http
+                .patch(&url)
                 .header("authorization", &authorization)
                 .send_json(body),
             _ => panic!("{method} {path} with {body:?}"),
@@ -735,5 +750,317 @@ fn pass_against_live_forgejo() {
     assert_eq!(winners.len(), 1, "{results:?}");
     let slot = actions.slot(LEASE_BRANCH, WIP).unwrap();
     assert_eq!(slot.lease().map(|l| &l.claim), Some(&winners[0].0));
+
+    file["epics"] = json!({"repository": PLANS});
+    let config = dir.join("epics.json");
+    std::fs::write(&config, file.to_string()).unwrap();
+    epics(&api, (&admin, admin_id), (&bot, bot_id), &board, &config);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// What stage 3 may change in the fixture repositories: each issue's state,
+/// labels and comment count, and the caller's runs.
+fn census(api: &Api, token: &str) -> Value {
+    let mut issues = Vec::new();
+    for repository in [WORK, PLANS] {
+        let path = format!("/repos/{repository}/issues?state=all&type=issues&limit=50");
+        for issue in api.get(token, &path).as_array().unwrap() {
+            let mut labels: Vec<_> = (issue["labels"].as_array().unwrap().iter())
+                .map(|l| l["name"].clone())
+                .collect();
+            labels.sort_by_key(ToString::to_string);
+            issues.push(json!([
+                format!("{repository}#{}", issue["number"]),
+                issue["state"],
+                labels,
+                issue["comments"]
+            ]));
+        }
+    }
+    issues.sort_by_key(ToString::to_string);
+    json!({"issues": issues, "runs": api.runs(token, WORKFLOW).len()})
+}
+
+/// The JSON of `body`'s block fenced as `fence`.
+fn fenced(body: &str, fence: &str) -> Value {
+    let (_, block) = body.split_once(&format!("```{fence}\n")).unwrap();
+    let (json, _) = block.split_once("\n```").unwrap();
+    serde_json::from_str(json).unwrap()
+}
+
+/// An applying pass that may start nothing and write at most `writes`.
+fn epic_pass(config: &Path, token: &str, writes: usize) -> (bool, String) {
+    let writes = writes.to_string();
+    let flags = ["--apply", "--max-dispatch", "0", "--max-writes", &writes];
+    pass(config, token, &flags)
+}
+
+/// The operator's epic plan on the epic, unedited; its comment id.
+fn epic_plan(api: &Api, (admin, admin_id): (&str, u64), epic: u64, actions: Value) -> u64 {
+    let plan = json!({"schema": "agent-board/epic-plan/v1", "epic": format!("{PLANS}#{epic}"),
+        "actions": actions});
+    let body = format!("Plan.\n\n```{EPIC_PLAN_FENCE}\n{plan:#}\n```\n");
+    let path = format!("/repos/{PLANS}/issues/{epic}/comments");
+    let posted = api.send(admin, "POST", &path, json!({ "body": body }));
+    assert_eq!(posted["user"]["id"], admin_id);
+    assert_eq!(posted["created_at"], posted["updated_at"]);
+    posted["id"].as_u64().unwrap()
+}
+
+/// Stage 3 against the live server (docs/forges.md "Epics"): a live epic
+/// in its own repository with two fixture children, one plan applied whole
+/// under `--max-writes`, and a second stopped by Forgejo's own refusal to
+/// close an issue with an open dependency, then recovered.
+fn epics(
+    api: &Api,
+    (admin, admin_id): (&str, u64),
+    (bot, bot_id): (&str, u64),
+    board: &Config,
+    config: &Path,
+) {
+    api.send(
+        admin,
+        "POST",
+        "/user/repos",
+        json!({"name": "plans", "auto_init": true, "default_branch": "main"}),
+    );
+    api.send(
+        admin,
+        "PUT",
+        &format!("/repos/{PLANS}/collaborators/{BOT}"),
+        json!({"permission": "write"}),
+    );
+    let label = api.send(
+        admin,
+        "POST",
+        &format!("/repos/{PLANS}/labels"),
+        json!({"name": EPIC_LABEL, "color": "#5f6b7a"}),
+    );
+    let created = api.send(
+        admin,
+        "POST",
+        &format!("/repos/{PLANS}/issues"),
+        json!({"title": "Epic", "body": "Live CI."}),
+    );
+    let epic = created["number"].as_u64().unwrap();
+    // A label event by the operator's id makes it live.
+    api.send(
+        admin,
+        "POST",
+        &format!("/repos/{PLANS}/issues/{epic}/labels"),
+        json!({"labels": [label["id"]]}),
+    );
+    let me = IssueRef::parse(&format!("{PLANS}#{epic}")).unwrap();
+    // Two fixture children, both sides related by the bot, and the second
+    // blocked by an open issue, so that Forgejo refuses to close it.
+    let first = issue(api, admin, "Epic child", Some("Live CI."));
+    let second = issue(api, admin, "Blocked epic child", Some("Live CI."));
+    let blocker = issue(api, admin, "Blocker", Some("Live CI."));
+    api.send(
+        admin,
+        "POST",
+        &format!("/repos/{WORK}/issues/{second}/dependencies"),
+        json!({"owner": ADMIN, "repo": "work", "index": blocker}),
+    );
+    let children: Vec<_> = [first, second]
+        .map(|n| IssueRef::parse(&format!("{WORK}#{n}")).unwrap())
+        .into();
+    let comment = |repository: &str, number: u64, body: String| {
+        let path = format!("/repos/{repository}/issues/{number}/comments");
+        api.send(bot, "POST", &path, json!({ "body": body }));
+    };
+    comment(PLANS, epic, children_comment(epic, &children));
+    for child in [first, second] {
+        comment(WORK, child, parent_comment(&me));
+    }
+    let listed = || {
+        let comments = api.get(admin, &format!("/repos/{PLANS}/issues/{epic}/comments"));
+        children_of(comments.as_array().unwrap(), bot_id, epic).unwrap()
+    };
+    let mut plans = board.clone();
+    plans.repositories.push(PLANS.into());
+    let forge = Forgejo {
+        transport: Client::from_env(&plans).unwrap(),
+        config: plans,
+    };
+    let at = ItemRef {
+        host: "127.0.0.1".into(),
+        repository: PLANS.into(),
+        number: epic,
+    };
+    // Each receipt's machine detail, oldest first, of the bot's claim.
+    let receipts = |plan: u64| -> Vec<Value> {
+        let claim = forge.plan_claim(&at, APPLY_MARKER, plan).unwrap().unwrap();
+        assert_eq!(claim.recorder, bot_id);
+        (claim.receipts.iter())
+            .map(|r| fenced(r, APPLY_MARKER))
+            .collect()
+    };
+
+    // A new issue with an implement job plan, which stage 4 then holds by
+    // `--max-dispatch 0`, as it holds the fixture issues.
+    let create = |title: &str| {
+        json!({"type": "create_sub_issue", "repo": WORK, "title": title, "body": "Live CI.",
+            "plan": {"schema": JOB_PLAN_SCHEMA, "kind": "implement", "runner": "hosted",
+                     "brief": "Implement the slice."}})
+    };
+    // A create, its Priority, and a close.
+    let plan = epic_plan(
+        api,
+        (admin, admin_id),
+        epic,
+        json!([
+            create("Epic slice"),
+            {"type": "set_priority", "new": 1, "value": "P1"},
+            {"type": "close_sub_issue", "issue": format!("{WORK}#{first}"), "reason": "Superseded."}
+        ]),
+    );
+    let words = format!("apply epic {PLANS}#{epic} plan={plan}@");
+    let before = census(api, admin);
+    let (ok, stdout) = pass(config, bot, &[]);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains(&words), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "Create a sub-issue in {WORK} (P1); Close {WORK}#{first}"
+        )),
+        "{stdout}"
+    );
+    assert_eq!(census(api, admin), before, "the preview wrote");
+    // One write short of the plan's: held whole, not even claimed.
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES - 1);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains(&format!("held by --max-writes: {words}")),
+        "{stdout}"
+    );
+    assert_eq!(census(api, admin), before, "a held apply wrote");
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains("dispatched 0/0"), "{stdout}");
+    let new = listed();
+    assert_eq!(new[..2], children[..]);
+    let made = new[2].number;
+    assert!(
+        stdout.contains(&format!("Created {WORK}#{made} (P1)")),
+        "{stdout}"
+    );
+    let slice = api.get(admin, &format!("/repos/{WORK}/issues/{made}"));
+    assert_eq!(slice["user"]["id"], bot_id);
+    assert_eq!(slice["labels"][0]["name"], "priority/P1");
+    assert_eq!(slice["labels"].as_array().unwrap().len(), 1);
+    let thread = api.comments(admin, made);
+    assert_eq!(thread.len(), 2);
+    assert!(thread.iter().all(|c| c["user"]["id"] == bot_id));
+    assert_eq!(thread[0]["body"].as_str().unwrap(), parent_comment(&me));
+    let job = fenced(thread[1]["body"].as_str().unwrap(), PLAN_FENCE);
+    assert_eq!(
+        (&job["repo"], &job["item"], &job["kind"]),
+        (&json!(WORK), &json!(made), &json!("implement"))
+    );
+    let closed = api.get(admin, &format!("/repos/{WORK}/issues/{first}"));
+    assert_eq!(closed["state"], "closed");
+    let reason = api.comments(admin, first);
+    assert_eq!(
+        (
+            &reason.last().unwrap()["body"],
+            &reason.last().unwrap()["user"]["id"]
+        ),
+        (&json!("Superseded."), &json!(bot_id))
+    );
+    // One receipt after the create, naming it, and the final one.
+    let detail = receipts(plan);
+    assert_eq!(detail.len(), 2);
+    assert_eq!(detail[0]["outcome"], "claimed");
+    assert_eq!(detail[0]["actions"][0]["writes"], json!(["create"]));
+    assert_eq!(detail[1]["outcome"], "applied");
+    assert_eq!(detail[1]["actions"][0]["issue"], format!("{WORK}#{made}"));
+    assert_eq!(
+        detail[1]["actions"][0]["writes"],
+        json!(["create", "link", "priority", "comment"])
+    );
+    assert_eq!(
+        detail[1]["actions"][2]["writes"],
+        json!(["comment", "patch"])
+    );
+    // Again: the claim stops a replay, and nothing is written or started.
+    let after = census(api, admin);
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("applied; nothing changed since"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("dispatched 0/0, writes 0/"), "{stdout}");
+    // The new issue is its epic's agreeing child, a candidate held only by
+    // the dispatch cap.
+    assert!(
+        stdout.contains(&format!("held by --max-dispatch: start {WORK}#{made}")),
+        "{stdout}"
+    );
+    assert_eq!(census(api, admin), after, "a replay wrote");
+
+    // A second plan, whose close Forgejo refuses with 412 after its comment:
+    // the apply stops, with the create confirmed on its receipts.
+    let plan = epic_plan(
+        api,
+        (admin, admin_id),
+        epic,
+        json!([
+            create("Second slice"),
+            {"type": "close_sub_issue", "issue": format!("{WORK}#{second}"), "reason": "Moved."}
+        ]),
+    );
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES);
+    assert!(!ok, "{stdout}");
+    assert!(stdout.contains("epic apply stopped"), "{stdout}");
+    let new = listed();
+    assert_eq!(new.len(), 4);
+    let made = new[3].number;
+    let detail = receipts(plan);
+    let last = detail.last().unwrap();
+    assert_eq!(last["outcome"], "stopped");
+    assert_eq!(last["actions"][0]["issue"], format!("{WORK}#{made}"));
+    assert_eq!(last["actions"][1]["writes"], json!(["comment"]));
+    let open = api.get(admin, &format!("/repos/{WORK}/issues/{second}"));
+    assert_eq!(open["state"], "open");
+    // Not proved while the child is open: held, and nothing is sent again.
+    let stopped = census(api, admin);
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains("is not proved"), "{stdout}");
+    assert_eq!(census(api, admin), stopped, "an unproved apply wrote");
+    // A person closes the blocker and the child: the next pass proves the
+    // apply from its receipts and records that once, creating nothing.
+    for number in [blocker, second] {
+        let path = format!("/repos/{WORK}/issues/{number}");
+        api.send(admin, "PATCH", &path, json!({"state": "closed"}));
+    }
+    let closed = census(api, admin);
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains(&format!("recover epic {PLANS}#{epic} plan={plan}@")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("dispatched 0/0, writes 1/"), "{stdout}");
+    assert_eq!(receipts(plan).last().unwrap()["outcome"], "recovered");
+    assert_eq!(listed(), new);
+    let recovered = census(api, admin);
+    assert_eq!(
+        recovered["issues"].as_array().unwrap().len(),
+        closed["issues"].as_array().unwrap().len(),
+        "a recovery created"
+    );
+    let (ok, stdout) = epic_pass(config, bot, EPIC_PLAN_WRITES);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("applied; nothing changed since"),
+        "{stdout}"
+    );
+    assert_eq!(
+        census(api, admin),
+        recovered,
+        "a recovered apply wrote again"
+    );
 }

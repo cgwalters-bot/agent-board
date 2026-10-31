@@ -233,7 +233,14 @@ impl ForgejoTransport for Instance {
                     .get(&key)
                     .cloned()
                     .unwrap_or_default();
-                return Ok(paged(&events, false));
+                // As v17.0.1 answers past a timeline's end.
+                let events = page(url, &events);
+                let body = if events.is_empty() {
+                    Value::Null
+                } else {
+                    events.into()
+                };
+                return Ok(Response { body, total: None });
             }
             ["repos", _, _, "issues", _, "dependencies"] => return Ok(paged(&[], false)),
             ["repos", _, _, "pulls"] => return Ok(paged(&[], true)),
