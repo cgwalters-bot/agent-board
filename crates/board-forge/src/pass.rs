@@ -1673,6 +1673,50 @@ fn top_priority(options: &[String], facts: &Facts) -> bool {
 
 // ---- The forge, bounded ----
 
+/// The parts of a pass whose requests [`Spent`] counts apart, in the order
+/// they run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    /// The direction issue and the dispatch ref, before the stages.
+    Setup,
+    Usage,
+    Maintain,
+    PullRequests,
+    Epics,
+    Schedule,
+    Status,
+    Holds,
+}
+
+impl Stage {
+    const ALL: [Stage; 8] = [
+        Stage::Setup,
+        Stage::Usage,
+        Stage::Maintain,
+        Stage::PullRequests,
+        Stage::Epics,
+        Stage::Schedule,
+        Stage::Status,
+        Stage::Holds,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Stage::Setup => "setup",
+            Stage::Usage => "usage",
+            Stage::Maintain => "maintain",
+            Stage::PullRequests => "pull requests",
+            Stage::Epics => "epics",
+            Stage::Schedule => "schedule",
+            Stage::Status => "status",
+            Stage::Holds => "holds",
+        }
+    }
+}
+
+/// Requests spent by each [`Stage`], in [`Stage::ALL`]'s order.
+type ByStage = [usize; Stage::ALL.len()];
+
 /// What a pass may still spend, in requests and in time, both stages
 /// together, and what it spent.
 struct Bounds {
@@ -1683,6 +1727,9 @@ struct Bounds {
     admit_by: Instant,
     /// A start passed its last check before `admit_by` and is under way.
     finishing: Cell<bool>,
+    /// The stage under way, which each request is counted to.
+    stage: Cell<Stage>,
+    by_stage: Cell<ByStage>,
     /// GraphQL points spent, and whether any of them are estimates.
     points: Cell<u64>,
     estimated: Cell<bool>,
@@ -1699,6 +1746,8 @@ impl Bounds {
             left: Cell::new(limit),
             admit_by,
             finishing: Cell::new(false),
+            stage: Cell::new(Stage::Setup),
+            by_stage: Cell::new([0; Stage::ALL.len()]),
             points: Cell::new(0),
             estimated: Cell::new(false),
             rate_limited: RefCell::new(None),
@@ -1710,10 +1759,16 @@ impl Bounds {
     fn spent(&self) -> Spent {
         Spent {
             requests: self.limit.saturating_sub(self.left.get()),
+            by_stage: self.by_stage.get(),
             points: self.points.get(),
             estimated: self.estimated.get(),
             rate_limited: self.rate_limited.borrow().is_some(),
         }
+    }
+
+    /// Counts the requests from here on to `stage`.
+    fn enter(&self, stage: Stage) {
+        self.stage.set(stage);
     }
 
     /// `report` with its failures for requests the breaker did not send
@@ -1734,12 +1789,13 @@ impl Bounds {
     }
 }
 
-/// What a pass spent ([`Report::summary_line`]): its budgeted requests and
-/// GraphQL points, `~` where some are estimates (1 a query, 5 a mutation),
-/// and whether a rate limit stopped it.
+/// What a pass spent ([`Report::summary_line`]): its budgeted requests,
+/// each stage's that spent any, GraphQL points, `~` where some are
+/// estimates (1 a query, 5 a mutation), and whether a rate limit stopped it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Spent {
     pub requests: usize,
+    by_stage: ByStage,
     pub points: u64,
     pub estimated: bool,
     pub rate_limited: bool,
@@ -1748,11 +1804,15 @@ pub struct Spent {
 impl std::fmt::Display for Spent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let about = if self.estimated { "~" } else { "" };
-        write!(
-            f,
-            "requests {}, points {about}{}",
-            self.requests, self.points
-        )?;
+        write!(f, "requests {}", self.requests)?;
+        let stages: Vec<String> = (Stage::ALL.iter().zip(self.by_stage))
+            .filter(|(_, n)| *n > 0)
+            .map(|(stage, n)| format!("{} {n}", stage.name()))
+            .collect();
+        if !stages.is_empty() {
+            write!(f, " ({})", stages.join(", "))?;
+        }
+        write!(f, ", points {about}{}", self.points)?;
         if self.rate_limited {
             f.write_str(", rate-limited")?;
         }
@@ -1793,6 +1853,9 @@ impl<C> Budget<'_, C> {
             "the pass's request budget ({PASS_REQUEST_LIMIT}) is spent"
         );
         bounds.left.set(left - 1);
+        let mut by_stage = bounds.by_stage.get();
+        by_stage[bounds.stage.get() as usize] += 1;
+        bounds.by_stage.set(by_stage);
         Ok(())
     }
 
@@ -1906,7 +1969,8 @@ pub struct Report {
 
 impl Report {
     /// The pass's last line: its caps' summary and what it spent, as
-    /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80, points ~95`.
+    /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80 (epics 30,
+    /// schedule 50), points ~95`.
     pub fn summary_line(&self) -> String {
         format!("{}, {}", self.summary, self.spent)
     }
@@ -2074,6 +2138,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     // Stage 1: usage from the broker, which this pass's runs pace by, pull
     // requests' included, and the next pass if it cannot read the broker.
+    bounds.enter(Stage::Usage);
     scheduler.refresh();
     // The maintain digest, planned while it is due, which the later stages
     // leave its share for.
@@ -2081,10 +2146,12 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
+    bounds.enter(Stage::Maintain);
     let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
     // Without stage 2's state, the incoming one keeps the maintain stage's.
     let kept = scheduler.report.maintain.is_some().then(|| state.clone());
     // Stage 2: pull request follow-up, today's poll.
+    bounds.enter(Stage::PullRequests);
     let mut earlier = maintained + scheduler.follow(state, &git_ref, maintained);
     if let Some(day) = scheduler.report.maintain.clone() {
         let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
@@ -2092,8 +2159,10 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
     // starts take their slots before stage 4's.
+    bounds.enter(Stage::Epics);
     earlier += scheduler.epics(earlier, &git_ref);
     // Stage 4: choose and start work.
+    bounds.enter(Stage::Schedule);
     if let Err(error) = scheduler.schedule(earlier, &git_ref) {
         scheduler.holds_whole = false;
         scheduler.report.failures += 1;
@@ -2103,12 +2172,14 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // which may move a head, and before Status, which sees its effects.
     scheduler.line(promote::line(config.promote.as_ref()));
     // Stage 5: board Status from the facts read, this pass's starts included.
+    bounds.enter(Stage::Status);
     if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
         scheduler.line(format!("status error: {error:#}"));
     }
     // Stages 3 and 4's holds, unless either failed outright: they would be
     // partial.
+    bounds.enter(Stage::Holds);
     if scheduler.holds_whole {
         scheduler.publish_holds();
     }

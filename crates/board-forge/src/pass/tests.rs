@@ -329,6 +329,41 @@ fn replay_idle_board_starts_work() {
     expected.push("status: 0 change(s) of 0 item(s) read");
     assert_eq!(report.lines, expected);
     assert_eq!(report.failures, 0);
+    // Each stage's requests, which add up to the pass's.
+    let spent = report.spent;
+    assert_eq!(spent.by_stage, [0, 0, 0, 0, 16, 37, 3, 0]);
+    assert_eq!(spent.by_stage.iter().sum::<usize>(), spent.requests);
+}
+
+/// The summary names each stage that spent a request, in stage order, and
+/// leaves the rest out.
+#[test]
+fn spent_names_each_stage_that_spent() {
+    let cases: &[(ByStage, bool, &str)] = &[
+        ([0; 8], false, "requests 0, points 7"),
+        (
+            [1, 0, 0, 40, 0, 2, 0, 0],
+            true,
+            "requests 43 (setup 1, pull requests 40, schedule 2), points ~7",
+        ),
+        (
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            false,
+            "requests 28 (usage 1, maintain 2, pull requests 3, epics 4, schedule 5, status 6, holds 7), points 7",
+        ),
+    ];
+    // Each stage counts at its place in the summary's order.
+    assert!(Stage::ALL.iter().enumerate().all(|(i, s)| *s as usize == i));
+    for (by_stage, estimated, expected) in cases {
+        let spent = Spent {
+            requests: by_stage.iter().sum(),
+            by_stage: *by_stage,
+            points: 7,
+            estimated: *estimated,
+            rate_limited: false,
+        };
+        assert_eq!(spent.to_string(), *expected);
+    }
 }
 
 /// `triage` true, or with the scope `all`, triages each candidate without a
@@ -7690,11 +7725,9 @@ fn caps_hold_starts_past_max_dispatch() {
             assert_eq!(report.summary, summary);
             // Then what it spent, every GraphQL point an estimate here.
             let line = report.summary_line();
-            let spent = format!(
-                "{summary}, requests {}, points ~{}",
-                report.spent.requests, report.spent.points
-            );
+            let spent = format!("{summary}, {}", report.spent);
             assert_eq!(line, spent);
+            assert!(spent.contains(&format!("requests {} (", report.spent.requests)));
             assert!(report.spent.requests > 0 && report.spent.points > 0);
             assert_eq!(report.failures, 0, "{:#?}", report.lines);
         }

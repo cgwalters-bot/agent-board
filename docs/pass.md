@@ -525,10 +525,12 @@ Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N
 step that a cap held ends `-> held by --max-dispatch` or
 `-> held by --max-writes`. With `--apply`, a started line also names its
 dispatch record and run. The last line is a summary such as
-`summary: dispatched 1/1, writes 3/5, held 12, requests 80, points ~95`, which
+`summary: dispatched 1/1, writes 3/5, held 12, requests 80 (pull requests 20, epics 25, schedule 30, status 5), points ~95`, which
 counts what a preview plans and what an apply did (an uncapped kind has no
-`/N`), the steps the caps held plus stage 4's stop on the weekly budget, and the pass's budgeted requests and GraphQL
-points; `~` marks points estimated as 1 a query and 5 a mutation where the
+`/N`), the steps the caps held plus stage 4's stop on the weekly budget, and the pass's budgeted requests, with each
+stage's share where it spent any (`setup` is the direction and dispatch-ref
+reads before stage 1, `maintain` the maintain digest, `holds` the hold
+snapshot), and GraphQL points; `~` marks points estimated as 1 a query and 5 a mutation where the
 response reads no `rateLimit { cost }`.
 A request GitHub still refuses under a rate limit after the client's
 retries stops the pass from sending anything more, as more requests only
