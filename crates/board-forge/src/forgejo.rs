@@ -9,7 +9,10 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
+pub mod epics;
 mod writes;
+
+pub use writes::RECEIPT_MARKER;
 
 impl<T: Transport> crate::Forge for Forgejo<T> {
     async fn snapshot(&self) -> Result<Snapshot> {

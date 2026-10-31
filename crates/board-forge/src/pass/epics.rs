@@ -518,7 +518,7 @@ pub(super) enum Next {
 
 impl Next {
     /// What it would be, for the line of an epic a person holds.
-    fn otherwise(&self) -> String {
+    pub(super) fn otherwise(&self) -> String {
         match self {
             Self::Idle(why) => why.clone(),
             Self::Hold(hold) | Self::Wait { hold, .. } => hold.reason.clone(),
