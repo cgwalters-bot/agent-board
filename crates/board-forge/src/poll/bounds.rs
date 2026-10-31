@@ -2,7 +2,8 @@
 //! (tracker's `.github/agentic-job/fix.toml`), read so that the poll starts
 //! no fix-kind run that agentic-job's policy step would refuse for its
 //! repository or head branch (agent-board#264). The policy step stays the
-//! boundary; this only saves the run it would refuse.
+//! boundary; this only saves the run it would refuse. The flag repeats, one
+//! file per bounds the caller dispatches with, read as a [`FixBoundsSet`].
 //!
 //! Only the top-level `repos` and `outputs.push_to_pull_request_branch.branches`
 //! are read; every other key is agentic-job's. A glob is evaluated only in
@@ -74,15 +75,51 @@ impl FixBounds {
         admits(&REPOS, &self.repos, repo)
     }
 
-    /// Why a fix run on `repo`'s pull request from `branch` is outside the
-    /// bounds; none where it is inside.
+    /// Whether a fix run may push to `repo`'s pull request from `branch`.
+    fn admits_pull(&self, repo: &str, branch: &str) -> bool {
+        self.admits_repo(repo) && admits(&BRANCHES, &self.branches, branch)
+    }
+}
+
+/// Every `--fix-bounds` file's bounds, each kept whole: a pull request is
+/// inside where any one file admits both its repository and its head branch,
+/// never a repository from one file paired with a branch from another, as
+/// the caller's dispatch picks one file per repository. Empty (the default)
+/// checks nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FixBoundsSet {
+    files: Vec<FixBounds>,
+}
+
+impl FixBoundsSet {
+    pub fn new(files: Vec<FixBounds>) -> Self {
+        Self { files }
+    }
+
+    /// The bounds files at `paths`, from the caller's trusted checkout.
+    pub fn read(paths: &[impl AsRef<Path>]) -> Result<Self> {
+        let files = paths
+            .iter()
+            .map(|p| FixBounds::read(p.as_ref()))
+            .collect::<Result<_>>()?;
+        Ok(Self { files })
+    }
+
+    /// Whether any file lets a fix run push to `repo`.
+    pub fn admits_repo(&self, repo: &str) -> bool {
+        self.files.iter().any(|f| f.admits_repo(repo))
+    }
+
+    /// Why a fix run on `repo`'s pull request from `branch` is outside every
+    /// file's bounds: its repository where no file admits it, else its head
+    /// branch; none where one file admits both, or there are no files.
     pub fn refusal(&self, repo: &str, branch: &str) -> Option<String> {
-        if !admits(&REPOS, &self.repos, repo) {
-            Some(format!("repository {repo} is outside the fix bounds"))
-        } else if !admits(&BRANCHES, &self.branches, branch) {
+        if self.files.is_empty() || self.files.iter().any(|f| f.admits_pull(repo, branch)) {
+            None
+        } else if self.admits_repo(repo) {
             Some(format!("head branch {branch:?} is outside the fix bounds"))
         } else {
-            None
+            Some(format!("repository {repo} is outside the fix bounds"))
         }
     }
 }
@@ -145,9 +182,21 @@ push_to_pull_request_branch = { max = 1, branches = ["dispatch/**", "bot/**", "m
 add_comment = { max = 1 }
 "#;
 
+    /// tracker's bounds for its midstream forks, beside [`TRACKER`]'s.
+    const MIDSTREAM: &str = r#"
+repos = ["cgwalters-forge/bootc", "cgwalters-forge/composefs-rs"]
+
+[outputs]
+push_to_pull_request_branch = { max = 1, branches = ["bot/**"] }
+"#;
+
+    fn set(files: &[&str]) -> FixBoundsSet {
+        FixBoundsSet::new(files.iter().map(|f| FixBounds::parse(f).unwrap()).collect())
+    }
+
     #[test]
     fn refusal_table() {
-        let bounds = FixBounds::parse(TRACKER).unwrap();
+        let bounds = set(&[TRACKER]);
         for (repo, branch, want) in [
             ("cgwalters-forge/tracker", "dispatch/x", None),
             ("CGWalters-Forge/Tracker", "dispatch/a/b", None),
@@ -190,6 +239,49 @@ add_comment = { max = 1 }
                 "{repo} {branch}"
             );
         }
+    }
+
+    #[test]
+    fn repeated_refusal_table() {
+        let bounds = set(&[TRACKER, MIDSTREAM]);
+        for (repo, branch, want) in [
+            ("cgwalters-forge/tracker", "dispatch/x", None),
+            // The midstream fork's bot branch, admitted by the second file.
+            ("cgwalters-forge/bootc", "bot/x", None),
+            ("CGWalters-Forge/composefs-rs", "bot/a/b", None),
+            (
+                "cgwalters-forge/tracker",
+                "pass-follow-midstream",
+                Some(r#"head branch "pass-follow-midstream" is outside the fix bounds"#),
+            ),
+            // The repository only the second file admits, with a branch only
+            // the first does: no one file admits the pair.
+            (
+                "cgwalters-forge/bootc",
+                "dispatch/x",
+                Some(r#"head branch "dispatch/x" is outside the fix bounds"#),
+            ),
+            (
+                "cgwalters-forge/agent-board",
+                "bot/x",
+                Some("repository cgwalters-forge/agent-board is outside the fix bounds"),
+            ),
+        ] {
+            assert_eq!(
+                bounds.refusal(repo, branch).as_deref(),
+                want,
+                "{repo} {branch}"
+            );
+        }
+        for (repo, want) in [
+            ("cgwalters-forge/tracker", true),
+            ("cgwalters-forge/bootc", true),
+            ("cgwalters-forge/agent-board", false),
+        ] {
+            assert_eq!(bounds.admits_repo(repo), want, "{repo}");
+            assert!(!set(&[]).admits_repo(repo), "{repo}");
+        }
+        assert_eq!(set(&[]).refusal("a/b", "c"), None);
     }
 
     #[test]

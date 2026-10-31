@@ -701,6 +701,10 @@ whose repository or head branch the file's `repos` and
 `outputs.push_to_pull_request_branch.branches` leave out; its line says
 `skip: left to the operator: head branch "B" is outside the fix bounds`, and
 nothing is claimed, marked, labelled or dispatched. Merges are unchanged.
+The flag repeats, one file per bounds tracker dispatches with (`fix.toml`
+and the midstream forks' `midstream-fix.toml`): a pull request is inside
+where any one file admits both its repository and its head branch, never a
+repository from one file with a branch from another.
 The [poll](poll.md) says which globs it reads. It does not replace
 agentic-job's policy step, which stays the boundary; it saves the run that
 step would refuse.
@@ -2042,7 +2046,7 @@ by hand, in a comment or an issue body, is dispatched as it is.
 A run that could edit the direction could steer every brief after it, so the
 pass uses it only where its repository is private, is none it starts runs on
 (`dispatchRepo`, `workRepositories`, `follow`, `epics.repository`) and is
-outside `--fix-bounds` when that is given, and where the body was last edited
+outside every `--fix-bounds` file given, and where the body was last edited
 by `operator` or `bot` (its author where it was never edited). The pass
 cannot read the caller's bounds for other kinds; keep the repository out of
 them. A body over 4,000 characters is refused, not cut short. Any of these is

@@ -495,7 +495,7 @@ pub struct Config {
     pub promote: Option<promote::Promote>,
     /// `--fix-bounds`, never the file's: the poll's [`PollPolicy::fix_bounds`].
     #[serde(skip)]
-    pub fix_bounds: Option<poll::bounds::FixBounds>,
+    pub fix_bounds: poll::bounds::FixBoundsSet,
 }
 
 /// Which candidates without a plan a triage run plans
@@ -5074,12 +5074,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(None);
         };
         let repo = &at.repository;
-        if let Some(bounds) = &self.config.fix_bounds {
-            ensure!(
-                !bounds.admits_repo(repo),
-                "{repo} is within the fix bounds, so a run may write to it"
-            );
-        }
+        ensure!(
+            !self.config.fix_bounds.admits_repo(repo),
+            "{repo} is within the fix bounds, so a run may write to it"
+        );
         let read = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
         ensure!(
             read.status == 200,
