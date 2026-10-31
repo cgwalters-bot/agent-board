@@ -43,7 +43,7 @@ impl<'a, T: Transport> Forgejo<'a, T> {
         bot: u64,
     ) -> Result<Self> {
         instance.validate()?;
-        target.validate()?;
+        target.validate_for(crate::forgejo::Naming::Forgejo)?;
         ensure!(
             bot > 0 && instance.recorders.contains(&bot),
             "dispatch bot must be a configured recorder id"
@@ -82,10 +82,15 @@ impl<'a, T: Transport> Forgejo<'a, T> {
     }
 
     fn path(&self, suffix: &str) -> Result<url::Url> {
-        Ok(self
-            .instance
-            .api_root()?
-            .join(&format!("repos/{}/actions/{suffix}", self.target.caller))?)
+        let mut url = self.instance.api_root()?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid API root"))?
+            .pop_if_empty()
+            .push("repos")
+            .extend(self.target.caller.split('/'))
+            .push("actions")
+            .extend(suffix.split('/'));
+        Ok(url)
     }
 
     fn get(&self, suffix: &str) -> Result<Value> {
@@ -99,7 +104,7 @@ impl<'a, T: Transport> Forgejo<'a, T> {
     }
 
     fn body(&self, start: &Start) -> Result<Value> {
-        crate::poll::validate_repository(start.repository)?;
+        crate::forgejo::validate_repository(start.repository)?;
         ensure!(
             self.instance
                 .repositories

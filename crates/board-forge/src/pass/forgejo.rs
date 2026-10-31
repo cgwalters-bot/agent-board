@@ -709,6 +709,84 @@ mod tests {
     }
 
     #[test]
+    fn naming_follows_trusted_board() {
+        for (login, forgejo, github) in [
+            ("alice", true, true),
+            ("alice-smith", true, true),
+            ("alice.smith", true, false),
+            ("alice_smith", true, true),
+            ("a..b", false, false),
+            ("a._b", false, false),
+            (".alice", false, false),
+            ("alice.", false, false),
+            ("..", false, false),
+            ("../alice", false, false),
+            ("alice/bob", false, false),
+            ("alice\\bob", false, false),
+            ("alice?x", false, false),
+            ("alice#x", false, false),
+            ("alice\n", false, false),
+            ("%2e%2e", false, false),
+            ("//evil.example", false, false),
+            ("https://evil.example", false, false),
+            ("alice@evil.example", false, false),
+        ] {
+            for (is_forgejo, accepted) in [(true, forgejo), (false, github)] {
+                for field in ["operator", "bot", "dispatchRepo", "workRepositories"] {
+                    let mut value = file();
+                    // Keep the GitHub baseline independent of broker settings.
+                    value.as_object_mut().unwrap().remove("usage");
+                    value.as_object_mut().unwrap().remove("pools");
+                    if !is_forgejo {
+                        value.as_object_mut().unwrap().remove("board");
+                    }
+                    value[field] = match field {
+                        "dispatchRepo" => json!(format!("{login}/work.repo")),
+                        "workRepositories" => json!([format!("{login}/work.repo")]),
+                        _ => json!(login),
+                    };
+                    assert_eq!(
+                        Config::parse(&value.to_string()).is_ok(),
+                        accepted,
+                        "forgejo={is_forgejo} {field}={login:?}"
+                    );
+                }
+            }
+        }
+        for name in [
+            "work.repo",
+            ".config",
+            "work_repo",
+            "work-repo",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a?b",
+            "a#b",
+            "a\n",
+            "%2f",
+            "//evil.example",
+        ] {
+            let accepted = matches!(name, "work.repo" | ".config" | "work_repo" | "work-repo");
+            for field in ["dispatchRepo", "workRepositories"] {
+                let mut value = file();
+                let repo = format!("example/{name}");
+                value[field] = if field == "workRepositories" {
+                    json!([repo])
+                } else {
+                    json!(repo)
+                };
+                assert_eq!(
+                    Config::parse(&value.to_string()).is_ok(),
+                    accepted,
+                    "{field}={name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn contract_drives_every_refused_option_before_decoding() {
         let contract: Value = serde_json::from_str(CONTRACT).unwrap();
         for (option, entry) in contract["options"].as_object().unwrap() {

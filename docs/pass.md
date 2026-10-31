@@ -39,6 +39,22 @@ the end-to-end Forgejo pass remains unbuilt. `--apply`, `--fix-bounds`,
 settings are refused before token lookup. Only `board.tokenEnv` is read,
 never `GH_TOKEN`, `GITHUB_TOKEN` or `DISPATCH_TOKEN`.
 
+Name admission follows the trusted board forge, not issue data. Forgejo accepts
+dotted local logins and owners (and underscores), using v17.0.1's username
+syntax with dots enabled; the instance decides whether such accounts exist.
+Board, work and dispatch repositories share the Forgejo validator. Repository
+segments use ASCII letters, digits, `-`, `_` and `.`, excluding `.` and `..`.
+These are existing-object lookups, not creation: Forgejo's creation-only reserved
+names and suffixes are not applied. The pinned rules are
+[`IsValidUsername`](https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/modules/validation/helpers.go)
+and [`IsUsableRepoName`](https://codeberg.org/forgejo/forgejo/src/commit/363f3dc30beef902b187af5a5244ff7af44901e6/models/repo/repo.go).
+Separators, traversal segments, percent escapes, query/fragment/control characters
+and host-shaped inputs are refused before token lookup. The operator is appended
+as an encoded API path segment beneath the configured instance's API root;
+both logins still require verified recorder ids. GitHub admission is unchanged.
+The same forge-selected repository check covers epic and publication fields
+when those capabilities become available; their current Forgejo refusals remain.
+
 On Forgejo, `usage` may contain only `url`; no publication fields are needed
 or accepted yet. Broker errors never read a GitHub snapshot or invoke forge
 publication. Missing readings hold pools, and failed reads count as failures.

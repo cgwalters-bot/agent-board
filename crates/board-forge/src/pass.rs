@@ -863,6 +863,11 @@ impl Config {
     }
 
     fn check(&self) -> Result<()> {
+        let naming = if self.forgejo_board().is_some() {
+            crate::forgejo::Naming::Forgejo
+        } else {
+            crate::forgejo::Naming::Github
+        };
         if let Some(board) = self.forgejo_board() {
             board.validate()?;
             ensure!(
@@ -871,11 +876,11 @@ impl Config {
             );
         }
         for login in [&self.operator, &self.bot] {
-            ensure!(is_github_login(login), "invalid login {login:?}");
+            ensure!(naming.is_login(login), "invalid login {login:?}");
         }
-        self.target("main").validate()?;
+        self.target("main").validate_for(naming)?;
         if let Some(git_ref) = &self.dispatch_ref {
-            self.target(git_ref).validate()?;
+            self.target(git_ref).validate_for(naming)?;
         }
         let harness = self.harness_repositories();
         for (what, list) in [
@@ -890,7 +895,9 @@ impl Config {
                 "{what} names more than {POLL_REPOSITORY_LIMIT} repositories"
             );
             for repo in list {
-                validate_repository(repo).with_context(|| what.to_owned())?;
+                naming
+                    .validate_repository(repo)
+                    .with_context(|| what.to_owned())?;
             }
         }
         let mut harness_seen = BTreeSet::new();
@@ -913,7 +920,9 @@ impl Config {
             );
         }
         if let Some(epics) = &self.epics {
-            validate_repository(&epics.repository).context("epics repository")?;
+            naming
+                .validate_repository(&epics.repository)
+                .context("epics repository")?;
             ensure!(
                 (1..=MAX_APPLIES_LIMIT).contains(&epics.max_applies_per_pass),
                 "epics maxAppliesPerPass is not from 1 to {MAX_APPLIES_LIMIT}"
@@ -1002,8 +1011,10 @@ impl Config {
             ensure!(self.usage.is_some(), "pools need usage");
         }
         if let Some(usage) = &self.usage {
-            if self.forgejo_board().is_none() {
-                validate_repository(&usage.repository).context("usage repository")?;
+            if self.forgejo_board().is_none() || !usage.repository.is_empty() {
+                naming
+                    .validate_repository(&usage.repository)
+                    .context("usage repository")?;
                 ensure!(usage.issue > 0, "usage issue is not a positive number");
             }
             // The address is not repeated: it may be private.
@@ -1015,7 +1026,9 @@ impl Config {
             }
         }
         if let Some(holds) = &self.holds {
-            validate_repository(&holds.repository).context("holds repository")?;
+            naming
+                .validate_repository(&holds.repository)
+                .context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
             if let Some(proposals) = &holds.proposals {
                 ensure!(holds.needs_you, "holds proposals needs holds needsYou");

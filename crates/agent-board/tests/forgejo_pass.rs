@@ -78,6 +78,39 @@ fn refusals_precede_credentials_and_auxiliary_files() {
 }
 
 #[test]
+fn invalid_names_precede_token_lookup() {
+    let dir = directory("names");
+    let path = dir.join("config.json");
+    for name in [
+        "..",
+        "../visitor",
+        "a/b",
+        "a\\b",
+        "a?b",
+        "a#b",
+        "a\n",
+        "%2e%2e",
+        "//evil.example",
+        "https://evil.example",
+    ] {
+        for field in ["operator", "bot", "dispatchRepo", "workRepositories"] {
+            let mut value = config("http://127.0.0.1:1/forge/");
+            value[field] = match field {
+                "dispatchRepo" => json!(format!("{name}/repo")),
+                "workRepositories" => json!([format!("{name}/repo")]),
+                _ => json!(name),
+            };
+            std::fs::write(&path, value.to_string()).unwrap();
+            let output = command(&path).assert().failure().get_output().clone();
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(error.contains("invalid"), "{field}={name:?}: {error}");
+            assert!(!error.contains("authentication required"), "{error}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn only_configured_instance_subpath_and_credential_free_broker() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -87,12 +120,12 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
         for (path, body, authenticated) in [
             (
                 "/forge/api/v1/user",
-                json!({"login": "bot", "id": 1, "html_url": "https://github.com/visitor"}),
+                json!({"login": "board.bot", "id": 1, "html_url": "https://github.com/visitor"}),
                 true,
             ),
             (
-                "/forge/api/v1/users/operator",
-                json!({"login": "operator", "id": 2}),
+                "/forge/api/v1/users/alice.smith",
+                json!({"login": "alice.smith", "id": 2}),
                 true,
             ),
             (
@@ -143,6 +176,10 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
     let dir = directory("isolation");
     let path = dir.join("config.json");
     let mut value = config(&format!("{origin}/forge"));
+    value["operator"] = "alice.smith".into();
+    value["bot"] = "board.bot".into();
+    value["dispatchRepo"] = "team.example/control.repo".into();
+    value["workRepositories"] = json!(["team.example/work.repo"]);
     value["usage"] = json!({"url": format!("{origin}/broker/usage")});
     value["pools"] = json!({"claude": {}});
     std::fs::write(&path, value.to_string()).unwrap();
@@ -154,7 +191,7 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
         .clone();
     let output = String::from_utf8(output.stdout).unwrap();
     assert!(
-        output.contains("identity: bot bot (id 1), operator operator (id 2)"),
+        output.contains("identity: bot board.bot (id 1), operator alice.smith (id 2)"),
         "{output}"
     );
     assert!(
