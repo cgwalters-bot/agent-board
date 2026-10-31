@@ -84,7 +84,7 @@ fn clock() -> OffsetDateTime {
 // and the URL uses index_in_repo (not the global id).
 fn run() -> Value {
     json!({"id":42, "index_in_repo":3, "workflow_id":"dispatch.yml", "prettyref":"main", "trigger_user":{"id":7},
-        "event":"workflow_dispatch", "trigger_event":"workflow_dispatch", "created":"2026-10-30T12:00:01Z",
+        "event":"", "trigger_event":"workflow_dispatch", "created":"2026-10-30T12:00:01Z",
         "title":"research example/app#9 (small)", "status":"waiting", "repository":{"full_name":"Example/Caller"}, "html_url":"https://public.example/Example/Caller/actions/runs/3",
         "event_payload":json!({"inputs":{"task":"Look.", "repo":"example/app", "item":"9", "kind":"research", "pool":"small"}}).to_string()})
 }
@@ -361,6 +361,7 @@ fn forgejo_identity_and_missing_trigger_hold() {
         ("workflow_id", json!("other.yml")),
         ("prettyref", json!("feature")),
         ("trigger_event", json!("push")),
+        ("event", json!("push")),
         ("repository", json!({"full_name":"other/caller"})),
         ("title", json!("research example/app#9")),
         ("created", json!("2026-10-30T11:59:59Z")),
@@ -373,6 +374,15 @@ fn forgejo_identity_and_missing_trigger_hold() {
         assert!(backend.recover(&start(), clock()).is_err(), "{key}");
         assert!(fake.posts.borrow().is_empty());
     }
+    // v17.0.1 answers "" (the fixture); a release naming the event still fits.
+    let mut r = run();
+    r["event"] = "workflow_dispatch".into();
+    let fake = Fake::new(vec![r]);
+    assert!(
+        backend(&fake, &instance, &target)
+            .recover(&start(), clock())
+            .is_ok()
+    );
     let mut r = run();
     r["trigger_event"] = "".into();
     let fake = Fake::new(vec![r]);

@@ -2038,7 +2038,7 @@ mod tests {
     fn caller_run(id: u64, title: &str) -> Value {
         json!({"id": id, "index_in_repo": id - 40, "workflow_id": "agent.yml",
             "title": title, "status": "running", "prettyref": "main",
-            "trigger_user": {"id": BOT}, "event": "workflow_dispatch",
+            "trigger_user": {"id": BOT}, "event": "",
             "repository": {"full_name": "example/control"}, "created": "2026-10-23T14:00:00Z",
             "html_url": "https://public.example/example/control/actions/runs/1"})
     }

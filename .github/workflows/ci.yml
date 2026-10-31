@@ -39,6 +39,34 @@ jobs:
       - run: cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board.json --emit
       - run: cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage
 
+  # The Forgejo pass against a real, disposable Forgejo
+  # (crates/agent-board/tests/forgejo_live.rs, docs/forges.md#live-ci), as
+  # agentic-job's forgejo job runs one: a service container on loopback,
+  # whose users and tokens the test makes at run time, and a pinned runner
+  # container the test starts beside it. No secret of this repository, the
+  # workflow's contents: read token and no persisted credentials. Not in the
+  # ci sentinel's needs until it has proven stable.
+  forgejo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      forgejo:
+        # v17.0.1, the release docs/forges.md checks; bumped by hand.
+        image: codeberg.org/forgejo/forgejo@sha256:fcd19ff4ebc85fb098a67e8e1d0d5a84d07dd6e8a23edcfdfd5b71a6178953be
+        env:
+          FORGEJO__security__INSTALL_LOCK: "true"
+          FORGEJO__server__ROOT_URL: http://127.0.0.1:3000/
+        ports:
+          - 127.0.0.1:3000:3000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo test --locked -p agent-board --test forgejo_live -- --ignored --nocapture
+        env:
+          AGENT_BOARD_TEST_FORGEJO: http://127.0.0.1:3000
+          AGENT_BOARD_TEST_FORGEJO_CONTAINER: ${{ job.services.forgejo.id }}
+
   # The shared workflow check, through the Justfile's lint recipe. The
   # checked-out actions repository is code run here, with only this job's
   # contents: read token and no persisted credentials; it follows main like
