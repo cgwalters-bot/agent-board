@@ -227,10 +227,14 @@ impl<'a, T: Transport> Forgejo<'a, T> {
             .find_map(|p| git_ref.strip_prefix(p))
             .unwrap_or(git_ref);
         ensure!(run["prettyref"] == short, "run ref outside configured ref");
+        // v17.0.1 serializes `event` through HookEventType.Event(), which has
+        // no case for workflow_dispatch and so answers "" (measured in CI's
+        // forgejo job); `trigger_event` keeps the name. A release that names
+        // it is accepted too; any other event is not a dispatch.
         ensure!(
             run["workflow_id"] == self.target.workflow
                 && run["trigger_user"]["id"] == self.bot
-                && run["event"] == "workflow_dispatch"
+                && (run["event"] == "" || run["event"] == "workflow_dispatch")
                 && run["trigger_event"] == "workflow_dispatch",
             "run trigger identity mismatch"
         );

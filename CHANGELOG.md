@@ -11,6 +11,12 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- A live Forgejo v17.0.1 proof in CI (docs/forges.md#live-ci). It found that
+  Forgejo starts were all cancelled as wrong runs, since the server reports a
+  dispatched run's `event` as empty; the adapter now accepts that, and
+  `trigger_event` still has to name the dispatch.
+  The Forgejo token also needs `read:organization` for label writes.
+
 - Forgejo pass `--record` and `--replay`: a preview's forge and broker reads
   saved in order, with 404s, totals and failures, to a fixture pinned to its
   instance, and replayed offline with no token or client

@@ -44,6 +44,11 @@ cargo run --locked -q -p agent-board -- reconcile plan --snapshot fixtures/board
 cargo run --locked -q -p agent-board -- project view --snapshot fixtures/board.json --json project,coverage
 ```
 
+A separate CI job, `forgejo`, runs the ignored `forgejo_live` test against a
+Forgejo service container ([Live CI](docs/forges.md#live-ci)); locally it
+needs a fresh container, docker or `CONTAINER=podman`, and the two
+`AGENT_BOARD_TEST_FORGEJO*` variables its module comment names.
+
 A separate CI job, `lint`, runs `just lint`: the shared workflow check over
 `.github/` (not `live/`) from a checkout of cgwalters-forge/actions (see the
 [Justfile](Justfile)). It needs just, cargo and docker or `CONTAINER=podman`,

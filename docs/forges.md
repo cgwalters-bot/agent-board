@@ -145,8 +145,9 @@ for each of stages 2, 5 and 6. Preview writes and dispatches nothing;
 credentials are read.
 The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
-of scheduler wiring. Offline tests are not live proof.
-The remaining driver wiring covers Status/snapshots (#523) and live CI (#515). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
+of scheduler wiring. Offline tests are not live proof; [Live CI](#live-ci)
+runs the pass against a disposable instance.
+The remaining driver wiring covers Status/snapshots (#523). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
 [pass option](pass.md#one-configuration-file); a test fails when an option is
 added to that table without one.
@@ -178,9 +179,11 @@ scope is fixed by that file alone:
   issues, all repositories of this instance. A plan, issue, comment or run that
   names anything else is held, not followed.
 * **Token.** One bot user's access token from `tokenEnv`, with the scopes
-  `read:user`, `read:issue`, `write:issue`, `read:repository` and
-  `write:repository` ([scopes][fj-scopes], [route groups][fj-api-scopes]) and
-  no admin, organization or `all` scope. At the start of every preview or applying pass,
+  `read:user`, `read:issue`, `write:issue`, `read:repository`,
+  `write:repository` and `read:organization` ([scopes][fj-scopes], [route groups][fj-api-scopes]) and
+  no admin, organization write or `all` scope. `read:organization` is for
+  label resolution's `GET /orgs/{owner}`, which answers 403 without it even
+  for a personal owner ([Live CI](#live-ci)). At the start of every preview or applying pass,
   `GET /user` must name `bot` with an id in `recorders`; otherwise nothing is
   written. Not the Actions automatic token: its user's id is negative, so it
   can be no recorder, and the comments it writes wake no workflow
@@ -408,7 +411,8 @@ the issue opened ([issue.go#L329-L346][fj-backdate], used by
 repositories' admins and owners as it trusts the operator; provisioning keeps
 those to the operator and the bot, which the pass cannot check. The times are
 whole seconds, so an edit within the second the comment was made is not seen
-either; #515 measures whether a fresh comment's two times can differ. The pass
+either. [Live CI](#live-ci) logs whether a fresh comment's two times
+differ; none did in the runs made when it was added. The pass
 therefore never edits a record: where the GitHub pass edits in place (the
 claim's outcome, the usage and hold snapshots, the planning request), a Forgejo
 pass appends a new comment and reads the newest valid one. A writer replaces a
@@ -592,8 +596,8 @@ send-boundary reservation with `run: 0` bound by the confirmed run id.
 The library requires preprovisioned free slots and refuses missing ones; it
 never creates a branch or deletes a slot. Unknown write outcomes hold without
 retry, rather than treating read-back as proof of winning ownership. Race and
-expiry tests use an offline conditional-write model; the container proof
-remains #515.
+expiry tests use an offline conditional-write model; [Live CI](#live-ci) races
+two admits on the container.
 
 ### The caller
 
@@ -632,15 +636,51 @@ repository:
 
 Two proofs, kept apart (#515):
 
-* **API proof, in CI.** A pinned Forgejo v17.0.1 service container in an
-  unprivileged job, as agentic-job#2109 runs one, with a throwaway admin
-  created at start and a bot user and token made from it; nothing leaves the
-  job. Its caller is an inert workflow, `workflow_dispatch` with the six
-  inputs and the `run-name` above and one job that prints them, on a runner
-  registered in the job. It proves the start (201 and id), the run check,
-  listing in every status including `waiting` (before the runner starts),
-  rerun attempts, cancellation, label and comment round trips and lease races.
-  It proves nothing about agents.
+* **API proof, in CI.** CI's `forgejo` job runs
+  [`forgejo_live.rs`](../crates/agent-board/tests/forgejo_live.rs) against a
+  Forgejo v17.0.1 service container pinned by digest, in a job with only
+  `contents: read`, no repository secret and no persisted credentials, as
+  agentic-job#2109 runs one. The test makes the admin (also the operator),
+  the bot and their tokens with the server's CLI at run time, with passwords
+  nobody keeps; nothing leaves the job. It provisions the work repository
+  with the exclusive labels, a private caller with the lease branch and its
+  free slots, and a private publication repository, only checked to read
+  back as private, as the pass publishes nothing on Forgejo yet. Its caller is an inert
+  workflow: `workflow_dispatch` with the six inputs and the `run-name`
+  above, and one job that prints them, waits ten seconds and fails when its
+  task is `fail`. A second workflow has no `workflow_dispatch`. A Forgejo
+  Runner v13.2.1 container (`host` label, for the caller only) is registered
+  through the API once the first start has been seen `waiting`.
+  `cargo test` skips it (`#[ignore]`, and it needs `AGENT_BOARD_TEST_FORGEJO`).
+
+  It proves, against the real server: label (exclusive scope replacement),
+  comment, claim, receipt and state round trips through `Forge::board_write`
+  and `plan_claim`; `agent-board pass` preview, then `--apply --max-dispatch 1`,
+  starting the planned issue with a 201 that the adapter confirms by reading
+  the run back, binding its lease and receipting it; the run listed
+  `waiting`, then `running`, then ended (`failure`); a second pass starting
+  nothing while it is in flight; one rerun, receipted with attempt 1, after
+  which the jobs show attempt 2 on the same run id, and no second rerun; the
+  ended run's lease released; a start on the workflow
+  without `workflow_dispatch`, which Forgejo answers with 201 and a run
+  without the inputs, recorded as ambiguous, cancelled and never sent again;
+  and two concurrent admits on one slot, of which exactly one wins. It also
+  logs how many of 24 fresh comments have `created_at` differing from
+  `updated_at`, without failing on it: a differing pair makes a record read
+  as edited, which holds rather than trusts. None did in the runs made when
+  it was added.
+
+  Two things only the live server showed. v17.0.1 serializes a dispatched
+  run's `event` as `""` (`HookEventType.Event()` has no case for
+  `workflow_dispatch`); only `trigger_event` names it. The adapter had
+  required `event` to name it too, so every real start was cancelled as a
+  wrong run; it now accepts `""` or `workflow_dispatch` there. And
+  label resolution's `GET /orgs/{owner}` needs `read:organization`, now in
+  the token's scopes above.
+
+  It proves nothing about agents, the real caller, Status, snapshots or a
+  pass inside Forgejo Actions (it runs as a local pass, with both caps), and
+  nothing about other Forgejo or runner versions.
 * **Caller smoke, separately approved.** One no-mutation research run through
   the real caller above, once it exists, on an isolated instance and
   repositories, checking the receipt, run accounting and that check and apply

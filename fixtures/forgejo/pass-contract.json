@@ -22,8 +22,8 @@
     "repositories": "board.repositories, workRepositories, epics.repository, dispatchRepo and the publication issues' repositories, all on this instance",
     "token": {
       "from": "board.tokenEnv",
-      "scopes": ["read:user", "read:issue", "write:issue", "read:repository", "write:repository"],
-      "refused": ["GH_TOKEN", "GITHUB_TOKEN", "the Actions automatic token", "admin, organization or all scopes"],
+      "scopes": ["read:user", "read:issue", "write:issue", "read:repository", "write:repository", "read:organization"],
+      "refused": ["GH_TOKEN", "GITHUB_TOKEN", "the Actions automatic token", "admin, write:organization or all scopes"],
       "identity": "GET /user names bot, whose id is in recorders, before an applying pass writes"
     },
     "crossInstance": "none: no GitHub reads, writes, tokens or fallback; publication only to this instance"
