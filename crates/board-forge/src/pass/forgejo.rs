@@ -7,6 +7,9 @@ use crate::forgejo::{
 };
 use crate::{BoardOperation, BoardWrite, Forge};
 
+mod record;
+pub use record::{Recorder, Replay};
+
 const CONTRACT: &str = include_str!("../../../../fixtures/forgejo/pass-contract.json");
 /// Pages of each listing stage 4 reads, 50 items each: a work repository's
 /// open issues, its open pull requests and an issue's dependencies. More
@@ -1665,15 +1668,24 @@ mod tests {
         config(&value)
     }
 
+    /// A preview through [`Recorder`], which its [`Replay`] repeats, with no
+    /// transport or broker, line for line: every preview test covers replay.
     fn preview(fake: &Fake, broker: &BrokerFake, config: &Config) -> Report {
-        run(
-            fake,
-            broker,
-            config,
-            (Mode::Preview, Limits::default()),
-            usage::tests::now(),
-        )
-        .unwrap()
+        let (board, now) = (config.forgejo_board().unwrap(), usage::tests::now());
+        let preview = (Mode::Preview, Limits::default());
+        let recorder = Recorder::new(fake, broker, board);
+        let report = run(&recorder, &recorder, config, preview, now).unwrap();
+        let fixture = recorder.fixture(now).unwrap();
+        let replay = Replay::from_json(&serde_json::from_str(&fixture).unwrap(), board).unwrap();
+        let replayed = run(&replay, &replay, config, preview, replay.now).unwrap();
+        replay.finish().unwrap();
+        assert_eq!(replayed.lines, report.lines);
+        assert_eq!(replayed.summary_line(), report.summary_line());
+        assert_eq!(
+            (replayed.failures, replayed.spent.requests),
+            (report.failures, report.spent.requests)
+        );
+        report
     }
 
     #[test]
@@ -2380,5 +2392,129 @@ mod tests {
             assert!(keys.insert(key(item)));
         }
         assert_eq!(keys.len(), 2);
+    }
+
+    /// A recording of a stage 4 preview at `url`, as JSON.
+    fn recording(url: &str) -> Value {
+        let fake = Fake {
+            listed: Listed {
+                issues: vec![issue(7, OPERATOR, &[])],
+                ..Listed::default()
+            },
+            ..Fake::default()
+        };
+        let broker = BrokerFake::default();
+        let config = scheduling(url, 2);
+        let recorder = Recorder::new(&fake, &broker, config.forgejo_board().unwrap());
+        let preview = (Mode::Preview, Limits::default());
+        run(&recorder, &recorder, &config, preview, usage::tests::now()).unwrap();
+        // Neither writes: the fake panics on one.
+        let target = url::Url::parse(&format!("{url}/api/v1/repos/example/work/labels")).unwrap();
+        assert!(recorder.send("POST", &target, &json!({})).is_err());
+        assert!(recorder.write("POST", &target, &json!({})).is_err());
+        serde_json::from_str(&recorder.fixture(usage::tests::now()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn replay_fails_closed() {
+        const OTHER: &str = "https://two.example:8443/subpath";
+        let fixture = recording(URL);
+        let requests = fixture["requests"].as_array().unwrap().len();
+        let config = scheduling(URL, 2);
+        let board = config.forgejo_board().unwrap();
+        // Another instance with the same item names, a GitHub recording, or
+        // a Forgejo one under a GitHub replay, is refused before any read.
+        let other = scheduling(OTHER, 2);
+        for (fixture, board, error) in [
+            (&fixture, other.forgejo_board().unwrap(), "recorded on"),
+            (
+                &json!({"schema": REPLAY_SCHEMA, "now": "2026-10-23T00:00:00Z", "requests": []}),
+                board,
+                "not a Forgejo pass replay",
+            ),
+        ] {
+            let refused = Replay::from_json(fixture, board).err().unwrap();
+            assert!(format!("{refused:#}").contains(error), "{refused:#}");
+        }
+        assert!(super::super::Replay::from_json(&fixture).is_err());
+        let recorded = recording(OTHER);
+        assert_ne!(recorded["requests"], fixture["requests"]);
+        // A response missing, a request changed, or one left unread.
+        let edited = |edit: &dyn Fn(&mut Vec<Value>)| {
+            let mut fixture = fixture.clone();
+            edit(fixture["requests"].as_array_mut().unwrap());
+            Replay::from_json(&fixture, board).unwrap()
+        };
+        for (replay, reads) in [
+            (edited(&|r| r.truncate(requests - 1)), "did not record"),
+            (
+                edited(&|r| r[2]["request"]["get"] = format!("{URL}/api/v1/user").into()),
+                "recorded",
+            ),
+            (edited(&|r| r.push(r[0].clone())), ""),
+        ] {
+            let report = run(
+                &replay,
+                &replay,
+                &config,
+                (Mode::Preview, Limits::default()),
+                replay.now,
+            )
+            .unwrap();
+            let finished = replay.finish().unwrap_err().to_string();
+            if reads.is_empty() {
+                assert_eq!(report.failures, 0);
+                assert_eq!(
+                    finished,
+                    format!(
+                        "the pass read {requests} of the replay's {} requests",
+                        requests + 1
+                    )
+                );
+            } else {
+                assert!(report.failures > 0, "{:?}", report.lines);
+                assert!(
+                    report.lines.iter().any(|l| l.contains(reads)),
+                    "{:?}",
+                    report.lines
+                );
+                assert!(
+                    finished.contains("diverged") || finished.contains("read"),
+                    "{finished}"
+                );
+            }
+        }
+        // Writes are refused, never answered.
+        let replay = Replay::from_json(&fixture, board).unwrap();
+        let target = url::Url::parse(&format!("{URL}/api/v1/repos/example/work/labels")).unwrap();
+        assert!(replay.write("POST", &target, &json!({})).is_err());
+        assert!(replay.send("POST", &target, &json!({})).is_err());
+    }
+
+    #[test]
+    fn recording_keeps_order_status_and_totals() {
+        let fixture = recording(URL);
+        assert_eq!(fixture["forge"], "forgejo");
+        assert_eq!(fixture["instance"], URL);
+        let requests: Vec<String> = (fixture["requests"].as_array().unwrap().iter())
+            .map(|e| e["request"].to_string())
+            .collect();
+        assert!(requests[0].contains("/api/v1/user"), "{requests:?}");
+        assert!(
+            requests[1].contains("/api/v1/users/operator"),
+            "{requests:?}"
+        );
+        assert_eq!(requests[2], r#"{"broker":"/usage"}"#);
+        let issues = (fixture["requests"].as_array().unwrap().iter())
+            .find(|e| {
+                e["request"]["get"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("/issues?")
+            })
+            .unwrap();
+        assert_eq!(issues["answer"]["total"], 1);
+        let text = fixture.to_string();
+        assert!(!text.contains("uthorization"), "{text}");
     }
 }

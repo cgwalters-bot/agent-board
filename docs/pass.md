@@ -35,8 +35,10 @@ OWNER/REPO#N` and `wip: no slot left` lines a GitHub pass would, with
 plan yet ([stage 4 in preview](forges.md#stage-4-in-preview)). Stages 2, 3, 5
 and 6 each print one not-built line. Preview writes and dispatches nothing;
 `--apply` implements stage 4's [claim/start/recover protocol](forges.md#stage-4-apply).
-The end-to-end Forgejo pass remains unbuilt. `--fix-bounds`,
-`--record` and `--replay`, contract-refused options and temporarily unbuilt
+The end-to-end Forgejo pass remains unbuilt. A preview can be
+[recorded and replayed](forges.md#recording-and-replay) offline, on its own
+instance only. `--fix-bounds`, `--record` with `--replay`,
+contract-refused options and temporarily unbuilt
 settings are refused before token lookup. Only `board.tokenEnv` is read,
 never `GH_TOKEN`, `GITHUB_TOKEN` or `DISPATCH_TOKEN`.
 
