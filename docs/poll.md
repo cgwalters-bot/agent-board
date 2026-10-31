@@ -220,6 +220,14 @@ refuses the file. This only saves the run the policy step would refuse; it
 reads the bounds file and does not replace that step, which stays the
 boundary. Without the flag nothing is checked, as before.
 
+The flag repeats, as tracker picks one bounds file per repository
+(`midstream-fix.toml` for its midstream forks, `fix.toml` for the rest). A
+pull request is then inside where any one file admits both its repository
+and its head branch; a repository one file admits paired with a branch only
+another admits is refused, since no single file allows that run. The line
+names the repository where no file admits it, and otherwise the head branch.
+The pass's direction check refuses a repository that any of the files admits.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`

@@ -2496,6 +2496,66 @@ fn pass_replay_previews_without_credentials() {
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
 }
 
+/// `--fix-bounds` parses twice on pass and poll, and every path it names is
+/// read: two good files get past reading them, and a missing second fails.
+#[test]
+fn fix_bounds_repeats() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let dir = std::env::temp_dir().join(format!("agent-board-bounds-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = |name: &str, repos: &str, branches: &str| {
+        let path = dir.join(name);
+        let text = format!(
+            "repos = [{repos:?}]\n[outputs.push_to_pull_request_branch]\nbranches = [{branches:?}]\n"
+        );
+        std::fs::write(&path, text).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let fix = file("fix.toml", "cgwalters-forge/tracker", "dispatch/**");
+    let midstream = file("midstream-fix.toml", "cgwalters-forge/bootc", "bot/**");
+    let missing = dir.join("missing.toml").to_str().unwrap().to_owned();
+    let pass = [
+        "pass",
+        "--config",
+        "fixtures/pass/config.json",
+        "--replay",
+        "fixtures/pass/board-2026-10-23.json",
+    ];
+    let poll = [
+        "poll",
+        "--operator",
+        "op",
+        "--bot",
+        "bot",
+        "--dispatch-repo",
+        "example/dispatch",
+    ];
+    let read_missing = format!("read {missing}");
+    // The poll goes only as far as reading its files: past them, with
+    // neither --dry-run nor --apply, it refuses.
+    let unasked = "poll takes its steps only when asked";
+    for (args, second, code, error) in [
+        (pass.as_slice(), &midstream, 0, ""),
+        (pass.as_slice(), &missing, 1, read_missing.as_str()),
+        (poll.as_slice(), &midstream, 1, unasked),
+        (poll.as_slice(), &missing, 1, read_missing.as_str()),
+    ] {
+        let output = command()
+            .args(args)
+            .args(["--fix-bounds", &fix, "--fix-bounds", second])
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(error), "{args:?} {second}: {stderr}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A `promote` section changes nothing in a replay but stage 4b's line: it
 /// needs no token, reads nothing the recording lacks and writes nothing. A
 /// section the configuration refuses fails before any read.

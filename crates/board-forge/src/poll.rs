@@ -506,10 +506,10 @@ pub struct PollPolicy {
     /// from the caller's pools file by [`PollPolicy::read_tiers`] ([`pace::tiers`]);
     /// none (the default) where they name only pools.
     pub tiers: pace::Tiers,
-    /// `--fix-bounds`: the caller's bounds for its `fix` kind, which a pull
-    /// request must be inside for the poll to start a fix-kind run on it
-    /// ([`bounds`]); none (the default) checks nothing.
-    pub fix_bounds: Option<bounds::FixBounds>,
+    /// `--fix-bounds`, repeatable: the caller's bounds for its `fix` kind, one
+    /// file of which a pull request must be inside for the poll to start a
+    /// fix-kind run on it ([`bounds`]); none (the default) checks nothing.
+    pub fix_bounds: bounds::FixBoundsSet,
     /// The pass's `pr.staleDays`: a stopped pull request of the bot's that
     /// conflicts or has changes requested, untouched by the operator for this
     /// many days, gets a fix round or is closed ([`stale`]). 0 (the default)
@@ -826,7 +826,7 @@ impl PollPolicy {
             footer: Footer::from_json(get("generatedBy")?)?,
             tiers: pace::Tiers::new(),
             // The CLI's `--fix-bounds`, never the config's.
-            fix_bounds: None,
+            fix_bounds: bounds::FixBoundsSet::default(),
             // The pass's only.
             head_owners: Vec::new(),
             stale_days: 0,
@@ -5932,13 +5932,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Every round here is dispatched as the `fix` kind, so one outside
         // the caller's fix bounds would only be refused by its policy step
         // (agent-board#264). Nothing is written; the operator takes it.
+        let bounds = &self.config.policy.fix_bounds;
         let left = matches!(
             decision.action,
             "fix" | "continue" | "rebase" | "answer" | RUN_RERUN
         )
-        .then(|| self.config.policy.fix_bounds.as_ref())
-        .flatten()
-        .and_then(|b| b.refusal(repo, text(&pull, "/headRefName")));
+        .then(|| bounds.refusal(repo, text(&pull, "/headRefName")))
+        .flatten();
         if let Some(why) = &left {
             answer.clear();
             decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
@@ -6469,7 +6469,7 @@ pub fn run_capped<R: Rest, G: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bounds::FixBounds;
+    use bounds::{FixBounds, FixBoundsSet};
     use std::cell::RefCell;
 
     /// A marker as a pass with the default attribution posts it.
@@ -12283,6 +12283,27 @@ mod tests {
                 0,
             ),
             (
+                "a change request admitted by the second fix bounds file starts a fix run",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "bounds": [bounds("bootc-dev/*"), bounds(REPO)]}),
+                none.clone(),
+                vec![],
+                vec![(200, json!({"workflow_run_id": 1234}))],
+                "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![comment.clone(), patch(99), patch(99)],
+                1,
+            ),
+            (
+                "a repository from one fix bounds file with a branch from the other starts nothing",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "headRefName": "dispatch/x",
+                    "bounds": [bounds("bootc-dev/*"), format!("repos = [\"{REPO}\"]\n[outputs]\npush_to_pull_request_branch = {{ branches = [\"bot/**\"] }}\n")]}),
+                none.clone(),
+                vec![],
+                vec![],
+                r#"skip: left to the operator: head branch "dispatch/x" is outside the fix bounds"#,
+                vec![],
+                0,
+            ),
+            (
                 "a continuation in a repository outside the fix bounds is not started",
                 json!({"isDraft": true, "body": checkpointed("budget"), "contexts": {"review": null}, "bounds": bounds("bootc-dev/*")}),
                 none.clone(),
@@ -12406,7 +12427,17 @@ mod tests {
                 .borrow_mut()
                 .insert(DISPATCHES.into(), dispatch);
             let mut cfg = config();
-            cfg.policy.fix_bounds = bounds.map(|b| FixBounds::parse(b.as_str().unwrap()).unwrap());
+            // One file, or a list of them given as --fix-bounds repeats.
+            let files = match bounds {
+                Some(Value::Array(files)) => files,
+                other => other.into_iter().collect(),
+            };
+            cfg.policy.fix_bounds = FixBoundsSet::new(
+                files
+                    .iter()
+                    .map(|b| FixBounds::parse(b.as_str().unwrap()).unwrap())
+                    .collect(),
+            );
             let outcome = run(
                 &fake,
                 &fake,

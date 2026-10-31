@@ -1125,8 +1125,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .config
             .policy
             .fix_bounds
-            .as_ref()
-            .and_then(|b| b.refusal(repo, text(&pull, "/head/ref")))
+            .refusal(repo, text(&pull, "/head/ref"))
         {
             return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
         }
@@ -1606,7 +1605,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::poll::bounds::FixBounds;
+    use crate::poll::bounds::{FixBounds, FixBoundsSet};
     use crate::poll::tests::marker_body;
     use std::cell::RefCell;
 
@@ -2215,12 +2214,12 @@ pub(super) mod tests {
                         "outside the repositories" => ("example/*", (BOT, "dispatch/x")),
                         _ => ("Upstream/app", (BOT, "dispatch/x")),
                     };
-                    config.policy.fix_bounds = Some(
+                    config.policy.fix_bounds = FixBoundsSet::new(vec![
                         FixBounds::parse(&format!(
                             "repos = [\"{repos}\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]\n"
                         ))
                         .unwrap(),
-                    );
+                    ]);
                     fake.rest.borrow_mut().get_mut(&pull).unwrap()["head"] = json!({
                         "sha": "abcdef0123456789", "ref": branch,
                         "repo": {"full_name": format!("{owner}/app")}});
