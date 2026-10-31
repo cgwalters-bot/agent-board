@@ -1727,6 +1727,8 @@ struct Bounds {
     admit_by: Instant,
     /// A start passed its last check before `admit_by` and is under way.
     finishing: Cell<bool>,
+    /// Writes sent, which [`Kept`] reads are kept no longer than.
+    writes: Cell<usize>,
     /// The stage under way, which each request is counted to.
     stage: Cell<Stage>,
     by_stage: Cell<ByStage>,
@@ -1746,6 +1748,7 @@ impl Bounds {
             left: Cell::new(limit),
             admit_by,
             finishing: Cell::new(false),
+            writes: Cell::new(0),
             stage: Cell::new(Stage::Setup),
             by_stage: Cell::new([0; Stage::ALL.len()]),
             points: Cell::new(0),
@@ -1853,6 +1856,7 @@ impl<C> Budget<'_, C> {
             "the pass's request budget ({PASS_REQUEST_LIMIT}) is spent"
         );
         bounds.left.set(left - 1);
+        bounds.writes.set(bounds.writes.get() + usize::from(write));
         let mut by_stage = bounds.by_stage.get();
         by_stage[bounds.stage.get() as usize] += 1;
         bounds.by_stage.set(by_stage);
@@ -1929,6 +1933,97 @@ impl<C: crate::github::GraphQl> crate::github::GraphQl for Budget<'_, C> {
         self.spend(mutation)?;
         let result = self.inner.graphql(query, variables).await;
         self.graphql_spent(mutation, result)
+    }
+}
+
+/// A read [`Kept`] answers again.
+#[derive(Clone)]
+enum KeptRead {
+    Rest(RestResponse),
+    GraphQl(Value),
+}
+
+/// Reads kept by request until the pass's next write, and the writes sent
+/// when they were read.
+#[derive(Default)]
+struct KeptReads {
+    writes: usize,
+    /// By the request, as the recordings key it.
+    reads: BTreeMap<String, KeptRead>,
+}
+
+/// The budgeted client, answering a read it made since the pass's last
+/// write from what it read then: stage 4's look ahead at a plan's overlap
+/// reads the same repository's pull requests, runs in flight and drafts for
+/// every candidate that waits on them. Any write, a start's included, may
+/// have changed them, so it drops them all. Only for reads that decide a
+/// hold; a start's own reads go to the forge.
+struct Kept<'a, C> {
+    inner: &'a Budget<'a, C>,
+    kept: &'a RefCell<KeptReads>,
+}
+
+impl<C> Kept<'_, C> {
+    /// What `read` answered to `key` since the last write, or its answer
+    /// now, kept where `keep` says it is one.
+    fn read(
+        &self,
+        key: Value,
+        read: impl FnOnce() -> Result<KeptRead>,
+        keep: impl FnOnce(&KeptRead) -> bool,
+    ) -> Result<KeptRead> {
+        let key = key.to_string();
+        let writes = self.inner.bounds.writes.get();
+        {
+            let mut kept = self.kept.borrow_mut();
+            if kept.writes != writes {
+                *kept = KeptReads {
+                    writes,
+                    ..KeptReads::default()
+                };
+            }
+            if let Some(answer) = kept.reads.get(&key) {
+                return Ok(answer.clone());
+            }
+        }
+        // A refusal is not an answer.
+        let answer = read()?;
+        if keep(&answer) {
+            self.kept.borrow_mut().reads.insert(key, answer.clone());
+        }
+        Ok(answer)
+    }
+}
+
+impl<C: Rest> Rest for Kept<'_, C> {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        let key = json!({"get": url, "validator": validator});
+        let read = || Ok(KeptRead::Rest(self.inner.get(url, validator)?));
+        // An error status is read again, as a transient one may pass.
+        let ok = |read: &KeptRead| matches!(read, KeptRead::Rest(r) if r.status == 200);
+        match self.read(key, read, ok)? {
+            KeptRead::Rest(response) => Ok(response),
+            KeptRead::GraphQl(_) => bail!("GET {url} was kept as a GraphQL answer"),
+        }
+    }
+
+    fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
+        bail!("{method} {url}: kept reads decide a hold, and write nothing")
+    }
+}
+
+impl<C: Transport> Transport for Kept<'_, C> {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        ensure!(
+            !is_mutation(query),
+            "kept reads decide a hold, and write nothing"
+        );
+        let key = graphql_key(query, &variables);
+        let read = || Ok(KeptRead::GraphQl(self.inner.graphql(query, variables)?));
+        match self.read(key, read, |_| true)? {
+            KeptRead::GraphQl(data) => Ok(data),
+            KeptRead::Rest(_) => bail!("a GraphQL query was kept as a REST answer"),
+        }
     }
 }
 
@@ -2114,6 +2209,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         holds_whole: true,
         unconsidered: 0,
         ended: RefCell::new(BTreeMap::new()),
+        kept: RefCell::default(),
         ignored: RefCell::default(),
         failed: BTreeMap::new(),
         infra: RefCell::new(BTreeMap::new()),
@@ -2419,6 +2515,8 @@ struct Scheduler<'a, C> {
     unconsidered: usize,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
+    /// The reads of stage 4's look ahead at overlaps ([`Self::kept`]).
+    kept: RefCell<KeptReads>,
     /// The overlaps [`Config::overlap`] waived for the candidate considered,
     /// which its hold snapshot shows as `overlap-ignored`.
     ignored: RefCell<Vec<String>>,
@@ -3047,6 +3145,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(live)
     }
 
+    /// The client through [`Kept`], for the reads that decide a hold.
+    fn kept(&self) -> Kept<'_, C> {
+        Kept {
+            inner: &self.client,
+            kept: &self.kept,
+        }
+    }
+
     /// The runs [`Self::ended`] took as ended in this pass, for the overlap
     /// check's own listing.
     fn ended_runs(&self) -> BTreeSet<u64> {
@@ -3638,7 +3744,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // not written. An apply asks too, before the recheck: a plan that
         // waits on either is held for these reads, not after a start's
         // recheck and the plan protocol's reads, nor stopped by the budget
-        // a start needs. The dispatch decides again on what it reads then.
+        // a start needs. The overlap's reads are kept until the next write;
+        // the dispatch decides both again on what it reads then.
         let bot = Some(config.bot.as_str());
         let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
             Ok(stacked) => stacked,
@@ -3649,7 +3756,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         if base.is_none() {
             let decision = overlap::decide_strict(
-                &self.client,
+                &self.kept(),
                 (issue, &dest),
                 &plan.brief,
                 &config.bot,
@@ -3753,7 +3860,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let bot = &self.config.bot;
             let checks = (&done, waiver);
             let decision = overlap::decide_strict(
-                &self.client,
+                &self.kept(),
                 (issue, dest),
                 &plan.brief,
                 bot,

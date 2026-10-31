@@ -929,6 +929,7 @@ pub fn validate_workflow(name: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct RestResponse {
     pub status: u16,
     pub etag: Option<String>,

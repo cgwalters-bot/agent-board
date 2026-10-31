@@ -763,8 +763,11 @@ existing bot overlap check and conservatively waits when it cannot complete it;
 this is stricter than standalone dispatch's best-effort heuristic. An implement
 plan's stack and overlap are checked before a start's recheck, in an apply as
 in a preview, so that a plan waiting on either is held for those reads alone,
-never stopped by the budget a start reserves; the dispatch checks both again on
-what it reads then.
+never stopped by the budget a start needs; the dispatch checks both again on
+what it reads then. Those overlap reads (a repository's open pull requests,
+the runs in flight, a draft's facts and activity, an issue's text) are kept
+for the next candidate that needs them until the pass writes anything, a
+start included, so each is read once between writes rather than once a candidate.
 
 With `overlap` set (agent-board#426), an open pull request of the bot's that
 overlaps a start does not hold it when it is a draft opened and last

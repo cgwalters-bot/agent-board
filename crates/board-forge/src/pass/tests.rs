@@ -11603,3 +11603,94 @@ fn pull_by(author: &str) -> ClosingPull {
         updated: None,
     }
 }
+
+/// A forge whose every read answers how many it has answered, or fails
+/// while `fail` is set; a GET with `status`, 200 unless set.
+#[derive(Default)]
+struct Counting {
+    reads: Cell<usize>,
+    fail: Cell<bool>,
+    status: Cell<Option<u16>>,
+}
+
+impl Counting {
+    fn answer(&self) -> Result<Value> {
+        ensure!(!self.fail.get(), "unreadable");
+        self.reads.set(self.reads.get() + 1);
+        Ok(json!({"read": self.reads.get()}))
+    }
+}
+
+impl Rest for Counting {
+    fn get(&self, _: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+        Ok(RestResponse {
+            status: self.status.get().unwrap_or(200),
+            etag: None,
+            last_modified: None,
+            link: None,
+            body: self.answer()?,
+        })
+    }
+
+    fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+        Ok((201, json!({})))
+    }
+}
+
+impl Transport for Counting {
+    fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+        self.answer()
+    }
+}
+
+/// Stage 4's look ahead at overlaps answers a read it made again from what
+/// it read, until the pass writes anything; a failed read is not kept, and
+/// it writes nothing itself.
+#[test]
+fn kept_reads_last_until_the_next_write() {
+    let forge = Counting::default();
+    let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
+    let client = Budget {
+        inner: &forge,
+        bounds: &bounds,
+    };
+    let kept = RefCell::default();
+    let reads = Kept {
+        inner: &client,
+        kept: &kept,
+    };
+    let query = "query { viewer { login } }";
+    let url = "https://api.github.com/repos/o/r/pulls";
+    let graphql = |variables: Value| Transport::graphql(&reads, query, variables);
+    assert_eq!(graphql(json!({"n": 1})).unwrap(), json!({"read": 1}));
+    assert_eq!(graphql(json!({"n": 1})).unwrap(), json!({"read": 1}));
+    // Another request, by its variables or its URL, is read.
+    assert_eq!(graphql(json!({"n": 2})).unwrap(), json!({"read": 2}));
+    assert_eq!(reads.get(url, None).unwrap().body, json!({"read": 3}));
+    assert_eq!(reads.get(url, None).unwrap().body, json!({"read": 3}));
+    assert_eq!(forge.reads.get(), 3);
+    // A write drops them all.
+    client.send("POST", url, &json!({})).unwrap();
+    assert_eq!(graphql(json!({"n": 1})).unwrap(), json!({"read": 4}));
+    assert_eq!(reads.get(url, None).unwrap().body, json!({"read": 5}));
+    // A failure is not an answer to keep.
+    forge.fail.set(true);
+    assert!(graphql(json!({"n": 3})).is_err());
+    forge.fail.set(false);
+    assert_eq!(graphql(json!({"n": 3})).unwrap(), json!({"read": 6}));
+    // Nor is an error status, which may pass.
+    let other = "https://api.github.com/repos/o/r/actions/runs";
+    forge.status.set(Some(502));
+    assert_eq!(reads.get(other, None).unwrap().status, 502);
+    forge.status.set(None);
+    assert_eq!(reads.get(other, None).unwrap().body, json!({"read": 8}));
+    // Nor does it write, and it spends nothing on a refusal.
+    let spent = bounds.spent().requests;
+    assert!(Transport::graphql(&reads, "mutation { x }", json!({})).is_err());
+    assert!(reads.send("POST", url, &json!({})).is_err());
+    assert_eq!(bounds.spent().requests, spent);
+    // Every read sent, the failed one too, and the write were budgeted;
+    // kept answers were not.
+    assert_eq!(spent, 9 + 1);
+}
