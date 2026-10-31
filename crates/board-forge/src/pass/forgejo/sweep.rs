@@ -22,6 +22,10 @@ const APPLIED_FENCE: &str = "agent-board-sweep-applied";
 const APPLIED_SCHEMA: &str = "agent-board/sweep-applied/v1";
 /// Requests one write may take with its reads ([`Forge::board_write`]).
 const WRITE_REQUESTS: usize = 12;
+/// Leave room under the writer's 16,000-character limit for its receipt marker.
+const RECEIPT_BODY_LIMIT: usize = 15_900;
+/// The full question/reason remains in the reply; receipts are only a summary.
+const LEFT_LINE_LIMIT: usize = 140;
 
 /// An issue's label names.
 fn names(issue: &Value) -> Result<Vec<String>> {
@@ -433,12 +437,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let claim = match self.claim(&item, accepted.id) {
             Ok(Some(claim)) => claim,
             Ok(None) => {
-                let why = format!(
-                    "its plan {} has no dispatch claim; a person dispatches it",
-                    accepted.id
-                );
-                self.sweep_stuck(found, &labels, &why);
-                return Ok(0);
+                return self.sweep_start(found, &labels, &listed, free, snapshot);
             }
             Err(error) => {
                 let why = format!("its plan cannot be used: {error:#}; a person replaces it");
@@ -594,9 +593,11 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.line(format!("sweep {url}: {why}"));
             return Ok(0);
         }
-        // The plan's comment, the lease, claim, bind and receipt.
-        if let Some(held) =
-            (self.caps.check(Kind::Dispatch)).or_else(|| self.caps.check_many(Kind::Write, 5))
+        // Reuse a plan left before its claim; apply rechecks it at admission.
+        let planned = self.accepted(&found.issue).is_ok();
+        // The optional plan comment, the lease, claim, bind and receipt.
+        if let Some(held) = (self.caps.check(Kind::Dispatch))
+            .or_else(|| self.caps.check_many(Kind::Write, 4 + usize::from(!planned)))
         {
             self.line(format!("{held}: {line}"));
             return Ok(0);
@@ -613,9 +614,12 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         );
         let item = self.sweep_item(found, labels);
         let forge = self.epic_forge();
-        let started = self
-            .write_on(&forge, issue, labels, BoardOperation::Comment { body })
-            .and_then(|()| self.apply(&item, &pool, snapshot));
+        let posted = if planned {
+            Ok(())
+        } else {
+            self.write_on(&forge, issue, labels, BoardOperation::Comment { body })
+        };
+        let started = posted.and_then(|()| self.apply(&item, &pool, snapshot));
         match started {
             Ok(true) => Ok(1),
             Ok(false) => Ok(0),
@@ -720,6 +724,21 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 ));
                 continue;
             }
+            let Verdict::Attach(epic) = verdict else {
+                // Closure since the reply settles it, without trusting or
+                // reading any of its comments for a non-attach verdict.
+                let path = format!("issues/{}", issue.number);
+                let url = api(self.board, &issue.repository, &path, &[])?;
+                if self
+                    .client
+                    .get(&url)
+                    .is_ok_and(|r| r.body["state"] == "closed")
+                {
+                    continue;
+                }
+                out.left.push(format!("- {name}: {}", said()));
+                continue;
+            };
             let child = IssueRef {
                 repo: issue.repository.clone(),
                 number: issue.number,
@@ -731,16 +750,16 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     out.left.push(format!("- {name}, not found: {}", said()));
                     continue;
                 }
-                Err(error) => return Err(error.context(format!("reading {name}"))),
+                Err(_) => {
+                    out.left
+                        .push(format!("- {name}: its records cannot be read"));
+                    continue;
+                }
             };
             // Settled since: the operator closed it.
             if value["state"] != "open" {
                 continue;
             }
-            let Verdict::Attach(epic) = verdict else {
-                out.left.push(format!("- {name}: {}", said()));
-                continue;
-            };
             let epic = IssueRef {
                 repo: epic.repository.clone(),
                 number: epic.number,
@@ -748,17 +767,37 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             let to = epic.to_string().to_ascii_lowercase();
             if !epics.contains_key(&to) {
                 let at = self.write_identity(&self.item(&epic));
-                let (value, thread) = forge
-                    .issue_thread(&at)
-                    .with_context(|| format!("reading the epic {epic}"))?;
-                ensure!(value["state"] == "open", "the epic {epic} is not open");
-                let labels = names(&value)?;
-                let children = relations::children(&thread, bot, epic.number)?;
-                epics.insert(to.clone(), (labels, children));
+                let read = (|| -> Result<_> {
+                    let (value, thread) = forge.issue_thread(&at)?;
+                    ensure!(value["state"] == "open", "the epic is not open");
+                    Ok((
+                        names(&value)?,
+                        relations::children(&thread, bot, epic.number)?,
+                    ))
+                })();
+                match read {
+                    Ok(read) => {
+                        epics.insert(to.clone(), read);
+                    }
+                    Err(_) => {
+                        out.left.push(format!(
+                            "- {name}: the epic {epic} is not readable and open"
+                        ));
+                        continue;
+                    }
+                }
             }
             let named = child.to_string();
             let lists = (epics[&to].1.iter()).any(|c| c.to_string().eq_ignore_ascii_case(&named));
-            let side = match relations::parent(&thread, bot)? {
+            let parent = match relations::parent(&thread, bot) {
+                Ok(parent) => parent,
+                Err(_) => {
+                    out.left
+                        .push(format!("- {name}: its parent record cannot be read"));
+                    continue;
+                }
+            };
+            let side = match parent {
                 None => Side::None,
                 Some(p) if p.to_string().eq_ignore_ascii_case(&to) && lists => Side::Both,
                 Some(p) if p.to_string().eq_ignore_ascii_case(&to) => Side::Child,
@@ -967,10 +1006,34 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             body.push_str(&format!(
                 "\nFor {}, who closes this issue once they are settled:\n\n{}\n",
                 self.config.operator,
-                plan.left.join("\n")
+                plan.left
+                    .iter()
+                    .map(|line| {
+                        let mut short: String = line.chars().take(LEFT_LINE_LIMIT).collect();
+                        if line.chars().count() > LEFT_LINE_LIMIT {
+                            short.push('…');
+                        }
+                        short
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
         body.push_str(&format!("\n```{APPLIED_FENCE}\n{detail:#}\n```\n"));
+        if body.chars().count() > RECEIPT_BODY_LIMIT {
+            // Long identities or many successful attaches can overflow too.
+            // Keep the recoverable counts, not repeated agent-controlled text.
+            let detail = json!({"schema": APPLIED_SCHEMA, "reply": reply_id,
+                "outcome": outcome, "attached": [format!("{} attachments; see relationship records", plan.done.len())],
+                "left": plan.left.len()});
+            body = format!(
+                "Sweep summary; full verdicts are in reply {reply_id}.\n\n```{APPLIED_FENCE}\n{detail:#}\n```\n"
+            );
+        }
+        if body.chars().count() > RECEIPT_BODY_LIMIT {
+            self.sweep_finish(found, labels, 1)?;
+            bail!("sweep receipt cannot fit; labelled needs-human");
+        }
         let receipt = BoardOperation::Receipt {
             marker: SWEEP_APPLY_MARKER.into(),
             plan: reply_id,

@@ -41,6 +41,9 @@ struct Instance {
     fault: Cell<&'static str>,
     /// Repositories `GET /repos/{o}/{r}` says are private.
     private: RefCell<BTreeSet<String>>,
+    /// Repository response overrides, including deliberately missing fields.
+    repositories: RefCell<BTreeMap<String, Value>>,
+    requests: RefCell<Vec<String>>,
 }
 
 fn labels(names: &[&str]) -> Value {
@@ -67,6 +70,8 @@ impl Instance {
             next: Cell::new(1000),
             fault: Cell::new(""),
             private: RefCell::default(),
+            repositories: RefCell::default(),
+            requests: RefCell::default(),
         };
         this.issue(PLANS, EPIC, OPERATOR, &["epic", "priority/P1"]);
         this.labelled(PLANS, EPIC, OPERATOR, "epic", true);
@@ -177,6 +182,7 @@ const APPLY_FENCE: &str = crate::epic_apply::APPLY_MARKER;
 
 impl ForgejoTransport for Instance {
     fn get(&self, url: &url::Url) -> Result<Response> {
+        self.requests.borrow_mut().push(url.to_string());
         let path = url.path().strip_prefix("/subpath/api/v1/").unwrap();
         let segments: Vec<&str> = path.split('/').collect();
         let query: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
@@ -193,6 +199,9 @@ impl ForgejoTransport for Instance {
                             && (query["state"] == "all" || i["state"] == query["state"].as_str())
                             && (query.get("created_by"))
                                 .is_none_or(|by| by == "bot" && i["user"]["id"] == BOT)
+                            && query.get("since").is_none_or(|since| {
+                                i["updated_at"].as_str().unwrap() > since.as_str()
+                            })
                             && query.get("labels").is_none_or(|l| {
                                 (i["labels"].as_array().unwrap())
                                     .iter()
@@ -211,7 +220,27 @@ impl ForgejoTransport for Instance {
             }
             ["repos", owner, name, "issues", n] if n != "comments" => {
                 let key = at(&format!("{owner}/{name}"), n.parse()?);
-                let mut issue = self.issues.borrow().get(&key).cloned().context("404")?;
+                if self.fault.get() == "child-permission" && key == at(WORK, 8) {
+                    bail!("permission denied");
+                }
+                let mut issue = self
+                    .issues
+                    .borrow()
+                    .get(&key)
+                    .cloned()
+                    .ok_or(crate::forgejo::NotFound)?;
+                let applying_sweep = self
+                    .requests
+                    .borrow()
+                    .iter()
+                    .any(|u| u.contains("/issues/30/comments"));
+                if key == at(PLANS, EPIC) && applying_sweep {
+                    match self.fault.get() {
+                        "epic-permission" => bail!("permission denied"),
+                        "epic-closed" => issue["state"] = "closed".into(),
+                        _ => {}
+                    }
+                }
                 issue["comments"] = self.thread(&key.0, key.1).len().into();
                 issue
             }
@@ -245,6 +274,12 @@ impl ForgejoTransport for Instance {
             ["repos", "example", "control"] => json!({"private": true}),
             ["repos", owner, name] => {
                 let repo = format!("{owner}/{name}");
+                if let Some(response) = self.repositories.borrow().get(&repo) {
+                    return Ok(Response {
+                        body: response.clone(),
+                        total: None,
+                    });
+                }
                 let private = self.private.borrow().contains(&repo);
                 json!({"full_name": repo, "private": private, "internal": false,
                     "owner": {"visibility": "public"}})

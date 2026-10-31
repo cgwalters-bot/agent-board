@@ -11,6 +11,10 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Forgejo weekly sweep liveness fixes: bounded summary receipts, per-issue
+  read-error holds, and retry of a plan left before its dispatch claim. The
+  existing opt-in and write set are unchanged.
+
 - The weekly sweep on a Forgejo board, behind the existing `sweep` setting
   (off unless set). The bot's earliest unedited list comment, not the
   issue body, records what the sweep lists. Its run starts through stage 4's

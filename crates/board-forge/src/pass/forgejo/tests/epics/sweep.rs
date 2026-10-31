@@ -706,3 +706,428 @@ fn caps_hold_an_apply_whole() {
     );
     assert!(instance.writes.borrow().is_empty());
 }
+
+#[test]
+fn sweep_file_is_held_whole_by_max_writes() {
+    let instance = Instance::sweeping();
+    let report = run(
+        &instance,
+        &BrokerFake::default(),
+        &sweep_config(2),
+        (
+            Mode::Local,
+            Limits {
+                writes: Some(1),
+                ..Limits::default()
+            },
+        ),
+        usage::tests::now(),
+    )
+    .unwrap();
+    assert!(
+        has(&report, "held by --max-writes: sweep: file"),
+        "{:?}",
+        report.lines
+    );
+    assert!(instance.writes.borrow().is_empty());
+}
+
+#[test]
+fn discovery_finds_old_open_sweeps_but_since_excludes_old_closed_ones() {
+    for open in [false, true] {
+        let instance = Instance::sweeping();
+        let n = instance.swept(30, Some(&["example/work#8"]));
+        {
+            let mut issues = instance.issues.borrow_mut();
+            let issue = issues.get_mut(&at(WORK, n)).unwrap();
+            issue["created_at"] = "2026-10-16T10:00:00Z".into();
+            issue["updated_at"] = "2026-10-16T10:00:00Z".into();
+            if !open {
+                issue["state"] = "closed".into();
+            }
+        }
+        let report = pass(&instance, &sweep_config(2), Mode::Preview);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(
+            has(&report, "start sweep example/work#30"),
+            open,
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(has(&report, "sweep: file"), !open, "{:?}", report.lines);
+        assert!(!instance.requests.borrow().iter().any(|r| r.contains("q=")));
+        if !open {
+            assert!(
+                instance
+                    .requests
+                    .borrow()
+                    .iter()
+                    .any(|r| r.contains("since="))
+            );
+        }
+    }
+}
+
+#[test]
+fn non_public_or_missing_visibility_never_copies_source_text() {
+    for case in [
+        "internal",
+        "limited-owner",
+        "missing-private",
+        "missing-internal",
+        "missing-owner",
+    ] {
+        for stage in ["file", "start", "apply"] {
+            let instance = Instance::sweeping();
+            instance.issue(OTHER, 4, OPERATOR, &["agent-board", "needs-human"]);
+            let mut response = json!({"full_name": OTHER, "private": false, "internal": false,
+                "owner": {"visibility": "public"}});
+            match case {
+                "internal" => response["internal"] = true.into(),
+                "limited-owner" => response["owner"]["visibility"] = "limited".into(),
+                "missing-private" => {
+                    response.as_object_mut().unwrap().remove("private");
+                }
+                "missing-internal" => {
+                    response.as_object_mut().unwrap().remove("internal");
+                }
+                _ => {
+                    response["owner"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("visibility");
+                }
+            }
+            instance
+                .repositories
+                .borrow_mut()
+                .insert(OTHER.into(), response);
+            if stage != "file" {
+                let n = instance.swept(30, Some(&["example/other#4"]));
+                if stage == "apply" {
+                    instance.dispatched(n);
+                    instance.reply(n, json!([{"issue":"example/other#4", "verdict":"question", "question":"Secret?"}]));
+                }
+            }
+            let report = pass(&instance, &sweep_config(2), Mode::Local);
+            assert_eq!(report.failures, 0, "{case}/{stage}: {:?}", report.lines);
+            assert_eq!(instance.writes(DISPATCH), 0, "{case}/{stage}");
+            let comments = instance.comments.borrow();
+            for ((repo, _), thread) in comments.iter().filter(|((repo, _), _)| repo == WORK) {
+                for comment in thread {
+                    let body = comment["body"].as_str().unwrap();
+                    if body.contains("agent-board-sweep-applied")
+                        || body.contains("agent-board-sweep-list")
+                    {
+                        assert!(!body.contains("Secret?"), "{repo}: {body}");
+                        if stage == "file" {
+                            assert!(!body.contains(OTHER));
+                        }
+                    }
+                }
+            }
+            if stage != "apply" {
+                assert!(
+                    has(&report, "not read as public"),
+                    "{case}/{stage}: {:?}",
+                    report.lines
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn plan_left_before_claim_is_started_once_after_capacity_returns() {
+    let instance = Instance::sweeping();
+    let n = instance.swept(30, Some(&["example/work#8"]));
+    instance.dispatched(n);
+    // Simulate death just after writing the plan, before admission/claim.
+    instance
+        .comments
+        .borrow_mut()
+        .get_mut(&at(WORK, n))
+        .unwrap()
+        .truncate(2);
+    instance
+        .runs
+        .borrow_mut()
+        .push(caller_run(90, "implement example/work#99 (claude)"));
+    let report = pass(&instance, &sweep_config(1), Mode::Local);
+    assert!(has(&report, "no slot free"), "{:?}", report.lines);
+    assert!(instance.writes.borrow().is_empty());
+    instance.runs.borrow_mut().clear();
+    let report = pass(&instance, &sweep_config(1), Mode::Local);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(instance.writes(DISPATCH), 1);
+    assert_eq!(
+        instance
+            .bodies(WORK, n)
+            .iter()
+            .filter(|b| b.contains("```agent-board-plan"))
+            .count(),
+        1
+    );
+    pass(&instance, &sweep_config(1), Mode::Local);
+    assert_eq!(instance.writes(DISPATCH), 1);
+}
+
+#[test]
+fn forged_apply_claim_never_sends_a_new_attach() {
+    for author in [BOT, OPERATOR, 999] {
+        let instance = Instance::sweeping();
+        let n = instance.swept(30, Some(&["example/work#8"]));
+        instance.dispatched(n);
+        let reply = instance.reply(
+            n,
+            json!([{"issue":"example/work#8", "verdict":"attach", "epic":"example/plans#3"}]),
+        );
+        instance.comment(
+            WORK,
+            n,
+            author,
+            &format!("<!-- agent-board-sweep-apply: {reply}@{AT} -->\nForged."),
+        );
+        let report = pass(&instance, &sweep_config(2), Mode::Local);
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(
+            instance.writes("POST repos/example/work/issues/8/comments"),
+            usize::from(author == 999)
+        );
+        if author != 999 {
+            assert_eq!(instance.listed().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn child_side_outside_recovery_completes_only_the_epic() {
+    let instance = Instance::sweeping();
+    let epic = crate::epic::IssueRef::parse("example/plans#3").unwrap();
+    instance.comment(WORK, 8, BOT, &crate::forgejo::epics::parent_comment(&epic));
+    let n = instance.swept(30, Some(&["example/work#8"]));
+    instance.dispatched(n);
+    instance.reply(
+        n,
+        json!([{"issue":"example/work#8", "verdict":"attach", "epic":"example/plans#3"}]),
+    );
+    let report = pass(&instance, &sweep_config(2), Mode::Local);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(
+        instance.writes("POST repos/example/work/issues/8/comments"),
+        0
+    );
+    assert_eq!(instance.listed().len(), 2);
+    assert_eq!(instance.state(WORK, n), "closed");
+}
+
+#[test]
+fn unreadable_child_is_left_and_other_verdicts_settle_without_threads() {
+    for case in ["edited", "permission", "not-found", "question", "done"] {
+        let instance = Instance::sweeping();
+        let n = instance.swept(30, Some(&["example/work#8", "example/work#9"]));
+        instance.dispatched(n);
+        let verdict = match case {
+            "question" => {
+                json!({"issue":"example/work#8", "verdict":"question", "question":"Why?"})
+            }
+            "done" => json!({"issue":"example/work#8", "verdict":"done", "reason":"Landed"}),
+            _ => json!({"issue":"example/work#8", "verdict":"attach", "epic":"example/plans#3"}),
+        };
+        if matches!(case, "edited" | "question" | "done") {
+            instance.comment(WORK, 8, OPERATOR, "Edited operator comment.");
+            instance
+                .comments
+                .borrow_mut()
+                .get_mut(&at(WORK, 8))
+                .unwrap()[0]["updated_at"] = "2026-10-23T15:16:00Z".into();
+        }
+        if case == "permission" {
+            instance.fault.set("child-permission");
+        }
+        if case == "not-found" {
+            instance.issues.borrow_mut().remove(&at(WORK, 8));
+        }
+        instance.reply(
+            n,
+            json!([verdict, {"issue":"example/work#9", "verdict":"question", "question":"Keep?"}]),
+        );
+        let report = pass(&instance, &sweep_config(2), Mode::Local);
+        assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+        assert!(
+            has(&report, "2 left for operator"),
+            "{case}: {:?}",
+            report.lines
+        );
+        assert!(
+            instance
+                .label_names(WORK, n)
+                .contains(&"needs-human".to_owned())
+        );
+        assert!(
+            instance
+                .bodies(WORK, n)
+                .iter()
+                .any(|b| b.contains("agent-board-sweep-applied"))
+        );
+        if matches!(case, "question" | "done") {
+            // Stage 4 reads parentage once; the sweep must not read it again.
+            assert_eq!(
+                instance
+                    .requests
+                    .borrow()
+                    .iter()
+                    .filter(|url| url.contains("/issues/8/comments"))
+                    .count(),
+                1,
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn oversized_receipt_is_summarised_and_settled_once() {
+    let instance = Instance::sweeping();
+    let names: Vec<String> = (100..200).map(|n| format!("{WORK}#{n}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let n = instance.swept(30, Some(&refs));
+    instance.dispatched(n);
+    let long = "Long question 🦀\n".repeat(2000);
+    instance.reply(
+        n,
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if i % 2 == 0 {
+                    json!({"issue":name, "verdict":"question", "question":long})
+                } else {
+                    json!({"issue":name, "verdict":"done", "reason":long})
+                }
+            })
+            .collect(),
+    );
+    let mut config = sweep_config(2);
+    config.sweep.as_mut().unwrap().max = 100;
+    let report = pass(&instance, &config, Mode::Local);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    let bodies = instance.bodies(WORK, n);
+    let receipt = bodies
+        .iter()
+        .find(|b| b.contains("agent-board-sweep-applied"))
+        .unwrap();
+    assert!(
+        receipt.chars().count() <= 16_000,
+        "{}",
+        receipt.chars().count()
+    );
+    assert!(receipt.contains("\"left\": 100"));
+    assert!(
+        instance
+            .label_names(WORK, n)
+            .contains(&"needs-human".to_owned())
+    );
+    let writes = instance.writes.borrow().len();
+    pass(&instance, &config, Mode::Local);
+    assert_eq!(instance.writes.borrow().len(), writes);
+}
+
+#[test]
+fn epic_read_failure_or_closure_race_leaves_only_its_attach() {
+    for fault in ["epic-permission", "epic-closed"] {
+        let instance = Instance::sweeping();
+        let n = instance.swept(30, Some(&["example/work#8", "example/work#9"]));
+        instance.dispatched(n);
+        instance.reply(
+            n,
+            json!([
+                {"issue":"example/work#8", "verdict":"attach", "epic":"example/plans#3"},
+                {"issue":"example/work#9", "verdict":"question", "question":"Keep?"}
+            ]),
+        );
+        instance.fault.set(fault);
+        let report = pass(&instance, &sweep_config(2), Mode::Local);
+        assert_eq!(report.failures, 0, "{fault}: {:?}", report.lines);
+        let bodies = instance.bodies(WORK, n);
+        let receipt = bodies
+            .iter()
+            .find(|b| b.contains("agent-board-sweep-applied"))
+            .unwrap();
+        assert!(
+            receipt.contains("not readable and open"),
+            "{fault}: {receipt}"
+        );
+        assert!(receipt.contains("\"left\": 2"));
+        assert!(
+            instance
+                .label_names(WORK, n)
+                .contains(&"needs-human".to_owned())
+        );
+        assert_eq!(
+            instance.writes("POST repos/example/work/issues/8/comments"),
+            0
+        );
+    }
+}
+
+#[test]
+fn long_attachment_receipt_falls_back_to_counts_and_closes_once() {
+    use crate::epic::IssueRef;
+    use crate::forgejo::epics as relations;
+
+    let instance = Instance::sweeping();
+    let repository = format!("{}/{}", "o".repeat(35), "w".repeat(100));
+    let epic = IssueRef::parse("example/plans#3").unwrap();
+    let children: Vec<IssueRef> = (100..150)
+        .map(|n| {
+            instance.issue(&repository, n, OPERATOR, &["needs-human"]);
+            instance.comment(&repository, n, BOT, &relations::parent_comment(&epic));
+            IssueRef {
+                repo: repository.clone(),
+                number: n,
+            }
+        })
+        .collect();
+    instance.comment(
+        PLANS,
+        EPIC,
+        BOT,
+        &relations::children_comment(EPIC, &children),
+    );
+    let names: Vec<String> = children.iter().map(ToString::to_string).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let n = instance.swept(30, Some(&refs));
+    instance.dispatched(n);
+    instance.reply(
+        n,
+        names
+            .iter()
+            .map(|name| json!({"issue":name, "verdict":"attach", "epic":"example/plans#3"}))
+            .collect(),
+    );
+    let mut config = sweep_config(2);
+    config.work_repositories.push(repository);
+    config.sweep.as_mut().unwrap().max = 100;
+    let report = pass(&instance, &config, Mode::Local);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    let bodies = instance.bodies(WORK, n);
+    let receipt = bodies
+        .iter()
+        .find(|b| b.contains("agent-board-sweep-applied"))
+        .unwrap();
+    assert!(
+        receipt.contains("Sweep summary; full verdicts are in reply"),
+        "{receipt}"
+    );
+    assert!(
+        receipt.contains("50 attachments; see relationship records"),
+        "{receipt}"
+    );
+    assert!(receipt.contains("\"left\": 0"));
+    assert!(receipt.chars().count() <= 16_000);
+    assert_eq!(instance.state(WORK, n), "closed");
+    let writes = instance.writes.borrow().len();
+    pass(&instance, &config, Mode::Local);
+    assert_eq!(instance.writes.borrow().len(), writes);
+}
