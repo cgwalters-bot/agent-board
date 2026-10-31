@@ -942,6 +942,10 @@ pub struct RestResponse {
 
 /// Conditional GETs against the REST API. `validator` is a header name and value.
 pub trait Rest {
+    /// Accounting context for subsequent run dispatches and reruns. This
+    /// observes decisions only; it neither authorizes nor counts a start.
+    fn start_kind(&self, _kind: &str) {}
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse>;
     /// A write, or a GET whose 404 is an answer; any status comes back,
     /// for the caller to judge.
@@ -4786,6 +4790,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// admitted ([`Self::review_admits`]) before anything is written: what
     /// came of it, and whether it was taken, or in a preview would be.
     fn take_review(&mut self, review: &Deferred) -> Result<(Option<String>, bool)> {
+        self.rest.start_kind(review.action);
+        if let Some(apply) = &self.apply {
+            apply.dispatcher.start_kind(review.action);
+        }
         if let Some(held) = self.caps.and_then(|caps| caps.check(Kind::Dispatch)) {
             return Ok((Some(held), false));
         }
@@ -5968,6 +5976,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // takes none of its writes.
         let stale = stale.filter(|_| matches!(decision.action, "fix" | "close"));
         let deferred_run = review_rerun.clone().filter(|_| deferred);
+        self.rest.start_kind(decision.action);
+        if let Some(apply) = &self.apply {
+            apply.dispatcher.start_kind(decision.action);
+        }
         let done = match (&self.apply, &retarget, &stale) {
             _ if capped || deferred => Ok(held),
             (Some(_), _, _) if !answer.is_empty() => self

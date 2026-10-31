@@ -819,6 +819,13 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let tally = self.report.tally.clone();
         let mut snapshot = holds::snapshot(&self.report.holds, stamp, tally);
+        if self.apply {
+            snapshot.pass.overhead = Some(holds::overhead(
+                previous,
+                self.now,
+                &self.client.bounds.effects.borrow(),
+            ));
+        }
         snapshot.leases = self.report.leases.clone();
         let considered = snapshot.pass.candidates.is_some();
         holds::carry(&mut snapshot, previous, (self.made_progress(), considered));
