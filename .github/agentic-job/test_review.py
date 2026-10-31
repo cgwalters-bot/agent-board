@@ -109,6 +109,14 @@ class ReviewContracts(unittest.TestCase):
                 )
                 self.assertEqual(checked.returncode, 0 if set(results) == {"success"} else 1)
 
+    def test_ci_uses_the_current_ubuntu_vm_runner(self):
+        ci = (ROOT / ".github/workflows/ci.yml").read_text().split("\njobs:\n", 1)[1]
+        jobs = re.findall(r"^  (\w+):\n(.*?)(?=^  \w+:|\Z)", ci, re.MULTILINE | re.DOTALL)
+        self.assertEqual([name for name, _ in jobs], ["specs", "rust", "lint", "ci"])
+        for name, job in jobs:
+            with self.subTest(job=name):
+                self.assertEqual(re.findall(r"^    runs-on: (.+)$", job, re.MULTILINE), ["ubuntu-26.04"])
+
     def test_ci_runs_the_shared_workflow_check(self):
         # Through the Justfile, beside a checkout of the shared actions at
         # main, on the standing runner label; the check itself denies
