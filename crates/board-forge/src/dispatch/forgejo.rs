@@ -1,5 +1,4 @@
-//! Native Forgejo v17 Actions primitives. The pass's preview lists only the
-//! runs in flight ([`Forgejo::active_runs`]); nothing here starts from it.
+//! Native Forgejo v17 Actions primitives, used by the Forgejo pass's stage 4.
 //! Response URLs are never request authority. All I/O uses the trusted instance,
 //! shares one bounded budget, and performs no automatic mutation retries.
 use super::{GitHub, Handle, Start, StartOutcome, Target};

@@ -90,7 +90,7 @@ impl Board {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     /// The Forgejo instance, for example `https://forge.example/` or
@@ -117,7 +117,7 @@ fn default_token_env() -> String {
     DEFAULT_TOKEN_ENV.into()
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Membership {
     /// Every open issue of the repositories.
@@ -158,7 +158,7 @@ pub(crate) fn is_login(name: &str) -> bool {
 /// Safe existing repository identity, not a repository-creation request.
 /// v17.0.1 models/repo/repo.go uses AlphaDashDotPattern; creation also
 /// reserves route names/suffixes. Do not apply creation reservations to lookup.
-pub(crate) fn validate_repository(repository: &str) -> Result<()> {
+pub fn validate_repository(repository: &str) -> Result<()> {
     ensure!(
         repository
             .split_once('/')
@@ -328,6 +328,20 @@ pub trait Transport {
     /// it may mean the server committed a write but lost the response.
     fn write(&self, _method: &str, _url: &Url, _body: &Value) -> Result<Value> {
         bail!("Forgejo writes unsupported by this transport")
+    }
+}
+
+impl<T: Transport + ?Sized> Transport for &T {
+    fn get(&self, url: &Url) -> Result<Response> {
+        (**self).get(url)
+    }
+
+    fn send(&self, method: &str, url: &Url, body: &Value) -> Result<(u16, Value)> {
+        (**self).send(method, url, body)
+    }
+
+    fn write(&self, method: &str, url: &Url, body: &Value) -> Result<Value> {
+        (**self).write(method, url, body)
     }
 }
 

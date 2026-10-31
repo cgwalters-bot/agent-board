@@ -2,6 +2,7 @@
   "schema": "agent-board/forgejo-pass-contract/v1",
   "built": false,
   "preview": {"built": true, "stages": [1, 4], "identity": "GET /user login equals bot and id in recorders, then GET /users/{operator} id in recorders; stop immediately on failure", "writes": false, "dispatch": false},
+  "apply": {"built": true, "stages": [4], "leases": "requires leases=true and preprovisioned slots on agent-board-leases", "activation": false},
   "doc": "docs/forges.md#a-forgejo-pass",
   "forgejo": {
     "release": "v17.0.1",

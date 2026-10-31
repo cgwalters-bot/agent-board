@@ -24,7 +24,7 @@ public; elsewhere it is planned and recorded but not dispatched.
 
 A [Forgejo pass](forges.md#a-forgejo-pass) now accepts the same file with a
 `board` tagged `"forge": "forgejo"`, reusing the read-only board's instance
-configuration. It previews only: verify the bot login and recorder id, resolve
+configuration. Preview is the default: verify the bot login and recorder id, resolve
 the operator and require its recorder id, then read broker usage and grants
 with the shared pacing and `usage:` line. Identity failure stops immediately.
 Stage 4 then reads the caller's runs in flight, the work repositories' open
@@ -33,8 +33,9 @@ requests, and prints the `hold wip|pools|budget`, `candidates:`, `hold
 OWNER/REPO#N` and `wip: no slot left` lines a GitHub pass would, with
 `would start OWNER/REPO#N pool=P` where GitHub would start a run: it reads no
 plan yet ([stage 4 in preview](forges.md#stage-4-in-preview)). Stages 2, 3, 5
-and 6 each print one not-built line. It writes and dispatches nothing;
-the end-to-end Forgejo pass remains unbuilt. `--apply`, `--fix-bounds`,
+and 6 each print one not-built line. Preview writes and dispatches nothing;
+`--apply` implements stage 4's [claim/start/recover protocol](forges.md#stage-4-apply).
+The end-to-end Forgejo pass remains unbuilt. `--fix-bounds`,
 `--record` and `--replay`, contract-refused options and temporarily unbuilt
 settings are refused before token lookup. Only `board.tokenEnv` is read,
 never `GH_TOKEN`, `GITHUB_TOKEN` or `DISPATCH_TOKEN`.
@@ -58,8 +59,21 @@ when those capabilities become available; their current Forgejo refusals remain.
 On Forgejo, `usage` may contain only `url`; no publication fields are needed
 or accepted yet. Broker errors never read a GitHub snapshot or invoke forge
 publication. Missing readings hold pools, and failed reads count as failures.
-Epics await #514; holds, usage publication, probes, leases and reruns await
-scheduler wiring #513. Sweep/revisit ownership and scheduling are deferred to
+Epics await #514; Status, holds, usage publication and probes await #523.
+Applying work requires `leases: true` and preprovisioned `leases/0.json` through
+`leases/(wip-1).json` on the private caller's `agent-board-leases` branch.
+Each begins as `{"free":"initial"}`; a pass never provisions it. `reruns: true`
+opts into one attempt-guarded rerun of a failed plan run. Both settings remain
+off by default. Forgejo starts are serialized within the pass. In Forgejo Actions,
+the pass checks its Actions server URL against `board.url`, takes its repository
+and run id from `FORGEJO_*` (or `GITHUB_*` compatibility variables), and lists
+its own workflow's active runs on that instance. Another running pass holds
+all stage 4 mutations. Outside Actions, both caps are required and a warning
+says it is not serialized against the scheduled pass. Each attempted lease,
+claim, bind, receipt and cancellation write consumes `--max-writes`; each
+start or rerun POST consumes `--max-dispatch`, including lost replies. A new
+start needs room for its four normal writes before admission; partial failures
+hold rather than bypass a cap. Sweep/revisit ownership and scheduling are deferred to
 follow-ups to #513, not activated by this preview. Existing GitHub JSON,
 publication requirements and replays are unchanged. No deployed caller config,
 workflow or secrets are changed.

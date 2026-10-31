@@ -195,6 +195,13 @@ impl<T: Transport> Reads<'_, T> {
 }
 
 impl<T: Transport> Forgejo<T> {
+    /// A complete, unedited recorder thread, using the claim protocol's reads.
+    pub(crate) fn plan_thread(&self, target: &ItemRef) -> Result<Vec<Value>> {
+        let reads = self.reads(target)?;
+        let (issue, _) = reads.issue()?;
+        reads.thread(&issue)
+    }
+
     fn reads<'a>(&'a self, target: &'a ItemRef) -> Result<Reads<'a, T>> {
         self.config.validate()?;
         target.validate()?;

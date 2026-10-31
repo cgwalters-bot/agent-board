@@ -1,11 +1,11 @@
-//! Preview-only Forgejo pass. Identity precedes broker reads; stage 4 reads
-//! the board, pull requests and runs in flight and says what it would start;
-//! no publication, GitHub fallback, adapter activation or dispatch is
-//! reachable here.
+//! Forgejo pass: identity, broker pacing and stage 4 preview/apply. No GitHub
+//! fallback, publication, PR follow-up, epics or Status writes.
 use super::*;
+use crate::dispatch::{Forgejo as Actions, ForgejoLease, ForgejoSlot, Start, StartOutcome};
 use crate::forgejo::{
     Config as ForgejoConfig, Transport as ForgejoTransport, listing, pages, pages_to_end,
 };
+use crate::{BoardOperation, BoardWrite, Forge};
 
 const CONTRACT: &str = include_str!("../../../../fixtures/forgejo/pass-contract.json");
 /// Pages of each listing stage 4 reads, 50 items each: a work repository's
@@ -21,6 +21,8 @@ const LISTING_INPUTS: [&str; 4] = ["task", "repo", "item", "kind"];
 /// The ref the runs are listed under where `dispatchRef` is unset. Listing
 /// does not filter by ref, so it only has to be valid.
 const LISTING_REF: &str = "main";
+/// Preprovisioned private contents branch; never created by a pass.
+const LEASE_BRANCH: &str = "agent-board-leases";
 
 /// Reject explicit settings, even false, empty or malformed ones, before typed
 /// decoding can discard their presence or hide the capability diagnostic.
@@ -49,8 +51,6 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
             "revisit",
             "a follow-up to scheduler #513 for revisit ownership",
         ),
-        ("leases", "lease wiring in scheduler #513"),
-        ("reruns", "run wiring in scheduler #513"),
     ] {
         let pointer = format!("/{}", option.replace('.', "/"));
         if value.pointer(&pointer).is_some() {
@@ -66,6 +66,53 @@ impl<C: ForgejoTransport> ForgejoTransport for Budget<'_, C> {
     fn get(&self, url: &url::Url) -> Result<crate::forgejo::Response> {
         self.spend(false)?;
         self.observe(self.inner.get(url))
+    }
+
+    fn send(&self, method: &str, url: &url::Url, body: &Value) -> Result<(u16, Value)> {
+        self.spend(true)?;
+        self.observe(self.inner.send(method, url, body))
+    }
+
+    fn write(&self, method: &str, url: &url::Url, body: &Value) -> Result<Value> {
+        self.spend(true)?;
+        self.observe(self.inner.write(method, url, body))
+    }
+}
+
+/// Every attempted mutation counts, including cancellation and lost replies.
+struct Capped<'a, C> {
+    inner: &'a C,
+    caps: &'a Caps,
+}
+
+impl<C: ForgejoTransport> Capped<'_, C> {
+    fn charge(&self, url: &url::Url) -> Result<()> {
+        let kind = if url.path().contains("/actions/")
+            && (url.path().ends_with("/dispatches") || url.path().ends_with("/rerun"))
+        {
+            Kind::Dispatch
+        } else {
+            Kind::Write
+        };
+        ensure!(self.caps.check(kind).is_none(), "held by {}", kind.flag());
+        self.caps.count(kind);
+        Ok(())
+    }
+}
+
+impl<C: ForgejoTransport> ForgejoTransport for Capped<'_, C> {
+    fn get(&self, url: &url::Url) -> Result<crate::forgejo::Response> {
+        self.inner.get(url)
+    }
+
+    fn send(&self, method: &str, url: &url::Url, body: &Value) -> Result<(u16, Value)> {
+        self.charge(url)?;
+        self.inner.send(method, url, body)
+    }
+
+    fn write(&self, method: &str, url: &url::Url, body: &Value) -> Result<Value> {
+        self.charge(url)?;
+        self.inner.write(method, url, body)
     }
 }
 
@@ -143,25 +190,29 @@ fn run_within(
     now: OffsetDateTime,
     bounds: &Bounds,
 ) -> Result<Report> {
-    ensure!(
-        matches!(mode, Mode::Preview),
-        "unsupported_capability: --apply: Forgejo scheduling needs #513"
-    );
     config.check()?;
     let board = config
         .forgejo_board()
         .context("Forgejo pass needs a Forgejo board")?;
-    let client = Budget {
+    let caps = Caps::new(limits);
+    let capped = Capped {
         inner: client,
+        caps: &caps,
+    };
+    let client = Budget {
+        inner: &capped,
         bounds,
     };
-    let caps = Caps::new(limits);
     let mut report = Report {
         summary: caps.summary(),
         ..Report::default()
     };
     report.tally.0.limit = config.wip;
-    report.tally.1.mode = "preview";
+    report.tally.1.mode = match mode {
+        Mode::Preview => "preview",
+        Mode::Local => "local",
+        Mode::Actions(_) => "actions",
+    };
     let ids = match identity(&client, board, config) {
         Ok((line, ids)) => {
             report.lines.push(line);
@@ -197,6 +248,7 @@ fn run_within(
         caps: &caps,
         report: &mut report,
         pulls: BTreeMap::new(),
+        mode,
     };
     if let Err(error) = schedule.run(snapshot.as_ref()) {
         report.failures += 1;
@@ -249,12 +301,579 @@ struct Schedule<'a, C> {
     /// Each work repository's open pull requests, read once, and whether
     /// they were all read; or why they were not.
     pulls: BTreeMap<String, std::result::Result<(Vec<Value>, bool), String>>,
+    mode: Mode<'a>,
 }
 
 /// A board issue read, and why its Priority could not be, where it could not.
 type Read = (Facts, Option<String>);
 
+struct Accepted {
+    id: u64,
+    plan: plan::JobPlan,
+}
+
+impl Accepted {
+    fn start(&self) -> Start<'_> {
+        Start {
+            repository: &self.plan.repo,
+            item: self.plan.item,
+            kind: &self.plan.kind,
+            brief: &self.plan.brief,
+            pool: Some(&self.plan.pool),
+            runner: Some(&self.plan.runner),
+            base: None,
+        }
+    }
+}
+
 impl<C: ForgejoTransport> Schedule<'_, C> {
+    fn forge(&self) -> crate::forgejo::Forgejo<&Budget<'_, C>> {
+        crate::forgejo::Forgejo {
+            transport: self.client,
+            config: self.board.clone(),
+        }
+    }
+
+    fn target(&self) -> Target {
+        self.config
+            .target(self.config.dispatch_ref.as_deref().unwrap_or(LISTING_REF))
+    }
+
+    fn actions<'a>(&'a self, target: &'a Target) -> Result<Actions<'a, Budget<'a, C>>> {
+        Actions::new(
+            self.client,
+            self.board,
+            target,
+            ["task", "repo", "item", "kind", "pool"]
+                .map(String::from)
+                .into(),
+            self.ids.bot,
+        )
+    }
+
+    /// The concrete race is two pass workflows both observing a free WIP slot.
+    /// Use this instance's bounded active inventory, never GitHub's API.
+    fn serialized(&self) -> Result<()> {
+        let Mode::Actions(own) = self.mode else {
+            return Ok(());
+        };
+        crate::forgejo::validate_repository(&own.repository)?;
+        ensure!(own.id > 0, "invalid pass run id");
+        let run = self
+            .client
+            .get(&api(
+                self.board,
+                &own.repository,
+                &format!("actions/runs/{}", own.id),
+                &[],
+            )?)?
+            .body;
+        ensure!(
+            run["id"] == own.id
+                && run["repository"]["full_name"]
+                    .as_str()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(&own.repository)),
+            "pass run identity mismatch"
+        );
+        let workflow = run["workflow_id"]
+            .as_str()
+            .context("pass run has no workflow")?;
+        validate_workflow(workflow)?;
+        let target = Target {
+            caller: own.repository.clone(),
+            workflow: workflow.into(),
+            git_ref: LISTING_REF.into(),
+        };
+        let actions = self.actions(&target)?;
+        ensure!(
+            !actions
+                .active_runs()?
+                .iter()
+                .any(|r| r["id"] != own.id && r["status"] == "running"),
+            "another pass is in progress; new work waits"
+        );
+        Ok(())
+    }
+
+    fn slots(&self, actions: &Actions<'_, Budget<'_, C>>) -> Result<Vec<(u64, ForgejoSlot)>> {
+        (0..self.config.wip)
+            .map(|n| Ok((n, actions.slot(LEASE_BRANCH, n)?)))
+            .collect()
+    }
+
+    fn reap(&mut self) -> Result<()> {
+        let target = self.target();
+        let actions = self.actions(&target)?;
+        for (_, slot) in self.slots(&actions)? {
+            let Some(lease) = slot.lease() else { continue };
+            let expired = OffsetDateTime::parse(&lease.expires_at, &Rfc3339)? <= self.now;
+            let ended = lease.run > 0
+                && actions.status(lease.run).is_ok_and(|r| {
+                    matches!(
+                        r["status"].as_str(),
+                        Some("success" | "failure" | "cancelled" | "skipped")
+                    )
+                });
+            if expired || ended {
+                ensure!(
+                    actions.release(&slot, &lease.claim, lease.run, self.now)?,
+                    "lease release lost race; held"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn accepted(&self, issue: &ItemRef) -> Result<Accepted> {
+        let comments = self.forge().plan_thread(&self.write_identity(issue))?;
+        let mut newest = None;
+        for comment in comments {
+            if !comment["user"]["id"]
+                .as_u64()
+                .is_some_and(|id| self.board.recorders.contains(&id))
+            {
+                continue;
+            }
+            let body = text(&comment, "/body");
+            let parsed = plan::fenced_json(body, PLAN_FENCE);
+            if matches!(parsed, Ok(None)) {
+                continue;
+            }
+            let id = comment["id"].as_u64().context("plan has no id")?;
+            if newest.as_ref().is_none_or(|(n, _)| id > *n) {
+                newest = Some((id, parsed));
+            }
+        }
+        let (id, parsed) = newest.context("no accepted recorder plan; a person must post one")?;
+        let value = parsed?.context("plan missing")?;
+        let plan = plan::JobPlan::from_json_for(&value, crate::forgejo::Naming::Forgejo)?;
+        ensure!(
+            plan.repo.eq_ignore_ascii_case(&issue.repository) && plan.item == issue.number,
+            "plan targets another issue; held"
+        );
+        ensure!(
+            plan.stacks_on.is_none(),
+            "stacked plans are not wired on Forgejo; held"
+        );
+        Ok(Accepted { id, plan })
+    }
+
+    // BoardWrite's normalized snapshot identities use the hostname, whereas
+    // scheduling keys retain the whole instance (port and subpath included).
+    fn write_identity(&self, issue: &ItemRef) -> ItemRef {
+        ItemRef {
+            host: self.board.url.host_str().unwrap_or_default().into(),
+            ..issue.clone()
+        }
+    }
+
+    fn write(&self, facts: &Facts, operation: BoardOperation) -> Result<()> {
+        let observed = board_core::Item {
+            identity: self.write_identity(&facts.issue),
+            project_item: None,
+            assignment: None,
+            title: String::new(),
+            state: "open".into(),
+            state_reason: None,
+            status: None,
+            priority: None,
+            turn: None,
+            fields_complete: false,
+            field_errors: vec![],
+            evidence: vec![],
+            content_kind: "issue".into(),
+            labels: facts.labels.clone(),
+            assignees: vec![],
+            author: None,
+            timestamps: BTreeMap::new(),
+            fields: BTreeMap::new(),
+        };
+        self.forge().board_write(
+            &BoardWrite {
+                observed,
+                policy: board_core::AgentPolicy::parse(board_core::DEFAULT_AGENT_POLICY)?,
+                operation,
+            },
+            true,
+            &mut 1,
+        )
+    }
+
+    fn receipt(&self, facts: &Facts, plan: u64, body: Value) -> Result<()> {
+        self.write(
+            facts,
+            BoardOperation::Receipt {
+                marker: plan::DISPATCH_MARKER.into(),
+                plan,
+                body: body.to_string(),
+            },
+        )
+    }
+
+    fn claim(&self, facts: &Facts, plan: u64) -> Result<Option<crate::PlanClaim>> {
+        self.forge().plan_claim(
+            &self.write_identity(&facts.issue),
+            plan::DISPATCH_MARKER,
+            plan,
+        )
+    }
+
+    fn claim_time(&self, facts: &Facts, claim: u64) -> Result<OffsetDateTime> {
+        let comments = self
+            .forge()
+            .plan_thread(&self.write_identity(&facts.issue))?;
+        let comment = comments
+            .iter()
+            .find(|c| c["id"] == claim)
+            .context("claim disappeared")?;
+        Ok(OffsetDateTime::parse(
+            text(comment, "/created_at"),
+            &Rfc3339,
+        )?)
+    }
+
+    fn final_check(
+        &self,
+        facts: &Facts,
+        accepted: &Accepted,
+        snapshot: Option<&Value>,
+        owner: Option<(&str, u64)>,
+    ) -> Result<()> {
+        self.serialized()?;
+        ensure!(!self.caps.full(Kind::Dispatch), "held by --max-dispatch");
+        ensure!(
+            choose(
+                snapshot,
+                &self.config.pools,
+                std::slice::from_ref(&accepted.plan.pool),
+                self.now
+            )
+            .is_ok(),
+            "pool holds"
+        );
+        ensure!(
+            budget_hold(self.config, snapshot, self.now, 1.0).is_none(),
+            "budget holds"
+        );
+        let latest = self.accepted(&facts.issue)?;
+        ensure!(
+            latest.id == accepted.id
+                && (latest.plan == accepted.plan || {
+                    let mut selected = latest.plan.clone();
+                    selected.pool = accepted.plan.pool.clone();
+                    latest.plan.pool.is_empty() && selected == accepted.plan
+                }),
+            "plan changed after admission; held"
+        );
+        let issue = self
+            .client
+            .get(&api(
+                self.board,
+                &facts.issue.repository,
+                &format!("issues/{}", facts.issue.number),
+                &[],
+            )?)?
+            .body;
+        let (fresh, unread) = self.facts(&instance(self.board), &facts.issue.repository, &issue)?;
+        ensure!(fresh.issue == facts.issue, "issue identity changed");
+        ensure!(
+            matches!(
+                screen(&fresh, self.config, &[], &self.people()),
+                Screen::Unparented
+            ),
+            "issue no longer qualifies as a candidate"
+        );
+        if let crate::forgejo::Membership::Label(member) = &self.board.membership {
+            ensure!(fresh.labels.contains(member), "issue left board membership");
+        }
+        let mut report = Report::default();
+        let mut recheck = Schedule {
+            client: self.client,
+            board: self.board,
+            config: self.config,
+            ids: self.ids,
+            now: self.now,
+            caps: self.caps,
+            report: &mut report,
+            pulls: BTreeMap::new(),
+            mode: self.mode,
+        };
+        let fresh = recheck
+            .complete(&fresh, unread.as_deref())
+            .map_err(|h| anyhow::anyhow!("{}", h.reason))?;
+        ensure!(
+            fresh.open
+                && issue["state"] == "open"
+                && hold(&fresh, &BTreeMap::new(), &self.people()).is_none(),
+            "issue now holds"
+        );
+        let target = self.target();
+        let actions = self.actions(&target)?;
+        let runs = actions.active_runs()?;
+        ensure!(
+            !runs.iter().any(
+                |r| run_title(text(r, "/title")).is_some_and(|(_, repo, n)| repo
+                    .eq_ignore_ascii_case(&facts.issue.repository)
+                    && n == facts.issue.number)
+            ),
+            "issue already in flight"
+        );
+        let active: BTreeSet<_> = runs.iter().filter_map(|r| r["id"].as_u64()).collect();
+        let mut occupied = active.len();
+        let mut owners = BTreeSet::new();
+        let mut leased_runs = BTreeSet::new();
+        let mut found_owner = false;
+        for (_, slot) in self.slots(&actions)? {
+            if let Some(lease) = slot.lease() {
+                ensure!(
+                    owners.insert(lease.claim.clone()),
+                    "duplicate lease claim; held"
+                );
+                ensure!(
+                    lease.run == 0 || leased_runs.insert(lease.run),
+                    "duplicate run lease; held"
+                );
+                if owner.is_some_and(|(claim, _)| lease.claim == claim) {
+                    ensure!(
+                        Some(lease.run) == owner.map(|(_, run)| run)
+                            && OffsetDateTime::parse(&lease.expires_at, &Rfc3339)? > self.now,
+                        "reservation no longer live"
+                    );
+                    found_owner = true;
+                    continue;
+                }
+                ensure!(
+                    !lease.item.eq_ignore_ascii_case(&facts.issue.display()),
+                    "issue already leased"
+                );
+                if lease.run == 0 || !active.contains(&lease.run) {
+                    occupied += 1;
+                }
+            }
+        }
+        ensure!(owner.is_none() || found_owner, "reservation disappeared");
+        ensure!(
+            occupied < self.config.wip as usize,
+            "WIP full including reservations; held"
+        );
+        Ok(())
+    }
+
+    fn reserve(
+        &self,
+        facts: &Facts,
+        accepted: &Accepted,
+        snapshot: Option<&Value>,
+    ) -> Result<(u64, ForgejoLease)> {
+        let target = self.target();
+        let actions = self.actions(&target)?;
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|e| anyhow::anyhow!("lease identity randomness: {e}"))?;
+        let nonce: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        let lease = ForgejoLease {
+            run: 0,
+            claim: format!("{}:{}/{}", facts.issue.display(), accepted.id, nonce),
+            item: facts.issue.display(),
+            pool: accepted.plan.pool.clone(),
+            taken_at: self.now.format(&Rfc3339)?,
+            expires_at: (self.now + time::Duration::seconds(lease::LEASE_SECONDS))
+                .format(&Rfc3339)?,
+        };
+        let (n, slot) = self
+            .slots(&actions)?
+            .into_iter()
+            .find(|(_, s)| s.lease().is_none())
+            .context("no free lease slot")?;
+        ensure!(
+            actions.admit(&slot, &lease, self.now, || self
+                .final_check(facts, accepted, snapshot, None))?,
+            "lease slot race lost; held"
+        );
+        Ok((n, lease))
+    }
+
+    fn bind(&self, slot: u64, lease: &ForgejoLease, run: u64) -> Result<()> {
+        let target = self.target();
+        let actions = self.actions(&target)?;
+        let slots = self.slots(&actions)?;
+        ensure!(
+            !slots.iter().any(|(_, s)| s
+                .lease()
+                .is_some_and(|l| l.run == run && l.claim != lease.claim)),
+            "run already leased"
+        );
+        let observed = actions.slot(LEASE_BRANCH, slot)?;
+        ensure!(
+            actions.bind(&observed, &lease.claim, run, self.now)?,
+            "lease bind lost race; held"
+        );
+        Ok(())
+    }
+
+    fn apply(&mut self, facts: &Facts, pool: &str, snapshot: Option<&Value>) -> Result<bool> {
+        let mut accepted = self.accepted(&facts.issue)?;
+        let existing = self.claim(facts, accepted.id)?;
+        if let Some(claim) = existing {
+            ensure!(
+                claim.recorder == self.ids.bot,
+                "plan claimed by another recorder; held"
+            );
+            let target = self.target();
+            let actions = self.actions(&target)?;
+            if claim.receipts.is_empty() {
+                let prefix = format!("{}:{}/", facts.issue.display(), accepted.id);
+                let slots = self.slots(&actions)?;
+                let matches: Vec<_> = slots
+                    .iter()
+                    .filter(|(_, s)| s.lease().is_some_and(|l| l.claim.starts_with(&prefix)))
+                    .collect();
+                ensure!(
+                    matches.len() == 1,
+                    "claim has no unique reservation; hold for a person, never retry"
+                );
+                let (slot, observed) = matches[0];
+                let lease = observed.lease().context("reservation disappeared")?;
+                accepted.plan.pool = lease.pool.clone();
+                let found =
+                    actions.recover(&accepted.start(), self.claim_time(facts, claim.claim)?)?;
+                let run: u64 = found.id.parse()?;
+                if lease.run == 0 {
+                    self.bind(*slot, lease, run)?;
+                } else {
+                    ensure!(lease.run == run, "recovered run differs from reservation");
+                }
+                self.receipt(
+                    facts,
+                    accepted.id,
+                    json!({"event":"found", "run":run, "url":found.url, "pool":lease.pool}),
+                )?;
+                self.line(format!(
+                    "recover {}: found {}",
+                    facts.issue.display(),
+                    found.url
+                ));
+                return Ok(false);
+            }
+            let receipts: Vec<Value> = claim
+                .receipts
+                .iter()
+                .filter_map(|r| serde_json::from_str(r).ok())
+                .collect();
+            let started = receipts
+                .iter()
+                .find(|r| matches!(r["event"].as_str(), Some("started" | "found")));
+            let Some(started) = started else {
+                self.line(format!(
+                    "hold {}: plan already receipted; never retry",
+                    facts.issue.display()
+                ));
+                return Ok(false);
+            };
+            let run = started["run"].as_u64().context("receipt has no run")?;
+            if !self.config.reruns
+                || receipts
+                    .iter()
+                    .any(|r| r["event"] == "rerun" && r["run"] == run)
+            {
+                self.line(format!(
+                    "hold {}: plan already dispatched",
+                    facts.issue.display()
+                ));
+                return Ok(false);
+            }
+            if actions.status(run)?["status"] != "failure" {
+                return Ok(false);
+            }
+            accepted.plan.pool = started["pool"]
+                .as_str()
+                .context("receipt has no pool")?
+                .into();
+            let at = self.claim_time(facts, claim.claim)?;
+            let mut sent = false;
+            let outcome = actions.rerun(run, &accepted.start(), at, || {
+                let (slot, lease) = self.reserve(facts, &accepted, snapshot)?;
+                self.bind(slot, &lease, run)?;
+                self.receipt(
+                    facts,
+                    accepted.id,
+                    json!({"event":"rerun", "run":run, "attempt":1, "pool":accepted.plan.pool}),
+                )?;
+                self.final_check(facts, &accepted, snapshot, Some((&lease.claim, run)))?;
+                let current = self
+                    .claim(facts, accepted.id)?
+                    .context("claim disappeared")?;
+                ensure!(
+                    current.claim == claim.claim && current.recorder == self.ids.bot,
+                    "claim changed before rerun"
+                );
+                sent = true;
+                Ok(())
+            });
+            let line = outcome_line(&outcome);
+            self.line(format!("run rerun {}: {line}", facts.issue.display()));
+            return Ok(sent);
+        }
+        if accepted.plan.pool.is_empty() {
+            accepted.plan.pool = pool.into();
+        }
+        if let Some(held) = self
+            .caps
+            .check(Kind::Dispatch)
+            .or_else(|| self.caps.check_many(Kind::Write, 4))
+        {
+            self.line(format!("{held}: start {}", facts.issue.display()));
+            return Ok(false);
+        }
+        let (slot, lease) = self.reserve(facts, &accepted, snapshot)?;
+        self.write(
+            facts,
+            BoardOperation::Claim {
+                marker: plan::DISPATCH_MARKER.into(),
+                plan: accepted.id,
+            },
+        )?;
+        let claim = self
+            .claim(facts, accepted.id)?
+            .context("claim disappeared")?;
+        let at = self.claim_time(facts, claim.claim)?;
+        let target = self.target();
+        let actions = self.actions(&target)?;
+        let outcome = actions.start(&accepted.start(), at, || {
+            self.final_check(facts, &accepted, snapshot, Some((&lease.claim, 0)))?;
+            let current = self
+                .claim(facts, accepted.id)?
+                .context("claim disappeared")?;
+            ensure!(
+                current.claim == claim.claim && current.receipts.is_empty(),
+                "claim changed before dispatch"
+            );
+            let observed = actions.slot(LEASE_BRANCH, slot)?;
+            ensure!(
+                observed.lease() == Some(&lease),
+                "reservation changed before dispatch"
+            );
+            Ok(())
+        });
+        let mut receipt =
+            json!({"event":"held", "detail":outcome_line(&outcome), "pool":accepted.plan.pool});
+        if let StartOutcome::Started(handle) = &outcome {
+            let run: u64 = handle.id.parse()?;
+            // Even a failed bind must not lose the confirmed start's receipt.
+            let bound = self.bind(slot, &lease, run);
+            receipt = json!({"event":"started", "run":run, "url":handle.url, "pool":accepted.plan.pool,
+                "bind_error":bound.err().map(|e| format!("{e:#}"))});
+        }
+        self.receipt(facts, accepted.id, receipt)?;
+        self.line(format!(
+            "start {}: {}",
+            facts.issue.display(),
+            outcome_line(&outcome)
+        ));
+        // A refusal or ambiguity still owns its reservation until expiry.
+        Ok(true)
+    }
+
     fn line(&mut self, line: String) {
         self.report.lines.push(line);
     }
@@ -299,9 +918,38 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     fn run(&mut self, snapshot: Option<&Value>) -> Result<()> {
         let config = self.config;
         self.report.tally.1.started = 0;
+        let mut recovered = BTreeSet::new();
         if !config.work() {
             self.line("schedule: off (wip 0 or no workRepositories)".into());
             return Ok(());
+        }
+        if !matches!(self.mode, Mode::Preview) {
+            self.serialized()?;
+            if !config.leases {
+                self.pass_held(
+                    HoldKind::Wip,
+                    "applying Forgejo work requires leases; no reservation, no start",
+                );
+                return Ok(());
+            }
+            // Recovery is not admission: even a full WIP or a held pool must
+            // not hide a claim left between POST and its receipt.
+            let issues = self.issues()?;
+            for (facts, _) in issues.values() {
+                let Ok(accepted) = self.accepted(&facts.issue) else {
+                    continue;
+                };
+                if self
+                    .claim(facts, accepted.id)?
+                    .is_some_and(|c| c.receipts.is_empty())
+                {
+                    recovered.insert(key(&facts.issue));
+                    if let Err(error) = self.apply(facts, "", snapshot) {
+                        self.held(facts, Hold::new(HoldKind::Unreadable, format!("{error:#}")));
+                    }
+                }
+            }
+            self.reap()?;
         }
         let (active, mut busy) = match self.runs() {
             Ok(runs) => runs,
@@ -332,6 +980,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let candidates = self.candidates(&board);
         let mut free = wip - active;
         for (n, (facts, unread)) in candidates.iter().enumerate() {
+            if recovered.contains(&key(&facts.issue)) {
+                continue;
+            }
             let left = candidates.len() - n;
             if free == 0 {
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
@@ -365,6 +1016,24 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 }
             };
             let line = format!("would start {} pool={pool}", facts.issue.display());
+            if !matches!(self.mode, Mode::Preview) {
+                match self.apply(&facts, &pool, snapshot) {
+                    Ok(true) => {
+                        free -= 1;
+                        busy.insert(key(&facts.issue), "started in this pass".into());
+                        self.report.tally.1.started += 1;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.report.failures += 1;
+                        self.held(
+                            &facts,
+                            Hold::new(HoldKind::Unreadable, format!("{error:#}")),
+                        );
+                    }
+                }
+                continue;
+            }
             free -= 1;
             if let Some(held) = self.caps.check(Kind::Dispatch) {
                 self.line(format!("{held}: {line}"));
@@ -615,6 +1284,15 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     }
 }
 
+fn outcome_line(outcome: &StartOutcome) -> String {
+    match outcome {
+        StartOutcome::Started(handle) => handle.url.clone(),
+        StartOutcome::NotStarted(error) => format!("refused: {error:#}"),
+        StartOutcome::Ambiguous(error) => format!("ambiguous: {error:#}; never retry"),
+        StartOutcome::Unnamed => "ambiguous: unnamed start; never retry".into(),
+    }
+}
+
 /// Bound each broker read as well as forge reads. A slow read cannot admit a
 /// second request after the deadline; HTTP transports also bound each call.
 struct BrokerReads<'a, B>(&'a Budget<'a, B>);
@@ -684,6 +1362,8 @@ fn refresh<B: Broker>(
 mod tests {
     use super::*;
     use crate::forgejo::Response;
+
+    mod apply;
 
     fn file() -> Value {
         let contract: Value = serde_json::from_str(CONTRACT).unwrap();
@@ -819,8 +1499,6 @@ mod tests {
             ("usage.probe", "#513"),
             ("sweep.max", "sweep ownership"),
             ("revisit.perPass", "revisit ownership"),
-            ("leases", "#513"),
-            ("reruns", "#513"),
         ] {
             let mut value = file();
             set(&mut value, option, json!(false));
@@ -1144,7 +1822,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_bounds_and_apply_refusal() {
+    fn shared_bounds() {
         let config = preview_config();
         for (limit, deadline, expected) in [
             (
@@ -1181,18 +1859,6 @@ mod tests {
             assert!(report.failures > 0);
             assert_eq!(report.spent.requests, expected);
         }
-        let fake = Fake::default();
-        assert!(
-            run(
-                &fake,
-                &BrokerFake::default(),
-                &config,
-                (Mode::Local, Limits::default()),
-                usage::tests::now()
-            )
-            .is_err()
-        );
-        assert!(fake.calls.borrow().is_empty());
     }
 
     fn login(id: u64) -> &'static str {

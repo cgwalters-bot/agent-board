@@ -13,6 +13,8 @@ fn command(path: &std::path::Path) -> Command {
         .args(["pass", "--config"])
         .arg(path)
         .env_remove(TOKEN_VAR)
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("FORGEJO_ACTIONS")
         .env("GH_TOKEN", "not-a-forgejo-credential")
         .env("GITHUB_TOKEN", "not-a-forgejo-credential")
         .env("DISPATCH_TOKEN", "not-a-forgejo-credential");
@@ -41,7 +43,6 @@ fn refusals_precede_credentials_and_auxiliary_files() {
     let base = config("http://127.0.0.1:1/forge/");
     std::fs::write(&path, base.to_string()).unwrap();
     for flags in [
-        vec!["--apply"],
         vec!["--fix-bounds", "does-not-exist"],
         vec!["--record", "does-not-exist/record.json"],
         vec!["--replay", "does-not-exist"],
@@ -63,7 +64,7 @@ fn refusals_precede_credentials_and_auxiliary_files() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains(TOKEN_VAR), "{error}");
     assert!(!error.contains("GH_TOKEN"), "{error}");
-    for option in ["follow", "bodyPlans", "leases"] {
+    for option in ["follow", "bodyPlans"] {
         let mut value = base.clone();
         value[option] = false.into();
         std::fs::write(&path, value.to_string()).unwrap();
@@ -73,6 +74,72 @@ fn refusals_precede_credentials_and_auxiliary_files() {
             error.contains(&format!("unsupported_capability: {option}:")),
             "{error}"
         );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn apply_requires_local_caps_or_matching_actions_instance_before_credentials() {
+    let dir = directory("apply-admission");
+    let path = dir.join("config.json");
+    std::fs::write(&path, config("http://127.0.0.1:1/forge/").to_string()).unwrap();
+    for flags in [
+        vec![],
+        vec!["--max-dispatch", "1"],
+        vec!["--max-writes", "4"],
+    ] {
+        let output = command(&path)
+            .arg("--apply")
+            .args(flags)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("needs both --max-dispatch and --max-writes"),
+            "{error}"
+        );
+    }
+    let output = command(&path)
+        .args(["--apply", "--max-dispatch", "1", "--max-writes", "4"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains(TOKEN_VAR)
+    );
+    for prefix in ["FORGEJO", "GITHUB"] {
+        for server in [
+            "http://foreign.example/forge",
+            "http://127.0.0.1:1/other",
+            "http://127.0.0.1:1/forge",
+        ] {
+            let output = command(&path)
+                .arg("--apply")
+                .env(format!("{prefix}_ACTIONS"), "true")
+                .env(format!("{prefix}_SERVER_URL"), server)
+                .env(format!("{prefix}_REPOSITORY"), "team.example/control.repo")
+                .env(format!("{prefix}_RUN_ID"), "42")
+                .assert()
+                .failure()
+                .get_output()
+                .clone();
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                error.contains(
+                    if server.ends_with("/forge") && !server.contains("foreign") {
+                        TOKEN_VAR
+                    } else {
+                        "server URL differs"
+                    }
+                ),
+                "{error}"
+            );
+        }
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -10,8 +10,8 @@ pub use crate::dispatch::Target;
 use crate::dispatch::{GitHub, Start, StartOutcome};
 use crate::github::{API_ROOT, Transport, is_github_login};
 use crate::overlap::{self, Decision, owner_name};
+use crate::poll::Rest;
 use crate::poll::pace::is_tier;
-use crate::poll::{Rest, validate_repository};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::ItemRef;
 use serde_json::{Value, json};
@@ -107,6 +107,10 @@ impl JobPlan {
     /// Validate one plan object. Unknown fields and nulls are refused: a field
     /// this version does not carry must not look as if it were honoured.
     pub fn from_json(value: &Value) -> Result<Self> {
+        Self::from_json_for(value, crate::forgejo::Naming::Github)
+    }
+
+    pub(crate) fn from_json_for(value: &Value, naming: crate::forgejo::Naming) -> Result<Self> {
         let object = value.as_object().context("plan is not a JSON object")?;
         for key in object.keys() {
             ensure!(FIELDS.contains(&key.as_str()), "unknown plan field {key:?}");
@@ -123,7 +127,7 @@ impl JobPlan {
             "unsupported plan schema (expected {JOB_PLAN_SCHEMA})"
         );
         let repo = text("repo")?;
-        validate_repository(repo)?;
+        naming.validate_repository(repo)?;
         let item = object
             .get("item")
             .context("plan has no item")?

@@ -87,6 +87,38 @@ fn own_run() -> Result<PassRun> {
     Ok(PassRun { repository, id })
 }
 
+/// Forgejo exports its own Actions variables and GitHub-compatible aliases.
+/// Check the server before reading credentials: an environment from another
+/// instance must not serialize against the wrong pass workflow.
+fn forgejo_apply_mode(
+    board: &board_forge::forgejo::Config,
+    limits: Limits,
+) -> Result<Option<PassRun>> {
+    let var = |key: &str| {
+        std::env::var(format!("FORGEJO_{key}")).or_else(|_| std::env::var(format!("GITHUB_{key}")))
+    };
+    if var("ACTIONS").as_deref() == Ok("true") {
+        let server = var("SERVER_URL").context("Forgejo Actions needs SERVER_URL")?;
+        ensure!(
+            server.trim_end_matches('/') == board.url.as_str().trim_end_matches('/'),
+            "Actions server URL differs from configured board.url"
+        );
+        let repository = var("REPOSITORY").context("Forgejo Actions needs REPOSITORY")?;
+        board_forge::forgejo::validate_repository(&repository)?;
+        let id = var("RUN_ID")
+            .context("Forgejo Actions needs RUN_ID")?
+            .parse()
+            .context("Forgejo RUN_ID")?;
+        ensure!(id > 0, "invalid Forgejo RUN_ID");
+        return Ok(Some(PassRun { repository, id }));
+    }
+    ensure!(
+        limits.dispatch.is_some() && limits.writes.is_some(),
+        "--apply outside Forgejo Actions needs both --max-dispatch and --max-writes"
+    );
+    Ok(None)
+}
+
 fn read(path: &PathBuf) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
 }
@@ -101,7 +133,6 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         // Stop unsupported operations before opening files or looking up any
         // credentials, including the GitHub apply/record/replay paths below.
         for (supplied, option, reason) in [
-            (args.apply, "--apply", "Forgejo scheduling needs #513"),
             (
                 args.fix_bounds.is_some(),
                 "--fix-bounds",
@@ -125,17 +156,36 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             writes: args.max_writes,
             status_changes: args.max_status_changes,
         };
+        let own = args
+            .apply
+            .then(|| forgejo_apply_mode(board, limits))
+            .transpose()?;
+        let mode = match &own {
+            None => Mode::Preview,
+            Some(Some(own)) => Mode::Actions(own),
+            Some(None) => Mode::Local,
+        };
         if let Some(warning) = board.plain_http_warning() {
             eprintln!("{warning}");
         }
         let client = board_forge::forgejo::Client::from_env(board)?;
         let broker = pass::HttpBroker::default();
-        writeln!(out, "pass: preview")?;
+        writeln!(
+            out,
+            "pass: {}",
+            if args.apply { "apply" } else { "preview" }
+        )?;
+        if matches!(mode, Mode::Local) {
+            writeln!(
+                out,
+                "warning: applying outside Forgejo Actions, not serialized against the scheduled workflow's passes"
+            )?;
+        }
         let report = pass::forgejo::run(
             &client,
             &broker,
             &config,
-            (Mode::Preview, limits),
+            (mode, limits),
             time::OffsetDateTime::now_utc(),
         )?;
         return print_report(&report, out);
