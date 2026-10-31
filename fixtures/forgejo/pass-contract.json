@@ -3,6 +3,7 @@
   "built": false,
   "preview": {"built": true, "stages": [1, 4], "identity": "GET /user login equals bot and id in recorders, then GET /users/{operator} id in recorders; stop immediately on failure", "writes": false, "dispatch": false},
   "apply": {"built": true, "stages": [4], "leases": "requires leases=true and preprovisioned slots on agent-board-leases", "activation": false},
+  "revisit": {"built": true, "default": "off", "reads": "bounded native issue updated_at and complete unedited recorder thread", "starts": "stage 4 claim/admit/start/receipt/recovery only", "activation": false},
   "doc": "docs/forges.md#a-forgejo-pass",
   "forgejo": {
     "release": "v17.0.1",
@@ -132,6 +133,7 @@
         {"capability": "open pull request for an item", "verdict": "native", "forgejo": "GET pulls?state=open, the bot's or operator's whose body has a closing keyword and the issue; unreadable holds"},
         {"capability": "WIP and runs in flight", "verdict": "native", "forgejo": "caller runs in waiting, blocked and running, listed whole twice"},
         {"capability": "pool pacing", "verdict": "same"},
+        {"capability": "spare-capacity revisits", "verdict": "native", "forgejo": "issue updated_at, shared silence/weight/sample rules and injected pass clock; recorder-id unedited plans and bot verdicts; existing stage 4 admission"},
         {"capability": "plan claims and dispatch", "verdict": "native", "forgejo": "appended claim, dispatch with return_run_info, run checked by trigger user, workflow and inputs"},
         {"capability": "one rerun", "verdict": "native", "forgejo": "POST runs/{id}/rerun, recorded with the jobs' attempt"},
         {"capability": "leases", "verdict": "native", "forgejo": "contents API blob-sha compare and swap"},

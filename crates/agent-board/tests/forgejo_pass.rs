@@ -64,6 +64,17 @@ fn refusals_precede_credentials_and_auxiliary_files() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains(TOKEN_VAR), "{error}");
     assert!(!error.contains("GH_TOKEN"), "{error}");
+    let mut revisits = base.clone();
+    revisits["triage"] = true.into();
+    revisits["planPools"] = json!(["claude"]);
+    revisits["pools"] = json!({"claude":{}});
+    revisits["usage"] = json!({"url":"http://broker.internal/usage"});
+    revisits["revisit"] = json!({"perPass":1,"afterDays":14});
+    std::fs::write(&path, revisits.to_string()).unwrap();
+    let output = command(&path).assert().failure().get_output().clone();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains(TOKEN_VAR), "{error}");
+    assert!(!error.contains("GH_TOKEN"), "{error}");
     for option in ["follow", "bodyPlans"] {
         let mut value = base.clone();
         value[option] = false.into();
@@ -249,6 +260,9 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
     value["workRepositories"] = json!(["team.example/work.repo"]);
     value["usage"] = json!({"url": format!("{origin}/broker/usage")});
     value["pools"] = json!({"claude": {}});
+    value["triage"] = true.into();
+    value["planPools"] = json!(["claude"]);
+    value["revisit"] = json!({"perPass":1,"afterDays":14});
     std::fs::write(&path, value.to_string()).unwrap();
     let output = command(&path)
         .env(TOKEN_VAR, "fixture-only")

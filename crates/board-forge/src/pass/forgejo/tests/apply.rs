@@ -335,6 +335,332 @@ fn applying(fake: &Applying, limits: Limits) -> Report {
     .unwrap()
 }
 
+fn revisit_file() -> Value {
+    let mut value = file();
+    value["board"]["url"] = URL.into();
+    value["wip"] = 2.into();
+    value["workRepositories"] = json!(["example/work"]);
+    value["pools"] = json!({"claude":{}, "openai":{"burst":10}});
+    value["leases"] = true.into();
+    value["triage"] = true.into();
+    value["triagePools"] = json!(["claude"]);
+    value["revisit"] = json!({"perPass":1,"afterDays":14,"heldAfterDays":7,"pools":["openai"]});
+    value
+}
+
+fn revisit_fake() -> Applying {
+    let mut fake = Applying::new();
+    fake.comments.borrow_mut().clear();
+    fake.reads.listed.issues[0]["labels"] = json!([{"name":"agent-board"},{"name":"needs-human"}]);
+    fake.reads.listed.issues[0]["updated_at"] = "2026-10-01T00:00:00Z".into();
+    fake
+}
+
+fn revisiting(fake: &Applying, value: &Value, mode: Mode<'_>, limits: Limits) -> Report {
+    run(
+        fake,
+        &BrokerFake::default(),
+        &config(value),
+        (mode, limits),
+        usage::tests::now(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn revisit_due_held_uses_native_admission_once_even_after_ambiguous_start() {
+    for fault in [
+        "",
+        "lost-reply",
+        "204",
+        "claim-reply-lost",
+        "receipt-before",
+    ] {
+        let mut fake = revisit_fake();
+        fake.fault = fault;
+        let value = revisit_file();
+        let report = revisiting(&fake, &value, Mode::Local, Limits::default());
+        assert_eq!(
+            fake.posts("/dispatches"),
+            usize::from(fault != "claim-reply-lost"),
+            "{fault}: {:?}",
+            report.lines
+        );
+        let body = fake.comments.borrow()[&7][0]["body"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(body.starts_with(revisit::REVISIT));
+        assert!(body.contains("https://forge.example:8443/subpath/example/work/issues/7"));
+        assert!(body.contains("\"pool\":\"openai\""));
+        assert!(body.contains("held (labelled needs-human)"));
+        assert!(!body.contains("github.com"));
+        revisiting(&fake, &value, Mode::Local, Limits::default());
+        assert_eq!(
+            fake.posts("/dispatches"),
+            usize::from(fault != "claim-reply-lost"),
+            "{fault}"
+        );
+        assert_eq!(
+            fake.comments.borrow()[&7]
+                .iter()
+                .filter(|c| text(c, "/body").starts_with(revisit::REVISIT))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn revisit_silence_scope_caps_and_capacity() {
+    for case in [
+        "off",
+        "recent",
+        "held-days",
+        "missing-time",
+        "bad-time",
+        "wip",
+        "pool",
+        "dispatch-cap",
+        "write-cap",
+        "edited",
+        "unreadable",
+        "pending",
+    ] {
+        let mut fake = revisit_fake();
+        let mut value = revisit_file();
+        let mut limits = Limits::default();
+        match case {
+            "off" => {
+                value.as_object_mut().unwrap().remove("revisit");
+            }
+            "recent" => fake.reads.listed.issues[0]["updated_at"] = "2026-10-22T00:00:00Z".into(),
+            "held-days" => value["revisit"]["heldAfterDays"] = 30.into(),
+            "missing-time" => fake.reads.listed.issues[0]
+                .as_object_mut()
+                .unwrap()
+                .remove("updated_at")
+                .map(|_| ())
+                .unwrap(),
+            "bad-time" => fake.reads.listed.issues[0]["updated_at"] = "invalid".into(),
+            "wip" => {
+                for id in [80, 81] {
+                    fake.runs
+                        .borrow_mut()
+                        .push(caller_run(id, "implement example/work#8 (claude)"));
+                }
+            }
+            "pool" => {
+                value["pools"]["openai"] = json!({"target":0.5});
+            }
+            "dispatch-cap" => limits.dispatch = Some(0),
+            "write-cap" => limits.writes = Some(4),
+            "edited" => {
+                fake.add(7, 400, BOT, revisit::REVISIT);
+                fake.comments.borrow_mut().get_mut(&7).unwrap()[0]["updated_at"] =
+                    "2026-10-23T15:15:11Z".into();
+            }
+            "unreadable" => fake.reads.listed.issues[0]["labels"]
+                .as_array_mut()
+                .unwrap()
+                .extend([json!({"name":"priority/P0"}), json!({"name":"priority/P1"})]),
+            "pending" => fake.add(7, 400, OPERATOR, "```agent-board-plan\ninvalid\n```"),
+            _ => unreachable!(),
+        }
+        let report = revisiting(&fake, &value, Mode::Local, limits);
+        assert_eq!(fake.posts("/dispatches"), 0, "{case}: {:?}", report.lines);
+        assert_eq!(fake.posts("/comments"), 0, "{case}: {:?}", report.lines);
+    }
+}
+
+#[test]
+fn revisit_sampling_is_deterministic_bounded_and_after_normal_work() {
+    let value = revisit_file();
+    let make = || {
+        let mut fake = revisit_fake();
+        for n in 8..=12 {
+            let mut other = issue(n, OPERATOR, &["agent-board", "needs-human"]);
+            other["updated_at"] = "2026-10-01T00:00:00Z".into();
+            fake.reads.listed.issues.push(other);
+        }
+        fake
+    };
+    let first = make();
+    let second = make();
+    for fake in [&first, &second] {
+        let report = revisiting(fake, &value, Mode::Local, Limits::default());
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(report.tally.1.revisited, Some(Some(1)));
+        assert_eq!(fake.posts("/dispatches"), 1);
+    }
+    assert_eq!(*first.comments.borrow(), *second.comments.borrow());
+    // A normal accepted implement plan gets the only slot before held revisits.
+    let mut fake = Applying::new();
+    let mut held = issue(8, OPERATOR, &["agent-board", "needs-human"]);
+    held["updated_at"] = "2026-10-01T00:00:00Z".into();
+    fake.reads.listed.issues.push(held);
+    let mut value = value;
+    value["wip"] = 1.into();
+    let report = revisiting(&fake, &value, Mode::Local, Limits::default());
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(fake.posts("/dispatches"), 1);
+    assert!(!fake.comments.borrow().contains_key(&8));
+}
+
+#[test]
+fn revisit_records_require_recorder_ids_and_unedited_bot_verdicts() {
+    let value = revisit_file();
+    for user in [BOT, OPERATOR, 999] {
+        let fake = revisit_fake();
+        fake.add(7, 400, user, revisit::REVISIT);
+        let report = revisiting(&fake, &value, Mode::Local, Limits::default());
+        assert_eq!(
+            fake.posts("/dispatches"),
+            usize::from(user == 999),
+            "{user}: {:?}",
+            report.lines
+        );
+    }
+    for case in [
+        "unchanged",
+        "foreign-verdict",
+        "edited-verdict",
+        "changed",
+        "unanswered",
+    ] {
+        let mut fake = revisit_fake();
+        revisiting(&fake, &value, Mode::Local, Limits::default());
+        fake.runs.borrow_mut()[0]["status"] = "success".into();
+        // A prior, completed revisit and claim, older than heldAfterDays.
+        for comment in fake.comments.borrow_mut().get_mut(&7).unwrap() {
+            comment["created_at"] = "2026-10-01T15:15:10Z".into();
+            comment["updated_at"] = comment["created_at"].clone();
+            comment["body"] = text(comment, "/body")
+                .replace("2026-10-23T15:15:10", "2026-10-01T15:15:10")
+                .into();
+        }
+        if case != "unanswered" {
+            fake.add(
+                7,
+                900,
+                if case == "foreign-verdict" { 999 } else { BOT },
+                "```schedule-triage\n{\"verdict\":\"not-done\"}\n```",
+            );
+        }
+        if case == "edited-verdict" {
+            fake.comments
+                .borrow_mut()
+                .get_mut(&7)
+                .unwrap()
+                .last_mut()
+                .unwrap()["updated_at"] = "2026-10-23T15:15:11Z".into();
+        }
+        if case == "changed" {
+            fake.reads.listed.issues[0]["body"] = "New facts".into();
+        }
+        let report = revisiting(&fake, &value, Mode::Local, Limits::default());
+        let again = matches!(case, "foreign-verdict" | "changed" | "unanswered");
+        assert_eq!(
+            fake.posts("/dispatches"),
+            1 + usize::from(again),
+            "{case}: {:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn revisit_preview_never_writes_and_validates_configuration_bounds() {
+    let fake = revisit_fake();
+    let value = revisit_file();
+    let report = revisiting(&fake, &value, Mode::Preview, Limits::default());
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("would start revisit "))
+    );
+    assert!(fake.writes.borrow().is_empty());
+    for (key, invalid) in [
+        ("perPass", json!(0)),
+        ("perPass", json!(6)),
+        ("afterDays", json!(0)),
+        ("heldAfterDays", json!(91)),
+        ("pools", json!([])),
+        ("pools", json!(["unknown"])),
+    ] {
+        let mut value = value.clone();
+        value["revisit"][key] = invalid;
+        assert!(Config::parse(&value.to_string()).is_err(), "{key}");
+    }
+}
+
+#[test]
+fn revisit_receipt_failure_keeps_per_pass_allowance_and_slot() {
+    for fault in ["receipt-before", "receipt-lost", "claim-reply-lost"] {
+        let mut fake = revisit_fake();
+        fake.fault = fault;
+        let mut other = issue(8, OPERATOR, &["agent-board", "needs-human"]);
+        other["updated_at"] = "2026-10-01T00:00:00Z".into();
+        fake.reads.listed.issues.push(other);
+        let report = revisiting(&fake, &revisit_file(), Mode::Local, Limits::default());
+        assert_eq!(
+            fake.posts("/dispatches"),
+            usize::from(fault != "claim-reply-lost"),
+            "{fault}: {:?}",
+            report.lines
+        );
+        assert_eq!(report.tally.1.revisited, Some(Some(1)), "{fault}");
+        assert_eq!(
+            fake.comments.borrow().len(),
+            1,
+            "must not plan a second candidate: {fault}"
+        );
+    }
+}
+
+#[test]
+fn unheld_revisits_are_not_failed_normal_work_in_either_mode() {
+    for mode in [Mode::Preview, Mode::Local] {
+        let mut fake = revisit_fake();
+        fake.reads.listed.issues[0]["labels"] = json!([{"name":"agent-board"}]);
+        let value = revisit_file();
+        let report = revisiting(&fake, &value, mode, Limits::default());
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(report.tally.1.revisited, Some(Some(1)));
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("would start example/"))
+        );
+        assert_eq!(
+            fake.posts("/dispatches"),
+            usize::from(!matches!(mode, Mode::Preview))
+        );
+    }
+    // A pending/recent revisit must not be previewed as a normal start on
+    // the normal pool, nor take the only free slot away from another revisit.
+    for mode in [Mode::Preview, Mode::Local] {
+        let mut fake = revisit_fake();
+        let value = revisit_file();
+        revisiting(&fake, &value, Mode::Local, Limits::default());
+        fake.runs.borrow_mut()[0]["status"] = "success".into();
+        fake.reads.listed.issues[0]["labels"] = json!([{"name":"agent-board"}]);
+        let report = revisiting(&fake, &value, mode, Limits::default());
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        assert_eq!(report.tally.1.started, 0);
+        assert_eq!(fake.posts("/dispatches"), 1);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("revisited too recently"))
+        );
+    }
+}
+
 #[test]
 fn apply_start_bind_receipt_and_second_pass_is_idle() {
     let fake = Applying::new();

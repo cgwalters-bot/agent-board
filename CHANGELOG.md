@@ -11,6 +11,10 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Optional native Forgejo revisits after normal stage 4 work, using bounded
+  issue/comment reads, shared seeded sampling and the existing claim, lease,
+  start and recovery path. Off by default, with no caller activation;
+  PR follow-up and sweep remain refused (docs/forges.md#native-revisits).
 - Forge-aware pass name admission: dotted Forgejo logins and repository owners
   now reach identity preview, without widening GitHub rules or allowing names
   to alter API paths. Recorder-id verification and preview-only behavior remain.

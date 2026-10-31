@@ -73,8 +73,15 @@ says it is not serialized against the scheduled pass. Each attempted lease,
 claim, bind, receipt and cancellation write consumes `--max-writes`; each
 start or rerun POST consumes `--max-dispatch`, including lost replies. A new
 start needs room for its four normal writes before admission; partial failures
-hold rather than bypass a cap. Sweep/revisit ownership and scheduling are deferred to
-follow-ups to #513, not activated by this preview. Existing GitHub JSON,
+hold rather than bypass a cap. Optional `revisit` now uses spare stage 4 capacity
+after normal work, with native issue timestamps and unedited recorder comments;
+it starts through the same claim/admit/start/receipt/recovery path. It retains
+`perPass`, `afterDays`, `heldAfterDays` and pool selection, the seeded weighted
+sample and unchanged-input cooldown. It needs `triage: true` (parents/epics
+are not read yet). A held issue may be revisited, but unreadable facts, a run
+or matching pull request still hold it. Preview reports revisits without writes;
+apply needs room for the plan comment plus the four normal writes. Sweep
+ownership remains deferred and explicitly refused. Existing GitHub JSON,
 publication requirements and replays are unchanged. No deployed caller config,
 workflow or secrets are changed.
 

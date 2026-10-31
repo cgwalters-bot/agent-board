@@ -19,14 +19,14 @@ const PER_PASS_LIMIT: u64 = 5;
 const DAYS_LIMIT: u64 = 90;
 /// The most days an issue nothing changed on waits between revisits: the
 /// code and board it is checked against may move on without touching it.
-const UNCHANGED_DAYS: u64 = DAYS_LIMIT;
+pub(super) const UNCHANGED_DAYS: u64 = DAYS_LIMIT;
 /// How many `afterDays` (or `heldAfterDays`) of silence count towards an
 /// item's weight; longer is no heavier.
 const SILENCE_STEPS: i64 = 4;
 /// Issues drawn a pass for each of `perPass`, so that drawn issues left
 /// alone (a recent revisit, a plan waiting to start) do not use up the
 /// pass's revisits, while a board of them costs a bounded number of reads.
-const DRAWS_PER_REVISIT: usize = 3;
+pub(super) const DRAWS_PER_REVISIT: usize = 3;
 /// What a revisit's triage plan says first: the record that keeps the issue
 /// from being revisited again within its days.
 pub(super) const REVISIT: &str =
@@ -74,16 +74,29 @@ impl Revisit {
         Ok(())
     }
 
-    fn pools<'a>(&'a self, config: &'a Config) -> &'a [String] {
+    pub(super) fn pools<'a>(&'a self, config: &'a Config) -> &'a [String] {
         self.pools.as_deref().unwrap_or(config.triage_pools())
     }
 
     /// The days an item waits: `heldAfterDays` where a person holds it.
-    fn days(&self, held: bool) -> u64 {
+    pub(super) fn days(&self, held: bool) -> u64 {
         match held {
             true => self.held_after_days.unwrap_or(self.after_days),
             false => self.after_days,
         }
+    }
+
+    /// Silence is measured only from a readable native update time, against
+    /// the pass's injected clock, never the wall clock of an individual read.
+    pub(super) fn silence(
+        &self,
+        updated: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+        held: bool,
+    ) -> Option<(u64, i64)> {
+        let days = self.days(held);
+        let silent = (now - updated?).whole_days();
+        (silent >= days as i64).then_some((days, silent))
     }
 }
 
@@ -209,9 +222,6 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let writers = self.writers();
         let mut due = Vec::new();
         for (rank, facts) in candidates {
-            let Some(updated) = facts.updated else {
-                continue;
-            };
             if revisit_hold(facts, &slots.busy, &writers).is_some()
                 || self.outside_epics(facts).is_some()
             {
@@ -219,11 +229,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             let status = facts.status.as_deref();
             let held = person_hold(&facts.labels, facts.labels_complete, status);
-            let days = revisit.days(held.is_some());
-            let silent = (self.now - updated).whole_days();
-            if silent < days as i64 {
+            let Some((days, silent)) = revisit.silence(facts.updated, self.now, held.is_some())
+            else {
                 continue;
-            }
+            };
             let parented = facts.parent.is_some();
             let weight = weight(board.options.len(), rank, parented, silent, days);
             due.push(Due {
