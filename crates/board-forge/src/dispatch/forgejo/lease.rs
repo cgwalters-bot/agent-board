@@ -47,7 +47,7 @@ impl<T: Transport> Forgejo<'_, T> {
             git_ref: branch.into(),
             ..self.target.clone()
         }
-        .validate()?;
+        .validate_for(crate::forgejo::Naming::Forgejo)?;
         ensure!(slot < SLOTS, "lease slot exceeds cap");
         let mut url = self.instance.api_root()?.join(&format!(
             "repos/{}/contents/leases/{slot}.json",
@@ -167,7 +167,7 @@ impl<T: Transport> Forgejo<'_, T> {
             "lease needs unique claim and pool"
         );
         let (repo, item) = lease.item.rsplit_once('#').context("invalid lease item")?;
-        crate::poll::validate_repository(repo)?;
+        crate::forgejo::validate_repository(repo)?;
         ensure!(
             item.parse::<u64>().is_ok_and(|n| n > 0),
             "invalid lease item number"

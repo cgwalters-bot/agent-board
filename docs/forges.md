@@ -10,13 +10,13 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels; pass identity and broker preview | Library board-write primitives and native dispatch/run/lease adapters; no CLI/pass writes or activation ([contract](#a-forgejo-pass)) |
+| Forgejo | Issues of configured repositories, fields from labels; pass identity and broker pacing | Stage 4 apply: claims, starts, recovery, leases and one rerun; no activation ([contract](#a-forgejo-pass)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Existing dispatch callers still use GitHub Actions. The backend boundary also
 offers opt-in native Forgejo start, recovery, active inventory, status, rerun,
 admission, reservation binding and release ([dispatch](dispatch.md#native-forgejo-adapters-not-activated)).
-No scheduler or CLI selects them yet.
+The Forgejo pass selects them for stage 4; other dispatch callers remain GitHub-only.
 The design's approach to other forges, capability
 negotiation rather than weakened guarantees, is in
 [Rust boundaries](design.md#7-rust-boundaries).
@@ -90,8 +90,8 @@ let a deleted or renamed label widen the board. The write side keeps that.
 `Forge::board_write` is a deterministic controller primitive, not an
 agent-output publisher. It refuses by default on other backends. Forgejo
 implements one scoped label replacement, issue open/close, append-only
-comments, and plan claims with their receipts. Nothing calls it from the CLI
-or a deployed caller yet. Its explicit
+comments, and plan claims with their receipts. The Forgejo pass's applying
+stage 4 calls its claim and receipt operations; no deployed caller is activated. Its explicit
 `apply` argument previews when false; each attempted mutation consumes the
 caller's remaining write cap, including an ambiguous failure. Each operation
 has at most 32 read requests and each comment at most 16,000 characters.
@@ -119,9 +119,9 @@ only later, so this needs one pass per board, as the pass's lease gives.
 Receipts are further comments by the claim's author whose first line
 is `<!-- agent-board-receipt: CLAIM-ID -->`; plain comments may not start with
 a claim or receipt line. `Forge::plan_claim` reads a plan's earliest claim and
-its receipts back for recovery. Choosing which plan to claim, dispatch (#512),
-scheduling (#513) and epic issues outside the board's membership (#514) are
-not built. Arbitrary
+its receipts back for recovery. Stage 4 now chooses and claims job plans and
+uses the native dispatch adapters; epic issues outside the board's membership
+remain #514. Arbitrary
 agent proposals must still go through independent check/apply; the CLI's
 `output check` and `output apply` remain unsupported. No caller settings or
 deployment are changed here.
@@ -131,15 +131,16 @@ deployment are changed here.
 This is the contract for a second, separate `agent-board pass` that drives a
 Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
 tracker#786). **The end-to-end pass is not built**. `agent-board pass --config FILE`
-now accepts a Forgejo board for preview only: identity checks, then stage 1's
+now accepts a Forgejo board: identity checks, then stage 1's
 broker usage and grants, and stage 4's candidates, holds and runs in flight
 (#522, [below](#stage-4-in-preview)), with one `not built on Forgejo yet` line
-for each of stages 2, 3, 5 and 6. It writes and dispatches nothing. `--apply` (pending #513),
-`--fix-bounds` and `--record`/`--replay` are refused before credentials are read.
+for each of stages 2, 3, 5 and 6. Preview writes and dispatches nothing;
+`--apply` supports [stage 4 only](#stage-4-apply). `--fix-bounds` and
+`--record`/`--replay` are refused before credentials are read.
 The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
 of scheduler wiring. Offline tests are not live proof.
-The remaining driver wiring covers scheduling (#513), epics (#514) and live
+The remaining driver wiring covers Status/snapshots (#523), epics (#514) and live
 CI (#515). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
 [pass option](pass.md#one-configuration-file); a test fails when an option is
@@ -157,7 +158,7 @@ the feature is refused, not approximated.
 
 The instance is the configuration's `board`, as for the reads (`url`,
 `tokenEnv`, `repositories`, `membership`, `recorders`), in the pass's own
-trusted file, with `"forge": "forgejo"`. The pass accepts it only for preview. Its
+trusted file, with `"forge": "forgejo"`. Its
 scope is fixed by that file alone:
 
 * **Host.** Every request goes to the canonical `url` (scheme, host and port
@@ -174,7 +175,7 @@ scope is fixed by that file alone:
 * **Token.** One bot user's access token from `tokenEnv`, with the scopes
   `read:user`, `read:issue`, `write:issue`, `read:repository` and
   `write:repository` ([scopes][fj-scopes], [route groups][fj-api-scopes]) and
-  no admin, organization or `all` scope. At the start of every preview (and a future applying pass),
+  no admin, organization or `all` scope. At the start of every preview or applying pass,
   `GET /user` must name `bot` with an id in `recorders`; otherwise nothing is
   written. Not the Actions automatic token: its user's id is negative, so it
   can be no recorder, and the comments it writes wake no workflow
@@ -200,8 +201,8 @@ The preview rejects every explicitly supplied refused option, even `false`,
 an empty collection or a nested setting, with
 `unsupported_capability: OPTION: REASON` from the contract, before token lookup.
 It also temporarily rejects `epics` (#514), `holds`, usage publication
-(`usage.repository`/`usage.issue`), `usage.probe`, leases and reruns (scheduler
-wiring #513). Sweep and revisit remain deferred: follow-ups to #513 must own
+(`usage.repository`/`usage.issue`) and `usage.probe` (#523). Leases and reruns
+are accepted. Sweep and revisit remain deferred: follow-ups to #513 must own
 their scheduling and publication semantics; neither is silently enabled by
 this preview or claimed as built by the native adapters.
 
@@ -275,6 +276,56 @@ start …`), choosing the pool from stage 1's snapshot.
 An issue is keyed by its instance URL and `OWNER/REPO#N`, so two
 configurations for two instances never share one, and every request goes to
 the configuration's own instance.
+
+### Stage 4 apply
+
+`--apply` is off by default. No deployment, token or caller is provisioned or
+activated. Applying work requires the existing `leases: true` setting, with
+one preprovisioned slot per WIP unit on the private caller's
+`agent-board-leases` branch. Slots are `leases/0.json` through
+`leases/(wip-1).json`, initially `{"free":"initial"}`. No lease means no start.
+
+The concrete threat is duplicate work after a pass races or dies around a
+dispatch. Stage 4 uses one existing claim/reservation protocol, in order:
+
+1. Read the newest job-plan comment by a recorder id, unedited under the
+   comment rules below. Validate its target, kind, runner and configured pool.
+   No plan holds for a person; it does not synthesize a triage plan. Stacked
+   plans are held because Forgejo stack resolution is not wired.
+2. Admit a unique `run: 0` lease reservation, then `BoardOperation::Claim`.
+3. Reread the thread and claim, membership, labels, dependencies, matching
+   pull requests, WIP, leases and pool/budget pacing before the start POST.
+4. Call the native dispatch adapter once, bind a confirmed id, then append
+   `BoardOperation::Receipt` with the run link or refusal/ambiguity.
+
+A 204, lost reply or unverifiable 201 is receipted and never retried. A claim
+without a receipt is recovered read-only, even when WIP is full or pacing
+holds. Exactly one matching run is bound and receipted as found; no match,
+several matches, a missing reservation or an edited recorder record holds
+for a person without another claim or POST. The reservation preserves the
+chosen pool. Starts run serially, not concurrently.
+
+`reruns: true` enables one rerun of a failed receipted run. The adapter checks
+all jobs' attempts; stage 4 records run id and attempt 1 before POST. Attempt
+2 or an existing rerun record holds, even after a lost rerun reply. Completed
+runs release their leases; expired leases are reaped with the existing
+ownership checks. Ambiguous unbound reservations are not released early.
+
+Every attempted mutation is capped: starts/reruns by `--max-dispatch`, other
+writes (lease operations, claims, receipts and cancellation) by `--max-writes`.
+A start needs space for four normal writes before admission. A cap reached
+after an unexpected failure never authorizes another write; recovery observes
+what remains. All I/O shares the 500-request/15-minute pass bound.
+
+To prevent two scheduled passes observing the same free capacity, an applying
+Forgejo Actions pass lists its **own pass workflow's** active runs on the
+configured instance, not GitHub. Actions `SERVER_URL` must match `board.url`;
+`REPOSITORY` and `RUN_ID` identify its run (`FORGEJO_*`, with `GITHUB_*`
+compatibility aliases). Another running pass holds stage 4. Outside Actions,
+both caps are required and serialization against the schedule is not promised.
+These bounded observations are not an atomic cross-workflow lock: deployments
+must serialize pass invocations. Status, snapshots and epics are not part of
+this applying slice (#523 and #514); other refusals remain in force.
 
 ### Labels and Status
 

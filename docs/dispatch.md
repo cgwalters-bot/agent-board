@@ -10,8 +10,8 @@ job through one interface (`board_forge::dispatch`): a start request (target
 repository, item, kind, brief, pool, runner, optional base) and a trusted route
 from configuration, answered with a run handle, a start without one, a refusal
 that started nothing, or an unknown outcome. Existing callers use GitHub
-Actions `workflow_dispatch`. Native Forgejo library adapters are also available
-but not wired to any CLI or scheduler (see below); closed
+Actions `workflow_dispatch`. The Forgejo pass's stage 4 also uses native
+Forgejo adapters (see below); closed
 [agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295)
 delivered only the start request.
 This page describes the interface as it exists.
@@ -181,8 +181,9 @@ is a workflow of this shape.
 
 ### Native Forgejo adapters (not activated)
 
-`board_forge::dispatch::Forgejo` sits alongside `GitHub`. No existing caller
-selects it and no pass option enables it. Construction takes the trusted
+`board_forge::dispatch::Forgejo` sits alongside `GitHub`. A Forgejo board's
+`pass --apply` selects it for stage 4 only; other CLI dispatch paths remain
+GitHub-only. No deployed caller is activated. Construction takes the trusted
 instance `forgejo::Config`, `dispatch::Target`, accepted input names and bot
 recorder id; `/user` must confirm that id. No response supplies routing or
 credentials. Unsupported kinds (including PR follow-up), runners and inputs
@@ -237,7 +238,8 @@ Slots sharing a branch can fail each other's non-forced push even when updating
 different files. Such failures hold the reservation: this affects liveness,
 not ownership safety, and is another reason for the caller to serialize starts.
 
-These are primitives, not a scheduler or durable journal. Final admission
+The Forgejo pass now supplies stage 4's durable journal through board claims
+and append-only receipts ([apply](forges.md#stage-4-apply)). Final admission
 callbacks must preserve WIP, pool pacing, dispatch/write caps, one lease per
 run, unexpired ownership and durable plan/rerun claims immediately before POST.
 A lost rerun reply holds even if jobs still show attempt 1. Ambiguous
@@ -246,6 +248,16 @@ transports and deployments without the pinned contents-write guarantees
 refuse, with no GitHub fallback. The [caller and live CI prerequisites](forges.md#the-caller)
 remain. Offline source-shaped fixtures validate the pinned API contract, not
 a deployed server, runner or production activation.
+
+Stage 4 reserves `run: 0`, claims the newest accepted recorder plan, rereads
+it, starts, binds a confirmed id, then appends its receipt. An ambiguous start
+is receipted and never retried. Only an unreceipted claim invokes read-only
+recovery; zero or multiple matches hold for a person. The selected pool is
+kept in the reservation so recovery does not choose a different request.
+Reruns record the run and job attempt 1 before POST, so a lost reply cannot
+grant a second rerun even if the jobs still report attempt 1. Terminal runs'
+leases are released; unbound reservations wait until expiry. Every mutation,
+including best-effort cancellation, shares the pass's caps and request bound.
 
 ## Recording a run on the board
 
