@@ -7963,22 +7963,34 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
 /// A budget that runs out once candidates were held and started defers the
 /// rest to the next pass, as a full wip does, rather than failing it
 /// (tracker#908); one too small for the first candidate is still a failure.
+/// tracker#527's plan waits on an open pull request's overlap: it is held
+/// for that, not by the budget a start needs, however little is left.
 #[test]
 fn apply_defers_the_rest_when_its_budget_runs_out() {
     let config = config(json!({"wip": 8}));
+    let overlap = "hold cgwalters-forge/tracker#527: Waiting: open pull request cgwalters-forge/tracker#832 changes `README.md`.";
+    // The limit, the stop, the failures, and the runs started.
     let cases = [
         (
-            170,
-            "budget: 61 requests left, fewer than a start may take (68); 1 more candidate(s) wait",
+            160,
+            "budget: 59 requests left, fewer than a start may take (68); 1 more candidate(s) wait",
             0,
+            5,
+        ),
+        (
+            120,
+            "budget: 61 requests left, fewer than a start may take (68); 4 more candidate(s) wait",
+            0,
+            2,
         ),
         (
             84,
             "budget: 62 requests left, fewer than a start may take (68); 9 more candidate(s) wait",
             1,
+            0,
         ),
     ];
-    for (limit, line, failures) in cases {
+    for (limit, line, failures, started) in cases {
         let forge = Forge::new(None, false);
         let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
         let report = block(run_within(
@@ -8000,12 +8012,13 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             "limit {limit}: {:#?}",
             report.lines
         );
+        assert_eq!(forge.dispatches().len(), started, "limit {limit}");
         if failures == 0 {
             let holds = (report.lines.iter())
                 .filter(|l| l.starts_with("hold cgwalters-forge/"))
                 .count();
             assert_eq!(holds, 3, "limit {limit}: {:#?}", report.lines);
-            assert_eq!(forge.dispatches().len(), 5, "limit {limit}");
+            assert!(report.lines.iter().any(|l| l == overlap), "limit {limit}");
         }
     }
 }

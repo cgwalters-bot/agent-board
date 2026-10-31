@@ -3634,33 +3634,39 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             issue.display()
         );
         let holds = vec![issue.clone(), dest.clone()];
+        // What the dispatch would decide of its stack and overlap, read but
+        // not written. An apply asks too, before the recheck: a plan that
+        // waits on either is held for these reads, not after a start's
+        // recheck and the plan protocol's reads, nor stopped by the budget
+        // a start needs. The dispatch decides again on what it reads then.
+        let bot = Some(config.bot.as_str());
+        let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
+            Ok(stacked) => stacked,
+            // The slice it stacks on is neither open nor closed yet.
+            Err(wait) => {
+                return Ok(Step::Hold(Hold::new(HoldKind::WaitingOn, wait.sentence())));
+            }
+        };
+        if base.is_none() {
+            let decision = overlap::decide_strict(
+                &self.client,
+                (issue, &dest),
+                &plan.brief,
+                &config.bot,
+                target,
+                (&self.ended_runs(), &waiver),
+            );
+            if let Some(step) = self.overlap_hold((issue, &dest), decision) {
+                return Ok(step);
+            }
+        }
         // A start the cap holds is judged as a preview judges it, so that it
         // is held by the cap only where it would have started.
         if !self.apply || self.caps.full(Kind::Dispatch) {
-            // What the dispatch would decide, read but not written.
-            let bot = Some(config.bot.as_str());
-            let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
-                Ok(stacked) => stacked,
-                // The slice it stacks on is neither open nor closed yet.
-                Err(wait) => {
-                    return Ok(Step::Hold(Hold::new(HoldKind::WaitingOn, wait.sentence())));
-                }
-            };
-            if base.is_none() {
-                let decision = overlap::decide_strict(
-                    &self.client,
-                    (issue, &dest),
-                    &plan.brief,
-                    &config.bot,
-                    target,
-                    (&self.ended_runs(), &waiver),
-                );
-                if let Some(step) = self.overlap_hold((issue, &dest), decision) {
-                    return Ok(step);
-                }
-            }
             return Ok(self.capped(&line).unwrap_or(Step::Started(line, holds)));
         }
+        // What the dispatch's own check waives is what the pass reports.
+        self.ignored.borrow_mut().clear();
         if let Some(step) = self.recheck(slots, (issue, &dest), target, hold)? {
             return Ok(step);
         }

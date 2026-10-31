@@ -760,7 +760,11 @@ OWNER/REPO#N is a pull request; a plan names the issue it implements`), not
 read as an unreadable issue; that is known only from one more read where
 the issue read fails with `NOT_FOUND`. To avoid duplicate/conflicting work, pass always enables the
 existing bot overlap check and conservatively waits when it cannot complete it;
-this is stricter than standalone dispatch's best-effort heuristic.
+this is stricter than standalone dispatch's best-effort heuristic. An implement
+plan's stack and overlap are checked before a start's recheck, in an apply as
+in a preview, so that a plan waiting on either is held for those reads alone,
+never stopped by the budget a start reserves; the dispatch checks both again on
+what it reads then.
 
 With `overlap` set (agent-board#426), an open pull request of the bot's that
 overlaps a start does not hold it when it is a draft opened and last
