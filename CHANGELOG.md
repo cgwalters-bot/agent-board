@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Forgejo pass `--record` and `--replay`: a preview's forge and broker reads
+  saved in order, with 404s, totals and failures, to a fixture pinned to its
+  instance, and replayed offline with no token or client
+  (docs/forges.md#recording-and-replay). Seeded recordings stay GitHub-only.
+
 - Forge-aware pass name admission: dotted Forgejo logins and repository owners
   now reach identity preview, without widening GitHub rules or allowing names
   to alter API paths. Recorder-id verification and preview-only behavior remain.

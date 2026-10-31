@@ -42,10 +42,17 @@ fn refusals_precede_credentials_and_auxiliary_files() {
     let path = dir.join("config.json");
     let base = config("http://127.0.0.1:1/forge/");
     std::fs::write(&path, base.to_string()).unwrap();
-    for flags in [
-        vec!["--fix-bounds", "does-not-exist"],
-        vec!["--record", "does-not-exist/record.json"],
-        vec!["--replay", "does-not-exist"],
+    for (flags, refused) in [
+        (vec!["--fix-bounds", "does-not-exist"], "--fix-bounds"),
+        (
+            vec![
+                "--record",
+                "does-not-exist/record.json",
+                "--replay",
+                "does-not-exist",
+            ],
+            "--record with --replay",
+        ),
     ] {
         let output = command(&path)
             .args(&flags)
@@ -55,7 +62,7 @@ fn refusals_precede_credentials_and_auxiliary_files() {
             .clone();
         let error = String::from_utf8(output.stderr).unwrap();
         assert!(
-            error.contains(&format!("unsupported_capability: {}:", flags[0])),
+            error.contains(&format!("unsupported_capability: {refused}:")),
             "{error}"
         );
         assert!(!error.contains("authentication required"), "{error}");
@@ -250,8 +257,11 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
     value["usage"] = json!({"url": format!("{origin}/broker/usage")});
     value["pools"] = json!({"claude": {}});
     std::fs::write(&path, value.to_string()).unwrap();
+    let recording = dir.join("recording.json");
     let output = command(&path)
         .env(TOKEN_VAR, "fixture-only")
+        .arg("--record")
+        .arg(&recording)
         .assert()
         .success()
         .get_output()
@@ -278,5 +288,49 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
     );
     assert!(output.contains("dispatched 0, writes 0"), "{output}");
     server.join().unwrap();
+    let fixture = std::fs::read_to_string(&recording).unwrap();
+    assert!(!fixture.contains("fixture-only"), "{fixture}");
+    assert!(
+        !fixture.to_ascii_lowercase().contains("authorization"),
+        "{fixture}"
+    );
+    // The server is gone and no token is set: the replay reads only the
+    // fixture, and decides the same.
+    let replayed = command(&path)
+        .arg("--replay")
+        .arg(&recording)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(String::from_utf8(replayed.stdout).unwrap(), output);
+    // Another instance's board, or a GitHub fixture or board, is refused.
+    let other = dir.join("other.json");
+    value["board"]["url"] = "https://forge.example/forge".into();
+    std::fs::write(&other, value.to_string()).unwrap();
+    let github = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/pass");
+    for (config, fixture, refused) in [
+        (other.clone(), recording.clone(), "recorded on"),
+        (
+            path.clone(),
+            format!("{github}/board-2026-10-23.json").into(),
+            "not a Forgejo pass replay",
+        ),
+        (
+            format!("{github}/config.json").into(),
+            recording.clone(),
+            "a \"forgejo\" pass replay",
+        ),
+    ] {
+        let output = command(&config)
+            .arg("--replay")
+            .arg(&fixture)
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains(refused), "{error}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -135,8 +135,10 @@ now accepts a Forgejo board: identity checks, then stage 1's
 broker usage and grants, and stage 4's candidates, holds and runs in flight
 (#522, [below](#stage-4-in-preview)), with one `not built on Forgejo yet` line
 for each of stages 2, 3, 5 and 6. Preview writes and dispatches nothing;
-`--apply` supports [stage 4 only](#stage-4-apply). `--fix-bounds` and
-`--record`/`--replay` are refused before credentials are read.
+`--apply` supports [stage 4 only](#stage-4-apply). A preview can be
+[recorded and replayed](#recording-and-replay). `--fix-bounds`, and
+`--record` with `--replay` (a seeded recording), are refused before
+credentials are read.
 The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
 of scheduler wiring. Offline tests are not live proof.
@@ -276,6 +278,30 @@ start …`), choosing the pool from stage 1's snapshot.
 An issue is keyed by its instance URL and `OWNER/REPO#N`, so two
 configurations for two instances never share one, and every request goes to
 the configuration's own instance.
+
+### Recording and replay
+
+`--record FILE` previews live, as without it, and saves the pass's reads to
+FILE: the GitHub pass's replay fixture (`agent-board/pass-replay/v1`, its
+clock and one request with its answer a line) with `"forge": "forgejo"` and
+the canonical `instance` added. Every forge read and broker read is kept in
+the order the pass made it, with its body and `X-Total-Count`, a 404 as
+`{"status": 404}`, or a failure's message; a broker read by its endpoint
+only, as on GitHub. Request headers, and so the token, are never kept, and a
+recording makes no write: it is a preview, and refuses `--apply`.
+A fixture keeps what the reads answered, such as the bot's `/user` record, so
+look at it before committing it.
+
+`--replay FILE` previews the recording at its clock with no client, broker
+or credential variable: it reads only the file, and sends nothing. It runs
+the same stages under the same request bound, so a stage built later is
+recorded and replayed with no change here. The time bound is the replay's
+own: a recording cut short by it does not replay. A fixture of another instance, or a GitHub
+one, is refused before any read, and a GitHub pass refuses a Forgejo fixture.
+Each read must be the next one recorded: a missing or different request
+fails that read, every read after it, and the pass, as does a request
+recorded but never read. A seeded recording (`--record` with `--replay`)
+stays GitHub-only.
 
 ### Stage 4 apply
 

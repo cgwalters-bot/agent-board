@@ -29,7 +29,7 @@ pub struct Pass {
     /// Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through.
     #[arg(long, value_name = "N")]
     pub max_status_changes: Option<usize>,
-    /// Preview a recorded pass (a replay fixture) at its clock instead of reading GitHub; needs no token. With --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage.
+    /// Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub replay: Option<PathBuf>,
     /// Preview live, and save every read and its answer to FILE as a replay fixture.
@@ -139,14 +139,9 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                 "PR follow-up has no reviewed Forgejo equivalent",
             ),
             (
-                args.record.is_some(),
-                "--record",
-                "a Forgejo recorder is not built; use fake-transport tests",
-            ),
-            (
-                args.replay.is_some(),
-                "--replay",
-                "a Forgejo replay is not built; use fake-transport tests",
+                args.record.is_some() && args.replay.is_some(),
+                "--record with --replay",
+                "a seeded recording is GitHub-only",
             ),
         ] {
             ensure!(!supplied, "unsupported_capability: {option}: {reason}");
@@ -156,6 +151,19 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             writes: args.max_writes,
             status_changes: args.max_status_changes,
         };
+        if let Some(path) = &args.replay {
+            // No client, broker or credential variable: only the fixture.
+            let value = serde_json::from_str(&read(path)?)
+                .with_context(|| format!("decode {}", path.display()))?;
+            let replay = pass::forgejo::Replay::from_json(&value, board)
+                .with_context(|| format!("{}", path.display()))?;
+            writeln!(out, "pass: preview")?;
+            let preview = (Mode::Preview, limits);
+            let report = pass::forgejo::run(&replay, &replay, &config, preview, replay.now)?;
+            let finished = replay.finish();
+            print_report(&report, out)?;
+            return finished.with_context(|| format!("{} replayed another pass", path.display()));
+        }
         let own = args
             .apply
             .then(|| forgejo_apply_mode(board, limits))
@@ -181,13 +189,19 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                 "warning: applying outside Forgejo Actions, not serialized against the scheduled workflow's passes"
             )?;
         }
-        let report = pass::forgejo::run(
-            &client,
-            &broker,
-            &config,
-            (mode, limits),
-            time::OffsetDateTime::now_utc(),
-        )?;
+        let now = time::OffsetDateTime::now_utc();
+        let report = match &args.record {
+            // A preview: --record conflicts with --apply.
+            Some(path) => {
+                let recorder = pass::forgejo::Recorder::new(&client, &broker, board);
+                let report =
+                    pass::forgejo::run(&recorder, &recorder, &config, (mode, limits), now)?;
+                std::fs::write(path, recorder.fixture(now)?)
+                    .with_context(|| format!("write {}", path.display()))?;
+                report
+            }
+            None => pass::forgejo::run(&client, &broker, &config, (mode, limits), now)?,
+        };
         return print_report(&report, out);
     }
     config.fix_bounds = args

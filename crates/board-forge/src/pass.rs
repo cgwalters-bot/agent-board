@@ -5212,16 +5212,20 @@ impl<'a, C> Recorder<'a, C> {
     /// request to a line, so that a re-recording diffs by request.
     pub fn fixture(&self, now: OffsetDateTime) -> Result<String> {
         let head = json!({"schema": REPLAY_SCHEMA, "now": now.format(&Rfc3339)?});
-        let head = head.to_string();
-        let mut out = format!("{},\n\"requests\": [\n", head.trim_end_matches('}'));
-        let entries = self.entries.borrow();
-        for (n, entry) in entries.iter().enumerate() {
-            let comma = if n + 1 < entries.len() { "," } else { "" };
-            out.push_str(&format!("{entry}{comma}\n"));
-        }
-        out.push_str("]}\n");
-        Ok(out)
+        Ok(fixture_text(&head, &self.entries.borrow()))
     }
+}
+
+/// A replay fixture of `head`'s fields and `entries`, one to a line.
+fn fixture_text(head: &Value, entries: &[Value]) -> String {
+    let head = head.to_string();
+    let mut out = format!("{},\n\"requests\": [\n", head.trim_end_matches('}'));
+    for (n, entry) in entries.iter().enumerate() {
+        let comma = if n + 1 < entries.len() { "," } else { "" };
+        out.push_str(&format!("{entry}{comma}\n"));
+    }
+    out.push_str("]}\n");
+    out
 }
 
 impl<C: Rest> Rest for Recorder<'_, C> {
@@ -5306,6 +5310,11 @@ impl Replay {
             value["schema"] == REPLAY_SCHEMA,
             "not a pass replay (expected {REPLAY_SCHEMA})"
         );
+        // A GitHub recording names no forge; a Forgejo one replays only on
+        // its instance ([`forgejo::Replay`]).
+        if let Some(forge) = value.get("forge") {
+            bail!("a {forge} pass replay, which replays only with that board's configuration");
+        }
         let now = OffsetDateTime::parse(text(value, "/now"), &Rfc3339).context("replay now")?;
         let requests = value["requests"]
             .as_array()
