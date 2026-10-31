@@ -41,6 +41,8 @@ const BRANCH_LIMIT: usize = 200;
 const CLOSING: &[&str] = &[
     "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
 ];
+/// GitHub's web root, under which its issue URLs lie.
+const GITHUB_WEB: &str = "https://github.com/";
 
 const LOWER_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $pulls: Int!) {
   repository(owner: $owner, name: $name) {
@@ -102,7 +104,13 @@ pub fn validate_branch(branch: &str) -> Result<()> {
 /// reference after it, so `Closes #41, closes #42` closes both and
 /// `Closes #41, #42` only #41, as on GitHub.
 pub(crate) fn closes(body: &str, repo: &str, number: u64) -> bool {
-    let references = references(repo, number);
+    closes_at(body, GITHUB_WEB, repo, number)
+}
+
+/// [`closes`] on the forge whose web root is `web`, with a trailing slash,
+/// whose issue URLs are `{web}OWNER/REPO/issues/N` (GitHub's and Forgejo's).
+pub(crate) fn closes_at(body: &str, web: &str, repo: &str, number: u64) -> bool {
+    let references = references(web, repo, number);
     let mut words = body.split_whitespace().peekable();
     while let Some(word) = words.next() {
         // A list marker, quote or bracket before the keyword: `- Closes`, `(fixes`.
@@ -124,11 +132,11 @@ pub(crate) fn closes(body: &str, repo: &str, number: u64) -> bool {
 }
 
 /// The ways a description names issue `number` of `repo`.
-fn references(repo: &str, number: u64) -> [String; 3] {
+fn references(web: &str, repo: &str, number: u64) -> [String; 3] {
     [
         format!("#{number}"),
         format!("{repo}#{number}"),
-        format!("https://github.com/{repo}/issues/{number}"),
+        format!("{web}{repo}/issues/{number}"),
     ]
 }
 
@@ -154,7 +162,7 @@ pub(crate) fn after_part_of(line: &str) -> Option<&str> {
 /// `#N`, `OWNER/REPO#N` or the issue's URL, as an implement run writes for a
 /// slice that does not finish the issue (and so does not close it on merge).
 fn part_of(body: &str, repo: &str, number: u64) -> bool {
-    let references = references(repo, number);
+    let references = references(GITHUB_WEB, repo, number);
     body.lines().any(|line| {
         after_part_of(line)
             .and_then(|rest| rest.split_whitespace().next())

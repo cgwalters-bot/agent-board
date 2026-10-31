@@ -166,7 +166,11 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
             .lines()
             .filter(|l| l.contains("not built on Forgejo yet"))
             .count(),
-        5
+        4
+    );
+    assert!(
+        output.contains("schedule: off (wip 0 or no workRepositories)"),
+        "{output}"
     );
     assert!(output.contains("dispatched 0, writes 0"), "{output}");
     server.join().unwrap();

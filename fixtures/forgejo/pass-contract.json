@@ -1,7 +1,7 @@
 {
   "schema": "agent-board/forgejo-pass-contract/v1",
   "built": false,
-  "preview": {"built": true, "stages": [1], "identity": "GET /user login equals bot and id in recorders, then GET /users/{operator} id in recorders; stop immediately on failure", "writes": false, "dispatch": false},
+  "preview": {"built": true, "stages": [1, 4], "identity": "GET /user login equals bot and id in recorders, then GET /users/{operator} id in recorders; stop immediately on failure", "writes": false, "dispatch": false},
   "doc": "docs/forges.md#a-forgejo-pass",
   "forgejo": {
     "release": "v17.0.1",
@@ -128,7 +128,7 @@
         {"capability": "holds", "verdict": "native", "forgejo": "needs-human and needs-design labels, status/blocked, open /dependencies"},
         {"capability": "replanning after a merged pull request", "verdict": "refused", "reason": "Forgejo's API does not name a pull request's closing issues"},
         {"capability": "plans in issue bodies", "verdict": "refused", "reason": "an issue body's last editor cannot be read"},
-        {"capability": "open pull request for an item", "verdict": "native", "forgejo": "GET pulls, matched to its issue as #513 specifies; unreadable holds"},
+        {"capability": "open pull request for an item", "verdict": "native", "forgejo": "GET pulls?state=open, the bot's or operator's whose body has a closing keyword and the issue; unreadable holds"},
         {"capability": "WIP and runs in flight", "verdict": "native", "forgejo": "caller runs in waiting, blocked and running, listed whole twice"},
         {"capability": "pool pacing", "verdict": "same"},
         {"capability": "plan claims and dispatch", "verdict": "native", "forgejo": "appended claim, dispatch with return_run_info, run checked by trigger user, workflow and inputs"},
