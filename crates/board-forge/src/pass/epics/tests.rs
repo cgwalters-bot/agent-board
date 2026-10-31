@@ -209,8 +209,9 @@ fn unapplied(replay: &mut Replay) {
 /// `author`'s comment on tracker#596, a minute before the recording, that
 /// its recorded sub-issues are all closed.
 fn said_done(replay: &mut Replay, author: &str) {
-    let board = config(json!({})).board.unwrap();
-    let facts = EpicFacts::from_node(&node(replay, 596), Some(&board)).unwrap();
+    let config = config(json!({}));
+    let board = config.github_board().unwrap();
+    let facts = EpicFacts::from_node(&node(replay, 596), Some(board)).unwrap();
     let body = format!("{}\nEvery sub-issue is closed.", done_marker(&facts.census));
     let said = posted(replay, 596, 7_000_000_009, author, 1, &body);
     comments(replay, COMMENTS_596).push(said);
@@ -1498,9 +1499,10 @@ fn done_epic_is_asked_or_closed_once() {
                 "field": {"id": "F_why", "dataType": "TEXT"}},
             "why": null}], "totalCount": 1}}}}},
     }));
-    let board = config(json!({})).board.unwrap();
+    let config = config(json!({}));
+    let board = config.github_board().unwrap();
     let marker = done_marker(
-        &EpicFacts::from_node(&node(&replay, 596), Some(&board))
+        &EpicFacts::from_node(&node(&replay, 596), Some(board))
             .unwrap()
             .census,
     );
@@ -1652,8 +1654,9 @@ fn done_epic_is_asked_or_closed_once() {
 #[test]
 fn decide_coalesces_changes_but_not_direction() {
     let replay = replay();
-    let board = config(json!({})).board.unwrap();
-    let facts = EpicFacts::from_node(&node(&replay, 890), Some(&board)).unwrap();
+    let config = config(json!({}));
+    let board = config.github_board().unwrap();
+    let facts = EpicFacts::from_node(&node(&replay, 890), Some(board)).unwrap();
     let recorded: Vec<Comment> = {
         let mut replay = Replay {
             now: replay.now,

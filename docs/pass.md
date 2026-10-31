@@ -12,7 +12,7 @@ authority for their operations. The differences below are intentional.
 
 ## What is built
 
-The pass implements the configuration below and stages 1 to 5, except
+The GitHub pass implements the configuration below and stages 1 to 5, except
 that the one rerun is the plain [`reruns`](#reruns) rather than one only of
 infrastructure failures, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
@@ -21,6 +21,26 @@ and its line are built: it evaluates no fork pull request, reads nothing and
 writes nothing.
 The [maintain](#maintain) digest is dispatched only where its repository is
 public; elsewhere it is planned and recorded but not dispatched.
+
+A [Forgejo pass](forges.md#a-forgejo-pass) now accepts the same file with a
+`board` tagged `"forge": "forgejo"`, reusing the read-only board's instance
+configuration. It previews only: verify the bot login and recorder id, resolve
+the operator and require its recorder id, then read broker usage and grants
+with the shared pacing and `usage:` line. Identity failure stops immediately.
+Each stage 2–6 prints one not-built line. It writes and dispatches nothing;
+the end-to-end Forgejo pass remains unbuilt. `--apply`, `--fix-bounds`,
+`--record` and `--replay`, contract-refused options and temporarily unbuilt
+settings are refused before token lookup. Only `board.tokenEnv` is read,
+never `GH_TOKEN`, `GITHUB_TOKEN` or `DISPATCH_TOKEN`.
+
+On Forgejo, `usage` may contain only `url`; no publication fields are needed
+or accepted yet. Broker errors never read a GitHub snapshot or invoke forge
+publication. Missing readings hold pools, and failed reads count as failures.
+Epics await #514; holds, usage publication, probes, leases and reruns await
+scheduler wiring #513. Sweep/revisit ownership and scheduling are deferred to
+follow-ups to #513, not activated by this preview. Existing GitHub JSON,
+publication requirements and replays are unchanged. No deployed caller config,
+workflow or secrets are changed.
 
 Stage 1 reads `usage.url`, the broker's `/usage`, without the forge token or
 an environment proxy (plain HTTP is allowed for a broker on a private network

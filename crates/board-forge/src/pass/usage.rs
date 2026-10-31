@@ -41,6 +41,80 @@ pub trait Broker {
     fn grant(&self, url: &str) -> Result<Value>;
 }
 
+/// A credential-free broker transport, separate from either forge client.
+pub struct HttpBroker {
+    agent: ureq::Agent,
+}
+
+impl Default for HttpBroker {
+    fn default() -> Self {
+        Self {
+            agent: crate::github::http_agent(),
+        }
+    }
+}
+
+impl Broker for HttpBroker {
+    fn usage(&self, url: &str) -> Result<Value> {
+        broker_get(&self.agent, url, "/usage")
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        broker_get(&self.agent, url, "/usage/grant")
+    }
+}
+
+const BROKER_BYTES: u64 = 256 * 1024;
+const BROKER_SECONDS: u64 = 10;
+
+pub(crate) fn broker_get(agent: &ureq::Agent, url: &str, path: &str) -> Result<Value> {
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", "agent-board")
+        .config()
+        .timeout_global(Some(Duration::from_secs(BROKER_SECONDS)))
+        .proxy(None)
+        .build()
+        .call()
+        .map_err(|error| match error {
+            ureq::Error::BadUri(_) => anyhow::anyhow!("GET {path}: invalid address"),
+            error => anyhow::anyhow!("GET {path}: {error}"),
+        })?;
+    let status = response.status().as_u16();
+    ensure!(status == 200, "GET {path}: HTTP status {status}");
+    response
+        .body_mut()
+        .with_config()
+        .limit(BROKER_BYTES)
+        .read_json()
+        .with_context(|| format!("GET {path}: not JSON, or over {BROKER_BYTES} bytes"))
+}
+
+pub(super) fn read_grant(broker: &impl Broker, budget: &WeeklyBudget) -> Result<Value> {
+    let grant = broker.grant(budget.url.as_deref().unwrap_or_default())?;
+    ensure!(
+        grant["schema"] == GRANT_SCHEMA,
+        "the grant is not {GRANT_SCHEMA}"
+    );
+    Ok(grant)
+}
+
+/// Forge-neutral snapshot construction, including grants, spend and probes.
+pub(super) fn reading(
+    broker: &Value,
+    config: &Config,
+    grant: Option<&Value>,
+    now: OffsetDateTime,
+) -> Result<(BTreeMap<String, String>, Value)> {
+    let mut snapshot = snapshot(broker, &config.pools, now)?;
+    if let Some(budget) = config.grant() {
+        grants(&mut snapshot, grant, budget, now)?;
+    } else if let Some(weekly) = config.budget.as_ref().and_then(|b| b.weekly_usd) {
+        snapshot["budget"] = spend(broker, weekly);
+    }
+    Ok((unasked(broker, &snapshot), snapshot))
+}
+
 /// One of a pool's windows as the broker last saw it, times in Unix seconds.
 #[derive(Clone, Copy, Debug)]
 struct Window {
@@ -352,7 +426,7 @@ pub(super) fn grants(
 
 /// A snapshot of `pools` with nothing read, for [`grants`] to fill in when
 /// the broker's `/usage` cannot be read.
-fn bare(pools: &Pools, now: OffsetDateTime) -> Result<Value> {
+pub(super) fn bare(pools: &Pools, now: OffsetDateTime) -> Result<Value> {
     let at = stamp(seconds(now))?;
     let pools: serde_json::Map<String, Value> = (pools.0.iter())
         .map(|(name, _)| (name.clone(), unread(&at)))
@@ -432,7 +506,7 @@ fn describe(name: &str, entry: &Value) -> String {
 }
 
 /// Each pool's [`describe`], then the budget's where there is one.
-fn pools(snapshot: &Value) -> Vec<String> {
+pub(super) fn pools(snapshot: &Value) -> Vec<String> {
     let pools = snapshot["pools"].as_object().into_iter().flatten();
     let mut lines: Vec<String> = pools.map(|(name, entry)| describe(name, entry)).collect();
     let budget = &snapshot["budget"];
@@ -478,13 +552,12 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         };
         let grant = config.grant().map(|budget| (budget, self.grant(budget)));
         let mut read = self.client.usage(url).and_then(|broker| {
-            let mut snapshot = snapshot(&broker, &config.pools, self.now)?;
-            if let Some((budget, grant)) = &grant {
-                grants(&mut snapshot, grant.as_ref(), budget, self.now)?;
-            } else if let Some(weekly) = config.budget.as_ref().and_then(|b| b.weekly_usd) {
-                snapshot["budget"] = spend(&broker, weekly);
-            }
-            Ok((unasked(&broker, &snapshot), snapshot))
+            reading(
+                &broker,
+                config,
+                grant.as_ref().and_then(|(_, g)| g.as_ref()),
+                self.now,
+            )
         });
         // With a grant, pacing never falls back to the published snapshot,
         // which may be paced otherwise: the grant decides, or holds.
@@ -563,14 +636,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// The broker's grant at `budget.url`; one it cannot read, or of another
     /// schema, is a failure, and none, which holds every pool.
     fn grant(&mut self, budget: &WeeklyBudget) -> Option<Value> {
-        let url = budget.url.as_deref().unwrap_or_default();
-        let read = self.client.grant(url).and_then(|grant| {
-            ensure!(
-                grant["schema"] == GRANT_SCHEMA,
-                "the grant is not {GRANT_SCHEMA}"
-            );
-            Ok(grant)
-        });
+        let read = read_grant(&self.client, budget);
         match read {
             Ok(grant) => Some(grant),
             Err(error) => {

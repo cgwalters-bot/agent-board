@@ -8405,7 +8405,7 @@ fn v1_representative_config() {
     assert!(cfg.work());
     assert_eq!(cfg.triage, Some(TriageScope::Epics));
     assert_eq!(cfg.triage_pools(), &cfg.plan_pools);
-    assert_eq!(cfg.board.as_ref().unwrap().priority_field, "Priority");
+    assert_eq!(cfg.github_board().unwrap().priority_field, "Priority");
     assert_eq!(cfg.epics.as_ref().unwrap().max_applies_per_pass, 1);
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_draft_hours, 4);
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_hours, 24);

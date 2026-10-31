@@ -181,7 +181,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
     /// change; or, past `--max-status-changes`, refuses them all.
     pub(super) async fn status(&mut self, git_ref: &str) -> Result<()> {
         let config = self.config;
-        let Some(board) = &config.board else {
+        let Some(board) = config.github_board() else {
             self.line("status: off (no board)".into());
             return Ok(());
         };
