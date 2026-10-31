@@ -280,8 +280,9 @@ fn only_configured_instance_subpath_and_credential_free_broker() {
             .lines()
             .filter(|l| l.contains("not built on Forgejo yet"))
             .count(),
-        4
+        3
     );
+    assert!(output.contains("stage 3 epics: off (no epics)"), "{output}");
     assert!(
         output.contains("schedule: off (wip 0 or no workRepositories)"),
         "{output}"

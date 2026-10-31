@@ -227,7 +227,7 @@ impl Config {
     }
 
     /// The plan, checked against the bounds and the caller's opt-ins.
-    fn validate(&self, value: &Value, epic: &Epic) -> Result<EpicPlan> {
+    pub(crate) fn validate(&self, value: &Value, epic: &Epic) -> Result<EpicPlan> {
         let validated = EpicPlan::validate(value, &self.bounds, epic);
         let plan = match &validated {
             Ok(plan) => plan,
@@ -350,7 +350,7 @@ impl Confirmed {
 /// The writes a plan action of `kind` makes, in order, by the names
 /// [`Confirmed`] records them; a create with `blocked_by` also links it, and
 /// one with a job plan posts it, a comment.
-fn needs(kind: &str, job_plan: bool, blocked: bool) -> Vec<&'static str> {
+pub(crate) fn needs(kind: &str, job_plan: bool, blocked: bool) -> Vec<&'static str> {
     match kind {
         "create_sub_issue" => {
             let mut out = vec!["create"];
@@ -397,7 +397,7 @@ pub struct Detail {
 }
 
 impl Detail {
-    fn new(plan: &str, outcome: Outcome) -> Self {
+    pub(crate) fn new(plan: &str, outcome: Outcome) -> Self {
         Self {
             schema: RECEIPT_SCHEMA.into(),
             plan: plan.into(),
@@ -866,7 +866,7 @@ fn designated<T: Transport>(
 /// The Priority each sub-issue the plan creates gets, by its action's
 /// position: a later `set_priority` of it, else the configured default.
 /// It is set once, with the create, not the default and then a second change.
-fn created_priorities(plan: &EpicPlan, config: &Config) -> BTreeMap<usize, String> {
+pub(crate) fn created_priorities(plan: &EpicPlan, config: &Config) -> BTreeMap<usize, String> {
     let mut out = BTreeMap::new();
     for (index, action) in plan.actions.iter().enumerate() {
         if let Action::Create { .. } = action {
@@ -1197,7 +1197,7 @@ fn touched(detail: &Detail) -> Vec<IssueRef> {
 pub const ALREADY_CLAIMED: &str = "Already claimed; nothing changed.";
 
 /// The type a plan action has in its JSON.
-fn kind(action: &Action) -> &'static str {
+pub(crate) fn kind(action: &Action) -> &'static str {
     match action {
         Action::Create { .. } => "create_sub_issue",
         Action::Attach { .. } => "attach_sub_issue",

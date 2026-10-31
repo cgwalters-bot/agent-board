@@ -197,9 +197,140 @@ impl<T: Transport> Reads<'_, T> {
 impl<T: Transport> Forgejo<T> {
     /// A complete, unedited recorder thread, using the claim protocol's reads.
     pub(crate) fn plan_thread(&self, target: &ItemRef) -> Result<Vec<Value>> {
+        Ok(self.issue_thread(target)?.1)
+    }
+
+    /// [`Self::plan_thread`] with the issue it read first.
+    pub(crate) fn issue_thread(&self, target: &ItemRef) -> Result<(Value, Vec<Value>)> {
         let reads = self.reads(target)?;
         let (issue, _) = reads.issue()?;
-        reads.thread(&issue)
+        let thread = reads.thread(&issue)?;
+        Ok((issue, thread))
+    }
+
+    /// The id of each label `names` names, from complete bounded repository
+    /// and organization listings: exactly one label each, and with
+    /// `exclusive` one in an exclusive scope. No label is created.
+    fn label_ids(
+        &self,
+        budget: &Cell<usize>,
+        repository: &str,
+        names: &[&str],
+        exclusive: bool,
+    ) -> Result<Vec<u64>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let api = self.config.api_root()?;
+        // Repository and organization labels are both needed: names in
+        // the issue API are silently dropped if resolution is missing.
+        let mut available = Vec::new();
+        let mut endpoints = vec![api.join(&format!("repos/{repository}/labels"))?];
+        let owner = repository.split('/').next().context("missing owner")?;
+        ensure!(budget.get() > 0, "Forgejo write read budget exhausted");
+        budget.set(budget.get() - 1);
+        // Repository.owner is an API User, with no `type` field.
+        // Only a real 404 means there is no organization. Auth and
+        // rate-limit errors must not masquerade as a personal owner.
+        match self.transport.get(&api.join(&format!("orgs/{owner}"))?) {
+            Ok(_) => endpoints.push(api.join(&format!("orgs/{owner}/labels"))?),
+            Err(error) if error.is::<NotFound>() => {}
+            Err(error) => return Err(error),
+        }
+        for endpoint in endpoints {
+            let (page, complete) = self.pages(budget, endpoint)?;
+            ensure!(complete, "incomplete label listing; hold");
+            available.extend(page);
+        }
+        names
+            .iter()
+            .map(|name| {
+                let candidates: Vec<_> = available
+                    .iter()
+                    .filter(|label| label["name"].as_str() == Some(name))
+                    .collect();
+                ensure!(
+                    candidates.len() == 1 && (!exclusive || candidates[0]["exclusive"] == true),
+                    "label missing, ambiguous or not exclusive"
+                );
+                candidates[0]["id"]
+                    .as_u64()
+                    .filter(|id| *id > 0)
+                    .context("invalid label id")
+            })
+            .collect()
+    }
+
+    /// Creates an issue of a configured repository, by a recorder, with
+    /// `labels` (the caller adds a membership label), and reads it back: its
+    /// number.
+    /// The write is never repeated: a failed or unconfirmed reply is an
+    /// ambiguous create, which holds for a person (docs/forges.md#epics).
+    pub(crate) fn create_issue(
+        &self,
+        repository: &str,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> Result<u64> {
+        self.config.validate()?;
+        ensure!(
+            self.config.repositories.iter().any(|r| r == repository),
+            "Forgejo request outside configured host/repository"
+        );
+        ensure!(
+            !title.trim().is_empty() && !body.trim().is_empty(),
+            "invalid issue text"
+        );
+        let budget = Cell::new(WRITE_READ_LIMIT);
+        let api = self.config.api_root()?;
+        let get = |url: &Url| -> Result<Value> {
+            ensure!(budget.get() > 0, "Forgejo write read budget exhausted");
+            budget.set(budget.get() - 1);
+            Ok(self.transport.get(url)?.body)
+        };
+        let user = get(&api.join("user")?)?["id"]
+            .as_u64()
+            .filter(|id| *id > 0 && self.config.recorders.contains(id))
+            .context("Forgejo authenticated user is not a configured recorder")?;
+        let mut names: Vec<&str> = labels.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        let ids = self.label_ids(&budget, repository, &names, false)?;
+        ensure!(budget.get() > 0, "no read-back budget remaining; hold");
+        let url = api.join(&format!("repos/{repository}/issues"))?;
+        let answer = self
+            .transport
+            .write(
+                "POST",
+                &url,
+                &json!({"title": title, "body": body, "labels": ids}),
+            )
+            .context("issue create ambiguous; hold, never retried")?;
+        let number = answer["number"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .context("issue create ambiguous: no number; hold, never retried")?;
+        let after = get(&api.join(&format!("repos/{repository}/issues/{number}"))?)
+            .context("issue create ambiguous: unreadable; hold, never retried")?;
+        let read: BTreeSet<&str> = after["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|l| l["name"].as_str())
+            .collect();
+        ensure!(
+            after["number"].as_u64() == Some(number)
+                && after["pull_request"].is_null()
+                && after["repository"]["full_name"].as_str() == Some(repository)
+                && after["user"]["id"].as_u64() == Some(user)
+                && after["state"] == "open"
+                && after["title"].as_str() == Some(title)
+                && after["body"].as_str() == Some(body)
+                && names.iter().all(|n| read.contains(n)),
+            "issue create read-back mismatch; hold, never retried"
+        );
+        Ok(number)
     }
 
     fn reads<'a>(&'a self, target: &'a ItemRef) -> Result<Reads<'a, T>> {
@@ -296,45 +427,7 @@ impl<T: Transport> Forgejo<T> {
                     before == observed.labels.iter().cloned().collect(),
                     "stale issue labels; hold"
                 );
-                // Repository and organization labels are both needed: names in
-                // the issue API are silently dropped if resolution is missing.
-                let mut available = Vec::new();
-                let mut endpoints = vec![api.join(&format!("repos/{}/labels", target.repository))?];
-                let owner = target
-                    .repository
-                    .split('/')
-                    .next()
-                    .context("missing owner")?;
-                ensure!(
-                    reads.budget.get() > 0,
-                    "Forgejo write read budget exhausted"
-                );
-                reads.budget.set(reads.budget.get() - 1);
-                // Repository.owner is an API User, with no `type` field.
-                // Only a real 404 means there is no organization. Auth and
-                // rate-limit errors must not masquerade as a personal owner.
-                match self.transport.get(&api.join(&format!("orgs/{owner}"))?) {
-                    Ok(_) => endpoints.push(api.join(&format!("orgs/{owner}/labels"))?),
-                    Err(error) if error.is::<NotFound>() => {}
-                    Err(error) => return Err(error),
-                }
-                for endpoint in endpoints {
-                    let (page, complete) = self.pages(&reads.budget, endpoint)?;
-                    ensure!(complete, "incomplete label listing; hold");
-                    available.extend(page);
-                }
-                let candidates: Vec<_> = available
-                    .iter()
-                    .filter(|label| label["name"].as_str() == Some(name))
-                    .collect();
-                ensure!(
-                    candidates.len() == 1 && candidates[0]["exclusive"] == true,
-                    "label missing, ambiguous or not exclusive"
-                );
-                let id = candidates[0]["id"]
-                    .as_u64()
-                    .filter(|id| *id > 0)
-                    .context("invalid label id")?;
+                let id = self.label_ids(&reads.budget, &target.repository, &[name], true)?[0];
                 // Re-read immediately before writing; no If-Match exists.
                 // This read's membership is the one the write relies on.
                 let (fresh, labels) = reads.issue()?;

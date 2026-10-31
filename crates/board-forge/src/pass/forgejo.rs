@@ -1,5 +1,6 @@
-//! Forgejo pass: identity, broker pacing and stage 4 preview/apply. No GitHub
-//! fallback, publication, PR follow-up, epics or Status writes.
+//! Forgejo pass: identity, broker pacing, stage 3's epics ([`epics`]) and
+//! stage 4 preview/apply. No GitHub fallback, publication, PR follow-up or
+//! Status writes.
 use super::*;
 use crate::dispatch::{Forgejo as Actions, ForgejoLease, ForgejoSlot, Start, StartOutcome};
 use crate::forgejo::{
@@ -7,6 +8,7 @@ use crate::forgejo::{
 };
 use crate::{BoardOperation, BoardWrite, Forge};
 
+mod epics;
 mod record;
 pub use record::{Recorder, Replay};
 
@@ -44,7 +46,6 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
         }
     }
     for (option, follow_up) in [
-        ("epics", "epic driver #514"),
         ("holds", "scheduler and hold publication #513"),
         ("usage.repository", "usage publication in scheduler #513"),
         ("usage.issue", "usage publication in scheduler #513"),
@@ -236,15 +237,22 @@ fn run_within(
     };
     bounds.enter(Stage::Usage);
     let snapshot = refresh(&broker, config, now, &mut report)?;
-    for (stage, name) in [(2, "follow pull requests"), (3, "epics")] {
-        report
-            .lines
-            .push(format!("stage {stage} {name}: not built on Forgejo yet"));
+    report
+        .lines
+        .push("stage 2 follow pull requests: not built on Forgejo yet".into());
+    bounds.enter(Stage::Epics);
+    // Starts may name the board's repositories and, for an epic's planning
+    // run, `epics.repository`, both from this trusted file.
+    let mut starts = board.clone();
+    if let Some(epics) = &config.epics
+        && !(starts.repositories.iter()).any(|r| r.eq_ignore_ascii_case(&epics.repository))
+    {
+        starts.repositories.push(epics.repository.clone());
     }
-    bounds.enter(Stage::Schedule);
     let mut schedule = Schedule {
         client: &client,
         board,
+        starts: &starts,
         config,
         ids,
         now,
@@ -252,7 +260,12 @@ fn run_within(
         report: &mut report,
         pulls: BTreeMap::new(),
         mode,
+        parents: BTreeMap::new(),
+        planning: BTreeSet::new(),
+        epic_started: 0,
     };
+    schedule.epics(snapshot.as_ref());
+    bounds.enter(Stage::Schedule);
     if let Err(error) = schedule.run(snapshot.as_ref()) {
         report.failures += 1;
         report.lines.push(format!("schedule error: {error:#}"));
@@ -296,6 +309,9 @@ fn api(
 struct Schedule<'a, C> {
     client: &'a Budget<'a, C>,
     board: &'a ForgejoConfig,
+    /// The instance as the dispatch adapter takes it: the board's
+    /// repositories and `epics.repository`, whose epics' planning runs start.
+    starts: &'a ForgejoConfig,
     config: &'a Config,
     ids: Ids,
     now: OffsetDateTime,
@@ -305,6 +321,22 @@ struct Schedule<'a, C> {
     /// they were all read; or why they were not.
     pulls: BTreeMap<String, std::result::Result<(Vec<Value>, bool), String>>,
     mode: Mode<'a>,
+    /// Stage 3's: each live epic's open children, where both relationship
+    /// comments agree, by [`key`].
+    parents: BTreeMap<String, Parented>,
+    /// The live epics of `epics.repository` by [`key`], whose planning
+    /// runs stage 3 starts through stage 4's claim and start path.
+    planning: BTreeSet<String>,
+    /// The planning runs stage 3 started or would start, whose slots stage
+    /// 4 does not offer again.
+    epic_started: usize,
+}
+
+/// A live epic's child, and the epic's Priority, which ranks it.
+#[derive(Clone)]
+struct Parented {
+    parent: Parent,
+    priority: Option<String>,
 }
 
 /// A board issue read, and why its Priority could not be, where it could not.
@@ -337,6 +369,33 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         }
     }
 
+    /// The writer of stage 3, whose epics and children need not be board
+    /// members: the work repositories and `epics.repository`, open issues
+    /// only. Its plans bound it further ([`crate::epic::Bounds`]).
+    fn epic_forge(&self) -> crate::forgejo::Forgejo<&Budget<'_, C>> {
+        let mut config = self.board.clone();
+        config.membership = crate::forgejo::Membership::Open;
+        config.repositories = Vec::new();
+        let epics = self.config.epics.iter().map(|e| &e.repository);
+        for repository in self.config.work_repositories.iter().chain(epics) {
+            if !(config.repositories.iter()).any(|r| r.eq_ignore_ascii_case(repository)) {
+                config.repositories.push(repository.clone());
+            }
+        }
+        crate::forgejo::Forgejo {
+            transport: self.client,
+            config,
+        }
+    }
+
+    /// The writer of `issue`: an epic's planning runs are stage 3's.
+    fn forge_for(&self, issue: &ItemRef) -> crate::forgejo::Forgejo<&Budget<'_, C>> {
+        match self.planning.contains(&key(issue)) {
+            true => self.epic_forge(),
+            false => self.forge(),
+        }
+    }
+
     fn target(&self) -> Target {
         self.config
             .target(self.config.dispatch_ref.as_deref().unwrap_or(LISTING_REF))
@@ -345,7 +404,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     fn actions<'a>(&'a self, target: &'a Target) -> Result<Actions<'a, Budget<'a, C>>> {
         Actions::new(
             self.client,
-            self.board,
+            self.starts,
             target,
             ["task", "repo", "item", "kind", "pool"]
                 .map(String::from)
@@ -428,7 +487,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     }
 
     fn accepted(&self, issue: &ItemRef) -> Result<Accepted> {
-        let comments = self.forge().plan_thread(&self.write_identity(issue))?;
+        let comments = self
+            .forge_for(issue)
+            .plan_thread(&self.write_identity(issue))?;
         let mut newest = None;
         for comment in comments {
             if !comment["user"]["id"]
@@ -471,8 +532,21 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     }
 
     fn write(&self, facts: &Facts, operation: BoardOperation) -> Result<()> {
+        let forge = self.forge_for(&facts.issue);
+        self.write_on(&forge, &facts.issue, &facts.labels, operation)
+    }
+
+    /// One bounded write by `forge` to the open `issue`, observed with
+    /// `labels`, which it reads back ([`Forge::board_write`]).
+    fn write_on(
+        &self,
+        forge: &crate::forgejo::Forgejo<&Budget<'_, C>>,
+        issue: &ItemRef,
+        labels: &[String],
+        operation: BoardOperation,
+    ) -> Result<()> {
         let observed = board_core::Item {
-            identity: self.write_identity(&facts.issue),
+            identity: self.write_identity(issue),
             project_item: None,
             assignment: None,
             title: String::new(),
@@ -485,13 +559,13 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             field_errors: vec![],
             evidence: vec![],
             content_kind: "issue".into(),
-            labels: facts.labels.clone(),
+            labels: labels.to_vec(),
             assignees: vec![],
             author: None,
             timestamps: BTreeMap::new(),
             fields: BTreeMap::new(),
         };
-        self.forge().board_write(
+        forge.board_write(
             &BoardWrite {
                 observed,
                 policy: board_core::AgentPolicy::parse(board_core::DEFAULT_AGENT_POLICY)?,
@@ -514,7 +588,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     }
 
     fn claim(&self, facts: &Facts, plan: u64) -> Result<Option<crate::PlanClaim>> {
-        self.forge().plan_claim(
+        self.forge_for(&facts.issue).plan_claim(
             &self.write_identity(&facts.issue),
             plan::DISPATCH_MARKER,
             plan,
@@ -523,7 +597,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
 
     fn claim_time(&self, facts: &Facts, claim: u64) -> Result<OffsetDateTime> {
         let comments = self
-            .forge()
+            .forge_for(&facts.issue)
             .plan_thread(&self.write_identity(&facts.issue))?;
         let comment = comments
             .iter()
@@ -577,39 +651,18 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 &[],
             )?)?
             .body;
-        let (fresh, unread) = self.facts(&instance(self.board), &facts.issue.repository, &issue)?;
-        ensure!(fresh.issue == facts.issue, "issue identity changed");
-        ensure!(
-            matches!(
-                screen(&fresh, self.config, &[], &self.people()),
-                Screen::Unparented
-            ),
-            "issue no longer qualifies as a candidate"
-        );
-        if let crate::forgejo::Membership::Label(member) = &self.board.membership {
-            ensure!(fresh.labels.contains(member), "issue left board membership");
+        if self.planning.contains(&key(&facts.issue)) {
+            // An epic's planning run: still an open, live epic.
+            ensure!(
+                issue["number"] == facts.issue.number
+                    && issue["pull_request"].is_null()
+                    && issue["state"] == "open"
+                    && self.live_epic(&facts.issue)?,
+                "epic is no longer live; held"
+            );
+        } else {
+            self.still_candidate(facts, &issue)?;
         }
-        let mut report = Report::default();
-        let mut recheck = Schedule {
-            client: self.client,
-            board: self.board,
-            config: self.config,
-            ids: self.ids,
-            now: self.now,
-            caps: self.caps,
-            report: &mut report,
-            pulls: BTreeMap::new(),
-            mode: self.mode,
-        };
-        let fresh = recheck
-            .complete(&fresh, unread.as_deref())
-            .map_err(|h| anyhow::anyhow!("{}", h.reason))?;
-        ensure!(
-            fresh.open
-                && issue["state"] == "open"
-                && hold(&fresh, &BTreeMap::new(), &self.people()).is_none(),
-            "issue now holds"
-        );
         let target = self.target();
         let actions = self.actions(&target)?;
         let runs = actions.active_runs()?;
@@ -658,6 +711,50 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         ensure!(
             occupied < self.config.wip as usize,
             "WIP full including reservations; held"
+        );
+        Ok(())
+    }
+
+    /// Whether the board issue `facts`, read again as `issue`, still
+    /// qualifies and holds nothing: a candidate, unparented or a live
+    /// epic's child, a board member, with its holds read again.
+    fn still_candidate(&self, facts: &Facts, issue: &Value) -> Result<()> {
+        let (fresh, unread) = self.facts(&instance(self.board), &facts.issue.repository, issue)?;
+        ensure!(fresh.issue == facts.issue, "issue identity changed");
+        ensure!(
+            matches!(
+                screen(&fresh, self.config, &[], &self.people()),
+                Screen::Unparented | Screen::Child(_)
+            ),
+            "issue no longer qualifies as a candidate"
+        );
+        if let crate::forgejo::Membership::Label(member) = &self.board.membership {
+            ensure!(fresh.labels.contains(member), "issue left board membership");
+        }
+        let mut report = Report::default();
+        let mut recheck = Schedule {
+            client: self.client,
+            board: self.board,
+            starts: self.starts,
+            config: self.config,
+            ids: self.ids,
+            now: self.now,
+            caps: self.caps,
+            report: &mut report,
+            pulls: BTreeMap::new(),
+            mode: self.mode,
+            parents: self.parents.clone(),
+            planning: BTreeSet::new(),
+            epic_started: 0,
+        };
+        let fresh = recheck
+            .complete(&fresh, unread.as_deref())
+            .map_err(|h| anyhow::anyhow!("{}", h.reason))?;
+        ensure!(
+            fresh.open
+                && issue["state"] == "open"
+                && hold(&fresh, &BTreeMap::new(), &self.people()).is_none(),
+            "issue now holds"
         );
         Ok(())
     }
@@ -963,6 +1060,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 return Ok(());
             }
         };
+        // Stage 3's planning starts count even where not listed yet; where
+        // they are, a slot waits a pass rather than the WIP limit giving.
+        let active = active + self.epic_started;
         self.report.tally.0.in_flight = Some(active);
         let wip = config.wip as usize;
         if active >= wip {
@@ -1150,12 +1250,16 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             && labels
                 .iter()
                 .any(|l| l.eq_ignore_ascii_case("status/blocked"));
+        let at = ItemRef {
+            host: host.into(),
+            repository: repository.into(),
+            number,
+        };
+        // A live epic's child where both relationship comments agree
+        // (stage 3); a claim of one side alone is held by [`Self::complete`].
+        let parent = self.parents.get(&key(&at)).map(|p| p.parent.clone());
         let facts = Facts {
-            issue: ItemRef {
-                host: host.into(),
-                repository: repository.into(),
-                number,
-            },
+            issue: at,
             open: true,
             created,
             updated: None,
@@ -1165,8 +1269,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             blocked_by: 0,
             pulls: Vec::new(),
             pulls_complete: true,
-            // Epic children are #514's: every issue is unparented here.
-            parent: None,
+            parent,
             priority,
             status: blocked.then(|| BLOCKED_STATUS.into()),
             why: None,
@@ -1193,10 +1296,12 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     let rank = rank(&options, None, facts.priority.as_deref(), facts);
                     ranked.push((rank, read));
                 }
-                // No parent is read on Forgejo yet.
+                // Only a live epic's children have a parent here.
                 Screen::Child(_) => {
-                    let why = "its parent is not read on Forgejo yet (#514)";
-                    self.held(facts, Hold::new(HoldKind::Unreadable, why));
+                    let epic =
+                        (self.parents.get(&key(&facts.issue))).and_then(|p| p.priority.as_deref());
+                    let rank = rank(&options, epic, facts.priority.as_deref(), facts);
+                    ranked.push((rank, read));
                 }
             }
         }
@@ -1221,6 +1326,26 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         }
         let mut facts = facts.clone();
         let issue = &facts.issue;
+        if self.config.epics.is_some() {
+            // Its own parent comment, where no live epic lists it back: one
+            // side alone, or an epic that is not live, holds it.
+            let thread = self.forge().plan_thread(&self.write_identity(issue));
+            let named = thread.and_then(|t| crate::forgejo::epics::parent(&t, self.ids.bot));
+            match (named, &facts.parent) {
+                (Err(error), _) => {
+                    self.report.failures += 1;
+                    let why = format!("its parent comment could not be read: {error:#}");
+                    return Err(unreadable(why));
+                }
+                (Ok(Some(epic)), None) => {
+                    let why = format!(
+                        "its parent {epic} is not a live epic (open, labelled epic by the operator or the bot) that lists it"
+                    );
+                    return Err(Hold::new(HoldKind::EpicNotLive, why));
+                }
+                _ => {}
+            }
+        }
         let path = format!("issues/{}/dependencies", issue.number);
         // Its pages carry no total ([`pages_to_end`]).
         let dependencies = api(self.board, &issue.repository, &path, &[])
@@ -1367,6 +1492,7 @@ mod tests {
     use crate::forgejo::Response;
 
     mod apply;
+    mod epics;
 
     fn file() -> Value {
         let contract: Value = serde_json::from_str(CONTRACT).unwrap();
@@ -1494,8 +1620,11 @@ mod tests {
     #[test]
     fn temporary_refusals_and_broker_only_usage() {
         assert!(config(&file()).forgejo_board().is_some());
+        let mut epics = file();
+        set(&mut epics, "epics.repository", json!("example/plans"));
+        set(&mut epics, "epics.close", json!(true));
+        assert!(Config::parse(&epics.to_string()).is_ok());
         for (option, follow_up) in [
-            ("epics.repository", "#514"),
             ("holds.issue", "#513"),
             ("usage.repository", "#513"),
             ("usage.issue", "#513"),
@@ -1707,7 +1836,7 @@ mod tests {
             report.lines[2..],
             [
                 "stage 2 follow pull requests: not built on Forgejo yet",
-                "stage 3 epics: not built on Forgejo yet",
+                "stage 3 epics: off (no epics)",
                 "schedule: off (wip 0 or no workRepositories)",
                 "stage 5 status: not built on Forgejo yet",
                 "stage 6 cost: not built on Forgejo yet",

@@ -22,6 +22,12 @@ is finished or dropped, so a plan written before may not add to or change it.
 Only where the configuration allows it may a plan close the epic itself
 ([`close_epic`](#format)).
 
+On a Forgejo board, `agent-board pass` applies the same plans, with
+relationship comments in place of sub-issues and `priority/` labels in place
+of the board's Priority, and refuses a whole plan with an action Forgejo has
+no mechanism for ([Forgejo epics](forges.md#epics)). `epic plan` and
+`epic apply` read and write GitHub only.
+
 ## Format
 
 One fenced block with the info string `agent-board-epic-plan`, at the start of

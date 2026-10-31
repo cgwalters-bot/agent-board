@@ -10,7 +10,7 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels; pass identity and broker pacing | Stage 4 apply: claims, starts, recovery, leases and one rerun; no activation ([contract](#a-forgejo-pass)) |
+| Forgejo | Issues of configured repositories, fields from labels; pass identity and broker pacing | Stage 3 epics; stage 4 apply: claims, starts, recovery, leases and one rerun; no activation ([contract](#a-forgejo-pass)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Existing dispatch callers still use GitHub Actions. The backend boundary also
@@ -119,9 +119,12 @@ only later, so this needs one pass per board, as the pass's lease gives.
 Receipts are further comments by the claim's author whose first line
 is `<!-- agent-board-receipt: CLAIM-ID -->`; plain comments may not start with
 a claim or receipt line. `Forge::plan_claim` reads a plan's earliest claim and
-its receipts back for recovery. Stage 4 now chooses and claims job plans and
-uses the native dispatch adapters; epic issues outside the board's membership
-remain #514. Arbitrary
+its receipts back for recovery. Stage 4 chooses and claims job plans and
+uses the native dispatch adapters. Stage 3 claims epic plans, and creates
+issues with `Forgejo::create_issue`, which reads the new issue back (number,
+repository, poster id, title, body and labels) and never repeats the POST.
+Its writer reaches the work repositories and `epics.repository` without the
+membership label, open issues only ([epics](#epics)). Arbitrary
 agent proposals must still go through independent check/apply; the CLI's
 `output check` and `output apply` remain unsupported. No caller settings or
 deployment are changed here.
@@ -132,18 +135,18 @@ This is the contract for a second, separate `agent-board pass` that drives a
 Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
 tracker#786). **The end-to-end pass is not built**. `agent-board pass --config FILE`
 now accepts a Forgejo board: identity checks, then stage 1's
-broker usage and grants, and stage 4's candidates, holds and runs in flight
+broker usage and grants, stage 3's epics where `epics` is set (#514,
+[below](#epics)), and stage 4's candidates, holds and runs in flight
 (#522, [below](#stage-4-in-preview)), with one `not built on Forgejo yet` line
-for each of stages 2, 3, 5 and 6. Preview writes and dispatches nothing;
-`--apply` supports [stage 4 only](#stage-4-apply). A preview can be
+for each of stages 2, 5 and 6. Preview writes and dispatches nothing;
+`--apply` supports stages 3 and [4](#stage-4-apply). A preview can be
 [recorded and replayed](#recording-and-replay). `--fix-bounds`, and
 `--record` with `--replay` (a seeded recording), are refused before
 credentials are read.
 The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
 of scheduler wiring. Offline tests are not live proof.
-The remaining driver wiring covers Status/snapshots (#523), epics (#514) and live
-CI (#515). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
+The remaining driver wiring covers Status/snapshots (#523) and live CI (#515). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
 [pass option](pass.md#one-configuration-file); a test fails when an option is
 added to that table without one.
@@ -202,7 +205,7 @@ reviewed mechanism replaces it.
 The preview rejects every explicitly supplied refused option, even `false`,
 an empty collection or a nested setting, with
 `unsupported_capability: OPTION: REASON` from the contract, before token lookup.
-It also temporarily rejects `epics` (#514), `holds`, usage publication
+It also temporarily rejects `holds`, usage publication
 (`usage.repository`/`usage.issue`) and `usage.probe` (#523). Leases and reruns
 are accepted. Sweep and revisit remain deferred: follow-ups to #513 must own
 their scheduling and publication semantics; neither is silently enabled by
@@ -252,9 +255,13 @@ start …`), choosing the pool from stage 1's snapshot.
 * **Candidates.** The open issues (with `membership`'s label, if any) of each
   board repository that is also a work repository, at most 4 pages of 50; a
   longer or shifting listing is an incomplete board, which starts nothing.
-  Issues labelled `epic` or `question` are not work. Parents are not read yet
-  (#514), so an issue is a candidate only where its poster's id is the bot's
-  or the operator's; others are counted as opened by others.
+  Issues labelled `epic` or `question` are not work. A live epic's child
+  ([below](#epics)) is a candidate whoever opened it, ranked first by its
+  epic's Priority; any other issue only where its poster's id is the bot's or
+  the operator's, and others are counted as opened by others. With `epics`
+  set, a candidate's own newest parent comment is read before it starts: one
+  naming an epic that is not live, or that does not list it back, holds it
+  as `epic-not-live`.
 * **Rank.** By the one `priority/` label, P0 first, unlabelled last, then age.
   Two `priority/` labels, or an unknown value, hold the issue.
 * **Holds.** As on GitHub: `needs-human` and `needs-design`, `status/blocked`
@@ -350,8 +357,8 @@ configured instance, not GitHub. Actions `SERVER_URL` must match `board.url`;
 compatibility aliases). Another running pass holds stage 4. Outside Actions,
 both caps are required and serialization against the schedule is not promised.
 These bounded observations are not an atomic cross-workflow lock: deployments
-must serialize pass invocations. Status, snapshots and epics are not part of
-this applying slice (#523 and #514); other refusals remain in force.
+must serialize pass invocations. Status and snapshots are not part of this
+applying slice (#523); other refusals remain in force.
 
 ### Labels and Status
 
@@ -417,19 +424,68 @@ GitHub; recovery reads what remains.
 
 ### Epics
 
-Forgejo has no sub-issues or projects ([api.go][fj-api]). An epic is an issue
-labelled `epic` in `epics.repository` whose newest `epic` label event in its
-[timeline][fj-timeline] is by the operator's or the bot's id. Its children are
-the epic's own relationship comments: one comment by the bot,
-`<!-- agent-board-epic-children: N -->` and a JSON list of `OWNER/REPO#N`,
-appended with each change and read by the rule above, newest first. Each
-child carries a `parent` back-reference in its own bot comment,
-`<!-- agent-board-epic-parent: OWNER/REPO#N -->`, and a child counts only
-where both sides agree, so a person cannot attach work to an epic by editing
-one issue. Forgejo's dependency links ([`/dependencies`, `/blocks`][fj-deps])
-keep their meaning, blocking, and are never used as parentage. The existing
-`agent-board/epic-plan/v1` and its receipts apply unchanged; create, link,
-Priority and close each read back before the receipt says so.
+Forgejo has no sub-issues or projects ([api.go][fj-api]). An epic is a live
+one when it is an open issue labelled `epic` in `epics.repository` (or, with
+`inWorkRepositories`, in a work repository) and the newest `epic` label event
+in its whole [timeline][fj-timeline] added the label, by the operator's or the
+bot's id. The timeline is read to its end, at most 10 pages of 50 events
+(comments count too); a longer one makes the epic unreadable rather than
+fall back to an older event. Forgejo lists every issue for a label name a
+repository does not have, so each listed epic must carry the label.
+
+Its children are the epic's own relationship comments: the bot's newest
+comment whose first line is `<!-- agent-board-epic-children: N -->`, `N`
+the epic's own number, followed by a line holding a JSON list of
+`OWNER/REPO#N` in the work repositories, at most 50. It is appended with each
+change, never edited. Each child carries a back-reference in its own newest
+bot comment, `<!-- agent-board-epic-parent: OWNER/REPO#N -->`, and a child
+counts only where both sides agree, so a person cannot attach work to an
+epic by editing one issue. An edited relationship comment, as any edited
+record, makes the epic unreadable rather than fall back to an older one.
+Each child costs two reads a pass (its issue and its comments). Forgejo's
+dependency links ([`/dependencies`, `/blocks`][fj-deps]) keep their meaning,
+blocking, and are never used as parentage.
+
+Stage 3 then applies the GitHub pass's [epic rules](pass.md#epic-planning-and-recovery)
+to each live epic of `epics.repository`, in Priority order: the newest
+accepted `agent-board/epic-plan/v1` is applied once, an apply cut short is
+recovered from its receipts, and at most one due epic a pass is planned. The
+operator and the bot are the plan writers, decided by id. The bot's planning
+request is a triage job plan it posts on the epic, which is claimed and
+started by stage 4's [claim and start path](#stage-4-apply) (leases, caps and
+recovery included); the dispatch adapter accepts `epics.repository` for it.
+These parts of the GitHub stage are left out: a planning request that got no
+plan holds the epic for a person (`epic-unplanned`) rather than being retried
+after six hours, a stale plan holds for a person rather than asking for a
+new one, and an epic whose children are all closed is closed (with
+`epics.close`, a comment then the state change, no close reason) or held for
+the operator, without the question label or a board Why.
+
+A plan is applied under the existing bounds: the work repositories, the
+`priority/P0`..`priority/P3` options, `epics.maxAppliesPerPass`, and the
+writes counted against `--max-writes`. Forgejo has a native mechanism only
+for creating, linking, setting Priority and closing, so a plan with any other
+action (`attach_sub_issue`, `rescope_sub_issue`, `close_epic`, a create with
+`blocked_by` or `stacks_on`, or a new issue labelled in the `priority/`,
+`turn/` or `status/` scope) is refused whole, before its claim, and held for
+the operator; no part of it is applied. Applying claims the plan, reads the
+epic again (still live, the plan unchanged, valid against the children now),
+and then for each action:
+
+* **create**: `POST /repos/{o}/{r}/issues` with the plan's labels and the
+  board's membership label, read back; then a receipt naming the new issue;
+* **link**: the child's parent comment, then the epic's new children
+  comment, each read back;
+* **Priority**: one `priority/` label write, read back ([labels](#labels-and-status)),
+  for a new issue its plan's `set_priority` or `priority/P3`;
+* **close**: the reason as a comment, then `PATCH` the state to closed,
+  each read back; a child closed already is satisfied, as on GitHub.
+
+A new issue's job plan is a further bot comment on it. A write that fails
+stops the apply; its final receipt says `stopped` and what was confirmed.
+A create whose reply is lost or cannot be read back is ambiguous: nothing
+names the issue, so recovery cannot prove it and holds the epic for a
+person, and the create is never sent again.
 
 ### Claims and recovery
 
@@ -439,9 +495,15 @@ dispatches only if the plan is unchanged, unedited and no earlier valid record
 names it. The run link or refusal is a second comment, never an edit of the
 first. A pass that died between the two leaves a claim with no outcome: the
 next pass looks for its run (below) and records it if found, and holds the
-plan for a person if not; it never dispatches it again. Epic receipts are
+plan for a person if not; it never dispatches it again. An epic's planning
+request is recovered the same way. An epic plan's claim is
+`<!-- agent-board-epic-apply: COMMENT-ID@TIME -->` and its receipts further
+comments, each with the whole `agent-board-epic-apply` detail of
+[epic plans](epic-plans.md#apply): one after each new issue is created and one
+when the apply ends. The claim's newest receipt by its author is its state,
+as GitHub's one receipt, edited in place, would be. Epic receipts are
 recovered as on GitHub, from the identities they confirmed and the issues as
-read now.
+read now, and a proved apply gets one more receipt saying `recovered`.
 
 ### Dispatch and runs
 
