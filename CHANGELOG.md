@@ -11,6 +11,15 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The weekly sweep on a Forgejo board, behind the existing `sweep` setting
+  (off unless set). The bot's earliest unedited list comment, not the
+  issue body, records what the sweep lists. Its run starts through stage 4's
+  claim path. Its reply is applied once under an appended
+  `agent-board-sweep-apply` claim and receipt, attaching issues with stage
+  3's relationship comments. An apply cut short completes only half-made
+  relationships. Edited or missing records label the sweep issue
+  `needs-human` (docs/forges.md#the-weekly-sweep).
+
 - A live Forgejo v17.0.1 proof in CI (docs/forges.md#live-ci). It found that
   Forgejo starts were all cancelled as wrong runs, since the server reports a
   dispatched run's `event` as empty; the adapter now accepts that, and

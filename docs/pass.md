@@ -80,8 +80,9 @@ says it is not serialized against the scheduled pass. Each attempted lease,
 claim, bind, receipt and cancellation write consumes `--max-writes`; each
 start or rerun POST consumes `--max-dispatch`, including lost replies. A new
 start needs room for its four normal writes before admission; partial failures
-hold rather than bypass a cap. Sweep/revisit ownership and scheduling are deferred to
-follow-ups to #513, not activated by this preview. Existing GitHub JSON,
+hold rather than bypass a cap. The [weekly sweep](forges.md#the-weekly-sweep)
+runs where `sweep` is set; revisit ownership and scheduling are deferred to a
+follow-up to #513, not activated by this preview. Existing GitHub JSON,
 publication requirements and replays are unchanged. No deployed caller config,
 workflow or secrets are changed.
 
@@ -1190,7 +1191,9 @@ nothing (every slot taken, no pool, the weekly budget reached), an open
 sweep is still applied, finished or labelled (step 4), which takes
 no run, on a board read for it; its run is not started, no new sweep is
 filed, and an epic its reply names is read as stage 4 would read it, where
-it is a parent on the board:
+it is a parent on the board. A Forgejo pass keeps these steps but holds its
+records in unedited bot comments instead of the issue body and an edited
+comment ([Forgejo](forges.md#the-weekly-sweep)):
 
 1. Before stage 4 reads its candidates, the pass looks in
    `sweep.repository` for the newest issue of the bot's whose body starts

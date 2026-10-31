@@ -3,6 +3,7 @@ use super::*;
 use crate::epic_apply::APPLY_MARKER;
 use crate::plan::DISPATCH_MARKER;
 use crate::{BoardOperation, BoardWrite, PlanClaim};
+use board_core::NEEDS_HUMAN_LABEL;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
@@ -10,8 +11,11 @@ const WRITE_READ_LIMIT: usize = 32;
 const COMMENT_LIMIT: usize = 16_000;
 /// The first line of a claim's receipt: `<!-- agent-board-receipt: CLAIM-ID -->`.
 pub const RECEIPT_MARKER: &str = "agent-board-receipt";
-/// What a claim may claim: a job plan's dispatch or an epic plan's apply.
-const CLAIM_MARKERS: [&str; 2] = [DISPATCH_MARKER, APPLY_MARKER];
+/// The claim of a weekly sweep's reply, applied once (docs/forges.md#the-weekly-sweep).
+pub const SWEEP_APPLY_MARKER: &str = "agent-board-sweep-apply";
+/// What a claim may claim: a job plan's dispatch, an epic plan's apply or a
+/// sweep reply's apply.
+const CLAIM_MARKERS: [&str; 3] = [DISPATCH_MARKER, APPLY_MARKER, SWEEP_APPLY_MARKER];
 
 fn marker_line(marker: &str, value: impl std::fmt::Display) -> String {
     format!("<!-- {marker}: {value} -->")
@@ -392,13 +396,19 @@ impl<T: Transport> Forgejo<T> {
         let mut verify = 1;
         let (method, url, body, latest) = match &write.operation {
             BoardOperation::Label { scope, name } => {
+                // The hold label is its own scope: added beside the others.
+                let hold = scope == NEEDS_HUMAN_LABEL && name == scope;
                 ensure!(
-                    [PRIORITY_SCOPE, TURN_SCOPE, STATUS_SCOPE].contains(&scope.as_str())
+                    hold || [PRIORITY_SCOPE, TURN_SCOPE, STATUS_SCOPE].contains(&scope.as_str())
                         && name.starts_with(scope)
                         && name.len() > scope.len(),
                     "unsupported label scope"
                 );
-                if scope == STATUS_SCOPE {
+                if hold {
+                    if before.contains(name) {
+                        return Ok(());
+                    }
+                } else if scope == STATUS_SCOPE {
                     ensure!(
                         self.config.status_labels && parse_status(&name[scope.len()..]).is_some(),
                         "Status labels disabled or unsupported Status"
@@ -427,7 +437,7 @@ impl<T: Transport> Forgejo<T> {
                     before == observed.labels.iter().cloned().collect(),
                     "stale issue labels; hold"
                 );
-                let id = self.label_ids(&reads.budget, &target.repository, &[name], true)?[0];
+                let id = self.label_ids(&reads.budget, &target.repository, &[name], !hold)?[0];
                 // Re-read immediately before writing; no If-Match exists.
                 // This read's membership is the one the write relies on.
                 let (fresh, labels) = reads.issue()?;
@@ -543,7 +553,9 @@ impl<T: Transport> Forgejo<T> {
             BoardOperation::Label { scope, name } => {
                 let (_, after) = reads.issue()?;
                 let mut expected = before;
-                expected.retain(|label| !label.starts_with(scope));
+                if scope != NEEDS_HUMAN_LABEL {
+                    expected.retain(|label| !label.starts_with(scope));
+                }
                 expected.insert(name.clone());
                 ensure!(after == expected, "label read-back mismatch; hold");
             }

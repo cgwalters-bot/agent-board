@@ -10,6 +10,7 @@ use crate::{BoardOperation, BoardWrite, Forge};
 
 mod epics;
 mod record;
+mod sweep;
 pub use record::{Recorder, Replay};
 
 const CONTRACT: &str = include_str!("../../../../fixtures/forgejo/pass-contract.json");
@@ -50,7 +51,6 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
         ("usage.repository", "usage publication in scheduler #513"),
         ("usage.issue", "usage publication in scheduler #513"),
         ("usage.probe", "run inventory in scheduler #513"),
-        ("sweep", "a follow-up to scheduler #513 for sweep ownership"),
         (
             "revisit",
             "a follow-up to scheduler #513 for revisit ownership",
@@ -241,13 +241,16 @@ fn run_within(
         .lines
         .push("stage 2 follow pull requests: not built on Forgejo yet".into());
     bounds.enter(Stage::Epics);
-    // Starts may name the board's repositories and, for an epic's planning
-    // run, `epics.repository`, both from this trusted file.
+    // Starts may name the board's repositories, for an epic's planning run
+    // `epics.repository`, and for the weekly sweep's run `sweep.repository`,
+    // all from this trusted file.
     let mut starts = board.clone();
-    if let Some(epics) = &config.epics
-        && !(starts.repositories.iter()).any(|r| r.eq_ignore_ascii_case(&epics.repository))
-    {
-        starts.repositories.push(epics.repository.clone());
+    let epics = config.epics.iter().map(|e| e.repository.as_str());
+    let swept = (config.sweep.iter()).filter_map(|s| s.repository(config).ok());
+    for repository in epics.chain(swept) {
+        if !(starts.repositories.iter()).any(|r| r.eq_ignore_ascii_case(repository)) {
+            starts.repositories.push(repository.to_owned());
+        }
     }
     let mut schedule = Schedule {
         client: &client,
@@ -263,6 +266,8 @@ fn run_within(
         parents: BTreeMap::new(),
         planning: BTreeSet::new(),
         epic_started: 0,
+        live: BTreeSet::new(),
+        swept: None,
     };
     schedule.epics(snapshot.as_ref());
     bounds.enter(Stage::Schedule);
@@ -330,6 +335,12 @@ struct Schedule<'a, C> {
     /// The planning runs stage 3 started or would start, whose slots stage
     /// 4 does not offer again.
     epic_started: usize,
+    /// Every live epic stage 3 read, as lower-case `OWNER/REPO#N`: those
+    /// a sweep's reply may attach to.
+    live: BTreeSet<String>,
+    /// With `sweep`, the newest sweep issue, read before stage 4's
+    /// candidates; None where it could not be read.
+    swept: Option<Option<crate::pass::sweep::Found>>,
 }
 
 /// A live epic's child, and the epic's Priority, which ranks it.
@@ -388,12 +399,18 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         }
     }
 
-    /// The writer of `issue`: an epic's planning runs are stage 3's.
+    /// The writer of `issue`: an epic's planning runs are stage 3's, and the
+    /// sweep issue, which need not be a board member, its too.
     fn forge_for(&self, issue: &ItemRef) -> crate::forgejo::Forgejo<&Budget<'_, C>> {
-        match self.planning.contains(&key(issue)) {
+        match self.planning.contains(&key(issue)) || self.is_sweep(issue) {
             true => self.epic_forge(),
             false => self.forge(),
         }
+    }
+
+    /// Whether `issue` is the sweep issue this pass found.
+    fn is_sweep(&self, issue: &ItemRef) -> bool {
+        matches!(&self.swept, Some(Some(found)) if key(&found.issue) == key(issue))
     }
 
     fn target(&self) -> Target {
@@ -660,6 +677,14 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     && self.live_epic(&facts.issue)?,
                 "epic is no longer live; held"
             );
+        } else if self.is_sweep(&facts.issue) {
+            // The sweep's run: its issue still open.
+            ensure!(
+                issue["number"] == facts.issue.number
+                    && issue["pull_request"].is_null()
+                    && issue["state"] == "open",
+                "sweep issue is no longer open; held"
+            );
         } else {
             self.still_candidate(facts, &issue)?;
         }
@@ -746,6 +771,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             parents: self.parents.clone(),
             planning: BTreeSet::new(),
             epic_started: 0,
+            live: BTreeSet::new(),
+            swept: None,
         };
         let fresh = recheck
             .complete(&fresh, unread.as_deref())
@@ -1023,6 +1050,15 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.line("schedule: off (wip 0 or no workRepositories)".into());
             return Ok(());
         }
+        if config.sweep.is_some() {
+            match self.find_sweep() {
+                Ok(found) => self.swept = Some(found),
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("sweep error: {error:#}"));
+                }
+            }
+        }
         if !matches!(self.mode, Mode::Preview) {
             self.serialized()?;
             if !config.leases {
@@ -1036,6 +1072,10 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             // not hide a claim left between POST and its receipt.
             let issues = self.issues()?;
             for (facts, _) in issues.values() {
+                // The sweep recovers its own start.
+                if self.is_sweep(&facts.issue) {
+                    continue;
+                }
                 let Ok(accepted) = self.accepted(&facts.issue) else {
                     continue;
                 };
@@ -1065,18 +1105,22 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let active = active + self.epic_started;
         self.report.tally.0.in_flight = Some(active);
         let wip = config.wip as usize;
+        // Where nothing starts, an open sweep is still applied or settled.
         if active >= wip {
             self.pass_held(HoldKind::Wip, format!("{active} of {wip} runs active"));
+            self.sweep(None, 0, &busy, snapshot);
             return Ok(());
         }
         let all: Vec<String> = config.pools.0.iter().map(|(n, _)| n.clone()).collect();
         if let Err(why) = choose(snapshot, &config.pools, &all, self.now) {
             self.pass_held(HoldKind::Pools, format!("{why}; new runs wait"));
+            self.sweep(None, 0, &busy, snapshot);
             return Ok(());
         }
         if let Some(why) = budget_hold(config, snapshot, self.now, 1.0) {
             self.caps.hold();
             self.pass_held(HoldKind::Budget, format!("{why}; new runs wait"));
+            self.sweep(None, 0, &busy, snapshot);
             return Ok(());
         }
         let board = self.issues()?;
@@ -1147,6 +1191,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.report.tally.1.started += 1;
             self.line(line);
         }
+        self.report.tally.1.started += self.sweep(Some(&candidates), free, &busy, snapshot);
         let started = self.report.tally.1.started;
         self.report.tally.0.in_flight = Some(active + started);
         Ok(())
@@ -1285,9 +1330,13 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let options: Vec<String> = PRIORITIES.iter().map(|p| p.to_string()).collect();
         let mut ranked = Vec::new();
         let (mut visitors, mut unparented) = (0, 0);
+        // The sweep issue's one run is the sweep's to start.
+        let control: Vec<String> = (self.swept.iter().flatten())
+            .map(|found| found.issue.display().to_ascii_lowercase())
+            .collect();
         for read in board.values() {
             let facts = &read.0;
-            match screen(facts, config, &[], &people) {
+            match screen(facts, config, &control, &people) {
                 Screen::Out => {}
                 Screen::Held(hold) => self.held(facts, hold),
                 Screen::Visitor => visitors += 1,
@@ -1629,7 +1678,6 @@ mod tests {
             ("usage.repository", "#513"),
             ("usage.issue", "#513"),
             ("usage.probe", "#513"),
-            ("sweep.max", "sweep ownership"),
             ("revisit.perPass", "revisit ownership"),
         ] {
             let mut value = file();

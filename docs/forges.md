@@ -89,7 +89,8 @@ let a deleted or renamed label widen the board. The write side keeps that.
 
 `Forge::board_write` is a deterministic controller primitive, not an
 agent-output publisher. It refuses by default on other backends. Forgejo
-implements one scoped label replacement, issue open/close, append-only
+implements one scoped label replacement (or the unscoped `needs-human`
+label added beside the others), issue open/close, append-only
 comments, and plan claims with their receipts. The Forgejo pass's applying
 stage 4 calls its claim and receipt operations; no deployed caller is activated. Its explicit
 `apply` argument previews when false; each attempted mutation consumes the
@@ -137,7 +138,8 @@ tracker#786). **The end-to-end pass is not built**. `agent-board pass --config F
 now accepts a Forgejo board: identity checks, then stage 1's
 broker usage and grants, stage 3's epics where `epics` is set (#514,
 [below](#epics)), and stage 4's candidates, holds and runs in flight
-(#522, [below](#stage-4-in-preview)), with one `not built on Forgejo yet` line
+(#522, [below](#stage-4-in-preview)) with the [weekly sweep](#the-weekly-sweep)
+where `sweep` is set, with one `not built on Forgejo yet` line
 for each of stages 2, 5 and 6. Preview writes and dispatches nothing;
 `--apply` supports stages 3 and [4](#stage-4-apply). A preview can be
 [recorded and replayed](#recording-and-replay). `--fix-bounds`, and
@@ -210,9 +212,10 @@ an empty collection or a nested setting, with
 `unsupported_capability: OPTION: REASON` from the contract, before token lookup.
 It also temporarily rejects `holds`, usage publication
 (`usage.repository`/`usage.issue`) and `usage.probe` (#523). Leases and reruns
-are accepted. Sweep and revisit remain deferred: follow-ups to #513 must own
-their scheduling and publication semantics; neither is silently enabled by
-this preview or claimed as built by the native adapters.
+are accepted, and so is `sweep` ([below](#the-weekly-sweep)). Revisit
+remains deferred: a follow-up to #513 must own its scheduling semantics; it
+is not silently enabled by this preview or claimed as built by the native
+adapters.
 
 Stage 1 accepts broker-only `usage: {"url": "http://broker.internal/usage"}`;
 GitHub still requires its publication repository and issue. It reuses the
@@ -228,7 +231,7 @@ is opt-in through a trusted config file, with no caller or adapter activation.
 | 1 Usage | Broker read unchanged; the snapshot is a new comment in a private repository (`GET /repos` `private`) | |
 | 2 Follow pull requests | Nothing | All of it: fix, rebase, continuation and answer rounds, reviews, required checks and their reruns, merges and merge queues, `--fix-bounds` |
 | 3 Epics | `epic` issues, children from relationship comments (below), plan and receipt comments, creating issues, Priority labels, closing, a planning run | Sub-issue APIs (none exist) |
-| 4 Schedule | Candidates, Priority, holds from labels and [dependencies][fj-deps], WIP from complete run listings, pool pacing, plan claims, dispatch, one rerun, file-based leases | Overlap waivers, the start breaker, `replanAfterDays`, `bodyPlans`, direction |
+| 4 Schedule | Candidates, Priority, holds from labels and [dependencies][fj-deps], WIP from complete run listings, pool pacing, plan claims, dispatch, one rerun, file-based leases, the [weekly sweep](#the-weekly-sweep) | Overlap waivers, the start breaker, `replanAfterDays`, `bodyPlans`, direction |
 | 5 Status | Derived as on GitHub, round-tripped through `status/` labels | Close reasons |
 | 6 Cost | Nothing | Publishing to a `data` branch |
 
@@ -414,7 +417,8 @@ whole seconds, so an edit within the second the comment was made is not seen
 either. [Live CI](#live-ci) logs whether a fresh comment's two times
 differ; none did in the runs made when it was added. The pass
 therefore never edits a record: where the GitHub pass edits in place (the
-claim's outcome, the usage and hold snapshots, the planning request), a Forgejo
+claim's outcome, the usage and hold snapshots, the planning request, the
+sweep's applied comment and its list in the issue body), a Forgejo
 pass appends a new comment and reads the newest valid one. A writer replaces a
 plan by replying with another, not by editing it. Run and Result reads now
 check both the author id and matching creation/update timestamps.
@@ -490,6 +494,102 @@ stops the apply; its final receipt says `stopped` and what was confirmed.
 A create whose reply is lost or cannot be read back is ambiguous: nothing
 names the issue, so recovery cannot prove it and holds the epic for a
 person, and the create is never sent again.
+
+### The weekly sweep
+
+The [weekly sweep](pass.md#the-weekly-sweep) runs on a Forgejo board with
+the same `sweep` settings, the same week, due time, list order, verdicts,
+spare-capacity pacing and lines. Only its records are different. On GitHub
+the pass trusts the sweep issue's body because its last editor is the bot,
+and it trusts its own applied comment because the bot edited it last.
+Forgejo shows neither who last edited a body nor who edited a comment
+([above](#comments-recorders-and-editors)). So on Forgejo the issue body is
+only for people to read, and every record is an unedited bot comment,
+appended, never edited:
+
+* **Finding it.** The sweep issue is the newest issue in `sweep.repository`
+  posted by the bot's id whose body starts with
+  `<!-- agent-board-sweep v1 -->`. The pass looks first among the open
+  issues (`created_by` the bot), then among all issues updated since this
+  week's due time, each listing read whole (4 pages of 50, `X-Total-Count`).
+  A listing that is cut short or fails is a `sweep error:`, and then no
+  sweep is filed or started. Stage 4 leaves the issue out of its candidates.
+* **The list.** The pass files the issue with `create_issue` (no labels,
+  never sent again) and then appends the list record:
+  `<!-- agent-board-sweep-list: N -->`, where `N` is the issue's own number,
+  followed by the `agent-board-sweep` block (`{"schema": "agent-board/sweep/v1",
+  "due": T, "issues": […]}`). Only the bot's earliest such comment counts. It
+  comes before the run's dispatch, so a run posting as the bot cannot replace
+  it. The issue's server-set `created_at` decides whether this week's sweep
+  was filed, so at most one is filed in each week. If the create's reply is
+  lost, or the pass stops before the record, the next pass finds an open
+  sweep with no list. That sweep is stuck: nothing is filed again, and
+  nothing is guessed.
+* **Its run.** The bot posts a triage job plan on the sweep issue, then
+  claims and starts it through [stage 4's path](#stage-4-apply) with its
+  leases, caps, final recheck and recovery. The run starts only after
+  stage 4's own starts, and only with a slot free, every `triagePools` pool
+  under its pace and the budget not reached. A claim with no receipt is
+  recovered and never started again.
+* **The reply.** Once the run is no longer in flight, the reply is the
+  bot's newest comment after the dispatch claim that holds the
+  `agent-board-sweep-verdicts` block.
+* **Applying.** The pass claims the reply as a plan:
+  `<!-- agent-board-sweep-apply: REPLY-ID@CREATED -->`, under the
+  [claim rules](#claims-and-recovery). Then it makes each `attach` with
+  stage 3's relationship comments: first the child's parent comment, then
+  the epic's new children comment, each read back. Only an open issue whose
+  newest parent comment names no epic is attached, and only to a live epic
+  that lists fewer than 50 children. An issue whose comment names another
+  epic is left with that conflict. One whose comment names this epic but is
+  not listed back gets only the epic's comment. After that, one receipt
+  holds the `agent-board-sweep-applied` block
+  (`{"schema": "agent-board/sweep-applied/v1", "reply": ID, "outcome":
+  "applied|recovered", "attached": […], "left": N}`), followed by the sweep
+  issue's `needs-human` label if anything is left, or its close if nothing
+  is.
+  A later pass reads the claim's receipt. It then adds the label or close
+  where a pass stopped before it, and otherwise waits for the operator.
+* **Recovery.** A claim with no receipt is an apply that was cut short. The
+  pass reads the claimed reply again and checks each attach against both
+  issues as they are now. An attach with both sides is done. One where only
+  the child's side is there gets the epic's comment. One with neither side
+  is listed for the operator and is never sent again. The pass then writes
+  the receipt (`recovered`) and the label or close.
+
+`done` and `obsolete` verdicts and questions are listed for the operator,
+and the pass closes no listed issue. Before applying, the pass reads again
+whether each listed issue's repository is public, as on GitHub. It never
+calls a sub-issue API and never falls back to GitHub. On Forgejo a
+repository counts as public only where `GET /repos/{o}/{r}` shows
+`private: false` and `internal: false` and its owner's `visibility` is
+`public`. Otherwise, including when a field is missing, its issues are not
+copied into the sweep issue.
+
+Anything the pass cannot use leaves the sweep stuck: an edited record by a
+recorder (which makes the whole thread unreadable), a missing list, a list
+naming another issue, a plan or claim that cannot be read, no reply, or
+verdicts that cannot be read. A stuck sweep gets the `needs-human` label,
+one write that is added and read back beside the issue's other labels
+(`BoardOperation::Label` takes `needs-human` as its own scope). A sweep issue
+outside `board.repositories` may have neither the membership label nor the
+board's other rules. Its writes therefore go through stage 3's writer, which
+reaches the work repositories' open issues.
+
+The run posts as the bot, so its comments carry the bot's trust, as a
+planning run's do on an epic. GitHub tells the pass's applied comment from
+the run's by who edited it last. Forgejo cannot, so the protection here is
+order. The list comes before the dispatch. A claim counts only as the
+earliest one, so a claim the run forged makes the pass's own claim fail.
+The next pass then reads the forged claim as an apply that was cut short,
+which sends no new attach. A run that forged a claim together with its
+receipt could still settle its own sweep, which is no more than its verdicts
+already decide.
+
+Each step's writes are checked against `--max-writes` before any of them is
+made: the list record's two (create and record), the run's plan with
+stage 4's start writes, and an apply's three (claim, receipt, label or close)
+plus two for each attach. A preview writes nothing.
 
 ### Claims and recovery
 
