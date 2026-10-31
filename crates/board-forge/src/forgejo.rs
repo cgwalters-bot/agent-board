@@ -443,37 +443,12 @@ impl<T: Transport> Forgejo<T> {
             "Forgejo snapshot request budget exhausted; no snapshot produced"
         );
         budget.set(remaining - 1);
-        let response = self.transport.get(url)?;
-        let items = response
-            .body
-            .as_array()
-            .context("Forgejo listing is not an array")?;
-        Ok((items.clone(), response.total))
+        listing(&self.transport, url)
     }
 
-    /// Every page of a listing, and whether it read as many items as one
-    /// `X-Total-Count` that every page reported. Offset pages shift when
-    /// issues change mid-read; this catches an issue lost to a shift, not
-    /// one removal and one addition that cancel out.
-    fn pages(&self, budget: &Cell<usize>, mut url: Url) -> Result<(Vec<Value>, bool)> {
-        let base: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-        let mut all = Vec::new();
-        let mut totals = BTreeSet::new();
-        for page in 1.. {
-            url.query_pairs_mut()
-                .clear()
-                .extend_pairs(&base)
-                .append_pair("limit", PAGE_LIMIT)
-                .append_pair("page", &page.to_string());
-            let (items, total) = self.get(budget, &url)?;
-            totals.insert(total);
-            all.extend(items.iter().cloned());
-            if items.is_empty() || total.is_some_and(|total| all.len() as u64 >= total) {
-                break;
-            }
-        }
-        let complete = totals.len() == 1 && totals.first() == Some(&Some(all.len() as u64));
-        Ok((all, complete))
+    /// Every page of a listing, and whether it read whole ([`pages`]).
+    fn pages(&self, budget: &Cell<usize>, url: Url) -> Result<(Vec<Value>, bool)> {
+        pages(url, usize::MAX, |url| self.get(budget, url))
     }
 
     fn snapshot_at(&self, clock: String, policy: &board_core::AgentPolicy) -> Result<Snapshot> {
@@ -548,6 +523,84 @@ impl<T: Transport> Forgejo<T> {
     }
 }
 
+/// One page of a listing at `url` and its `X-Total-Count`.
+pub(crate) fn listing(transport: &impl Transport, url: &Url) -> Result<(Vec<Value>, Option<u64>)> {
+    let response = transport.get(url)?;
+    let items = response
+        .body
+        .as_array()
+        .context("Forgejo listing is not an array")?;
+    Ok((items.clone(), response.total))
+}
+
+/// At most `cap` pages of a listing, each read by `get`, and whether it read
+/// as many items as one `X-Total-Count` that every page reported; more than
+/// `cap` pages is not whole. Offset pages shift when issues change
+/// mid-read; this catches an issue lost to a shift, not one removal and one
+/// addition that cancel out.
+pub(crate) fn pages(
+    mut url: Url,
+    cap: usize,
+    mut get: impl FnMut(&Url) -> Result<(Vec<Value>, Option<u64>)>,
+) -> Result<(Vec<Value>, bool)> {
+    let base: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    let mut all = Vec::new();
+    let mut totals = BTreeSet::new();
+    for page in 1..=cap {
+        let (items, total) = get(page_url(&mut url, &base, page))?;
+        totals.insert(total);
+        all.extend(items.iter().cloned());
+        if items.is_empty() || total.is_some_and(|total| all.len() as u64 >= total) {
+            break;
+        }
+    }
+    let complete = totals.len() == 1 && totals.first() == Some(&Some(all.len() as u64));
+    Ok((all, complete))
+}
+
+/// [`pages`] of a listing that sends no `X-Total-Count`, such as an issue's
+/// dependencies: whole only where it read an empty page, as a server's pages
+/// may be smaller than asked for.
+pub(crate) fn pages_to_end(
+    mut url: Url,
+    cap: usize,
+    mut get: impl FnMut(&Url) -> Result<(Vec<Value>, Option<u64>)>,
+) -> Result<(Vec<Value>, bool)> {
+    let base: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    let mut all = Vec::new();
+    for page in 1..=cap {
+        let (items, _) = get(page_url(&mut url, &base, page))?;
+        if items.is_empty() {
+            return Ok((all, true));
+        }
+        all.extend(items);
+    }
+    Ok((all, false))
+}
+
+/// `url` with its `base` query and the `page` of [`PAGE_LIMIT`] items.
+fn page_url<'a>(url: &'a mut Url, base: &[(String, String)], page: usize) -> &'a Url {
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(base)
+        .append_pair("limit", PAGE_LIMIT)
+        .append_pair("page", &page.to_string());
+    url
+}
+
+/// The Priority of an issue's one `priority/` label, as the snapshot reads
+/// it: none without one, and an error with two, or an unknown value.
+pub(crate) fn priority(labels: &[String]) -> std::result::Result<Option<Priority>, String> {
+    if !labels.iter().any(|label| label.starts_with(PRIORITY_SCOPE)) {
+        return Ok(None);
+    }
+    let mut errors = Vec::new();
+    match exclusive(labels, PRIORITY_SCOPE, &mut errors, parse_priority) {
+        Some(priority) => Ok(Some(priority)),
+        None => Err(errors.join("; ")),
+    }
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
     value[key]
         .as_str()
@@ -599,9 +652,7 @@ fn item(
         } else {
             None
         };
-    let priority = exclusive(&labels, PRIORITY_SCOPE, &mut errors, |value| {
-        serde_json::from_value::<Priority>(value.into()).ok()
-    });
+    let priority = exclusive(&labels, PRIORITY_SCOPE, &mut errors, parse_priority);
     let turn = exclusive(&labels, TURN_SCOPE, &mut errors, |value| {
         match value.to_ascii_lowercase().as_str() {
             "coordinator" => Some(Turn::Coordinator),
@@ -795,6 +846,10 @@ pub(super) fn unedited(comment: &Value) -> bool {
         time::OffsetDateTime::parse(created, &time::format_description::well_known::Rfc3339).is_ok()
             && comment["updated_at"].as_str() == Some(created)
     })
+}
+
+fn parse_priority(value: &str) -> Option<Priority> {
+    serde_json::from_value(value.into()).ok()
 }
 
 fn parse_status(value: &str) -> Option<Status> {

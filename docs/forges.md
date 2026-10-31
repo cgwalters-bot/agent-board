@@ -132,8 +132,9 @@ This is the contract for a second, separate `agent-board pass` that drives a
 Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
 tracker#786). **The end-to-end pass is not built**. `agent-board pass --config FILE`
 now accepts a Forgejo board for preview only: identity checks, then stage 1's
-broker usage and grants, followed by one `not built on Forgejo yet` line for
-each stage 2–6. It writes and dispatches nothing. `--apply` (pending #513),
+broker usage and grants, and stage 4's candidates, holds and runs in flight
+(#522, [below](#stage-4-in-preview)), with one `not built on Forgejo yet` line
+for each of stages 2, 3, 5 and 6. It writes and dispatches nothing. `--apply` (pending #513),
 `--fix-bounds` and `--record`/`--replay` are refused before credentials are read.
 The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
@@ -227,9 +228,53 @@ every option of it (`follow`, `pr.*`, `state`) is refused, with `maintain`,
 whose digest reads the operator's pull requests across GitHub. Work whose run
 opens a pull request must still hold its issue until a person merges or closes
 it. GitHub names a pull request's closing issues; no such field was found in
-Forgejo's pull request API, so #513 specifies and tests how an open pull
-request (`GET /repos/{o}/{r}/pulls`) is matched to its issue, and an item whose
-match cannot be read is held, as an unreadable hold is today.
+Forgejo's pull request API, so stage 4 matches them itself (#522, below), and
+an item whose match cannot be read is held, as an unreadable hold is today.
+
+### Stage 4 in preview
+
+A preview's stage 4 applies the GitHub pass's rules to what it reads of this
+instance, in the same order, and prints the same lines: `hold wip|pools|budget: …`,
+`candidates: N (…)`, `hold OWNER/REPO#N: why`, and `wip: no slot left; …`.
+It reads no plan, so where GitHub would print `start triage|implement …`, it
+prints `would start OWNER/REPO#N pool=P` (or `held by --max-dispatch: would
+start …`), choosing the pool from stage 1's snapshot.
+
+* **Runs in flight.** The caller's `waiting`, `blocked` and `running` runs,
+  listed twice by the dispatch adapter's
+  [active inventory](#dispatch-and-runs) within its page cap. Each counts
+  toward `wip`, and its title (`KIND OWNER/REPO#N (POOL)`, from the caller's
+  `run-name`) holds that issue. A listing that fails, or is cut short, holds
+  every new start and is a failure.
+* **Candidates.** The open issues (with `membership`'s label, if any) of each
+  board repository that is also a work repository, at most 4 pages of 50; a
+  longer or shifting listing is an incomplete board, which starts nothing.
+  Issues labelled `epic` or `question` are not work. Parents are not read yet
+  (#514), so an issue is a candidate only where its poster's id is the bot's
+  or the operator's; others are counted as opened by others.
+* **Rank.** By the one `priority/` label, P0 first, unlabelled last, then age.
+  Two `priority/` labels, or an unknown value, hold the issue.
+* **Holds.** As on GitHub: `needs-human` and `needs-design`, `status/blocked`
+  where `statusLabels` is set, and a run in flight, which hold before anything
+  more is read; then open [dependencies][fj-deps] and a matching pull request.
+  The dependency listing has no total, so it is read to an empty page, at
+  most 4 pages of 50; more holds, a blocker the token cannot read counts as
+  open, and a repository without dependencies enabled (404) has none. A read
+  that fails holds the issue and is a failure.
+* **Matching pull requests.** The open pull requests of the issue's
+  repository (`GET /repos/{o}/{r}/pulls?state=open`, at most 4 pages of 50,
+  read once a pass) whose poster's id is the bot's or the operator's, and whose
+  body closes the issue as [`stacks_on`](job-plans.md#stacking) reads GitHub's:
+  a closing keyword (`close`, `closes`, `closed`, `fix`, `fixes`, `fixed`,
+  `resolve`, `resolves` or `resolved`, any case, with an optional colon), then
+  `#N`, `OWNER/REPO#N` or the issue's URL on this instance. `Part of #N` does
+  not match, and a visitor's pull request never holds an issue. A listing that
+  fails or has more holds the issue too. Unlike GitHub's closing references,
+  a pull request in another repository is not read.
+
+An issue is keyed by its instance URL and `OWNER/REPO#N`, so two
+configurations for two instances never share one, and every request goes to
+the configuration's own instance.
 
 ### Labels and Status
 

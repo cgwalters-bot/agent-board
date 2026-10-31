@@ -1547,9 +1547,14 @@ impl Facts {
     }
 }
 
-/// `OWNER/REPO#N` in lower case, as runs and holds are matched.
+/// `OWNER/REPO#N` in lower case, as runs and holds are matched. An issue of
+/// another forge carries its instance as its host, which leads its key, so
+/// that two instances' `OWNER/REPO#N` never meet.
 fn key(issue: &ItemRef) -> String {
-    issue.display().to_ascii_lowercase()
+    match issue.host == DEFAULT_HOST {
+        true => issue.display().to_ascii_lowercase(),
+        false => format!("{}/{}", issue.host, issue.display()).to_ascii_lowercase(),
+    }
 }
 
 fn is(login: Option<&str>, who: &[&str]) -> bool {
@@ -1690,6 +1695,65 @@ fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) ->
     }
     busy.get(&key(&facts.issue))
         .map(|run| Hold::new(HoldKind::InFlight, format!("a run is in flight, {run}")))
+}
+
+/// What stage 4 makes of an open board issue before it ranks it, on any forge.
+enum Screen<'a> {
+    /// Not work: closed, outside the work repositories, one of `control`, or
+    /// labelled one of [`EXCLUDED_LABELS`].
+    Out,
+    /// Held before it is ranked: its labels could not all be read.
+    Held(Hold),
+    /// Unparented and opened by someone but the operator and the bot.
+    Visitor,
+    /// Unparented and opened by the operator or the bot.
+    Unparented,
+    /// A child, a candidate only where its parent is a live epic.
+    Child(&'a Parent),
+}
+
+/// [`Screen`] of `facts`, where `control` is the `OWNER/REPO#N` keys of the
+/// pass's own issues and `people` the operator and the bot.
+fn screen<'a>(
+    facts: &'a Facts,
+    config: &Config,
+    control: &[String],
+    people: &[&str],
+) -> Screen<'a> {
+    if !facts.open
+        || !config.works_in(&facts.issue.repository)
+        || control.contains(&facts.issue.display().to_ascii_lowercase())
+    {
+        return Screen::Out;
+    }
+    if !facts.labels_complete {
+        let why = "its labels could not all be read";
+        return Screen::Held(Hold::new(HoldKind::Unreadable, why));
+    }
+    if EXCLUDED_LABELS.iter().any(|l| facts.labelled(l)) {
+        return Screen::Out;
+    }
+    match &facts.parent {
+        None if is(facts.author.as_deref(), people) => Screen::Unparented,
+        None => Screen::Visitor,
+        Some(parent) => Screen::Child(parent),
+    }
+}
+
+/// Stage 4's `candidates:` line: how many were ranked, and how many were
+/// opened by others, outside a live epic and unparented.
+fn candidates_line(
+    config: &Config,
+    ranked: usize,
+    (visitors, outside, unparented): (usize, usize, usize),
+) -> String {
+    let scoped = match config.triage {
+        Some(TriageScope::Epics) => format!(", {unparented} unparented: run only with a plan"),
+        _ => String::new(),
+    };
+    format!(
+        "candidates: {ranked} ({visitors} opened by others, {outside} outside a live epic{scoped})"
+    )
 }
 
 /// A candidate's place in line: its epic's Priority, its own, its age, then
@@ -3416,30 +3480,21 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut ranked = Vec::new();
         let (mut visitors, mut outside, mut unparented) = (0, Vec::new(), 0);
         for facts in board.items.values() {
-            if !facts.open
-                || !config.works_in(&facts.issue.repository)
-                || control.contains(&key(&facts.issue))
-            {
-                continue;
-            }
-            if !facts.labels_complete {
-                let why = "its labels could not all be read";
-                self.held(facts, Hold::new(HoldKind::Unreadable, why));
-                continue;
-            }
-            if EXCLUDED_LABELS.iter().any(|l| facts.labelled(l)) {
-                continue;
-            }
-            let epic = match &facts.parent {
-                None if is(facts.author.as_deref(), &people) => {
-                    unparented += 1;
-                    None
+            let epic = match screen(facts, config, &control, &people) {
+                Screen::Out => continue,
+                Screen::Held(hold) => {
+                    self.held(facts, hold);
+                    continue;
                 }
-                None => {
+                Screen::Visitor => {
                     visitors += 1;
                     continue;
                 }
-                Some(parent) => match self.live(parent) {
+                Screen::Unparented => {
+                    unparented += 1;
+                    None
+                }
+                Screen::Child(parent) => match self.live(parent) {
                     Ok(true) => board.items.get(&key(&parent.issue)),
                     Ok(false) => {
                         let why = format!(
@@ -3467,15 +3522,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
         self.report.tally.1.candidates = Some(ranked.len());
-        let scoped = match config.triage {
-            Some(TriageScope::Epics) => format!(", {unparented} unparented: run only with a plan"),
-            _ => String::new(),
-        };
-        self.line(format!(
-            "candidates: {} ({visitors} opened by others, {} outside a live epic{scoped})",
-            ranked.len(),
-            outside.len()
-        ));
+        let line = candidates_line(config, ranked.len(), (visitors, outside.len(), unparented));
+        self.line(line);
         for entry in outside {
             self.record(entry);
         }

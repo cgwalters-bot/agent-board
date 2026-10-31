@@ -27,7 +27,13 @@ A [Forgejo pass](forges.md#a-forgejo-pass) now accepts the same file with a
 configuration. It previews only: verify the bot login and recorder id, resolve
 the operator and require its recorder id, then read broker usage and grants
 with the shared pacing and `usage:` line. Identity failure stops immediately.
-Each stage 2–6 prints one not-built line. It writes and dispatches nothing;
+Stage 4 then reads the caller's runs in flight, the work repositories' open
+issues, their dependencies and the bot's and operator's matching pull
+requests, and prints the `hold wip|pools|budget`, `candidates:`, `hold
+OWNER/REPO#N` and `wip: no slot left` lines a GitHub pass would, with
+`would start OWNER/REPO#N pool=P` where GitHub would start a run: it reads no
+plan yet ([stage 4 in preview](forges.md#stage-4-in-preview)). Stages 2, 3, 5
+and 6 each print one not-built line. It writes and dispatches nothing;
 the end-to-end Forgejo pass remains unbuilt. `--apply`, `--fix-bounds`,
 `--record` and `--replay`, contract-refused options and temporarily unbuilt
 settings are refused before token lookup. Only `board.tokenEnv` is read,
