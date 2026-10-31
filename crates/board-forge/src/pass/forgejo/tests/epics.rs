@@ -39,6 +39,8 @@ struct Instance {
     writes: RefCell<Vec<String>>,
     next: Cell<u64>,
     fault: Cell<&'static str>,
+    /// Repositories `GET /repos/{o}/{r}` says are private.
+    private: RefCell<BTreeSet<String>>,
 }
 
 fn labels(names: &[&str]) -> Value {
@@ -64,6 +66,7 @@ impl Instance {
             writes: RefCell::default(),
             next: Cell::new(1000),
             fault: Cell::new(""),
+            private: RefCell::default(),
         };
         this.issue(PLANS, EPIC, OPERATOR, &["epic", "priority/P1"]);
         this.labelled(PLANS, EPIC, OPERATOR, "epic", true);
@@ -187,7 +190,9 @@ impl ForgejoTransport for Instance {
                 let listed: Vec<Value> = (self.issues.borrow().iter())
                     .filter(|((r, _), i)| {
                         *r == repo
-                            && i["state"] == query["state"].as_str()
+                            && (query["state"] == "all" || i["state"] == query["state"].as_str())
+                            && (query.get("created_by"))
+                                .is_none_or(|by| by == "bot" && i["user"]["id"] == BOT)
                             && query.get("labels").is_none_or(|l| {
                                 (i["labels"].as_array().unwrap())
                                     .iter()
@@ -196,6 +201,12 @@ impl ForgejoTransport for Instance {
                     })
                     .map(|(_, i)| i.clone())
                     .collect();
+                // One the total says is there, but is not listed.
+                if self.fault.get() == "sweep-listing" && query.contains_key("created_by") {
+                    let mut response = paged(&listed, true);
+                    response.total = Some(listed.len() as u64 + 1);
+                    return Ok(response);
+                }
                 return Ok(paged(&listed, true));
             }
             ["repos", owner, name, "issues", n] if n != "comments" => {
@@ -232,6 +243,12 @@ impl ForgejoTransport for Instance {
             }
             ["orgs", _] => return Err(crate::forgejo::NotFound.into()),
             ["repos", "example", "control"] => json!({"private": true}),
+            ["repos", owner, name] => {
+                let repo = format!("{owner}/{name}");
+                let private = self.private.borrow().contains(&repo);
+                json!({"full_name": repo, "private": private, "internal": false,
+                    "owner": {"visibility": "public"}})
+            }
             ["repos", "example", "control", "contents", "leases", file] => {
                 let n: usize = file.trim_end_matches(".json").parse()?;
                 let (version, body) = &self.slots.borrow()[n];
@@ -824,3 +841,5 @@ fn planning_run_starts_through_the_claim_path_once() {
     assert_eq!(instance.writes(DISPATCH), 1);
     assert_eq!(instance.comments.borrow()[&at(PLANS, EPIC)].len(), writes);
 }
+
+mod sweep;

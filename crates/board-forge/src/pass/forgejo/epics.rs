@@ -244,6 +244,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             repositories.join(", ")
         ));
         for epic in &live {
+            (self.live).insert(epic.facts.issue.display().to_ascii_lowercase());
             let parent = Parent {
                 issue: epic.facts.issue.clone(),
                 open: true,
@@ -344,7 +345,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         Ok(relations::labelled_by(&events).is_some_and(|id| id == bot || id == operator))
     }
 
-    fn item(&self, issue: &IssueRef) -> ItemRef {
+    pub(super) fn item(&self, issue: &IssueRef) -> ItemRef {
         ItemRef {
             host: instance(self.board),
             repository: issue.repo.clone(),

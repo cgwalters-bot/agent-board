@@ -12,7 +12,7 @@ use url::Url;
 pub mod epics;
 mod writes;
 
-pub use writes::RECEIPT_MARKER;
+pub use writes::{RECEIPT_MARKER, SWEEP_APPLY_MARKER};
 
 impl<T: Transport> crate::Forge for Forgejo<T> {
     async fn snapshot(&self) -> Result<Snapshot> {

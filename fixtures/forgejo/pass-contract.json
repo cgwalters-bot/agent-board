@@ -47,7 +47,9 @@
     "markers": {
       "dispatch": "<!-- agent-board-dispatch: COMMENT-ID@TIME -->",
       "children": "<!-- agent-board-epic-children: N -->",
-      "parent": "<!-- agent-board-epic-parent: OWNER/REPO#N -->"
+      "parent": "<!-- agent-board-epic-parent: OWNER/REPO#N -->",
+      "sweepList": "<!-- agent-board-sweep-list: N -->",
+      "sweepApply": "<!-- agent-board-sweep-apply: COMMENT-ID@TIME -->"
     }
   },
   "dispatch": {
@@ -136,6 +138,7 @@
         {"capability": "one rerun", "verdict": "native", "forgejo": "POST runs/{id}/rerun, recorded with the jobs' attempt"},
         {"capability": "leases", "verdict": "native", "forgejo": "contents API blob-sha compare and swap"},
         {"capability": "overlap waivers", "verdict": "refused", "reason": "reads GitHub branch activity"},
+        {"capability": "weekly sweep", "verdict": "native", "forgejo": "issue filed by the bot, its list and due time in the bot's earliest unedited sweep-list comment, its run through the claim and start path, its reply applied under an appended claim and receipt, attaches as relationship comments; edited or missing records label needs-human"},
         {"capability": "start breaker", "verdict": "refused", "reason": "classifies start failures from GitHub job data; Forgejo job logs are unreviewed"},
         {"capability": "operator direction", "verdict": "refused", "reason": "no last editor of an issue body"}
       ]
@@ -188,10 +191,10 @@
     "revisit.afterDays": {"verdict": "native", "forgejo": "issue updated_at"},
     "revisit.heldAfterDays": {"verdict": "native", "forgejo": "issue updated_at"},
     "revisit.pools": {"verdict": "same"},
-    "sweep.weekday": {"verdict": "native", "forgejo": "files one issue on this instance"},
+    "sweep.weekday": {"verdict": "native", "forgejo": "files one issue on this instance, its list in an unedited bot record comment"},
     "sweep.hourUtc": {"verdict": "same"},
     "sweep.max": {"verdict": "same"},
-    "sweep.repository": {"verdict": "native", "forgejo": "a work repository of this instance"},
+    "sweep.repository": {"verdict": "native", "forgejo": "a work repository of this instance; other repositories' issues listed only where public, not internal, with a public owner"},
     "maintain.repos.sinceDays": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
     "maintain.repos.min": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
     "maintain.repos.max": {"verdict": "refused", "reason": "the digest reads the operator's GitHub pull requests"},
