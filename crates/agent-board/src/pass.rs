@@ -97,6 +97,49 @@ fn read(path: &PathBuf) -> Result<String> {
 pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
     let mut config = Config::parse(&read(&args.config)?)
         .with_context(|| format!("{}", args.config.display()))?;
+    if let Some(board) = config.forgejo_board() {
+        // Stop unsupported operations before opening files or looking up any
+        // credentials, including the GitHub apply/record/replay paths below.
+        for (supplied, option, reason) in [
+            (args.apply, "--apply", "Forgejo scheduling needs #513"),
+            (
+                args.fix_bounds.is_some(),
+                "--fix-bounds",
+                "PR follow-up has no reviewed Forgejo equivalent",
+            ),
+            (
+                args.record.is_some(),
+                "--record",
+                "a Forgejo recorder is not built; use fake-transport tests",
+            ),
+            (
+                args.replay.is_some(),
+                "--replay",
+                "a Forgejo replay is not built; use fake-transport tests",
+            ),
+        ] {
+            ensure!(!supplied, "unsupported_capability: {option}: {reason}");
+        }
+        let limits = Limits {
+            dispatch: args.max_dispatch,
+            writes: args.max_writes,
+            status_changes: args.max_status_changes,
+        };
+        if let Some(warning) = board.plain_http_warning() {
+            eprintln!("{warning}");
+        }
+        let client = board_forge::forgejo::Client::from_env(board)?;
+        let broker = pass::HttpBroker::default();
+        writeln!(out, "pass: preview")?;
+        let report = pass::forgejo::run(
+            &client,
+            &broker,
+            &config,
+            (Mode::Preview, limits),
+            time::OffsetDateTime::now_utc(),
+        )?;
+        return print_report(&report, out);
+    }
     config.fix_bounds = args
         .fix_bounds
         .as_deref()
@@ -179,6 +222,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
             }
         }
     };
+    print_report(&report, out)
+}
+
+fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
     for line in &report.lines {
         writeln!(out, "{line}")?;
     }

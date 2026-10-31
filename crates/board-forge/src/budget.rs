@@ -388,7 +388,7 @@ pub fn read<T: Transport>(client: &T, config: &Config) -> Result<Tree> {
             used: Cell::new(0),
         },
         bot: &config.bot,
-        board: config.board.as_ref(),
+        board: config.github_board(),
         items: Cell::new(0),
     };
     let data = reader.client.graphql(

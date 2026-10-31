@@ -941,7 +941,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if live.is_empty() {
             return Ok(());
         }
-        let project = match &self.config.board {
+        let project = match self.config.github_board() {
             Some(board) => Some(self.project(board)?),
             None => None,
         };
@@ -1007,7 +1007,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         only: Option<&str>,
     ) -> Result<Vec<std::result::Result<EpicFacts, (ItemRef, anyhow::Error)>>> {
         let (owner, name) = repository.split_once('/').context("epics repository")?;
-        let board = self.config.board.as_ref();
+        let board = self.config.github_board();
         let field = board.map_or("Priority", |b| b.priority_field.as_str());
         let mut cursor = Value::Null;
         let mut out = Vec::new();
@@ -1156,7 +1156,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// the last (the lowest).
     fn apply_config(&self, project: &Project) -> Result<epic_apply::Config> {
         let config = self.config;
-        let board = config.board.as_ref().context("no board")?;
+        let board = config.github_board().context("no GitHub board")?;
         let priorities: serde_json::Map<String, Value> = (project.options.iter())
             .map(|(id, name)| (name.clone(), Value::from(id.clone())))
             .collect();
@@ -1657,7 +1657,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// for a person, who sees it: labelled [`NEEDS_HUMAN`], and with a board
     /// its Why set to `question`. One write step each, taken whole.
     fn ask_epic(&mut self, facts: &EpicFacts, held: &str, question: &str) {
-        let board = self.config.board.as_ref();
+        let board = self.config.github_board();
         let mut why = format!("{held}; label {NEEDS_HUMAN}");
         if board.is_some() {
             why.push_str(&format!(", {WHY_FIELD} {question}"));
@@ -1755,7 +1755,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// ([`Self::changed_since`]).
     fn finish_epic(&mut self, facts: &EpicFacts, why: &str) {
         let close = self.config.epics.as_ref().is_some_and(|e| e.close);
-        let board = self.config.board.as_ref();
+        let board = self.config.github_board();
         let name = facts.issue.display();
         let (line, writes) = match close {
             true => (format!("close epic {name}: {why}"), 2),

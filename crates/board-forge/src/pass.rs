@@ -408,7 +408,7 @@ pub struct Config {
     pub follow: Vec<String>,
     #[serde(default)]
     pub work_repositories: Vec<String>,
-    pub board: Option<Board>,
+    pub board: Option<BoardConfig>,
     pub epics: Option<Epics>,
     #[serde(default)]
     pub wip: u64,
@@ -535,6 +535,31 @@ fn triage_setting<'de, D: Deserializer<'de>>(
     }
 }
 
+/// Legacy GitHub JSON stays untagged; Forgejo shares the board reader's tag.
+#[derive(Debug)]
+pub enum BoardConfig {
+    Github(Board),
+    Forgejo(crate::forgejo::Config),
+}
+
+impl<'de> Deserialize<'de> for BoardConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if value.get("forge").is_some() {
+            match serde_json::from_value(value).map_err(de::Error::custom)? {
+                crate::forgejo::Board::Forgejo(config) => Ok(Self::Forgejo(config)),
+                crate::forgejo::Board::Github {} => Err(de::Error::custom(
+                    "pass GitHub board uses owner, project and priorityField without a forge tag",
+                )),
+            }
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Github)
+                .map_err(de::Error::custom)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Board {
@@ -647,7 +672,9 @@ pub struct Usage {
     /// The broker's usage endpoint, which stage 1 reads; without it, pacing
     /// reads the snapshot another job publishes.
     pub url: Option<String>,
+    #[serde(default)]
     pub repository: String,
+    #[serde(default)]
     pub issue: u64,
     /// Off unless set: lets a pool the broker has no reading for and has
     /// sent no request through since it started take one run a pass while
@@ -794,6 +821,9 @@ fn valid_pool(name: &str) -> bool {
 impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         let value: Value = serde_json::from_str(text).context("pass config is not JSON")?;
+        if value["board"]["forge"] == "forgejo" {
+            forgejo::check_options(&value)?;
+        }
         no_nulls(&value, "config")?;
         let config: Self = serde_json::from_str(text).context("pass config")?;
         config.check()?;
@@ -818,7 +848,28 @@ impl Config {
             .filter(|b| b.source == Some(BudgetSource::Broker))
     }
 
+    pub fn forgejo_board(&self) -> Option<&crate::forgejo::Config> {
+        match &self.board {
+            Some(BoardConfig::Forgejo(board)) => Some(board),
+            _ => None,
+        }
+    }
+
+    pub fn github_board(&self) -> Option<&Board> {
+        match &self.board {
+            Some(BoardConfig::Github(board)) => Some(board),
+            _ => None,
+        }
+    }
+
     fn check(&self) -> Result<()> {
+        if let Some(board) = self.forgejo_board() {
+            board.validate()?;
+            ensure!(
+                board.token_env != "DISPATCH_TOKEN",
+                "board tokenEnv must not be DISPATCH_TOKEN"
+            );
+        }
         for login in [&self.operator, &self.bot] {
             ensure!(is_github_login(login), "invalid login {login:?}");
         }
@@ -850,10 +901,9 @@ impl Config {
             );
         }
         ensure!(self.wip <= WIP_LIMIT, "wip is not 0 to {WIP_LIMIT}");
-        if self.work() {
+        if self.work() && self.forgejo_board().is_none() {
             let board = self
-                .board
-                .as_ref()
+                .github_board()
                 .context("board is required when wip and workRepositories start work")?;
             ensure!(is_github_login(&board.owner), "invalid board owner");
             ensure!(board.project > 0, "board project is not a positive number");
@@ -952,8 +1002,10 @@ impl Config {
             ensure!(self.usage.is_some(), "pools need usage");
         }
         if let Some(usage) = &self.usage {
-            validate_repository(&usage.repository).context("usage repository")?;
-            ensure!(usage.issue > 0, "usage issue is not a positive number");
+            if self.forgejo_board().is_none() {
+                validate_repository(&usage.repository).context("usage repository")?;
+                ensure!(usage.issue > 0, "usage issue is not a positive number");
+            }
             // The address is not repeated: it may be private.
             if let Some(url) = &usage.url {
                 ensure!(
@@ -2151,6 +2203,10 @@ pub async fn run<C: Rest + Transport + crate::github::GraphQl + Broker>(
     (mode, limits): (Mode<'_>, Limits),
     now: OffsetDateTime,
 ) -> Result<Report> {
+    ensure!(
+        config.forgejo_board().is_none(),
+        "use pass::forgejo::run for a Forgejo board"
+    );
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, admit_by);
     run_within(
@@ -3278,7 +3334,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Every open issue on the board, whole, or an error: scheduling from
     /// part of the board would start the wrong work.
     fn board(&self) -> Result<BoardRead> {
-        let board = self.config.board.as_ref().context("no board")?;
+        let board = self.config.github_board().context("no GitHub board")?;
         let query = board_query(self.config.revisit.is_some() || self.config.sweep.is_some());
         let mut cursor = Value::Null;
         let mut options = None;
@@ -3505,7 +3561,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// `issue` read now, with its Status on the board, for what a person
     /// changed since the board was read.
     fn fresh(&self, issue: &ItemRef) -> Result<Facts> {
-        let board = self.config.board.as_ref().context("no board")?;
+        let board = self.config.github_board().context("no GitHub board")?;
         let node = self.issue(FRESH_QUERY, issue)?;
         let mut facts = Facts::from_node(&node)?;
         let items = node["projectItems"]["nodes"]
@@ -5353,7 +5409,10 @@ mod status;
 pub mod sweep;
 mod usage;
 
-pub use usage::Broker;
+pub mod forgejo;
+
+pub(crate) use usage::broker_get;
+pub use usage::{Broker, HttpBroker};
 
 #[cfg(test)]
 mod tests;

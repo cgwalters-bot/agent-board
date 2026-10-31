@@ -10,7 +10,7 @@ works today:
 | Forge | Board reads | Writes, plans and dispatch |
 |---|---|---|
 | GitHub | Projects v2 | Yes |
-| Forgejo | Issues of configured repositories, fields from labels | Library board-write primitives and native dispatch/run/lease adapters; no CLI/pass writes or activation ([contract](#a-forgejo-pass)) |
+| Forgejo | Issues of configured repositories, fields from labels; pass identity and broker preview | Library board-write primitives and native dispatch/run/lease adapters; no CLI/pass writes or activation ([contract](#a-forgejo-pass)) |
 | GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Existing dispatch callers still use GitHub Actions. The backend boundary also
@@ -130,14 +130,16 @@ deployment are changed here.
 
 This is the contract for a second, separate `agent-board pass` that drives a
 Forgejo board ([#271](https://github.com/cgwalters-forge/agent-board/issues/271),
-tracker#786). **The end-to-end pass is not built**: the CLI refuses a Forgejo board for
-everything but the five reads above, and no option below turns a pass on.
+tracker#786). **The end-to-end pass is not built**. `agent-board pass --config FILE`
+now accepts a Forgejo board for preview only: identity checks, then stage 1's
+broker usage and grants, followed by one `not built on Forgejo yet` line for
+each stage 2–6. It writes and dispatches nothing. `--apply` (pending #513),
+`--fix-bounds` and `--record`/`--replay` are refused before credentials are read.
 The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
 of scheduler wiring. Offline tests are not live proof.
-The remaining contract covers the write primitives
-(#511), dispatch and run adapters (#512), scheduling (#513), epics (#514) and
-live CI (#515) are. [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
+The remaining driver wiring covers scheduling (#513), epics (#514) and live
+CI (#515). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
 [pass option](pass.md#one-configuration-file); a test fails when an option is
 added to that table without one.
@@ -154,7 +156,7 @@ the feature is refused, not approximated.
 
 The instance is the configuration's `board`, as for the reads (`url`,
 `tokenEnv`, `repositories`, `membership`, `recorders`), in the pass's own
-trusted file, with `"forge": "forgejo"`. The v1 file refuses it today. Its
+trusted file, with `"forge": "forgejo"`. The pass accepts it only for preview. Its
 scope is fixed by that file alone:
 
 * **Host.** Every request goes to the canonical `url` (scheme, host and port
@@ -171,13 +173,13 @@ scope is fixed by that file alone:
 * **Token.** One bot user's access token from `tokenEnv`, with the scopes
   `read:user`, `read:issue`, `write:issue`, `read:repository` and
   `write:repository` ([scopes][fj-scopes], [route groups][fj-api-scopes]) and
-  no admin, organization or `all` scope. At the start of an applying pass,
+  no admin, organization or `all` scope. At the start of every preview (and a future applying pass),
   `GET /user` must name `bot` with an id in `recorders`; otherwise nothing is
   written. Not the Actions automatic token: its user's id is negative, so it
   can be no recorder, and the comments it writes wake no workflow
   ([notifier_helper.go#L137-L150][fj-actions-user]).
 * **Identities.** `operator` and `bot` stay logins, each resolved to its user
-  id once a pass (`GET /users/{login}`), and each id must be in `recorders`, or
+  id once a pass (bot through `GET /user`, operator through `GET /users/{login}`), and each id must be in `recorders`, or
   nothing the pass reads counts as theirs: a login can be renamed and
   registered again, an id cannot. Every trust decision compares ids.
 
@@ -192,6 +194,24 @@ Each verdict is `same` (forge-independent), `native` (the Forgejo mechanism
 below, to be built) or `refused`: a Forgejo pass refuses a configuration that
 sets a refused option, and what depends on a refused capability holds until a
 reviewed mechanism replaces it.
+
+The preview rejects every explicitly supplied refused option, even `false`,
+an empty collection or a nested setting, with
+`unsupported_capability: OPTION: REASON` from the contract, before token lookup.
+It also temporarily rejects `epics` (#514), `holds`, usage publication
+(`usage.repository`/`usage.issue`), `usage.probe`, leases and reruns (scheduler
+wiring #513). Sweep and revisit remain deferred: follow-ups to #513 must own
+their scheduling and publication semantics; neither is silently enabled by
+this preview or claimed as built by the native adapters.
+
+Stage 1 accepts broker-only `usage: {"url": "http://broker.internal/usage"}`;
+GitHub still requires its publication repository and issue. It reuses the
+GitHub pass's snapshot, grants, pacing and `usage:` rendering, but never its
+publication or snapshot fallback. Missing readings hold pools; failed reads
+report failures, with grants still deciding when available. No broker is no
+reading, never a reason to access GitHub. The Forgejo transport and separate
+credential-free broker share the 500-request/15-minute pass bound. The preview
+is opt-in through a trusted config file, with no caller or adapter activation.
 
 | Stage | Forgejo | Refused |
 | --- | --- | --- |

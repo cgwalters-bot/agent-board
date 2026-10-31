@@ -312,7 +312,7 @@ impl<'a, C: Rest + Transport> Reader<'a, C> {
         &mut self,
         config: &Config,
     ) -> Result<BTreeMap<String, Option<String>>> {
-        let board = config.board.as_ref().context("no board")?;
+        let board = config.github_board().context("no GitHub board")?;
         let mut cursor = Value::Null;
         let mut priorities = BTreeMap::new();
         for _ in 0..BOARD_PAGES {
