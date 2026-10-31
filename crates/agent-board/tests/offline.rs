@@ -197,7 +197,7 @@ fn setup_credential_free_rehearsal() {
             assert!(text.starts_with("pass: preview\n"), "{text}");
             assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 1);
             assert!(text.contains("held by --max-dispatch: start "), "{text}");
-            assert!(text.ends_with("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, requests 57 (epics 17, schedule 37, status 3), points ~43\n"), "{text}");
+            assert!(text.ends_with("status: 0 change(s) of 0 item(s) read\nsummary: dispatched 1/1, writes 3/3, held 5, requests 57 (epics 17, schedule 37, status 3), points ~43, starts {}, comments created 0, edited 0, planned starts {\"triage\":1}\n"), "{text}");
             assert!(output.stderr.is_empty(), "{line}");
         }
         count += 1;
@@ -2474,7 +2474,7 @@ fn pass_replay_previews_without_credentials() {
     // sub-issues are all closed: it is asked about, three writes, not planned.
     assert_eq!(text.lines().filter(|l| l.starts_with("start ")).count(), 6);
     assert!(
-        text.ends_with("\nsummary: dispatched 6, writes 3, held 0, requests 57 (epics 17, schedule 37, status 3), points ~43\n"),
+        text.ends_with("\nsummary: dispatched 6, writes 3, held 0, requests 57 (epics 17, schedule 37, status 3), points ~43, starts {}, comments created 0, edited 0, planned starts {\"triage\":6}\n"),
         "{text}"
     );
     for refused in [

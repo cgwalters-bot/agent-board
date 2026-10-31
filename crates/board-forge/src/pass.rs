@@ -28,8 +28,8 @@ use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{ItemRef, NEEDS_HUMAN_LABEL as NEEDS_HUMAN};
 use holds::{Entry, Hold, HoldKind, PassSummary, Scope, Wip};
-use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
@@ -1861,6 +1861,8 @@ type ByStage = [usize; Stage::ALL.len()];
 /// What a pass may still spend, in requests and in time, both stages
 /// together, and what it spent.
 struct Bounds {
+    effects: RefCell<Effects>,
+    start_kind: RefCell<String>,
     limit: usize,
     left: Cell<usize>,
     /// No request is admitted after this, but those [`FINISH_SECONDS`] lets
@@ -1891,6 +1893,8 @@ struct Bounds {
 impl Bounds {
     fn new(limit: usize, admit_by: Instant) -> Self {
         Self {
+            effects: RefCell::default(),
+            start_kind: RefCell::default(),
             limit,
             left: Cell::new(limit),
             admit_by,
@@ -1934,6 +1938,7 @@ impl Bounds {
     /// Counts the requests from here on to `stage`.
     fn enter(&self, stage: Stage) {
         self.stage.set(stage);
+        self.start_kind.borrow_mut().clear();
     }
 
     /// `report` with its failures for requests the breaker did not send
@@ -2073,6 +2078,10 @@ fn is_mutation(query: &str) -> bool {
 }
 
 impl<C: Rest> Rest for Budget<'_, C> {
+    fn start_kind(&self, kind: &str) {
+        *self.bounds.start_kind.borrow_mut() = kind.to_owned();
+    }
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.spend(false)?;
         self.observe(self.inner.get(url, validator))
@@ -2080,7 +2089,41 @@ impl<C: Rest> Rest for Budget<'_, C> {
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         self.spend(true)?;
-        self.observe(self.inner.send(method, url, body))
+        let response = self.observe(self.inner.send(method, url, body))?;
+        if (200..300).contains(&response.0) {
+            let mut effects = self.bounds.effects.borrow_mut();
+            // Publishing the holds is deliberately excluded: accounting must
+            // not cause its own next publication.
+            if self.bounds.stage.get() != Stage::Holds {
+                let path = url.strip_prefix(API_ROOT).unwrap_or(url);
+                let parts: Vec<_> = path.split('/').collect();
+                match (method, parts.as_slice()) {
+                    ("POST", ["repos", _, _, "issues", n, "comments"])
+                        if n.parse::<u64>().is_ok() =>
+                    {
+                        effects.comments_created += 1
+                    }
+                    ("PATCH", ["repos", _, _, "issues", "comments", n])
+                        if n.parse::<u64>().is_ok() =>
+                    {
+                        effects.comments_edited += 1
+                    }
+                    _ => {}
+                }
+            }
+            if method == "POST"
+                && (url.ends_with("/dispatches") || url.ends_with("/rerun-failed-jobs"))
+            {
+                let context = self.bounds.start_kind.borrow();
+                let kind = if context.is_empty() {
+                    body["inputs"]["kind"].as_str().unwrap_or("review")
+                } else {
+                    context.as_str()
+                };
+                *effects.starts.entry(kind.to_owned()).or_default() += 1;
+            }
+        }
+        Ok(response)
     }
 
     fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
@@ -2217,6 +2260,10 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    /// Confirmed effects only, independently of the step caps.
+    pub effects: Effects,
+    /// Previewed starts, never included in confirmed effects or daily totals.
+    pub planned_starts: BTreeMap<String, u64>,
     pub lines: Vec<String>,
     pub summary: String,
     pub spent: Spent,
@@ -2238,8 +2285,28 @@ impl Report {
     /// `summary: dispatched 1/1, writes 3/5, held 12, requests 80 (epics 30,
     /// schedule 50), points ~95`.
     pub fn summary_line(&self) -> String {
-        format!("{}, {}", self.summary, self.spent)
+        let planned = if self.tally.1.mode == "preview" {
+            format!(", planned starts {}", json!(self.planned_starts))
+        } else {
+            String::new()
+        };
+        format!(
+            "{}, {}, starts {}, comments created {}, edited {}{planned}",
+            self.summary,
+            self.spent,
+            json!(self.effects.starts),
+            self.effects.comments_created,
+            self.effects.comments_edited
+        )
     }
+}
+
+/// Confirmed, successful effects of one pass, or their daily sum.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Effects {
+    pub starts: BTreeMap<String, u64>,
+    pub comments_created: u64,
+    pub comments_edited: u64,
 }
 
 /// The workflow run an applying pass runs in. No two passes may start work
@@ -2318,6 +2385,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds.collapse(&mut report);
     report.summary = caps.summary();
     report.spent = bounds.spent();
+    report.effects = bounds.effects.borrow().clone();
     Ok(report)
 }
 
@@ -2877,6 +2945,29 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.now,
         ) {
             Ok(outcome) => {
+                if !self.apply {
+                    for step in &outcome.steps {
+                        if step.ran
+                            && matches!(
+                                step.action,
+                                "fix"
+                                    | "rebase"
+                                    | "continue"
+                                    | "answer"
+                                    | "review"
+                                    | "review rerun"
+                                    | "run rerun"
+                                    | "check rerun"
+                            )
+                        {
+                            *self
+                                .report
+                                .planned_starts
+                                .entry(step.action.to_owned())
+                                .or_default() += 1;
+                        }
+                    }
+                }
                 self.report.lines.extend(outcome.lines);
                 self.report.failures += outcome.errors;
                 self.report.state = Some(outcome.state);
@@ -3158,6 +3249,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// A run started, or sent and perhaps started, by its `line`: its slot
     /// and the issues it `holds` are taken for the rest of the pass.
     fn took(&mut self, slots: &mut Slots, line: String, holds: Vec<ItemRef>, failed: bool) {
+        if !self.apply && !failed {
+            let kind = start_line_kind(&line);
+            *self
+                .report
+                .planned_starts
+                .entry(kind.to_owned())
+                .or_default() += 1;
+        }
         self.probed(slots, &line);
         // Sent or planned: a failed start may have dispatched.
         self.caps.count(Kind::Dispatch);
@@ -4001,6 +4100,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let options = (0, Some(config.bot.as_str()), None, scheduled);
         let dispatcher = self.lease_dispatch(&dest, &pool);
+        self.dispatcher.start_kind(start_line_kind(&line));
         let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
         Ok(self.dispatched(line, holds, done))
     }
@@ -4091,6 +4191,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             rerun: Some(id),
             ..self.lease_dispatch(dest, &pool)
         };
+        self.dispatcher.start_kind("run rerun");
         Ok(match dispatcher.send("POST", &path, &json!({})) {
             Ok((status, _)) if (200..300).contains(&status) => Step::Started(line, holds),
             // Refused, so nothing runs: the issue waits as it would have.
@@ -4960,6 +5061,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let writers = self.writers();
         let options = (0, None, None, scheduled);
         let dispatcher = self.lease_dispatch(issue, pool);
+        self.dispatcher.start_kind(start_line_kind(&line));
         let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
         Ok(self.dispatched(line, holds, done))
     }
@@ -5151,6 +5253,17 @@ fn run_id(line: &str) -> Option<u64> {
 /// The pool in a start's line, `… pool=POOL[ …]`.
 fn line_pool(line: &str) -> Option<&str> {
     line.split(' ').find_map(|word| word.strip_prefix("pool="))
+}
+
+/// The deterministic start-line vocabulary, not issue text.
+fn start_line_kind(line: &str) -> &str {
+    if line.starts_with("run rerun ") {
+        "run rerun"
+    } else {
+        line.strip_prefix("start ")
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("research")
+    }
 }
 
 // ---- Recording and replay ----

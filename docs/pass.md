@@ -210,6 +210,39 @@ it so; absent otherwise, and where stage 3 or 4 did not get as far as
 reading them. It too was added to v1 later, and a reader treats
 it as absent in an older comment.
 
+An applying pass also adds optional `pass.overhead` (added to holds/v1 later):
+`{"today":{"day":"2026-10-31","complete":false,"passes":2,"starts":{"planning":1,"triage":3},"comments_created":8,"comments_edited":4},"history":[]}`.
+`day` is the pass clock's UTC calendar day. `today` accumulates published
+applying passes, and `history` keeps at most the seven preceding calendar
+days, newest first. Starts use the decision lines' kinds: stage 2's `fix`,
+`rebase`, `continue`, `answer`, `review`, `review rerun`, `check rerun` and
+`run rerun`; stage 3's `planning`; stage 4's `implement`, `triage`, `research`,
+`revisit`, `sweep` and `run rerun`. The maintain digest's `research` starts
+also count. Missing kinds mean zero confirmed starts, not an unknown kind.
+`comments_created` and `comments_edited` count the pass's own issue-comment
+POSTs and PATCHes, including PR issue comments, usage, plans, receipts and
+append-only dispatch records. They count once per final successful (2xx)
+REST response after the client's retries; a failed, ambiguous or capped
+write counts nothing. Starts count when dispatch or rerun is accepted, even
+if a later bookkeeping write fails. These are effects, not the caps' write
+steps. Labels, issue edits/creates, reviews, merges, board fields, reads,
+agents' comments and other actors' runs are not comment writes here.
+The hold snapshot's own publication is excluded, both from per-pass figures
+and daily totals.
+
+The previous published snapshot carries the aggregate. A missing, unreadable,
+older (without overhead), malformed or future snapshot starts today's
+observed counts with `complete: false`, never a claim of zero prior effects.
+That flag persists for the day. UTC rollover moves the old day into history
+and starts a new day; after a gap longer than a day the new day is incomplete
+too. `complete` means the available published history carried whole, not
+that every pass was observed: **a pass whose holds are not published loses
+its counts from the aggregate**, including a no-effect pass left unchanged,
+a capped/failed publish, or an interrupted pass. No local state or extra
+reporter fills those gaps. Counts and rollover alone never make an idle pass
+write; otherwise unchanged holds still say `holds: unchanged`. Previews have no
+`overhead` and never add to it.
+
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
 on the operator, for review's needs-you view, so that review need not work
@@ -567,18 +600,24 @@ Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N
 step that a cap held ends `-> held by --max-dispatch` or
 `-> held by --max-writes`. With `--apply`, a started line also names its
 dispatch record and run. The last line is a summary such as
-`summary: dispatched 1/1, writes 3/5, held 12, requests 80 (pull requests 20, epics 25, schedule 30, status 5), points ~95`, which
+`summary: dispatched 1/1, writes 3/5, held 12, requests 80 (pull requests 20, epics 25, schedule 30, status 5), points ~95, starts {"triage":1}, comments created 2, edited 1`, which
 counts what a preview plans and what an apply did (an uncapped kind has no
 `/N`), the steps the caps held plus stage 4's stop on the weekly budget, and the pass's budgeted requests, with each
 stage's share where it spent any (`setup` is the direction and dispatch-ref
 reads before stage 1, `maintain` the maintain digest, `holds` the hold
 snapshot), and GraphQL points; `~` marks points estimated as 1 a query and 5 a mutation where the
-response reads no `rateLimit { cost }`.
+response reads no `rateLimit { cost }`. The final `starts`, `comments created`
+and `edited` are confirmed per-pass effects as defined above, also available
+on the pass's `Report.effects`. A preview leaves these zero (`starts {}`)
+and appends separately labelled `planned starts {"triage":1}`
+(`Report.planned_starts`); it does not estimate individual planned comment
+writes. The earlier caps figures still describe planned steps in a preview.
 A request GitHub still refuses under a rate limit after the client's
 retries stops the pass from sending anything more, as more requests only
 prolong a secondary limit: the refused operation fails as usual, the
 requests not sent are left out, and one `rate-limited: …` line says why,
-before the summary, which then ends `, rate-limited`. The next pass carries on.
+before the summary, which includes `, rate-limited` before its final effect
+counts. The next pass carries on.
 `--record FILE` previews live and saves every read as a new fixture. Add
 `--replay SEED` to answer reads the token cannot make, such as a private usage
 snapshot or the broker's `/usage`. A preview counts only the PR runs that stage 2 actually starts, so it

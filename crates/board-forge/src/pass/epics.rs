@@ -2012,6 +2012,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.report.failures += 1;
             self.not_started += 1;
         }
+        if !self.apply && matches!(step, Step::Started(..)) {
+            *self
+                .report
+                .planned_starts
+                .entry("planning".into())
+                .or_default() += 1;
+        }
         match step {
             Step::Hold(hold) => self.epic_held(facts, hold),
             Step::Stop(why, halt) => {

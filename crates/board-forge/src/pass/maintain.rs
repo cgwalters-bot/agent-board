@@ -781,6 +781,11 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }
         self.caps.count(Kind::Dispatch);
         if !self.apply {
+            *self
+                .report
+                .planned_starts
+                .entry(DIGEST_KIND.to_owned())
+                .or_default() += 1;
             self.line(line);
             return Ok(Some(None));
         }
@@ -799,6 +804,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         let writers = self.writers();
         let options = (0, None, None, scheduled);
         let dispatcher = self.lease_dispatch(issue, pool);
+        self.dispatcher.start_kind(DIGEST_KIND);
         let attempt = Attempt {
             client: &dispatcher,
             maybe_started: Cell::new(false),

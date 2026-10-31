@@ -2380,6 +2380,14 @@ fn apply_publishes_the_holds() {
         (8, None, true, None, published.clone(), Some(&add)),
         (8, None, true, Some("same"), "holds: unchanged".into(), None),
         (8, None, true, Some("old"), published.clone(), Some(&edit)),
+        (
+            8,
+            None,
+            true,
+            Some("accumulate"),
+            published.clone(),
+            Some(&edit),
+        ),
         // One past a cap the usage comment filled (a cap of 1 reads the
         // broker) where the pass made progress, which is in this comment
         // alone: here its starts.
@@ -2445,6 +2453,11 @@ fn apply_publishes_the_holds() {
         }
         let comment = match found {
             Some("same") => first.clone(),
+            Some("accumulate") => {
+                let mut previous = holds::published(first.as_deref().unwrap()).unwrap();
+                previous["pass"]["mode"] = "local".into();
+                Some(format!("{}\n```json\n{previous}\n```", holds::HOLDS_MARKER))
+            }
             Some(_) => {
                 let old = holds::snapshot(&[], "2026-10-22T00:00:00Z".into(), Default::default());
                 Some(holds::render(&old).unwrap())
@@ -2499,6 +2512,24 @@ fn apply_publishes_the_holds() {
             assert!(report.summary.contains("writes 2/1"), "{}", report.summary);
         }
         let writes = forge.writes.borrow();
+        let created = writes
+            .iter()
+            .filter(|(m, u, b)| {
+                m == "POST"
+                    && u.ends_with("/comments")
+                    && !text(b, "/body").starts_with(holds::HOLDS_MARKER)
+            })
+            .count();
+        let edited = writes
+            .iter()
+            .filter(|(m, u, b)| {
+                m == "PATCH"
+                    && u.contains("/issues/comments/")
+                    && !text(b, "/body").starts_with(holds::HOLDS_MARKER)
+            })
+            .count();
+        assert_eq!(report.effects.comments_created, created as u64, "{line}");
+        assert_eq!(report.effects.comments_edited, edited as u64, "{line}");
         let holds = writes
             .iter()
             // Not the usage snapshot's, which a budget reads from a broker.
@@ -2514,6 +2545,25 @@ fn apply_publishes_the_holds() {
         };
         assert!(body.starts_with(holds::HOLDS_MARKER), "{body}");
         let snapshot = holds::parse(&body).unwrap();
+        let overhead = &snapshot["pass"]["overhead"]["today"];
+        let factor = if found == Some("accumulate") { 2 } else { 1 };
+        let starts: BTreeMap<_, _> = report
+            .effects
+            .starts
+            .iter()
+            .map(|(k, n)| (k, n * factor))
+            .collect();
+        assert_eq!(overhead["starts"], json!(starts));
+        assert_eq!(
+            overhead["comments_created"],
+            report.effects.comments_created * factor
+        );
+        assert_eq!(
+            overhead["comments_edited"],
+            report.effects.comments_edited * factor
+        );
+        assert_eq!(overhead["passes"], factor);
+        assert_eq!(overhead["complete"], false);
         assert_eq!(snapshot["at"], now.format(&Rfc3339).unwrap());
         // The WIP limit and count and the pass's summary, as its lines say.
         // Both stop before the board is read.
@@ -2531,7 +2581,7 @@ fn apply_publishes_the_holds() {
         let tally = json!({
             "wip": {"limit": wip, "in_flight": in_flight},
             "pass": {"mode": "actions", "candidates": candidates, "started": started,
-                     "live_epics": 0, "progress_at": snapshot["at"]},
+                      "live_epics": 0, "progress_at": snapshot["at"], "overhead": snapshot["pass"]["overhead"]},
         });
         assert_eq!(
             json!({"wip": snapshot["wip"], "pass": snapshot["pass"]}),
@@ -2660,6 +2710,79 @@ fn apply_publishes_the_holds() {
         held.unwrap().reason,
         "not a live epic, so its 4 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#650 (P0), cgwalters-forge/tracker#659 (P0), cgwalters-forge/tracker#666 (P0) and 1 more"
     );
+}
+
+/// The accounting boundary sees one final response, never the client's
+/// intermediate retries, failed writes or capped operations not sent to it.
+#[test]
+fn confirmed_comment_effects() {
+    struct Retrying {
+        status: u16,
+        retries: usize,
+        wire_requests: Cell<usize>,
+    }
+    impl Rest for Retrying {
+        fn get(&self, _: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+            bail!("not read")
+        }
+
+        fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+            // Like the real Rest client, retry internally and return only its
+            // final response to the Budget wrapper.
+            self.wire_requests
+                .set(self.wire_requests.get() + self.retries + 1);
+            if self.status == 0 {
+                bail!("response lost");
+            }
+            Ok((self.status, json!({})))
+        }
+    }
+    for (method, path, status, retries, created, edited) in [
+        ("POST", "issues/1/comments", 201, 0, 1, 0),
+        ("PATCH", "issues/comments/7", 200, 0, 0, 1),
+        ("POST", "issues/1/comments", 403, 0, 0, 0),
+        ("PATCH", "issues/comments/7", 0, 0, 0, 0),
+        ("POST", "issues/1/comments", 201, 2, 1, 0),
+        ("PATCH", "issues/comments/7", 200, 2, 0, 1),
+        ("PATCH", "issues/7", 200, 0, 0, 0),
+        ("POST", "pulls/1/reviews", 200, 0, 0, 0),
+    ] {
+        let wire = Retrying {
+            status,
+            retries,
+            wire_requests: Cell::new(0),
+        };
+        let bounds = Bounds::new(10, Instant::now() + Duration::from_secs(60));
+        let client = Budget {
+            inner: &wire,
+            bounds: &bounds,
+        };
+        let url = format!("{API_ROOT}repos/o/r/{path}");
+        let _ = client.send(method, &url, &json!({}));
+        assert_eq!(
+            bounds.effects.borrow().comments_created,
+            created,
+            "{method} {status}"
+        );
+        assert_eq!(
+            bounds.effects.borrow().comments_edited,
+            edited,
+            "{method} {status}"
+        );
+        assert_eq!(wire.wire_requests.get(), retries + 1);
+        bounds.enter(Stage::Holds);
+        let before = bounds.effects.borrow().clone();
+        let _ = client.send(method, &url, &json!({}));
+        assert_eq!(
+            *bounds.effects.borrow(),
+            before,
+            "snapshot publication excluded"
+        );
+        bounds.left.set(0);
+        let before = wire.wire_requests.get();
+        assert!(client.send(method, &url, &json!({})).is_err());
+        assert_eq!(wire.wire_requests.get(), before);
+    }
 }
 
 /// `nodes` as the one page of comments [`plan::issue_comments`] reads of
@@ -7741,7 +7864,19 @@ fn caps_hold_starts_past_max_dispatch() {
             // Then what it spent, every GraphQL point an estimate here.
             let line = report.summary_line();
             let spent = format!("{summary}, {}", report.spent);
-            assert_eq!(line, spent);
+            assert!(line.starts_with(&format!("{spent}, starts ")), "{line}");
+            let confirmed = report.tally.1.mode != "preview";
+            assert_eq!(
+                report.effects.starts.get("triage").copied().unwrap_or(0),
+                if confirmed { started as u64 } else { 0 }
+            );
+            assert_eq!(
+                report.planned_starts.get("triage").copied().unwrap_or(0),
+                if confirmed { 0 } else { started as u64 }
+            );
+            if !confirmed {
+                assert_eq!(report.effects, Effects::default());
+            }
             assert!(spent.contains(&format!("requests {} (", report.spent.requests)));
             assert!(report.spent.requests > 0 && report.spent.points > 0);
             assert_eq!(report.failures, 0, "{:#?}", report.lines);
@@ -7772,9 +7907,43 @@ fn apply_interrupted_at_each_write_reruns_without_duplicates() {
         ),
         ("the dispatch record's read-back", None, true),
         ("the dispatch response", Some("/dispatches"), false),
+        (
+            "the run-link edit",
+            Some("PATCH https://api.github.com/repos/cgwalters-forge/tracker/issues/comments/"),
+            false,
+        ),
     ] {
         let forge = Forge::new(fail, after_record);
         let first = apply(&forge, &config);
+        assert_eq!(
+            first.effects.starts.get("triage").copied().unwrap_or(0),
+            u64::from(boundary == "the run-link edit"),
+            "{boundary}"
+        );
+        let mut failed = false;
+        let writes = forge.writes.borrow();
+        let mut comments = (0, 0);
+        for (method, url, _) in writes.iter() {
+            if !failed && fail.is_some_and(|f| format!("{method} {url}").contains(f)) {
+                failed = true;
+                continue;
+            }
+            if method == "POST" && url.ends_with("/comments") {
+                comments.0 += 1;
+            }
+            if method == "PATCH" && url.contains("/issues/comments/") {
+                comments.1 += 1;
+            }
+        }
+        assert_eq!(
+            (
+                first.effects.comments_created,
+                first.effects.comments_edited
+            ),
+            comments,
+            "{boundary}"
+        );
+        drop(writes);
         assert_eq!(first.failures, 1, "{boundary}: {:#?}", first.lines);
         assert!(
             first
@@ -9614,7 +9783,7 @@ fn apply_stops_at_the_first_rate_limit() {
         assert_eq!((spent.requests, spent.rate_limited), (after + 1, true));
         let line = report.summary_line();
         assert!(line.starts_with(&report.summary), "{line}");
-        assert!(line.ends_with(", rate-limited"), "{line}");
+        assert!(line.contains(", rate-limited, starts "), "{line}");
     }
 }
 
@@ -10293,7 +10462,25 @@ fn apply_edits_an_epics_planning_request_in_place() {
                 }
             }));
         }
+        if !raced {
+            let preview = block(run(
+                &forge,
+                &forge,
+                &config(json!({})),
+                State::default(),
+                (Mode::Preview, Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(preview.planned_starts.get("planning"), Some(&1));
+            assert_eq!(preview.effects, Effects::default());
+            assert!(preview.tally.1.overhead.is_none());
+        }
         let report = apply(&forge, &config(json!({})));
+        assert_eq!(
+            report.effects.starts.get("planning").copied().unwrap_or(0),
+            u64::from(posted.is_some())
+        );
         assert_eq!(report.failures, 0, "{:#?}", report.lines);
         if posted.is_none() {
             let held = format!(
@@ -11479,6 +11666,23 @@ fn apply_starts_reviews_by_priority_within_wip() {
         let (said, wrote) = review_steps(&forge, &report);
         assert_eq!(said, lines, "{name}: {:#?}", report.lines);
         assert_eq!(wrote, writes, "{name}");
+        let starts = writes.iter().filter(|w| w.starts_with("start ")).count() as u64;
+        let reruns = writes.iter().filter(|w| w.starts_with("rerun ")).count() as u64;
+        assert_eq!(
+            report.effects.starts.get("review").copied().unwrap_or(0),
+            starts,
+            "{name}"
+        );
+        assert_eq!(
+            report
+                .effects
+                .starts
+                .get("review rerun")
+                .copied()
+                .unwrap_or(0),
+            reruns,
+            "{name}"
+        );
     }
 }
 

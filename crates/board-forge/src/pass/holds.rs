@@ -360,6 +360,10 @@ pub struct Wip {
 /// What the pass did besides its holds, as its lines say.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PassSummary {
+    /// Bounded daily confirmed effects; absent in older v1 snapshots and
+    /// previews. Accounting alone never makes an idle pass publish.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overhead: Option<Overhead>,
     /// `preview`, `actions` or `local` ([`super::Mode`]).
     pub mode: &'static str,
     /// Stage 4's candidates (`candidates: N …`); null where it did not
@@ -381,6 +385,132 @@ pub struct PassSummary {
     /// ([`carry`]).
     pub progress_at: String,
 }
+
+/// Today and at most the seven preceding UTC calendar days.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overhead {
+    pub today: OverheadDay,
+    pub history: Vec<OverheadDay>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverheadDay {
+    pub day: String,
+    pub complete: bool,
+    pub passes: u64,
+    #[serde(flatten)]
+    pub effects: super::Effects,
+}
+
+const OVERHEAD_HISTORY_DAYS: i64 = 7;
+
+/// Carry only a whole, well-formed aggregate. Unknown history is never zero.
+/// The injected pass clock is converted to UTC, including across rollover.
+pub fn overhead(
+    previous: Option<&Value>,
+    now: OffsetDateTime,
+    effects: &super::Effects,
+) -> Overhead {
+    let today = now.to_offset(time::UtcOffset::UTC).date();
+    let parse_day = |day: &str| {
+        OffsetDateTime::parse(&format!("{day}T00:00:00Z"), &Rfc3339)
+            .ok()
+            .map(|t| t.date())
+    };
+    let carried = previous
+        .filter(|p| p["schema"] == HOLDS_SCHEMA)
+        .and_then(|p| {
+            let at = parse_time(p["at"].as_str()?)?;
+            let old: Overhead = serde_json::from_value(p["pass"]["overhead"].clone()).ok()?;
+            let day = parse_day(&old.today.day)?;
+            if at > now
+                || at.to_offset(time::UtcOffset::UTC).date() != day
+                || day > today
+                || old.history.len() > OVERHEAD_HISTORY_DAYS as usize
+            {
+                return None;
+            }
+            let mut seen = BTreeSet::new();
+            for entry in std::iter::once(&old.today).chain(&old.history) {
+                let d = parse_day(&entry.day)?;
+                if !seen.insert(d)
+                    || d > day
+                    || (day - d).whole_days() > OVERHEAD_HISTORY_DAYS
+                    || entry.effects.starts.len() > START_KINDS.len()
+                    || entry
+                        .effects
+                        .starts
+                        .keys()
+                        .any(|k| !START_KINDS.contains(&k.as_str()))
+                {
+                    return None;
+                }
+            }
+            Some(old)
+        });
+    let mut result = Overhead {
+        today: OverheadDay {
+            day: today.to_string(),
+            complete: false,
+            passes: 0,
+            effects: super::Effects::default(),
+        },
+        history: Vec::new(),
+    };
+    if let Some(mut old) = carried {
+        if old.today.day == result.today.day {
+            result.today = old.today;
+        } else {
+            result.today.complete =
+                parse_day(&old.today.day).is_some_and(|d| (today - d).whole_days() == 1);
+            old.history.push(old.today);
+        }
+        result.history = old
+            .history
+            .into_iter()
+            .filter(|d| {
+                parse_day(&d.day)
+                    .is_some_and(|day| (today - day).whole_days() <= OVERHEAD_HISTORY_DAYS)
+            })
+            .collect();
+        result.history.sort_by(|a, b| b.day.cmp(&a.day));
+    }
+    let day = &mut result.today;
+    let mut add = |a: &mut u64, b: u64| {
+        if let Some(sum) = a.checked_add(b) {
+            *a = sum;
+        } else {
+            day.complete = false;
+            *a = u64::MAX;
+        }
+    };
+    add(&mut day.passes, 1);
+    add(&mut day.effects.comments_created, effects.comments_created);
+    add(&mut day.effects.comments_edited, effects.comments_edited);
+    for (kind, count) in &effects.starts {
+        add(day.effects.starts.entry(kind.clone()).or_default(), *count);
+    }
+    result
+}
+
+/// Fixed vocabulary keeps carried data bounded as well as the day count.
+const START_KINDS: &[&str] = &[
+    "fix",
+    "rebase",
+    "continue",
+    "answer",
+    "review",
+    "review rerun",
+    "check rerun",
+    "run rerun",
+    "planning",
+    "implement",
+    "triage",
+    "research",
+    "revisit",
+    "sweep",
+    "close",
+];
 
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
 #[derive(Debug, PartialEq, Serialize)]
@@ -1477,6 +1607,13 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
         });
         s["at"] = Value::Null;
         now["at"] = Value::Null;
+        // A pass count or UTC rollover alone must not cause a comment write.
+        if let Some(pass) = s["pass"].as_object_mut() {
+            pass.remove("overhead");
+        }
+        if let Some(pass) = now["pass"].as_object_mut() {
+            pass.remove("overhead");
+        }
         due || s != now
     }))
 }
@@ -1680,6 +1817,7 @@ mod tests {
             in_flight: Some(2),
         };
         let pass = PassSummary {
+            overhead: None,
             mode: "actions",
             candidates: Some(3),
             started: 1,
@@ -1688,6 +1826,88 @@ mod tests {
             progress_at: String::new(),
         };
         (wip, pass)
+    }
+
+    #[test]
+    fn overhead_carry_and_rollover() {
+        let at = OffsetDateTime::parse("2026-10-23T23:59:00Z", &Rfc3339).unwrap();
+        let effects = super::super::Effects {
+            starts: BTreeMap::from([("triage".into(), 2)]),
+            comments_created: 3,
+            comments_edited: 1,
+        };
+        let wrap = |at: OffsetDateTime, overhead: &Overhead| {
+            json!({
+                "schema": HOLDS_SCHEMA, "at": at.format(&Rfc3339).unwrap(),
+                "pass": {"overhead": overhead},
+            })
+        };
+        let first = overhead(None, at, &effects);
+        assert!(!first.today.complete);
+        let previous = wrap(at, &first);
+        let again = overhead(Some(&previous), at, &effects);
+        assert_eq!(again.today.passes, 2);
+        assert_eq!(again.today.effects.starts["triage"], 4);
+        assert_eq!(again.today.effects.comments_created, 6);
+        assert_eq!(again.today.effects.comments_edited, 2);
+        assert!(!again.today.complete);
+
+        for previous in [
+            None,
+            Some(json!({})),
+            Some(json!({"schema": "older"})),
+            Some(json!({"schema": HOLDS_SCHEMA, "at": "unreadable", "pass": {"overhead": first}})),
+            Some(wrap(at + time::Duration::days(1), &first)),
+        ] {
+            let reset = overhead(previous.as_ref(), at, &effects);
+            assert_eq!(reset, first);
+        }
+        let next = at + time::Duration::minutes(2);
+        let rolled = overhead(Some(&previous), next, &effects);
+        assert!(rolled.today.complete);
+        assert_eq!(rolled.today.day, "2026-10-24");
+        assert_eq!(rolled.today.passes, 1);
+        assert_eq!(rolled.history, vec![first.today]);
+        // UTC, not the caller's local date.
+        assert_eq!(
+            overhead(
+                Some(&previous),
+                next.to_offset(time::UtcOffset::from_hms(-5, 0, 0).unwrap()),
+                &effects
+            ),
+            rolled
+        );
+        let gap = overhead(Some(&previous), at + time::Duration::days(3), &effects);
+        assert!(!gap.today.complete);
+
+        let mut carried = previous;
+        for n in 1..=12 {
+            let now = at + time::Duration::days(n);
+            let daily = overhead(Some(&carried), now, &effects);
+            assert_eq!(daily.history.len(), (n as usize).min(7));
+            assert!(daily.today.complete);
+            assert!(daily.history.iter().all(|d| d.day < daily.today.day));
+            carried = wrap(now, &daily);
+        }
+    }
+
+    #[test]
+    fn overhead_alone_does_not_publish() {
+        let at = "2026-10-23T23:59:00Z";
+        let now = parse_time(at).unwrap();
+        let mut first = snapshot(&[], at.into(), tally());
+        first.pass.overhead = Some(overhead(None, now, &super::super::Effects::default()));
+        let body = render(&first).unwrap();
+        let previous = published(&body).unwrap();
+        for days in [0, 1, 10] {
+            let mut later = snapshot(&[], at.into(), tally());
+            later.pass.overhead = Some(overhead(
+                Some(&previous),
+                now + time::Duration::days(days),
+                &super::super::Effects::default(),
+            ));
+            assert!(!changed(Some(&body), &later).unwrap());
+        }
     }
 
     /// `revisited` is absent without `revisit`, as `tally` has it, and
