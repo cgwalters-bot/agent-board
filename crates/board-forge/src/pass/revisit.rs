@@ -278,8 +278,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 ));
                 break;
             }
-            let step = self.revisit_one(item, slots, (snapshot, target));
-            self.client.bounds.finishing.set(false);
+            let step = self.within_reserve(|s| s.revisit_one(item, slots, (snapshot, target)));
+            self.client.bounds.end_start();
             match step {
                 Err(error) => {
                     self.report.failures += 1;

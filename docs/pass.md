@@ -707,7 +707,21 @@ Deleting a local cache must never authorize replay.
 To stop an unbounded board scan or runaway dispatch loop, use one fixed pass
 budget: at most 500 forge requests and 15 minutes, including existing subcommand
 work; existing tighter read/action bounds still apply. Report exhaustion and
-defer unresolved decisions, never interpret truncated data as empty. There is
+defer unresolved decisions, never interpret truncated data as empty.
+Starting ready work is the pass's main job, so stage 4 keeps what a start may
+take for one: once it has ranked its candidates and until it is done, no read
+outside a start is sent once 73 requests (a start's recheck, 5, and the 68 a
+start may take after it; 2 more for each lease held, which the recheck reads
+again) and the 4 kept for writes are all that is left. Writes are not refused
+for it. A start may spend them, so a candidate found ready has what its start
+takes. Stage 4 stops considering candidates there, as it
+stops for a full WIP, with `budget: N requests left, only what a start may take
+(73); M more candidate(s) wait`, rather than read on into requests no start it
+found could use; the rest wait for the next pass, and the stop is a failure only
+when no candidate was considered. Revisits, the weekly sweep and blocker reads
+that meet the reserve wait too, saying so; none holds, labels or fails an item
+for it.
+Stage 5 and the hold snapshot, which come after every start, spend what is left. There is
 no second fill-page budget. Preview performs no forge writes or dispatches and
 does not change the apply cache.
 

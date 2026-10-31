@@ -353,12 +353,26 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let Some(found) = self.swept.clone() else {
             return (free, 0);
         };
+        let bounds = self.client.bounds;
+        let (refused, reserved) = (bounds.refused.get(), bounds.reserved());
         let step = match found {
+            // What is left is a start's: the sweep waits for the next pass.
+            _ if reserved => Ok(None),
             Some(found) if found.open => self.sweep_open(&found, board, slots, free, context),
             found => self
                 .sweep_file(sweep, found.as_ref(), candidates)
                 .map(|_| None),
         };
+        let started = matches!(
+            step,
+            Ok(Some(
+                Step::Started(..) | Step::Failed(..) | Step::Capped(..)
+            ))
+        );
+        if !started && (reserved || bounds.refused.get() > refused) {
+            self.line(format!("sweep: {}", self.reserved()));
+            return (free, 0);
+        }
         match step {
             Ok(Some(Step::Started(line, holds))) => {
                 self.took(slots, line, holds, false);
@@ -736,7 +750,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             line,
             context,
         );
-        self.client.bounds.finishing.set(false);
+        self.client.bounds.end_start();
         Ok(match step? {
             Step::Hold(hold) => {
                 self.line(format!("sweep {url}: {}", hold.reason));
@@ -989,7 +1003,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// unless it is already, one write within `--max-writes`.
     fn sweep_stuck(&mut self, found: &Found, why: &str) {
         let url = &found.url;
-        if found.labelled {
+        // A read the reserve refused is not stuck: it waits for the next
+        // pass, unlabelled ([`Self::sweep`] says so).
+        if found.labelled || self.client.bounds.reserved() {
             self.line(format!("sweep {url}: {why}"));
             return;
         }

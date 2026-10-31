@@ -2113,6 +2113,21 @@ fn apply(forge: &Forge, config: &Config) -> Report {
     .unwrap()
 }
 
+/// [`apply`] within a budget of `limit` requests.
+fn apply_within(forge: &Forge, config: &Config, limit: usize) -> Report {
+    let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+    let state = (State::default(), Mode::Actions(&own()), Limits::default());
+    let within = (state.0, state.1, state.2, forge.replay.now);
+    block(run_within(
+        forge,
+        forge,
+        config,
+        within,
+        &Bounds::new(limit, admit_by),
+    ))
+    .unwrap()
+}
+
 /// Replay the pass against the atomic ref forge, with a foreign workflow
 /// taking a lease on a chosen listing. Its run is never in the caller list.
 struct LeasedForge {
@@ -7963,8 +7978,9 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
 /// A budget that runs out once candidates were held and started defers the
 /// rest to the next pass, as a full wip does, rather than failing it
 /// (tracker#908); one too small for the first candidate is still a failure.
-/// tracker#527's plan waits on an open pull request's overlap: it is held
-/// for that, not by the budget a start needs, however little is left.
+/// Stage 4 stops considering where what is left is what a start may take,
+/// so tracker#527, whose plan waits on an open pull request's overlap, is
+/// held for that, never stopped by the budget.
 #[test]
 fn apply_defers_the_rest_when_its_budget_runs_out() {
     let config = config(json!({"wip": 8}));
@@ -7973,39 +7989,26 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     let cases = [
         (
             160,
-            "budget: 59 requests left, fewer than a start may take (68); 1 more candidate(s) wait",
+            "budget: 66 requests left, only what a start may take (73); 1 more candidate(s) wait",
             0,
             5,
         ),
         (
-            120,
-            "budget: 61 requests left, fewer than a start may take (68); 4 more candidate(s) wait",
+            129,
+            "budget: 77 requests left, only what a start may take (73); 4 more candidate(s) wait",
             0,
             2,
         ),
         (
             84,
-            "budget: 62 requests left, fewer than a start may take (68); 9 more candidate(s) wait",
+            "budget: 69 requests left, only what a start may take (73); 9 more candidate(s) wait",
             1,
             0,
         ),
     ];
     for (limit, line, failures, started) in cases {
         let forge = Forge::new(None, false);
-        let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
-        let report = block(run_within(
-            &forge,
-            &forge,
-            &config,
-            (
-                State::default(),
-                Mode::Actions(&own()),
-                Limits::default(),
-                forge.replay.now,
-            ),
-            &Bounds::new(limit, admit_by),
-        ))
-        .unwrap();
+        let report = apply_within(&forge, &config, limit);
         assert_eq!(last_scheduled(&report), line, "limit {limit}");
         assert_eq!(
             report.failures, failures,
@@ -8021,6 +8024,42 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             assert!(report.lines.iter().any(|l| l == overlap), "limit {limit}");
         }
     }
+}
+
+/// Whatever the budget, stage 4 never finds a candidate ready and then
+/// lacks the requests to start it, and the reserve it keeps for one holds
+/// no candidate nor fails one: it only stops considering them.
+#[test]
+fn apply_keeps_a_starts_requests_for_it() {
+    let config = config(json!({"wip": 8}));
+    let mut started = BTreeSet::new();
+    for limit in 60..=200 {
+        let forge = Forge::new(None, false);
+        let report = apply_within(&forge, &config, limit);
+        let lines = &report.lines;
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("fewer than a start may take")
+                    || l.contains("for a start") && !l.starts_with("budget: ")),
+            "limit {limit}: {lines:#?}"
+        );
+        // Nothing considered is the only failure.
+        let total = report.tally.1.candidates.unwrap_or_default();
+        let wait = format!("; {total} more candidate(s) wait");
+        let none = lines.iter().any(|l| l.ends_with(&wait));
+        assert_eq!(
+            report.failures,
+            usize::from(none),
+            "limit {limit}: {lines:#?}"
+        );
+        started.insert(forge.dispatches().len());
+    }
+    assert_eq!(
+        started,
+        (0..=6).collect(),
+        "every number of starts up to wip's"
+    );
 }
 
 /// The operator's implement plan for tracker#446, without a pool.

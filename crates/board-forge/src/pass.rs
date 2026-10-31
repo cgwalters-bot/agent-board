@@ -66,6 +66,18 @@ pub(super) const CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 /// tries) and its note, with room for a stack's reads. A start never runs out
 /// of budget between claim and run.
 const START_REQUESTS: usize = 64 + overlap::DRAFT_READS;
+/// A start's recheck's own reads before it checks [`START_REQUESTS`]: both
+/// run listings, the leases and the issue and its plan's item read again, a
+/// page each.
+const RECHECK_REQUESTS: usize = 5;
+/// Requests no read outside a start may spend once stage 4 found a free
+/// slot, until it is done: what the next start's recheck and
+/// [`START_REQUESTS`] may take. Stage 4 stops considering candidates there
+/// rather than read on into requests no start it found could use.
+const START_RESERVE: usize = RECHECK_REQUESTS + START_REQUESTS;
+/// What the recheck reads again of each lease held, past [`START_RESERVE`]'s
+/// one page of them: its commit and its run.
+const LEASE_RECHECK_REQUESTS: usize = 2;
 /// Requests only writes may spend: a claim already posted is still sent or
 /// noted when its reads have spent the rest.
 const WRITE_RESERVE: usize = 4;
@@ -1727,6 +1739,12 @@ struct Bounds {
     admit_by: Instant,
     /// A start passed its last check before `admit_by` and is under way.
     finishing: Cell<bool>,
+    /// What reads outside a start leave ([`START_RESERVE`], or none), and
+    /// how many of them it refused.
+    reserve: Cell<usize>,
+    refused: Cell<usize>,
+    /// A start's recheck began: its reads may spend the reserve.
+    starting: Cell<bool>,
     /// Writes sent, which [`Kept`] reads are kept no longer than.
     writes: Cell<usize>,
     /// The stage under way, which each request is counted to.
@@ -1748,6 +1766,9 @@ impl Bounds {
             left: Cell::new(limit),
             admit_by,
             finishing: Cell::new(false),
+            reserve: Cell::new(0),
+            refused: Cell::new(0),
+            starting: Cell::new(false),
             writes: Cell::new(0),
             stage: Cell::new(Stage::Setup),
             by_stage: Cell::new([0; Stage::ALL.len()]),
@@ -1767,6 +1788,18 @@ impl Bounds {
             estimated: self.estimated.get(),
             rate_limited: self.rate_limited.borrow().is_some(),
         }
+    }
+
+    /// Whether the reserve refuses a read now.
+    fn reserved(&self) -> bool {
+        !self.starting.get() && self.left.get() <= WRITE_RESERVE + self.reserve.get()
+    }
+
+    /// A start, or what was considered for one, is over: what comes next
+    /// leaves the reserve and waits for the time bound.
+    fn end_start(&self) {
+        self.finishing.set(false);
+        self.starting.set(false);
     }
 
     /// Counts the requests from here on to `stage`.
@@ -1824,10 +1857,12 @@ impl std::fmt::Display for Spent {
 }
 
 /// Every request through it spends one of the pass's budget; reads leave
-/// [`WRITE_RESERVE`] of it to writes. Past the time bound it admits only a
-/// write, or a request of a start under way, and for [`FINISH_SECONDS`]: a
-/// claim already written can still get its run or its note, and what is
-/// left is for the next pass to observe. Once a request is refused under a
+/// [`WRITE_RESERVE`] of it to writes, and those outside a start the
+/// reserve ([`START_RESERVE`]) to starts. A write is never refused for the
+/// reserve: one may follow a read that decided it. Past the time bound it
+/// admits only a write, or a request of a start under way, and for
+/// [`FINISH_SECONDS`]: a claim already written can still get its run or its
+/// note, and what is left is for the next pass to observe. Once a request is refused under a
 /// rate limit past the client's retries ([`RateLimited`]), it sends nothing
 /// more: more requests would only prolong the limit.
 struct Budget<'a, C> {
@@ -1855,6 +1890,13 @@ impl<C> Budget<'_, C> {
             left > floor,
             "the pass's request budget ({PASS_REQUEST_LIMIT}) is spent"
         );
+        if !write && bounds.reserved() {
+            bounds.refused.set(bounds.refused.get() + 1);
+            bail!(
+                "the pass keeps its last {} requests for a start",
+                bounds.reserve.get()
+            );
+        }
         bounds.left.set(left - 1);
         bounds.writes.set(bounds.writes.get() + usize::from(write));
         let mut by_stage = bounds.by_stage.get();
@@ -2268,6 +2310,8 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // which may move a head, and before Status, which sees its effects.
     scheduler.line(promote::line(config.promote.as_ref()));
     // Stage 5: board Status from the facts read, this pass's starts included.
+    // No start comes after stage 4, so it and the holds spend what is left.
+    bounds.reserve.set(0);
     bounds.enter(Stage::Status);
     if let Err(error) = scheduler.status(&git_ref).await {
         scheduler.report.failures += 1;
@@ -2831,6 +2875,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let holds = self.report.holds.len();
         let candidates = self.candidates(&board);
+        // From here on, until stage 4 is done, a read that would leave too
+        // little for a start is not sent ([`START_RESERVE`]), with each
+        // lease's own reads where its recheck reads them again.
+        let leases = LEASE_RECHECK_REQUESTS * slots.leased.len();
+        self.client.bounds.reserve.set(START_RESERVE + leases);
         let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
         let (free, revisited) = self.revisit(&candidates, &board, &mut slots, free, context);
         let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
@@ -2892,13 +2941,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             let issue = facts.issue.display();
-            let step = self.consider(facts, board, slots, snapshot, target);
+            let step = self.within_reserve(|s| s.consider(facts, board, slots, snapshot, target));
             for why in self.ignored.take() {
                 self.held(facts, Hold::new(HoldKind::OverlapIgnored, why));
             }
             let earlier = std::mem::replace(&mut self.considered, true);
             // A start under way finishes; the next waits for the time bound.
-            self.client.bounds.finishing.set(false);
+            self.client.bounds.end_start();
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
@@ -2944,6 +2993,33 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             taken += 1;
         }
         (free, taken)
+    }
+
+    /// What `consider` decides, or stage 4's stop for the budget where the
+    /// reserve leaves it nothing to read, or refused one of its reads and it
+    /// started nothing: then it decided nothing, like those after it, and
+    /// holds nothing; the stop is a failure only before any candidate.
+    fn within_reserve(&mut self, consider: impl FnOnce(&mut Self) -> Result<Step>) -> Result<Step> {
+        let bounds = self.client.bounds;
+        if bounds.reserved() {
+            return Ok(Step::Stop(self.reserved(), Halt::Budget));
+        }
+        let refused = bounds.refused.get();
+        match consider(self) {
+            step @ Ok(Step::Started(..) | Step::Failed(..) | Step::Capped(..)) => step,
+            _ if bounds.refused.get() > refused => {
+                self.ignored.take();
+                Ok(Step::Stop(self.reserved(), Halt::Budget))
+            }
+            step => step,
+        }
+    }
+
+    /// Why stage 4 considers no more: what is left is what a start may take.
+    fn reserved(&self) -> String {
+        let bounds = self.client.bounds;
+        let (left, reserve) = (bounds.left.get(), bounds.reserve.get());
+        format!("budget: {left} requests left, only what a start may take ({reserve})")
     }
 
     /// A run started, or sent and perhaps started, by its `line`: its slot
@@ -3497,6 +3573,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         target: &Target,
         rule: HoldRule,
     ) -> Result<Option<Step>> {
+        // From here on its reads are the start's, and may spend the reserve.
+        self.client.bounds.starting.set(true);
         let (listed, mut busy) = self.runs(target)?;
         let mut current = slots.clone();
         if self.config.leases {

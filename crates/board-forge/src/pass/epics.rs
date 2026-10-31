@@ -1999,7 +1999,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let context = (slots, target, hold as HoldRule);
         let start = (pool.as_str(), brief, intro.as_str());
         let step = self.start_triage(&facts.issue, start, reuse, None, line, context);
-        self.client.bounds.finishing.set(false);
+        self.client.bounds.end_start();
         let step = match step {
             Ok(step) => step,
             Err(error) => {

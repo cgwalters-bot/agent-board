@@ -246,7 +246,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 "not read: past the {BLOCKER_READS} blockers read a pass"
             ));
         }
-        if bounds.left.get() <= BLOCKER_RESERVE || Instant::now() > bounds.admit_by {
+        if bounds.left.get() <= BLOCKER_RESERVE
+            || bounds.reserved()
+            || Instant::now() > bounds.admit_by
+        {
             return Seen::Unseen("not read: the pass's request budget or time is low".into());
         }
         *reads -= 1;
