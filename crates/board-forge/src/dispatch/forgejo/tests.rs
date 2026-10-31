@@ -14,6 +14,55 @@ fn target() -> Target {
     }
 }
 
+#[test]
+fn forgejo_target_names_and_path_are_not_github_rules() {
+    let fake = Fake::new(vec![]);
+    let mut instance = instance();
+    instance.repositories = vec!["team.example/work.repo".into()];
+    let mut target = target();
+    target.caller = "team.example/control.repo".into();
+    assert!(target.validate().is_err());
+    let adapter = Forgejo::new(
+        &fake,
+        &instance,
+        &target,
+        ["task", "repo", "item", "kind"].map(String::from).into(),
+        7,
+    )
+    .unwrap();
+    assert_eq!(
+        adapter.path("runs").unwrap().as_str(),
+        "https://forge.example/api/v1/repos/team.example/control.repo/actions/runs"
+    );
+    let mut start = start();
+    start.repository = "team.example/work.repo";
+    start.pool = None;
+    assert!(adapter.body(&start).is_ok());
+    for bad in [
+        "../repo",
+        "a/..",
+        "//evil.example/repo",
+        "a/b?x",
+        "a/b#x",
+        "a/b\\c",
+        "a/%2e%2e",
+    ] {
+        let mut target = target.clone();
+        target.caller = bad.into();
+        assert!(
+            Forgejo::new(
+                &fake,
+                &instance,
+                &target,
+                ["task", "repo", "item", "kind"].map(String::from).into(),
+                7
+            )
+            .is_err(),
+            "{bad}"
+        );
+    }
+}
+
 fn start() -> Start<'static> {
     Start {
         repository: "example/app",

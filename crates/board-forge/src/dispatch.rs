@@ -259,7 +259,13 @@ fn route_runs(
 impl Target {
     /// Each part goes into an API path that carries the dispatch token.
     pub fn validate(&self) -> Result<()> {
-        validate_repository(&self.caller).context("invalid caller repository")?;
+        self.validate_for(crate::forgejo::Naming::Github)
+    }
+
+    pub(crate) fn validate_for(&self, naming: crate::forgejo::Naming) -> Result<()> {
+        naming
+            .validate_repository(&self.caller)
+            .context("invalid caller repository")?;
         validate_workflow(&self.workflow)?;
         let git_ref = &self.git_ref;
         ensure!(

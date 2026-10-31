@@ -135,6 +135,63 @@ fn is_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
 }
 
+/// Existing local account names, using Forgejo v17.0.1's
+/// modules/validation/helpers.go IsValidUsername with dots enabled. Whether
+/// an instance permits dots at creation is its choice; lookup verifies identity.
+/// Creation-only reserved route names are not an identity admission rule.
+pub(crate) fn is_login(name: &str) -> bool {
+    is_name(name)
+        && name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && name
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && !name
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair.iter().all(|c| b"-._".contains(c)))
+}
+
+/// Safe existing repository identity, not a repository-creation request.
+/// v17.0.1 models/repo/repo.go uses AlphaDashDotPattern; creation also
+/// reserves route names/suffixes. Do not apply creation reservations to lookup.
+pub(crate) fn validate_repository(repository: &str) -> Result<()> {
+    ensure!(
+        repository
+            .split_once('/')
+            .is_some_and(|(owner, name)| is_login(owner) && is_name(name)),
+        "invalid repository {repository:?}: expected Forgejo OWNER/REPO"
+    );
+    Ok(())
+}
+
+/// Naming is selected only from trusted board configuration. GitHub callers
+/// retain their existing rules; accepting Forgejo names must not widen them.
+#[derive(Clone, Copy)]
+pub(crate) enum Naming {
+    Github,
+    Forgejo,
+}
+
+impl Naming {
+    pub(crate) fn is_login(self, login: &str) -> bool {
+        match self {
+            Self::Github => crate::is_github_login(login),
+            Self::Forgejo => is_login(login),
+        }
+    }
+
+    pub(crate) fn validate_repository(self, repository: &str) -> Result<()> {
+        match self {
+            Self::Github => crate::poll::validate_repository(repository),
+            Self::Forgejo => validate_repository(repository),
+        }
+    }
+}
+
 impl Config {
     pub(crate) fn validate(&self) -> Result<()> {
         let url = &self.url;
@@ -157,11 +214,7 @@ impl Config {
         );
         let mut seen = BTreeSet::new();
         for repository in &self.repositories {
-            let parts: Vec<_> = repository.split('/').collect();
-            ensure!(
-                parts.len() == 2 && parts.iter().all(|part| is_name(part)),
-                "invalid board repository: {repository}"
-            );
+            validate_repository(repository).context("invalid board repository")?;
             ensure!(
                 seen.insert(repository.to_ascii_lowercase()),
                 "duplicate board repository: {repository}"
