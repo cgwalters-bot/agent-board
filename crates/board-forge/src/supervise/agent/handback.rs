@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 /// The safe output that holds the agent's report and its requests block.
 const REPORT_TYPE: &str = "add_comment";
 /// agentic-job's bound on a run's safe outputs.
-pub const MAX_OUTPUTS_BYTES: usize = 1024 * 1024;
+pub const MAX_OUTPUTS_BYTES: usize = safe_outputs::MAX_OUTPUTS_BYTES as usize;
 /// Every entry at its longest, and room to spare.
 pub const MAX_LEDGER_BYTES: usize = 2 * 1024 * 1024;
 const LEDGER_SCHEMA: &str = "agent-board/supervisor-ledger/v1";
@@ -68,19 +68,14 @@ pub struct HandBack {
 
 /// The one comment in the agent's safe outputs; none asks for nothing.
 pub fn report(outputs: &str) -> Result<String> {
-    ensure!(
-        outputs.len() <= MAX_OUTPUTS_BYTES,
-        "The agent's safe outputs exceed 1 MiB"
-    );
     let mut bodies = vec![];
-    for line in outputs.lines().filter(|l| !l.trim().is_empty()) {
-        // A parse error would quote its input into the public log.
-        let output: Value = serde_json::from_str(line)
-            .ok()
-            .filter(Value::is_object)
-            .context("Malformed safe outputs")?;
-        if output["type"] == REPORT_TYPE {
-            let body = output["body"].as_str().context("Malformed safe outputs")?;
+    for request in safe_outputs::decode::decode(outputs.as_bytes())? {
+        let output = request.object;
+        if request.kind == REPORT_TYPE {
+            let body = output
+                .get("body")
+                .and_then(Value::as_str)
+                .context("Malformed safe outputs")?;
             bodies.push(body.to_owned());
         }
     }

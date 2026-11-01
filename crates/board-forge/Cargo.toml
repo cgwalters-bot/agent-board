@@ -12,6 +12,7 @@ flate2 = "1"
 board-core = { path = "../board-core" }
 serde.workspace = true
 serde_json.workspace = true
+safe-outputs = { git = "https://github.com/cgwalters-forge/agentic-job", rev = "009ac9883c9278293114c54f8376a5f40d88300f" }
 sha2 = "0.10"
 url = "2"
 ureq = { version = "3", features = ["json", "platform-verifier"] }

@@ -899,6 +899,18 @@ mod tests {
     }
 
     #[test]
+    fn ruleset_serialization_golden() {
+        // safe-outputs enables preserve_order and float_roundtrip workspace-wide.
+        // The operator's digest and write body must retain their canonical bytes.
+        let source = r#"{"rules":[],"conditions":{"z":1e0,"a":[123456.0,0.0]},"name":"Numbers","target":"branch","enforcement":"active"}"#;
+        let value: Value = serde_json::from_str(source).unwrap();
+        assert_eq!(
+            normalize_ruleset(&value).unwrap(),
+            r#"{"conditions":{"a":[123456,0],"z":1},"enforcement":"active","name":"Numbers","rules":[],"target":"branch"}"#,
+        );
+    }
+
+    #[test]
     fn ruleset_digests_and_sources() {
         let fixture = fixture();
         for vector in fixture["ruleset_digests"].as_array().unwrap() {

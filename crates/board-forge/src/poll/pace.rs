@@ -518,6 +518,10 @@ pub fn tiers(pools: Option<&Value>, named: &[(&str, &str)]) -> Result<Tiers> {
             pools.push(pool.clone());
         }
     }
+    // The first pool takes unpaced rounds; JSON insertion order is not policy.
+    for pools in tiers.values_mut() {
+        pools.sort();
+    }
     for (setting, tier) in named {
         match tiers.get(*tier) {
             None => bail!("{setting} names {tier}, which is not a tier of the pools file"),

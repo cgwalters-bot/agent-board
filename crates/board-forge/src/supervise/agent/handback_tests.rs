@@ -120,15 +120,112 @@ fn the_report_is_the_one_comment_in_the_safe_outputs() {
         ),
         (comment(json!(null)), Err("Malformed safe outputs")),
         (comment(json!(["a"])), Err("Malformed safe outputs")),
-        ("[1]".into(), Err("Malformed safe outputs")),
-        ("{\"secret\": ".into(), Err("Malformed safe outputs")),
-        ("x".repeat(1024 * 1024 + 1), Err("exceed 1 MiB")),
+        ("[1]".into(), Err("not a JSON object")),
+        ("{\"secret\": ".into(), Err("not JSON")),
+        ("x".repeat(1024 * 1024 + 1), Err("over 1048576 bytes")),
     ];
     for (text, expected) in cases {
         match (report(&text), expected) {
             (Ok(body), Ok(want)) => assert_eq!(body, want),
             (Err(error), Err(want)) => assert!(error.to_string().contains(want), "{error}"),
             (got, want) => panic!("{got:?} for {want:?}"),
+        }
+    }
+}
+
+#[test]
+fn framing_compatibility() {
+    // Baseline outcomes of the former reader. Differences are
+    // confined to the shared decoder's string-type and JS whitespace contract.
+    // Non-UTF-8 was (and is) refused by the CLI's read_to_string boundary.
+    let report_line = br#"{"type":"add_comment","body":"<b>@someone</b> #1\r\n```supervisor-actions\n```\n","extra":true}"#;
+    let body = "<b>@someone</b> #1\r\n```supervisor-actions\n```\n";
+    let max = handback::MAX_OUTPUTS_BYTES;
+    let mut at_bound = br#"{"type":"noop"}"#.to_vec();
+    at_bound.resize(max, b' ');
+    let mut oversize = at_bound.clone();
+    oversize.push(b' ');
+    let mixed = [
+        b"{\"type\":\"missing_data\",\"reason\":\"x\"}\n".as_slice(),
+        report_line,
+        b"\n{\"type\":\"noop\"}\n{\"type\":\"unknown\",\"body\":false}",
+    ]
+    .concat();
+    // (name, bytes, old report outcome, new report outcome); None means refusal.
+    let cases = [
+        ("empty", vec![], Some(""), Some("")),
+        (
+            "malformed",
+            b"{\"body\":\"untrusted-marker".to_vec(),
+            None,
+            None,
+        ),
+        ("non-object", b"[\"untrusted-marker\"]".to_vec(), None, None),
+        ("non-UTF-8", vec![0xff], None, None),
+        ("at bound", at_bound, Some(""), Some("")),
+        ("oversize", oversize, None, None),
+        (
+            "duplicate reports",
+            [report_line.as_slice(), b"\n", report_line].concat(),
+            None,
+            None,
+        ),
+        ("mixed no-write outcomes", mixed, Some(body), Some(body)),
+        (
+            "no report",
+            b"{\"type\":\"missing_tool\"}\n{\"type\":\"noop\"}".to_vec(),
+            Some(""),
+            Some(""),
+        ),
+        (
+            "missing body",
+            b"{\"type\":\"add_comment\"}".to_vec(),
+            None,
+            None,
+        ),
+        (
+            "missing type",
+            b"{\"body\":\"untrusted-marker\"}".to_vec(),
+            Some(""),
+            None,
+        ),
+        (
+            "non-string type",
+            b"{\"type\":[\"untrusted-marker\"]}".to_vec(),
+            Some(""),
+            None,
+        ),
+        (
+            "JS BOM whitespace",
+            "\u{feff}{\"type\":\"noop\"}".as_bytes().to_vec(),
+            None,
+            Some(""),
+        ),
+        (
+            "Rust-only whitespace",
+            "\u{85}".as_bytes().to_vec(),
+            Some(""),
+            None,
+        ),
+    ];
+    for (name, bytes, old, expected) in cases {
+        let decoded = safe_outputs::decode::decode(&bytes);
+        let got = std::str::from_utf8(&bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(report);
+        assert_eq!(
+            got.as_ref().ok().map(String::as_str),
+            expected,
+            "{name}: old={old:?}, new={got:?}"
+        );
+        if let Err(error) = &got {
+            assert!(!format!("{error:#}").contains("untrusted-marker"), "{name}");
+        }
+        if name == "non-UTF-8" {
+            assert!(matches!(
+                decoded,
+                Err(safe_outputs::decode::DecodeError::NotUtf8(_))
+            ));
         }
     }
 }
