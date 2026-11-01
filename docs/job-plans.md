@@ -198,6 +198,26 @@ Each record (the primary's and each extra's) ends with the decision. A check
 that cannot read runs the issue independently, as without `--bot`: it is a
 scheduling heuristic, not a boundary. `--dry-run` prints the decision on stderr.
 
+### The overlap command
+
+`agent-board overlap -R OWNER/REPO --caller OWNER/REPO --workflow FILE` with
+one of `--paths P…`, `--branch B` or `--pr N` answers the same question for a
+change before anyone starts it ([#297](https://github.com/cgwalters-forge/agent-board/issues/297)):
+which open pull requests of the repository, of any author, and which implement
+runs in flight on the caller's workflow share a path with it. It reads them as
+the check above does, with the same function: each pull request's first 100
+files (of the newest 250 open ones, said when there are more), and the paths
+each of up to ten running issues names. The change is the given paths, the
+files `--pr N` changes (at most 100; that pull request is not listed), or what
+`--branch B` changes against the default branch. Each one found is listed with
+its item, the paths it shares, its age and its last activity; a draft is
+flagged stale by the pass's rule for waiving a draft's overlap (head proved
+unchanged by complete branch activity for `--stale-draft-hours`, 4 by
+default), within the same allowance of forty reads; a draft past it is shown
+as not checked (`"stale": null`).
+`--json repository,paths,pulls,runs,complete` prints the report as JSON. It
+only reads, with `GH_TOKEN`.
+
 ## Stacking
 
 Slices of one piece of work that change the same files stack instead of

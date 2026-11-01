@@ -10997,7 +10997,7 @@ mod tests {
                 "a tier's first injected ticket wins despite unequal headroom",
                 tier,
                 usage(json!({"claude": pool(10.0, 84), "openai": pool(40.0, 84)})),
-                (Ok("claude"), "openai normal 40%/50%"),
+                (Ok("claude"), "openai normal 40% used of 50% allowed"),
             ),
             (
                 "a tier's held pool sends the round to the other",

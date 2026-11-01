@@ -13,6 +13,7 @@ mod item;
 mod lease;
 mod live;
 mod org_status;
+mod overlap;
 mod pass;
 mod poll;
 mod prune;
@@ -132,6 +133,8 @@ enum Command {
     },
     /// Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request).
     Dispatch(dispatch::FromPlan),
+    /// The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command).
+    Overlap(overlap::Overlap),
     /// Check a coordinator's plan for an epic's sub-issues.
     Epic {
         #[command(subcommand)]
@@ -600,6 +603,36 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 || board_forge::github::Client::from_var("DISPATCH_TOKEN"),
                 &mut io::stdout().lock(),
             )
+        }
+        Command::Overlap(args) => {
+            ensure!(
+                cli.snapshot.is_none() && cli.owner.is_none() && cli.project.is_none(),
+                "overlap reads live from -R only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            for field in cli.json.iter().flat_map(|f| f.split(',')) {
+                ensure!(
+                    overlap::FIELDS.contains(&field),
+                    "unknown JSON field: {field}; available fields: {}",
+                    overlap::FIELDS.join(",")
+                );
+            }
+            let report = overlap::report(
+                args,
+                cli.repo.as_deref(),
+                board_forge::github::Client::from_env,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            if cli.json.is_some() {
+                render(report, &cli)
+            } else {
+                Ok(io::stdout()
+                    .lock()
+                    .write_all(overlap::text(&report).as_bytes())?)
+            }
         }
         Command::Epic {
             command: Epic::Apply(args),
@@ -1454,6 +1487,8 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
     if let Some(fields) = &cli.json {
         let available: &[&str] = if matches!(cli.command, Command::Status(_)) {
             board_forge::org_status::FIELDS
+        } else if matches!(cli.command, Command::Overlap(_)) {
+            overlap::FIELDS
         } else if matches!(cli.command, Command::Item { .. } | Command::Ask { .. }) {
             &[
                 "identity",

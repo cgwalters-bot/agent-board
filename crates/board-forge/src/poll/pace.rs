@@ -445,7 +445,8 @@ pub fn line(
                 .into_iter()
                 .map(|pool| match paces.get(pool).unwrap_or(&Mode::Unpaced) {
                     Mode::Normal { used, ceiling } => {
-                        format!("{pool} normal {used:.0}%/{ceiling:.0}%")
+                        // Labelled: a bare second figure reads as burst or an allowance.
+                        format!("{pool} normal {used:.0}% used of {ceiling:.0}% allowed")
                     }
                     Mode::Held { until } => format!("{pool} held{}", until_minute(*until)),
                     Mode::Unpaced => format!("{pool} unpaced"),
@@ -1057,7 +1058,7 @@ mod tests {
         }
         assert_eq!(
             line(&read(october), &BTreeSet::new(), &[], now),
-            "pools: claude normal 70%/121%, openai held until 2026-10-22T00:33Z"
+            "pools: claude normal 70% used of 121% allowed, openai held until 2026-10-22T00:33Z"
         );
     }
 
@@ -1075,7 +1076,7 @@ mod tests {
         let configured = BTreeSet::from(["small".to_owned(), "claude".to_owned()]);
         assert_eq!(
             line(&read, &configured, &[], now),
-            "pools: claude normal 50%/50%, mistral unpaced, openai held until 2026-10-18T16:04Z, small unpaced"
+            "pools: claude normal 50% used of 50% allowed, mistral unpaced, openai held until 2026-10-18T16:04Z, small unpaced"
         );
         assert_eq!(
             line(&paces(None, now, 0.0, &[]), &configured, &[], now),
@@ -1097,7 +1098,7 @@ mod tests {
         );
         assert_eq!(
             line(&read, &configured, &overrides, now),
-            "pools: claude normal 50%/50%, openai override spend until 2026-10-18T00:00Z (use the week's allowance), small unpaced; override for small expired at 2026-10-17T00:00Z"
+            "pools: claude normal 50% used of 50% allowed, openai override spend until 2026-10-18T00:00Z (use the week's allowance), small unpaced; override for small expired at 2026-10-17T00:00Z"
         );
     }
 
