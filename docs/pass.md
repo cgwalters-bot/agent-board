@@ -422,8 +422,10 @@ With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
 broker's `spend.runs`, the trailing week's cost of runs' requests at API list
 prices in dollars ([praxis-credential-broker#38][spend]), in the snapshot's
 `budget` (`weekly_usd`, `spent_usd`, `prices`, `unpriced_requests`, and the
-broker's `since` and `unmetered_requests` where it gives them), and its line
-ends `budget: $412 of $1000 this week at list prices`. Spend in another
+broker's `since` and `unmetered_requests` where it gives them), and the
+published comment ends its list `budget: $412 of $1000 this week at list
+prices`. The pass's own `usage:` line leaves dollars out, since a public
+repository's run log is public. Spend in another
 currency, basis or window is no reading, and so is a broker without `runs`, a
 total that leaves runs' requests unpriced
 (`budget: $1000 a week, 3 request(s) unpriced (held)`) or does not say how many

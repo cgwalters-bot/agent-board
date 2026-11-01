@@ -507,28 +507,36 @@ fn describe(name: &str, entry: &Value) -> String {
     )
 }
 
-/// Each pool's [`describe`], then the budget's where there is one.
+/// Each pool's [`describe`]. These go in the pass's log, which a public
+/// repository's run shows anyone, so the budget's amounts stay out.
 pub(super) fn pools(snapshot: &Value) -> Vec<String> {
     let pools = snapshot["pools"].as_object().into_iter().flatten();
-    let mut lines: Vec<String> = pools.map(|(name, entry)| describe(name, entry)).collect();
-    let budget = &snapshot["budget"];
-    if budget.is_object() {
-        let weekly = budget["weekly_usd"].as_f64().unwrap_or(f64::NAN);
-        lines.push(match budget["spent_usd"].as_f64() {
-            Some(spent) => format!("budget: ${spent:.0} of ${weekly:.0} this week at list prices"),
-            None => match budget["unpriced_requests"].as_u64() {
-                Some(n) => format!("budget: ${weekly:.0} a week, {n} request(s) unpriced (held)"),
-                None => format!("budget: ${weekly:.0} a week, no spend reading (held)"),
-            },
-        });
-    }
-    lines
+    pools.map(|(name, entry)| describe(name, entry)).collect()
 }
 
-/// The comment: the marker, a line per pool, then the JSON that pacing and
-/// the review app read.
+/// The budget's line, in dollars, where there is a budget; for the published
+/// comment alone.
+fn budget_line(snapshot: &Value) -> Option<String> {
+    let budget = snapshot["budget"].as_object()?;
+    let weekly = budget
+        .get("weekly_usd")
+        .and_then(Value::as_f64)
+        .unwrap_or(f64::NAN);
+    let unpriced = budget.get("unpriced_requests").and_then(Value::as_u64);
+    Some(match budget.get("spent_usd").and_then(Value::as_f64) {
+        Some(spent) => format!("budget: ${spent:.0} of ${weekly:.0} this week at list prices"),
+        None => match unpriced {
+            Some(n) => format!("budget: ${weekly:.0} a week, {n} request(s) unpriced (held)"),
+            None => format!("budget: ${weekly:.0} a week, no spend reading (held)"),
+        },
+    })
+}
+
+/// The comment: the marker, a line per pool and the budget's, then the JSON
+/// that pacing and the review app read.
 pub(super) fn render(snapshot: &Value) -> Result<String> {
-    let pools: String = pools(snapshot).iter().map(|p| format!("- {p}\n")).collect();
+    let lines = pools(snapshot).into_iter().chain(budget_line(snapshot));
+    let pools: String = lines.map(|p| format!("- {p}\n")).collect();
     Ok(format!(
         "{USAGE_MARKER}\nUsage as of {}, from the inference broker's `/usage`. Written by `agent-board pass`; the review app's ops view reads the JSON below.\n\n{pools}\n```json\n{}\n```\n",
         text(snapshot, "/updated_at"),

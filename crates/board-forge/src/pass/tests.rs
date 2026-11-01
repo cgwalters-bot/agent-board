@@ -1181,7 +1181,7 @@ fn replay_scenarios() {
             "spend under the weekly budget is shown and starts runs",
             Box::new(|r, c| with_spend(r, c, spend(412.37))),
             vec![
-                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $412 of $1000 this week at list prices",
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z",
                 "start triage cgwalters-forge/tracker#446 pool=claude",
             ],
             6,
@@ -1223,7 +1223,7 @@ fn replay_scenarios() {
                 with_spend(r, c, spend);
             }),
             vec![
-                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $1000 a week, 1000 request(s) unpriced (held)",
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z",
                 "hold budget: the usage snapshot has no spend reading; new runs wait",
             ],
             0,
@@ -1266,7 +1266,7 @@ fn replay_scenarios() {
                 with_spend(r, c, spend);
             }),
             vec![
-                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z; budget: $412 of $1000 this week at list prices",
+                "usage: claude: 18% used, pace allows 50%, resets 2026-10-26T23:00:00Z, read 2026-10-23T15:06:40Z; openai: 3% used, pace allows 2%, resets 2026-10-30T12:00:00Z, read 2026-10-23T15:06:40Z",
                 "start triage cgwalters-forge/tracker#446 pool=claude",
             ],
             6,
