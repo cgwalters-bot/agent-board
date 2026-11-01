@@ -1423,7 +1423,7 @@ mod tests {
                 false,
                 false,
                 "What does the poll read?",
-                line(&format!("triage on {DISPATCH}#1001 -> {RUN}")),
+                line(&format!("tracked without dispatch on {DISPATCH}#1001")),
             ),
         ] {
             let case = format!("scope={scope} private={private} pull={pull}");
@@ -1454,7 +1454,11 @@ mod tests {
             let outcome = pass(&fake, &config(extra), State::default(), true);
             assert_eq!(outcome.errors, 0, "{case}: {:?}", outcome.lines);
             assert_eq!(outcome.lines, [expected], "{case}");
-            assert_eq!(dispatches(&fake).len(), usize::from(!private), "{case}");
+            assert_eq!(
+                dispatches(&fake).len(),
+                usize::from(!private && body == addressed),
+                "{case}"
+            );
         }
     }
 

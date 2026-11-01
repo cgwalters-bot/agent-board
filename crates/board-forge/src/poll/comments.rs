@@ -16,6 +16,8 @@
 //! pull request, and the claim goes on that issue instead of the thread. As
 //! nothing on the thread links to it, the issue is found again by its title
 //! ([`Pass::tracked`]). A claim already on such a thread still counts.
+//! Without a line addressing the bot, new comments are only tracked, with
+//! a completed claim and no dispatch; the issue waits for the board pass.
 //!
 //! A search a pass, of a few pages, finds the threads the operator commented
 //! on that were updated since a cursor in the state. Each new comment is
@@ -148,7 +150,9 @@ pub(super) struct Said {
 ///
 /// A marker or claim is posted before its dispatch with the comments as
 /// `pending`, and only the write after a dispatch that started a run, or may
-/// have, names them as `comments`. So a refusal needs no write of its own: a
+/// have, names them as `comments`. Tracking without dispatch also names them
+/// as `comments`, with outcome `tracked`, and never has a pending state.
+/// So a refusal needs no write of its own: a
 /// pending record, whose dispatch was refused or whose pass failed before
 /// recording it, counts as one refusal once it is older than the run
 /// timeout; until then it may be another pass's dispatch under way, and is
@@ -1160,6 +1164,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             (true, why)
         } else if mine {
             self.comment_fix(repo, number, hit, comments, &said)?
+        } else if let Some(tracked) = &tracked
+            && !said.iter().any(|s| explicit(&s.body, &bot))
+        {
+            self.comment_track(repo, number, pull, comments, &said, tracked)?
         } else {
             let tries = refused.get(&keys[0]).copied().unwrap_or(0);
             self.comment_triage(
@@ -1174,6 +1182,42 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             done,
             format!("operator comments {}: {what}", keys.join(", ")),
         )))
+    }
+
+    /// An unaddressed upstream comment waits on its tracking issue, without
+    /// a run. The completed claim deduplicates it without holding the cursor.
+    fn comment_track(
+        &mut self,
+        repo: &str,
+        number: u64,
+        pull: bool,
+        read: &[Value],
+        said: &[Said],
+        tracked: &Tracked,
+    ) -> Result<Handled> {
+        if self.apply.is_none() {
+            return Ok((true, "tracked without dispatch on a tracking issue".into()));
+        }
+        let path = if pull { "pull" } else { "issues" };
+        let url = format!("https://github.com/{repo}/{path}/{number}");
+        let (issue, read) = self.tracking_issue(repo, number, &url, read, said, Some(tracked))?;
+        let keys: Vec<&str> = said.iter().map(|s| s.key.as_str()).collect();
+        // A completed tracking receipt has its own identity for the whole
+        // batch: neither an earlier dispatch attempt nor an overlapping
+        // pass tracking a smaller batch may hide any of these comments.
+        let state = json!({"from": format!("{TRIAGE_FROM}tracked:{}", keys.join(",")),
+            "comments": keys, "outcome": "tracked"});
+        let tracker = self.config.dispatch_repo.clone();
+        let of = format!("Tracked without dispatch from {url}");
+        let marker = find_marker(&read, &self.config.bot);
+        // No dispatch follows, so even a pass interrupted after posting this
+        // claim leaves a completed record, never a pending retry.
+        // An earlier claim with this exact identity completes the same batch.
+        let _ = self.claim(&tracker, issue, &marker, &read, (state, &of))?;
+        Ok((
+            true,
+            format!("tracked without dispatch on {tracker}#{issue}"),
+        ))
     }
 
     /// A fix round on the bot's pull request, as any other counted in its
@@ -1715,11 +1759,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .context("the new issue has no number")?;
         // Two passes that overlap may each have opened one: both go on with
         // the oldest open one, where the claim decides between them.
-        if tracked.is_some()
-            && let Some((found, comments)) = self.tracked(repo, number, false)?.open()
-            && let Some(oldest) = found["number"].as_u64()
-        {
-            return Ok((oldest, comments.clone()));
+        if tracked.is_some() {
+            let again = self.tracked(repo, number, false)?;
+            if let Some((found, _)) = again.open()
+                && let Some(oldest) = found["number"].as_u64()
+                && oldest != issue
+            {
+                // The other pass may have quoted fewer comments. Reuse the
+                // normal note path before claiming ours on the selected issue.
+                return self.tracking_issue(repo, number, url, read, said, Some(&again));
+            }
+            if let Some((_, comments)) = again.open() {
+                return Ok((issue, comments.clone()));
+            }
         }
         Ok((issue, Vec::new()))
     }
@@ -1878,6 +1930,8 @@ pub(super) mod tests {
         /// Whether a search for a tracking issue finds none, as a search
         /// index that has not caught up.
         unindexed: RefCell<bool>,
+        /// Another pass's issue or receipt appearing as ours opens an issue.
+        on_tracking_create: RefCell<Vec<(String, Value)>>,
         fallback: bool,
         concurrent_hold: bool,
         post_delete_page: bool,
@@ -2050,6 +2104,7 @@ pub(super) mod tests {
                     json!({"number": id, "user": {"login": BOT}, "state": "open", "title": body["title"], "body": body["body"],
                         "repository_url": url.strip_suffix("/issues").unwrap()}),
                 );
+                rest.extend(self.on_tracking_create.take());
                 return Ok((201, json!({"id": id, "number": id})));
             }
             if method == "POST" && url.ends_with("/comments") {
@@ -2770,7 +2825,7 @@ pub(super) mod tests {
             400,
             OPERATOR,
             "2026-10-16T10:30:00Z",
-            "Is this still broken?",
+            "@worker is this still broken?",
         );
         // A claim an earlier pass posted on the thread, before claims moved.
         let claimed = json!({"id": 450, "user": {"login": BOT}, "created_at": "2026-10-16T10:40:00Z",
@@ -2943,6 +2998,268 @@ pub(super) mod tests {
             assert_eq!(created(&fake), [issue], "{case}");
             assert_eq!(claims(&fake).len(), 2, "{case}");
             assert_eq!(upstream(&fake), 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn unaddressed_upstream_comments_wait_on_the_tracking_issue() {
+        let mut config = config();
+        config.policy = PollPolicy::from_json(&json!({
+            "operatorComments": {"repositories": ["outside/*", "upstream/*"]},
+            "kindPools": {"triage": "small"}}))
+        .unwrap();
+        for (repo, pull, starts) in [
+            ("outside/app", false, false),
+            ("outside/app", true, false),
+            ("upstream/app", false, true),
+        ] {
+            let thread = format!("{repo}#3");
+            let case = format!("{thread} pull={pull}");
+            let fake = one_thread(
+                &thread,
+                pull,
+                json!([said(
+                    400,
+                    OPERATOR,
+                    "2026-10-16T10:30:00Z",
+                    "A design observation"
+                )]),
+            );
+            let list = format!("{API_ROOT}repos/{repo}/issues/3/comments?per_page=100");
+            let preview = pass_configured(&fake, &config, (None, None), false, now());
+            assert_eq!(preview.errors, 0, "{case}: {:?}", preview.lines);
+            assert!(fake.writes.borrow().is_empty(), "{case}");
+            let first = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(first.errors, 0, "{case}: {:?}", first.lines);
+            if starts {
+                assert_eq!(dispatches(&fake).len(), 1, "{case}");
+                assert_eq!(dispatches(&fake)[0]["repo"], repo, "{case}");
+                continue;
+            }
+            assert!(dispatches(&fake).is_empty(), "{case}");
+            let issue = fake
+                .rest
+                .borrow()
+                .iter()
+                .find_map(|(path, v)| {
+                    (path.starts_with(&format!("{API_ROOT}repos/{DISPATCH}/issues/"))
+                        && v["title"] == format!("{thread}: operator request"))
+                    .then(|| v["number"].as_u64().unwrap())
+                })
+                .unwrap();
+            let tracking = format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}");
+            assert!(
+                text(&fake.rest.borrow()[&tracking], "/body").contains("A design observation"),
+                "{case}"
+            );
+            let records = || {
+                fake.rest.borrow()[&format!("{tracking}/comments?per_page=100")]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            };
+            let check_done = |keys: &[&str]| {
+                let comments = records();
+                let (done, refused) = handled(&comments, BOT, now());
+                assert_eq!(
+                    done,
+                    keys.iter().map(|s| (*s).to_owned()).collect(),
+                    "{case}"
+                );
+                assert!(refused.is_empty(), "{case}");
+                assert!(!pending(&comments, BOT, now()), "{case}");
+                for state in comments
+                    .iter()
+                    .filter_map(|c| parse_marker(CLAIM, text(c, "/body")))
+                {
+                    assert_eq!(state["outcome"], "tracked", "{case}");
+                    assert!(state.get("pending").is_none(), "{case}");
+                }
+            };
+            check_done(&["issuecomment-400"]);
+            let before = fake.writes.borrow().len();
+            let again = pass_configured(&fake, &config, (None, None), true, now());
+            assert!(again.lines.is_empty(), "{case}: {:?}", again.lines);
+            assert_eq!(fake.writes.borrow().len(), before, "{case}");
+
+            // Reviews and review comments use the same tracking-only path.
+            let (second_list, second, key) = if pull {
+                (
+                    format!("{API_ROOT}repos/{repo}/pulls/3/reviews?per_page=100"),
+                    json!({"id": 401, "user": {"login": OPERATOR},
+                        "submitted_at": "2026-10-16T11:00:00Z", "body": "Another observation"}),
+                    "pullrequestreview-401",
+                )
+            } else {
+                (
+                    list.clone(),
+                    said(401, OPERATOR, "2026-10-16T11:00:00Z", "Another observation"),
+                    "issuecomment-401",
+                )
+            };
+            fake.rest
+                .borrow_mut()
+                .get_mut(&second_list)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(second);
+            let second = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(second.errors, 0, "{case}: {:?}", second.lines);
+            assert!(dispatches(&fake).is_empty(), "{case}");
+            check_done(&["issuecomment-400", key]);
+            assert!(
+                records()
+                    .iter()
+                    .any(|c| text(c, "/body").contains("Another observation")),
+                "{case}"
+            );
+
+            let (last_list, last, last_key) = if pull {
+                (
+                    format!("{API_ROOT}repos/{repo}/pulls/3/comments?per_page=100"),
+                    said(
+                        402,
+                        OPERATOR,
+                        "2026-10-16T11:30:00Z",
+                        "@worker please triage this",
+                    ),
+                    "discussion_r402",
+                )
+            } else {
+                (
+                    list.clone(),
+                    said(
+                        402,
+                        OPERATOR,
+                        "2026-10-16T11:30:00Z",
+                        "@worker please triage this",
+                    ),
+                    "issuecomment-402",
+                )
+            };
+            fake.rest
+                .borrow_mut()
+                .get_mut(&last_list)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(last);
+            let last = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(last.errors, 0, "{case}: {:?}", last.lines);
+            pass_configured(&fake, &config, (None, None), true, now());
+            let inputs = dispatches(&fake);
+            assert_eq!(inputs.len(), 1, "{case}");
+            assert_eq!(inputs[0]["repo"], DISPATCH, "{case}");
+            assert_eq!(inputs[0]["item"], issue.to_string(), "{case}");
+            let task = inputs[0]["task"].as_str().unwrap();
+            assert!(
+                task.contains(last_key) && task.contains("please triage this"),
+                "{case}: {task}"
+            );
+            assert!(
+                !task.contains("A design observation") && !task.contains("Another observation"),
+                "{case}: {task}"
+            );
+            assert_eq!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .filter(|(path, _)| path == &format!("POST {API_ROOT}repos/{DISPATCH}/issues"))
+                    .count(),
+                1,
+                "{case}"
+            );
+            assert!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .all(|(path, _)| !path.contains(&format!("repos/{repo}/"))),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn tracking_completes_the_whole_batch_when_passes_overlap() {
+        let mut config = config();
+        config.policy = PollPolicy::from_json(&json!({
+            "operatorComments": {"repositories": ["outside/*"]}}))
+        .unwrap();
+        for case in ["smaller batch", "refused", "expired", "other issue"] {
+            let fake = one_thread(
+                "outside/app#3",
+                false,
+                json!([
+                    said(400, OPERATOR, "2026-10-16T10:30:00Z", "First observation"),
+                    said(401, OPERATOR, "2026-10-16T11:00:00Z", "Second observation")
+                ]),
+            );
+            let issue = if case == "other issue" { 900 } else { 1001 };
+            let tracking = format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}");
+            let (from, field) = match case {
+                "smaller batch" => ("comment:tracked:issuecomment-400", "comments"),
+                "refused" => ("comment:issuecomment-400", "refused"),
+                "expired" => ("comment:issuecomment-400", "pending"),
+                _ => ("comment:tracked:issuecomment-400", "comments"),
+            };
+            let mut state = json!({"from": from});
+            state[field] = json!(["issuecomment-400"]);
+            if field == "comments" {
+                state["outcome"] = "tracked".into();
+            }
+            let claim = json!({"id": 800, "user": {"login": BOT},
+                "created_at": "2026-10-15T09:00:00Z",
+                "body": format!("<!-- {CLAIM}: {state} -->")});
+            let mut interleaved =
+                vec![(format!("{tracking}/comments?per_page=100"), json!([claim]))];
+            if case == "other issue" {
+                interleaved.push((tracking.clone(), json!({
+                    "number": issue, "user": {"login": BOT}, "state": "open",
+                    "title": "outside/app#3: operator request",
+                    "repository_url": format!("{API_ROOT}repos/{DISPATCH}"),
+                    "body": "[comment](https://github.com/outside/app/issues/3#issuecomment-400): First observation"
+                })));
+            }
+            *fake.on_tracking_create.borrow_mut() = interleaved;
+            let result = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(result.errors, 0, "{case}: {:?}", result.lines);
+            let comments = fake.rest.borrow()[&format!("{tracking}/comments?per_page=100")]
+                .as_array()
+                .unwrap()
+                .clone();
+            let (done, _) = handled(&comments, BOT, now());
+            assert_eq!(
+                done,
+                BTreeSet::from(["issuecomment-400".into(), "issuecomment-401".into()]),
+                "{case}"
+            );
+            let quotes = std::iter::once(
+                fake.rest.borrow()[&tracking]["body"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+            .chain(comments.iter().map(|c| text(c, "/body").to_owned()))
+            .collect::<Vec<_>>()
+            .join("\n");
+            assert!(
+                quotes.contains("First observation") && quotes.contains("Second observation"),
+                "{case}: {quotes}"
+            );
+            let before = fake.writes.borrow().len();
+            let again = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(again.errors, 0, "{case}: {:?}", again.lines);
+            assert!(again.lines.is_empty(), "{case}: {:?}", again.lines);
+            assert_eq!(fake.writes.borrow().len(), before, "{case}");
+            assert!(dispatches(&fake).is_empty(), "{case}");
+            assert!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .all(|(path, _)| !path.contains("repos/outside/app/")),
+                "{case}"
+            );
         }
     }
 

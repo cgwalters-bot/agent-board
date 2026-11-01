@@ -359,8 +359,8 @@ once more from its start where threads updated meanwhile may have moved one
 not yet read before where it resumed), and reads the
 comments, reviews and review comments of each thread found. The operator's
 comments from the last two days that no round's marker or triage claim of
-the bot's names start one run a thread: on an open pull request the bot opened
-(upstream or in its fork), a fix round counted in its marker like any other (within
+the bot's names start at most one run a thread: on an open pull request the bot
+opened (upstream or in its fork), a fix round counted in its marker like any other (within
 the 2 fix rounds, not while one runs for the head, not once labelled
 `needs-human`), whose task quotes them; on any other issue or pull request,
 a `triage` run whose task quotes them, says the operator wrote them, and says
@@ -386,13 +386,21 @@ new one; a pass that opened one goes on with the oldest open one, so two passes
 that overlap claim on the same issue. A claim already on such a thread is still
 honoured. The brief says that the result stays on the tracking issue, and that
 a comment may be direction or feedback on the bot's own earlier comments, which
-is no reason to triage the item again. A fix round on the bot's own pull request
-is as anywhere else. Each comment is claimed first, on its thread or its
-tracking issue, as a fix round is, so a comment is acted on once whether or not
-the cursor survives. A run GitHub refuses (a 4xx) is recorded on its claim or
+is no reason to triage the item again. When none of the new comments on a thread
+outside our own space has a `/bot` or `@BOT` line, they are only quoted on its
+tracking issue: no run is dispatched, no priority or project write is made, and
+nothing is posted upstream. Its claim names the comments as done (`comments`,
+with outcome `tracked`), never pending, so later passes skip them and advance
+the search. The issue waits for the board pass like any other issue. A later
+addressed comment dispatches one run on the same open tracking issue, quoting
+only the new comments. This applies equally to comments, reviews and review
+comments. Comments in our own space keep their existing behavior, and a fix
+round on the bot's own pull request is as anywhere else. Each comment is claimed
+first, on its thread or its tracking issue, as a fix round is, so a comment is
+acted on once whether or not the cursor survives. A run GitHub refuses (a 4xx) is recorded on its claim or
 marker, without using the round, and tried again on later passes, three times
-at most. The claim or marker names the comments as pending until a write after
-the dispatch records its outcome. One still pending after the run timeout
+at most. For a run, the claim or marker names the comments as pending until a
+write after the dispatch records its outcome. One still pending after the run timeout
 counts as a refusal, so a refusal whose record could not be written, or a
 started run whose record could not, is tried again too, within those tries
 and the fix rounds (agent-board#185). A
