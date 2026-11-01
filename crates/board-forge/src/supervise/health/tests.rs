@@ -653,6 +653,121 @@ fn wrapper(release: &str, tag: &str) -> Value {
 }
 
 #[test]
+fn wrapper_pin_versions() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    for (pin, expected) in [
+        ("v0.4.0".to_owned(), Some("v0.4.0")),
+        ("v0.4.0 # release".to_owned(), Some("v0.4.0")),
+        (format!("{sha} # v0.4.0"), Some("v0.4.0")),
+        (format!("{sha}\t#\tv0.4.0 notes"), Some("v0.4.0")),
+        (format!("{sha} #v0.4.0"), Some("v0.4.0")),
+        (format!("{} # v0.4.0", sha.to_uppercase()), Some("v0.4.0")),
+        (sha.to_owned(), None),
+        (format!("{sha} # no version"), None),
+        (format!("{sha}\n# v0.4.0"), None),
+        (format!("{sha} v0.4.0"), None),
+        (format!("{} # v0.4.0", &sha[..39]), None),
+        (format!("{sha}0 # v0.4.0"), None),
+        (format!("{}g # v0.4.0", &sha[..39]), None),
+        ("main # v0.4.0".to_owned(), None),
+        (format!("{sha} # v0.4"), None),
+        (format!("{sha} # v0.4.0-rc.1"), None),
+        ("v0.4.0-rc.1".to_owned(), None),
+        ("v0.4.0suffix".to_owned(), None),
+        ("v0..0".to_owned(), None),
+    ] {
+        for name in ["policy", "check", "apply"] {
+            let text = format!("  uses: o/aj/.github/workflows/{name}.yml@{pin}\n");
+            let expected: Vec<_> = expected.into_iter().collect();
+            assert_eq!(wrapper_pins(&text, "o/aj"), expected, "{text}");
+            assert!(wrapper_pins(&text, "other/repo").is_empty());
+        }
+    }
+}
+
+#[test]
+fn release_check_reads_tag_and_commit_pinned_wrappers() {
+    let (_, now) = recorded();
+    let s = project_settings();
+    // cgwalters-forge/actions, .github/workflows/cgwalters-agentic-job.yml,
+    // observed 2026-11-01; latest stable agentic-job release was v0.6.4.
+    let current = "258dc11ca7fe1798836976c0424274d1498e22cb # v0.6.2";
+    for (case, pin, mismatch, expected_pin) in [
+        ("tag current", "v0.6.4", false, Some("v0.6.4")),
+        ("tag lag", "v0.6.2", false, Some("v0.6.2")),
+        (
+            "commit lag: current wrapper",
+            current,
+            false,
+            Some("v0.6.2"),
+        ),
+        (
+            "commit current",
+            "258dc11ca7fe1798836976c0424274d1498e22cb # v0.6.4",
+            false,
+            Some("v0.6.4"),
+        ),
+        (
+            "missing version",
+            "258dc11ca7fe1798836976c0424274d1498e22cb",
+            false,
+            None,
+        ),
+        ("mismatched versions", current, true, None),
+    ] {
+        let fake = Fake::new(|_: &str, path: &str, _: &Value| -> Result<Value> {
+            if path.contains("/releases/latest") {
+                return Ok(
+                    json!({"tag_name": "v0.6.4", "html_url": "https://github.com/example/agentic-job/releases/tag/v0.6.4"}),
+                );
+            }
+            if path.contains("/contents/") {
+                let mut text = String::new();
+                for name in ["policy", "check", "apply"] {
+                    let pin = if mismatch && name == "apply" {
+                        "v0.6.4"
+                    } else {
+                        pin
+                    };
+                    text.push_str(&format!(
+                        "uses: example/agentic-job/.github/workflows/{name}.yml@{pin}\n"
+                    ));
+                }
+                return Ok(json!({"content": base64(&text)}));
+            }
+            bail!("not this check")
+        });
+        let snapshot = collect(&fake, &s, "main", now, None);
+        let result = check(&snapshot, "release", now);
+        let item = &snapshot.observations["release"].as_ref().unwrap()[0];
+        if let Some(pin) = expected_pin {
+            assert_eq!(item["pin"], pin, "{case}");
+            assert_eq!(
+                result["status"],
+                if pin == "v0.6.4" { "ok" } else { "fail" },
+                "{case}"
+            );
+        } else {
+            assert!(item["pin"].is_null(), "{case}");
+            assert_eq!(
+                item["reason"], "Wrapper versions are missing, unrecognized or mismatched.",
+                "{case}"
+            );
+            assert_eq!(result["status"], "fail", "{case}");
+            assert_eq!(
+                result["evidence"],
+                json!([
+                    "https://github.com/example/agentic-job/releases/tag/v0.6.4",
+                    item["reason_url"]
+                ]),
+                "{case}"
+            );
+            assert!(item["reason_url"].as_str().unwrap().contains("/blob/HEAD/"));
+        }
+    }
+}
+
+#[test]
 fn collector_reads_scheduler_logs_records_runs_annotations_and_pull_requests() {
     let (_, now) = recorded();
     let s = project_settings();
