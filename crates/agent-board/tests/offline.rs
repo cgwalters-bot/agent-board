@@ -938,6 +938,16 @@ fn board_config_cli_table() {
             "AGENT_BOARD_TEST_FORGEJO_TOKEN",
         ),
         (
+            vec!["intake", "--board-config", forgejo, "--json"],
+            1,
+            "board.intake is not configured",
+        ),
+        (
+            vec!["intake", "--json"],
+            1,
+            "intake requires --board-config",
+        ),
+        (
             vec!["item", "list", "--board-config", forgejo, "--owner", "x"],
             1,
             "not --owner or --project",

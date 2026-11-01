@@ -9,6 +9,7 @@ mod decisions;
 mod deploy;
 mod dispatch;
 mod epic;
+mod intake;
 mod item;
 mod lease;
 mod live;
@@ -46,7 +47,7 @@ struct Cli {
     #[arg(long, global = true)]
     snapshot: Option<PathBuf>,
     /// Print selected comma-separated JSON fields.
-    #[arg(long, global = true, value_name = "FIELDS")]
+    #[arg(long, global = true, value_name = "FIELDS", num_args = 0..=1, default_missing_value = "*")]
     json: Option<String>,
     /// Filter JSON output with a jq expression.
     #[arg(long, global = true, requires = "json")]
@@ -74,6 +75,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Report new Forgejo issues and comments; no bodies, routing or forge writes.
+    Intake(intake::Intake),
     /// Validate proposed operator mutations; never execute them.
     Action {
         #[command(subcommand)]
@@ -443,6 +446,7 @@ fn board(cli: &Cli) -> Result<board_forge::forgejo::Board> {
             || matches!(
                 cli.command,
                 Command::Snapshot { .. }
+                    | Command::Intake(_)
                     | Command::Project {
                         command: Project::View
                     }
@@ -513,6 +517,7 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
         eprintln!("{warning}");
     }
     match &cli.command {
+        Command::Intake(args) => intake::run(args, &cli, &mut io::stdout().lock()),
         Command::HelpMarkdown => {
             use clap::CommandFactory;
             io::stdout()

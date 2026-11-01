@@ -14,6 +14,7 @@ agent-board [OPTIONS] <COMMAND>
 
 Commands:
 
+- [`intake`](#agent-board-intake): Report new Forgejo issues and comments; no bodies, routing or forge writes
 - [`action`](#agent-board-action): Validate proposed operator mutations; never execute them
 - [`check`](#agent-board-check): Check proposals without applying them
 - [`project`](#agent-board-project): Inspect a project's summary and schema
@@ -52,6 +53,19 @@ Global options:
 - `--owner <OWNER>`: Organization or user owning the live project
 - `--project <PROJECT>`: Live project number, not its node ID
 - `--board-config <FILE>`: Trusted default-branch agent-board.json whose `board` names the forge (GitHub by default)
+
+## agent-board intake
+
+Report new Forgejo issues and comments; no bodies, routing or forge writes
+
+```text
+agent-board intake [OPTIONS]
+```
+
+Options:
+
+- `--since <SINCE>`: Override stored cursors with this RFC3339 start time
+- `--state <FILE>`: JSON map of repository to since cursor; saved after complete reads only
 
 ## agent-board action
 
