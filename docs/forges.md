@@ -139,9 +139,12 @@ now accepts a Forgejo board: identity checks, then stage 1's
 broker usage and grants, stage 3's epics where `epics` is set (#514,
 [below](#epics)), and stage 4's candidates, holds and runs in flight
 (#522, [below](#stage-4-in-preview)) with the [weekly sweep](#the-weekly-sweep)
-where `sweep` is set, with one `not built on Forgejo yet` line
-for each of stages 2, 5 and 6. Preview writes and dispatches nothing;
-`--apply` supports stages 3 and [4](#stage-4-apply). A preview can be
+where `sweep` is set, stage 5's [Status labels](#labels-and-status) where
+`board.statusLabels` is set, and the usage and hold
+[snapshots](#comments-recorders-and-editors) where `usage.repository` and
+`holds` are set (#523), with one `not built on Forgejo yet` line
+for each of stages 2 and 6. Preview writes and dispatches nothing;
+`--apply` supports stages 3, [4](#stage-4-apply) and 5 and the snapshots. A preview can be
 [recorded and replayed](#recording-and-replay). `--fix-bounds`, and
 `--record` with `--replay` (a seeded recording), are refused before
 credentials are read.
@@ -149,7 +152,7 @@ The library board primitives above implement only part of the write contract;
 native dispatch/run/lease primitives implement the sections below independently
 of scheduler wiring. Offline tests are not live proof; [Live CI](#live-ci)
 runs the pass against a disposable instance.
-The remaining driver wiring covers Status/snapshots (#523). [`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
+[`fixtures/forgejo/pass-contract.json`](../fixtures/forgejo/pass-contract.json)
 holds its per-stage capability inventory and a verdict for every
 [pass option](pass.md#one-configuration-file); a test fails when an option is
 added to that table without one.
@@ -210,8 +213,7 @@ reviewed mechanism replaces it.
 The preview rejects every explicitly supplied refused option, even `false`,
 an empty collection or a nested setting, with
 `unsupported_capability: OPTION: REASON` from the contract, before token lookup.
-It also temporarily rejects `holds`, usage publication
-(`usage.repository`/`usage.issue`) and `usage.probe` (#523). Leases and reruns
+It also temporarily rejects `usage.probe`. Leases and reruns
 are accepted, and so is `sweep` ([below](#the-weekly-sweep)). Optional
 spare-capacity revisits are built on the same stage 4 path
 ([below](#native-revisits)). Nothing activates a caller.
@@ -219,7 +221,9 @@ spare-capacity revisits are built on the same stage 4 path
 Stage 1 accepts broker-only `usage: {"url": "http://broker.internal/usage"}`;
 GitHub still requires its publication repository and issue. It reuses the
 GitHub pass's snapshot, grants, pacing and `usage:` rendering, but never its
-publication or snapshot fallback. Missing readings hold pools; failed reads
+snapshot fallback. With `usage.repository` and `usage.issue` (both or
+neither), and with `holds`, the snapshots are published as the
+[comments section](#comments-recorders-and-editors) says. Missing readings hold pools; failed reads
 report failures, with grants still deciding when available. No broker is no
 reading, never a reason to access GitHub. The Forgejo transport and separate
 credential-free broker share the 500-request/15-minute pass bound. The preview
@@ -363,8 +367,7 @@ configured instance, not GitHub. Actions `SERVER_URL` must match `board.url`;
 compatibility aliases). Another running pass holds stage 4. Outside Actions,
 both caps are required and serialization against the schedule is not promised.
 These bounded observations are not an atomic cross-workflow lock: deployments
-must serialize pass invocations. Status and snapshots are not part of this
-applying slice (#523); other refusals remain in force.
+must serialize pass invocations. Other refusals remain in force.
 
 ### Native revisits
 
@@ -424,10 +427,17 @@ as stage 5 does with Status.
 
 Status round-trips through its label when `board.statusLabels` is true:
 the snapshot reads `status/…` as Status. No `status/` label is no Status,
-which the future Forgejo stage 5 makes Todo;
+which stage 5 makes Todo;
 two, or an unknown value, is incomplete and keeps whatever is there. Stage 5
-writes the derived value with one label write, and the next read must show it.
-Blocked and Backlog stay a person's holds; `status/blocked` is the board's
+derives Status as the GitHub pass does, from the board's open issues, their
+labels, the runs in flight (this pass's starts included) and the bot's and
+operator's open closing pull requests, and, with a membership label, from its
+closed issues updated in the last seven days, which are Done (an open board's
+closed issues are off it). It writes each change with the label
+write above, which reads it back, counted against `--max-status-changes` and
+`--max-writes`; without `statusLabels` it prints one `off` line.
+Blocked and Backlog stay a person's holds, which stage 5 never replaces, Done
+included; `status/blocked` is the board's
 Blocked, and the `blocked/<reason>` labels keep filling the Blocked list. Forgejo
 has no close reason ([issue.go#L121][fj-close]), so a closed issue is Done and
 nothing reads Cancelled from it; `triageClose` closes with a comment that says
@@ -457,7 +467,16 @@ differ; none did in the runs made when it was added. The pass
 therefore never edits a record: where the GitHub pass edits in place (the
 claim's outcome, the usage and hold snapshots, the planning request, the
 sweep's applied comment and its list in the issue body), a Forgejo
-pass appends a new comment and reads the newest valid one. A writer replaces a
+pass appends a new comment and reads the newest valid one. The usage and hold
+snapshots go to issues of repositories this instance's `GET /repos` says are
+private, or the pass stops before stage 1; each is the bot's new comment,
+with the GitHub pass's marker and rendering, posted only where it changed:
+for holds by the GitHub pass's change rule, for usage when anything but its
+times and the pace figures that move with the clock changed. Unlike the
+GitHub pass, the hold snapshot is published even where stage 4 failed, and
+never one write past `--max-writes`. `holds.needsYou`
+lists the epics', items' and pass's asks; its reviews, proposals and digest
+sources are off. A writer replaces a
 plan by replying with another, not by editing it. Run and Result reads now
 check both the author id and matching creation/update timestamps.
 The issue body has the same problem, and an issue's `updated_at` moves with

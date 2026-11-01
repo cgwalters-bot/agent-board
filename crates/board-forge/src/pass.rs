@@ -1025,7 +1025,8 @@ impl Config {
             ensure!(self.usage.is_some(), "pools need usage");
         }
         if let Some(usage) = &self.usage {
-            if self.forgejo_board().is_none() || !usage.repository.is_empty() {
+            // On Forgejo publication is optional, but whole where set.
+            if self.forgejo_board().is_none() || !usage.repository.is_empty() || usage.issue > 0 {
                 naming
                     .validate_repository(&usage.repository)
                     .context("usage repository")?;

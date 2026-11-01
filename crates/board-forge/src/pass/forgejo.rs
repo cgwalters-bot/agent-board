@@ -1,6 +1,7 @@
-//! Forgejo pass: identity, broker pacing, stage 3's epics ([`epics`]) and
-//! stage 4 preview/apply. No GitHub fallback, publication, PR follow-up or
-//! Status writes.
+//! Forgejo pass: identity, broker pacing, stage 3's epics ([`epics`]),
+//! stage 4 preview/apply, stage 5's Status labels ([`status`]) and the
+//! usage and hold snapshots ([`publish`]). No GitHub fallback or PR
+//! follow-up.
 use super::*;
 use crate::dispatch::{Forgejo as Actions, ForgejoLease, ForgejoSlot, Start, StartOutcome};
 use crate::forgejo::{
@@ -9,7 +10,9 @@ use crate::forgejo::{
 use crate::{BoardOperation, BoardWrite, Forge};
 
 mod epics;
+mod publish;
 mod record;
+mod status;
 mod sweep;
 pub use record::{Recorder, Replay};
 
@@ -46,19 +49,10 @@ pub(super) fn check_options(value: &Value) -> Result<()> {
             );
         }
     }
-    for (option, follow_up) in [
-        ("holds", "scheduler and hold publication #513"),
-        ("usage.repository", "usage publication in scheduler #513"),
-        ("usage.issue", "usage publication in scheduler #513"),
-        ("usage.probe", "run inventory in scheduler #513"),
-    ] {
-        let pointer = format!("/{}", option.replace('.', "/"));
-        if value.pointer(&pointer).is_some() {
-            bail!(
-                "unsupported_capability: {option}: not built on Forgejo yet; needs {follow_up}; leave this option out for preview"
-            );
-        }
-    }
+    ensure!(
+        value.pointer("/usage/probe").is_none(),
+        "unsupported_capability: usage.probe: not built on Forgejo yet; needs run inventory in scheduler #513; leave this option out for preview"
+    );
     Ok(())
 }
 
@@ -225,6 +219,12 @@ fn run_within(
             return Ok(report);
         }
     };
+    if let Err(error) = publish::private(&client, board, config) {
+        report.failures += 1;
+        report.lines.push(format!("config error: {error:#}"));
+        report.spent = bounds.spent();
+        return Ok(report);
+    }
     // Broker calls share the same bound and clock, but not the forge transport
     // or its token. Nothing can fall back to a forge snapshot here.
     let broker = Budget {
@@ -233,6 +233,10 @@ fn run_within(
     };
     bounds.enter(Stage::Usage);
     let snapshot = refresh(&broker, config, now, &mut report)?;
+    if let Some(snapshot) = &snapshot {
+        let at = (ids, &caps, mode);
+        publish::usage(&client, board, config, at, snapshot, &mut report);
+    }
     report
         .lines
         .push("stage 2 follow pull requests: not built on Forgejo yet".into());
@@ -264,18 +268,23 @@ fn run_within(
         epic_started: 0,
         live: BTreeSet::new(),
         swept: None,
+        busy: None,
+        ranked: None,
+        unconsidered: 0,
     };
     schedule.epics(snapshot.as_ref());
     bounds.enter(Stage::Schedule);
     if let Err(error) = schedule.run(snapshot.as_ref()) {
-        report.failures += 1;
-        report.lines.push(format!("schedule error: {error:#}"));
+        schedule.report.failures += 1;
+        schedule.line(format!("schedule error: {error:#}"));
     }
-    for (stage, name) in [(5, "status"), (6, "cost")] {
-        report
-            .lines
-            .push(format!("stage {stage} {name}: not built on Forgejo yet"));
-    }
+    bounds.enter(Stage::Status);
+    schedule.status();
+    bounds.enter(Stage::Holds);
+    schedule.publish_holds();
+    report
+        .lines
+        .push("stage 6 cost: not built on Forgejo yet".into());
     report.summary = caps.summary();
     report.spent = bounds.spent();
     Ok(report)
@@ -337,6 +346,14 @@ struct Schedule<'a, C> {
     /// With `sweep`, the newest sweep issue, read before stage 4's
     /// candidates; None where it could not be read.
     swept: Option<Option<crate::pass::sweep::Found>>,
+    /// Stage 4's runs in flight by [`key`], its own starts included, which
+    /// stage 5 reads; None where it did not list them, `Some(None)` where
+    /// the listing failed.
+    busy: Option<Option<BTreeMap<String, String>>>,
+    /// Stage 4's ranked candidates, none where it did not get to them.
+    ranked: Option<Vec<ItemRef>>,
+    /// The candidates stage 4 left undecided.
+    unconsidered: usize,
 }
 
 /// A live epic's child, and the epic's Priority, which ranks it.
@@ -785,6 +802,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             epic_started: 0,
             live: BTreeSet::new(),
             swept: None,
+            busy: None,
+            ranked: None,
+            unconsidered: 0,
         };
         let fresh = recheck
             .complete(&fresh, unread.as_deref())
@@ -1410,11 +1430,13 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             Ok(runs) => runs,
             Err(error) => {
                 self.report.failures += 1;
+                self.busy = Some(None);
                 let why = format!("the runs in flight could not all be listed: {error:#}");
                 self.pass_held(HoldKind::Wip, format!("{why}; new runs wait"));
                 return Ok(());
             }
         };
+        self.busy = Some(Some(busy.clone()));
         // Stage 3's planning starts count even where not listed yet; where
         // they are, a slot waits a pass rather than the WIP limit giving.
         let active = active + self.epic_started;
@@ -1440,6 +1462,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         }
         let board = self.issues()?;
         let candidates = self.candidates(&board);
+        self.ranked = Some(candidates.iter().map(|(f, _)| f.issue.clone()).collect());
         let mut free = wip - active;
         for (n, (facts, unread)) in candidates.iter().enumerate() {
             if recovered.contains(&key(&facts.issue)) {
@@ -1447,6 +1470,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             }
             let left = candidates.len() - n;
             if free == 0 {
+                self.unconsidered += left;
                 self.line(format!("wip: no slot left; {left} more candidate(s) wait"));
                 break;
             }
@@ -1541,6 +1565,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let revisited = self.revisits(&candidates, snapshot, &mut busy, free, &recovered)?;
         self.report.tally.1.started = started + revisited;
         self.report.tally.0.in_flight = Some(active + started + revisited);
+        self.busy = Some(Some(busy));
         Ok(())
     }
 
@@ -1580,6 +1605,12 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
     /// listing past [`LIST_PAGES`] or not read whole is an error:
     /// scheduling from part of the board would start the wrong work.
     fn issues(&self) -> Result<BTreeMap<String, Read>> {
+        // Only a work repository's issues can be candidates.
+        self.board_issues(|repository| self.config.works_in(repository))
+    }
+
+    /// [`Self::issues`] of each board repository `include` takes.
+    fn board_issues(&self, include: impl Fn(&str) -> bool) -> Result<BTreeMap<String, Read>> {
         let board = self.board;
         let host = instance(board);
         let mut query = vec![("type", "issues"), ("state", "open")];
@@ -1588,8 +1619,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         }
         let mut items = BTreeMap::new();
         for repository in &board.repositories {
-            // Only a work repository's issues can be candidates.
-            if !self.config.works_in(repository) {
+            if !include(repository) {
                 continue;
             }
             let url = api(board, repository, "issues", &query)?;
@@ -1766,6 +1796,19 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 return Err(unreadable(why));
             }
         };
+        let (closing, whole) = self.closing(&facts.issue).map_err(unreadable)?;
+        facts.pulls = closing;
+        facts.pulls_complete = whole;
+        Ok(facts)
+    }
+
+    /// The bot's and the operator's open pull requests that close `issue`,
+    /// from its repository's listing, read once, and whether that listing
+    /// was whole; or why they could not be read.
+    fn closing(
+        &mut self,
+        issue: &ItemRef,
+    ) -> std::result::Result<(Vec<ClosingPull>, bool), String> {
         let repository = issue.repository.to_ascii_lowercase();
         if !self.pulls.contains_key(&repository) {
             let query = [("state", "open")];
@@ -1777,11 +1820,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         }
         let (pulls, whole) = match &self.pulls[&repository] {
             Ok(read) => read,
-            Err(error) => {
-                return Err(unreadable(format!(
-                    "its pull requests could not all be read: {error}"
-                )));
-            }
+            Err(error) => return Err(format!("its pull requests could not all be read: {error}")),
         };
         let web = format!("{}/", instance(self.board));
         let mut closing = Vec::new();
@@ -1794,7 +1833,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 continue;
             }
             let Some(number) = pull["number"].as_u64() else {
-                return Err(unreadable("a pull request has no number".into()));
+                return Err("a pull request has no number".into());
             };
             closing.push(ClosingPull {
                 number,
@@ -1804,9 +1843,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok()),
             });
         }
-        facts.pulls = closing;
-        facts.pulls_complete = *whole;
-        Ok(facts)
+        Ok((closing, *whole))
     }
 }
 
@@ -1891,6 +1928,7 @@ mod tests {
 
     mod apply;
     mod epics;
+    mod publish;
 
     fn file() -> Value {
         let contract: Value = serde_json::from_str(CONTRACT).unwrap();
@@ -2026,12 +2064,7 @@ mod tests {
         set(&mut focus, "epics.focus", json!("example/plans#1"));
         let refused = Config::parse(&focus.to_string()).unwrap_err();
         assert!(format!("{refused:#}").contains("unsupported_capability: epics.focus"));
-        for (option, follow_up) in [
-            ("holds.issue", "#513"),
-            ("usage.repository", "#513"),
-            ("usage.issue", "#513"),
-            ("usage.probe", "#513"),
-        ] {
+        for (option, follow_up) in [("usage.probe", "#513"), ("holds.proposals", "GitHub")] {
             let mut value = file();
             set(&mut value, option, json!(false));
             let error = Config::parse(&value.to_string()).unwrap_err().to_string();
@@ -2040,6 +2073,37 @@ mod tests {
                 "{option}: {error}"
             );
             assert!(error.contains(follow_up), "{option}: {error}");
+        }
+        // Publication is accepted where whole; the pass checks its privacy.
+        for (usage, holds, accepted) in [
+            (
+                json!({"repository": "example/private", "issue": 1}),
+                json!(null),
+                true,
+            ),
+            (
+                json!({}),
+                json!({"repository": "example/private", "issue": 2, "needsYou": true}),
+                true,
+            ),
+            (json!({"issue": 1}), json!(null), false),
+            (json!({"repository": "example/private"}), json!(null), false),
+            (json!({}), json!({"repository": "example/private"}), false),
+            (
+                json!({}),
+                json!({"repository": "a/../b", "issue": 2}),
+                false,
+            ),
+        ] {
+            let mut value = file();
+            for (key, setting) in usage.as_object().unwrap() {
+                value["usage"][key] = setting.clone();
+            }
+            if !holds.is_null() {
+                value["holds"] = holds.clone();
+            }
+            let parsed = Config::parse(&value.to_string());
+            assert_eq!(parsed.is_ok(), accepted, "{usage} {holds}: {parsed:?}");
         }
         for variable in ["GH_TOKEN", "GITHUB_TOKEN", "DISPATCH_TOKEN"] {
             let mut value = file();
@@ -2124,7 +2188,15 @@ mod tests {
             let body = match path.split('/').collect::<Vec<_>>()[..] {
                 ["user"] => self.bot.clone(),
                 ["users", "operator"] => self.operator.clone(),
-                ["repos", "example", "work", "issues"] => return paged(&listed.issues, 0),
+                ["repos", "example", "work", "issues"] => {
+                    // The open listing as it is, which may lie, and the closed one filtered.
+                    let state = url.query_pairs().find(|(k, _)| k == "state").unwrap().1;
+                    let issues: Vec<Value> = (listed.issues.iter())
+                        .filter(|i| state == "open" || i["state"] == *state)
+                        .cloned()
+                        .collect();
+                    return paged(&issues, 0);
+                }
                 ["repos", "example", "work", "pulls"] => {
                     return paged(&listed.pulls.0, listed.pulls.1);
                 }
@@ -2238,7 +2310,7 @@ mod tests {
                 "stage 2 follow pull requests: not built on Forgejo yet",
                 "stage 3 epics: off (no epics)",
                 "schedule: off (wip 0 or no workRepositories)",
-                "stage 5 status: not built on Forgejo yet",
+                "stage 5 status: off (no board.statusLabels)",
                 "stage 6 cost: not built on Forgejo yet",
             ]
         );
