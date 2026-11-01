@@ -931,13 +931,13 @@ for the next candidate that needs them until the pass writes anything, a
 start included, so each is read once between writes rather than once a candidate.
 
 With `overlap` set (agent-board#426), an open pull request of the bot's that
-overlaps a start does not hold it when it is a draft opened and last
-pushed to at least `overlap.staleDraftHours` before the pass's clock (a
-draft nobody moves races no run), or when every path it shares is
-documentation (`*.md` or under `docs/`) and the issue is in the board's first
+overlaps a start does not hold it when it is a draft or labelled `needs-human`
+or `hold`, opened and last pushed to at least `overlap.staleDraftHours` before
+the pass's clock (a draft or parked PR nobody moves races no run), or when every
+path it shares is documentation (`*.md` or under `docs/`) and the issue is in the board's first
 Priority option (such a conflict is cheap to resolve, and P0 work should not
 wait on it). Commit authored/committed dates do not date head movement: an old
-commit pushed now is fresh, including a force push. The draft rule reads GitHub's
+commit pushed now is fresh, including a force push. The idle rule reads GitHub's
 authenticated repository activity for the current head repository and branch,
 without actor, activity-type or time filters. It requires a complete single page
 (fewer than 100 entries, no pagination link), an ordered change chain back to
@@ -948,10 +948,11 @@ pull request is judged alone, and any one not waived still holds the start;
 a run in flight is never waived. A waived overlap is said as
 `overlap ignored: OWNER/REPO#N: open pull request … changes …, but …`, kept
 in the hold snapshot as kind `overlap-ignored` (not blocking, not the
-operator's), and the dispatch record says it too. The draft rule spends the
-allowance of forty requests: one for a PR's draft/head facts and one
-for its branch activity, so at most twenty drafts can be waived. A start's request
-reservation covers these reads; any past the allowance, and one that cannot
+operator's), and the dispatch record says it too, with a distinct reason naming
+the parking label or draft state. The idle rule spends the allowance of forty
+requests: one for a PR's draft/label/head facts (first 100 labels, no extra
+pagination) and one for its branch activity, so at most twenty idle PRs can be
+waived. A start's request reservation covers these reads; any past the allowance, and one that cannot
 read, holds the start, as any unreadable overlap check does. The overlap
 holds that remain move their pull requests on, or ask a person to, as
 [blockers](#blockers) says.
@@ -1659,10 +1660,10 @@ clears.
 ## Blockers
 
 An overlap hold keeps an issue waiting for the bot's open pull request that
-changes what its run would. Once that pull request stops moving, nothing
-released the issue: `overlap.staleDraftHours` waives only drafts, and the
-stall alarm said the same thing once for every item it held (agent-board#482:
-a broker pull request conflicting since 19 October held three issues). With
+changes what its run would. An idle draft or PR labelled `needs-human` or `hold`
+can be waived by `overlap.staleDraftHours`, as above. Other stopped PRs still
+hold; the stall alarm used to say the same thing once for every item held
+(agent-board#482: a broker pull request conflicting since 19 October held three issues). With
 `overlap` set, each pull request stage 4's overlap holds name is looked at
 once a pass, however many items it holds, after the candidates, and either
 moves on or gets one card. The hold itself stays: its items wait as before.
@@ -2461,7 +2462,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `maintain.share` | The share (0 < share < 1) of each pool's allowance the digest keeps while due; needs `pools`; section absent (off) |
 | `maintain.digest.repository`, `maintain.digest.issue` | The digest issue, outside `maintain.repos.include`; its run is dispatched where the repository is public, else only planned; required |
 | `maintain.hourUtc` | The hour, 0–23 UTC, from which a day's digest is due; required |
-| `overlap.staleDraftHours` | With `overlap` set, an overlapping draft unchanged this many hours (0–168; 0 never) does not hold a start, nor does a documentation-only overlap of a first-Priority issue, see [scheduling](#scheduling); `4`; section absent (off) |
+| `overlap.staleDraftHours` | With `overlap` set, an overlapping draft or PR labelled `needs-human` or `hold` unchanged this many hours (0–168; 0 never) does not hold a start, nor does a documentation-only overlap of a first-Priority issue, see [scheduling](#scheduling); `4`; section absent (off) |
 | `overlap.staleHours` | With `overlap` set, how long (0–168 hours; 0 off) a pull request that overlap holds name, and that only a person moves, may stand still before it gets one needs-you card in place of its items' stall alarms, see [blockers](#blockers); `24`; section absent (off) |
 | `pools` | Map of automatic pool names to pacing settings; `{}` (no automatic runs) |
 | `pools.NAME.target`, `pools.NAME.burst` | Fraction of paced window to spend (0 < target ≤ 1), burst percentage points (0–100); `0.95`, `0` |
