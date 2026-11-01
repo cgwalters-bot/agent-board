@@ -2521,6 +2521,28 @@ on a stale stop counts as fix round 1, so a pull request gets at most one
 such round before it is closed, unless a person resets it. The round
 respects `--fix-bounds`, `--max-dispatch` and pacing like any other.
 
+`needs-human` cannot tell a stop no one looked at from one that waits on a
+decision, so a person holds a followed pull request with the label `hold`,
+in any case (agent-board#562). Nothing in this stage takes it off: a held
+pull request gets no stale round or close, no reset on the operator's
+answer, no continuation, fix or rebase round, no merge or merge queue entry
+and no other step, and its line is `skip: labelled hold`. The label is read
+again just before a step's first write, and the stale close reads it a third
+time with the head; one put on in between turns the step into `not taken:
+labelled hold`. A review start that `reviewPools` defers to the end of the
+pass is not read again. The hold reaches only what this stage starts: a
+merge queue entry already made stays, and a run already dispatched can still
+mark its draft ready, until agentic-job's apply honors the label.
+
+Before a continuation, fix, rebase or answer round, or a rerun of a round's
+run, one query lists the open pull requests whose head is the same branch of
+the same repository. If one of them is in a repository the pass does not
+follow, such as an upstream that only an approved promote may push to, no
+round starts: `skip: left to the operator: its head is also the head of
+OWNER/REPO#N, which this pass does not follow`. A query that fails, a head
+branch that is gone, or more than the 20 pull requests it reads, skip the
+round too. Merged and closed pull requests do not count.
+
 A pull request labelled `needs-human` is otherwise only skipped, so the pass
 does not pay for it: one query per repository with such a pull request lists
 them, and only one with a conflict (or mergeability not known yet) or a change

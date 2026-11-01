@@ -9936,6 +9936,14 @@ fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, com
         "request": graphql_key(poll::PULL_QUERY, &variables),
         "answer": {"data": {"repository": {"pullRequest": pull}}},
     }));
+    // Its head is no other pull request's.
+    let variables = json!({"owner": owner, "name": name, "number": number,
+        "pulls": poll::SHARED_HEAD_READS});
+    replay.requests.push(json!({
+        "request": graphql_key(poll::SHARED_HEAD_QUERY, &variables),
+        "answer": {"data": {"repository": {"pullRequest": {"headRef": {"associatedPullRequests":
+            {"nodes": [], "pageInfo": {"hasNextPage": false}}}}}}},
+    }));
     for (path, body) in [
         ("events?per_page=100".into(), json!([])),
         (
@@ -10108,6 +10116,38 @@ fn labelled_pull_requests_are_read_only_to_act_on() {
         );
         assert_eq!(report.failures, usize::from(want == READ), "{name}");
     }
+
+    // One the open list shows held says so, still with no read of its own.
+    let (mut replay, mut settings) = (replay(), json!({}));
+    followed_labelled(&mut replay, &mut settings, json!({"fixPools": ["claude"]}));
+    replay
+        .requests
+        .retain(|e| e["request"]["graphql"] != fnv(poll::PULL_QUERY));
+    let list = format!("{API_ROOT}repos/cgwalters-forge/agentic-job/pulls?state=open");
+    let open = (replay.requests.iter_mut()).rfind(|e| {
+        e["request"]["get"]
+            .as_str()
+            .is_some_and(|url| url.starts_with(&list))
+    });
+    open.unwrap()["answer"]["body"][0]["labels"] =
+        json!([{"name": "needs-human"}, {"name": "HOLD"}]);
+    let variables = json!({"owner": "cgwalters-forge", "name": "agentic-job",
+        "label": "needs-human", "pulls": 100});
+    let node = json!({"number": 9, "headRefOid": "abc", "mergeable": "MERGEABLE",
+        "commits": {"nodes": [{"commit": {"committedDate": "2026-10-20T00:00:00Z"}}]},
+        "reviews": whole});
+    replay.requests.push(json!({
+        "request": graphql_key(poll::LABELLED_QUERY, &variables),
+        "answer": {"data": {"repository": {"pullRequests": {"nodes": [node]}}}},
+    }));
+    let report = preview(&config(settings), &replay);
+    let held = "cgwalters-forge/agentic-job#9 abc skip: labelled hold";
+    assert!(
+        report.lines.iter().any(|l| l == held),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(report.failures, 0);
 }
 
 /// A pull request's comments come with its query, the REST list only past its
@@ -10132,8 +10172,9 @@ fn pull_request_comments_come_with_its_query() {
     let cases: Vec<Case> = vec![
         ("none", vec![], false, 0, FIRST),
         ("more than a query reads", vec![], true, 1, FIRST),
+        // Its run is read in place of the shared head lookup a continuation makes.
         ("a round's marker, whose run it then reads",
-            vec![(&bot, &round, hours(1))], false, 1, "cgwalters-forge/agentic-job#9 error: "),
+            vec![(&bot, &round, hours(1))], false, 0, "cgwalters-forge/agentic-job#9 error: "),
         ("an app of the bot's name writes no marker", vec![(&app, &round, hours(1))], false, 0, FIRST),
         ("a stop since reset takes no second read", vec![(&bot, &stop, hours(1))], false, 0, FIRST),
         ("a stop just made may not have its label yet",

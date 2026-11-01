@@ -312,6 +312,24 @@ pub(crate) const LABELLED_QUERY: &str = r#"query($owner: String!, $name: String!
 }"#;
 /// Labelled pull requests one list query reads; any past them are read whole.
 const LABELLED_READS: u64 = 100;
+
+/// The label that holds a followed pull request for a person (agent-board#562):
+/// the poll takes no step on it and never takes the label off, unlike
+/// [`LABEL`], which `staleDays` and `operatorAnswers` clear.
+pub const HOLD_LABEL: &str = "hold";
+
+/// The open pull requests whose head is a pull request's head ref, in any
+/// repository: a round's push to that head changes each of them too.
+pub(crate) const SHARED_HEAD_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $pulls: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRef { associatedPullRequests(states: OPEN, first: $pulls) {
+        nodes { number repository { nameWithOwner } } pageInfo { hasNextPage } } }
+    }
+  }
+}"#;
+/// Pull requests read that share one head; past them no round starts.
+pub(crate) const SHARED_HEAD_READS: u64 = 20;
 /// How far a stop's comment may be from the label written before it: another
 /// pass's stop newer than this may not have its label on yet.
 const STOP_WRITES_SECONDS: i64 = 60;
@@ -2107,6 +2125,21 @@ fn labelled(pull: &Value) -> bool {
         .any(|l| l["name"] == LABEL)
 }
 
+/// Whether `labels`, GraphQL's nodes or the REST list, carry [`HOLD_LABEL`].
+/// GitHub's label names are case-insensitive.
+fn holds(labels: &[Value]) -> bool {
+    labels.iter().any(|l| {
+        l["name"]
+            .as_str()
+            .is_some_and(|n| n.eq_ignore_ascii_case(HOLD_LABEL))
+    })
+}
+
+/// Whether `pull`, as [`PULL_QUERY`] read it, is held ([`HOLD_LABEL`]).
+fn is_held(pull: &Value) -> bool {
+    holds(nodes(pull, "/labels/nodes"))
+}
+
 /// The bot's own pull request from its fork, whatever the head branch: a
 /// dispatch run's `dispatch/` head, or another the bot pushed, such as the
 /// release train's bumps (agent-board#142). Who can push to a head of the
@@ -3545,6 +3578,8 @@ struct Pass<'a, R, G> {
     /// The followed repositories this pass takes steps in, where
     /// `repositoriesPerPass` is set; none admits every followed repository.
     envelope: Option<admission::Envelope>,
+    /// Every followed repository, lower case ([`Pass::shared_head`]).
+    followed: BTreeSet<String>,
     /// The pass's caps on its steps ([`caps`]); none is uncapped.
     caps: Option<&'a caps::Caps>,
     /// Writes sent, or tried, so far: whether a step wrote anything.
@@ -5738,16 +5773,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .collect()
     }
 
-    /// What [`Pass::pull`] comes to for a pull request of [`Pass::left_labelled`].
+    /// What [`Pass::pull`] comes to for a pull request of [`Pass::left_labelled`],
+    /// or one held ([`HOLD_LABEL`]): skipped for `label`.
     fn labelled_skip(
         &self,
         repo: &str,
         number: u64,
         merge_only: bool,
-        listed: &Value,
+        (listed, label): (&Value, &str),
     ) -> (String, bool, Option<Wait>, Option<Stepped>) {
         let head = text(listed, "/headRefOid");
-        let reason = format!("labelled {LABEL}");
+        let reason = format!("labelled {label}");
         let wait = Wait {
             repository: repo.to_owned(),
             number,
@@ -5766,6 +5802,46 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         });
         let line = format!("{repo}#{number} {} skip: {reason}", short(head));
         (line, false, Some(wait), stepped)
+    }
+
+    /// Why `pull` gets no round, if its head ref is also the head of an open
+    /// pull request in a repository this pass does not follow, which the
+    /// round's push would change too, such as an upstream's that only an
+    /// approved promote may push to (agent-board#562); or if those could not
+    /// all be read, which counts the same.
+    fn shared_head(&mut self, owner: &str, name: &str, number: u64) -> Option<String> {
+        let variables =
+            json!({"owner": owner, "name": name, "number": number, "pulls": SHARED_HEAD_READS});
+        let read = self
+            .spend()
+            .and_then(|()| self.graphql.graphql(SHARED_HEAD_QUERY, variables));
+        let data = match read {
+            Ok(data) => data,
+            Err(error) => {
+                return Some(format!(
+                    "the pull requests that share its head could not be read ({error:#})"
+                ));
+            }
+        };
+        let list = data.pointer("/repository/pullRequest/headRef/associatedPullRequests");
+        let Some(pulls) = list.and_then(|l| l["nodes"].as_array()) else {
+            return Some("the pull requests that share its head could not be read".into());
+        };
+        if list.and_then(|l| l.pointer("/pageInfo/hasNextPage")) != Some(&Value::Bool(false)) {
+            return Some(format!(
+                "more than the {SHARED_HEAD_READS} pull requests read share its head"
+            ));
+        }
+        pulls
+            .iter()
+            .map(|p| (text(p, "/repository/nameWithOwner"), p["number"].as_u64()))
+            .find(|(at, _)| !self.followed.contains(&at.to_ascii_lowercase()))
+            .map(|(at, n)| {
+                format!(
+                    "its head is also the head of {at}#{}, which this pass does not follow",
+                    n.unwrap_or_default()
+                )
+            })
     }
 
     /// One pull request's decision line, and whether it is in flight.
@@ -5826,6 +5902,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 None,
                 None,
             ));
+        }
+        // A person's hold, which nothing here takes off: no round, reset,
+        // stale step, merge or other write (agent-board#562).
+        if is_held(&pull) {
+            return Ok(self.labelled_skip(repo, number, merge_only, (&pull, HOLD_LABEL)));
         }
         if text(&pull, "/author/login") != self.config.bot {
             marker = Marker::default();
@@ -6086,12 +6167,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // the caller's fix bounds would only be refused by its policy step
         // (agent-board#264). Nothing is written; the operator takes it.
         let bounds = &self.config.policy.fix_bounds;
-        let left = matches!(
+        let round = matches!(
             decision.action,
             "fix" | "continue" | "rebase" | "answer" | RUN_RERUN
-        )
-        .then(|| bounds.refusal(repo, text(&pull, "/headRefName")))
-        .flatten();
+        );
+        let mut left = round
+            .then(|| bounds.refusal(repo, text(&pull, "/headRefName")))
+            .flatten();
+        if round && left.is_none() {
+            left = self.shared_head(owner, name, number);
+        }
         if let Some(why) = &left {
             answer.clear();
             decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
@@ -6133,8 +6218,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(apply) = &self.apply {
             apply.dispatcher.start_kind(decision.action);
         }
+        // The hold is read again just before the step's first write: one put
+        // on since the read above stops it too.
+        let hold = if self.apply.is_some() && kind.is_some() && !capped && !deferred {
+            self.read_pull(owner, name, number).map(|p| is_held(&p))
+        } else {
+            Ok(false)
+        };
         let done = match (&self.apply, &retarget, &stale) {
             _ if capped || deferred => Ok(held),
+            _ if !matches!(hold, Ok(false)) => {
+                hold.map(|_| Some(format!("not taken: labelled {HOLD_LABEL}")))
+            }
             (Some(_), _, _) if !answer.is_empty() => self
                 .answer_round(repo, &pull, (&marker, &comments), (&answer, &labelled_by))
                 .map(Some),
@@ -6336,10 +6431,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let mut required = BTreeMap::new();
         let left = self.left_labelled(repo, &open);
+        let on_hold: BTreeSet<u64> = open
+            .iter()
+            .filter(|p| p["labels"].as_array().is_some_and(|l| holds(l)))
+            .filter_map(|p| p["number"].as_u64())
+            .collect();
         for (number, merge_only) in numbers {
             self.deferring = None;
+            let label = if on_hold.contains(&number) {
+                HOLD_LABEL
+            } else {
+                LABEL
+            };
             let read = match left.get(&number) {
-                Some(listed) => Ok(self.labelled_skip(repo, number, merge_only, listed)),
+                Some(listed) => Ok(self.labelled_skip(repo, number, merge_only, (listed, label))),
                 None => self.pull(repo, number, merge_only, &mut required),
             };
             match read {
@@ -6469,6 +6574,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         outages: None,
         paces: None,
         envelope: None,
+        followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
         writes: 0,
         review_runs: BTreeMap::new(),
@@ -9768,6 +9874,14 @@ mod tests {
         /// `LOWER_QUERY` gives them, and the branches it was asked for.
         lower: Vec<Value>,
         lower_reads: RefCell<Vec<Value>>,
+        /// The pull request `SHARED_HEAD_QUERY` gives, null for a read that
+        /// fails; none gives a head no other pull request shares.
+        shared_head: Option<Value>,
+        shared_reads: RefCell<usize>,
+        /// How many reads of `PULL_QUERY` come before a person puts the hold
+        /// on, if one does.
+        hold_after: Option<usize>,
+        pull_reads: RefCell<usize>,
     }
 
     impl Fake {
@@ -9900,11 +10014,28 @@ mod tests {
                     .push(variables["branch"].clone());
                 return Ok(json!({"repository": {"pullRequests": {"nodes": self.lower}}}));
             }
+            if query == SHARED_HEAD_QUERY {
+                *self.shared_reads.borrow_mut() += 1;
+                let pull = self.shared_head.clone().unwrap_or_else(|| {
+                    json!({"headRef": {"associatedPullRequests": {
+                        "nodes": [], "pageInfo": {"hasNextPage": false}}}})
+                });
+                ensure!(!pull.is_null(), "GraphQL: unavailable");
+                return Ok(json!({"repository": {"pullRequest": pull}}));
+            }
             assert_eq!(query, PULL_QUERY);
             let number = variables["number"].as_u64().unwrap();
             let mut pull = self.pulls[&number].clone();
             if *self.labelled.borrow() {
                 pull["labels"]["nodes"] = json!([{"name": LABEL}]);
+            }
+            *self.pull_reads.borrow_mut() += 1;
+            if self
+                .hold_after
+                .is_some_and(|n| *self.pull_reads.borrow() > n)
+                && let Some(labels) = pull["labels"]["nodes"].as_array_mut()
+            {
+                labels.push(json!({"name": "Hold"}));
             }
             Ok(json!({"repository": {"pullRequest": pull}}))
         }
@@ -12929,7 +13060,16 @@ mod tests {
     /// An applying pass with `policy` over pull request 470 changed by
     /// `change`, whose newest marker is `state`; the line, and the fake.
     fn applied_with(policy: Value, change: Value, state: Value) -> (String, Fake, Fake) {
-        let mut fake = github();
+        applied_from(github(), policy, change, state)
+    }
+
+    /// [`applied_with`] over `fake`.
+    fn applied_from(
+        mut fake: Fake,
+        policy: Value,
+        change: Value,
+        state: Value,
+    ) -> (String, Fake, Fake) {
         fake.pulls.insert(470, pull("pull-470", change));
         fake.answers.borrow_mut().insert(
             format!("{API_ROOT}repos/{REPO}/labels"),
@@ -13016,6 +13156,99 @@ mod tests {
                 assert!(dispatcher.writes.borrow().is_empty(), "{state} {line}");
             }
         }
+    }
+
+    /// A pull request labelled `hold`, in any case, takes no step: no merge,
+    /// round or stop (agent-board#562). One put on after the pass read it,
+    /// but before the step's first write, stops the step too.
+    #[test]
+    fn a_held_pull_request_takes_no_step() {
+        let failing = json!({"ci": {"conclusion": "FAILURE"}});
+        let checkpoint = checkpointed("budget");
+        // The policy, the change, the marker and the step without a hold.
+        #[rustfmt::skip]
+        let cases = [
+            (json!({}), json!({}), json!({}), "merge:"),
+            (json!({}), json!({"contexts": failing}), json!({"sha": "older"}), "fix:"),
+            (json!({}), json!({"contexts": failing}), json!({"rounds": 2, "sha": "older"}), "needs-human:"),
+            (json!({"rebaseRounds": 1}), json!({"mergeable": CONFLICTING}), json!({}), "rebase:"),
+            (json!({}), json!({"isDraft": true, "body": checkpoint, "contexts": {"review": null}}), json!({}), "continue:"),
+        ];
+        for (policy, change, marker, step) in cases {
+            let (line, fake, _) = applied_with(policy.clone(), change.clone(), marker.clone());
+            assert!(line.contains(step), "{step}: {line}");
+            assert!(!fake.writes.borrow().is_empty(), "{step}: {line}");
+            for label in ["hold", "HOLD", "Hold"] {
+                let mut held = change.clone();
+                held["labels"] = json!({"nodes": [{"name": "other"}, {"name": label}]});
+                let (line, fake, dispatcher) = applied_with(policy.clone(), held, marker.clone());
+                assert_eq!(
+                    line,
+                    format!("{REPO}#470 {} skip: labelled hold", short(HEAD)),
+                    "{step} {label}"
+                );
+                assert!(fake.writes.borrow().is_empty(), "{step} {label}");
+                assert!(dispatcher.writes.borrow().is_empty(), "{step} {label}");
+            }
+            let mut fake = github();
+            fake.hold_after = Some(1);
+            let (line, fake, dispatcher) =
+                applied_from(fake, policy, change.clone(), marker.clone());
+            assert!(line.contains(step), "{step}: {line}");
+            assert!(line.ends_with(" -> not taken: labelled hold"), "{line}");
+            assert!(fake.writes.borrow().is_empty(), "{step}: {line}");
+            assert!(dispatcher.writes.borrow().is_empty(), "{step}: {line}");
+        }
+    }
+
+    /// A round pushes to the head, so none starts where an open pull request
+    /// in a repository the pass does not follow shares it, nor where those
+    /// sharing it could not all be read (agent-board#562). Another of a
+    /// followed repository, this one included, does not count; nor does one
+    /// merged or closed, which the query does not list.
+    #[test]
+    fn no_round_starts_on_a_head_an_unfollowed_pull_request_shares() {
+        let fix = (
+            json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+            json!({"sha": "older"}),
+        );
+        let continuation = (
+            json!({"isDraft": true, "body": checkpointed("budget"), "contexts": {"review": null}}),
+            json!({}),
+        );
+        let shared = |nodes: Value, more: bool| json!({"headRef": {"associatedPullRequests": {"nodes": nodes, "pageInfo": {"hasNextPage": more}}}});
+        let ours = json!({"number": 470, "repository": {"nameWithOwner": REPO}});
+        let upstream = json!({"number": 55, "repository": {"nameWithOwner": "bootc-dev/bootc"}});
+        let left = "skip: left to the operator: ";
+        #[rustfmt::skip]
+        let cases = [
+            ("only this one", Some(shared(json!([ours]), false)), None),
+            ("a followed repository's, in another case", Some(shared(json!([{"number": 3, "repository": {"nameWithOwner": "CGWalters-Forge/Agentic-Job"}}]), false)), None),
+            ("an upstream's", Some(shared(json!([ours, upstream]), false)), Some("its head is also the head of bootc-dev/bootc#55, which this pass does not follow")),
+            ("more than are read", Some(shared(json!([ours]), true)), Some("more than the 20 pull requests read share its head")),
+            ("a head ref that is gone", Some(json!({"headRef": null})), Some("the pull requests that share its head could not be read")),
+            ("a read that fails", Some(Value::Null), Some("the pull requests that share its head could not be read (GraphQL: unavailable)")),
+        ];
+        for (name, answer, skip) in cases {
+            for (change, marker) in [&fix, &continuation] {
+                let mut fake = github();
+                fake.shared_head = answer.clone();
+                let (line, fake, dispatcher) =
+                    applied_from(fake, json!({}), change.clone(), marker.clone());
+                assert_eq!(*fake.shared_reads.borrow(), 1, "{name}: {line}");
+                let Some(skip) = skip else {
+                    assert!(line.contains(" -> https://github.com/"), "{name}: {line}");
+                    continue;
+                };
+                assert!(line.ends_with(&format!("{left}{skip}")), "{name}: {line}");
+                assert!(fake.writes.borrow().is_empty(), "{name}");
+                assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            }
+        }
+        // A step that is no round reads none.
+        let (line, fake, _) = applied_with(json!({}), json!({}), json!({}));
+        assert!(line.contains("merge:"), "{line}");
+        assert_eq!(*fake.shared_reads.borrow(), 0);
     }
 
     /// After its fix rounds, a pull request that still fails gets one round
@@ -14085,6 +14318,26 @@ mod tests {
             "{line}"
         );
         assert!(fake.writes.borrow().is_empty());
+        // A hold keeps the label on, answered or not (agent-board#562).
+        let mut fake = answered();
+        fake.pulls.get_mut(&470).unwrap()["labels"]["nodes"] =
+            json!([{"name": LABEL}, {"name": "hold"}]);
+        let dispatcher = Fake::default();
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        let line = outcome.lines.last().unwrap();
+        assert!(line.ends_with("skip: labelled hold"), "{line}");
+        assert!(fake.writes.borrow().is_empty());
+        assert!(dispatcher.writes.borrow().is_empty());
         // A run GitHub refuses leaves the label on and posts a fresh stop,
         // naming the answer as refused (agent-board#202).
         let fake = answered();
@@ -14278,6 +14531,7 @@ mod tests {
             format!("PATCH repos/{REPO}/pulls/470"),
         ];
         let truncated = json!({"mergeable": CONFLICTING, "truncated": {"reviews": true}});
+        let held = json!({"mergeable": CONFLICTING, "labels": {"nodes": [{"name": LABEL}, {"name": "Hold"}]}});
         let fix_line = "fix: conflicts with main, and cgwalters has not acted on it in the 1 days since the poll stopped on 2026-10-11T00:00:00Z, so it gets a fix round -> https://github.com/cgwalters-forge/tracker/actions/runs/1234, label removed";
         let close_line = "close: review requested changes, and cgwalters has not acted on it in the 1 days since the poll stopped on 2026-10-11T00:00:00Z, after a fix round, so it is closed -> closed";
         // Name, staleDays, the pull request's change, its comments, who put
@@ -14301,11 +14555,14 @@ mod tests {
             ("a label a person put back", 1, &conflicting, vec![stop(0, HEAD)], "cgwalters", None),
             ("neither a conflict nor changes requested", 1, &neither, vec![stop(1, HEAD)], BOT, None),
             ("a partial read of the reviews", 1, &truncated, vec![stop(1, HEAD)], BOT, None),
+            ("a hold, however old the stop", 1, &held, vec![stop(0, HEAD)], BOT, None),
         ];
         let github_with = |change: &Value, issue: Vec<Value>, labeller: &str| {
             let mut fake = github();
             let mut change = change.clone();
-            change["labels"] = json!({"nodes": [{"name": LABEL}]});
+            if change.get("labels").is_none() {
+                change["labels"] = json!({"nodes": [{"name": LABEL}]});
+            }
             fake.pulls.insert(470, pull("pull-470", change));
             fake.rest.get_mut(&comments).unwrap().3 = Value::Array(issue);
             for url in ["reviews", "comments"] {
@@ -14350,8 +14607,9 @@ mod tests {
             .unwrap();
             let line = outcome.lines.last().unwrap();
             let Some((expected, writes)) = expected else {
+                let label = if is_held(change) { HOLD_LABEL } else { LABEL };
                 assert!(
-                    line.ends_with("skip: labelled needs-human"),
+                    line.ends_with(&format!("skip: labelled {label}")),
                     "{name}: {line}"
                 );
                 assert!(fake.writes.borrow().is_empty(), "{name}");
@@ -14402,7 +14660,7 @@ mod tests {
 
         // What the close reads again since the pass's snapshot: another
         // pass's round, on a reset or an answer, claimed from the stop
-        // first; the label taken off; or a push. Each leaves it open.
+        // first; the label taken off; a push; or a hold. Each leaves it open.
         let claimed = said(
             7,
             BOT,
@@ -14416,13 +14674,19 @@ mod tests {
             json!({"id": 1, "event": "labeled", "label": {"name": LABEL}, "actor": {"login": BOT}});
         let unlabeled = json!({"id": 2, "event": "unlabeled", "label": {"name": LABEL}, "actor": {"login": "cgwalters"}});
         let (on, off) = (json!([labeled]), json!([labeled, unlabeled]));
+        // The pull request as the close reads it again.
+        let fresh = |sha: &str, labels: &[&str]| {
+            let labels: Vec<Value> = labels.iter().map(|l| json!({"name": l})).collect();
+            json!({"state": "open", "head": {"sha": sha}, "labels": labels})
+        };
         #[rustfmt::skip]
         let races = [
-            ("a round claimed from the stop first", vec![stop(1, HEAD), claimed], &on, HEAD, "not closed: another pass went first, in comment 7"),
-            ("the label taken off", vec![stop(1, HEAD)], &off, HEAD, "not closed: needs-human was taken off or put on again"),
-            ("a push", vec![stop(1, HEAD)], &on, "newer", "not closed: it was pushed to or closed meanwhile"),
+            ("a round claimed from the stop first", vec![stop(1, HEAD), claimed], &on, fresh(HEAD, &[LABEL]), "not closed: another pass went first, in comment 7"),
+            ("the label taken off", vec![stop(1, HEAD)], &off, fresh(HEAD, &[]), "not closed: needs-human was taken off or put on again"),
+            ("a push", vec![stop(1, HEAD)], &on, fresh("newer", &[LABEL]), "not closed: it was pushed to or closed meanwhile"),
+            ("a hold", vec![stop(1, HEAD)], &on, fresh(HEAD, &[LABEL, "hold"]), "not closed: labelled hold"),
         ];
-        for (name, issue, events, head, expected) in races {
+        for (name, issue, events, pull, expected) in races {
             let mut fake = github_with(&changes, issue, BOT);
             fake.page(
                 &format!("repos/{REPO}/issues/470/events?per_page=100"),
@@ -14430,12 +14694,7 @@ mod tests {
                 None,
                 events.clone(),
             );
-            fake.page(
-                &format!("repos/{REPO}/pulls/470"),
-                None,
-                None,
-                json!({"state": "open", "head": {"sha": head}}),
-            );
+            fake.page(&format!("repos/{REPO}/pulls/470"), None, None, pull);
             let dispatcher = Fake::default();
             let mut cfg = config();
             cfg.policy.stale_days = 1;
@@ -15606,6 +15865,7 @@ mod tests {
             outages: None,
             paces: None,
             envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),
+            followed: BTreeSet::new(),
             caps: None,
             writes: 0,
             review_runs: BTreeMap::new(),
