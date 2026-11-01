@@ -79,8 +79,20 @@ The concrete threats and the corresponding bounds are:
   lock**: the operator must serialize invocations across both callers. The
   caller must keep `cancel-in-progress: false`.
 
+An inventory failure or active-work blocker at the final route admission check,
+before any dispatch POST, is a definitely unsent refusal. The existing refusal
+cleanup removes the plan claim marker so a later invocation can retry the
+unchanged plan after recovery. If cleanup fails, its error is reported and the
+remaining marker still holds the plan; a later invocation cannot assume release.
+This prevents a transient final inventory failure from permanently consuming an
+unsent plan without weakening duplicate prevention.
+
 The existing plan claim/read-back protocol still records an ambiguous or failed
-POST and never automatically retries it. The selected caller's repository is
+POST and never automatically retries it. In particular, an admission failure
+before a compatibility retry (after a POST with `return_run_details` received
+HTTP 422) retains the claim: it is not classified as definitely unsent. This
+correction does not reclassify other dispatch errors or change caller bounds.
+The selected caller's repository is
 used in the returned run URL and dispatch receipt. Subsequent invocations poll
 both workflows for active work; no cancellation, migration or redispatch is
 performed. A receipt remains a receipt when routing configuration changes.

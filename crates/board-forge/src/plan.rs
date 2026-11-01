@@ -1043,20 +1043,34 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             target,
             run_details: true,
         };
-        // Either failure is recorded the same way: not dispatched, or not knowingly.
-        match github.start_routed(
+        let mut admission_failed = false;
+        let mut sent = false;
+        let outcome = github.start_routed(
             &job.start(base),
             routing,
             || {
                 if let Some(route) = routing {
-                    route.check_idle(client, legacy, &job.repo)?;
+                    route
+                        .check_idle(client, legacy, &job.repo)
+                        .inspect_err(|_| {
+                            admission_failed = true;
+                        })?;
                 }
                 Ok(())
             },
-            |path, body| dispatcher.send("POST", &format!("{API_ROOT}{path}"), body),
-        ) {
+            |path, body| {
+                sent = true;
+                dispatcher.send("POST", &format!("{API_ROOT}{path}"), body)
+            },
+        );
+        match outcome {
             StartOutcome::Started(run) => Ok(Some(run.url)),
             StartOutcome::Unnamed => Ok(None),
+            // Only a failed route check before any POST is definitely unsent.
+            // A compatibility retry's check cannot release an earlier send's claim.
+            StartOutcome::NotStarted(error) if admission_failed && !sent => {
+                Err(Refused(format!("{error:#}")).into())
+            }
             StartOutcome::NotStarted(error) | StartOutcome::Ambiguous(error) => Err(error),
         }
     })();
@@ -1775,12 +1789,40 @@ mod tests {
                     url.contains("/actions/workflows/"),
                     "unexpected routing GET"
                 );
+                let selected = url.contains("/agent.yml/");
+                let final_check = self.comments.borrow().len() > 1
+                    && self.dispatches.borrow().len()
+                        >= self.overlap["afterPosts"].as_u64().unwrap_or(0) as usize;
+                let failure = if final_check {
+                    self.overlap["failure"].as_str().unwrap_or_default()
+                } else {
+                    ""
+                };
+                if failure == "unavailable" {
+                    bail!("inventory transport unavailable");
+                }
+                let active = failure == "legacy" && !selected
+                    || failure == "selected" && selected
+                    || failure == "mixed";
+                // Both workflows can have unrelated active work without blocking.
+                let mut runs = vec![json!({"status": "in_progress",
+                    "display_title": "research unrelated/repo#1 (openai, 4c)"})];
+                if active {
+                    runs.push(json!({"status": "in_progress",
+                        "display_title": "implement bootc-dev/bootc#2531 (openai, 4c)",
+                        "html_url": "https://github.com/bootc-dev/bootc/actions/runs/99"}));
+                }
+                let body = if failure == "malformed" {
+                    json!({"total_count": 0})
+                } else {
+                    json!({"total_count": runs.len(), "workflow_runs": runs})
+                };
                 return Ok(crate::poll::RestResponse {
                     status: 200,
                     etag: None,
                     last_modified: None,
                     link: None,
-                    body: json!({"total_count": 0, "workflow_runs": []}),
+                    body,
                 });
             }
             if url.contains("/collaborators/") {
@@ -1856,6 +1898,9 @@ mod tests {
                 return Ok((201, json!({"id": id, "html_url": url})));
             }
             if let (Some(id), "PATCH") = (url.strip_prefix(edits), method) {
+                if self.twist == "cleanup fails" && text.contains("A later dispatch may take it") {
+                    return Ok((500, json!({"message": "cleanup unavailable"})));
+                }
                 if let Some(node) = self
                     .others
                     .borrow_mut()
@@ -1891,7 +1936,134 @@ mod tests {
                 return Err(Refused("lease admission: no slot".into()).into());
             }
             self.dispatches.borrow_mut().push(body.clone());
+            if self.twist == "lost answer" {
+                bail!("dispatch answer lost");
+            }
             Ok(self.answers.borrow_mut().remove(0))
+        }
+    }
+
+    #[test]
+    fn routed_final_admission_releases_only_definitely_unsent_claims() {
+        let routing: crate::dispatch::Routing = serde_json::from_value(json!({
+            "namespace": "bootc-dev", "repositories": ["bootc-dev/bootc"],
+            "target": {"caller": "bootc-dev/cgwalters-devspace-sandbox", "workflow": "agent.yml", "gitRef": "main"},
+            "runnerConfig": "rhel10"
+        })).unwrap();
+        let mut block = plan();
+        block["repo"] = "bootc-dev/bootc".into();
+        let fenced = format!("```{PLAN_FENCE}\n{block}\n```");
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        // Failure, transport twist, earlier POST, useful blocker, claim released.
+        for (failure, twist, earlier_post, blocker, released) in [
+            ("unavailable", "", false, "route unavailable", true),
+            ("malformed", "", false, "missing workflow_runs", true),
+            (
+                "legacy",
+                "",
+                false,
+                "cgwalters-forge/tracker/dispatch.yml",
+                true,
+            ),
+            (
+                "selected",
+                "",
+                false,
+                "bootc-dev/cgwalters-devspace-sandbox/agent.yml",
+                true,
+            ),
+            ("mixed", "", false, "active run", true),
+            (
+                "unavailable",
+                "cleanup fails",
+                false,
+                "its record was not updated",
+                false,
+            ),
+            // A 422 compatibility send still owns its claim if the next check fails.
+            ("unavailable", "", true, "route unavailable", false),
+            ("malformed", "", true, "missing workflow_runs", false),
+            ("selected", "", true, "active run", false),
+            ("", "lost answer", false, "dispatch answer lost", false),
+            ("", "", false, "GitHub HTTP status 500", false),
+        ] {
+            let answers = if earlier_post {
+                vec![(422, json!({}))]
+            } else if failure.is_empty() {
+                vec![(500, json!({"message": "unavailable"}))]
+            } else {
+                vec![]
+            };
+            let mut forge = Forge::new(
+                vec![node(7, PLANNER, "2026-10-13T10:00:00Z", &fenced)],
+                answers,
+            );
+            forge.twist = twist;
+            forge.overlap = json!({"routing": true, "failure": failure,
+                "afterPosts": usize::from(earlier_post)});
+            let dispatch = |forge: &Forge| {
+                dispatch_with(
+                    forge,
+                    forge,
+                    &issue,
+                    &[OPERATOR, PLANNER],
+                    &target(),
+                    (
+                        0,
+                        None,
+                        None,
+                        Scheduled {
+                            routing: Some(&routing),
+                            ..Default::default()
+                        },
+                    ),
+                )
+            };
+            let error = dispatch(&forge).unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains(blocker),
+                "{failure}/{twist}: {diagnostic}"
+            );
+            let posted = usize::from(earlier_post || failure.is_empty());
+            assert_eq!(forge.dispatches.borrow().len(), posted, "{diagnostic}");
+            let body = forge.bodies().pop().unwrap();
+            assert_eq!(!body.contains(DISPATCH_MARKER), released, "{body}");
+            if released {
+                assert!(error.is::<Refused>(), "{diagnostic}");
+                assert!(body.contains("A later dispatch may take it"), "{body}");
+                assert!(body.contains(blocker), "{body}");
+            } else if twist != "cleanup fails" {
+                assert!(!error.is::<Refused>(), "{diagnostic}");
+                assert!(body.contains("It is not tried again"), "{body}");
+            }
+            // Recover inventory/transport without changing the original plan.
+            forge.overlap = json!({"routing": true});
+            forge.twist = "";
+            *forge.answers.borrow_mut() = vec![(200, json!({"workflow_run_id": 100}))];
+            let retry = dispatch(&forge);
+            if released {
+                let run =
+                    "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/100";
+                assert_eq!(retry.unwrap().run.as_deref(), Some(run));
+                assert!(forge.bodies().last().unwrap().contains(run));
+                assert_eq!(forge.dispatches.borrow().len(), 1);
+                assert!(
+                    dispatch(&forge)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("dispatch record already")
+                );
+                assert_eq!(forge.dispatches.borrow().len(), 1);
+            } else {
+                assert!(
+                    retry
+                        .unwrap_err()
+                        .to_string()
+                        .contains("dispatch record already")
+                );
+                assert_eq!(forge.dispatches.borrow().len(), posted);
+            }
         }
     }
 

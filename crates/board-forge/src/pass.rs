@@ -3187,12 +3187,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let Some(focus) = self.focus.live.as_ref().map(key) else {
             return;
         };
-        let outside = |facts: &Facts| {
-            !facts
-                .parent
-                .as_ref()
-                .is_some_and(|p| key(&p.issue) == focus)
-        };
+        let outside = |facts: &Facts| facts.parent.as_ref().is_none_or(|p| key(&p.issue) != focus);
         candidates.sort_by_key(|(_, facts)| outside(facts));
         self.focus.children = candidates.iter().filter(|(_, f)| !outside(f)).count();
     }
