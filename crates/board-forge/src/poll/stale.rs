@@ -14,6 +14,10 @@
 //! marker counts it, so a stop after it is a close: one round per pull
 //! request, unless a person resets it. The close posts a stop first, so a
 //! pull request someone reopens is not closed again for that many days.
+//!
+//! `needs-human` cannot tell a stop no one looked at from one that waits on
+//! a decision, so a pull request also labelled [`HOLD_LABEL`] is never acted
+//! on here, however long it waits (agent-board#562).
 use super::*;
 use comments::stamp;
 
@@ -45,10 +49,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // A partial read is left alone, as `decide` waits on one: a review
         // past those read, such as the operator's approval, could outweigh
-        // the change request the read ends on.
+        // the change request the read ends on. A hold is a person's
+        // (agent-board#562): silence there is not leave to act.
         if days == 0
             || !stop.stopped
             || !labelled(pull)
+            || is_held(pull)
             || !is_harness(pull, self.config)
             || stop.sha.as_deref() != Some(head)
             || self.now - at < time::Duration::days(days as i64)
@@ -120,7 +126,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ///
     /// The close is claimed from the stop, as a reset's or an answer's round
     /// is, so of those one goes on: a round claimed first keeps it open.
-    /// Before the claim it reads again what the operator acts by: the label,
+    /// Before the claim it reads again what the operator acts by: the hold
+    /// ([`HOLD_LABEL`]) and the label,
     /// still on and last put on by the bot (`labelled`), and the comments,
     /// both without the cache; the head, the newest marker and what they said
     /// since the stop. GitHub
@@ -153,6 +160,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let fresh = self.get(&format!("repos/{repo}/pulls/{number}"))?;
         if fresh["state"] != "open" || text(&fresh, "/head/sha") != head {
             return Ok("not closed: it was pushed to or closed meanwhile".into());
+        }
+        if fresh["labels"].as_array().is_some_and(|l| holds(l)) {
+            return Ok(format!("not closed: labelled {HOLD_LABEL}"));
         }
         let comments = self.paged(
             &format!("repos/{repo}/issues/{number}/comments?per_page=100"),

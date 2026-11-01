@@ -493,6 +493,7 @@ mod tests {
             outages: None,
             paces: None,
             envelope: None,
+            followed: BTreeSet::new(),
             caps: None,
             writes: 0,
             review_runs: BTreeMap::new(),
