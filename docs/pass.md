@@ -927,8 +927,8 @@ a run in flight is never waived. A waived overlap is said as
 `overlap ignored: OWNER/REPO#N: open pull request … changes …, but …`, kept
 in the hold snapshot as kind `overlap-ignored` (not blocking, not the
 operator's), and the dispatch record says it too. The draft rule spends the
-existing allowance of four requests: one for a PR's draft/head facts and one
-for its branch activity, so at most two drafts can be waived. A start's request
+allowance of forty requests: one for a PR's draft/head facts and one
+for its branch activity, so at most twenty drafts can be waived. A start's request
 reservation covers these reads; any past the allowance, and one that cannot
 read, holds the start, as any unreadable overlap check does. The overlap
 holds that remain move their pull requests on, or ask a person to, as

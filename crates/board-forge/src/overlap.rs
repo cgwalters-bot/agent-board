@@ -42,7 +42,7 @@ pub const RUN_READS: usize = 10;
 /// Requests spent on [`Waiver::stale_draft`], at most, so
 /// that the check's requests stay within what a start reserves; one past it
 /// holds.
-pub const DRAFT_READS: usize = 4;
+pub const DRAFT_READS: usize = 40;
 /// Paths named in a decision, at most.
 const SHOWN: usize = 3;
 

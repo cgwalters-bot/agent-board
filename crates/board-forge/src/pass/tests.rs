@@ -8171,20 +8171,20 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     // The limit, the stop, the failures, and the runs started.
     let cases = [
         (
-            160,
-            "budget: 66 requests left, only what a start may take (73); 1 more candidate(s) wait",
+            196,
+            "budget: 102 requests left, only what a start may take (109); 1 more candidate(s) wait",
             0,
             5,
         ),
         (
-            129,
-            "budget: 77 requests left, only what a start may take (73); 4 more candidate(s) wait",
+            165,
+            "budget: 113 requests left, only what a start may take (109); 4 more candidate(s) wait",
             0,
             2,
         ),
         (
-            84,
-            "budget: 69 requests left, only what a start may take (73); 9 more candidate(s) wait",
+            120,
+            "budget: 105 requests left, only what a start may take (109); 9 more candidate(s) wait",
             1,
             0,
         ),
@@ -8221,7 +8221,7 @@ fn apply_defers_the_sweep_when_its_budget_runs_out() {
     ];
     let mut deferred = 0;
     // Below these it stops before any candidate, the one stop that fails.
-    for limit in 100..=200 {
+    for limit in 136..=236 {
         let mut forge = Forge::new(None, false);
         only(&mut forge.replay, &issues);
         silent(&mut forge.replay, &[], &[]);
@@ -8242,7 +8242,7 @@ fn apply_defers_the_sweep_when_its_budget_runs_out() {
 fn apply_keeps_a_starts_requests_for_it() {
     let config = config(json!({"wip": 8}));
     let mut started = BTreeSet::new();
-    for limit in 60..=200 {
+    for limit in 60..=236 {
         let forge = Forge::new(None, false);
         let report = apply_within(&forge, &config, limit);
         let lines = &report.lines;
