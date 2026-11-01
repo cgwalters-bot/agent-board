@@ -619,33 +619,32 @@ fn says_part_of(body: &str) -> bool {
         .any(|line| crate::stack::after_part_of(line).is_some())
 }
 
-/// The release tags `uses: {release}/.github/workflows/(policy|check|apply).yml@vX.Y.Z` pins.
+/// Release tags on policy/check/apply calls: `@vX.Y.Z` or `@<full commit> # vX.Y.Z`.
+/// The comment is a version label for reporting, not verification of the commit.
 fn wrapper_pins(text: &str, release: &str) -> Vec<String> {
     let needle = format!("uses: {release}/.github/workflows/");
     text.match_indices(&needle)
         .filter_map(|(at, _)| {
-            let tail = &text[at + needle.len()..];
+            let tail = text[at + needle.len()..].lines().next()?;
             let tail = ["policy", "check", "apply"]
                 .iter()
                 .find_map(|n| tail.strip_prefix(n))?
-                .strip_prefix(".yml@v")?;
-            let mut end = 0;
-            for part in 0..3 {
-                let len = tail[end..]
-                    .find(|c: char| !c.is_ascii_digit())
-                    .unwrap_or(tail.len() - end);
-                if len == 0 {
-                    return None;
+                .strip_prefix(".yml@")?;
+            let mut words = tail.split_whitespace();
+            let pin = words.next()?;
+            let version = if pin.len() == 40 && pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+                // Stay on this call's line: another job's comment is not its version.
+                let comment = words.next()?.strip_prefix('#')?;
+                if comment.is_empty() {
+                    words.next()?
+                } else {
+                    comment
                 }
-                end += len;
-                if part < 2 {
-                    if !tail[end..].starts_with('.') {
-                        return None;
-                    }
-                    end += 1;
-                }
-            }
-            Some(format!("v{}", &tail[..end]))
+            } else {
+                pin
+            };
+            let parts: Vec<_> = version.strip_prefix('v')?.split('.').collect();
+            (parts.len() == 3 && parts.iter().all(|p| digits(p))).then(|| version.to_owned())
         })
         .collect()
 }
@@ -1138,13 +1137,21 @@ impl Collector<'_> {
         ))?;
         let text = base64_decode(file["content"].as_str().context("wrapper content")?)?;
         let pins = wrapper_pins(&String::from_utf8_lossy(&text), &release.repository);
-        ensure!(
-            pins.len() == 3 && pins.iter().all(|p| *p == pins[0]),
-            "unrecognized wrapper pin"
-        );
-        let mut items = vec![
-            json!({"pin": pins[0], "latest": latest["tag_name"], "html_url": latest["html_url"]}),
-        ];
+        let tag = latest["tag_name"].as_str().context("release tag_name")?;
+        let pin = pins
+            .first()
+            .filter(|first| pins.len() == 3 && pins.iter().all(|p| p == *first));
+        let mut item = json!({"pin": pin, "latest": tag, "html_url": latest["html_url"]});
+        if pin.is_none() {
+            // The wrapper was read, but its version cannot be compared. Report
+            // a failure with evidence instead of hiding it as a failed read.
+            item["reason"] = json!("Wrapper versions are missing, unrecognized or mismatched.");
+            item["reason_url"] = json!(format!(
+                "https://github.com/{}/blob/HEAD/{}",
+                release.wrapper_repository, release.wrapper_path
+            ));
+        }
+        let mut items = vec![item];
         if let Some(workflow) = &s.release_train_workflow {
             items.extend(self.release_train(release, &latest, workflow)?);
         }
