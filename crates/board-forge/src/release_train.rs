@@ -659,12 +659,25 @@ pub struct Pin {
     pub version: String,
 }
 
+/// The comment Dependabot writes right after a commit pin, before its
+/// version: `@<sha> # vX.Y.Z`.
+const BARE_VERSION: &str = " # v";
+
+/// Whether Dependabot's `# vX.Y.Z` beside a pin of `target` is `project`'s
+/// version: it names `target`'s own tag, so only when `target` is the
+/// project's repository. A caller's pin of the wrappers is not.
+fn bare_is_project(target: &str, project: &str) -> bool {
+    target.split_once('/').map(|(_, name)| name) == Some(project)
+}
+
 /// The one pin of `target`'s workflows in `files`, a tag or a commit, and
 /// the version it is: the tag's, or the `<project> vX.Y.Z` beside a commit
-/// on its line.
+/// on its line, or failing that, in a pin of the project's own repository,
+/// a `# vX.Y.Z` right after the commit.
 pub fn pin_of(files: &[(String, String)], target: &str, project: &str) -> Result<Pin> {
     let uses = format!("{target}/.github/workflows/");
     let named = format!("{project} ");
+    let bare = bare_is_project(target, project);
     let mut pins = BTreeSet::new();
     let mut versions = BTreeSet::new();
     for (_, text) in files {
@@ -681,7 +694,9 @@ pub fn pin_of(files: &[(String, String)], target: &str, project: &str) -> Result
             let rest = &s[at + pin.len()..];
             let version = match pin.strip_prefix('v') {
                 Some(version) => Some(version),
-                None => named_version(rest, &named),
+                None => named_version(rest, &named).or_else(|| {
+                    bare.then(|| rest.strip_prefix(BARE_VERSION).and_then(version_at))?
+                }),
             };
             pins.insert(pin.to_owned());
             versions.insert(version.map(str::to_owned));
@@ -701,9 +716,10 @@ pub fn pin_of(files: &[(String, String)], target: &str, project: &str) -> Result
 
 /// Moves every pin of `target`'s workflows in `files` to `to.pin`, and the
 /// `<project> vX.Y.Z` that names the version beside it, in plain or
-/// regex-escaped form (a test asserting the pin), to `to.version`. Every
-/// file must change: a file that no longer has the pin is a layout this
-/// cannot follow, and a PR missing it would be half a bump.
+/// regex-escaped form (a test asserting the pin), or the `# vX.Y.Z` that
+/// [`pin_of`] reads right after a commit, to `to.version`. Every file must change: a file that no
+/// longer has the pin is a layout this cannot follow, and a PR missing it
+/// would be half a bump.
 pub fn repin(
     files: &[(String, String)],
     target: &str,
@@ -735,6 +751,15 @@ pub fn repin(
                 &pinned,
             ),
             false => text.replace(&from.pin, &to.pin),
+        };
+        // Dependabot's version right after the commit moves with it.
+        let moved = match bare_is_project(target, project) {
+            true => {
+                let after = format!("{}{BARE_VERSION}", to.pin);
+                let at = |_: &str| Some(after.len());
+                replace_after(&moved, &after, at, &from.version, &to.version)
+            }
+            false => moved,
         };
         let at = |s: &str| named_at(s, named.len());
         let moved = replace_after(&moved, &named, at, &from.version, &to.version);

@@ -9,6 +9,9 @@ use std::cell::RefCell;
 /// open trains by creator came back empty and the pass opened a second train
 /// (tracker#882). That case adds the listing without creator, which then
 /// returned tracker#772, and the `.txt` is this pass's: it opens nothing.
+/// Since agent-board#532 reads the wrappers' Dependabot pins, the second
+/// adds the empty listing of open PRs its state=all listing implies, and
+/// its `.txt` and the third's line on following v0.6.3 are this pass's.
 /// Responses are trimmed to the fields the train reads, keyed by path with
 /// the query decoded; null is a 404.
 const CASES: &[(&str, &str, &str)] = &[
@@ -119,28 +122,33 @@ fn previews_print_what_train_cjs_printed() {
 #[test]
 fn applied_passes_write_what_train_cjs_wrote() {
     let issue = "https://github.com/cgwalters-forge/tracker/issues/880";
-    let halted = "Halted: no single pin of cgwalters-forge/agentic-job with its version. Fix it, then remove the `needs-human` label.";
     for (name, expected) in [
         (
             "halted",
             vec![format!("{issue} is labelled needs-human: halted")],
         ),
+        // agent-board#532: the wrappers' Dependabot pins now read, so the
+        // train moves them.
         (
             "wrappers-887",
             vec![
                 format!("{issue} v0.6.4: wrappers"),
-                format!("label {issue} needs-human"),
-                format!("comment on {issue}: {halted}"),
-                "POST /repos/cgwalters-forge/tracker/issues/880/labels".into(),
+                "open a PR on cgwalters-forge/actions from cgwalters-bot/actions-1:release-train/v0.6.4 changing .github/workflows/cgwalters-agentic-job.yml, .github/workflows/cgwalters-review.yml, README.md: wrappers: Pin agentic-job v0.6.4".into(),
+                format!("comment on {issue}: Opened the wrappers' pin bump: https://example/4"),
+                "POST /repos/cgwalters-bot/actions-1/git/trees".into(),
+                "POST /repos/cgwalters-bot/actions-1/git/commits".into(),
+                "POST /repos/cgwalters-bot/actions-1/git/refs".into(),
+                "POST /repos/cgwalters-forge/actions/pulls".into(),
                 "POST /repos/cgwalters-forge/tracker/issues/880/comments".into(),
             ],
         ),
         // tracker#882: with tracker#772 open, train.cjs opened a second train
         // and its bump; the listing without creator finds #772, so nothing.
+        // The pin now reads, and the tag's commit, never recorded, does not.
         (
             "duplicate-882",
             vec![
-                "not following v0.6.3: no single pin of cgwalters-forge/agentic-job with its version".into(),
+                "not following v0.6.3: GET /repos/cgwalters-forge/agentic-job/commits/v0.6.3: HTTP 404".into(),
                 "due: 49 pull requests merged since v0.6.3; next is v0.6.4".into(),
                 "https://github.com/cgwalters-forge/tracker/issues/772 is open but the open trains listed by creator miss it: the listings disagree, not starting".into(),
             ],
@@ -870,14 +878,25 @@ fn pins_move_with_the_version_named_beside_them() {
             },
             Err("o/actions is already pinned at 5555555555555555555555555555555555555555"),
         ),
-        // tracker#887: a bare "# v0.6.2" beside a commit names no version.
+        // agent-board#532: Dependabot's "# v0.6.2" moves with its commit.
         (
             files(&format!(
                 "    uses: o/tool/.github/workflows/check.yml@{old} # v0.6.2\n"
             )),
             "o/tool",
-            tag("0.6.4"),
-            Err("no single pin of o/tool with its version"),
+            commit("0.6.4"),
+            Ok(vec![format!(
+                "    uses: o/tool/.github/workflows/check.yml@{sha} # v0.6.4\n"
+            )]),
+        ),
+        // But beside a caller's pin of the wrappers it is their own tag.
+        (
+            files(&format!(
+                "    uses: o/actions/.github/workflows/review.yml@{old} # v1.2.0\n"
+            )),
+            "o/actions",
+            commit("0.6.4"),
+            Err("no single pin of o/actions with its version"),
         ),
     ] {
         let moved = repin(&files, target, "tool", &to);
@@ -895,6 +914,90 @@ fn pins_move_with_the_version_named_beside_them() {
             (got, expected) => panic!("{got:?}, expected {expected:?}"),
         }
     }
+}
+
+#[test]
+fn a_commit_pin_reads_its_version_named_or_as_dependabot_writes_it() {
+    let sha = "7".repeat(40);
+    let other = "8".repeat(40);
+    let uses = |pin: &str, comment: &str| {
+        format!("    uses: o/agentic-job/.github/workflows/review.yml@{pin}{comment}\n")
+    };
+    let (single, stalled) = (Some("0.6.2"), None);
+    // Each file's text, then the version read with the pin, or none for the stall.
+    for (texts, expected) in [
+        // As in cgwalters-forge/actions' wrappers, which Dependabot keeps.
+        (
+            vec![
+                format!(
+                    "jobs:\n  review:\n{}    with:\n      model: x\n",
+                    uses(&sha, " # v0.6.2")
+                ),
+                uses(&sha, " # v0.6.2"),
+            ],
+            single,
+        ),
+        (vec![uses(&sha, " # main, agentic-job v0.6.2")], single),
+        (
+            vec![uses(&sha, " # v0.6.2"), uses(&sha, " # agentic-job v0.6.2")],
+            single,
+        ),
+        // The named version is preferred to the bare one.
+        (vec![uses(&sha, " # v0.6.1, agentic-job v0.6.2")], single),
+        (
+            vec![uses(&sha, " # v0.6.2"), uses(&sha, " # agentic-job v0.6.4")],
+            stalled,
+        ),
+        (
+            vec![uses(&sha, " # v0.6.2"), uses(&sha, " # v0.6.4")],
+            stalled,
+        ),
+        (
+            vec![uses(&sha, " # v0.6.2"), uses(&other, " # v0.6.2")],
+            stalled,
+        ),
+        // Only right after the commit: a version later on the line is not it.
+        (vec![uses(&sha, " # main v0.6.2")], stalled),
+        (vec![uses(&sha, "")], stalled),
+    ] {
+        let files: Vec<_> = texts
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| (i.to_string(), text))
+            .collect();
+        let got = pin_of(&files, "o/agentic-job", "agentic-job").map_err(|e| e.to_string());
+        let expected = expected
+            .map(|version| Pin {
+                pin: sha.clone(),
+                version: version.into(),
+            })
+            .ok_or_else(|| "no single pin of o/agentic-job with its version".to_owned());
+        assert_eq!(got, expected, "{files:?}");
+    }
+    // cgwalters-forge/actions' wrappers as recorded: moved to v0.6.4's
+    // commit, they read back as it.
+    let recorded = fixture("wrappers-887");
+    let files: Vec<_> = recorded["responses"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(path, _)| path.starts_with("/repos/cgwalters-forge/actions/contents/"))
+        .map(|(path, file)| (path.clone(), decode(&file["content"]).unwrap()))
+        .collect();
+    let (target, project) = ("cgwalters-forge/agentic-job", "agentic-job");
+    let to = Pin {
+        pin: "732db8c24295ee8d4a79de19f588e6f871d35fe0".into(),
+        version: "0.6.4".into(),
+    };
+    assert_eq!(
+        pin_of(&files, target, project).unwrap(),
+        Pin {
+            pin: "258dc11ca7fe1798836976c0424274d1498e22cb".into(),
+            version: "0.6.2".into(),
+        }
+    );
+    let moved = repin(&files, target, project, &to).unwrap();
+    assert_eq!(pin_of(&moved, target, project).unwrap(), to);
 }
 
 #[test]

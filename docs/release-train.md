@@ -23,7 +23,11 @@ The steps of a train, each a pass:
 3. **wrappers**: once the release is out, a PR on the wrappers repository
    moving its pins of the release's workflows to the commit of the release
    tag, checked to be on the default branch, with "`NAME vX.Y.Z`" beside
-   them. A pin is never a tag, which could move after its review.
+   them. A pin is never a tag, which could move after its review. A commit
+   pin's version is read from the "`NAME vX.Y.Z`" on its line or, failing
+   that, from Dependabot's "`# vX.Y.Z`" right after it, which moves with it
+   (the release's pins only: beside a caller's pin of the wrappers it is the
+   wrappers' tag); pins or versions that disagree stall the train.
 4. **callers**: once that merges into the default branch, a PR on each caller
    moving its commit pin of the wrappers to that merge commit.
 5. **done**: close the tracking issue.
@@ -82,11 +86,3 @@ The shape is train.cjs's `config.json` with `bot` (formerly read from the
 poll's `agent-board.json`) added and `pageSize`, `maxRequests` and
 `requestTimeoutSeconds` removed: listings are one page of 100, the request
 bound is fixed, and every request has the client's 30-second timeout.
-
-## Known limits
-
-These are carried over unchanged; the replay fixtures in
-`fixtures/release-train/` record them:
-
-- Wrappers that pin the release by commit with a bare `# vX.Y.Z` comment are
-  not read, so the wrappers step stalls ([tracker#887](https://github.com/cgwalters-forge/tracker/issues/887)).
