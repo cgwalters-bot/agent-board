@@ -146,7 +146,7 @@ pub fn derive(facts: &ItemFacts) -> Option<Change> {
 }
 
 /// A change's line, `status OWNER/REPO#N: OLD -> NEW (why)`.
-fn line(item: &ItemRef, change: &Change) -> String {
+pub(super) fn line(item: &ItemRef, change: &Change) -> String {
     format!(
         "status {}: {} -> {} ({})",
         item.display(),

@@ -525,7 +525,7 @@ pub(super) fn pools(snapshot: &Value) -> Vec<String> {
 
 /// The comment: the marker, a line per pool, then the JSON that pacing and
 /// the review app read.
-fn render(snapshot: &Value) -> Result<String> {
+pub(super) fn render(snapshot: &Value) -> Result<String> {
     let pools: String = pools(snapshot).iter().map(|p| format!("- {p}\n")).collect();
     Ok(format!(
         "{USAGE_MARKER}\nUsage as of {}, from the inference broker's `/usage`. Written by `agent-board pass`; the review app's ops view reads the JSON below.\n\n{pools}\n```json\n{}\n```\n",

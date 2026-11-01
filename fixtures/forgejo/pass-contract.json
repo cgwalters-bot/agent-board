@@ -1,8 +1,8 @@
 {
   "schema": "agent-board/forgejo-pass-contract/v1",
   "built": false,
-  "preview": {"built": true, "stages": [1, 3, 4], "identity": "GET /user login equals bot and id in recorders, then GET /users/{operator} id in recorders; stop immediately on failure", "writes": false, "dispatch": false},
-  "apply": {"built": true, "stages": [3, 4], "leases": "requires leases=true and preprovisioned slots on agent-board-leases", "activation": false},
+  "preview": {"built": true, "stages": [1, 3, 4, 5], "identity": "GET /user login equals bot and id in recorders, then GET /users/{operator} id in recorders; stop immediately on failure", "writes": false, "dispatch": false},
+  "apply": {"built": true, "stages": [1, 3, 4, 5], "leases": "requires leases=true and preprovisioned slots on agent-board-leases", "activation": false},
   "revisit": {"built": true, "default": "off", "reads": "bounded native issue updated_at and complete unedited recorder thread", "starts": "stage 4 claim/admit/start/receipt/recovery only", "activation": false},
   "doc": "docs/forges.md#a-forgejo-pass",
   "forgejo": {

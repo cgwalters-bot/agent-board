@@ -911,7 +911,7 @@ fn markers(
     Ok(fields)
 }
 
-pub(super) fn unedited(comment: &Value) -> bool {
+pub(crate) fn unedited(comment: &Value) -> bool {
     comment["created_at"].as_str().is_some_and(|created| {
         time::OffsetDateTime::parse(created, &time::format_description::well_known::Rfc3339).is_ok()
             && comment["updated_at"].as_str() == Some(created)
@@ -922,16 +922,27 @@ fn parse_priority(value: &str) -> Option<Priority> {
     serde_json::from_value(value.into()).ok()
 }
 
-fn parse_status(value: &str) -> Option<Status> {
-    Some(match value {
-        "todo" => Status::Todo,
-        "backlog" => Status::Backlog,
-        "blocked" => Status::Blocked,
-        "in-progress" => Status::InProgress,
-        "needs-human" => Status::NeedsHuman,
-        "done" => Status::Done,
-        _ => return None,
-    })
+/// The six Status values a `status/` label may name, by that name.
+const STATUSES: [(&str, Status); 6] = [
+    ("todo", Status::Todo),
+    ("backlog", Status::Backlog),
+    ("blocked", Status::Blocked),
+    ("in-progress", Status::InProgress),
+    ("needs-human", Status::NeedsHuman),
+    ("done", Status::Done),
+];
+
+pub(crate) fn parse_status(value: &str) -> Option<Status> {
+    (STATUSES.iter())
+        .find(|(name, _)| *name == value)
+        .map(|(_, status)| status.clone())
+}
+
+/// The `status/` label of `status`, none for a Status no label names.
+pub(crate) fn status_label(status: &Status) -> Option<String> {
+    (STATUSES.iter())
+        .find(|(_, s)| s == status)
+        .map(|(name, _)| format!("{STATUS_SCOPE}{name}"))
 }
 
 #[cfg(test)]

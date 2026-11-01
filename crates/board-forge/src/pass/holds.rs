@@ -586,10 +586,12 @@ pub fn question(why: &str) -> Option<String> {
 }
 
 fn url(item: &ItemRef) -> String {
-    format!(
-        "https://{}/{}/issues/{}",
-        item.host, item.repository, item.number
-    )
+    // A Forgejo pass's host is its instance, scheme and path included.
+    let base = match item.host.contains("://") {
+        true => item.host.clone(),
+        false => format!("https://{}", item.host),
+    };
+    format!("{base}/{}/issues/{}", item.repository, item.number)
 }
 
 /// How the snapshot orders an item: by repository and number.
@@ -1775,6 +1777,24 @@ mod tests {
             host: DEFAULT_HOST.into(),
             repository: repository.into(),
             number,
+        }
+    }
+
+    #[test]
+    fn urls_stay_on_the_items_forge() {
+        let forgejo = "https://forge.example:8443/subpath";
+        for (host, expected) in [
+            (DEFAULT_HOST, "https://github.com/o/r/issues/7"),
+            (forgejo, "https://forge.example:8443/subpath/o/r/issues/7"),
+        ] {
+            let mut on = item("o/r", 7);
+            on.host = host.into();
+            let held = entry(
+                Scope::Item(on),
+                HoldKind::NeedsHuman,
+                "labelled needs-human",
+            );
+            assert_eq!(held.published().url.as_deref(), Some(expected));
         }
     }
 

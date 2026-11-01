@@ -35,10 +35,14 @@ OWNER/REPO#N` and `wip: no slot left` lines a GitHub pass would, with
 plan yet ([stage 4 in preview](forges.md#stage-4-in-preview)). With `epics`,
 stage 3 runs this page's [epic rules](#epic-planning-and-recovery) over
 relationship comments ([Forgejo epics](forges.md#epics)); without, it prints
-`stage 3 epics: off (no epics)`. Stages 2, 5 and 6 each print one not-built
-line. Preview writes and dispatches nothing; `--apply` implements stage 3's
-applies and planning starts and stage 4's
-[claim/start/recover protocol](forges.md#stage-4-apply).
+`stage 3 epics: off (no epics)`. With `board.statusLabels`, stage 5 derives
+Status as below and writes it as one `status/` label
+([labels and Status](forges.md#labels-and-status)); without, it prints
+`stage 5 status: off (no board.statusLabels)`. Stages 2 and 6 each print one
+not-built line. Preview writes and dispatches nothing; `--apply` implements stage 3's
+applies and planning starts, stage 4's
+[claim/start/recover protocol](forges.md#stage-4-apply), stage 5's labels and
+the usage and hold snapshots.
 The end-to-end Forgejo pass remains unbuilt. A preview can be
 [recorded and replayed](forges.md#recording-and-replay) offline, on its own
 instance only. `--fix-bounds`, `--record` with `--replay`,
@@ -59,14 +63,16 @@ Separators, traversal segments, percent escapes, query/fragment/control characte
 and host-shaped inputs are refused before token lookup. The operator is appended
 as an encoded API path segment beneath the configured instance's API root;
 both logins still require verified recorder ids. GitHub admission is unchanged.
-The same forge-selected repository check covers `epics.repository`, and will
-cover publication fields when those become available; their current Forgejo
-refusals remain.
+The same forge-selected repository check covers `epics.repository`,
+`usage.repository` and `holds.repository`.
 
-On Forgejo, `usage` may contain only `url`; no publication fields are needed
-or accepted yet. Broker errors never read a GitHub snapshot or invoke forge
-publication. Missing readings hold pools, and failed reads count as failures.
-Status, holds, usage publication and probes await #523.
+On Forgejo, `usage` needs only `url`; `usage.repository` and `usage.issue`,
+both or neither, and `holds` publish the snapshots as new bot comments on an
+issue of a repository the instance says is private, or the pass stops before
+stage 1 ([comments](forges.md#comments-recorders-and-editors)). Broker errors
+never read a GitHub snapshot or a published one. Missing readings hold pools,
+and failed reads count as failures. `usage.probe` and `holds.proposals` are
+refused.
 Applying work requires `leases: true` and preprovisioned `leases/0.json` through
 `leases/(wip-1).json` on the private caller's `agent-board-leases` branch.
 Each begins as `{"free":"initial"}`; a pass never provisions it. `reruns: true`
