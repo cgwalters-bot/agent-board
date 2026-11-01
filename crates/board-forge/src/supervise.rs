@@ -148,6 +148,10 @@ pub struct Limits {
     pub unqueued_wait_hours: f64,
     pub unclosed_wait_hours: f64,
     pub pace_margin_percent: f64,
+    /// The points a pool may stay under its allowed percent while passes go
+    /// idle before the capacity check warns; absent, that check is not
+    /// configured.
+    pub capacity_margin_percent: Option<f64>,
     pub usage_stale_minutes: f64,
     /// The release train's interval: a release older than this, with pull
     /// requests merged since, is due.
@@ -180,6 +184,7 @@ impl Default for Limits {
             unqueued_wait_hours: 1.0,
             unclosed_wait_hours: 1.0,
             pace_margin_percent: 25.0,
+            capacity_margin_percent: None,
             usage_stale_minutes: 45.0,
             release_interval_hours: 24.0,
             release_overdue_hours: 1.0,
@@ -233,6 +238,10 @@ impl Limits {
             unqueued_wait_hours: number("unqueuedWaitHours", d.unqueued_wait_hours)?,
             unclosed_wait_hours: number("unclosedWaitHours", d.unclosed_wait_hours)?,
             pace_margin_percent: number("paceMarginPercent", d.pace_margin_percent)?,
+            capacity_margin_percent: match value.get(CAPACITY_MARGIN).filter(|v| !v.is_null()) {
+                Some(_) => Some(number(CAPACITY_MARGIN, 0.0)?),
+                None => None,
+            },
             usage_stale_minutes: number("usageStaleMinutes", d.usage_stale_minutes)?,
             release_interval_hours: number("releaseIntervalHours", d.release_interval_hours)?,
             release_overdue_hours: number("releaseOverdueHours", d.release_overdue_hours)?,
@@ -308,11 +317,21 @@ pub struct AgentSettings {
 /// The supervisor file's optional settings that switch something on, read
 /// as [`POLL_OPTIONS`] are: `agent`, and within it these.
 /// The [`Limits`] are left out: each has a working default and only tunes a
-/// check, so one left unset is not a feature left off. `schedulerJob` and
+/// check, so one left unset is not a feature left off; the exception is
+/// [`CAPACITY_MARGIN`], which switches its check on. `schedulerJob` and
 /// `releaseRepository` (standing for its group) were once required: listed,
 /// one dropped or misspelled shows in `unset` rather than leaving its checks
 /// "not configured" unseen.
-pub const SUPERVISOR_OPTIONS: &[&str] = &["agent", "schedulerJob", "releaseRepository"];
+pub const SUPERVISOR_OPTIONS: &[&str] = &[
+    "agent",
+    "schedulerJob",
+    "releaseRepository",
+    CAPACITY_MARGIN,
+];
+
+/// The limit without a default: set, the capacity check runs.
+const CAPACITY_MARGIN: &str = "capacityMarginPercent";
+
 pub const AGENT_OPTIONS: &[&str] = &[
     "kinds",
     "maxDispatchesPerPass",
@@ -1015,6 +1034,24 @@ pub(crate) mod tests {
                 }
             }
         }
+        // The capacity margin has no default: absent or null, its check is off.
+        for (value, want) in [
+            (None, Ok(None)),
+            (Some(Value::Null), Ok(None)),
+            (Some(json!(0)), Ok(Some(0.0))),
+            (Some(json!(10)), Ok(Some(10.0))),
+            (Some(json!(-1)), Err(())),
+            (Some(json!("10")), Err(())),
+        ] {
+            let mut cfg = supervisor();
+            if let Some(value) = &value {
+                cfg[CAPACITY_MARGIN] = value.clone();
+            }
+            let result = Settings::from_json(&board(), &cfg, None)
+                .map(|s| s.limits.capacity_margin_percent)
+                .map_err(|_| ());
+            assert_eq!(result, want, "{value:?}");
+        }
     }
 
     #[test]
@@ -1148,6 +1185,7 @@ pub(crate) mod tests {
             .filter(|k| !["mergeAuthors", "kindPools", "dispatchWorkflow", "pace"].contains(k))
             .map(|k| (*k).to_owned())
             .collect();
+        expected.push(CAPACITY_MARGIN.to_owned());
         expected.extend(
             ["dailyCaps", "state", "tracker", "project", "passConfig"]
                 .map(|k| format!("agent.{k}")),

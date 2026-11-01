@@ -20,8 +20,18 @@ fn with(id: &str, items: Option<Vec<Value>>) -> Snapshot {
     }
 }
 
+/// The capacity margin the tests configure; it has no default.
+const CAPACITY_MARGIN: f64 = 10.0;
+
+fn limits() -> Limits {
+    Limits {
+        capacity_margin_percent: Some(CAPACITY_MARGIN),
+        ..Limits::default()
+    }
+}
+
 fn check(snapshot: &Snapshot, id: &str, now: i64) -> Value {
-    evaluate(snapshot, now, &Limits::default())
+    evaluate(snapshot, now, &limits())
         .into_iter()
         .find(|c| c["id"] == id)
         .unwrap()
@@ -54,7 +64,7 @@ fn recorded_reduced_snapshots_healthy_and_unavailable_observations() {
             })
             .collect();
         let result = check(&with(id, Some(items.clone())), id, now);
-        let expected = if id == "infrastructure" || id == "unset" {
+        let expected = if ["infrastructure", "unset", "capacity"].contains(&id.as_str()) {
             "warn"
         } else {
             "fail"
@@ -103,11 +113,32 @@ fn threshold_boundaries_and_stale_probe() {
         assert_eq!(status("poll", json!(runs), now), want, "{between}");
         assert_eq!(status("poll", json!(runs[..3]), now), "ok", "{between}");
     }
-    let at = iso(now - (limits.run_timeout_minutes * 60_000.0) as i64);
+    // Past the timeout fails until a week, when GitHub may no longer cancel it.
+    let hours = |h: f64| iso(now - (h * HOUR_MS as f64) as i64);
+    let timeout = limits.run_timeout_minutes / 60.0;
+    for (started, status_now, want) in [
+        (timeout, "in_progress", "ok"),
+        (timeout + 0.1, "in_progress", "fail"),
+        (timeout + 0.1, "completed", "ok"),
+        (ABANDONED_RUN_HOURS, "queued", "fail"),
+        (ABANDONED_RUN_HOURS + 0.1, "queued", "ok"),
+        (ABANDONED_RUN_HOURS + 0.1, "in_progress", "ok"),
+    ] {
+        assert_eq!(
+            status(
+                "runs",
+                json!([{"status": status_now, "run_started_at": hours(started)}]),
+                now
+            ),
+            want,
+            "{started} {status_now}"
+        );
+    }
+    // Without a start time, the creation time counts.
     assert_eq!(
         status(
             "runs",
-            json!([{"status": "in_progress", "run_started_at": at}]),
+            json!([{"status": "queued", "run_started_at": null, "created_at": hours(24.0 * 30.0)}]),
             now
         ),
         "ok"
@@ -146,12 +177,22 @@ fn threshold_boundaries_and_stale_probe() {
         let mut failed = vec![unfinished.clone()];
         failed.extend(s["broker"].as_array().unwrap().iter().cloned());
         assert_eq!(status("broker", json!(failed), now), "fail", "{unfinished}");
+        // Alone, only a skipped run says the probe is off.
+        let alone = check(
+            &with("broker", Some(vec![unfinished.clone()])),
+            "broker",
+            now,
+        );
+        let off = unfinished["conclusion"] == "skipped";
         assert_eq!(
-            status("broker", json!([unfinished]), now),
-            "warn",
+            alone["status"],
+            if off { "ok" } else { "warn" },
             "{unfinished}"
         );
+        assert_eq!(alone["suggested_action"] == PROBE_OFF, off, "{unfinished}");
     }
+    // Nothing listed is no observation, not a probe switched off.
+    assert_eq!(status("broker", json!([]), now), "warn");
     assert_eq!(
         status(
             "queue",
@@ -255,6 +296,49 @@ fn newer_checks_and_their_boundaries() {
         "ok"
     );
     assert_eq!(status("held", json!([{}]), now), "fail");
+    // A draft in the promote queue is the operator's, however long it waits.
+    assert_eq!(status("held", json!([{"promote": true}]), now), "ok");
+    assert_eq!(
+        status("held", json!([{"promote": true}, {"promote": false}]), now),
+        "fail"
+    );
+    // Under capacity by more than the margin, with a pass gone idle, warns;
+    // the blockers lead the evidence.
+    let pool = |allowed: f64, used: f64| {
+        json!({"kind": "pool", "allowed_percent": allowed, "used_percent": used,
+            "html_url": "https://github.com/o/ops/issues/1#issuecomment-1"})
+    };
+    let pass = |idle: bool| json!({"kind": "pass", "idle": idle, "html_url": "https://github.com/o/c/actions/runs/1"});
+    let blocker = json!({"kind": "blocker", "html_url": "https://github.com/o/r/pull/3"});
+    let under = 50.0 - CAPACITY_MARGIN - 0.1;
+    for (items, want) in [
+        (vec![pool(50.0, under), pass(true)], "warn"),
+        (vec![pool(50.0, 50.0 - CAPACITY_MARGIN), pass(true)], "ok"),
+        (vec![pool(50.0, under), pass(false)], "ok"),
+        (vec![pool(50.0, under)], "ok"),
+        (vec![pass(true), blocker.clone()], "ok"),
+        (
+            vec![pool(50.0, 49.0), pool(50.0, under), pass(false), pass(true)],
+            "warn",
+        ),
+        (vec![json!({"kind": "pool"}), pass(true)], "ok"),
+    ] {
+        assert_eq!(status("capacity", json!(items), now), want, "{items:?}");
+    }
+    let items = vec![pool(50.0, 0.0), pass(true), blocker];
+    let result = check(&with("capacity", Some(items.clone())), "capacity", now);
+    assert_eq!(
+        result["evidence"],
+        json!([
+            "https://github.com/o/r/pull/3",
+            "https://github.com/o/ops/issues/1#issuecomment-1",
+            "https://github.com/o/c/actions/runs/1"
+        ])
+    );
+    // Without a margin the check reads nothing; given items, it stays ok.
+    let off = evaluate(&with("capacity", Some(items)), now, &Limits::default());
+    let off = off.iter().find(|c| c["id"] == "capacity").unwrap();
+    assert_eq!(off["status"], "ok");
     assert_eq!(
         status(
             "unqueued",
@@ -325,7 +409,8 @@ fn checks_left_unconfigured_are_ok_and_read_nothing() {
     let (_, now) = recorded();
     let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> { bail!("HTTP 403") });
     let mut s = settings();
-    let ids = ["release", "idle", "stuck"];
+    s.limits.capacity_margin_percent = Some(CAPACITY_MARGIN);
+    let ids = ["release", "idle", "stuck", "capacity"];
     // Configured, a read that fails is a blind spot.
     let snapshot = collect(&fake, &s, "main", now, None);
     for id in ids {
@@ -334,6 +419,7 @@ fn checks_left_unconfigured_are_ok_and_read_nothing() {
     s.release = None;
     s.release_train_workflow = None;
     s.scheduler_job = None;
+    s.limits.capacity_margin_percent = None;
     let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> { bail!("HTTP 403") });
     let snapshot = collect(&fake, &s, "main", now, None);
     for id in ids {
@@ -386,17 +472,21 @@ fn an_observation_unavailable_for_an_hour_fails() {
         ..Snapshot::default()
     };
     assert_eq!(check(&missing, "pace", now)["status"], "fail");
-    // A switched-off probe is no observation either.
-    assert_eq!(
-        check_since(
-            "broker",
-            Some(vec![
-                json!({"status": "completed", "conclusion": "skipped"})
-            ]),
-            Some(&at(61))
-        )["status"],
-        "fail"
-    );
+    // A probe that has not completed is no observation either; one switched
+    // off is said, however long it has been.
+    for (conclusion, want) in [("cancelled", "fail"), ("skipped", "ok")] {
+        assert_eq!(
+            check_since(
+                "broker",
+                Some(vec![
+                    json!({"status": "completed", "conclusion": conclusion})
+                ]),
+                Some(&at(61))
+            )["status"],
+            want,
+            "{conclusion}"
+        );
+    }
     // A time from the future, or none that parses, starts again.
     assert_eq!(
         check_since("queue", None, Some("2027-01-01T00:00:00Z"))["status"],
@@ -439,6 +529,23 @@ fn log_and_record_parsers() {
     assert!(!idle_line(
         "example/project#1 idle: 7 slot(s) free and nothing started"
     ));
+    for (line, want) in [
+        (
+            "blocker o/r#3: stage 2 moves it (fix); it holds o/r#4",
+            Some(("o/r", 3)),
+        ),
+        (
+            "blocker o/r#3: only a person moves it at abc (wait); it holds o/r#4 by overlap",
+            Some(("o/r", 3)),
+        ),
+        ("blocker o/r#x: reason", None),
+        ("blocker o/r#3 reason", None),
+        ("blocker ../r#3: reason", None),
+        ("o/r#1 blocker o/r#3: reason", None),
+        ("overlap ignored: o/r#3: reason", None),
+    ] {
+        assert_eq!(blocker_line(line), want, "{line}");
+    }
     assert_eq!(strip_colours("a\x1b[0mb\x1b[1;31mc\x1b[x"), "abc\x1b[x");
     let skip = "example/project#5 (epic example/project#1) skip: plan https://github.com/example/project/issues/5#issuecomment-1 was dispatched already, https://github.com/example/project/issues/5#issuecomment-2";
     assert_eq!(skip_line(skip), Some(("example/project", 2)));
@@ -959,6 +1066,146 @@ fn successful_snapshot_skips_old_pull_request_detail_and_keeps_commented_approva
     }
 }
 
+/// The capacity check reads the usage snapshot and the newest passes once
+/// each, and links the blockers they name; `held` leaves out drafts where
+/// the pass config's `pr.noMerge` turns merging off.
+#[test]
+fn capacity_links_blockers_and_held_leaves_out_the_promote_queue() {
+    let (_, now) = recorded();
+    let mut s = project_settings();
+    s.limits.capacity_margin_percent = Some(CAPACITY_MARGIN);
+    let root = format!("/repos/{}", s.dispatch_repo);
+    let bot = s.bot.clone();
+    let pass_config =
+        std::env::temp_dir().join(format!("supervise-health-pass-{}.json", std::process::id()));
+    std::fs::write(
+        &pass_config,
+        json!({"operator": "owner", "bot": "worker", "dispatchRepo": "example/control",
+            "dispatchWorkflow": "dispatch.yml", "pr": {"noMerge": ["Example/Project"]}})
+        .to_string(),
+    )
+    .unwrap();
+    let log = [
+        "2026-10-15T11:50:30.0Z blocker example/project#3: stage 2 moves it (fix: conflicts with main); it holds example/project#4",
+        "2026-10-15T11:50:31.0Z blocker example/project#3: it is merged now; it holds example/project#5",
+        "2026-10-15T11:50:32.0Z blocker example/other#9: only a person moves it at abc (wait); it holds example/project#6 by overlap",
+        "2026-10-15T11:50:41.4Z idle: 3 slot(s) free and nothing started",
+    ]
+    .join("\n");
+    let pull = |number: u64, draft: bool, base: &str| {
+        json!({"url": format!("https://github.com/{base}/pull/{number}"), "isInMergeQueue": false,
+            "isDraft": draft, "mergeStateStatus": "CLEAN", "baseRepository": {"nameWithOwner": base},
+            "author": {"__typename": "User", "login": bot},
+            "labels": {"nodes": [{"name": "needs-human"}]},
+            "timelineItems": {"nodes": [{"createdAt": "2026-10-14T00:00:00Z", "label": {"name": "needs-human"}}]},
+            "comments": {"nodes": []}})
+    };
+    let fake = Fake::new(|kind: &str, path: &str, _: &Value| -> Result<Value> {
+        if kind == "DOWNLOAD" {
+            return Ok(log.clone().into());
+        }
+        if kind == "GRAPHQL" {
+            let nodes = if path.contains("states: OPEN") {
+                // A draft where merging is off, a ready one there, and a
+                // draft somewhere merging is on.
+                vec![
+                    pull(10, true, "example/project"),
+                    pull(11, false, "example/project"),
+                    pull(12, true, "example/elsewhere"),
+                ]
+            } else {
+                vec![]
+            };
+            return Ok(
+                json!({"repository": {"pullRequests": {"pageInfo": {"hasNextPage": false}, "nodes": nodes}}}),
+            );
+        }
+        if path.starts_with(&format!("{root}/actions/workflows/poll.yml/runs")) {
+            let runs = [1, 2].map(|id| {
+                json!({"id": id, "status": "completed", "conclusion": "success",
+                "html_url": format!("https://github.com/example/control/actions/runs/{id}")})
+            });
+            return Ok(json!({ "workflow_runs": runs }));
+        }
+        if path.starts_with(&format!("{root}/actions/runs/")) && path.contains("/jobs") {
+            let id: u64 = path[root.len() + "/actions/runs/".len()..]
+                .split('/')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            return Ok(
+                json!({"jobs": [{"id": id, "name": "board", "status": "completed", "conclusion": "success"}]}),
+            );
+        }
+        if path.contains("/actions/") {
+            return Ok(json!({"workflow_runs": []}));
+        }
+        if path.starts_with("/repos/example/ops/issues/1/comments") {
+            return Ok(
+                json!([{"user": {"login": "worker"}, "html_url": "https://github.com/example/ops/issues/1#issuecomment-1",
+                "body": format!("<!-- bot-usage v1 -->\n```json\n{}\n```", json!({"schema": "bot-usage/v1", "updated_at": iso(now - 60_000),
+                    "pools": {"large": {"allowed_percent": 40, "used_percent": 5, "window_minutes": 10080, "resets_at": "2026-10-20T12:00:00Z"}}}))}]),
+            );
+        }
+        Ok(json!([]))
+    });
+    let checks = |s: &Settings| {
+        let snapshot = collect(&fake, s, "main", now, None);
+        evaluate(&snapshot, now, &s.limits)
+            .into_iter()
+            .map(|c| (c["id"].as_str().unwrap().to_owned(), c))
+            .collect::<BTreeMap<String, Value>>()
+    };
+    let pulls = |numbers: &[u64]| -> Vec<String> {
+        numbers
+            .iter()
+            .map(|n| match n {
+                12 => format!("https://github.com/example/elsewhere/pull/{n}"),
+                _ => format!("https://github.com/example/project/pull/{n}"),
+            })
+            .collect()
+    };
+
+    // Without a pass config, every held draft counts.
+    let without = checks(&s);
+    assert_eq!(without["held"]["evidence"], json!(pulls(&[10, 11, 12])));
+    assert_eq!(without["capacity"]["status"], "warn");
+    assert_eq!(
+        without["capacity"]["evidence"],
+        json!([
+            "https://github.com/example/project/pull/3",
+            "https://github.com/example/other/pull/9",
+            "https://github.com/example/ops/issues/1#issuecomment-1",
+            "https://github.com/example/control/actions/runs/1",
+            "https://github.com/example/control/actions/runs/2",
+        ])
+    );
+    // The usage snapshot is read once for pace and capacity.
+    let reads = fake
+        .calls
+        .borrow()
+        .iter()
+        .filter(|c| c.contains("/repos/example/ops/issues/1/comments"))
+        .count();
+    assert_eq!(reads, 1);
+    // No percentage reaches the report.
+    assert!(!without["capacity"].to_string().contains("40"));
+
+    let mut with_config = s.clone();
+    with_config.agent.as_mut().unwrap().pass_config =
+        Some(pass_config.to_str().unwrap().to_owned());
+    assert_eq!(
+        checks(&with_config)["held"]["evidence"],
+        json!(pulls(&[11, 12]))
+    );
+    // A pass config that does not read leaves held unavailable.
+    with_config.agent.as_mut().unwrap().pass_config = Some("/nonexistent/pass.json".into());
+    assert_eq!(checks(&with_config)["held"]["evidence"], json!([]));
+    assert_eq!(checks(&with_config)["held"]["status"], "warn");
+    std::fs::remove_file(&pass_config).unwrap();
+}
+
 #[test]
 fn scheduled_runs_are_judged_by_workflow_in_each_repository_with_links_only() {
     let (_, now) = recorded();
@@ -1192,7 +1439,8 @@ fn the_release_train_check_refuses_a_crowded_page() {
 #[test]
 fn the_overall_deadline_leaves_observations_unavailable_without_further_requests() {
     let (_, now) = recorded();
-    let s = settings();
+    let mut s = settings();
+    s.limits.capacity_margin_percent = Some(CAPACITY_MARGIN);
     let time = Cell::new(now);
     let clock = || time.get();
     let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> {
@@ -1214,6 +1462,7 @@ fn the_collector_has_a_bounded_request_budget_and_writes_nothing() {
     let (_, now) = recorded();
     let mut s = settings();
     s.limits.max_requests = 2;
+    s.limits.capacity_margin_percent = Some(CAPACITY_MARGIN);
     let clock = || now;
     let fake = Fake::new(|_: &str, _: &str, _: &Value| -> Result<Value> { bail!("HTTP 403") });
     let bounded = Bounded::new(&fake, &s.limits, &clock);

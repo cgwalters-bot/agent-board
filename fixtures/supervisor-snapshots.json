@@ -14,6 +14,7 @@
   "idle": [{"idle":true},{"idle":true}],
   "stuck": [{"ended":true,"pull":"merged"}],
   "pace": [{"used_percent":90,"window_minutes":10080,"resets_at":"2026-10-20T12:00:00Z"}],
+  "capacity": [{"kind":"pool","allowed_percent":60,"used_percent":20},{"kind":"pass","idle":true},{"kind":"blocker"}],
   "failures": [{"reason":"refused"}],
   "held": [{"labeledAt":"2026-10-14T00:00:00Z"}],
   "unqueued": [{"approvedAt":"2026-10-15T10:00:00Z","clean":true,"queued":false}],

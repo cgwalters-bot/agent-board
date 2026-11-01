@@ -56,6 +56,10 @@ pub const CHECKS: &[(&str, &str)] = &[
         "Compare the pool's usage with the pace of its window.",
     ),
     (
+        "capacity",
+        "Start from the blockers the pass names for why the pool is under capacity.",
+    ),
+    (
         "failures",
         "Inspect agent runs that failed for a reason that recurs.",
     ),
@@ -82,7 +86,13 @@ pub const CHECKS: &[(&str, &str)] = &[
 ];
 
 /// The checks whose settings may be left out, reported "Not configured.".
-const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck"];
+const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck", "capacity"];
+/// A run still listed as unfinished after this long is left out of the runs
+/// check: GitHub has refused both cancel and force-cancel on such runs, so
+/// nothing can clear them and they would keep the check red for ever.
+const ABANDONED_RUN_HOURS: f64 = 7.0 * 24.0;
+/// The broker check's reason when the probe is switched off.
+const PROBE_OFF: &str = "Not observed: every listed probe run was skipped, so the probe is off.";
 /// Coordinator checkpoints on an epic: `<!-- coordinator/v1: {...} -->`.
 const CHECKPOINT_MARKER: &str = "coordinator/v1";
 /// The usage snapshot comment (`pass`'s stage 1, or tracker's usage.yml) and its JSON's schema.
@@ -140,8 +150,8 @@ fn truthy(value: &Value) -> bool {
 /// concurrency group, has not observed anything, so the newest completed
 /// probe decides; one that hangs, or is cancelled at its timeout, is caught
 /// by the newest completed probe going stale (`probe_stale_minutes`). A
-/// probe that is switched off leaves skipped runs: no observation, which
-/// fails once it has lasted, like any other.
+/// probe that is switched off leaves skipped runs, said as [`PROBE_OFF`]
+/// once they are all that is listed.
 fn probes(items: &[Value]) -> Vec<&Value> {
     items
         .iter()
@@ -201,6 +211,22 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                     "suggested_action": "Not configured.",
                 });
             }
+            // A probe switched off by its job's condition leaves only skipped
+            // runs: nothing observes the broker, and no request here can
+            // change that, so it is said rather than failed for ever.
+            if id == "broker"
+                && !items.is_empty()
+                && items
+                    .iter()
+                    .all(|r| r["status"] == "completed" && r["conclusion"] == "skipped")
+            {
+                return json!({
+                    "id": id,
+                    "status": "ok",
+                    "evidence": [],
+                    "suggested_action": PROBE_OFF,
+                });
+            }
             if id == "broker" && probes(items).is_empty() {
                 return unavailable(id, action, snapshot.previous.as_deref(), now, limits);
             }
@@ -235,6 +261,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                         };
                         r["status"] != "completed"
                             && older(started, limits.run_timeout_minutes / 60.0)
+                            && !older(started, ABANDONED_RUN_HOURS)
                     })
                     .collect(),
                 "broker" => probes(items)
@@ -333,11 +360,46 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                     })
                     .collect(),
                 "failures" => items.iter().filter(|r| truthy(&r["reason"])).collect(),
-                // A hold whose time is not known has lasted at least as long as we can see.
+                // Under capacity by the margin while the newest passes go
+                // idle; the blockers they name come first, as what holds the work.
+                "capacity" => {
+                    // Unset, nothing is read, so no pool is under it.
+                    let margin = limits.capacity_margin_percent.unwrap_or(f64::INFINITY);
+                    let kind = |k: &'static str| move |i: &&Value| i["kind"] == k;
+                    let under: Vec<&Value> = items
+                        .iter()
+                        .filter(kind("pool"))
+                        .filter(|p| {
+                            let allowed = p["allowed_percent"].as_f64().unwrap_or(f64::NAN);
+                            let used = p["used_percent"].as_f64().unwrap_or(f64::NAN);
+                            allowed - used > margin
+                        })
+                        .collect();
+                    let idle: Vec<&Value> = items
+                        .iter()
+                        .filter(kind("pass"))
+                        .filter(|p| truthy(&p["idle"]))
+                        .collect();
+                    if under.is_empty() || idle.is_empty() {
+                        vec![]
+                    } else {
+                        items
+                            .iter()
+                            .filter(kind("blocker"))
+                            .chain(under)
+                            .chain(idle)
+                            .collect()
+                    }
+                }
+                // A hold whose time is not known has lasted at least as long
+                // as we can see. A draft where merging is off (`pr.noMerge`)
+                // waits in the operator's promote queue, not on the hold.
                 "held" => items
                     .iter()
                     .filter(|p| {
-                        !truthy(&p["labeledAt"]) || older(&p["labeledAt"], limits.hold_wait_hours)
+                        !truthy(&p["promote"])
+                            && (!truthy(&p["labeledAt"])
+                                || older(&p["labeledAt"], limits.hold_wait_hours))
                     })
                     .collect(),
                 "unqueued" => items
@@ -388,7 +450,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             evidence.truncate(limits.max_evidence);
             let status = if bad.is_empty() {
                 "ok"
-            } else if ["infrastructure", "unset"].contains(&id)
+            } else if ["infrastructure", "unset", "capacity"].contains(&id)
                 || bad
                     .iter()
                     .all(|i| truthy(&i["missing"]) || truthy(&i["override"]))
@@ -409,7 +471,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
 
 const OPEN_PULLS: &str = r#"query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
   pullRequests(states: OPEN, first: 100) { pageInfo { hasNextPage } nodes {
-    url isInMergeQueue mergeStateStatus author { __typename login }
+    url isInMergeQueue isDraft mergeStateStatus author { __typename login } baseRepository { nameWithOwner }
     labels(first: 30) { nodes { name } }
     timelineItems(itemTypes: [LABELED_EVENT], last: 50) { nodes { ... on LabeledEvent { createdAt label { name } } } }
     comments(last: 10) { nodes { url author { login } } }
@@ -539,6 +601,17 @@ fn idle_line(line: &str) -> bool {
     line.strip_prefix("idle: ")
         .and_then(|rest| rest.split_once(' '))
         .is_some_and(|(n, rest)| digits(n) && rest.starts_with("slot(s) free and nothing started"))
+}
+
+/// The pull request a pass's blocker line names: `blocker O/R#N: reason...`.
+fn blocker_line(line: &str) -> Option<(&str, u64)> {
+    let (target, _) = line.strip_prefix("blocker ")?.split_once(": ")?;
+    let (repo, number) = target.split_once('#')?;
+    // Strictly, as the report links it.
+    if crate::poll::validate_repository(repo).is_err() || !digits(number) {
+        return None;
+    }
+    Some((repo, number.parse().ok()?))
 }
 
 /// The record a scheduler skip names: `O/R#N (epic ...) skip: plan URL was
@@ -1268,34 +1341,45 @@ impl Collector<'_> {
         Ok(result)
     }
 
-    /// The usage snapshot from the private repository its config names.
-    /// Only links reach the report, never the numbers.
+    /// The fresh usage snapshot from the private repository its config
+    /// names, and its comment's link, as `{"snap", "url"}`.
+    fn usage(&self) -> Result<Value> {
+        self.once("usage", || {
+            let usage = self
+                .s
+                .usage
+                .as_ref()
+                .context("no usage snapshot configured")?;
+            let comments = self.list(
+                &format!(
+                    "/repos/{}/issues/{}/comments",
+                    usage.issue.repository, usage.issue.issue
+                ),
+                true,
+            )?;
+            let comment = comments.iter().find(|c| {
+                c["user"]["login"] == usage.bot.as_str()
+                    && c["body"]
+                        .as_str()
+                        .is_some_and(|b| b.starts_with(USAGE_MARKER))
+            });
+            let snap = comment.and_then(|c| usage_snapshot(c["body"].as_str()?));
+            let fresh = self.now - (self.s.limits.usage_stale_minutes * 60_000.0) as i64;
+            let Some(snap) =
+                snap.filter(|s| millis(&s["updated_at"]).is_some_and(|at| at >= fresh))
+            else {
+                bail!("no fresh usage snapshot");
+            };
+            let url = comment.map_or(Value::Null, |c| c["html_url"].clone());
+            Ok(json!({"snap": snap, "url": url}))
+        })
+    }
+
+    /// The pools of the usage snapshot. Only links reach the report, never
+    /// the numbers.
     fn pace(&self) -> Result<Vec<Value>> {
-        let usage = self
-            .s
-            .usage
-            .as_ref()
-            .context("no usage snapshot configured")?;
-        let comments = self.list(
-            &format!(
-                "/repos/{}/issues/{}/comments",
-                usage.issue.repository, usage.issue.issue
-            ),
-            true,
-        )?;
-        let comment = comments.iter().find(|c| {
-            c["user"]["login"] == usage.bot.as_str()
-                && c["body"]
-                    .as_str()
-                    .is_some_and(|b| b.starts_with(USAGE_MARKER))
-        });
-        let snap = comment.and_then(|c| usage_snapshot(c["body"].as_str()?));
-        let fresh = self.now - (self.s.limits.usage_stale_minutes * 60_000.0) as i64;
-        let Some(snap) = snap.filter(|s| millis(&s["updated_at"]).is_some_and(|at| at >= fresh))
-        else {
-            bail!("no fresh usage snapshot");
-        };
-        let url = comment.map_or(Value::Null, |c| c["html_url"].clone());
+        let usage = self.usage()?;
+        let (snap, url) = (&usage["snap"], &usage["url"]);
         // An override in force says why a pool runs off its pace.
         let overridden = |pool: &str| {
             self.s
@@ -1318,6 +1402,38 @@ impl Collector<'_> {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Each pool's allowed and used percent from the usage snapshot, then
+    /// each of the scheduler's newest passes, whether it went idle, and the
+    /// pull requests its blocker lines name, as links built from the
+    /// parsed repository and number.
+    fn capacity(&self, poll: Option<&Vec<Value>>) -> Result<Vec<Value>> {
+        let usage = self.usage()?;
+        let mut items: Vec<Value> = usage["snap"]["pools"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, p)| truthy(p))
+            .map(|(_, p)| json!({"kind": "pool", "allowed_percent": p["allowed_percent"], "used_percent": p["used_percent"], "html_url": usage["url"]}))
+            .collect();
+        for pass in self.passes(poll)? {
+            let lines: Vec<&str> = pass["lines"]
+                .as_array()
+                .map(|l| l.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let idle = lines.iter().any(|l| idle_line(l));
+            items.push(json!({"kind": "pass", "idle": idle, "html_url": pass["html_url"]}));
+            let blockers: Vec<(&str, u64)> = lines.iter().filter_map(|l| blocker_line(l)).collect();
+            ensure!(
+                blockers.len() <= self.s.limits.max_items,
+                "too many blockers"
+            );
+            items.extend(blockers.into_iter().map(|(repo, number)| {
+                json!({"kind": "blocker", "html_url": format!("https://github.com/{repo}/pull/{number}")})
+            }));
+        }
+        Ok(items)
     }
 
     /// The newest run of each kind and target that failed, when its failed
@@ -1418,7 +1534,19 @@ impl Collector<'_> {
         Ok(false)
     }
 
+    /// The pass config's `pr.noMerge`, from the file `agent.passConfig`
+    /// names; none without one.
+    fn no_merge(&self) -> Result<Vec<String>> {
+        let Some(path) = self.s.agent.as_ref().and_then(|a| a.pass_config.as_deref()) else {
+            return Ok(vec![]);
+        };
+        let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+        let config = crate::pass::Config::parse(&text).with_context(|| path.to_owned())?;
+        Ok(config.pr.no_merge)
+    }
+
     fn held(&self) -> Result<Vec<Value>> {
+        let no_merge = self.no_merge()?;
         Ok(self
             .open_pulls()?
             .iter()
@@ -1442,7 +1570,9 @@ impl Collector<'_> {
                     .rfind(|c| c["author"]["login"] == self.s.bot.as_str())
                     .or(comments.last())
                     .map_or(Value::Null, |c| c["url"].clone());
-                json!({"labeledAt": labelled, "html_url": p["url"], "reason_url": reason})
+                let base = p["baseRepository"]["nameWithOwner"].as_str();
+                let promote = p["isDraft"] == true && base.is_some_and(|b| no_merge.iter().any(|r| r.eq_ignore_ascii_case(b)));
+                json!({"labeledAt": labelled, "promote": promote, "html_url": p["url"], "reason_url": reason})
             })
             .collect())
     }
@@ -1722,6 +1852,10 @@ pub fn collect(
         None => unconfigured(),
     });
     capture("pace", &|_| c.pace());
+    capture("capacity", &|o| match s.limits.capacity_margin_percent {
+        Some(_) => c.capacity(got(o, "poll").as_ref()),
+        None => unconfigured(),
+    });
     capture("failures", &|_| c.failures());
     capture("held", &|_| c.held());
     capture("unqueued", &|o| c.unqueued(got(o, "approved").as_ref()));

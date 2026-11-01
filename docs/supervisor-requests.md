@@ -352,11 +352,20 @@ Required:
 
 Optional, each switching off only the checks that need it. Such a check
 reports `ok` with "Not configured." and makes no request, and the `unset`
-check names `schedulerJob` or `releaseRepository` while it is left out, so a
-dropped or misspelled key is seen:
+check names `schedulerJob`, `releaseRepository` or `capacityMarginPercent`
+while it is left out, so a dropped or misspelled key is seen:
 
-- `schedulerJob`: the poll workflow's scheduler job, whose log the `idle` and
-  `stuck` checks read.
+- `schedulerJob`: the poll workflow's scheduler job, whose log the `idle`,
+  `stuck` and `capacity` checks read.
+- `capacityMarginPercent`: a finite number ≥ 0, with no default; null is
+  left out. With it, the `capacity` check warns when a pool of the usage
+  snapshot is more than this many points under its `allowed_percent` while
+  one of the scheduler's newest passes (`idlePasses`) logged `idle: N slot(s)
+  free`. Its evidence is links only: first the pull requests those passes'
+  `blocker O/R#N: ...` lines name, then the usage snapshot comment and the
+  idle passes' runs. The percentages stay out of the report, as the snapshot
+  is private. It needs `--usage-config` and `schedulerJob`; without them the
+  check is unavailable.
 - `releaseRepository`, `wrapperRepository` and `wrapperPath`, all three or
   none: the repository whose latest release the `release` check compares with
   the pin in the wrapper workflow at that path.
@@ -382,6 +391,16 @@ dropped or misspelled key is seen:
   required. The cooldown applies outside the daily pass. `kinds`, `maxDispatchesPerPass`, `maxDispatchesPerDay`,
   `dailyCaps`, `tracker`, `state`, `project` and `passConfig` are described below;
   `profile` and `skipUnchangedFailures` under [workflow steps](#workflow-steps).
+  The health pass reads `passConfig` too: the `held` check leaves out a draft
+  pull request whose base repository is in its `pr.noMerge`, the operator's
+  promote queue; a file that does not read leaves `held` unavailable.
+
+Two checks leave out what nothing can change. The `runs` check leaves out a
+run still listed as unfinished seven days after it started: GitHub has
+refused both cancel and force-cancel on such runs. The `broker` check reports
+`ok`, saying the probe is off, when every listed probe run was skipped: the
+probe's job condition is false, so nothing observes the broker, and that is
+not a token's missing access.
 
 All new daily caps default to zero (disabled), accept integers from zero to 100,
 and `status_update` accepts at most one. Dispatches of all admitted kinds share
@@ -421,6 +440,7 @@ have no policy maximum.
 | `unavailableFailHours`, `unqueuedWaitHours`, `unclosedWaitHours`, `releaseOverdueHours` | 1 each | finite number ≥ 0 |
 | `holdWaitHours` | 12 | finite number ≥ 0 |
 | `paceMarginPercent` | 25 | finite number ≥ 0 |
+| `capacityMarginPercent` | none (check off) | finite number ≥ 0 |
 
 ## Lines
 
