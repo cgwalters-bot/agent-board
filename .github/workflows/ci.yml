@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Hosted Ubuntu supplies Java, Node and curl. The harness pins TLC's hash.
+      # Hosted Ubuntu supplies Java, Rust and curl. The Rust harness pins TLC's hash.
       - run: bash specs/check.sh
       - run: python3 .github/agentic-job/test_review.py
   rust:

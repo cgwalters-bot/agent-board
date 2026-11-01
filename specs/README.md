@@ -15,7 +15,7 @@ with TLC's invariant-violation exit code, not merely fail to parse.
 
 ## Run it
 
-Install Java (17 or newer), Node (18 or newer) and curl, then from the checkout:
+Install Java (17 or newer), Rust (edition 2024) and curl, then from the checkout:
 
 ```sh
 bash specs/check.sh
@@ -25,8 +25,10 @@ If Java is not on PATH, set `JAVA_BIN` to its executable. The script downloads
 the official TLA+ tools v1.7.4 jar, checks its pinned SHA-256 before executing
 it, and leaves logs and state files in a newly printed directory under your
 home directory, not in the checkout. No credentials or forge writes are needed.
-`check.sh` is a small shell entry point; the standard-library Node harness handles
-download verification and result checking. CI runs the same command.
+`check.sh` is a small shell entry point; the Rust harness
+[`specs-check`](../crates/agent-board/src/bin/specs-check.rs) handles download
+verification and result checking. The release binaries do not include it. CI
+runs the same command.
 
 The three configurations share one module, `DispatchJoin.tla`:
 
