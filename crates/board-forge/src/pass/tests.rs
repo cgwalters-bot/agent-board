@@ -9681,7 +9681,7 @@ fn budget_refuses_past_its_limit() {
     let error = budget.get(url, None).err().unwrap();
     assert_eq!(
         error.to_string(),
-        "the pass's request budget (500) is spent"
+        "the pass's request budget (650) is spent"
     );
     // Writes spend the reserve reads leave them; the replay then refuses
     // each, but only after the budget let it through.
@@ -9692,7 +9692,7 @@ fn budget_refuses_past_its_limit() {
     let error = budget.send("PATCH", url, &json!({})).err().unwrap();
     assert_eq!(
         error.to_string(),
-        "the pass's request budget (500) is spent"
+        "the pass's request budget (650) is spent"
     );
 }
 

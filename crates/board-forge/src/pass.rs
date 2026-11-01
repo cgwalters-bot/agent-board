@@ -39,7 +39,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Every forge request of one pass, the pull request poll's reads included:
 /// a bound on an unbounded board scan or a runaway dispatch loop.
-pub const PASS_REQUEST_LIMIT: usize = 500;
+pub const PASS_REQUEST_LIMIT: usize = 650;
 /// How long one pass may take before it defers what is left.
 pub const PASS_SECONDS_LIMIT: u64 = 15 * 60;
 /// How much longer than [`PASS_SECONDS_LIMIT`] what was under way may take

@@ -605,7 +605,7 @@ example/work#14 is open)`. Each change is one write step; one that
 `--max-writes` holds starts `held by --max-writes: `. An applying pass
 reads the item's Status again just before writing it, and leaves one a
 person changed since (`changed to X since the board was read`); that read
-and the write are two of the pass's 500 requests, so once the budget or the
+and the write are two of the pass's 650 requests, so once the budget or the
 time bound is spent the rest wait for the next pass, on one line. The stage
 is not serialized by the hold that keeps two passes from starting work: two
 overlapping passes derive the same values, and the read before each write
@@ -830,7 +830,7 @@ made, stop the affected operation, and recover by observation on the next pass.
 Deleting a local cache must never authorize replay.
 
 To stop an unbounded board scan or runaway dispatch loop, use one fixed pass
-budget: at most 500 forge requests and 15 minutes, including existing subcommand
+budget: at most 650 forge requests and 15 minutes, including existing subcommand
 work; existing tighter read/action bounds still apply. Report exhaustion and
 defer unresolved decisions, never interpret truncated data as empty.
 Starting ready work is the pass's main job, so stage 4 keeps what a start may
@@ -2370,7 +2370,7 @@ file setting. A minimal file enables no new work or optional publisher. Existing
 enabled deployments retain their behavior: omitting an opt-in does not disable
 the pass's ordinary PR follow-up or Status reconciliation when their inputs are
 configured. `--max-dispatch` and `--max-writes` have no default cap; local apply
-requires both explicitly. The fixed 500-request/15-minute budget (two minutes
+requires both explicitly. The fixed 650-request/15-minute budget (two minutes
 to finish work already under way), the 50 default `--max-status-changes` refusal
 threshold and the tighter feature bounds still apply. These limits bound runaway
 scans and writes; they do not grant new authority or replace agentic-job checks.
