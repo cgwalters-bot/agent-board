@@ -1409,7 +1409,8 @@ cancelled too.
   `wip` ([reviews](#reviews)).
 * **Required checks, stage 2 (agent-board#413).** Before spending a fix round
   or stopping the bot's pull request from its fork, rerun the Actions runs
-  named by its failed checks once per head. This uses the existing failed-check
+  named by its failed checks once per head and check (workflow ID, event and
+  name; [receipt and recovery details](poll.md#failed-checks-before-fix-rounds)). This uses the existing failed-check
   selection: with a merge queue, required checks (or all checks where none
   are required); without a merge queue, all checks, including optional ones. Each
   job URL must be in the PR's repository; the job's run must be completed with
@@ -1421,10 +1422,11 @@ cancelled too.
   `check rerun OWNER/REPO#N SHA: failed jobs ci (run ID) at head SHA, … -> re-run`
   logs the jobs and head. The claim, marker and rerun requests together are
   one write step within `--max-writes`, not a fix round or agent dispatch.
-  The marker records `checks_rerun: SHA`, selected `checks_runs` IDs and the
+  The marker records `checks_rerun: SHA`, selected `checks_runs` IDs, `checks_keys` identities and the
   reservation time `checks_at` **before** the rerun requests, so an
   interrupted pass or refused request cannot buy another retry; authenticated
-  older markers also prevent a reset or return to that head buying one.
+  older markers also prevent a reset, fresh run ID or return to that head buying one
+  for the same check. Legacy head-only receipts reserve the whole head.
   Subsequent polls read those runs: stale attempt 1 results and in-progress
   retries wait rather than spending a fix round or stopping. A completed
   second failure spends a fix round or stops as before; successful retries
