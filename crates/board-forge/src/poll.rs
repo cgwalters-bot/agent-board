@@ -464,6 +464,9 @@ pub struct PollPolicy {
     /// ([`is_harness`]): such as an organization whose forks hold its
     /// branches. Empty (the default) is its fork alone.
     pub head_owners: Vec<String>,
+    /// The pass's `pr.noMerge`: exact base repositories never merged or
+    /// enqueued by the poll. Empty leaves merge decisions unchanged.
+    pub no_merge: Vec<String>,
     pub toil_fix_pool: String,
     /// `conflictFixPool`: the pool for a toil or rebase round whose pull
     /// request conflicts with its base, where conflicts and the other toil
@@ -847,6 +850,7 @@ impl PollPolicy {
             fix_bounds: bounds::FixBoundsSet::default(),
             // The pass's only.
             head_owners: Vec::new(),
+            no_merge: Vec::new(),
             stale_days: 0,
             reruns: false,
             review_pools: Vec::new(),
@@ -3231,6 +3235,21 @@ pub fn decide(
             return step("update", format!("{why}, so it is rebased onto {base}"));
         }
         return step(if harness { "needs-human" } else { "wait" }, why);
+    }
+    // Approval on a midstream fork can mean consent to promote upstream,
+    // not to land on the fork. Keep this after rounds and review holds, and
+    // before the single merge decision that also feeds queue retries.
+    let repository = text(pull, "/baseRepository/nameWithOwner");
+    if config
+        .policy
+        .no_merge
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(repository))
+    {
+        return step(
+            "wait",
+            "pr.noMerge: merging into this base repository is disabled",
+        );
     }
     if harness && matches!(verdicts(pull, config).0, Some((Review::Approved, _))) {
         step("merge", format!("approved by the operator at {head}"))
@@ -7471,6 +7490,17 @@ mod tests {
             // upstream pull request from the midstream organization's fork,
             // and a `bot/` branch within that fork.
             (
+                "an operator-approved ready headOwners branch merges by default",
+                "pull-470",
+                json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"},
+                    "headRefName": "bot/lint-erofs", "headOwners": ["cgwalters-forge"],
+                    "reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "merge",
+                None,
+            ),
+            (
                 "a head in a headOwners fork gets a fix",
                 "pull-470",
                 json!({"headRepositoryOwner": {"login": "cgwalters-forge"}, "headRefName": "bot/fsck-layout",
@@ -8474,7 +8504,7 @@ mod tests {
                 &cfg,
                 &p,
                 &classify_checks(&p, &required()),
-                &marker(state),
+                &marker(state.clone()),
                 (
                     Some(&fix_run).filter(|r| !r.is_null()),
                     review_run(&p).as_ref(),
@@ -8488,6 +8518,53 @@ mod tests {
                 "{name}: {}",
                 got.reason
             );
+            // The same scenarios with merge suppression must retain rounds,
+            // review requirements and human holds. Only merge-ready heads wait.
+            // An unrelated base entry must behave exactly like an absent option,
+            // even though the head is unchanged (as on an upstream PR).
+            for repository in [
+                "unlisted/repository".to_owned(),
+                text(&p, "/baseRepository/nameWithOwner").to_ascii_uppercase(),
+            ] {
+                let listed = repository != "unlisted/repository";
+                cfg.policy.no_merge = vec![repository];
+                let suppressed = decide(
+                    &cfg,
+                    &p,
+                    &classify_checks(&p, &required()),
+                    &marker(state.clone()),
+                    (
+                        Some(&fix_run).filter(|r| !r.is_null()),
+                        review_run(&p).as_ref(),
+                    ),
+                    &outages,
+                    now(),
+                );
+                if listed && action == "merge" {
+                    assert_eq!(suppressed.action, "wait", "{name}");
+                    assert_eq!(
+                        suppressed.reason,
+                        "pr.noMerge: merging into this base repository is disabled",
+                        "{name}"
+                    );
+                    // Neither a retry nor its exhausted tries may turn this
+                    // wait into an enqueue or a policy-only needs-human stop.
+                    for tries in [0, QUEUE_TRIES] {
+                        let queued = queue_step(
+                            step(suppressed.action, &suppressed.reason),
+                            Removal::Retry("stack invalidated".into()),
+                            QueueState {
+                                tries,
+                                ..QueueState::default()
+                            },
+                            QUEUE_TRIES,
+                        );
+                        assert_eq!(queued, suppressed, "{name}");
+                    }
+                } else {
+                    assert_eq!(suppressed, got, "{name}");
+                }
+            }
         }
     }
 
@@ -10559,6 +10636,85 @@ mod tests {
                 .collect();
             assert_eq!(writes, expected, "{:?}", outcome.lines);
             assert!(dispatcher.writes.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn no_merge_blocks_direct_and_queued_merges_for_all_followed_authors() {
+        for queued in [false, true] {
+            for merge_only in [false, true] {
+                for repositories in [vec![], vec!["upstream/other".into()], vec![REPO.into()]] {
+                    let blocked = repositories == vec![REPO.to_owned()];
+                    let mut fake = github();
+                    fake.page(
+                        &format!("repos/{REPO}"),
+                        None,
+                        None,
+                        json!({"allow_rebase_merge": true}),
+                    );
+                    if queued {
+                        fake.rest
+                            .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                            .unwrap()
+                            .3
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"type": "merge_queue"}));
+                    }
+                    let mut p = pull(
+                        "pull-470",
+                        json!({"isCrossRepository": false,
+                        "headRepositoryOwner": {"login": "cgwalters-forge"},
+                        "headRefName": "bot/midstream",
+                        "reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}}),
+                    );
+                    if merge_only {
+                        p["author"] = json!({"__typename": "Bot", "login": "updater"});
+                        fake.page(
+                            &format!("repos/{REPO}/pulls?state=open&per_page=100"),
+                            None,
+                            None,
+                            json!([{"number": 470, "user": {"login": "updater[bot]"}}]),
+                        );
+                    }
+                    fake.pulls.insert(470, p);
+                    let mut cfg = config();
+                    cfg.policy.merge_authors = vec!["updater[bot]".into()];
+                    cfg.policy.head_owners = vec!["cgwalters-forge".into()];
+                    cfg.policy.no_merge = repositories;
+                    let dispatcher = Fake::default();
+                    let outcome = run(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        State::default(),
+                        &[],
+                        &[REPO.into()],
+                        applying(&dispatcher),
+                        now(),
+                    )
+                    .unwrap();
+                    assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                    let writes = fake.writes.borrow();
+                    assert_eq!(
+                        writes.iter().any(|(q, _)| q.contains("mergePullRequest")
+                            || q.contains("enqueuePullRequest")),
+                        !blocked,
+                        "queue={queued} merge_only={merge_only}: {:?}",
+                        outcome.lines
+                    );
+                    if blocked {
+                        assert!(writes.is_empty());
+                        assert!(
+                            outcome
+                                .lines
+                                .iter()
+                                .any(|l| l.contains("wait: pr.noMerge:"))
+                        );
+                    }
+                    assert!(dispatcher.writes.borrow().is_empty());
+                }
+            }
         }
     }
 
@@ -15097,6 +15253,10 @@ mod tests {
                 Waiting,
             ),
             (format!("o/r#3{AHEAD_IN_QUEUE}rebased after it"), Waiting),
+            (
+                "pr.noMerge: merging into this base repository is disabled".into(),
+                Person,
+            ),
             ("a wait nobody wrote yet".into(), Person),
         ];
         // One case a wait the poll decides, and one it does not know.
@@ -16314,7 +16474,8 @@ mod tests {
                     change: Value,
                     marker: &Value,
                     failing: Option<&str>,
-                    queue: &Value| {
+                    queue: &Value,
+                    no_merge: bool| {
             let mut fake = github();
             fake.rest
                 .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
@@ -16397,6 +16558,9 @@ mod tests {
             );
             let mut config = config();
             config.policy.merge_queue = tries;
+            if no_merge {
+                config.policy.no_merge = vec![REPO.into()];
+            }
             let outcome = run(
                 &fake,
                 &fake,
@@ -16418,8 +16582,23 @@ mod tests {
         };
         for (name, tries, mut change, marker, failing, queue, line, writes, recorded) in cases {
             let restart = change.as_object_mut().unwrap().remove("restart");
+            if writes.iter().any(|w| w == "enqueuePullRequest") {
+                let (fake, dispatcher, outcome, markers) =
+                    pass(tries, change.clone(), &marker, failing, &queue, true);
+                assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+                assert!(
+                    outcome.lines.last().unwrap().ends_with(
+                        "wait: pr.noMerge: merging into this base repository is disabled"
+                    ),
+                    "{name}: {:?}",
+                    outcome.lines
+                );
+                assert!(fake.writes.borrow().is_empty(), "{name}");
+                assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+                assert!(markers.is_empty(), "{name}");
+            }
             let (mut fake, mut dispatcher, mut outcome, mut markers) =
-                pass(tries, change.clone(), &marker, failing, &queue);
+                pass(tries, change.clone(), &marker, failing, &queue, false);
             if let Some(removal) = restart {
                 // The next pass reads the newest marker the first wrote.
                 let newest = markers.last().unwrap().clone();
@@ -16431,7 +16610,7 @@ mod tests {
                 assert_eq!(read.queue.unwrap().queued.as_deref(), Some(HEAD), "{name}");
                 change["timelineItems"] = removal;
                 (fake, dispatcher, outcome, markers) =
-                    pass(tries, change, &newest, failing, &queue);
+                    pass(tries, change, &newest, failing, &queue, false);
             }
             let got = outcome.lines.last().unwrap();
             assert!(got.ends_with(line), "{name}: {got}");

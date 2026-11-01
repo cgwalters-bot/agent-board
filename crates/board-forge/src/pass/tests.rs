@@ -8733,6 +8733,35 @@ fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
     let parsed = Config::parse(&minimal.to_string()).unwrap();
     assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
+    assert!(parsed.pr.no_merge.is_empty());
+    assert!(parsed.poll(None).policy.no_merge.is_empty());
+    for repositories in [
+        json!([]),
+        json!(["cgwalters-forge/bootc", "cgwalters-forge/composefs-rs"]),
+    ] {
+        let mut settings = minimal.clone();
+        settings["pr"] = json!({"noMerge": repositories});
+        let parsed = Config::parse(&settings.to_string()).unwrap();
+        assert_eq!(json!(parsed.pr.no_merge), repositories);
+        assert_eq!(json!(parsed.poll(None).policy.no_merge), repositories);
+    }
+    for repositories in [
+        json!(null),
+        json!("o/r"),
+        json!([1]),
+        json!(["o/*"]),
+        json!(["o/r/extra"]),
+        json!(["https://github.com/o/r"]),
+        json!([""]),
+        json!(["o/.."]),
+    ] {
+        let mut settings = minimal.clone();
+        settings["pr"] = json!({"noMerge": repositories});
+        assert!(
+            Config::parse(&settings.to_string()).is_err(),
+            "{repositories}"
+        );
+    }
     assert!(parsed.pools.0.is_empty() && parsed.dispatch_ref.is_none());
     assert_eq!(parsed.wip, 0);
     assert!(!parsed.reruns && !parsed.leases && !parsed.body_plans && !parsed.triage_close);
@@ -9924,6 +9953,92 @@ fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, com
             "request": {"get": format!("{API_ROOT}repos/{repo}/{path}")},
             "answer": {"status": 200, "link": null, "body": body},
         }));
+    }
+}
+
+#[test]
+fn no_merge_preserves_followed_rounds_and_holds() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+        "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+        "pageInfo": {"hasPreviousPage": false}});
+    for queued in [false, true] {
+        for (name, change, action) in [
+            ("ready", json!({}), "wait: pr.noMerge:"),
+            ("conflict", json!({"mergeable": "CONFLICTING"}), "rebase:"),
+            (
+                "changes",
+                json!({"reviews": {"nodes": [{"state": "CHANGES_REQUESTED",
+                "author": {"__typename": "User", "login": "cgwalters"}, "commit": {"oid": "abc"},
+                "submittedAt": "2026-10-23T00:00:00Z", "body": "Fix it"}], "pageInfo": {"hasPreviousPage": false}}}),
+                "fix:",
+            ),
+            (
+                "unreviewed",
+                json!({"reviews": {"nodes": [], "pageInfo": {"hasPreviousPage": false}}}),
+                "wait: no approving review",
+            ),
+            (
+                "held",
+                json!({"labels": {"nodes": [{"name": "needs-human"}], "pageInfo": {"hasNextPage": false}}}),
+                "skip: labelled needs-human",
+            ),
+            (
+                "continuation",
+                json!({"isDraft": true, "body": "```checkpoint\n{\"reason\":\"budget\",\"done\":\"half\",\"left\":\"half\",\"next\":\"finish\"}\n```"}),
+                "continue:",
+            ),
+        ] {
+            let mut forge = Forge::new(None, false);
+            let settings = json!({"wip": 0, "follow": [REPO], "pr": {"fixPools": ["claude"],
+                "headOwners": ["cgwalters-forge"], "noMerge": [REPO], "rebaseRounds": 1}});
+            let mut fields = json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"},
+                "headRefName": "bot/midstream", "reviews": approval});
+            fields
+                .as_object_mut()
+                .unwrap()
+                .extend(change.as_object().unwrap().clone());
+            followed(&mut forge.replay, (REPO, 9), fields, json!([]));
+            if queued {
+                answer(
+                    &mut forge.replay,
+                    &format!("repos/{REPO}/rules/branches/main"),
+                )["body"] = json!([{"type": "merge_queue"}]);
+            }
+            for (path, body) in [
+                ("user", json!({"login": "cgwalters-bot"})),
+                ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+            ] {
+                forge
+                    .replay
+                    .requests
+                    .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+                    "answer": {"status": 200, "link": null, "body": body}}));
+            }
+            let cfg = config(settings);
+            for report in [preview(&cfg, &forge.replay), apply(&forge, &cfg)] {
+                assert_eq!(
+                    report.failures, 0,
+                    "{name} queue={queued}: {:?}",
+                    report.lines
+                );
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.contains(&format!("{REPO}#9 abc {action}"))),
+                    "{name} queue={queued}: {:?}",
+                    report.lines
+                );
+            }
+            assert!(
+                forge.writes.borrow().iter().all(|(_, _, body)| {
+                    let body = body.to_string();
+                    !body.contains("mergePullRequest") && !body.contains("enqueuePullRequest")
+                }),
+                "{name} queue={queued}"
+            );
+        }
     }
 }
 
