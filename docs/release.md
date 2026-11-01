@@ -4,7 +4,7 @@
 > Evidence read on 30 October 2026 at agent-board `0c58afb`, tracker `34c36db` and review `ea38559`; nothing here tags or publishes a release.
 
 agent-board has never been released: the workspace version is `0.1.0`, the
-repository has no tags and no release workflow, and its one deployment
+repository has no tags or published release, and its one deployment
 builds a reviewed commit from source. v1.0 is criterion 3 of
 [tracker#939](https://github.com/cgwalters-forge/tracker/issues/939), and
 [#466](https://github.com/cgwalters-forge/agent-board/issues/466) prepares it.
@@ -44,7 +44,7 @@ step, fails CI while any gate here is blocked.
 | `deployment-logic` | The deployment's logic lives in agent-board, not in tracker's workflows ([tracker#890](https://github.com/cgwalters-forge/tracker/issues/890)) | All 14 port sub-issues are closed and tracker's only script left is `config.test.cjs` ([plan of 25 October](https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-6400999456), rechecked at tracker `34c36db`) | tracker's `poll.yml` ran `agent-board pass` at pin `7a73c07` from tracker `a365418` ([run 41085678834](https://github.com/cgwalters-forge/tracker/actions/runs/41085678834)), and tracker `34c36db` pins `0c58afb`; tracker#890 is open, and still missing: tracker's `supervisor.yml` passes `--result-url` rather than the artifact hand-back of [#420](https://github.com/cgwalters-forge/agent-board/pull/420); [#494](https://github.com/cgwalters-forge/agent-board/pull/494), [`88d51db`](https://github.com/cgwalters-forge/agent-board/commit/88d51dbbef245dca643b9017a18190ca0b9c741b), ships the Priority-ordered review starts, but `pass.json` has no `pr.reviewPools`, [#439](https://github.com/cgwalters-forge/agent-board/issues/439) is `needs-human` and [agentic-job#2163](https://github.com/cgwalters-forge/agentic-job/issues/2163)'s caller side is open; the infra move waits on the operator | blocked |
 | `shared-logic` | One logic, two frontends: the review app renders what the pass decides ([#307](https://github.com/cgwalters-forge/agent-board/issues/307)) | [#360](https://github.com/cgwalters-forge/agent-board/pull/360), [#372](https://github.com/cgwalters-forge/agent-board/pull/372), [#373](https://github.com/cgwalters-forge/agent-board/pull/373) publish the holds and [review#183](https://github.com/cgwalters-forge/review/pull/183) renders them; [#477](https://github.com/cgwalters-forge/agent-board/pull/477), [`b9228a1`](https://github.com/cgwalters-forge/agent-board/commit/b9228a1b0e5f5bb74a745b99091db5a25692b08b), publishes the needs-you list (tracker's `holds.needsYou` is `true`) and [review#212](https://github.com/cgwalters-forge/review/pull/212), [`ea38559`](https://github.com/cgwalters-forge/review/commit/ea38559ac7b3882a4f19cae66fd2ab798b72b8dc), shows it | None: no recorded check that the review app shows a live pass's holds and needs-you list | blocked |
 | `backlog` | Every open agent-board issue is a sub-issue of tracker#939 or P2, and none is `needs-design` | The [readiness audit](prune.md#readiness-audit--30-october-2026) ([#470](https://github.com/cgwalters-forge/agent-board/pull/470), [`9542fbb`](https://github.com/cgwalters-forge/agent-board/commit/9542fbbc15268fae52c0ba8e29505d11c1ec5eea)) proposes each issue's action | None: the proposals [still pending](#pending-backlog-decisions) are not applied, and six issues are still `needs-design` | blocked |
-| `release-path` | A tagged release with binaries and their SHA-256 checksums, built from the tagged commit on main | None: no `release.yml` here; [Install](#install-and-build-today) builds from source | None: no release | blocked |
+| `release-path` | A tagged release with binaries and their SHA-256 checksums, built from the tagged commit on main | Implemented but unreleased: [release.yml](../.github/workflows/release.yml) reuses agentic-job's manual path; CI tests version refusals and builds the static binaries. No merged implementation evidence recorded yet | None: no release or dispatched release run | blocked |
 | `changelog` | A changelog with the v1 section | The [changelog](../CHANGELOG.md)'s Unreleased section ([#472](https://github.com/cgwalters-forge/agent-board/pull/472), [`8d3e136`](https://github.com/cgwalters-forge/agent-board/commit/8d3e13600434df0bea5cbb7186b36a1934f453ec)); no v1 section | n/a | blocked |
 
 Two of tracker#939's slices are not gates. [#471](https://github.com/cgwalters-forge/agent-board/issues/471)'s
@@ -64,8 +64,10 @@ These stay blocked until the operator decides them; no change here can.
   who authorizes release-triggered use, and where reports go without giving
   stage credentials production authority. [Setup](setup.md#the-stage-deploy-smoke-path)
   lists the installation steps that follow those answers.
-- **Release policy:** adding a `release.yml` here and pointing the release
-  train at agent-board ([below](#install-and-build-today)).
+- **Release policy:** the operator's decision to adopt the manual workflow by
+  merging it, when to dispatch the first release, and whether ever to point the
+  release train at agent-board ([below](#manual-release-path)). Nothing here
+  dispatches it or changes the train's configuration.
 - **Pass health and spend coverage:** what “a board healthy without the
   operator's hands” means for tracker#939, and which repositories tracker's
   `budget.harnessRepositories` names so the four-week report can run
@@ -148,14 +150,46 @@ and builds it with `cargo install --locked --rev`
 through `just build-agent-board` with `AGENT_BOARD_REV`, and its
 `agent-board-pin` workflow proposes moving that pin. CI's `rust` job runs
 `just check` and the CLI against the fixture on every pull request and on
-main. There are no release binaries, so there are no checksums to verify.
+main. CI also builds the static release target. No release has been published;
+[setup](setup.md#download-and-verify-a-release) documents verification for when one is.
 
-The release path to reuse rather than build: the [release train](release-train.md)
-already bumps a Rust workspace's version and dispatches the release
-repository's `release.yml` with `version`, and agentic-job's `release.yml`
-tags main's commit and publishes static binaries with SHA-256 checksums and
-an attested manifest. Adding such a workflow here, and pointing the train at
-agent-board, changes release policy and needs the operator's decision first.
+## Manual release path
+
+[release.yml](../.github/workflows/release.yml) and the shared static
+[build.yml](../.github/workflows/build.yml) adapt cgwalters-forge/agentic-job's
+workflows, without its secure-host image steps. Merging this workflow adopts a
+manual release policy; nothing is published until the operator dispatches it.
+The operator's policy decision remains open until that merge. There is no
+schedule, version bump or release-train enrollment in this change.
+
+After a reviewed workspace version change reaches main, dispatch `release.yml`
+on `main` with `version=MAJOR.MINOR.PATCH`. `just release-check VERSION` reads
+the checkout's `v*` tags, refuses malformed versions/tags, workspace mismatch,
+and versions not newer than every existing version tag, and prints the previous
+tag for release notes (empty for the first release). This checker is adapted
+from agentic-job's Rust checker, including its 1 MiB tag-input bound; its fixture
+tests run in `just check`. `cargo test --locked -p agent-board --bin release-check`
+and `cargo test --locked -p agent-board --test release` run the two release checklists.
+
+One release runs at a time. Read-only jobs validate and build the dispatched
+commit with `just build-static` for `x86_64-unknown-linux-musl`, using no build
+cache. A separate job attests `release.json` and verifies its bundle against the
+workflow on main and the dispatched commit without a token. Only the publish
+job has `contents: write`; it executes no project code. It rechecks the tag
+inventory, creates `vVERSION` explicitly at the dispatched SHA (never reuses an
+existing tag), and publishes `agent-board-x86_64-unknown-linux-musl`,
+`gh-agent-board-x86_64-unknown-linux-musl`, `SHA256SUMS`, `release.json` and
+`provenance.jsonl`. The manifest records the repository, commit, tag, target and
+both binary checksums. Every action is pinned by full SHA.
+
+These checks stop accidental off-main releases, stale/ambiguous version upgrades,
+tag reuse and substitution of release assets. They do not protect against a
+maintainer editing the workflow on another branch: restrict creation of `v*`
+tags with a repository ruleset. If tagging succeeds but publication fails, a
+maintainer must inspect and clean up that tag/draft before retrying; no force
+replacement is attempted. No workflow run or live publication is evidence yet.
+The [release train](release-train.md) can dispatch this interface, but enrolling
+agent-board is a separate operator decision and is not configured here.
 
 ## Beyond the release
 

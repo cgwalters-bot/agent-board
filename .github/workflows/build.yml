@@ -1,0 +1,47 @@
+# Static build shared by CI and release, adapted from agentic-job's build.yml.
+name: build
+on:
+  workflow_call:
+    inputs:
+      release:
+        description: Tag recorded in the manifest (CI does not publish)
+        type: string
+        default: TAG
+permissions:
+  contents: read
+env:
+  TARGET: x86_64-unknown-linux-musl
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y --no-install-recommends musl-tools just
+        timeout-minutes: 5
+      - run: rustup target add "$TARGET"
+      - run: just build-static
+      - name: Stage static binaries and checksums
+        run: |
+          mkdir dist
+          for name in agent-board gh-agent-board; do
+            cp "target/$TARGET/release/$name" "dist/$name-$TARGET"
+            file "dist/$name-$TARGET" | tee /dev/stderr | grep -q 'static'
+            "dist/$name-$TARGET" --version
+          done
+          (cd dist && sha256sum agent-board-* gh-agent-board-*) > dist/SHA256SUMS
+      # An attested manifest binds the commit and tag to both binary digests.
+      - name: Manifest
+        env:
+          RELEASE: ${{ inputs.release }}
+        run: |
+          jq -n --arg repository "$GITHUB_REPOSITORY" --arg commit "$GITHUB_SHA" --arg tag "$RELEASE" \
+            --arg target "$TARGET" --rawfile sums dist/SHA256SUMS \
+            '{schema: "agent-board.release.v1", repository: $repository, commit: $commit, tag: $tag, target: $target, sha256sums: $sums}' > dist/release.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-board
+          path: dist/
+          if-no-files-found: error

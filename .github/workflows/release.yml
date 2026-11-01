@@ -1,0 +1,128 @@
+# Manual-only release, adapted from cgwalters-forge/agentic-job's release.yml.
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: MAJOR.MINOR.PATCH, matching the workspace and newer than every v* tag
+        required: true
+        type: string
+permissions:
+  contents: read
+# Prevent two releases from both passing the newer-than check.
+concurrency:
+  group: ${{ github.workflow }}
+env:
+  TARGET: x86_64-unknown-linux-musl
+jobs:
+  version:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      previous: ${{ steps.check.outputs.previous }}
+      tags: ${{ steps.check.outputs.tags }}
+    steps:
+      # Stops accidental publication of another branch; a v* ruleset is still
+      # needed to restrict who can create tags (a branch can remove this check).
+      - run: test "$GITHUB_REF" = refs/heads/main
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 install -y --no-install-recommends just
+      - id: check
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          previous=$(just release-check "$VERSION")
+          tags=$(git tag --list 'v*')
+          {
+            echo "tag=v$VERSION"
+            echo "previous=$previous"
+            echo "tags=$(printf '%s' "$tags" | LC_ALL=C sort | sha256sum)"
+          } >> "$GITHUB_OUTPUT"
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository] Build the dispatched revision, not a moving ref.
+    with:
+      release: ${{ needs.version.outputs.tag }}
+  # OIDC is isolated from project execution: signs bytes, runs no built binary.
+  attest:
+    needs: build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-board
+          path: dist
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        id: attest
+        with:
+          subject-path: dist/release.json
+      - name: Stage verification bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          mkdir provenance
+          cp "$BUNDLE" provenance/provenance.jsonl
+      - name: Verify without a token
+        run: >-
+          GH_TOKEN='' GITHUB_TOKEN='' gh attestation verify dist/release.json
+          --bundle provenance/provenance.jsonl --repo "$GITHUB_REPOSITORY"
+          --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/heads/main"
+          --source-ref refs/heads/main --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provenance
+          path: provenance/
+          if-no-files-found: error
+  # Only this job can tag/publish; it builds and executes no project code.
+  publish:
+    needs: [version, build, attest]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      PREVIOUS: ${{ needs.version.outputs.previous }}
+      TAGS: ${{ needs.version.outputs.tags }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-board
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: provenance
+      - run: sha256sum --check SHA256SUMS
+      # Refuse a tag race during the build rather than publish a stale version.
+      - name: Tags have not changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')
+          test "$(printf '%s' "$tags" | LC_ALL=C sort | sha256sum)" = "$TAGS"
+      # Explicit creation refuses an existing tag instead of attaching these
+      # binaries to a different commit. Failure afterwards leaves a tag to clean up.
+      - name: Tag dispatched commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"
+          -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" --silent
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          start=()
+          [ -z "$PREVIOUS" ] || start=(--notes-start-tag "$PREVIOUS")
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$TAG" --generate-notes "${start[@]}" \
+            "agent-board-$TARGET" "gh-agent-board-$TARGET" SHA256SUMS release.json provenance.jsonl
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
