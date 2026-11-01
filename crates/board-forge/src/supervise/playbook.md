@@ -58,6 +58,16 @@ use exactly these fields in addition to `type` and `action`:
   assignee or label, so it is not a question for the operator. Like a new
   issue, it is marked as yours; a dispatch on it refuses the whole batch
   until a person removes the mark.
+- `file_work`: `epic`, `title`, `body`; files work into the tracker as an
+  open sub-issue of `epic` (`OWNER/REPO#N` in the epics repository) and puts
+  it on the board at the board's last Priority. It is neither assigned nor
+  held: the board pass's triage plans it like any other child of the epic.
+  Its body ends with a line saying you filed it, and you cannot dispatch an
+  implement run on it; a triage or research run you may. Use it when the
+  board is short of runnable work you can name concretely. The epic must be
+  live (open, labelled `epic` by {{operator}} or the bot) and not labelled
+  `needs-human` or `needs-design`. You cannot choose its Priority, nor the
+  run, kind, pool or brief that does it.
 - `close`: `repository`, `item`, `triage_run` (URL), `triage_comment` (comment ID).
   The configured workflow must have completed a successful triage on this issue;
    its unedited bot comment must contain exactly one `schedule-triage` fenced

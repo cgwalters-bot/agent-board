@@ -324,6 +324,7 @@ A complete supervisor file:
       "comment": 4,
       "create_issue": 2,
       "file_bug": 2,
+      "file_work": 1,
       "close": 2,
       "remove_needs_human": 1,
       "clear_needs_human": 4,
@@ -431,6 +432,7 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"comment","repository":"OWNER/repo","item":1,"body":"Investigation and links."}
 {"type":"supervisor_action","action":"create_issue","title":"Decision needed","body":"Question and evidence."}
 {"type":"supervisor_action","action":"file_bug","title":"Failure class","body":"Failure and evidence."}
+{"type":"supervisor_action","action":"file_work","epic":"OWNER/epics#4","title":"Work to do","body":"What and why."}
 {"type":"supervisor_action","action":"close","repository":"OWNER/repo","item":1,"triage_run":"https://github.com/OWNER/tracker/actions/runs/456","triage_comment":789}
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
 {"type":"supervisor_action","action":"clear_needs_human","repository":"OWNER/repo","item":5,"evidence":"operator_comment","comment":901}
@@ -456,6 +458,31 @@ configured operator and labeled `needs-human`. `file_bug` files a failure with
 neither, so it is not an operator question; its own cap keeps it off unless
 configured. Both bodies carry the supervisor note below, so the supervisor
 never dispatches either until a person removes it.
+
+`file_work` lets the agent add work when the board runs short of it, which
+the two above cannot: their note blocks dispatch. Its own cap keeps it off
+unless configured, and it needs `tracker` and `project`; `tracker` must be
+one of the pass's work repositories, or the pass never triages what it
+files. The executor files the issue in `tracker` with no supervisor note,
+assignee or label, attaches it as a sub-issue of `epic` (`OWNER/REPO#N` in
+the epics repository) as the pass's [sweep](pass.md#the-weekly-sweep)
+attaches an issue, and adds it to `project` at the last option of its
+`Priority` field, as epic apply's `set_priority` does. The pass's triage
+then plans it like any other child of the epic. Its body ends with a fixed
+line saying the agent filed it, and the supervisor's own implement dispatch
+refuses an issue holding that line: otherwise the agent could file work
+and dispatch an implement run on it the next pass, with no plan between its
+text and the run. The request carries no brief, plan, kind, pool or
+Priority: the agent cannot pick the run that does the work. It still picks
+the epic, whose Priority ranks its children first, so the work ranks last
+among that epic's children, not below every other item. The
+epic must be live as the pass reads one: open and labelled `epic`, the
+newest labeling by the operator or the bot (a user account), so that someone
+with only triage access cannot make the agent's work their epic's child. An
+epic labelled `needs-human` or `needs-design` is refused: it waits on a
+person. The epic and the Priority field are read before the batch's first
+write. The issue is created first; if attaching or ranking it then fails,
+the log line names the issue it filed.
 The executor ends every comment, new issue and status update with the
 attribution poll uses (agent-board.json's `generatedBy`), rather than trusting
 the agent to.

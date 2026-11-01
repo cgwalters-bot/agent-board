@@ -357,9 +357,9 @@ impl Api for Fake {
             let options =
                 (self.objects.get("options").cloned()).unwrap_or(json!(["P0", "P1", "P2", "P3"]));
             let options: Vec<Value> = (options.as_array().unwrap().iter())
-                .map(|name| json!({"name": name}))
+                .map(|name| json!({"id": format!("O_{}", name.as_str().unwrap()), "name": name}))
                 .collect();
-            return Ok(json!({"node": {"field": {"options": options}}}));
+            return Ok(json!({"node": {"field": {"id": "F_priority", "options": options}}}));
         }
         if query.contains("search(") {
             // The spend split's search for the bot's comments, or the changes'.
@@ -403,15 +403,22 @@ impl Api for Fake {
             bail!("{method} {path}: HTTP 422");
         }
         if path == "/graphql" {
-            return Ok(
-                json!({"data": {"createProjectV2StatusUpdate": {"statusUpdate": {"id": "update"}}}}),
-            );
+            let query = body["query"].as_str().unwrap();
+            // Filed work's board item, then its Priority.
+            let item = json!({"id": "PVTI_item"});
+            return Ok(if query.contains("addProjectV2ItemById(") {
+                json!({"data": {"addProjectV2ItemById": {"item": item}}})
+            } else if query.contains("updateProjectV2ItemFieldValue(") {
+                json!({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": item}}})
+            } else {
+                json!({"data": {"createProjectV2StatusUpdate": {"statusUpdate": {"id": "update"}}}})
+            });
         }
         let mut id = self.next_id.borrow_mut();
         *id += 1;
         // A created issue answers with its number, as GitHub's API does.
         if path == "/repos/example/control/issues" {
-            return Ok(json!({"id": *id, "number": 738}));
+            return Ok(json!({"id": *id, "node_id": "I_738", "number": 738}));
         }
         Ok(json!({"id": *id}))
     }

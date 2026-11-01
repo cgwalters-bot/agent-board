@@ -14,7 +14,7 @@ fn configured_with(generated_by: Option<&str>) -> Settings {
     let mut cfg = supervisor();
     cfg["agent"]["dailyCaps"] = json!({"comment": 2, "create_issue": 1, "close": 1,
         "remove_needs_human": 1, "replace_state": 1, "status_update": 1, "file_bug": 1,
-        "clear_needs_human": 1});
+        "clear_needs_human": 1, "file_work": 1});
     cfg["agent"]["tracker"] = json!("example/control");
     cfg["agent"]["state"] = json!({"repository": "example/control", "issue": 8});
     cfg["agent"]["project"] = json!("PVT_project");
@@ -71,10 +71,36 @@ fn actions_signed(footer: &Footer) -> Vec<Value> {
             "clear_needs_human",
             json!({"repository": "example/project", "item": 6, "evidence": "operator_comment", "comment": 31}),
         ),
+        action(
+            "file_work",
+            json!({"epic": "example/control#2", "title": "Cache the census", "body": "Each pass reads it twice."}),
+        ),
     ]
 }
 
+/// The live epic `file_work` names: open, labelled `epic` last by the
+/// operator; `rest` overrides its REST fields, `by` the labeling's actor.
+fn epic(fake: &mut Fake, rest: Value, by: Value) {
+    let mut issue = json!({"state": "open", "labels": [{"name": "epic"}]});
+    for (k, v) in rest.as_object().unwrap() {
+        issue[k] = v.clone();
+    }
+    fake.objects
+        .insert("/repos/example/control/issues/2".into(), issue);
+    fake.issues.insert(
+        2,
+        json!({"timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": [
+            {"actor": {"__typename": "User", "login": "visitor"}, "label": {"name": "bug"}},
+            {"actor": by, "label": {"name": "epic"}}]}}),
+    );
+}
+
 fn evidence(fake: &mut Fake) {
+    epic(
+        fake,
+        json!({}),
+        json!({"__typename": "User", "login": "owner"}),
+    );
     fake.objects.insert(
         "/repos/example/control/issues/8".into(),
         json!({"state": "open", "labels": []}),
@@ -192,7 +218,9 @@ fn signs_with(generated_by: Option<&str>) {
         let out = run(&fake, &s, RESULT_URL, 1);
         assert!(out.ok, "{r}: {out:?}");
         let writes = fake.writes();
-        assert_eq!(writes.len(), 2, "{r}");
+        // Filed work is attached and put on the board too.
+        let more = if r["action"] == "file_work" { 3 } else { 0 };
+        assert_eq!(writes.len(), 2 + more, "{r}");
         assert_eq!(writes[0].1, "/repos/example/operator/issues/7/comments");
         assert!(writes[0].2["body"].as_str().unwrap().contains(": starting"));
         assert!(out.lines[0].contains(": done"));
@@ -241,6 +269,35 @@ fn signs_with(generated_by: Option<&str>) {
                 assert!(
                     out.lines[0].contains(": done, https://github.com/example/control/issues/738"),
                     "{out:?}"
+                );
+            }
+            "file_work" => {
+                // Neither assigned, held nor noted: the pass's triage plans it.
+                assert_eq!(path, "/repos/example/control/issues");
+                assert_eq!(
+                    body,
+                    &json!({"title": "Cache the census", "body": format!("Each pass reads it twice.\n\n{}\n\n{footer}",
+                        super::judgment::WORK_NOTE)})
+                );
+                assert!(!crate::input::is_supervisor_note(
+                    body["body"].as_str().unwrap()
+                ));
+                assert_eq!(writes[2].1, "/repos/example/control/issues/2/sub_issues");
+                // The created issue's id, after the log comment's.
+                assert_eq!(writes[2].2, json!({"sub_issue_id": 1002}));
+                let vars: Vec<&Value> = writes[3..].iter().map(|w| &w.2["variables"]).collect();
+                assert_eq!(
+                    vars,
+                    [
+                        &json!({"project": "PVT_project", "content": "I_738"}),
+                        // The board's last Priority, whatever the agent asks.
+                        &json!({"project": "PVT_project", "item": "PVTI_item",
+                            "field": "F_priority", "option": "O_P3"}),
+                    ]
+                );
+                assert_eq!(
+                    out.lines[0],
+                    "- `file_work` configured target under example/control#2: done, https://github.com/example/control/issues/738"
                 );
             }
             "close" => {
@@ -299,6 +356,83 @@ fn refuses(s: &Settings, r: Value, change: impl FnOnce(&mut Fake)) {
         fake.writes().is_empty(),
         "refusal must precede the first write: {r}"
     );
+}
+
+#[test]
+fn file_work_refuses_all_but_a_live_unheld_epic_and_bounded_text() {
+    let s = configured();
+    let work = |fields: Value| {
+        let mut r = action(
+            "file_work",
+            json!({"epic": "example/control#2", "title": "Cache it", "body": "Why."}),
+        );
+        for (k, v) in fields.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        r
+    };
+    for refused in [
+        json!({"title": ""}),
+        json!({"title": "x".repeat(257)}),
+        json!({"body": ""}),
+        json!({"body": "x".repeat(4001)}),
+        json!({"body": "```agent-board-job-plan\n{}\n```"}),
+        json!({"body": "<!-- tracker-poll {} -->"}),
+        // Only in the epics repository, and only as OWNER/REPO#N.
+        json!({"epic": "example/project#2"}),
+        json!({"epic": "https://github.com/example/control/issues/2"}),
+        json!({"epic": "#2"}),
+        json!({"epic": "example/control#0"}),
+        json!({"epic": 2}),
+    ] {
+        refuses(&s, work(refused), |_| {});
+    }
+    let user = |login: &str| json!({"__typename": "User", "login": login});
+    for (rest, by) in [
+        (json!({"state": "closed"}), user("owner")),
+        (json!({"labels": []}), user("owner")),
+        (json!({"pull_request": {}}), user("owner")),
+        (json!({"labels": null}), user("owner")),
+        // A person settles a held epic before it takes work.
+        (
+            json!({"labels": [{"name": "epic"}, {"name": "needs-human"}]}),
+            user("owner"),
+        ),
+        (
+            json!({"labels": [{"name": "Epic"}, {"name": "Needs-Design"}]}),
+            user("owner"),
+        ),
+        // Labelled by someone with triage access, or an app named like the
+        // operator: not live.
+        (json!({}), user("visitor")),
+        (json!({}), json!({"__typename": "Bot", "login": "owner"})),
+    ] {
+        refuses(&s, work(json!({})), |f| epic(f, rest, by));
+    }
+    // The bot's label makes it live as the operator's does.
+    let mut fake = Fake::new(&block(&[work(json!({}))]));
+    evidence(&mut fake);
+    epic(&mut fake, json!({}), user("worker"));
+    assert!(run(&fake, &s, RESULT_URL, 1).ok);
+    // Filed but not attached: the log names the issue for a person.
+    let mut fake = Fake::new(&block(&[work(json!({}))]));
+    evidence(&mut fake);
+    fake.fail = Some("/repos/example/control/issues/2/sub_issues".into());
+    let out = run(&fake, &s, RESULT_URL, 1);
+    assert!(!out.ok);
+    assert!(
+        out.lines[0].contains("failed (filed example/control#738: "),
+        "{out:?}"
+    );
+    // Without a project, or a Priority option to set, it files nothing.
+    let mut cfg = supervisor();
+    cfg["agent"]["dailyCaps"] = json!({"file_work": 1});
+    cfg["agent"]["tracker"] = json!("example/control");
+    let unboarded = Settings::from_json(&board(), &cfg, None).unwrap();
+    refuses(&unboarded, work(json!({})), |_| {});
+    refuses(&s, work(json!({})), |f| {
+        f.objects.insert("options".into(), json!([]));
+    });
 }
 
 #[test]
@@ -755,6 +889,12 @@ fn forbidden_actions_injected_targets_and_protocol_comments_never_write() {
             json!({"log": 12}),
             json!({"assignees": ["attacker"]}),
             json!({"labels": ["epic"]}),
+            // No run's text or choice: filed work is the pass's to plan.
+            json!({"brief": "Implement it."}),
+            json!({"plan": {"kind": "implement"}}),
+            json!({"kind": "implement"}),
+            json!({"pool": "large"}),
+            json!({"priority": "P0"}),
         ] {
             let mut injected = r.clone();
             for (k, v) in extra.as_object().unwrap() {
@@ -1725,14 +1865,25 @@ fn implement_requires_native_membership_under_an_epic_labeled_plan() {
             );
         });
     }
+    let epic = |f: &mut Fake| {
+        f.objects.insert(
+            "/repos/example/project/issues/3/parent".into(),
+            json!({"repository_url": "https://api.github.com/repos/example/control", "number": 10}),
+        );
+        f.objects.insert(
+            "/repos/example/control/issues/10".into(),
+            json!({"state": "open", "labels": [{"name": "epic"}]}),
+        );
+    };
+    // The agent's own filed work goes to the pass's triage, not to an
+    // implement run the agent picks.
+    refuses(&s, r.clone(), |f| {
+        epic(f);
+        f.objects
+            .get_mut("/repos/example/project/issues/3")
+            .unwrap()["body"] = json!(format!("Do it.\n\n{}", super::judgment::WORK_NOTE));
+    });
     let mut fake = Fake::new(&block(&[r]));
-    fake.objects.insert(
-        "/repos/example/project/issues/3/parent".into(),
-        json!({"repository_url": "https://api.github.com/repos/example/control", "number": 10}),
-    );
-    fake.objects.insert(
-        "/repos/example/control/issues/10".into(),
-        json!({"state": "open", "labels": [{"name": "epic"}]}),
-    );
+    epic(&mut fake);
     assert!(run(&fake, &s, RESULT_URL, 1).ok);
 }

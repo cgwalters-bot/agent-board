@@ -493,7 +493,9 @@ fragment Actor on Actor { __typename login }"#;
 /// had the bot post on the target would carry that text in anyway, and the
 /// run's answer would be read by the next pass, so one agent run would steer
 /// the next in a loop. An issue it created carries the note in its body, so
-/// it is not dispatched here until a person removes it.
+/// it is not dispatched here until a person removes it; work it filed for
+/// the pass's triage (`file_work`) carries none, and is refused only an
+/// implement run ([`preflight`]).
 ///
 /// `writers` adds agent-board#111's check, for a closure: a triage verdict
 /// closes the issue with no review after it, so the run must have read only
@@ -620,6 +622,12 @@ fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
     ensure!(!held, "The issue is the operator's or held");
     conversation(api, &r.repository, r.item, false)?;
     if r.kind == "implement" {
+        ensure!(
+            !issue["body"]
+                .as_str()
+                .is_some_and(|b| b.contains(judgment::WORK_NOTE)),
+            "The issue is the supervisor agent's filed work, for triage to plan"
+        );
         // The supervisor must not turn an ordinary issue into approved work.
         // Native parentage and the operator's epic label are read, not supplied
         // by the request or inferred from links in attacker-controlled prose.

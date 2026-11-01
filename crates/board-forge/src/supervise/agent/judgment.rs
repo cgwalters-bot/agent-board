@@ -4,6 +4,9 @@ use super::*;
 use crate::Footer;
 use crate::changes;
 use crate::dispatch::{GitHub, Start, StartOutcome};
+use crate::epic::{EPIC_LABEL, epic_labelled_by};
+use crate::github::{DEFAULT_HOST, parse_github_issue};
+use board_core::ItemRef;
 use board_core::NEEDS_HUMAN_LABEL as NEEDS_HUMAN;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -13,6 +16,7 @@ pub const ACTIONS: &[&str] = &[
     "comment",
     "create_issue",
     "file_bug",
+    "file_work",
     "close",
     "remove_needs_human",
     "clear_needs_human",
@@ -53,6 +57,23 @@ pub enum Write {
     FileBug {
         title: String,
         body: String,
+    },
+    /// An issue in the tracker as an open sub-issue of `epic`, a live epic
+    /// (`OWNER/REPO#N` in the epics repository), on the board at its last
+    /// Priority, and neither assigned, held nor marked with the supervisor
+    /// note, which the pass refuses: work the pass's triage plans as any
+    /// other child. [`WORK_NOTE`] keeps the supervisor's own implement
+    /// dispatch off it, so that the agent's text reaches an implement run
+    /// only through that plan. No brief, plan, kind or pool: the agent
+    /// cannot choose the run that does it.
+    FileWork {
+        epic: String,
+        title: String,
+        body: String,
+        /// The project's Priority field and its last option, read by
+        /// [`Checked::preflight`] before any write.
+        #[serde(skip)]
+        priority: Option<(String, String)>,
     },
     Close {
         repository: String,
@@ -114,8 +135,15 @@ const NEWEST_UPDATE: &str = "query($id:ID!){node(id:$id){... on ProjectV2{status
 /// The project field whose option order ranks the queue, as the pass's
 /// default `priorityField`.
 const PRIORITY_FIELD: &str = "Priority";
-/// The options of the project's [`PRIORITY_FIELD`], in the board's order.
-const PRIORITY_OPTIONS: &str = "query($id:ID!,$field:String!){node(id:$id){... on ProjectV2{field(name:$field){... on ProjectV2SingleSelectField{options{name}}}}}}";
+/// The project's [`PRIORITY_FIELD`] and its options, in the board's order.
+const PRIORITY_OPTIONS: &str = "query($id:ID!,$field:String!){node(id:$id){... on ProjectV2{field(name:$field){... on ProjectV2SingleSelectField{id options{id name}}}}}}";
+/// Puts filed work on the project, as epic apply's `set_priority` does.
+const ADD_ITEM: &str = "mutation($project:ID!,$content:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}}";
+const SET_PRIORITY: &str = "mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}";
+/// The line `file_work` ends its issue's body with. Without it, an injected
+/// agent could file work and dispatch an implement run on it the next pass,
+/// with no triage plan between its text and the run.
+pub(super) const WORK_NOTE: &str = "Filed by the supervisor's agent for the board pass's triage to plan; the supervisor dispatches no implement run on it.";
 /// The whole of the operator's comment that releases a `needs-human` hold.
 const RELEASE_COMMAND: &str = "/release";
 
@@ -271,6 +299,7 @@ impl Checked {
                 Write::Comment { .. } => "comment",
                 Write::CreateIssue { .. } => "create_issue",
                 Write::FileBug { .. } => "file_bug",
+                Write::FileWork { .. } => "file_work",
                 Write::Close { .. } => "close",
                 Write::RemoveNeedsHuman { .. } => "remove_needs_human",
                 Write::ClearNeedsHuman { .. } => "clear_needs_human",
@@ -306,7 +335,13 @@ impl Checked {
         if let Self::Write(w) = self {
             match w {
                 Write::Comment { body, .. } => text(body, 4000, true, &p.settings.footer)?,
-                Write::CreateIssue { title, body } | Write::FileBug { title, body } => {
+                Write::CreateIssue { title, body }
+                | Write::FileBug { title, body }
+                | Write::FileWork { title, body, .. } => {
+                    if let Write::FileWork { epic, .. } = w {
+                        epic_ref(epic, p)?;
+                        ensure!(p.agent.project.is_some(), "No configured project");
+                    }
                     let repo = p
                         .agent
                         .tracker
@@ -392,6 +427,12 @@ impl Checked {
                 "`{}` configured target (no spend split: {reason})",
                 self.action()
             ),
+            // Checked by `validate` before anything is described.
+            Self::Write(Write::FileWork { epic, .. }) => {
+                let epic = parse_github_issue(epic, None, DEFAULT_HOST)
+                    .map_or_else(|_| epic.clone(), |e| e.display());
+                format!("`{}` configured target under {epic}", self.action())
+            }
             _ => {
                 let target = self
                     .issue()
@@ -416,7 +457,9 @@ impl Checked {
             return format!("https://github.com/{repository}/issues/{item}#issuecomment-{id}");
         }
         let target = self.issue().or_else(|| match self {
-            Self::Write(Write::CreateIssue { .. } | Write::FileBug { .. }) => p
+            Self::Write(
+                Write::CreateIssue { .. } | Write::FileBug { .. } | Write::FileWork { .. },
+            ) => p
                 .agent
                 .tracker
                 .as_deref()
@@ -452,6 +495,16 @@ impl Checked {
                 }
                 Err(error) => *body = Some(Err(format!("{error:#}"))),
             }
+            return Ok(());
+        }
+        if let Self::Write(Write::FileWork { epic, priority, .. }) = self {
+            live_epic(api, p, &epic_ref(epic, p)?)?;
+            let project = p
+                .agent
+                .project
+                .as_deref()
+                .context("No configured project")?;
+            *priority = Some(last_priority(api, project)?);
             return Ok(());
         }
         let this = &*self;
@@ -592,6 +645,12 @@ impl Checked {
                     ),
                     json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE), &p.settings.footer)}),
                 ),
+                Write::FileWork {
+                    epic,
+                    title,
+                    body,
+                    priority,
+                } => return file_work(api, p, (epic, title, body), priority.as_ref()),
                 Write::Close {
                     repository, item, ..
                 } => (
@@ -660,6 +719,129 @@ impl Checked {
         }
         Ok(receipt)
     }
+}
+
+/// `file_work`'s epic, `OWNER/REPO#N` in the epics repository.
+fn epic_ref(epic: &str, p: &Policy) -> Result<ItemRef> {
+    let refuse = || anyhow::anyhow!("The epic is not OWNER/REPO#N in the epics repository");
+    if epic.contains("://") {
+        return Err(refuse());
+    }
+    let epic = parse_github_issue(epic, None, DEFAULT_HOST).map_err(|_| refuse())?;
+    ensure!(
+        epic.repository
+            .eq_ignore_ascii_case(&p.settings.epics_repository),
+        refuse()
+    );
+    Ok(epic)
+}
+
+/// That `epic` is live as the pass reads one (`Scheduler::live`): open and
+/// labelled `epic`, last by the operator or the bot, so that no one else
+/// with triage access can make the agent's work a child of theirs; and not
+/// held, as an epic waiting on a person takes no new work.
+fn live_epic(api: &dyn Api, p: &Policy, epic: &ItemRef) -> Result<()> {
+    let issue = api.get(&format!(
+        "/repos/{}/issues/{}",
+        epic.repository, epic.number
+    ))?;
+    ensure!(issue["labels"].is_array(), "Missing epic labels");
+    ensure!(
+        issue["state"] == "open"
+            && issue.get("pull_request").is_none_or(Value::is_null)
+            && has_label(&issue, EPIC_LABEL),
+        "The epic is not live"
+    );
+    ensure!(
+        !changes::HOLD_LABELS.iter().any(|h| has_label(&issue, h)),
+        "The epic is held"
+    );
+    let by = epic_labelled_by(&super::super::Graphql(api), epic)?;
+    ensure!(
+        by.is_some_and(|l| [&p.settings.operator, &p.settings.bot]
+            .iter()
+            .any(|w| w.eq_ignore_ascii_case(&l))),
+        "The epic is not live: its label is not the operator's or the bot's"
+    );
+    Ok(())
+}
+
+/// The project's [`PRIORITY_FIELD`] and its last option: filed work ranks
+/// last among its epic's children, whatever the agent thinks of it.
+fn last_priority(api: &dyn Api, project: &str) -> Result<(String, String)> {
+    let read = api.graphql(
+        PRIORITY_OPTIONS,
+        json!({"id": project, "field": PRIORITY_FIELD}),
+    )?;
+    let field = &read["node"]["field"];
+    let id = |v: &Value| {
+        v["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let option = field["options"].as_array().and_then(|o| o.last());
+    id(field)
+        .zip(option.and_then(id))
+        .context("The project has no Priority options")
+}
+
+/// Files `file_work` in the tracker, attaches it to the epic as the pass's
+/// sweep attaches an issue, and puts it on the board at `priority`. The
+/// answer is the created issue's; a later failure names it.
+fn file_work(
+    api: &dyn Api,
+    p: &Policy,
+    (epic, title, body): (&str, &str, &str),
+    priority: Option<&(String, String)>,
+) -> Result<Value> {
+    let (field, option) = priority.context("The epic was not checked")?;
+    let epic = epic_ref(epic, p)?;
+    let tracker = p.agent.tracker.as_deref().context("No tracker")?;
+    let project = p.agent.project.as_deref().context("No project")?;
+    let created = api.send(
+        "POST",
+        &format!("/repos/{tracker}/issues"),
+        &json!({"title": title, "body": signed(body, Some(WORK_NOTE), &p.settings.footer)}),
+    )?;
+    let number = created["number"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .context("The filed issue has no number")?;
+    let attach = || -> Result<()> {
+        // The sub-issue API takes the issue's id, the project its node ID.
+        let id = created["id"].as_u64().context("No issue id")?;
+        let node = created["node_id"].as_str().context("No issue node ID")?;
+        api.send(
+            "POST",
+            &format!(
+                "/repos/{}/issues/{}/sub_issues",
+                epic.repository, epic.number
+            ),
+            &json!({"sub_issue_id": id}),
+        )?;
+        let added = api.send(
+            "POST",
+            "/graphql",
+            &json!({"query": ADD_ITEM, "variables": {"project": project, "content": node}}),
+        )?;
+        let item = added["data"]["addProjectV2ItemById"]["item"]["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("The board did not add it")?;
+        let set = api.send(
+            "POST",
+            "/graphql",
+            &json!({"query": SET_PRIORITY, "variables": {"project": project, "item": item, "field": field, "option": option}}),
+        )?;
+        ensure!(
+            set["data"]["updateProjectV2ItemFieldValue"]["projectV2Item"]["id"] == item,
+            "Its Priority was not set"
+        );
+        Ok(())
+    };
+    attach().with_context(|| format!("filed {tracker}#{number}"))?;
+    Ok(created)
 }
 
 /// `summary` and `notes` over the project's changes since its last status
