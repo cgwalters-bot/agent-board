@@ -85,6 +85,57 @@ with none left lists every issue ([issue.go#L448-L461][fj-labels-filter]), so
 the reader refuses a listed issue without the membership label rather than
 let a deleted or renamed label widen the board. The write side keeps that.
 
+### Read-only intake
+
+`agent-board intake --board-config agent-board.json --state intake-state.json`
+reports new issues and comments, one metadata line per item. Nothing acts on
+the output yet: it does not route asks, start jobs, or write to Forgejo, and it
+is not connected to the pass or poll. Intake is off unless explicitly invoked
+with `board.intake` configured, reusing the board's `url` and `tokenEnv`:
+
+```json
+"intake": {
+  "repositories": ["example/work", "another-owner/*"],
+  "operatorId": 1234
+}
+```
+
+The concrete scope threat is reading unrelated repositories or spending
+unbounded requests on a large instance. Only the intake list is read (not the
+board repository list); `owner/*` expands through `GET /users/{owner}/repos`
+and includes only repositories owned by that owner. There are at most 100
+selectors and 100 resolved repositories. Each owner listing and each repository's
+issue and comment listing has a cap of 10 pages of 50, following totals when
+present, otherwise continuing to an empty page. A truncated listing is refused,
+not accepted as complete. Owner expansion failures are reported for that selector;
+other selectors still run. A repository error, including 401 or 404, is reported
+on its own line without stopping other repositories.
+
+`--since RFC3339` overrides stored cursors. Without it, each repository uses its
+own cursor from the optional `--state FILE`, or 1970-01-01T00:00:00Z when absent
+(the first read may therefore need a more recent `--since` to fit the cap).
+Only items created at or after that time and through invocation start are reported;
+an old issue updated since then is not a new issue. After both listings finish
+completely, that repository's cursor advances to invocation start, including
+when no new items were found. A failed repository emits no partial items and
+keeps its cursor. Reads overlap the cursor second so an item arriving after its
+endpoint was read within that second is not lost; boundary items may repeat.
+State is a JSON map of lowercased repository to RFC3339 cursor; use a
+separate file per instance and serialize invocations. Output is flushed before
+atomic state replacement using a fresh temporary name; interrupted runs can
+repeat items and leave a temporary file. Offset pagination
+is not an atomic snapshot; duplicate ids and inconsistent totals are refused,
+but concurrent changes that preserve totals may still shift pages.
+
+Bare `--json` emits newline-delimited JSON with `repository`, `kind` (`issue` or
+`comment`), `number`, `url`, `authorId`, `authorLogin`, `isOperator` and
+`generatedBy`; errors have `repository` and `error`. No bodies or titles are
+printed. Operator matching compares the numeric `operatorId`, not the login,
+which can be renamed or reused. `generatedBy` means the trimmed body ends in
+the configured top-level `generatedBy` line (the usual `Generated-by:` trailer
+by default), outside a fenced or indented code block. This is descriptive
+metadata, not proof of human authorship or permission to act.
+
 ### Board-write library boundary
 
 `Forge::board_write` is a deterministic controller primitive, not an

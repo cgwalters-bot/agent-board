@@ -1,0 +1,23 @@
+{
+  "clock": "2026-10-30T12:00:00Z",
+  "since": "2026-10-29T00:00:00Z",
+  "responses": [
+    {"path":"users/example/repos","page":1,"total":3,"body":[{"full_name":"example/work"},{"full_name":"example/missing"},{"full_name":"outside/ignored"}]},
+    {"path":"repos/example/work/issues","page":1,"total":2,"body":[{"id":10,"number":1,"html_url":"https://forge.example/example/work/issues/1","user":{"id":42,"login":"renamed"},"body":"New issue","created_at":"2026-10-30T01:00:00Z"}]},
+    {"path":"repos/example/work/issues","page":2,"total":2,"body":[{"id":11,"number":2,"html_url":"https://forge.example/example/work/issues/2","user":{"id":99,"login":"operator"},"body":"Old issue updated recently","created_at":"2026-10-28T01:00:00Z"}]},
+    {"path":"repos/example/work/issues/comments","page":1,"total":3,"body":[{"id":20,"issue_url":"https://forge.example/Example/Work/issues/1","pull_request_url":"","html_url":"https://forge.example/Example/Work/issues/1#issuecomment-20","user":{"id":42,"login":"renamed"},"body":"Agent response\n\nGenerated-by: https://github.com/cgwalters/#llms","created_at":"2026-10-30T02:00:00Z"}]},
+    {"path":"repos/example/work/issues/comments","page":2,"total":3,"body":[{"id":21,"issue_url":"","pull_request_url":"https://forge.example/Example/Work/pulls/2","html_url":"https://forge.example/Example/Work/pulls/2#issuecomment-21","user":{"id":99,"login":"operator"},"body":"Quoted example\n```text\nGenerated-by: https://github.com/cgwalters/#llms","created_at":"2026-10-30T03:00:00Z"},{"id":22,"issue_url":"","pull_request_url":"https://forge.example/Example/Work/pulls/2","html_url":"https://forge.example/Example/Work/pulls/2#issuecomment-22","user":{"id":-2,"login":"forgejo-actions"},"body":"CI result","created_at":"2026-10-30T04:00:00Z"}]},
+    {"path":"repos/example/missing/issues","page":1,"error":404},
+    {"path":"repos/example/denied/issues","page":1,"error":401},
+    {"path":"repos/example/long/issues","repeat":true,"total":999,"body":[{"id":30}]},
+    {"path":"repos/outside/ignored/issues","page":1,"total":0,"body":[]}
+  ],
+  "cases": [
+    {"name":"paging and cursor advance","repositories":["example/work"],"success":["example/work"],"errors":[]},
+    {"name":"mixed case repository","repositories":["Example/Work"],"success":["Example/Work"],"errors":[]},
+    {"name":"404 isolates repository","repositories":["example/missing","example/work"],"success":["example/work"],"errors":["example/missing"]},
+    {"name":"401 isolates repository","repositories":["example/denied","example/work"],"success":["example/work"],"errors":["example/denied"]},
+    {"name":"wildcard ignores foreign owner","repositories":["example/*"],"success":["example/work"],"errors":["example/missing"]},
+    {"name":"truncated read retains cursor","repositories":["example/long","example/work"],"success":["example/work"],"errors":["example/long"]}
+  ]
+}

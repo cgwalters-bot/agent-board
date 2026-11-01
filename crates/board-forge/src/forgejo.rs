@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
 pub mod epics;
+pub mod intake;
 mod writes;
 
 pub use writes::{RECEIPT_MARKER, SWEEP_APPLY_MARKER};
@@ -114,6 +115,9 @@ pub struct Config {
     /// the old read-only board's lack of a Status field.
     #[serde(default)]
     pub status_labels: bool,
+    /// Standalone read-only intake; absent by default. Not used by the pass.
+    #[serde(default)]
+    pub intake: Option<Box<intake::Config>>,
 }
 
 fn default_token_env() -> String {
@@ -239,6 +243,9 @@ impl Config {
             self.recorders.iter().all(|id| *id > 0),
             "invalid board recorder id"
         );
+        if let Some(intake) = &self.intake {
+            intake.validate()?;
+        }
         Ok(())
     }
 
