@@ -1,3 +1,3 @@
-not following v0.6.3: no single pin of cgwalters-forge/agentic-job with its version
+not following v0.6.3: GET /repos/cgwalters-forge/agentic-job/commits/v0.6.3: HTTP 404
 due: 49 pull requests merged since v0.6.3; next is v0.6.4
 https://github.com/cgwalters-forge/tracker/issues/772 is open but the open trains listed by creator miss it: the listings disagree, not starting
