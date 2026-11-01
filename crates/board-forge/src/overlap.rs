@@ -19,8 +19,9 @@
 //! independently, as without the check. See docs/job-plans.md#overlap.
 //!
 //! The pass may waive an open pull request's overlap ([`Waiver`],
-//! agent-board#426): a draft nobody is moving races no run, and a conflict
-//! in documentation is cheap to resolve for the board's most urgent work.
+//! agent-board#426, #578): a draft or labelled parked PR nobody is moving
+//! races no run, and a conflict in documentation is cheap to resolve for the
+//! board's most urgent work.
 //!
 //! [`intersecting`] finds every open pull request and run that shares a
 //! path; the check's decision is drawn from it, and `agent-board overlap`
@@ -70,11 +71,12 @@ pub(crate) const TEXT_QUERY: &str = r#"query($owner: String!, $name: String!, $n
   repository(owner: $owner, name: $name) { issue(number: $number) { title body } }
 }"#;
 
-/// Draft identity and current head; commit dates cannot date a push of an
+/// Draft/parked identity and current head; commit dates cannot date a push of an
 /// old commit. Read only where [`Waiver::stale_draft`] asks.
 pub(crate) const DRAFT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
     isDraft createdAt headRefOid headRefName headRepository { nameWithOwner }
+    labels(first: 100) { nodes { name } }
   } }
 }"#;
 
@@ -110,9 +112,10 @@ impl Decision {
 /// never waived: they have not pushed, so nobody can tell what they change.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Waiver {
-    /// The pass's clock and `overlap.staleDraftHours`: a draft opened and
-    /// last pushed to at least that many hours before does not hold, only
-    /// with complete authenticated activity for its current head branch.
+    /// The pass's clock and `overlap.staleDraftHours`: a draft or PR labelled
+    /// `needs-human` or `hold` opened and last pushed to at least that many
+    /// hours before does not hold, only with complete authenticated activity
+    /// for its current head branch.
     pub stale_draft: Option<(OffsetDateTime, u64)>,
     /// Whether the waiting issue is in the board's first Priority option:
     /// then a pull request that shares only documentation does not hold.
@@ -144,8 +147,11 @@ impl Waiver {
         let Some(stale) = self.stale_draft else {
             return Ok(None);
         };
-        Ok(idle_draft(client, (dest, pull), stale, reads)?
-            .map(|idle| format!("it is a draft whose head has not changed for {idle} hours")))
+        Ok(
+            idle_pull(client, (dest, pull), stale, reads, true)?.map(|(idle, reason)| {
+                format!("it is {reason} whose head has not changed for {idle} hours")
+            }),
+        )
     }
 }
 
@@ -160,6 +166,19 @@ pub fn idle_draft<T: Transport + Rest>(
     (now, hours): (OffsetDateTime, u64),
     reads: &mut usize,
 ) -> Result<Option<i64>> {
+    Ok(idle_pull(client, (dest, pull), (now, hours), reads, false)?.map(|(idle, _)| idle))
+}
+
+/// Share the same bounded head-activity proof for drafts and, when requested,
+/// PRs parked on a person. A matching label is enough; unread labels cannot
+/// grant a waiver, so no label pagination is needed.
+fn idle_pull<T: Transport + Rest>(
+    client: &T,
+    (dest, pull): (&ItemRef, u64),
+    (now, hours): (OffsetDateTime, u64),
+    reads: &mut usize,
+    parked: bool,
+) -> Result<Option<(i64, &'static str)>> {
     if *reads == 0 {
         return Ok(None);
     }
@@ -173,9 +192,22 @@ pub fn idle_draft<T: Transport + Rest>(
         .pointer("/repository/pullRequest")
         .filter(|n| n.is_object())
         .with_context(|| format!("pull request {pull} is not readable"))?;
-    if node["isDraft"] != Value::Bool(true) {
+    let label = |name| {
+        parked
+            && node
+                .pointer("/labels/nodes")
+                .and_then(Value::as_array)
+                .is_some_and(|labels| labels.iter().any(|label| label["name"] == name))
+    };
+    let reason = if label("needs-human") {
+        "a PR labelled `needs-human`"
+    } else if label("hold") {
+        "a PR labelled `hold`"
+    } else if node["isDraft"] == Value::Bool(true) {
+        "a draft"
+    } else {
         return Ok(None);
-    }
+    };
     let Some(opened) = timestamp(&node["createdAt"]) else {
         return Ok(None);
     };
@@ -257,7 +289,7 @@ pub fn idle_draft<T: Transport + Rest>(
         return Ok(None);
     };
     let idle = (now - changed).whole_hours();
-    Ok((idle >= i64::try_from(hours)?).then_some(idle))
+    Ok((idle >= i64::try_from(hours)?).then_some((idle, reason)))
 }
 
 fn timestamp(value: &Value) -> Option<OffsetDateTime> {
@@ -1257,6 +1289,11 @@ mod tests {
         };
         let mut unknown = pull(5, &["src/a.rs"], true, (9, 9));
         unknown["activity"] = Value::Null;
+        let labelled = |label: &str, pushed| {
+            let mut parked = pull(5, &["src/a.rs"], false, (9, pushed));
+            parked["labels"] = json!({"nodes": [{"name": label}]});
+            parked
+        };
         let off = Waiver::default();
         let stale = Waiver {
             stale_draft: Some((now, 4)),
@@ -1375,6 +1412,27 @@ mod tests {
                 ),
             ),
         ];
+        for label in ["needs-human", "hold"] {
+            for (name, pushed, waiver, waived) in [
+                ("labelled and idle", 5, stale, true),
+                ("labelled and recently pushed", 3, stale, false),
+                ("off, labelled and idle", 5, off, false),
+            ] {
+                cases.push((
+                    name,
+                    fix_code,
+                    json!([labelled(label, pushed)]),
+                    waiver,
+                    if waived {
+                        ignored(&format!(
+                            "{code}, but it is a PR labelled `{label}` whose head has not changed for 5 hours"
+                        ))
+                    } else {
+                        wait(code, &[5])
+                    },
+                ));
+            }
+        }
         for (name, field, value) in [
             ("missing head", "/headRefOid", Value::Null),
             ("missing fork", "/headRepository", Value::Null),

@@ -198,6 +198,13 @@ Each record (the primary's and each extra's) ends with the decision. A check
 that cannot read runs the issue independently, as without `--bot`: it is a
 scheduling heuristic, not a boundary. `--dry-run` prints the decision on stderr.
 
+The scheduled pass can opt into [overlap waivers](pass.md#scheduling): a draft
+or PR labelled `needs-human` or `hold` does not block once its head is proved
+idle for `overlap.staleDraftHours`, using the same bounded branch-activity
+check. Recent pushes still hold, including on labelled PRs; an unlabelled ready
+PR still holds. The waiver is off without the pass's `overlap` setting, and
+runs in flight are never waived.
+
 ### The overlap command
 
 `agent-board overlap -R OWNER/REPO --caller OWNER/REPO --workflow FILE` with
