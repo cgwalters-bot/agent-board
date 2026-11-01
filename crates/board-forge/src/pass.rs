@@ -777,6 +777,9 @@ pub struct Pr {
     /// [`PollPolicy::head_owners`].
     #[serde(default)]
     pub head_owners: Vec<String>,
+    /// Base repositories followed for rounds but never merged into.
+    #[serde(default)]
+    pub no_merge: Vec<String>,
     #[serde(default)]
     pub rebase_rounds: u64,
     pub merge_queue: Option<MergeQueue>,
@@ -1153,6 +1156,9 @@ impl Config {
                 "pr headOwners names {owner:?}, not a login"
             );
         }
+        for repository in &self.pr.no_merge {
+            poll::validate_repository(repository).context("pr noMerge repository")?;
+        }
         ensure!(
             self.pr.rebase_rounds <= REBASE_ROUNDS_LIMIT,
             "pr rebaseRounds is not 0 to {REBASE_ROUNDS_LIMIT}"
@@ -1252,6 +1258,7 @@ impl Config {
         let policy = PollPolicy {
             merge_authors: self.pr.merge_authors.clone(),
             head_owners: self.pr.head_owners.clone(),
+            no_merge: self.pr.no_merge.clone(),
             toil_fix_pool: self.pr.toil_fix_pool.clone().unwrap_or_default(),
             conflict_fix_pool: self.pr.conflict_fix_pool.clone().unwrap_or_default(),
             merge_queue: self.pr.merge_queue.as_ref().map(|q| q.tries),

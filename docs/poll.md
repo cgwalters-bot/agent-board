@@ -124,6 +124,22 @@ Unfollowed authors are reported as skips, including when the pull request query
 disagrees with the open-list author; they do not count as pass errors. API and
 repository failures still count as errors, without stopping other repositories.
 
+The pass's `pr.noMerge` (default `[]`, not a standalone poll option) is passed
+into the poll policy. It prevents an operator approval meant for upstream
+promotion from merging staged work into a midstream fork. Each entry is an
+exact `OWNER/REPO` base repository, validated using the existing repository
+validator and compared case-insensitively; globs are refused. It never matches
+by head owner, so an upstream PR from the same fork head is unaffected.
+For a listed base, the poll never initiates a direct merge, enqueue or
+re-enqueue, including `mergeAuthors` and queue-removal retries. Authorized fix,
+conflict-rebase and continuation rounds, review requirements and existing
+`needs-human` holds are unchanged. Otherwise merge-ready heads wait with
+`pr.noMerge: merging into this base repository is disabled`; the option does
+not add a `needs-human` label, since that would block fix rounds.
+Already queued PRs and externally enabled auto-merge are not revoked. This
+only prevents new merge admissions; it does not implement upstream promotion
+(#308). An absent or empty list leaves existing behavior unchanged.
+
 An absent/empty `toilFixPool` leaves normal fix-round pool selection unchanged.
 When set, only a first round with no failed check and either no rejected review
 or wholly toil findings uses it. Review classification conservatively accepts

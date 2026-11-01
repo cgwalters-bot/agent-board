@@ -757,7 +757,21 @@ A pass captures one clock and performs these stages in order:
    visitor's approval count for nothing. This uses the same merge path,
    including enqueueing where a merge queue is required: required checks,
    head rechecks and per-pass write caps still gate it. Its log is
-   `merge OWNER/REPO#N: approved by the operator at <head>`.
+    `merge OWNER/REPO#N: approved by the operator at <head>`.
+    With `pr.noMerge`, listed base repositories never get a direct merge,
+    enqueue or re-enqueue from the pass, including `pr.mergeAuthors` and
+    queue-removal retries. This prevents an approval meant for upstream
+    promotion from landing staged work on a midstream fork. The list defaults
+    to `[]`; entries are exact `OWNER/REPO` names (case-insensitive, no globs),
+    validated like other repositories. It matches the base repository, not
+    the head owner: an upstream PR using the same fork head is unaffected.
+    Authorized fix, conflict-rebase and continuation rounds, review requirements
+    and existing `needs-human` holds stay unchanged. An otherwise merge-ready
+    head waits with `pr.noMerge: merging into this base repository is disabled`,
+    without labelling it `needs-human`, which would block fix rounds.
+    Already queued PRs and externally enabled auto-merge are not revoked;
+    this option prevents new merge admissions only. Upstream promotion (#308)
+    remains unbuilt.
    Retain its claim and head-recheck rules, but follow the
    [bookkeeping rule](architecture.md#bookkeeping): in an external repository
    the claims and markers become one hidden comment the bot edits in place, and
@@ -2473,6 +2487,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |
 | `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
+| `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
