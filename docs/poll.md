@@ -99,6 +99,51 @@ required or not, must have passed, been skipped or be neutral, but for an option
 `review` status (agent-board#163); a failed optional check gets fix rounds as a
 required one does. It has been exercised against recorded responses only.
 
+## Failed checks before fix rounds
+
+A transient CI or infrastructure failure can spend both paid fix rounds on
+work the agent cannot repair, then leave the PR at `needs-human`. The pass's
+[`reruns: true`](pass.md#reruns) (off by default; not a standalone poll option)
+offers the failed Actions checks one rerun before a fix round or stop. This
+extends the existing rerun path, not a new workflow dispatch or failure classifier.
+Only completed `failure` runs on attempt 1, created within the last day, in
+the PR's repository and for its current head qualify. Status contexts and
+runs without a workflow ID or event do not qualify. The existing check
+selection, bot-fork scope, holds, review gates and per-pass caps still apply;
+an in-flight fix round, operator answer, stack operation or explicit queue
+stop is not displaced.
+
+The chance belongs to the head and check (workflow ID, event and check name),
+not its run ID and not the whole head. A different check failing later on the
+same head may get its chance; a fresh run of an already retried check cannot
+get another. If any failed check has already used its chance, the failure
+goes to the normal fix/stop decision instead of retrying its peers. Failed
+jobs in a shared run are rerun together, once; attempt 2 is never rerun.
+
+As with rounds, the poll claims and records the reservation before the POST.
+Its authenticated `tracker-poll` comment records `checks_rerun` (head),
+`checks_runs`, `checks_keys` (the check identities), `checks_at` and `checks_from`
+(the claim identity). Older comments remain receipts through resets and returns to a head; legacy
+receipts without identities conservatively spend the whole head's chance.
+The claim names the head and preceding marker, so overlapping passes deciding
+from that marker contend even if they read different failed-check rollups.
+An ambiguous or refused POST never buys another try. These writes and the
+rerun POSTs form one write step under `--max-writes`, not an agent dispatch
+or a charged fix round; reads use the existing check and request limits.
+
+The existing recovery wait applies: attempt 1 or an orphaned claim waits up
+to ten minutes; an in-progress retry or stale failed rollup of its run waits
+up to a day from reservation, then needs a person. A successful old retry
+does not wait on a different run's later failure. A completed second failure
+returns to the usual fix/stop decision. Green results still need the normal
+review and merge gates. No new fix-round delay is added.
+
+The motivating [actions#154](https://github.com/cgwalters-forge/actions/pull/154)
+is evidence for avoiding premature fix work, not proof that this rerun heals
+its egress refusal: its same-run second attempt also failed, while fresh CI
+after a merge from main passed. This rule tries once without diagnosing the
+failure; it does not start fresh CI or weaken the egress policy.
+
 ## Configuration
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:

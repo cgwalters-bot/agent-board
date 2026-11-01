@@ -18,7 +18,7 @@ use crate::{Footer, overlap};
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{NEEDS_HUMAN_LABEL as LABEL, admission};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry as MapEntry};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub mod bounds;
@@ -1760,6 +1760,12 @@ pub struct Marker {
 
     pub checks_at: Option<String>,
 
+    /// Check identities (workflow, event, name) reserved by this receipt.
+    /// Empty on legacy receipts, which conservatively reserve the whole head.
+    pub checks_keys: Vec<String>,
+
+    pub checks_from: Option<String>,
+
     /// The head a review start was reserved for and when
     /// ([`Pass::review_start`]). Written, never read into the marker: later
     /// passes look for it among all the bot's markers, so a later round's
@@ -1908,6 +1914,8 @@ impl Marker {
             state["checks_rerun"] = plain(head).into();
             state["checks_runs"] = json!(self.checks_runs);
             state["checks_at"] = json!(self.checks_at);
+            state["checks_keys"] = json!(self.checks_keys);
+            state["checks_from"] = json!(self.checks_from);
         }
         if let Some(head) = &self.review_head {
             state["review_head"] = plain(head).into();
@@ -2038,6 +2046,12 @@ pub fn find_marker(comments: &[Value], login: &str) -> Marker {
                 .map_or(0, |r| r.min(REBASE_ROUNDS_LIMIT)),
             rebasing: state["rebasing"].as_bool().unwrap_or(false),
             checks_rerun: state["checks_rerun"].as_str().map(str::to_owned),
+            checks_keys: nodes(&state, "/checks_keys")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            checks_from: state["checks_from"].as_str().map(str::to_owned),
             checks_runs: state["checks_runs"]
                 .as_array()
                 .map(|runs| runs.iter().filter_map(Value::as_u64).collect())
@@ -3862,6 +3876,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             checks_rerun: marker.checks_rerun.clone(),
             checks_runs: marker.checks_runs.clone(),
             checks_at: marker.checks_at.clone(),
+            checks_keys: marker.checks_keys.clone(),
+            checks_from: marker.checks_from.clone(),
             sha: Some(head.to_owned()),
             stopped: true,
             queue: marker.queue.as_ref().map(|q| QueueState {
@@ -4166,6 +4182,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             checks_rerun: marker.checks_rerun.clone(),
             checks_runs: marker.checks_runs.clone(),
             checks_at: marker.checks_at.clone(),
+            checks_keys: marker.checks_keys.clone(),
+            checks_from: marker.checks_from.clone(),
             review_head: None,
             review_at: None,
         };
@@ -4427,8 +4445,22 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         repo: &str,
         pull: &Value,
         checks: &Checks,
-    ) -> Result<BTreeMap<u64, String>> {
-        let mut runs = BTreeMap::new();
+        comments: &[Value],
+    ) -> Result<BTreeMap<u64, BTreeMap<String, String>>> {
+        let head = text(pull, "/headRefOid");
+        let receipts: Vec<Value> = comments
+            .iter()
+            .filter(|c| text(c, "/user/login") == self.config.bot)
+            .filter_map(|c| parse_marker(MARKER, text(c, "/body")))
+            .filter(|m| m["checks_rerun"] == head)
+            .collect();
+        // Older receipts spent the whole head's chance. Never give it back
+        // on an upgrade, reset, or return to a previously seen head.
+        if receipts.iter().any(|m| nodes(m, "/checks_keys").is_empty()) {
+            return Ok(BTreeMap::new());
+        }
+        let mut runs: BTreeMap<u64, BTreeMap<String, String>> = BTreeMap::new();
+        let mut run_data = BTreeMap::new();
         for (name, url) in &checks.failed {
             let Some(id) = url.as_deref().and_then(|url| job_id(repo, url)) else {
                 continue;
@@ -4437,18 +4469,43 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let Some(run) = job["run_id"].as_u64().filter(|id| *id > 0) else {
                 continue;
             };
-            if runs.contains_key(&run) {
+            let data = match run_data.entry(run) {
+                MapEntry::Occupied(entry) => entry.into_mut(),
+                MapEntry::Vacant(entry) => {
+                    entry.insert(self.get(&format!("repos/{repo}/actions/runs/{run}"))?)
+                }
+            };
+            let Some(workflow) = data["workflow_id"].as_u64().filter(|id| *id > 0) else {
+                continue;
+            };
+            let event = text(data, "/event");
+            if event.is_empty() {
                 continue;
             }
-            let data = self.get(&format!("repos/{repo}/actions/runs/{run}"))?;
-            if text(&data, "/repository/full_name") == repo
-                && text(&data, "/head_sha") == text(pull, "/headRefOid")
+            // A fresh run ID or another workflow with a same-named job must
+            // not renew this check's chance or spend another check's chance.
+            // Keep the identity lossless, but safe inside the marker's HTML
+            // comment, including names containing its `} -->` delimiter.
+            let key = json!([workflow, event, name])
+                .to_string()
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e");
+            if receipts
+                .iter()
+                .any(|m| nodes(m, "/checks_keys").contains(&json!(key)))
+            {
+                // A second failure goes to a fix round, even if other checks
+                // failing alongside it have not yet used their chance.
+                return Ok(BTreeMap::new());
+            }
+            if text(data, "/repository/full_name") == repo
+                && text(data, "/head_sha") == text(pull, "/headRefOid")
                 && data["status"] == "completed"
                 && data["conclusion"] == RERUN_CONCLUSION
                 && data["run_attempt"].as_u64() == Some(1)
-                && rerun_window(self.now, &data)
+                && rerun_window(self.now, data)
             {
-                runs.insert(run, plain(name));
+                runs.entry(run).or_default().insert(key, plain(name));
             }
         }
         Ok(runs)
@@ -4462,23 +4519,47 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         repo: &str,
         head: &str,
         comments: &[Value],
-        failed_checks: bool,
+        checks: &Checks,
     ) -> Result<Option<Decision>> {
-        let receipt = comments
+        let from = format!("check-rerun:{head}");
+        let reserved: Vec<String> = comments
             .iter()
             .filter(|c| text(c, "/user/login") == self.config.bot)
             .filter_map(|c| parse_marker(MARKER, text(c, "/body")))
-            .find(|m| m["checks_rerun"] == head);
+            .filter(|m| m["checks_rerun"] == head)
+            .map(|m| m["checks_from"].as_str().unwrap_or(&from).to_owned())
+            .collect();
+        let orphan = comments
+            .iter()
+            .filter(|c| text(c, "/user/login") == self.config.bot)
+            .filter_map(|c| parse_marker(CLAIM, text(c, "/body")))
+            .filter_map(|c| c["from"].as_str().map(str::to_owned))
+            .filter(|claim| !reserved.contains(claim) && (claim != &from || reserved.is_empty()))
+            .find(|claim| claim == &from || claim.starts_with(&format!("{from}:")))
+            .and_then(|from| earliest_claim(comments, &self.config.bot, &from));
+        let receipt = comments
+            .iter()
+            .filter(|c| text(c, "/user/login") == self.config.bot)
+            .filter(|c| {
+                parse_marker(MARKER, text(c, "/body")).is_some_and(|m| m["checks_rerun"] == head)
+            })
+            .max_by_key(|c| c["id"].as_u64())
+            .and_then(|c| parse_marker(MARKER, text(c, "/body")));
         let age = |at: Option<&str>| timestamp(at).map(|at| (self.now - at).whole_seconds());
+        if orphan.is_some() || receipt.is_none() {
+            return Ok(orphan.map(|(_, at)| {
+                if age(at.as_deref()).is_some_and(|age| age < CHECK_RERUN_START_SECONDS) {
+                    step("wait", CLAIM_AWAITING)
+                } else {
+                    step(
+                        "needs-human",
+                        "check rerun claim was interrupted; inspect the runs before retrying",
+                    )
+                }
+            }));
+        }
         let Some(receipt) = receipt else {
-            return Ok(earliest_claim(comments, &self.config.bot, &format!("check-rerun:{head}"))
-                .map(|(_, at)| {
-                    if age(at.as_deref()).is_some_and(|age| age < CHECK_RERUN_START_SECONDS) {
-                        step("wait", CLAIM_AWAITING)
-                    } else {
-                        step("needs-human", "check rerun claim was interrupted; inspect the runs before retrying")
-                    }
-                }));
+            return Ok(None);
         };
         let runs: Vec<u64> = receipt["checks_runs"]
             .as_array()
@@ -4496,7 +4577,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut waiting = false;
         let mut unstarted = false;
         let mut failed = false;
+        let mut stale = false;
         for run in runs {
+            stale |= checks.failed.iter().any(|(_, url)| {
+                url.as_deref().is_some_and(|url| {
+                    url.starts_with(&format!(
+                        "https://github.com/{repo}/actions/runs/{run}/job/"
+                    ))
+                })
+            });
             let data = self.get(&format!("repos/{repo}/actions/runs/{run}"))?;
             if text(&data, "/repository/full_name") != repo || text(&data, "/head_sha") != head {
                 return Ok(Some(step(
@@ -4514,7 +4603,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         }
         // The run API may show success before replacement check contexts appear.
-        waiting |= !failed && failed_checks;
+        waiting |= !failed && stale;
         if !waiting {
             return Ok(None);
         }
@@ -4541,13 +4630,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         pull: &Value,
         marker: &Marker,
         read: &[Value],
-        runs: &BTreeMap<u64, String>,
+        runs: &BTreeMap<u64, BTreeMap<String, String>>,
     ) -> Result<String> {
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
         let head = text(pull, "/headRefOid");
-        let from = format!("check-rerun:{head}");
+        // Fence on the marker we decided from, not the selected runs: two
+        // overlapping passes may see different failed-check rollups.
+        let from = format!("check-rerun:{head}:{}", claim_from(marker));
         let claim = match self.claim(
             repo,
             number,
@@ -4566,13 +4657,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             checks_rerun: Some(head.to_owned()),
             checks_runs: runs.keys().copied().collect(),
             checks_at: Some(self.now.format(&Rfc3339)?),
+            checks_keys: runs
+                .values()
+                .flat_map(|checks| checks.keys().cloned())
+                .collect(),
+            checks_from: Some(from),
             ..marker.clone()
         };
         self.mark_claim(
             repo,
             claim,
             &mut recorded,
-            "Failed checks: one rerun reserved for this head.",
+            "Failed checks: one rerun reserved for these checks on this head.",
         )?;
         let rest = self.rest;
         for run in runs.keys() {
@@ -6124,20 +6220,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             && is_harness(&pull, self.config);
         let retry_wait =
             if retry_scope && matches!(decision.action, "fix" | "needs-human" | "merge" | "wait") {
-                self.check_retry_wait(repo, head, &comments, !checks.failed.is_empty())?
+                self.check_retry_wait(repo, head, &comments, &checks)?
             } else {
                 None
             };
         let check_reruns = if retry_scope
             && retry_wait.is_none()
             && matches!(decision.action, "fix" | "needs-human")
-            && marker.checks_rerun.as_deref() != Some(head)
-            // A reset or a return to an older head must not buy another
-            // attempt. Older authenticated markers remain its receipts.
-            && !comments.iter().any(|c| text(c, "/user/login") == self.config.bot
-                && parse_marker(MARKER, text(c, "/body")).is_some_and(|m| m["checks_rerun"] == head))
         {
-            self.check_reruns(repo, &pull, &checks)?
+            self.check_reruns(repo, &pull, &checks, &comments)?
         } else {
             BTreeMap::new()
         };
@@ -6156,7 +6247,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         "failed jobs {} at head {head}, so their failed jobs run once more before a fix round or stop",
                         check_reruns
                             .iter()
-                            .map(|(run, job)| format!("{job} (run {run})"))
+                            .flat_map(|(run, checks)| checks
+                                .values()
+                                .map(move |job| format!("{job} (run {run})")))
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
@@ -11787,6 +11880,7 @@ mod tests {
             json!({
                 "repository": {"full_name": REPO}, "head_sha": HEAD,
                 "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                "workflow_id": 42, "event": "pull_request",
                 "created_at": "2026-10-12T01:00:00Z"
             }),
         );
@@ -12080,10 +12174,270 @@ mod tests {
     }
 
     #[test]
+    fn check_rerun_receipts_follow_the_check_across_runs_not_the_whole_head() {
+        for (name, workflow, event, check, expected) in [
+            (
+                "fresh run of the same check",
+                42,
+                "pull_request",
+                "ci",
+                false,
+            ),
+            ("another check", 42, "pull_request", "test", true),
+            (
+                "comment delimiters",
+                42,
+                "pull_request",
+                "ci} --> <!--",
+                true,
+            ),
+            (
+                "same name in another workflow",
+                43,
+                "pull_request",
+                "ci",
+                true,
+            ),
+            ("same name on another event", 42, "push", "ci", true),
+        ] {
+            let mut fake = failed_check_github();
+            let receipt = json!({
+                "rounds": 0, "checks_rerun": HEAD, "checks_runs": [76],
+                "checks_at": "2026-10-12T01:50:00Z",
+                "checks_keys": [json!([42, "pull_request", "ci"]).to_string()]
+            });
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None, None,
+                json!([
+                    {"id": 4, "user": {"login": BOT}, "body": marker_body(&receipt, "Earlier retry.")},
+                    {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 0}), "Reset.")}
+                ]),
+            );
+            fake.page(
+                &format!("repos/{REPO}/actions/runs/76"),
+                None,
+                None,
+                json!({"repository": {"full_name": REPO}, "head_sha": HEAD,
+                    "status": "completed", "conclusion": "success", "run_attempt": 2}),
+            );
+            let data = &mut fake
+                .rest
+                .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/runs/77"))
+                .unwrap()
+                .3;
+            data["workflow_id"] = workflow.into();
+            data["event"] = event.into();
+            fake.pulls.get_mut(&470).unwrap()["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                ["contexts"]["nodes"][0]["name"] = check.into();
+            let mut cfg = config();
+            cfg.policy.reruns = true;
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.to_owned()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            assert_eq!(
+                outcome.lines.iter().any(|l| l.starts_with("check rerun")),
+                expected,
+                "{name}: {:?}",
+                outcome.lines
+            );
+            assert_eq!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .filter(|(w, _)| w.ends_with("/rerun-failed-jobs"))
+                    .count(),
+                usize::from(expected),
+                "{name}"
+            );
+            if expected {
+                let writes = fake.writes.borrow();
+                let body = writes
+                    .iter()
+                    .find(|(w, _)| w.starts_with("PATCH") && w.ends_with("/comments/99"))
+                    .unwrap()
+                    .1["body"]
+                    .as_str()
+                    .unwrap();
+                let state = parse_marker(MARKER, body).unwrap();
+                assert_eq!(
+                    state["checks_keys"],
+                    json!([json!([workflow, event, check])
+                        .to_string()
+                        .replace('<', "\\u003c")
+                        .replace('>', "\\u003e")])
+                );
+                assert_eq!(state["checks_runs"], json!([77]));
+                assert_eq!(state["rounds"], 0);
+                assert!(dispatcher.writes.borrow().is_empty());
+                let body = body.to_owned();
+                drop(writes);
+                fake.page(
+                    &format!("repos/{REPO}/issues/470/comments?per_page=100"), None, None,
+                    json!([
+                        {"id": 4, "user": {"login": BOT}, "body": marker_body(&receipt, "Earlier retry.")},
+                        // A losing claim survives, but its reservation proves it
+                        // was handled. It must not block the winning retry.
+                        {"id": 98, "user": {"login": BOT}, "body": format!("<!-- {CLAIM}: {} -->", json!({"from": state["checks_from"]}))},
+                        {"id": 99, "user": {"login": BOT}, "body": body}
+                    ]),
+                );
+                fake.writes.borrow_mut().clear();
+                for (attempt, expected) in [(1, " wait:"), (2, " fix:")] {
+                    fake.rest
+                        .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/runs/77"))
+                        .unwrap()
+                        .3["run_attempt"] = attempt.into();
+                    let replay = run(
+                        &fake,
+                        &fake,
+                        &cfg,
+                        State::default(),
+                        &[],
+                        &[REPO.to_owned()],
+                        None,
+                        now(),
+                    )
+                    .unwrap();
+                    assert_eq!(replay.errors, 0, "{name}: {:?}", replay.lines);
+                    assert!(
+                        replay.lines.iter().any(|l| l.contains(expected)),
+                        "{name}: {:?}",
+                        replay.lines
+                    );
+                    assert!(fake.writes.borrow().is_empty());
+                }
+                // Even a fresh run ID cannot renew a check's chance. This
+                // also exercises delimiter-bearing identities after read-back.
+                let data = &mut fake
+                    .rest
+                    .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/runs/77"))
+                    .unwrap()
+                    .3;
+                data["conclusion"] = "success".into();
+                let mut fresh = data.clone();
+                fresh["conclusion"] = "failure".into();
+                fresh["run_attempt"] = 1.into();
+                fake.page(&format!("repos/{REPO}/actions/runs/78"), None, None, fresh);
+                fake.rest
+                    .get_mut(&format!("{API_ROOT}repos/{REPO}/actions/jobs/88"))
+                    .unwrap()
+                    .3["run_id"] = 78.into();
+                fake.pulls.get_mut(&470).unwrap()["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                    ["contexts"]["nodes"][0]["detailsUrl"] =
+                    format!("https://github.com/{REPO}/actions/runs/78/job/88").into();
+                let replay = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.to_owned()],
+                    None,
+                    now(),
+                )
+                .unwrap();
+                assert_eq!(replay.errors, 0, "{name}: {:?}", replay.lines);
+                assert!(
+                    replay.lines.iter().any(|l| l.contains(" fix:")),
+                    "{name}: {:?}",
+                    replay.lines
+                );
+                assert!(fake.writes.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn check_reruns_share_run_reads_and_posts_for_failed_matrix_jobs() {
+        let mut fake = failed_check_github();
+        let contexts = &mut fake.pulls.get_mut(&470).unwrap()["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["contexts"]["nodes"];
+        let template = contexts[0].clone();
+        *contexts = (0..50)
+            .map(|i| {
+                let mut check = template.clone();
+                check["name"] = format!("matrix-{i}").into();
+                check
+            })
+            .collect();
+        let mut cfg = config();
+        cfg.policy.reruns = true;
+        let dispatcher = Fake::default();
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[REPO.to_owned()],
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(
+            fake.sent
+                .borrow()
+                .iter()
+                .filter(|(url, _)| url.ends_with("/actions/runs/77"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fake.writes
+                .borrow()
+                .iter()
+                .filter(|(url, _)| url.ends_with("/rerun-failed-jobs"))
+                .count(),
+            1
+        );
+        let writes = fake.writes.borrow();
+        let body = writes
+            .iter()
+            .find(|(w, _)| w.starts_with("PATCH") && w.ends_with("/comments/99"))
+            .unwrap()
+            .1["body"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            nodes(&parse_marker(MARKER, body).unwrap(), "/checks_keys").len(),
+            50
+        );
+        assert!(dispatcher.writes.borrow().is_empty());
+    }
+
+    #[test]
     fn check_reruns_respect_scope_attempts_and_authenticated_head_receipts() {
         for (name, enabled, change, author, receipt, expected) in [
             ("off", false, json!({}), BOT, "older", false),
             ("eligible", true, json!({}), BOT, "older", true),
+            (
+                "no workflow identity",
+                true,
+                json!({"workflow_id": null}),
+                BOT,
+                "older",
+                false,
+            ),
+            (
+                "no event identity",
+                true,
+                json!({"event": null}),
+                BOT,
+                "older",
+                false,
+            ),
             (
                 "wrong head",
                 true,
