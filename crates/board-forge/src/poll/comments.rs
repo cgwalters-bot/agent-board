@@ -10,6 +10,13 @@
 //! records the issue, so that later comments go to the same one. Only a
 //! public repository's comments are copied to the tracker that way.
 //!
+//! A thread outside our own space, the organization of `dispatch_repo` and
+//! the bot's own account, gets no write from a triage at all
+//! (agent-board#283): its run's item is a tracking issue as well, issue or
+//! pull request, and the claim goes on that issue instead of the thread. As
+//! nothing on the thread links to it, the issue is found again by its title
+//! ([`Pass::tracked`]). A claim already on such a thread still counts.
+//!
 //! A search a pass, of a few pages, finds the threads the operator commented
 //! on that were updated since a cursor in the state. Each new comment is
 //! claimed on its thread by the bot before its run starts, and a claim, or a
@@ -59,6 +66,13 @@ const DISPATCH_RECORDED_REQUESTS: usize = 3;
 /// two event reads, removal and restoration. Pagination may need more; each
 /// read separately protects the writes still needed to finish or recover.
 const ANSWER_ROUND_REQUESTS: usize = 3 + DISPATCH_RECORDED_REQUESTS + 4;
+/// The search results read for a thread's tracking issues: one, unless
+/// people closed earlier ones.
+const TRACKING_MATCHES: usize = 10;
+/// The bot's newest issues in the tracker read for a thread's tracking
+/// issue, which a search may not show yet: more than it opens in the time a
+/// search can lag.
+const NEWEST_ISSUES: usize = 100;
 
 /// `operatorComments`: absent reads no comments; present, it names at least
 /// one organization (`OWNER/*`) or repository.
@@ -217,6 +231,41 @@ fn settle(state: &mut Value, outcome: &str) {
     }
 }
 
+/// Whether a marker or claim of the bot's among `comments` still has a
+/// dispatch pending, short of the run timeout.
+fn pending(comments: &[Value], bot: &str, now: OffsetDateTime) -> bool {
+    comments.iter().any(|comment| {
+        text(comment, "/user/login") == bot
+            && [MARKER, CLAIM].iter().any(|kind| {
+                parse_marker(kind, text(comment, "/body"))
+                    .is_some_and(|state| !nodes(&state, "/pending").is_empty())
+            })
+            && !older_than(now, comment["created_at"].as_str(), FIX_RUN_TIMEOUT_SECONDS)
+    })
+}
+
+/// The title of the issue in the tracker that tracks a thread.
+fn tracking_title(repo: &str, number: u64) -> String {
+    format!("{repo}#{number}: operator request")
+}
+
+/// The bot's issues in the tracker that track a thread outside our own
+/// space, oldest first, each with its comments ([`Pass::tracked`]).
+#[derive(Default)]
+pub(super) struct Tracked(Vec<(Value, Vec<Value>)>);
+
+impl Tracked {
+    /// The comments of every one: their claims are the thread's.
+    fn comments(&self) -> Vec<Value> {
+        self.0.iter().flat_map(|(_, c)| c.iter().cloned()).collect()
+    }
+
+    /// The oldest open one, which later comments go to.
+    fn open(&self) -> Option<&(Value, Vec<Value>)> {
+        self.0.iter().find(|(issue, _)| issue["state"] == "open")
+    }
+}
+
 /// Whether a line of the operator's asks the bot for action explicitly.
 fn explicit(body: &str, bot: &str) -> bool {
     addressed(body, bot).next().is_some()
@@ -369,13 +418,17 @@ fn triage_brief(
     };
     let answer = match tracking {
         Some(issue) => format!(
-            "then propose a plan as an `agent-board-plan` comment, or answer, on {issue}, the issue that tracks it, which is your item: not on the {what}"
+            "then propose a plan as an `agent-board-plan` comment, or answer, on {issue}, the issue that tracks it, which is your item. The result stays on that issue: post nothing to the {what}"
         ),
         None => "then propose a plan as an `agent-board-plan` comment, or answer there".into(),
     };
     let mut lines = vec![
         format!(
             "The operator, {operator}, commented on {what} {repo}#{number} ({url}). {task}, {answer}. {intent}"
+        ),
+        String::new(),
+        format!(
+            "A comment may be direction or feedback on {bot}'s own earlier comments in that thread rather than a request about the {what}; answering it is no reason to triage the {what} again."
         ),
         String::new(),
         format!(
@@ -1046,35 +1099,51 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let number = hit["number"].as_u64().context("search hit has no number")?;
         let pull = hit.get("pull_request").is_some_and(|p| !p.is_null());
         let floor = self.now - Duration::seconds(LOOKBACK_SECONDS);
-        let (done, refused) = handled(comments, &self.config.bot, self.now);
-        let said: Vec<Said> = self
+        let bot = self.config.bot.clone();
+        let (done, mut refused) = handled(comments, &bot, self.now);
+        let mut said: Vec<Said> = self
             .said(repo, number, comments, pull, floor)?
             .into_iter()
             .filter(|s| !done.contains(&s.key))
             .collect();
+        // Outside our own space, a fix round on the bot's pull request is
+        // as anywhere; anything else is tracked in the tracker, whose
+        // issues hold the claims, read with any left on the thread before.
+        // The checks that need no lookup go first, as each lookup is a search.
+        let mine = pull && text(hit, "/user/login") == bot;
+        let routed = !said.is_empty() && !mine && !self.ours(repo);
+        if routed && addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
+            return Ok(None);
+        }
+        if routed && let Some(why) = self.not_public(repo)? {
+            let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
+            return Ok(Some((
+                true,
+                format!("operator comments {}: {why}", keys.join(", ")),
+            )));
+        }
+        let tracked = match routed {
+            true => Some(self.tracked(repo, number, true)?),
+            false => None,
+        };
+        let mut records = comments.to_vec();
+        if let Some(tracked) = &tracked {
+            records.extend(tracked.comments());
+            let (done, again) = handled(&records, &bot, self.now);
+            said.retain(|s| !done.contains(&s.key));
+            refused = again;
+        }
         if said.is_empty() {
             // A fresh pending record suppresses dispatch, but is not finished:
             // keep its thread in the search until it settles or times out.
             // Otherwise advancing the cursor loses the retry when no further
             // comments update the thread before the timeout.
-            let pending = comments.iter().any(|comment| {
-                text(comment, "/user/login") == self.config.bot
-                    && [MARKER, CLAIM].iter().any(|kind| {
-                        parse_marker(kind, text(comment, "/body"))
-                            .is_some_and(|state| !nodes(&state, "/pending").is_empty())
-                    })
-                    && !older_than(
-                        self.now,
-                        comment["created_at"].as_str(),
-                        FIX_RUN_TIMEOUT_SECONDS,
-                    )
-            });
-            if pending {
+            if pending(&records, &bot, self.now) {
                 return Ok(Some((false, "operator comments: dispatch pending".into())));
             }
             return Ok(None);
         }
-        if addressed && !said.iter().any(|s| explicit(&s.body, &self.config.bot)) {
+        if addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
             return Ok(None);
         }
         let keys: Vec<String> = said.iter().map(|s| s.key.clone()).collect();
@@ -1089,11 +1158,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // may open one in the fork, whose code a fix round would build on.
         let (done, what) = if let Some(why) = private {
             (true, why)
-        } else if pull && text(hit, "/user/login") == self.config.bot {
+        } else if mine {
             self.comment_fix(repo, number, hit, comments, &said)?
         } else {
             let tries = refused.get(&keys[0]).copied().unwrap_or(0);
-            self.comment_triage(repo, number, (pull, None), (comments, tries), &said)?
+            self.comment_triage(
+                repo,
+                number,
+                (pull, None, tracked.as_ref()),
+                (comments, tries),
+                &said,
+            )?
         };
         Ok(Some((
             done,
@@ -1302,24 +1377,31 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// comments it is started on, and how often a run for it was refused.
     /// With `peer`, the comments are that notifications peer's, on an issue
     /// ([`super::notify`]), and the run is research with [`peer_brief`].
+    /// With `tracked`, the thread is outside our own space: the run is on
+    /// its tracking issue, which is claimed instead of the thread.
     pub(super) fn comment_triage(
         &mut self,
         repo: &str,
         number: u64,
-        (pull, peer): (bool, Option<&str>),
+        (pull, peer, tracked): (bool, Option<&str>, Option<&Tracked>),
         (read, tries): (&[Value], usize),
         said: &[Said],
     ) -> Result<Handled> {
         ensure!(peer.is_none() || !pull, "a peer's run is on an issue");
+        ensure!(
+            peer.is_none() || tracked.is_none(),
+            "a peer's run is on its thread"
+        );
         let kind = match peer {
             Some(_) => "research",
             None => run_kind(said, &self.config.bot),
         };
+        let tracks = pull || tracked.is_some();
         // The tracking issue and the run's brief quote the operator's
         // comments in the tracker, which may be read more widely than the
-        // pull request: only a public one's are copied there. So is a peer's
+        // thread: only a public one's are copied there. So is a peer's
         // repository, which the operator did not name in `operatorComments`.
-        if (pull || peer.is_some())
+        if (tracks || peer.is_some())
             && let Some(why) = self.not_public(repo)?
         {
             return Ok((true, why));
@@ -1327,7 +1409,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let Some(apply) = &self.apply else {
             return Ok((
                 true,
-                match pull {
+                match tracks {
                     true => format!("{kind} on a tracking issue"),
                     false => kind.into(),
                 },
@@ -1365,8 +1447,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             tries => format!("{TRIAGE_FROM}{}/{tries}", keys[0]),
         };
         let state = json!({"from": from, "pending": keys});
-        let marker = find_marker(read, &self.config.bot);
-        let claim = match self.claim(repo, number, &marker, read, (state.clone(), &of))? {
+        let tracker = self.config.dispatch_repo.clone();
+        // Outside our own space, the tracking issue is opened, or found, and
+        // claimed first: nothing is written to the thread. A pass that dies
+        // between the two leaves an issue that the next one finds again.
+        let (at, on, read) = match tracked {
+            Some(tracked) => {
+                let (issue, read) =
+                    self.tracking_issue(repo, number, &url, read, said, Some(tracked))?;
+                (tracker.clone(), issue, read)
+            }
+            None => (repo.to_owned(), number, read.to_vec()),
+        };
+        let marker = find_marker(&read, &self.config.bot);
+        let claim = match self.claim(&at, on, &marker, &read, (state.clone(), &of))? {
             Ok(claim) => claim,
             Err((id, _)) => {
                 return Ok((
@@ -1388,9 +1482,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // finds the issue rather than opening a second one for the same
         // comments (agent-board#206). A failure before the dispatch leaves
         // the claim pending, and the comments are tried again.
-        let (item_repo, item, tracking) = if pull {
-            let issue = self.tracking_issue(repo, number, &url, read, said)?;
-            let tracker = self.config.dispatch_repo.clone();
+        let (item_repo, item, tracking) = if tracked.is_some() {
+            let link = format!("https://github.com/{tracker}/issues/{on}");
+            (tracker, on, Some(link))
+        } else if pull {
+            let (issue, _) = self.tracking_issue(repo, number, &url, &read, said, None)?;
             let link = format!("https://github.com/{tracker}/issues/{issue}");
             state["issue"] = issue.into();
             self.rewrite(
@@ -1430,13 +1526,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             // tried once it is older than the run timeout ([`handled`]).
             Err(error) if error.is::<NotStarted>() => {
                 settle(&mut state, "refused");
-                self.rewrite(repo, claim, claim_body(&state, "not started."))?;
+                self.rewrite(&at, claim, claim_body(&state, "not started."))?;
                 return Err(error);
             }
             // Anything else may have started the run: its comments are done.
             Err(error) => {
                 settle(&mut state, "comments");
-                self.rewrite(repo, claim, claim_body(&state, "may have started."))?;
+                self.rewrite(&at, claim, claim_body(&state, "may have started."))?;
                 return Err(error);
             }
         };
@@ -1444,13 +1540,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // and the comments are tried again after the run timeout ([`handled`]).
         settle(&mut state, "comments");
         let (on, text) = match &tracking {
+            Some(_) if tracked.is_some() => (
+                format!(" on {item_repo}#{item}"),
+                "claimed; started.".into(),
+            ),
             Some(link) => (
                 format!(" on {item_repo}#{item}"),
                 format!("claimed; tracked in {link}."),
             ),
             None => (String::new(), "claimed; started.".to_owned()),
         };
-        self.rewrite(repo, claim, claim_body(&state, &text))
+        self.rewrite(&at, claim, claim_body(&state, &text))
             .context("the run started, but its claim does not record it")?;
         Ok((
             true,
@@ -1462,8 +1562,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     }
 
     /// The issue in `Config::dispatch_repo` that tracks someone else's pull
-    /// request: the one the newest claim of the bot's on it names, with the
-    /// new comments quoted on it; else a new one that quotes them.
+    /// request, or a thread outside our own space, and its comments: the
+    /// one the newest claim of the bot's on the pull request names, or the
+    /// oldest open one of the `tracked`, with the new comments quoted on it;
+    /// else a new one that quotes them.
     fn tracking_issue(
         &mut self,
         repo: &str,
@@ -1471,10 +1573,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         url: &str,
         read: &[Value],
         said: &[Said],
-    ) -> Result<u64> {
+        tracked: Option<&Tracked>,
+    ) -> Result<(u64, Vec<Value>)> {
         let tracker = self.config.dispatch_repo.clone();
         let bot = self.config.bot.clone();
-        let title = format!("{repo}#{number}: operator request");
+        let title = tracking_title(repo, number);
         // Quoted for people to read, not run: nothing in it can carry a
         // marker or claim of the bot's.
         let operator = self.config.operator.clone();
@@ -1483,28 +1586,51 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .join("\n")
                 .replace("<!--", "<!- -")
         };
-        let claims: Vec<(u64, Value)> = read
-            .iter()
-            .filter(|c| text(c, "/user/login") == bot)
-            .filter_map(|c| {
-                let state = parse_marker(CLAIM, text(c, "/body"))?;
-                Some((c["id"].as_u64()?, state))
-            })
-            .filter(|(_, state)| state["issue"].is_u64())
-            .collect();
-        let mapped = claims
-            .iter()
-            .max_by_key(|(id, _)| *id)
-            .and_then(|(_, state)| state["issue"].as_u64());
-        if let Some(issue) = mapped {
-            let found = match self.get(&format!("repos/{tracker}/issues/{issue}")) {
-                Ok(found) => found,
-                // Deleted, or never there: a new issue is opened instead.
-                // Any other failure, such as authentication or a transient
-                // one, is the pass's error, and the request is tried again.
-                Err(error) if error.is::<NotFound>() => Value::Null,
-                Err(error) => return Err(error),
-            };
+        let claims_in = |comments: &[Value]| -> Vec<(u64, Value)> {
+            comments
+                .iter()
+                .filter(|c| text(c, "/user/login") == bot)
+                .filter_map(|c| {
+                    let state = parse_marker(CLAIM, text(c, "/body"))?;
+                    Some((c["id"].as_u64()?, state))
+                })
+                .collect()
+        };
+        // The issue, its claims of the comments it quotes, and its comments.
+        let (found, claims, comments) = match tracked {
+            Some(tracked) => match tracked.open() {
+                Some((found, comments)) => (found.clone(), claims_in(comments), comments.clone()),
+                None => (Value::Null, Vec::new(), Vec::new()),
+            },
+            None => {
+                let claims: Vec<(u64, Value)> = claims_in(read)
+                    .into_iter()
+                    .filter(|(_, state)| state["issue"].is_u64())
+                    .collect();
+                let mapped = claims
+                    .iter()
+                    .max_by_key(|(id, _)| *id)
+                    .and_then(|(_, state)| state["issue"].as_u64());
+                let found = match mapped {
+                    Some(issue) => match self.get(&format!("repos/{tracker}/issues/{issue}")) {
+                        Ok(found) => found,
+                        // Deleted, or never there: a new issue is opened
+                        // instead. Any other failure, such as authentication
+                        // or a transient one, is the pass's error, and the
+                        // request is tried again.
+                        Err(error) if error.is::<NotFound>() => Value::Null,
+                        Err(error) => return Err(error),
+                    },
+                    None => Value::Null,
+                };
+                let claims = claims
+                    .into_iter()
+                    .filter(|(_, state)| mapped.is_some_and(|issue| state["issue"] == issue))
+                    .collect();
+                (found, claims, Vec::new())
+            }
+        };
+        if let Some(issue) = found["number"].as_u64() {
             // The upstream repository's admins may edit the bot's claim: only
             // an open issue the bot opened for this pull request is reused,
             // so the run cannot be pointed at another issue in the tracker,
@@ -1518,10 +1644,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 // Every claim naming the issue names the comments it quotes,
                 // as it is recorded before its dispatch: a retry after a
                 // refusal, or after a run whose claim was not recorded,
-                // quotes none of them again (agent-board#206).
+                // quotes none of them again (agent-board#206). Nor does one
+                // after a pass that opened the issue and died before its
+                // claim, as the issue quotes them.
                 let named: BTreeSet<&str> = claims
                     .iter()
-                    .filter(|(_, state)| state["issue"] == issue)
                     .flat_map(|(_, state)| {
                         ["/pending", "/refused", "/comments"]
                             .into_iter()
@@ -1529,9 +1656,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     })
                     .filter_map(Value::as_str)
                     .collect();
+                let quotes: Vec<&str> = std::iter::once(text(&found, "/body"))
+                    .chain(
+                        comments
+                            .iter()
+                            .filter(|c| text(c, "/user/login") == bot)
+                            .map(|c| text(c, "/body")),
+                    )
+                    .collect();
                 let new: Vec<Said> = said
                     .iter()
                     .filter(|s| !named.contains(s.key.as_str()))
+                    .filter(|s| {
+                        let anchor = format!("({url}#{}):", s.key);
+                        !quotes.iter().any(|q| q.contains(&anchor))
+                    })
                     .cloned()
                     .collect();
                 if !new.is_empty() {
@@ -1549,11 +1688,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         0,
                     )?;
                 }
-                return Ok(issue);
+                return Ok((issue, comments));
             }
         }
+        let about = match tracked {
+            Some(_) => "a thread outside our own space. Runs for it take this issue as their item and answer here; nothing is posted there.".to_owned(),
+            None => format!(
+                "a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it."
+            ),
+        };
         let body = format!(
-            "The operator commented on {url}, a pull request {bot} did not open. Runs for it take this issue as their item and answer here; {bot}'s comment there links to it.\n{}\n\n{}",
+            "The operator commented on {url}, {about}\n{}\n\n{}",
             quoted(said),
             self.config.policy.footer
         );
@@ -1565,9 +1710,82 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             json!({"title": title, "body": body}),
             0,
         )?;
-        created["number"]
+        let issue = created["number"]
             .as_u64()
-            .context("the new issue has no number")
+            .context("the new issue has no number")?;
+        // Two passes that overlap may each have opened one: both go on with
+        // the oldest open one, where the claim decides between them.
+        if tracked.is_some()
+            && let Some((found, comments)) = self.tracked(repo, number, false)?.open()
+            && let Some(oldest) = found["number"].as_u64()
+        {
+            return Ok((oldest, comments.clone()));
+        }
+        Ok((issue, Vec::new()))
+    }
+
+    /// Whether `repo` is in our own space: the organization of
+    /// `Config::dispatch_repo`, or the bot's own account.
+    fn ours(&self, repo: &str) -> bool {
+        let home = self.config.dispatch_repo.split_once('/').map(|(o, _)| o);
+        let ours = [home.unwrap_or(&self.config.dispatch_repo), &self.config.bot];
+        in_scope(&ours.map(|owner| format!("{owner}/*")), repo)
+    }
+
+    /// The bot's issues in the tracker that track a thread outside our own
+    /// space (agent-board#283), with their comments. Nothing on the thread
+    /// links to them, so they are found by their title, which only the
+    /// bot's issues in the tracker count for: among the newest it opened,
+    /// a list that is always current, and, where `search`, a search, which
+    /// finds older ones but may not show a new one for minutes. So a pass
+    /// that died after opening one, or after its dispatch, finds it again.
+    fn tracked(&mut self, repo: &str, number: u64, search: bool) -> Result<Tracked> {
+        let tracker = self.config.dispatch_repo.clone();
+        let title = tracking_title(repo, number);
+        let creator: String =
+            url::form_urlencoded::byte_serialize(self.config.bot.as_bytes()).collect();
+        let (newest, _) = self.get_url(
+            &format!(
+                "{API_ROOT}repos/{tracker}/issues?creator={creator}&state=all&sort=created&direction=desc&per_page={NEWEST_ISSUES}"
+            ),
+            Value::clone,
+            self.apply.is_some(),
+        )?;
+        let mut issues = newest
+            .as_array()
+            .context("GitHub list is not an array")?
+            .clone();
+        if search {
+            let query = format!("repo:{tracker} is:issue in:title \"{title}\"");
+            let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+            let found = self.get(&format!(
+                "search/issues?q={query}&sort=created&order=asc&per_page={TRACKING_MATCHES}"
+            ))?;
+            // Read again on a later pass, rather than taken as none there.
+            ensure!(
+                found["incomplete_results"] == false,
+                "the search for {title:?} was incomplete"
+            );
+            issues.extend(nodes(&found, "/items").iter().cloned());
+        }
+        // By number, which is by creation: the oldest first.
+        let mut mine: BTreeMap<u64, Value> = BTreeMap::new();
+        for issue in issues {
+            if text(&issue, "/repository_url") == format!("{API_ROOT}repos/{tracker}")
+                && text(&issue, "/user/login") == self.config.bot
+                && text(&issue, "/title") == title
+                && issue.get("pull_request").is_none_or(Value::is_null)
+                && let Some(number) = issue["number"].as_u64()
+            {
+                mine.insert(number, issue);
+            }
+        }
+        let mut tracked = Tracked::default();
+        for (number, issue) in mine {
+            let comments = self.thread_comments(&tracker, number)?;
+            tracked.0.push((issue, comments));
+        }
+        Ok(tracked)
     }
 
     /// [`Pass::dispatch`], not started unless the request budget leaves the
@@ -1611,7 +1829,7 @@ pub(super) mod tests {
 
     pub(in crate::poll) const OPERATOR: &str = "op";
     pub(in crate::poll) const BOT: &str = "worker";
-    pub(in crate::poll) const DISPATCH: &str = "example/tracker";
+    pub(in crate::poll) const DISPATCH: &str = "upstream/tracker";
     const BOT_PULL: &str = "upstream/app#7";
     const ISSUE: &str = "upstream/operator#3";
 
@@ -1657,6 +1875,9 @@ pub(super) mod tests {
         pub(in crate::poll) gone: RefCell<BTreeSet<String>>,
         /// Every request, in order, as `METHOD URL`.
         pub(in crate::poll) log: RefCell<Vec<String>>,
+        /// Whether a search for a tracking issue finds none, as a search
+        /// index that has not caught up.
+        unindexed: RefCell<bool>,
         fallback: bool,
         concurrent_hold: bool,
         post_delete_page: bool,
@@ -1690,7 +1911,50 @@ pub(super) mod tests {
                     body: Value::Null,
                 });
             }
-            let body = if url.starts_with(&format!("{API_ROOT}search/issues?")) {
+            // The tracker's issues, oldest first.
+            let tracker = || -> Vec<Value> {
+                let prefix = format!("{API_ROOT}repos/{DISPATCH}/issues/");
+                let mut issues: Vec<(u64, Value)> = self
+                    .rest
+                    .borrow()
+                    .iter()
+                    .filter_map(|(k, v)| Some((k.strip_prefix(&prefix)?.parse().ok()?, v.clone())))
+                    .collect();
+                issues.sort_by_key(|(n, _)| *n);
+                issues.into_iter().map(|(_, v)| v).collect()
+            };
+            let query = |key: &str| -> String {
+                let (_, query) = url.split_once('?').unwrap();
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find(|(k, _)| k == key)
+                    .unwrap()
+                    .1
+                    .into_owned()
+            };
+            let body = if url.starts_with(&format!("{API_ROOT}search/issues?q=repo%3A")) {
+                // A search for a thread's tracking issue: the tracker's
+                // issues of that title, unless the index is behind.
+                let q = query("q");
+                let (_, title) = q.split_once('"').unwrap();
+                let title = title.trim_end_matches('"');
+                let items: Vec<Value> = match *self.unindexed.borrow() {
+                    true => Vec::new(),
+                    false => tracker()
+                        .into_iter()
+                        .filter(|v| v["title"] == title)
+                        .collect(),
+                };
+                json!({"total_count": items.len(), "incomplete_results": false, "items": items})
+            } else if url.starts_with(&format!("{API_ROOT}repos/{DISPATCH}/issues?creator=")) {
+                // The issues one account opened in the tracker, newest first.
+                let creator = query("creator");
+                let mut issues: Vec<Value> = tracker()
+                    .into_iter()
+                    .filter(|v| v["user"]["login"] == creator.as_str())
+                    .collect();
+                issues.reverse();
+                Value::Array(issues)
+            } else if url.starts_with(&format!("{API_ROOT}search/issues?")) {
                 self.searched.borrow_mut().push(url.into());
                 // The recorded results updated since the query's time, a page
                 // of them as the URL asks.
@@ -2058,8 +2322,8 @@ pub(super) mod tests {
         assert_eq!(
             first.lines[..2],
             [
-                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 1 -> https://github.com/example/tracker/actions/runs/1234",
-                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/example/tracker/actions/runs/1234",
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 1 -> https://github.com/upstream/tracker/actions/runs/1234",
+                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/upstream/tracker/actions/runs/1234",
             ]
         );
         assert_eq!(
@@ -2164,7 +2428,7 @@ pub(super) mod tests {
             // the issue that tracks it.
             (
                 "visitor",
-                "triage on example/tracker#1002 -> https://github.com/example/tracker/actions/runs/1234",
+                "triage on upstream/tracker#1002 -> https://github.com/upstream/tracker/actions/runs/1234",
                 false,
             ),
             // With the caller's fix bounds, a round is started only inside
@@ -2172,7 +2436,7 @@ pub(super) mod tests {
             // `ci-drop-grub-cc`, which agentic-job refused (agent-board#264).
             (
                 "inside the bounds",
-                "fix round 2 -> https://github.com/example/tracker/actions/runs/1234",
+                "fix round 2 -> https://github.com/upstream/tracker/actions/runs/1234",
                 false,
             ),
             (
@@ -2341,7 +2605,7 @@ pub(super) mod tests {
         assert_eq!(
             first.lines,
             [format!(
-                "upstream/app#7 operator comments issuecomment-100, discussion_r200: triage on {DISPATCH}#{issue} -> https://github.com/example/tracker/actions/runs/1234"
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: triage on {DISPATCH}#{issue} -> https://github.com/upstream/tracker/actions/runs/1234"
             )]
         );
         let inputs = dispatches(&fake);
@@ -2463,6 +2727,225 @@ pub(super) mod tests {
         }
     }
 
+    /// GitHub where the operator's search finds only `thread`, someone's,
+    /// with these comments.
+    fn one_thread(thread: &str, pull: bool, comments: Value) -> Fake {
+        let (repo, number) = thread.split_once('#').unwrap();
+        let fake = Fake::default();
+        fake.page("user", json!({"login": BOT}));
+        fake.page(
+            &format!("repos/{repo}"),
+            json!({"private": false, "visibility": "public"}),
+        );
+        fake.page(
+            "search",
+            json!({"total_count": 1, "incomplete_results": false, "items": [
+                hit(thread, "someone", pull, "2026-10-16T11:00:00Z")
+            ]}),
+        );
+        fake.page(
+            &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+            comments,
+        );
+        for list in ["reviews", "comments"] {
+            fake.page(
+                &format!("repos/{repo}/pulls/{number}/{list}?per_page=100"),
+                json!([]),
+            );
+        }
+        fake
+    }
+
+    /// A triage on a thread outside our own space, the tracker's
+    /// organization and the bot's account, writes nothing to it
+    /// (agent-board#283): its claims go on the issue that tracks it.
+    #[test]
+    fn a_thread_outside_our_own_space_is_tracked_and_written_nothing() {
+        let mut config = config();
+        config.policy = PollPolicy::from_json(&json!({
+            "operatorComments": {"repositories": ["upstream/*", "outside/*", format!("{BOT}/*")]},
+            "kindPools": {"triage": "small"}}))
+        .unwrap();
+        let ask = said(
+            400,
+            OPERATOR,
+            "2026-10-16T10:30:00Z",
+            "Is this still broken?",
+        );
+        // A claim an earlier pass posted on the thread, before claims moved.
+        let claimed = json!({"id": 450, "user": {"login": BOT}, "created_at": "2026-10-16T10:40:00Z",
+            "body": format!("<!-- {CLAIM}: {} -->\nTriage: claimed; started.",
+                json!({"from": "comment:issuecomment-400", "comments": ["issuecomment-400"]}))});
+        // The thread, whether a pull request, its comments, and where the
+        // run goes: the tracker, the thread, or nowhere.
+        for (thread, pull, comments, tracked, started) in [
+            ("outside/app#3", false, json!([ask]), true, true),
+            ("outside/app#4", true, json!([ask]), true, true),
+            ("upstream/operator#3", false, json!([ask]), false, true),
+            (&format!("{BOT}/app#5"), false, json!([ask]), false, true),
+            ("outside/app#3", false, json!([ask, claimed]), false, false),
+        ] {
+            let case = format!("{thread} pull={pull} started={started}");
+            let fake = one_thread(thread, pull, comments);
+            // On the pull request, the search never shows the tracking
+            // issue: the list of the bot's newest issues finds it.
+            *fake.unindexed.borrow_mut() = pull;
+            // An issue of that title someone else opened is not followed.
+            fake.page(
+                &format!("repos/{DISPATCH}/issues/7"),
+                json!({"number": 7, "user": {"login": "someone"}, "state": "open",
+                    "title": format!("{thread}: operator request"),
+                    "repository_url": format!("{API_ROOT}repos/{DISPATCH}")}),
+            );
+            let (repo, number) = thread.split_once('#').unwrap();
+            let list = format!("{API_ROOT}repos/{repo}/issues/{number}/comments?per_page=100");
+            let upstream = |fake: &Fake| {
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .filter(|(w, _)| w.contains(&format!("repos/{repo}/")))
+                    .count()
+            };
+            // The bot's issues in the tracker, which the fake keeps as it
+            // opens them.
+            let created = |fake: &Fake| -> Vec<u64> {
+                fake.rest
+                    .borrow()
+                    .iter()
+                    .filter(|(_, v)| v["user"]["login"] == BOT)
+                    .filter_map(|(k, _)| {
+                        k.strip_prefix(&format!("{API_ROOT}repos/{DISPATCH}/issues/"))?
+                            .parse()
+                            .ok()
+                    })
+                    .collect()
+            };
+            let preview = pass_configured(&fake, &config, (None, None), false, now());
+            assert!(fake.writes.borrow().is_empty(), "{case}");
+            let first = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(first.errors, 0, "{case}: {:?}", first.lines);
+            let inputs = dispatches(&fake);
+            if !started {
+                // The claim on the thread is honoured: nothing is read
+                // again, nothing tracked, nothing written.
+                assert!(preview.lines.is_empty() && first.lines.is_empty(), "{case}");
+                assert!(fake.writes.borrow().is_empty(), "{case}");
+                continue;
+            }
+            assert_eq!(inputs.len(), 1, "{case}");
+            let task = inputs[0]["task"].as_str().unwrap();
+            assert!(
+                task.contains("answering it is no reason to triage"),
+                "{case}: {task}"
+            );
+            if !tracked {
+                // Our own organization's thread is claimed and answered as before.
+                assert_eq!(
+                    preview.lines,
+                    [format!(
+                        "{thread} operator comments issuecomment-400: triage"
+                    )],
+                    "{case}"
+                );
+                assert_eq!(
+                    (&inputs[0]["repo"], &inputs[0]["item"]),
+                    (&json!(repo), &json!(number)),
+                    "{case}"
+                );
+                assert!(created(&fake).is_empty(), "{case}");
+                assert_eq!(upstream(&fake), 2, "{case}: the claim and its record");
+                continue;
+            }
+            assert_eq!(
+                preview.lines,
+                [format!(
+                    "{thread} operator comments issuecomment-400: triage on a tracking issue"
+                )],
+                "{case}"
+            );
+            let issues = created(&fake);
+            assert_eq!(issues.len(), 1, "{case}");
+            let issue = issues[0];
+            assert_eq!(
+                first.lines,
+                [format!(
+                    "{thread} operator comments issuecomment-400: triage on {DISPATCH}#{issue} -> https://github.com/{DISPATCH}/actions/runs/1234"
+                )],
+                "{case}"
+            );
+            assert_eq!(
+                (&inputs[0]["repo"], &inputs[0]["item"]),
+                (&json!(DISPATCH), &json!(issue.to_string())),
+                "{case}"
+            );
+            assert!(
+                task.contains("The result stays on that issue: post nothing to the"),
+                "{case}: {task}"
+            );
+            let tracking =
+                fake.rest.borrow()[&format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}")].clone();
+            assert_eq!(
+                tracking["title"],
+                format!("{thread}: operator request"),
+                "{case}"
+            );
+            assert!(
+                text(&tracking, "/body").contains("nothing is posted there"),
+                "{case}"
+            );
+            // The claim, with its run recorded, is on the tracking issue.
+            let claims = |fake: &Fake| -> Vec<Value> {
+                fake.rest.borrow()
+                    [&format!("{API_ROOT}repos/{DISPATCH}/issues/{issue}/comments?per_page=100")]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|c| parse_marker(CLAIM, text(c, "/body")))
+                    .collect()
+            };
+            assert_eq!(
+                claims(&fake)[0]["comments"],
+                json!(["issuecomment-400"]),
+                "{case}"
+            );
+
+            // Read again, it is handled; a new comment goes to the same issue.
+            pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(dispatches(&fake).len(), 1, "{case}");
+            fake.rest
+                .borrow_mut()
+                .get_mut(&list)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(said(
+                    401,
+                    OPERATOR,
+                    "2026-10-16T11:50:00Z",
+                    "@worker woah there",
+                ));
+            // Its run started, but the write recording it failed: the claim
+            // on the tracking issue is pending, and the next pass finds it
+            // there, rather than starting the run again or opening an issue.
+            *fake.broken.borrow_mut() = true;
+            let second = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(second.errors, 1, "{case}: {:?}", second.lines);
+            *fake.broken.borrow_mut() = false;
+            let third = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(
+                third.lines,
+                [format!("{thread} operator comments: dispatch pending")],
+                "{case}"
+            );
+            let inputs = dispatches(&fake);
+            assert_eq!(inputs.len(), 2, "{case}");
+            assert_eq!(inputs[1]["item"], json!(issue.to_string()), "{case}");
+            assert_eq!(created(&fake), [issue], "{case}");
+            assert_eq!(claims(&fake).len(), 2, "{case}");
+            assert_eq!(upstream(&fake), 0, "{case}");
+        }
+    }
+
     #[test]
     fn someone_elses_pull_request_is_copied_only_when_public_and_once() {
         // Nothing of a pull request that is not public goes to the tracker.
@@ -2580,7 +3063,7 @@ pub(super) mod tests {
         assert_eq!(
             again.lines,
             [
-                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/example/tracker/actions/runs/1234"
+                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/upstream/tracker/actions/runs/1234"
             ]
         );
         assert!(
@@ -2714,8 +3197,8 @@ pub(super) mod tests {
         assert_eq!(
             again.lines[..2],
             [
-                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 1 -> https://github.com/example/tracker/actions/runs/1234",
-                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/example/tracker/actions/runs/1234",
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 1 -> https://github.com/upstream/tracker/actions/runs/1234",
+                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/upstream/tracker/actions/runs/1234",
             ]
         );
         assert_eq!((marker(&fake).rounds, marker(&fake).run), (1, Some(1234)));
@@ -2753,8 +3236,8 @@ pub(super) mod tests {
         assert_eq!(
             last.lines[..2],
             [
-                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 2 -> https://github.com/example/tracker/actions/runs/1234",
-                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/example/tracker/actions/runs/1234",
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 2 -> https://github.com/upstream/tracker/actions/runs/1234",
+                "upstream/operator#3 operator comments issuecomment-400: triage -> https://github.com/upstream/tracker/actions/runs/1234",
             ]
         );
         assert_eq!(dispatches(&fake).len(), 4);

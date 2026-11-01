@@ -374,8 +374,21 @@ nothing private is copied to the tracker; any other is left. The claim on the
 pull request records its number and links it once the run is dispatched; later
 comments are quoted on the issue the newest claim names, if the bot opened it
 for that pull request and it is open, else (also where it is gone) on a new one.
-Each is claimed on its
-thread first, as a fix round is, so a comment is acted on once whether or not
+A thread outside our own space (the dispatch repository's organization and the
+bot's own account) gets no write from a triage at all (agent-board#283): an
+issue there, like a pull request, is triaged on a tracking issue, so only a
+public repository's, and the claim goes on that issue instead of the thread. As
+nothing on the thread links to it, the issue is found by its exact title among
+the bot's issues in the dispatch repository: the 100 it opened last, a list that
+is always current, and the first 10 of a search for the title, which finds older
+ones but may lag. Later comments are quoted on the oldest open one, else on a
+new one; a pass that opened one goes on with the oldest open one, so two passes
+that overlap claim on the same issue. A claim already on such a thread is still
+honoured. The brief says that the result stays on the tracking issue, and that
+a comment may be direction or feedback on the bot's own earlier comments, which
+is no reason to triage the item again. A fix round on the bot's own pull request
+is as anywhere else. Each comment is claimed first, on its thread or its
+tracking issue, as a fix round is, so a comment is acted on once whether or not
 the cursor survives. A run GitHub refuses (a 4xx) is recorded on its claim or
 marker, without using the round, and tried again on later passes, three times
 at most. The claim or marker names the comments as pending until a write after
