@@ -133,9 +133,11 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   whether an outage (broker, API, runner) caused them and whether it has
   ended, or which issue owns the bug.
 - **runs**: a run past its timeout. Check whether it is still working, and
-  report it if it is stuck.
+  report it if it is stuck. A run listed as unfinished for over seven days
+  is left out: GitHub refuses to cancel it.
 - **broker**: the probe failed or is stale. Report it. Nothing here repairs
-  the broker.
+  the broker. `ok` saying the probe is off means every listed probe run was
+  skipped; nothing observes the broker, and that is the operator's choice.
 - **epics**: a coordinator epic failing, stale or looping. Read its
   checkpoint and the runs it names, and report what failed.
 - **dispatch**: a dispatch whose issue is closed, has an open pull request
@@ -173,6 +175,11 @@ binds the answer to this issue, without a scheduler question's `request` ID.
 - **pace**: a pool's used share of its window is outside the margin around
   the share elapsed. Report it. Keep the numbers out of public issues,
   because the snapshot is private.
+- **capacity**: a pool is under its allowed share by the configured margin
+  while a recent pass went idle with slots free. It only warns. The evidence
+  starts with the pull requests the pass's `blocker` lines name: start there
+  and report what holds each one (a fix round, a review, the operator), then
+  whether ready work lacks a plan, as for **idle**. Give no percentages.
 - **failures**: an agent run's newest attempt failed for a reason that
   recurs if run again unchanged. Its `reason` is `secret`, `refused`,
   `blocker` or `bounds`. Ask for a triage run on its target with
@@ -184,7 +191,9 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   work by hand, and whether the poll and pass read `--fix-bounds`.
 - **held**: `needs-human` on the bot's pull request for longer than the
   configured hours. The evidence is the pull request and its latest
-  comment, which says why. Report what the operator has to decide.
+  comment, which says why. Report what the operator has to decide. A draft
+  in a repository the pass never merges into (`pr.noMerge`) is left out: it
+  waits in the operator's promote queue.
 - **unqueued**: an approved pull request, its merge state clean, not in the
   merge queue for over an hour. Report why the poll did not merge it.
 - **unclosed**: the bot's implement pull request merged and its issue, named
@@ -201,4 +210,4 @@ binds the answer to this issue, without a scheduler question's `request` ID.
 - **Unavailable**: a check whose `suggested_action` starts `Observation
   unavailable` fails once `unavailable_since` is an hour old. Find which
   read it lacks (a private repository, a token scope, a truncated listing, a
-  probe switched off) and report it.
+  pass config that does not read) and report it.
