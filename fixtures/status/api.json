@@ -38,11 +38,11 @@
     {"status": "in_progress", "labels": ["self-hosted", "linux"], "created_at": "2026-10-22T11:55:00Z", "html_url": "https://github.com/example/control/actions/runs/24/job/241"}
   ]},
   "/repos/example/control/actions/workflows/dispatch.yml/runs?status=queued&per_page=100&page=1": {"total_count": 2, "workflow_runs": [
-    {"id": 21, "display_title": "triage example/code#5 (claude)", "status": "queued"},
-    {"id": 22, "display_title": "triage example/code#6 (claude)", "status": "queued"}
+    {"id": 21, "display_title": "triage example/code#5 (claude)", "status": "queued", "created_at": "2026-10-22T11:46:00Z"},
+    {"id": 22, "display_title": "triage example/code#6 (claude)", "status": "queued", "created_at": "2026-10-22T11:58:00Z"}
   ]},
   "/repos/example/control/actions/workflows/dispatch.yml/runs?status=in_progress&per_page=100&page=1": {"total_count": 1, "workflow_runs": [
-    {"id": 23, "display_title": "implement example/code#3 (openai)", "status": "in_progress"}
+    {"id": 23, "display_title": "implement example/code#3 (openai)", "status": "in_progress", "created_at": "2026-10-22T10:35:00Z"}
   ]},
   "/repos/example/control/actions/workflows/dispatch.yml/runs?status=completed&created=%3E%3D2026-10-22T06%3A00%3A00.000Z&per_page=100&page=1": {"total_count": 4, "workflow_runs": [
     {"id": 31, "display_title": "fix example/code#9", "conclusion": "success", "updated_at": "2026-10-22T11:30:00Z", "html_url": "https://github.com/example/control/actions/runs/31"},

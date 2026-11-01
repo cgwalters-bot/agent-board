@@ -276,7 +276,8 @@ fn kind_and_pool(title: &str) -> (String, String) {
     (kind.into(), pool.into())
 }
 
-/// Agent runs active by kind and by pool, and the last hour's outcomes.
+/// Agent runs active by kind and by pool, each with its item and age, and
+/// the last hour's outcomes.
 fn agents(api: &dyn Api, s: &Settings, now_ms: i64) -> Result<Value> {
     let runs_path = format!(
         "/repos/{}/actions/workflows/{}/runs",
@@ -284,6 +285,7 @@ fn agents(api: &dyn Api, s: &Settings, now_ms: i64) -> Result<Value> {
     );
     let mut by_kind: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut by_pool: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut active = vec![];
     let mut seen = BTreeSet::new();
     for status in ACTIVE {
         for run in listed(
@@ -295,7 +297,16 @@ fn agents(api: &dyn Api, s: &Settings, now_ms: i64) -> Result<Value> {
             if !seen.insert(run["id"].as_u64().context("run without id")?) {
                 continue;
             }
-            let (kind, pool) = kind_and_pool(run["display_title"].as_str().unwrap_or_default());
+            let title = run["display_title"].as_str().unwrap_or_default();
+            let (kind, pool) = kind_and_pool(title);
+            active.push(json!({
+                "kind": kind,
+                "item": run_title(title).map(|(_, repo, number)| format!("{repo}#{number}")),
+                "pool": pool,
+                "status": status,
+                "age_seconds": seconds_since(&run["created_at"], now_ms),
+                "html_url": run["html_url"],
+            }));
             *by_kind
                 .entry(kind)
                 .or_default()
@@ -338,6 +349,7 @@ fn agents(api: &dyn Api, s: &Settings, now_ms: i64) -> Result<Value> {
     Ok(json!({
         "by_kind": by_kind,
         "by_pool": by_pool,
+        "runs": active,
         "last_hour": outcomes,
         "failed": failed,
     }))
@@ -524,7 +536,7 @@ pub fn board_counts(snapshot: &Snapshot) -> Value {
 }
 
 /// Remote text without control characters, which could move a terminal's cursor.
-fn clean(value: &Value) -> String {
+pub fn clean(value: &Value) -> String {
     let text = match value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
@@ -533,7 +545,8 @@ fn clean(value: &Value) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn duration(seconds: i64) -> String {
+/// A short duration, such as `5m` or `2h05m`.
+pub fn duration(seconds: i64) -> String {
     match seconds {
         ..60 => format!("{seconds}s"),
         60..3600 => format!("{}m", seconds / 60),
@@ -596,6 +609,23 @@ pub fn text(report: &Value) -> String {
                     counts(states)
                 ));
             }
+        }
+        for run in a["runs"].as_array().into_iter().flatten() {
+            let status = match run["status"].as_str() {
+                Some("in_progress") => "running",
+                _ => "queued",
+            };
+            let age = run["age_seconds"]
+                .as_i64()
+                .map_or_else(|| "age unknown".into(), |s| format!("{} old", duration(s)));
+            let item = run["item"]
+                .as_str()
+                .map_or("(no item)".into(), |i| clean(&i.into()));
+            line(format!(
+                "  {} {item} {status}, {age}, pool {}",
+                clean(&run["kind"]),
+                clean(&run["pool"])
+            ));
         }
         let n = |k: &str| a["last_hour"][k].as_u64().unwrap_or(0);
         line(format!(
@@ -873,9 +903,12 @@ agents:
   kind triage: 0 running, 2 queued
   pool claude: 0 running, 2 queued
   pool openai: 1 running, 0 queued
+  triage example/code#5 queued, 14m old, pool claude
+  triage example/code#6 queued, 2m old, pool claude
+  implement example/code#3 running, 1h25m old, pool openai
   last hour: 1 succeeded, 1 failed, 1 cancelled
     failed: implement example/code#4 (claude) https://github.com/example/control/actions/runs/32
-pools: claude normal 26%/30%, openai held until 2026-10-23T00:00Z
+pools: claude normal 26% used of 30% allowed, openai held until 2026-10-23T00:00Z
 queues:
   example/code: 2 queued; approved, not queued: #42 conflicting, #43 failing, #44 behind
 board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
@@ -1095,6 +1128,37 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
             (pull("MERGEABLE", "CLEAN", "SUCCESS"), "not queued"),
         ] {
             assert_eq!(not_queued(&p), reason, "{p}");
+        }
+    }
+
+    /// Each agent run in flight is a line: kind, item, status, age and pool.
+    #[test]
+    fn run_lines() {
+        for (run, expected) in [
+            (
+                json!({"kind": "fix", "item": "o/r#7", "pool": "default", "status": "in_progress",
+                    "age_seconds": 7300}),
+                "  fix o/r#7 running, 2h01m old, pool default",
+            ),
+            (
+                json!({"kind": "triage", "item": "o/r#8", "pool": "claude", "status": "queued",
+                    "age_seconds": 45}),
+                "  triage o/r#8 queued, 45s old, pool claude",
+            ),
+            // A title that names no item, and a run with no creation time.
+            (
+                json!({"kind": "other", "item": null, "pool": "default", "status": "queued",
+                    "age_seconds": null}),
+                "  other (no item) queued, age unknown, pool default",
+            ),
+            (
+                json!({"kind": "implement", "item": "o/r#9\u{1b}[2J", "pool": "a\u{7}",
+                    "status": "in_progress", "age_seconds": 60}),
+                "  implement o/r#9[2J running, 1m old, pool a",
+            ),
+        ] {
+            let out = text(&json!({"agents": {"runs": [run]}}));
+            assert!(out.lines().any(|l| l == expected), "{out}");
         }
     }
 

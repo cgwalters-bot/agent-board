@@ -24,6 +24,7 @@ Commands:
 - [`run`](#agent-board-run): Propose run field updates, or write them with --apply
 - [`request`](#agent-board-request): Prepare an operator-approved workflow dispatch (no network writes)
 - [`dispatch`](#agent-board-dispatch): Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request)
+- [`overlap`](#agent-board-overlap): The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command)
 - [`epic`](#agent-board-epic): Check a coordinator's plan for an epic's sub-issues
 - [`review`](#agent-board-review): Send an operator-approved review draft as the bot
 - [`snapshot`](#agent-board-snapshot): Save a normalized board snapshot for offline use
@@ -464,6 +465,23 @@ Options:
 - `--bot <LOGIN>`: Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration
 - `--collaborators-only`: Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository. Off without it; from the caller's configuration
 - `--status-app-id <ID>`: With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration
+
+## agent-board overlap
+
+The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command)
+
+```text
+agent-board overlap [OPTIONS] --caller <OWNER/REPO> --workflow <FILE> <--paths <PATH>...|--branch <BRANCH>|--pr <N>>
+```
+
+Options:
+
+- `--paths <PATH>`: Paths the change touches, as files or directories
+- `--branch <BRANCH>`: Branch of -R whose changes against its default branch are the change
+- `--pr <N>`: Pull request of -R whose files (at most 100) are the change; it is not listed itself
+- `--caller <OWNER/REPO>`: Repository whose --workflow runs are the dispatch runs; from the caller's configuration
+- `--workflow <FILE>`: Workflow file in --caller that starts the runs, such as dispatch.yml
+- `--stale-draft-hours <HOURS>`: Hours a draft's head must be proved unchanged for it to be flagged stale, as the pass's `overlap.staleDraftHours` (default: `4`)
 
 ## agent-board epic
 

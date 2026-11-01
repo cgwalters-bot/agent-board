@@ -21,6 +21,10 @@
 //! The pass may waive an open pull request's overlap ([`Waiver`],
 //! agent-board#426): a draft nobody is moving races no run, and a conflict
 //! in documentation is cheap to resolve for the board's most urgent work.
+//!
+//! [`intersecting`] finds every open pull request and run that shares a
+//! path; the check's decision is drawn from it, and `agent-board overlap`
+//! lists it (agent-board#297).
 use crate::github::{API_ROOT, Transport};
 use crate::plan::Target;
 use crate::poll::{Rest, validate_repository};
@@ -46,10 +50,18 @@ pub const DRAFT_READS: usize = 40;
 /// Paths named in a decision, at most.
 const SHOWN: usize = 3;
 
-const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $pulls: Int!, $files: Int!) {
+/// Pages of [`PULL_READS`] open pull requests `agent-board overlap` reads;
+/// the dispatch check reads one.
+pub const PULL_PAGES: usize = 5;
+
+const PULLS_QUERY: &str = r#"query($owner: String!, $name: String!, $pulls: Int!, $files: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, first: $pulls, orderBy: {field: CREATED_AT, direction: DESC}) {
-      nodes { number author { login } files(first: $files) { nodes { path } } }
+    pullRequests(states: OPEN, first: $pulls, after: $after, orderBy: {field: CREATED_AT, direction: DESC}) {
+      nodes {
+        number author { login } isDraft createdAt updatedAt
+        files(first: $files) { nodes { path } }
+      }
+      pageInfo { hasNextPage endCursor }
     }
   }
 }"#;
@@ -129,107 +141,123 @@ impl Waiver {
                 "it shares only documentation, and the issue is in the first Priority".into(),
             ));
         }
-        let Some((now, hours)) = self.stale_draft.filter(|_| *reads > 0) else {
+        let Some(stale) = self.stale_draft else {
             return Ok(None);
         };
-        *reads -= 1;
-        let (owner, name) = owner_name(dest)?;
-        let data = client.graphql(
-            DRAFT_QUERY,
-            json!({"owner": owner, "name": name, "number": pull}),
-        )?;
-        let node = data
-            .pointer("/repository/pullRequest")
-            .filter(|n| n.is_object())
-            .with_context(|| format!("pull request {pull} is not readable"))?;
-        if node["isDraft"] != Value::Bool(true) {
-            return Ok(None);
-        }
-        let Some(opened) = timestamp(&node["createdAt"]) else {
+        Ok(idle_draft(client, (dest, pull), stale, reads)?
+            .map(|idle| format!("it is a draft whose head has not changed for {idle} hours")))
+    }
+}
+
+/// The hours since pull request `pull` of `dest`'s repository last changed,
+/// if it is a draft opened and last pushed to at least `hours` before `now`,
+/// proved by complete authenticated activity for its current head branch:
+/// the rule by which [`Waiver::stale_draft`] waives a draft. Each read spends
+/// one of `reads`; with none left, it is not proved stale.
+pub fn idle_draft<T: Transport + Rest>(
+    client: &T,
+    (dest, pull): (&ItemRef, u64),
+    (now, hours): (OffsetDateTime, u64),
+    reads: &mut usize,
+) -> Result<Option<i64>> {
+    if *reads == 0 {
+        return Ok(None);
+    }
+    *reads -= 1;
+    let (owner, name) = owner_name(dest)?;
+    let data = client.graphql(
+        DRAFT_QUERY,
+        json!({"owner": owner, "name": name, "number": pull}),
+    )?;
+    let node = data
+        .pointer("/repository/pullRequest")
+        .filter(|n| n.is_object())
+        .with_context(|| format!("pull request {pull} is not readable"))?;
+    if node["isDraft"] != Value::Bool(true) {
+        return Ok(None);
+    }
+    let Some(opened) = timestamp(&node["createdAt"]) else {
+        return Ok(None);
+    };
+    if (now - opened).whole_hours() < i64::try_from(hours)? || *reads == 0 {
+        return Ok(None);
+    }
+    let Some(repo) = node
+        .pointer("/headRepository/nameWithOwner")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    validate_repository(repo)?;
+    let Some(branch) = node["headRefName"].as_str().filter(|b| !b.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(head) = node["headRefOid"].as_str().filter(|h| oid(h)) else {
+        return Ok(None);
+    };
+    let reference = format!("refs/heads/{branch}");
+    let encoded: String = url::form_urlencoded::byte_serialize(reference.as_bytes()).collect();
+    *reads -= 1;
+    // Unlike the public Events feed or commit pushedDate, repository activity
+    // records branch changes, including force pushes back to an old commit.
+    // No actor/type/time filter: omissions could hide a newer head change.
+    let response = client.get(
+        &format!(
+            "{API_ROOT}repos/{repo}/activity?ref={encoded}&direction=desc&per_page={FILE_READS}"
+        ),
+        None,
+    )?;
+    if response.status != 200 || response.link.is_some() {
+        return Ok(None);
+    }
+    let Some(events) = response
+        .body
+        .as_array()
+        .filter(|e| !e.is_empty() && e.len() < FILE_READS as usize)
+    else {
+        return Ok(None);
+    };
+    // Require a complete, ordered chain ending at the PR head. A partial
+    // page, unknown activity, or a different branch/head proves no idle time.
+    let mut expected = head;
+    let mut previous = now;
+    for event in events {
+        let Some(at) = timestamp(&event["timestamp"]) else {
             return Ok(None);
         };
-        if (now - opened).whole_hours() < i64::try_from(hours)? || *reads == 0 {
-            return Ok(None);
-        }
-        let Some(repo) = node
-            .pointer("/headRepository/nameWithOwner")
-            .and_then(Value::as_str)
-        else {
+        let Some(before) = event["before"].as_str().filter(|h| oid(h)) else {
             return Ok(None);
         };
-        validate_repository(repo)?;
-        let Some(branch) = node["headRefName"].as_str().filter(|b| !b.is_empty()) else {
-            return Ok(None);
-        };
-        let Some(head) = node["headRefOid"].as_str().filter(|h| oid(h)) else {
-            return Ok(None);
-        };
-        let reference = format!("refs/heads/{branch}");
-        let encoded: String = url::form_urlencoded::byte_serialize(reference.as_bytes()).collect();
-        *reads -= 1;
-        // Unlike the public Events feed or commit pushedDate, repository activity
-        // records branch changes, including force pushes back to an old commit.
-        // No actor/type/time filter: omissions could hide a newer head change.
-        let response = client.get(
-            &format!(
-                "{API_ROOT}repos/{repo}/activity?ref={encoded}&direction=desc&per_page={FILE_READS}"
-            ),
-            None,
-        )?;
-        if response.status != 200 || response.link.is_some() {
-            return Ok(None);
-        }
-        let Some(events) = response
-            .body
-            .as_array()
-            .filter(|e| !e.is_empty() && e.len() < FILE_READS as usize)
-        else {
-            return Ok(None);
-        };
-        // Require a complete, ordered chain ending at the PR head. A partial
-        // page, unknown activity, or a different branch/head proves no idle time.
-        let mut expected = head;
-        let mut previous = now;
-        for event in events {
-            let Some(at) = timestamp(&event["timestamp"]) else {
-                return Ok(None);
-            };
-            let Some(before) = event["before"].as_str().filter(|h| oid(h)) else {
-                return Ok(None);
-            };
-            if event["ref"] != reference
-                || event["after"] != expected
-                || at > previous
-                || !matches!(
-                    event["activity_type"].as_str(),
-                    Some(
-                        "push"
-                            | "force_push"
-                            | "branch_creation"
-                            | "branch_deletion"
-                            | "pr_merge"
-                            | "merge_queue_merge"
-                    )
+        if event["ref"] != reference
+            || event["after"] != expected
+            || at > previous
+            || !matches!(
+                event["activity_type"].as_str(),
+                Some(
+                    "push"
+                        | "force_push"
+                        | "branch_creation"
+                        | "branch_deletion"
+                        | "pr_merge"
+                        | "merge_queue_merge"
                 )
-            {
-                return Ok(None);
-            }
-            expected = before;
-            previous = at;
-        }
-        if expected != "0".repeat(40)
-            || events.last().map(|e| &e["activity_type"]) != Some(&json!("branch_creation"))
+            )
         {
             return Ok(None);
         }
-        let Some(changed) = timestamp(&events[0]["timestamp"]).map(|pushed| opened.max(pushed))
-        else {
-            return Ok(None);
-        };
-        let idle = (now - changed).whole_hours();
-        Ok((idle >= i64::try_from(hours)?)
-            .then(|| format!("it is a draft whose head has not changed for {idle} hours")))
+        expected = before;
+        previous = at;
     }
+    if expected != "0".repeat(40)
+        || events.last().map(|e| &e["activity_type"]) != Some(&json!("branch_creation"))
+    {
+        return Ok(None);
+    }
+    let Some(changed) = timestamp(&events[0]["timestamp"]).map(|pushed| opened.max(pushed)) else {
+        return Ok(None);
+    };
+    let idle = (now - changed).whole_hours();
+    Ok((idle >= i64::try_from(hours)?).then_some(idle))
 }
 
 fn timestamp(value: &Value) -> Option<OffsetDateTime> {
@@ -386,46 +414,35 @@ fn check<C: Transport + Rest>(
     if named.is_empty() {
         return Ok(Decision::Independent("the issue names no path".into()));
     }
+    let scope = Scope {
+        author: Some(bot),
+        pages: 1,
+        first_run: true,
+    };
+    let found = intersecting(client, &named, (dest, target), ended, scope)?;
     // A run in flight has not pushed, and a batch cannot join a run that
     // started, so an overlap waits for its pull request.
-    for running in in_flight(client, dest, target, ended)?
-        .iter()
-        .take(RUN_READS)
-    {
-        // Text against text, the same bare `.name` in both is as often an
-        // extension as a file: agentic-job#636 waited on #882 only because
-        // both said `.patch`. Against a path with a directory, or a pull
-        // request's files, it still overlaps.
-        let bare = |path: &str| path.starts_with('.') && !path.contains('/');
-        let theirs: Vec<String> = paths(&text(client, running)?)
-            .into_iter()
-            .filter(|o| named.iter().any(|n| overlaps(n, o) && !(n == o && bare(n))))
-            .collect();
-        if !theirs.is_empty() {
-            return Ok(Decision::Wait(
-                format!(
-                    "the run for {} in flight names {}",
-                    running.display(),
-                    shown(&theirs)
-                ),
-                Vec::new(),
-            ));
-        }
+    if let Some(run) = found.runs.first() {
+        return Ok(Decision::Wait(
+            format!(
+                "the run for {} in flight names {}",
+                run.item.display(),
+                shown(&run.shared)
+            ),
+            Vec::new(),
+        ));
     }
     let (mut overlapping, mut ignored) = (Vec::new(), Vec::new());
     let mut reads = DRAFT_READS;
-    for (number, files) in open_pulls(client, dest, bot)? {
-        let theirs = shared(&named, &files);
-        if !theirs.is_empty() {
-            let pull = ItemRef {
-                number,
-                ..dest.clone()
-            };
-            let changes = format!("{} changes {}", pull.display(), shown(&theirs));
-            match waiver.waives(client, (dest, number), &theirs, &mut reads)? {
-                Some(why) => ignored.push(format!("{changes}, but {why}")),
-                None => overlapping.push((number, changes)),
-            }
+    for found in &found.pulls {
+        let pull = ItemRef {
+            number: found.number,
+            ..dest.clone()
+        };
+        let changes = format!("{} changes {}", pull.display(), shown(&found.shared));
+        match waiver.waives(client, (dest, found.number), &found.shared, &mut reads)? {
+            Some(why) => ignored.push(format!("{changes}, but {why}")),
+            None => overlapping.push((found.number, changes)),
         }
     }
     Ok(if !overlapping.is_empty() {
@@ -462,44 +479,170 @@ fn text<T: Transport>(client: &T, issue: &ItemRef) -> Result<String> {
     ))
 }
 
-/// The bot's open pull requests on `dest`'s repository and the files each changes.
-fn open_pulls<T: Transport>(
-    client: &T,
-    dest: &ItemRef,
-    bot: &str,
-) -> Result<Vec<(u64, BTreeSet<String>)>> {
-    let (owner, name) = owner_name(dest)?;
-    let data = client.graphql(
-        PULLS_QUERY,
-        json!({"owner": owner, "name": name, "pulls": PULL_READS, "files": FILE_READS}),
-    )?;
-    let nodes = data
-        .pointer("/repository/pullRequests/nodes")
-        .and_then(Value::as_array)
-        .context("pull requests have no nodes")?;
-    let mut out = Vec::new();
-    for pull in nodes {
-        let author = pull.pointer("/author/login").and_then(Value::as_str);
-        if !author.is_some_and(|a| a.eq_ignore_ascii_case(bot)) {
-            continue;
-        }
-        let number = pull["number"]
-            .as_u64()
-            .context("pull request has no number")?;
-        let files = pull
-            .pointer("/files/nodes")
-            .and_then(Value::as_array)
-            .context("pull request has no files")?
-            .iter()
-            // A path is quoted into the next run's task and into the record, and
-            // git allows backticks and newlines in one: keep only plain paths.
-            .filter_map(|f| f["path"].as_str())
-            .filter(|p| p.chars().all(pathlike))
-            .map(str::to_owned)
+/// An open pull request that changes a path in the set [`intersecting`]
+/// was given.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PullOverlap {
+    pub number: u64,
+    pub author: Option<String>,
+    pub draft: bool,
+    pub created: Option<OffsetDateTime>,
+    /// Its last activity, as GitHub dates it.
+    pub updated: Option<OffsetDateTime>,
+    /// The files it changes that intersect the set.
+    pub shared: Vec<String>,
+}
+
+/// An implement run in flight whose issue names a path in the set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunOverlap {
+    pub item: ItemRef,
+    pub id: Option<u64>,
+    pub url: Option<String>,
+    pub created: Option<OffsetDateTime>,
+    pub updated: Option<OffsetDateTime>,
+    /// The paths its issue names that intersect the set.
+    pub shared: Vec<String>,
+}
+
+/// What [`intersecting`] found, in the order the dispatch check weighs it:
+/// runs by issue number, pull requests newest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Overlap {
+    pub runs: Vec<RunOverlap>,
+    pub pulls: Vec<PullOverlap>,
+    /// Whether every open pull request was read, rather than only the
+    /// pages asked for.
+    pub complete: bool,
+}
+
+/// What [`intersecting`] reads.
+#[derive(Clone, Copy, Debug)]
+pub struct Scope<'a> {
+    /// Only this login's pull requests, ignoring ASCII case; any author's
+    /// without it.
+    pub author: Option<&'a str>,
+    /// Pages of [`PULL_READS`] pull requests read, at most.
+    pub pages: usize,
+    /// Stop at the first intersecting run, reading no pull request then:
+    /// the dispatch check waits on it whatever else intersects, so a later
+    /// read cannot change that.
+    pub first_run: bool,
+}
+
+impl Scope<'_> {
+    /// What `agent-board overlap` lists.
+    pub const ALL: Scope<'static> = Scope {
+        author: None,
+        pages: PULL_PAGES,
+        first_run: false,
+    };
+}
+
+/// Every open pull request of `dest`'s repository whose files intersect
+/// `named`, and every implement run in flight on `target` for another issue
+/// of it (the first [`RUN_READS`]; those by id in `ended` left out) whose
+/// issue names a path that does, as the dispatch check reads both, within
+/// `scope`.
+pub fn intersecting<C: Transport + Rest>(
+    client: &C,
+    named: &BTreeSet<String>,
+    (dest, target): (&ItemRef, &Target),
+    ended: &BTreeSet<u64>,
+    scope: Scope,
+) -> Result<Overlap> {
+    let mut found = Overlap::default();
+    for mut run in in_flight(client, dest, target, ended)?
+        .into_iter()
+        .take(RUN_READS)
+    {
+        // Text against text, the same bare `.name` in both is as often an
+        // extension as a file: agentic-job#636 waited on #882 only because
+        // both said `.patch`. Against a path with a directory, or a pull
+        // request's files, it still overlaps.
+        let bare = |path: &str| path.starts_with('.') && !path.contains('/');
+        run.shared = paths(&text(client, &run.item)?)
+            .into_iter()
+            .filter(|o| named.iter().any(|n| overlaps(n, o) && !(n == o && bare(n))))
             .collect();
-        out.push((number, files));
+        if !run.shared.is_empty() {
+            found.runs.push(run);
+            if scope.first_run {
+                return Ok(found);
+            }
+        }
     }
-    Ok(out)
+    let (pulls, complete) = open_pulls(client, dest, scope)?;
+    found.complete = complete;
+    for (mut pull, files) in pulls {
+        pull.shared = shared(named, &files);
+        if !pull.shared.is_empty() {
+            found.pulls.push(pull);
+        }
+    }
+    Ok(found)
+}
+
+/// Open pull requests, each with the files it changes.
+type Pulls = Vec<(PullOverlap, BTreeSet<String>)>;
+
+/// Open pull requests on `dest`'s repository by `scope`'s author, newest
+/// first, and the files each changes, from at most `scope`'s pages; and
+/// whether that was all.
+fn open_pulls<T: Transport>(client: &T, dest: &ItemRef, scope: Scope) -> Result<(Pulls, bool)> {
+    let (owner, name) = owner_name(dest)?;
+    let mut out = Vec::new();
+    let mut variables =
+        json!({"owner": owner, "name": name, "pulls": PULL_READS, "files": FILE_READS});
+    for _ in 0..scope.pages {
+        let data = client.graphql(PULLS_QUERY, variables.clone())?;
+        let connection = data
+            .pointer("/repository/pullRequests")
+            .context("pull requests have no nodes")?;
+        let nodes = connection["nodes"]
+            .as_array()
+            .context("pull requests have no nodes")?;
+        for pull in nodes {
+            let author = pull.pointer("/author/login").and_then(Value::as_str);
+            // Before the node is read, so that another author's cannot fail it.
+            if scope
+                .author
+                .is_some_and(|want| !author.is_some_and(|a| a.eq_ignore_ascii_case(want)))
+            {
+                continue;
+            }
+            let number = pull["number"]
+                .as_u64()
+                .context("pull request has no number")?;
+            let files = pull
+                .pointer("/files/nodes")
+                .and_then(Value::as_array)
+                .context("pull request has no files")?
+                .iter()
+                // A path is quoted into the next run's task and into the record, and
+                // git allows backticks and newlines in one: keep only plain paths.
+                .filter_map(|f| f["path"].as_str())
+                .filter(|p| p.chars().all(pathlike))
+                .map(str::to_owned)
+                .collect();
+            let found = PullOverlap {
+                number,
+                author: author.map(str::to_owned),
+                draft: pull["isDraft"] == true,
+                created: timestamp(&pull["createdAt"]),
+                updated: timestamp(&pull["updatedAt"]),
+                shared: Vec::new(),
+            };
+            out.push((found, files));
+        }
+        let page = &connection["pageInfo"];
+        match page["endCursor"].as_str() {
+            // The first page is asked without a cursor, as a recorded pass replays it.
+            Some(cursor) if page["hasNextPage"] == true => variables["after"] = cursor.into(),
+            _ => return Ok((out, true)),
+        }
+    }
+    Ok((out, false))
 }
 
 /// The other issues of `dest`'s repository with an implement run of the
@@ -511,9 +654,9 @@ fn in_flight<C: Rest>(
     dest: &ItemRef,
     target: &Target,
     ended: &BTreeSet<u64>,
-) -> Result<Vec<ItemRef>> {
+) -> Result<Vec<RunOverlap>> {
     target.validate()?;
-    let mut out = Vec::new();
+    let mut out: Vec<RunOverlap> = Vec::new();
     for status in ["in_progress", "queued"] {
         let url = format!(
             "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page=100",
@@ -545,17 +688,107 @@ fn in_flight<C: Rest>(
             };
             if repo.eq_ignore_ascii_case(&dest.repository)
                 && number != dest.number
-                && !out.iter().any(|o: &ItemRef| o.number == number)
+                && !out.iter().any(|o| o.item.number == number)
             {
-                out.push(ItemRef {
-                    number,
-                    ..dest.clone()
+                out.push(RunOverlap {
+                    item: ItemRef {
+                        number,
+                        ..dest.clone()
+                    },
+                    id: run["id"].as_u64(),
+                    url: run["html_url"].as_str().map(str::to_owned),
+                    created: timestamp(&run["created_at"]),
+                    updated: timestamp(&run["updated_at"]),
+                    shared: Vec::new(),
                 });
             }
         }
     }
-    out.sort_by_key(|o| o.number);
+    out.sort_by_key(|o| o.item.number);
     Ok(out)
+}
+
+/// The most files GitHub lists of a comparison; one that reaches it may
+/// change more.
+const COMPARE_FILES: usize = 300;
+
+/// The files pull request `number` of `repo` changes, at most
+/// [`FILE_READS`]: one that changes more is refused, as part of its files
+/// would understate what it overlaps.
+pub fn pull_paths<C: Rest>(client: &C, repo: &str, number: u64) -> Result<BTreeSet<String>> {
+    validate_repository(repo)?;
+    let response = client.get(
+        &format!("{API_ROOT}repos/{repo}/pulls/{number}/files?per_page={FILE_READS}"),
+        None,
+    )?;
+    ensure!(
+        response.status == 200,
+        "reading the files of {repo}#{number}: GitHub HTTP status {}",
+        response.status
+    );
+    ensure!(
+        !response.link.is_some_and(|l| l.contains("rel=\"next\"")),
+        "{repo}#{number} changes more than {FILE_READS} files; name the paths with --paths"
+    );
+    changed(&response.body, &format!("{repo}#{number}"))
+}
+
+/// Whether a branch name may go into an API path as it is.
+fn plain(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.len() <= 200
+        && !branch.starts_with(['-', '/', '.'])
+        && !branch.contains("..")
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+}
+
+/// Refuse a branch name that may not go into an API path as it is.
+pub fn validate_branch(branch: &str) -> Result<()> {
+    ensure!(plain(branch), "invalid branch {branch:?}");
+    Ok(())
+}
+
+/// The files `branch` of `repo` changes against the default branch.
+pub fn branch_paths<C: Rest>(client: &C, repo: &str, branch: &str) -> Result<BTreeSet<String>> {
+    validate_repository(repo)?;
+    validate_branch(branch)?;
+    let read = |url: String| -> Result<Value> {
+        let response = client.get(&url, None)?;
+        ensure!(
+            response.status == 200,
+            "{url}: GitHub HTTP status {}",
+            response.status
+        );
+        Ok(response.body)
+    };
+    let base = read(format!("{API_ROOT}repos/{repo}"))?;
+    let base = base["default_branch"]
+        .as_str()
+        .filter(|b| plain(b))
+        .context("the repository's default branch is not a plain branch name")?;
+    let comparison = read(format!(
+        "{API_ROOT}repos/{repo}/compare/{base}...{branch}?per_page=1"
+    ))?;
+    let files = &comparison["files"];
+    ensure!(
+        files.as_array().is_some_and(|f| f.len() < COMPARE_FILES),
+        "{branch} changes {COMPARE_FILES} files or more against {base}, more than GitHub lists; name the paths with --paths"
+    );
+    changed(files, branch)
+}
+
+/// The plain paths of a REST file list.
+fn changed(files: &Value, what: &str) -> Result<BTreeSet<String>> {
+    Ok(files
+        .as_array()
+        .with_context(|| format!("the files of {what} are not a list"))?
+        .iter()
+        .filter_map(|f| f["filename"].as_str())
+        .filter(|p| p.chars().all(pathlike))
+        .map(str::to_owned)
+        .collect())
 }
 
 #[cfg(test)]
@@ -1245,5 +1478,440 @@ mod tests {
                 "Run independently: overlap ignored: open pull request {docs}, but {only_docs}."
             )
         );
+    }
+
+    /// [`Forge`], with its open pull requests in pages and its runs dated.
+    struct Paged {
+        forge: Forge,
+        pages: Vec<Value>,
+        runs: Vec<Value>,
+    }
+
+    impl Transport for Paged {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if query != PULLS_QUERY {
+                ensure!(variables["number"] != 12, "example/work#12 is not an issue");
+                return self.forge.graphql(query, variables);
+            }
+            let page: usize = variables["after"]
+                .as_str()
+                .map_or(0, |c| c.parse().unwrap());
+            let next = page + 1 < self.pages.len();
+            Ok(
+                json!({"repository": {"pullRequests": {"nodes": self.pages[page],
+                "pageInfo": {"hasNextPage": next, "endCursor": next.then(|| (page + 1).to_string())}}}}),
+            )
+        }
+    }
+
+    impl Rest for Paged {
+        fn get(&self, url: &str, auth: Option<(&str, &str)>) -> Result<RestResponse> {
+            if url.contains("/activity?") {
+                return self.forge.get(url, auth);
+            }
+            let runs = if url.contains("status=in_progress") {
+                self.runs.clone()
+            } else {
+                vec![]
+            };
+            Ok(RestResponse {
+                status: 200,
+                etag: None,
+                last_modified: None,
+                link: None,
+                body: json!({"workflow_runs": runs}),
+            })
+        }
+
+        fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
+            panic!("unexpected {method} {url}")
+        }
+    }
+
+    /// Every intersecting pull request, of any author, and run, with their
+    /// times, and which drafts [`idle_draft`] proves stale.
+    #[test]
+    fn intersecting_table() {
+        let target = Target {
+            caller: "cgwalters-forge/tracker".into(),
+            workflow: "dispatch.yml".into(),
+            git_ref: "main".into(),
+        };
+        let dest = ItemRef {
+            host: "github.com".into(),
+            repository: "example/work".into(),
+            number: 0,
+        };
+        let now = OffsetDateTime::parse("2026-10-28T18:00:00Z", &Rfc3339).unwrap();
+        let at = |h: i64| (now - time::Duration::hours(h)).format(&Rfc3339).unwrap();
+        // Opened 100 hours ago and last pushed to `pushed` hours ago.
+        let pull = |n: u64, author: &str, files: &[&str], draft: bool, pushed: i64| {
+            json!({"number": n, "author": {"login": author}, "isDraft": draft,
+                "createdAt": at(100), "updatedAt": at(pushed),
+                "headRefOid": "a".repeat(40), "headRefName": format!("draft-{n}"),
+                "headRepository": {"nameWithOwner": "example/fork"},
+                "activityLink": null, "activityStatus": 200,
+                "activity": [
+                    {"ref": format!("refs/heads/draft-{n}"), "activity_type": "push",
+                     "timestamp": at(pushed), "before": "b".repeat(40), "after": "a".repeat(40)},
+                    {"ref": format!("refs/heads/draft-{n}"), "activity_type": "branch_creation",
+                     "timestamp": at(100), "before": "0".repeat(40), "after": "b".repeat(40)}],
+                "files": {"nodes": files.iter().map(|p| json!({"path": p})).collect::<Vec<_>>()}})
+        };
+        let run = |id: u64, title: &str, started: i64| {
+            json!({"id": id, "display_title": title, "created_at": at(started),
+                "updated_at": at(1), "html_url": format!("https://github.com/runs/{id}")})
+        };
+        let bot = "agentic-bot";
+        let age = |t: Option<OffsetDateTime>| t.map_or(-1, |t| (now - t).whole_hours());
+        // Name, pull request pages, runs, pages read; what is found, and whether all of it.
+        type Case<'a> = (&'a str, Vec<Value>, Vec<Value>, usize, Vec<&'a str>, bool);
+        let cases: Vec<Case> = vec![
+            (
+                "bot and other authors",
+                vec![json!([
+                    pull(5, bot, &["src/a.rs"], false, 2),
+                    pull(6, "visitor", &["docs/x.md", "src/a.rs"], false, 3),
+                    pull(7, bot, &["docs/y.md"], false, 2)
+                ])],
+                vec![],
+                1,
+                vec![
+                    "pull #5 by agentic-bot, 100h old, idle 2h: src/a.rs",
+                    "pull #6 by visitor, 100h old, idle 3h: src/a.rs",
+                ],
+                true,
+            ),
+            (
+                "a run",
+                vec![json!([])],
+                vec![
+                    run(1, "implement example/work#11 (claude)", 3),
+                    run(2, "implement example/work#14", 2),
+                    run(3, "fix example/work#13", 2),
+                ],
+                1,
+                vec!["run example/work#11 1, 3h old, idle 1h: a.rs"],
+                true,
+            ),
+            (
+                "a stale draft",
+                vec![json!([
+                    pull(5, bot, &["src/a.rs"], true, 50),
+                    pull(6, "visitor", &["src/a.rs"], true, 1),
+                    pull(8, bot, &["src/a.rs"], false, 50)
+                ])],
+                vec![],
+                1,
+                vec![
+                    "pull #5 by agentic-bot, 100h old, idle 50h, draft stale 50h: src/a.rs",
+                    "pull #6 by visitor, 100h old, idle 1h, draft: src/a.rs",
+                    "pull #8 by agentic-bot, 100h old, idle 50h: src/a.rs",
+                ],
+                true,
+            ),
+            (
+                "no intersection",
+                vec![json!([pull(5, bot, &["docs/x.md"], false, 2)])],
+                vec![run(2, "implement example/work#14", 2)],
+                1,
+                vec![],
+                true,
+            ),
+            (
+                "more than one page",
+                vec![
+                    json!([pull(9, bot, &["src/a.rs"], false, 2)]),
+                    json!([pull(
+                        4,
+                        "visitor",
+                        &["crates/x/src/a.rs", "src/a.rs"],
+                        false,
+                        9
+                    )]),
+                ],
+                vec![],
+                PULL_PAGES,
+                vec![
+                    "pull #9 by agentic-bot, 100h old, idle 2h: src/a.rs",
+                    "pull #4 by visitor, 100h old, idle 9h: src/a.rs",
+                ],
+                true,
+            ),
+            (
+                "more pages than read",
+                vec![
+                    json!([pull(9, bot, &["src/a.rs"], false, 2)]),
+                    json!([pull(4, "visitor", &["src/a.rs"], false, 9)]),
+                ],
+                vec![],
+                1,
+                vec!["pull #9 by agentic-bot, 100h old, idle 2h: src/a.rs"],
+                false,
+            ),
+        ];
+        let named = BTreeSet::from(["src/a.rs".to_owned()]);
+        for (name, pages, runs, read, expected, complete) in cases {
+            let paged = Paged {
+                forge: Forge {
+                    runs: vec![],
+                    pulls: pages
+                        .iter()
+                        .flat_map(|p| p.as_array().unwrap().clone())
+                        .collect(),
+                    tracker_pulls: json!([]),
+                    texts: [
+                        ("example/work#11", "Touches a.rs."),
+                        ("example/work#13", "Touches a.rs."),
+                        ("example/work#14", "Touches docs/y.md."),
+                    ]
+                    .into(),
+                    fail: false,
+                },
+                pages,
+                runs,
+            };
+            let scope = Scope {
+                pages: read,
+                ..Scope::ALL
+            };
+            let found = intersecting(&paged, &named, (&dest, &target), &BTreeSet::new(), scope)
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+            let mut reads = DRAFT_READS;
+            let mut lines: Vec<String> = Vec::new();
+            for p in &found.pulls {
+                let stale = if p.draft {
+                    match idle_draft(&paged, (&dest, p.number), (now, 4), &mut reads).unwrap() {
+                        Some(idle) => format!(", draft stale {idle}h"),
+                        None => ", draft".into(),
+                    }
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "pull #{} by {}, {}h old, idle {}h{stale}: {}",
+                    p.number,
+                    p.author.as_deref().unwrap_or("-"),
+                    age(p.created),
+                    age(p.updated),
+                    p.shared.join(", ")
+                ));
+            }
+            for r in &found.runs {
+                assert_eq!(
+                    r.url.as_deref(),
+                    Some(format!("https://github.com/runs/{}", r.id.unwrap()).as_str())
+                );
+                lines.push(format!(
+                    "run {} {}, {}h old, idle {}h: {}",
+                    r.item.display(),
+                    r.id.unwrap(),
+                    age(r.created),
+                    age(r.updated),
+                    r.shared.join(", ")
+                ));
+            }
+            assert_eq!(lines, expected, "{name}");
+            assert_eq!(found.complete, complete, "{name}");
+        }
+        // The dispatch check's scope reads what it read before it drew its
+        // decision from here: it stops at the first intersecting run, neither
+        // reading example/work#12's text nor any pull request (no page to
+        // answer with), and skips another author's pull request unread.
+        let check = Scope {
+            author: Some(bot),
+            pages: 1,
+            first_run: true,
+        };
+        let malformed = json!([{"number": 6, "author": {"login": "visitor"}, "files": null},
+            pull(5, bot, &["src/a.rs"], false, 2)]);
+        for (name, pages, runs, scope, expected) in [
+            (
+                "first run",
+                vec![],
+                vec![
+                    run(1, "implement example/work#11", 3),
+                    run(2, "implement example/work#12", 2),
+                ],
+                check,
+                Ok((vec![11], vec![])),
+            ),
+            (
+                "another author's unreadable pull request",
+                vec![malformed.clone()],
+                vec![],
+                check,
+                Ok((vec![], vec![5])),
+            ),
+            (
+                "listing every author's",
+                vec![malformed],
+                vec![],
+                Scope::ALL,
+                Err("pull request has no files"),
+            ),
+            (
+                "listing every run",
+                vec![json!([])],
+                vec![
+                    run(1, "implement example/work#11", 3),
+                    run(2, "implement example/work#12", 2),
+                ],
+                Scope::ALL,
+                Err("example/work#12 is not an issue"),
+            ),
+        ] {
+            let paged = Paged {
+                forge: Forge {
+                    runs: vec![],
+                    pulls: json!([]),
+                    tracker_pulls: json!([]),
+                    texts: [("example/work#11", "Touches a.rs.")].into(),
+                    fail: false,
+                },
+                pages,
+                runs,
+            };
+            let found = intersecting(&paged, &named, (&dest, &target), &BTreeSet::new(), scope)
+                .map(|f| {
+                    let runs = f.runs.iter().map(|r| r.item.number).collect::<Vec<_>>();
+                    (runs, f.pulls.iter().map(|p| p.number).collect::<Vec<_>>())
+                })
+                .map_err(|e| format!("{e:#}"));
+            match (found, expected) {
+                (Ok(found), Ok(expected)) => assert_eq!(found, expected, "{name}"),
+                (Err(found), Err(expected)) => assert!(found.contains(expected), "{name}: {found}"),
+                (found, _) => panic!("{name}: {found:?}"),
+            }
+        }
+    }
+
+    /// REST answers by URL, as (status, Link, body).
+    struct Files(std::collections::BTreeMap<String, (u16, Option<&'static str>, Value)>);
+
+    impl Rest for Files {
+        fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
+            let (status, link, body) = self.0.get(url).cloned().context(url.to_owned())?;
+            Ok(RestResponse {
+                status,
+                etag: None,
+                last_modified: None,
+                link: link.map(str::to_owned),
+                body,
+            })
+        }
+
+        fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
+            panic!("unexpected {method} {url}")
+        }
+    }
+
+    /// The change `agent-board overlap --pr` and `--branch` read, and the
+    /// inputs they refuse before any read.
+    #[test]
+    fn changed_paths_table() {
+        let root = "https://api.github.com/repos/example/work";
+        let files =
+            |names: &[&str]| -> Value { names.iter().map(|n| json!({"filename": n})).collect() };
+        let pr = format!("{root}/pulls/6/files?per_page={FILE_READS}");
+        let compare = format!("{root}/compare/main...topic/x?per_page=1");
+        let answers = |pr_answer, base: &str, compare_answer| {
+            Files(
+                [
+                    (pr.clone(), pr_answer),
+                    (
+                        root.to_owned(),
+                        (200, None, json!({"default_branch": base})),
+                    ),
+                    (compare.clone(), compare_answer),
+                ]
+                .into(),
+            )
+        };
+        let plain = (200, None, files(&["src/a.rs", "docs/`x`.md", "README.md"]));
+        let next = Some(r#"<https://api.github.com/x?page=2>; rel="next""#);
+        let many: Vec<String> = (0..COMPARE_FILES).map(|n| format!("f{n}.rs")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        // Name, the answers, the --pr or --branch read; the paths or the refusal.
+        type Read = fn(&Files) -> Result<BTreeSet<String>>;
+        type Case<'a> = (&'a str, Files, Read, Result<BTreeSet<String>, &'a str>);
+        let by_pr: Read = |f| pull_paths(f, "example/work", 6);
+        let by_branch: Read = |f| branch_paths(f, "example/work", "topic/x");
+        let ok = |paths: &[&str]| Ok(paths.iter().map(|p| p.to_string()).collect());
+        let cases: Vec<Case> = vec![
+            (
+                "pull request, a crafted name left out",
+                answers(plain.clone(), "main", plain.clone()),
+                by_pr,
+                ok(&["README.md", "src/a.rs"]),
+            ),
+            (
+                "pull request past a page",
+                answers((200, next, files(&["a.rs"])), "main", plain.clone()),
+                by_pr,
+                Err("more than 100 files"),
+            ),
+            (
+                "pull request not readable",
+                answers((404, None, json!({})), "main", plain.clone()),
+                by_pr,
+                Err("GitHub HTTP status 404"),
+            ),
+            (
+                "branch",
+                answers(
+                    plain.clone(),
+                    "main",
+                    (200, None, json!({"files": files(&["src/b.rs"])})),
+                ),
+                by_branch,
+                ok(&["src/b.rs"]),
+            ),
+            (
+                "branch with all GitHub lists",
+                answers(
+                    plain.clone(),
+                    "main",
+                    (200, None, json!({"files": files(&many)})),
+                ),
+                by_branch,
+                Err("300 files or more"),
+            ),
+            (
+                "default branch not plain",
+                answers(plain.clone(), "main?x", plain.clone()),
+                by_branch,
+                Err("default branch is not a plain branch name"),
+            ),
+            (
+                "comparison not readable",
+                answers(plain.clone(), "main", (404, None, json!({}))),
+                by_branch,
+                Err("GitHub HTTP status 404"),
+            ),
+        ];
+        for (name, answers, read, expected) in cases {
+            match (read(&answers), expected) {
+                (Ok(found), Ok(expected)) => assert_eq!(found, expected, "{name}"),
+                (Err(e), Err(why)) => assert!(format!("{e:#}").contains(why), "{name}: {e:#}"),
+                (found, _) => panic!("{name}: {found:?}"),
+            }
+        }
+        let none = Files(Default::default());
+        for branch in [
+            "",
+            "-x",
+            "/x",
+            ".x",
+            "a..b",
+            "a?b",
+            "a#b",
+            "a b",
+            &"b".repeat(201),
+        ] {
+            let error = branch_paths(&none, "example/work", branch).unwrap_err();
+            assert!(error.to_string().contains("invalid branch"), "{branch}");
+        }
+        assert!(pull_paths(&none, "no-slash", 6).is_err());
     }
 }

@@ -144,8 +144,8 @@ const TRIAGE_RUNNER: &str = "hosted";
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// `overlap.staleDraftHours` when the key is left out, and the most it may
 /// be: a week, past which a draft nobody moves holds nothing anyway.
-const STALE_DRAFT_HOURS: u64 = 4;
-const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
+pub const STALE_DRAFT_HOURS: u64 = 4;
+pub const STALE_DRAFT_HOURS_LIMIT: u64 = 7 * 24;
 /// `overlap.staleHours` when the key is left out, a day, and the most it
 /// may be, a week: how long a pull request that holds work by overlap may
 /// stand still before it gets a needs-you card ([`blockers`]).

@@ -1047,7 +1047,7 @@ fn replay_scenarios() {
             vec![
                 "usage: publish to cgwalters-forge/bot-ops#1; a preview paces by it unpublished",
                 "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1)",
-                "pools: claude normal 18%/145%, openai normal 3%/5%",
+                "pools: claude normal 18% used of 145% allowed, openai normal 3% used of 5% allowed",
             ],
             6,
             0,
@@ -10087,7 +10087,7 @@ fn apply_paces_pull_requests_by_this_pass_reading() {
     for line in [
         "usage: published ",
         "cgwalters-forge/agentic-job#9 abc continue: continuing (round 1): its checkpoint says budget -> https://github.com/",
-        "pools: claude normal 18%/145%, openai normal 3%/5%",
+        "pools: claude normal 18% used of 145% allowed, openai normal 3% used of 5% allowed",
         "hold wip: 3 of 2 runs active",
     ] {
         assert!(

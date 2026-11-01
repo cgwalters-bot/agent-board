@@ -589,9 +589,11 @@ supervisor's bounded API (at most `REQUEST_LIMIT` requests and
 every unarchived repository's queued and in-progress runs, by runner label
 (self-hosted as one), with the configured `dispatchRepo`'s `dispatchWorkflow`
 runs counted as agent runs apart from other CI, against `--job-limit`.
-Agent runs are counted by the kind and pool their titles name, with the last
+Agent runs are counted by the kind and pool their titles name, and each in
+flight is listed with its kind, item, status, age and pool, with the last
 hour's outcomes; pools, where the config has `pace`, are the poll's pace line
-from the same usage snapshot; queues are each `follow` repository's merge queue
+from the same usage snapshot (such as `claude normal 26% used of 30% allowed`,
+the allowed share including any burst); queues are each `follow` repository's merge queue
 and its approved pull requests not in it, among the newest hundred (marked
 partial past that); `--project` adds the board's Status counts and open P0
 items with no Run, Result or linked pull request, read by the board's own
