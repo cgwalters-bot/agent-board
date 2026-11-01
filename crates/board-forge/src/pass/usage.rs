@@ -335,6 +335,8 @@ pub(super) fn snapshot(broker: &Value, pools: &Pools, now: OffsetDateTime) -> Re
     if let Some(mistral) = mistral(broker, &at)? {
         out["mistral"] = mistral;
     }
+    // Preserve the published snapshot's ordering with serde_json preserve_order.
+    out.sort_all_objects();
     Ok(out)
 }
 

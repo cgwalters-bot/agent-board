@@ -121,6 +121,17 @@ comments:
   none asks for nothing) is read exactly like the comment, at most 1 MiB.
   Only the agent job, whose requests are already treated as the attacker's,
   could have written it. There is no comment to check for edits.
+  Framing uses agentic-job's pinned `safe-outputs` read-only decoder: the
+  shared 1 MiB bound, UTF-8, JavaScript whitespace trimming, and JSON objects
+  with a string `type`. Unlike the former local reader, missing/non-string
+  types are refused, a BOM is trimmed, and Rust-only whitespace is not blank.
+  Decoder refusals quote no input. This does **not** call the sanitizing
+  collector: the report body is passed through byte-for-byte after JSON escape
+  decoding. The supervisor still owns the single-report rule, ignores all
+  other string types (including no-write outcomes), and owns request admission,
+  configured repositories/targets, operator decisions, caps, dispatch claims
+  and lost-ledger accounting below. Sharing framing grants no write authority
+  and adds no option or caller setting.
 - The day's counts come from a ledger, `agent-board/supervisor-ledger/v1`,
   that each executor run writes to `LEDGER` for the caller to upload as an
   artifact. It holds the run's number and each write of the last 24 hours:

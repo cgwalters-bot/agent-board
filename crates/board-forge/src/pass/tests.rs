@@ -92,6 +92,9 @@ pub(super) fn config(edit: Value) -> Config {
         .as_object_mut()
         .unwrap()
         .extend(edit.as_object().unwrap().clone());
+    // Preserve these fixtures' pre-preserve_order pool order. Production Pools
+    // deliberately reads the order in the caller's text, not Value iteration.
+    value.sort_all_objects();
     Config::parse(&value.to_string()).unwrap()
 }
 

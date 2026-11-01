@@ -1058,7 +1058,8 @@ mod tests {
                         Some("TEXT") => assert!(options.is_null()),
                         Some("SINGLE_SELECT") => {
                             for option in options.as_array().unwrap() {
-                                let keys: Vec<_> = option.as_object().unwrap().keys().collect();
+                                let mut keys: Vec<_> = option.as_object().unwrap().keys().collect();
+                                keys.sort();
                                 assert_eq!(keys, ["color", "description", "name"]);
                                 assert_eq!(option["color"], "GRAY");
                             }

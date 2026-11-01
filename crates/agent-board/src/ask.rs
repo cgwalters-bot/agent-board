@@ -163,7 +163,10 @@ fn needs_human(kind: &str, item: &ItemRef) -> Value {
 
 pub(crate) fn print_proposals(out: &mut impl Write, values: &[Value]) -> Result<()> {
     for value in values {
-        serde_json::to_writer(&mut *out, value)?;
+        // Keep proposal bytes stable when dependencies enable preserve_order.
+        let mut value = value.clone();
+        value.sort_all_objects();
+        serde_json::to_writer(&mut *out, &value)?;
         writeln!(out)?;
     }
     eprintln!("Proposed only; not applied. Re-run with --apply to write with your token.");
@@ -778,7 +781,7 @@ mod tests {
         let proposals = "{\"assignees\":[\"op\"],\"body\":\"Blocks: https://github.com/example/intake/issues/7\\n\\nQ: Q?\\n\\nOptions:\\nA) a\\nB) b\\n\\nReply with a letter or free text. Only comments by @op count.\\n\",\"labels\":[\"question\",\"needs-human\"],\"target_repo\":\"example/intake\",\"title\":\"Q?\",\"type\":\"create_issue\"}\n{\"item_number\":7,\"labels\":[\"needs-human\"],\"target_repo\":\"example/intake\",\"type\":\"add_labels\"}\n";
         let preview = format!(
             "{}\n{proposals}",
-            json!({"type": "add_comment", "target_repo": "example/intake", "item_number": 7, "body": ASK_HOLD})
+            json!({"body": ASK_HOLD, "item_number": 7, "target_repo": "example/intake", "type": "add_comment"})
         );
         let commented = "https://github.com/example/intake/issues/7#issuecomment-1\tcommented\n";
         // Columns: board setup, apply, stdout, mutations in order, error.
