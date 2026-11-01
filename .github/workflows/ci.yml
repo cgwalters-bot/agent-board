@@ -11,6 +11,8 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  build:
+    uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository] Check this revision's release build without publishing.
   specs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -97,7 +99,7 @@ jobs:
   # Require only ci in the ruleset, on both PR and merge-group commits.
   ci:
     if: ${{ always() }}
-    needs: [specs, rust, lint]
+    needs: [specs, rust, lint, build]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions: {}

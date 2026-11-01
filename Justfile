@@ -5,6 +5,15 @@
 # this one. CONTAINER=podman runs the linters without docker.
 forge_actions := env("FORGE_ACTIONS", "../actions")
 
+# As agentic-job's release-check: refuse malformed, mismatched or old versions.
+# pipefail prevents a failed tag read from looking like a first release.
+release-check version:
+    bash -euo pipefail -c 'git tag --list "v*" | cargo run --quiet --locked -p agent-board --bin release-check -- "$1"' -- {{quote(version)}}
+
+# Shared by PR CI and manual release; musl-tools and the Rust target are prerequisites.
+build-static:
+    cargo build --release --locked --target x86_64-unknown-linux-musl -p agent-board --bin agent-board --bin gh-agent-board
+
 lint:
     {{ just_executable() }} --justfile "{{ forge_actions }}/lint/Justfile" --working-directory . check
 

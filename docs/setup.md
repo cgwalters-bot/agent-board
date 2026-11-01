@@ -10,8 +10,10 @@ GitHub; see [forges](forges.md) for Forgejo and GitLab.
 
 ## Install
 
-agent-board needs Rust supporting edition 2024. There are no prebuilt releases,
-and it is not installable with `gh extension install`.
+Building agent-board needs Rust supporting edition 2024. No prebuilt release has
+been published yet; the [manual release path](release.md#manual-release-path)
+will provide Linux x86_64 static binaries when dispatched. It is not installable
+with `gh extension install`.
 
 ```sh
 cargo install --locked --git https://github.com/cgwalters-forge/agent-board agent-board
@@ -22,6 +24,37 @@ The binary is also built as `gh-agent-board`. Output follows `gh`: `--json`,
 through rustls-platform-verifier, not bundled Mozilla roots, so install a
 sandbox egress proxy's or corporate CA certificate in the system trust store;
 certificate and hostname verification stay on.
+
+### Download and verify a release
+
+Once the operator publishes a release, choose a reviewed tag and its full
+40-character source commit from the repository, independently of downloaded
+assets. Set `TAG` and `COMMIT` to those values, and work in an empty directory.
+Use a recent GitHub CLI with `gh attestation verify` and `--source-digest`:
+
+```sh
+REPO=cgwalters-forge/agent-board
+gh release download "$TAG" --repo "$REPO" --pattern '*-x86_64-unknown-linux-musl' --pattern SHA256SUMS --pattern release.json --pattern provenance.jsonl
+GH_TOKEN='' GITHUB_TOKEN='' gh attestation verify release.json --bundle provenance.jsonl --repo "$REPO" \
+  --cert-identity "https://github.com/$REPO/.github/workflows/release.yml@refs/heads/main" \
+  --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+jq -e --arg repo "$REPO" --arg tag "$TAG" --arg commit "$COMMIT" \
+  '.schema == "agent-board.release.v1" and .repository == $repo and .tag == $tag and .commit == $commit and .target == "x86_64-unknown-linux-musl"' release.json
+jq -rj '.sha256sums' release.json > attested-SHA256SUMS
+cmp SHA256SUMS attested-SHA256SUMS
+sha256sum --check attested-SHA256SUMS
+```
+
+Stop if any command fails. Checksums alone detect corruption, not authenticity:
+the attested manifest and the independently selected commit bind these binaries
+to the release workflow on main. Only after verification, install the binary
+you need into a directory on `PATH`, for example
+`install -m 755 agent-board-x86_64-unknown-linux-musl "$HOME/.local/bin/agent-board"`
+(create that directory first). For the gh-style executable install
+`gh-agent-board-x86_64-unknown-linux-musl` as `gh-agent-board`. Static linking
+does not remove the need for the system CA store described above. Callers still
+build from source until their own reviewed configuration adopts release downloads;
+this workflow does not change tracker or enroll agent-board in the release train.
 
 ## Try it offline
 

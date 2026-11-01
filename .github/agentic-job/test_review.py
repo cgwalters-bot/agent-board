@@ -98,7 +98,7 @@ class ReviewContracts(unittest.TestCase):
         self.assertIn("merge_group:\n    types: [checks_requested]", ci)
         sentinel = ci.split("\n  ci:\n", 1)[1]
         self.assertIn("if: ${{ always() }}", sentinel)
-        jobs = ("specs", "rust", "lint")
+        jobs = ("specs", "rust", "lint", "build")
         self.assertIn(f"needs: [{', '.join(jobs)}]", sentinel)
         expression = re.search(r"run: jq -e '([^']+)'", sentinel).group(1)
         for results in itertools.product(("success", "failure", "cancelled", "skipped"), repeat=len(jobs)):
@@ -112,9 +112,12 @@ class ReviewContracts(unittest.TestCase):
     def test_ci_uses_the_current_ubuntu_vm_runner(self):
         ci = (ROOT / ".github/workflows/ci.yml").read_text().split("\njobs:\n", 1)[1]
         jobs = re.findall(r"^  (\w+):\n(.*?)(?=^  \w+:|\Z)", ci, re.MULTILINE | re.DOTALL)
-        self.assertEqual([name for name, _ in jobs], ["specs", "rust", "forgejo", "lint", "ci"])
+        self.assertEqual([name for name, _ in jobs], ["build", "specs", "rust", "forgejo", "lint", "ci"])
         for name, job in jobs:
             with self.subTest(job=name):
+                if name == "build":
+                    self.assertIn("uses: ./.github/workflows/build.yml", job)
+                    job = (ROOT / ".github/workflows/build.yml").read_text().split("\n  build:\n", 1)[1]
                 self.assertEqual(re.findall(r"^    runs-on: (.+)$", job, re.MULTILINE), ["ubuntu-26.04"])
 
     def test_ci_runs_the_shared_workflow_check(self):
