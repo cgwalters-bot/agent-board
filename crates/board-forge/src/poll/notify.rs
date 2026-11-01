@@ -485,7 +485,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let (done, what) = self.comment_triage(
                 repo,
                 number,
-                (false, Some(&login)),
+                (false, Some(&login), None),
                 (&comments, tries),
                 &said,
             )?;
@@ -698,7 +698,7 @@ mod tests {
             .collect()
     }
 
-    const RUN: &str = "https://github.com/example/tracker/actions/runs/1234";
+    const RUN: &str = "https://github.com/upstream/tracker/actions/runs/1234";
 
     /// The thread's one comment, `repo#2`'s, says this instead.
     fn reword(fake: &Fake, repo: &str, body: &str) {
@@ -715,11 +715,12 @@ mod tests {
         // pass does: its line after `repo#2 notification (reason)`, the run
         // kind it starts and where.
         let cases: &[(&str, &str, bool, &str, Option<&str>)] = &[
+            // Outside our own space: on the issue that tracks it.
             (
                 OPERATOR,
                 OTHER,
                 false,
-                ": operator comments issuecomment-11: triage",
+                ": operator comments issuecomment-11: triage on a tracking issue",
                 Some("triage"),
             ),
             // Outside `operatorComments`, what the operator said to someone
@@ -797,8 +798,16 @@ mod tests {
                 }
                 let line = format!("{repo}#2 notification ({reason}){line}");
                 assert_eq!(preview.lines, std::slice::from_ref(&line), "{case}");
+                const TRACKING: &str = "on a tracking issue";
+                let (item_repo, item) = match line.ends_with(TRACKING) {
+                    true => (DISPATCH, "1001"),
+                    false => (*repo, "2"),
+                };
                 let started = match kind {
-                    Some(_) => format!("{line} -> {RUN}"),
+                    Some(_) => format!(
+                        "{} -> {RUN}",
+                        line.replace(TRACKING, &format!("on {item_repo}#{item}"))
+                    ),
                     None => line,
                 };
                 assert_eq!(applied.lines, [started], "{case}");
@@ -807,7 +816,7 @@ mod tests {
                 if let Some(kind) = kind {
                     assert_eq!(
                         (&inputs[0]["kind"], &inputs[0]["repo"], &inputs[0]["item"]),
-                        (&json!(kind), &json!(repo), &json!("2")),
+                        (&json!(kind), &json!(item_repo), &json!(item)),
                         "{case}"
                     );
                 }
@@ -880,7 +889,9 @@ mod tests {
         assert_eq!(
             outcome.lines,
             [
-                format!("{OTHER}#2 operator comments issuecomment-11: triage -> {RUN}"),
+                format!(
+                    "{OTHER}#2 operator comments issuecomment-11: triage on {DISPATCH}#1001 -> {RUN}"
+                ),
                 format!("{OTHER}#2 notification (mention): nothing to act on from op"),
             ]
         );
@@ -1340,7 +1351,7 @@ mod tests {
             (
                 "private",
                 line(
-                    "left: peer/coord is not public, so nothing of it is copied to example/tracker",
+                    "left: peer/coord is not public, so nothing of it is copied to upstream/tracker",
                 ),
             ),
             (
@@ -1394,7 +1405,7 @@ mod tests {
             format!("{OTHER}#2 notification (mention): operator comments issuecomment-11: {what}")
         };
         let not_public =
-            line("left: other/place is not public, so nothing of it is copied to example/tracker");
+            line("left: other/place is not public, so nothing of it is copied to upstream/tracker");
         let addressed = "@worker what does the poll read?";
         // `pull`: the bot's own pull request, which takes a fix round.
         for (scope, private, pull, body, expected) in [
@@ -1412,7 +1423,7 @@ mod tests {
                 false,
                 false,
                 "What does the poll read?",
-                line(&format!("triage -> {RUN}")),
+                line(&format!("triage on {DISPATCH}#1001 -> {RUN}")),
             ),
         ] {
             let case = format!("scope={scope} private={private} pull={pull}");
