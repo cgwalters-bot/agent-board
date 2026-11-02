@@ -5,6 +5,55 @@
 
 const CHECKLIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/release.md");
 
+#[test]
+fn commit_prerelease_contract() {
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let job = |name| {
+        ci.split_once(&format!("\n  {name}:\n"))
+            .unwrap_or_else(|| panic!("missing {name} job"))
+            .1
+            .split("\n  #")
+            .next()
+            .unwrap()
+    };
+    let gate = "if: github.event_name == 'push' && github.ref == 'refs/heads/main'";
+    let attest = job("attest");
+    let publish = job("publish");
+    assert!(attest.contains(gate));
+    assert!(attest.contains("needs: ci"));
+    assert!(publish.contains(gate));
+    assert!(publish.contains("needs: [ci, attest]"));
+    assert_eq!(ci.matches("contents: write").count(), 1);
+    assert!(publish.contains("contents: write"));
+    assert_eq!(ci.matches("id-token: write").count(), 1);
+    assert!(attest.contains("id-token: write"));
+    for job in [attest, publish] {
+        assert!(!job.contains("checkout@"));
+        assert!(!job.contains("cargo "));
+        assert!(!job.contains("run: ./"));
+    }
+    for required in [
+        "release: build-${{ github.sha }}",
+        "github.event_name == 'push' && github.sha || github.ref",
+        "--source-digest \"$GITHUB_SHA\"",
+        ".github/workflows/ci.yml@refs/heads/main",
+    ] {
+        assert!(ci.contains(required), "missing {required}");
+    }
+    for required in [
+        "TAG: build-${{ github.sha }}",
+        "-f ref=\"refs/tags/$TAG\" -f sha=\"$GITHUB_SHA\"",
+        "--verify-tag --draft --prerelease --latest=false",
+        "--draft=false --latest=false",
+        "SHA256SUMS release.json provenance.jsonl",
+    ] {
+        assert!(publish.contains(required), "missing {required}");
+    }
+    for forbidden in ["--clobber", "--force", "--target main"] {
+        assert!(!publish.contains(forbidden));
+    }
+}
+
 const CHANGELOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../CHANGELOG.md");
 
 /// The gates of tracker#939 and agent-board#466, in the checklist's order.

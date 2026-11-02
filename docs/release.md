@@ -150,15 +150,49 @@ and builds it with `cargo install --locked --rev`
 through `just build-agent-board` with `AGENT_BOARD_REV`, and its
 `agent-board-pin` workflow proposes moving that pin. CI's `rust` job runs
 `just check` and the CLI against the fixture on every pull request and on
-main. CI also builds the static release target. No release has been published;
-[setup](setup.md#download-and-verify-a-release) documents verification for when one is.
+main. CI also builds the static release target and publishes
+[commit prereleases](#commit-prereleases) for green main pushes.
+[Setup](setup.md#download-and-verify-a-release) documents versioned release
+verification and [commit verification](setup.md#download-and-verify-a-commit-prerelease).
+
+## Commit prereleases
+
+[CI](../.github/workflows/ci.yml) publishes `build-<full 40-character commit>`
+after its `ci` sentinel succeeds on a push to main: specs, Rust, workflow lint,
+static build and Forgejo must all pass. PR and merge-group runs never publish.
+Each main commit has its own concurrency group so a newer push does not cancel
+an older green commit's publication. No extra build or version bump is needed;
+`release.yml` remains the manual path for versioned releases.
+
+CI passes the commit tag to [build.yml](../.github/workflows/build.yml), then a
+separate job attests its `release.json` manifest and verifies the bundle without
+a token. Only the publishing job has `contents: write`; neither it nor the OIDC
+job checks out or executes project code. It creates the tag explicitly at the
+tested SHA and publishes the two static binaries, `SHA256SUMS`, `release.json`
+and `provenance.jsonl` as a prerelease with `--latest=false`. This avoids giving
+PR code publishing credentials or mistaking a moving main ref for the tested
+commit. The [caller verification recipe](setup.md#download-and-verify-a-commit-prerelease)
+binds the manifest to CI on main and an independently pinned commit before
+checking the binary digests; checksums alone do not establish authenticity.
+
+Existing tags/releases are never overwritten: rerunning publication fails if
+the tag already exists. If a failure leaves a tag or draft, a maintainer must
+inspect it and remove the incomplete release/tag before rerunning. Restrict
+`build-*` tag creation with a ruleset to limit who can impersonate this naming
+scheme; caller attestation verification remains necessary.
+
+There is **no automatic pruning** of these prereleases or their tags. They stay
+available for pinned callers even after Actions artifacts expire. Manual removal
+can break those callers; check deployed pins before removing any. Commits before
+this workflow was installed, failed/cancelled CI runs and failed publication do
+not gain a release. No backfill or cleanup job is added here.
 
 ## Manual release path
 
 [release.yml](../.github/workflows/release.yml) and the shared static
 [build.yml](../.github/workflows/build.yml) adapt cgwalters-forge/agentic-job's
 workflows, without its secure-host image steps. Merging this workflow adopts a
-manual release policy; nothing is published until the operator dispatches it.
+manual release policy; no versioned release is published until the operator dispatches it.
 The operator's policy decision remains open until that merge. There is no
 schedule, version bump or release-train enrollment in this change.
 
