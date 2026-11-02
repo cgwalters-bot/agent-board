@@ -643,7 +643,12 @@ One scheduled pass: follow up pull requests, apply and plan live epics, then cho
 
 ```text
 agent-board pass [OPTIONS] --config <FILE>
+       agent-board pass <COMMAND>
 ```
+
+Commands:
+
+- [`next`](#agent-board-pass-next): After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake a stale supervisor, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass)
 
 Options:
 
@@ -655,6 +660,26 @@ Options:
 - `--max-status-changes <N>`: Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through
 - `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage
 - `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture
+
+## agent-board pass next
+
+After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake a stale supervisor, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass)
+
+```text
+agent-board pass next [OPTIONS] --workflow <FILE> --branch <BRANCH> --apply-title <TITLE> --wait-minutes <MINUTES>
+```
+
+Options:
+
+- `--workflow <FILE>`: The pass workflow to dispatch, such as pass.yml; its runs are the ones checked for a newer applying run
+- `--branch <BRANCH>`: The default branch: the ref dispatched, and the branch whose runs are read
+- `--input <NAME=VALUE>`: An input of the pass dispatch, such as apply=true. Repeatable
+- `--apply-title <TITLE>`: The run title of a dispatched pass that applies; a scheduled run always counts as applying
+- `--wait-minutes <MINUTES>`: The pass interval: start the next pass this many minutes after this run started, never waiting longer
+- `--supervisor-workflow <FILE>`: A supervisor workflow to start, before the pass, when its newest run on --branch, ignoring issue_comment runs, is at least --supervisor-stale-minutes old or is not among its newest 100. Its failures only warn
+- `--supervisor-stale-minutes <MINUTES>`: How old the supervisor's newest run may be before it is started
+- `--supervisor-input <NAME=VALUE>`: An input of the supervisor dispatch, such as session=false. Repeatable
+- `--dry-run`: Print what would wait and start; wait for and start nothing
 
 ## agent-board admit
 

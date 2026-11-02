@@ -2372,6 +2372,43 @@ operator-agreed health criterion defined; links alone would not define one.
 This command publishes nothing, comments nowhere, and changes neither schedules
 nor admission. Defining health and supplying its evidence remain separate work.
 
+## The next pass
+
+GitHub drops most scheduled runs of a frequent cron, so a caller can make each
+applying pass start the next: `agent-board pass next`, in a job after the
+pass, with the run's own `GITHUB_REPOSITORY` and `GITHUB_RUN_ID` and a
+`GH_TOKEN` that has `actions: write` on that repository. Every name and
+interval comes from its flags ([CLI](cli.md#agent-board-pass-next)); none
+has a default. In order, it:
+
+1. Waits until `--wait-minutes` after this run started, never longer than
+   `--wait-minutes` from now.
+2. With `--supervisor-workflow`, starts it with its `--supervisor-input`s when
+   its newest run on `--branch`, `issue_comment` runs aside (any comment in
+   the repository starts one), is at least `--supervisor-stale-minutes` old or
+   there is none among its newest 100. An unreadable listing is unknown, not
+   absent; a failure here only warns, and the chain goes on.
+3. Dispatches `--workflow` on `--branch` with its `--input`s, unless a newer
+   applying run of it on that branch is still queued, waiting, pending,
+   requested or in progress: that run continues the chain, so two chains a
+   few minutes apart become one. A run applies when it is a `schedule` run, or
+   a `workflow_dispatch` run titled `--apply-title`; newer means created later,
+   or in the same second with a higher ID. The listing, its newest 200 runs,
+   must reach back to this run, else a newer one may be unseen and it fails.
+   A dispatch that failed may still have started a run, so it lists the runs
+   again before each of four tries; that narrows, but cannot rule out, a
+   second chain, as can a run arriving between the listing and the dispatch.
+
+Each GitHub call gets four tries, 2, 4 and 8 seconds apart, and each request
+at most 30 seconds, so one server error does not end the chain; it waits out
+no rate limit beyond those tries, and `--wait-minutes` is at most six hours,
+a hosted job's limit, so the caller's job timeout bounds it. It fails when
+it cannot read this run's start or the pass workflow's runs, or cannot start
+the pass. `--dry-run` reads as above but waits for and starts nothing,
+printing what it would wait and start. Only the caller's job conditions
+decide that a pass applied and the chain should go on; cancelling the waiting
+job ends the chain.
+
 ## One configuration file
 
 The v1 JSON field inventory below is exhaustive; reject unknown keys and nulls.

@@ -10,10 +10,13 @@ use std::{io::Write, path::PathBuf};
 use tokio::runtime::Runtime;
 
 #[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct Pass {
+    #[command(subcommand)]
+    pub command: Option<PassCommand>,
     /// The pass configuration (docs/pass.md), from a trusted default-branch checkout. Credentials come from GH_TOKEN (the bot's) and DISPATCH_TOKEN, never the file.
-    #[arg(long, value_name = "FILE")]
-    pub config: PathBuf,
+    #[arg(long, value_name = "FILE", required = true)]
+    pub config: Option<PathBuf>,
     /// The caller's agentic-job bounds file for its `fix` kind (such as .github/agentic-job/fix.toml), from the same trusted checkout, never a dispatched head or workflow input: a pull request whose repository is outside its `repos`, or whose head branch is outside its push_to_pull_request_branch `branches`, gets no fix, rebase or continuation round and is left to the operator. Repeatable: a pull request is inside where any one file admits both its repository and its head branch. The policy step stays the boundary.
     #[arg(long, value_name = "FILE")]
     pub fix_bounds: Vec<PathBuf>,
@@ -35,6 +38,100 @@ pub struct Pass {
     /// Preview live, and save every read and its answer to FILE as a replay fixture.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub record: Option<PathBuf>,
+}
+
+#[derive(clap::Subcommand)]
+pub enum PassCommand {
+    /// After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake a stale supervisor, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass).
+    Next(Next),
+}
+
+#[derive(clap::Args)]
+pub struct Next {
+    /// The pass workflow to dispatch, such as pass.yml; its runs are the ones checked for a newer applying run.
+    #[arg(long, value_name = "FILE")]
+    pub workflow: String,
+    /// The default branch: the ref dispatched, and the branch whose runs are read.
+    #[arg(long)]
+    pub branch: String,
+    /// An input of the pass dispatch, such as apply=true. Repeatable.
+    #[arg(long, value_name = "NAME=VALUE", value_parser = input)]
+    pub input: Vec<(String, String)>,
+    /// The run title of a dispatched pass that applies; a scheduled run always counts as applying.
+    #[arg(long, value_name = "TITLE")]
+    pub apply_title: String,
+    /// The pass interval: start the next pass this many minutes after this run started, never waiting longer.
+    #[arg(long, value_name = "MINUTES")]
+    pub wait_minutes: u64,
+    /// A supervisor workflow to start, before the pass, when its newest run on --branch, ignoring issue_comment runs, is at least --supervisor-stale-minutes old or is not among its newest 100. Its failures only warn.
+    #[arg(long, value_name = "FILE", requires = "supervisor_stale_minutes")]
+    pub supervisor_workflow: Option<String>,
+    /// How old the supervisor's newest run may be before it is started.
+    #[arg(long, value_name = "MINUTES", requires = "supervisor_workflow")]
+    pub supervisor_stale_minutes: Option<u64>,
+    /// An input of the supervisor dispatch, such as session=false. Repeatable.
+    #[arg(long, value_name = "NAME=VALUE", value_parser = input, requires = "supervisor_workflow")]
+    pub supervisor_input: Vec<(String, String)>,
+    /// Print what would wait and start; wait for and start nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+fn input(text: &str) -> Result<(String, String)> {
+    let (name, value) = text
+        .split_once('=')
+        .with_context(|| format!("{text:?} is not NAME=VALUE"))?;
+    ensure!(!name.is_empty(), "{text:?} has no input name");
+    Ok((name.into(), value.into()))
+}
+
+fn next(args: &Next, out: &mut impl Write) -> Result<()> {
+    use board_forge::pass::next::{self, Supervisor, Workflow};
+    let var = |name| {
+        std::env::var(name)
+            .with_context(|| format!("pass next runs in a GitHub Actions run, which sets {name}"))
+    };
+    let workflow = |file: &str, inputs: &[(String, String)]| {
+        let mut workflow = Workflow {
+            file: file.into(),
+            inputs: Default::default(),
+        };
+        for (name, value) in inputs {
+            let first = workflow.inputs.insert(name.clone(), value.clone());
+            ensure!(first.is_none(), "input {name} of {file} given twice");
+        }
+        Ok(workflow)
+    };
+    let minutes = |m: u64| Duration::from_secs(m.saturating_mul(60));
+    let supervisor = match (&args.supervisor_workflow, args.supervisor_stale_minutes) {
+        (Some(file), Some(stale)) => Some(Supervisor {
+            workflow: workflow(file, &args.supervisor_input)?,
+            stale: minutes(stale),
+        }),
+        _ => None,
+    };
+    let settings = next::Settings {
+        repository: var("GITHUB_REPOSITORY")?,
+        run: var("GITHUB_RUN_ID")?.parse().context("GITHUB_RUN_ID")?,
+        branch: args.branch.clone(),
+        pass: workflow(&args.workflow, &args.input)?,
+        apply_title: args.apply_title.clone(),
+        interval: minutes(args.wait_minutes),
+        supervisor,
+        dry_run: args.dry_run,
+    };
+    settings.validate()?;
+    // A deadline already past: the client waits out no rate limit itself, so
+    // `pass next`'s own four tries bound each call, as GitHub's job timeout
+    // would otherwise end it mid-wait.
+    let client = Client::from_env()?.retry_within(Instant::now());
+    next::run(
+        &client,
+        &next::SystemClock,
+        &settings,
+        out,
+        &mut std::io::stderr().lock(),
+    )
 }
 
 /// A preview through `live` whose reads are saved to `path` as a replay fixture.
@@ -127,8 +224,11 @@ fn read(path: &PathBuf) -> Result<String> {
 /// previews or applies, and a summary of its caps last. Any failed operation
 /// fails the command, after the rest of the pass has run.
 pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
-    let mut config = Config::parse(&read(&args.config)?)
-        .with_context(|| format!("{}", args.config.display()))?;
+    if let Some(PassCommand::Next(args)) = &args.command {
+        return next(args, out);
+    }
+    let path = args.config.as_ref().context("pass needs --config")?;
+    let mut config = Config::parse(&read(path)?).with_context(|| format!("{}", path.display()))?;
     if let Some(board) = config.forgejo_board() {
         // Stop unsupported operations before opening files or looking up any
         // credentials, including the GitHub apply/record/replay paths below.
