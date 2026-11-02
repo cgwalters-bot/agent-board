@@ -22,7 +22,7 @@ pub const CHECKS: &[(&str, &str)] = &[
     ("broker", "Inspect the broker probe and connectivity."),
     (
         "epics",
-        "Inspect coordinator checkpoints before retrying planning.",
+        "Inspect the pass's epic records and planning run before retrying planning.",
     ),
     (
         "dispatch",
@@ -93,8 +93,6 @@ const OPTIONAL_CHECKS: &[&str] = &["release", "idle", "stuck", "capacity"];
 const ABANDONED_RUN_HOURS: f64 = 7.0 * 24.0;
 /// The broker check's reason when the probe is switched off.
 const PROBE_OFF: &str = "Not observed: every listed probe run was skipped, so the probe is off.";
-/// Coordinator checkpoints on an epic: `<!-- coordinator/v1: {...} -->`.
-const CHECKPOINT_MARKER: &str = "coordinator/v1";
 /// The usage snapshot comment (`pass`'s stage 1, or tracker's usage.yml) and its JSON's schema.
 pub(crate) const USAGE_MARKER: &str = "<!-- bot-usage v1 -->";
 pub(crate) const USAGE_SCHEMA: &str = "bot-usage/v1";
@@ -201,7 +199,7 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 return unavailable(id, action, snapshot.previous.as_deref(), now, limits);
             };
             // Only checks with optional settings honour the marker: others'
-            // items carry remote data, such as an epic's checkpoint JSON,
+            // items carry remote data, such as an epic's records,
             // that must not switch a check off.
             if OPTIONAL_CHECKS.contains(&id) && items.iter().any(|i| i["configured"] == false) {
                 return json!({
@@ -277,6 +275,9 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                     .filter(|e| {
                         truthy(&e["missing"])
                             || e["failures"]
+                                .as_f64()
+                                .is_some_and(|f| f >= limits.epic_failures)
+                            || e["loops"]
                                 .as_f64()
                                 .is_some_and(|f| f >= limits.epic_failures)
                             || (truthy(&e["pending"])
@@ -489,7 +490,7 @@ const RECENT_PULLS: &str = r#"query($owner: String!, $name: String!, $after: Str
 const COMMENTS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) { issue(number: $number) {
     comments(first: 100, after: $cursor) {
-      nodes { databaseId updatedAt lastEditedAt body author { login } editor { login } }
+      nodes { databaseId url createdAt updatedAt lastEditedAt body author { login } editor { login } }
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -511,30 +512,6 @@ fn own_comments<'a>(comments: &'a [Value], who: &str) -> Vec<&'a Value> {
                 && !((truthy(&c["lastEditedAt"]) || truthy(&c["editor"])) && !is(&c["editor"]))
         })
         .collect()
-}
-
-/// The newest coordinator checkpoint of the bot's: its state, or `None`.
-fn checkpoint(comments: &[Value], bot: &str) -> Result<Option<Value>> {
-    let prefix = format!("<!-- {CHECKPOINT_MARKER}: ");
-    let Some(latest) = own_comments(comments, bot)
-        .into_iter()
-        .rfind(|c| c["body"].as_str().is_some_and(|b| b.starts_with(&prefix)))
-    else {
-        return Ok(None);
-    };
-    let body = latest["body"].as_str().unwrap_or_default();
-    let line = body
-        .split_once('\n')
-        .map(|(line, _)| line)
-        .context("invalid coordinator record")?;
-    let json = line
-        .strip_prefix(&prefix)
-        .and_then(|l| l.strip_suffix(" -->"))
-        .filter(|j| j.starts_with('{') && j.ends_with('}'))
-        .context("invalid coordinator record")?;
-    let state: Value = serde_json::from_str(json).context("invalid coordinator record")?;
-    ensure!(state.is_object(), "invalid coordinator record");
-    Ok(Some(state))
 }
 
 /// The JSON of the usage snapshot comment, if it holds one of its schema.
@@ -1036,7 +1013,7 @@ impl Collector<'_> {
             // Live only if the operator applied the label, as the newest
             // labeled or unlabeled event for it says: anyone who can triage
             // can label an issue, and the coordinator plans only from live
-            // epics. The census's board read is left out: a checkpoint does
+            // epics. The census's board read is left out: these records do
             // not depend on it.
             let timeline = self.paged(
                 &format!("/repos/{repo}/issues/{number}/timeline"),
@@ -1057,9 +1034,29 @@ impl Collector<'_> {
             if !live {
                 continue;
             }
-            let state = checkpoint(&self.comments(repo, number)?, &self.s.bot)?;
-            let mut item = state.clone().unwrap_or_else(|| json!({}));
-            item["missing"] = state.is_none().into();
+            let comments = self
+                .comments(repo, number)?
+                .iter()
+                .map(crate::plan::comment)
+                .collect::<Result<Vec<_>>>()?;
+            let (mut item, runs) =
+                crate::pass::epics::health(&comments, &self.s.operator, &self.s.bot)?;
+            for run in runs {
+                let path = format!("{}/actions/runs/{run}", self.root);
+                let run = self.cached_get(&path)?;
+                item["run_url"] = run["html_url"].clone();
+                if run["status"] == "completed" && FAILED.iter().any(|c| run["conclusion"] == *c) {
+                    item["failures"] = json!(item["failures"].as_u64().unwrap_or(0) + 1);
+                    if item["failures"]
+                        .as_f64()
+                        .is_some_and(|n| n >= self.s.limits.epic_failures)
+                    {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
             item["html_url"] = format!("https://github.com/{repo}/issues/{number}").into();
             result.push(item);
         }

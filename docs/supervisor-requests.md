@@ -22,8 +22,17 @@ leave out (the loaders' `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` and
 or confirmed off (agent-board#141). An observation it cannot read whole is `warn`, and becomes
 `fail` once `--previous` shows it has been unavailable for an hour. The
 previous report now comes from a file the workflow downloads, not from an
-artifact the binary unzips. The epics check reads each live epic's checkpoint
-without the census's board read. `supervise trigger` decides whether the agent
+artifact the binary unzips. The epics check reuses the pass's readers for each
+live epic's latest plan, apply receipt, done comment and planning request,
+without the census's board read. It warns when no record exists, fails a pending
+plan, unfinished apply or unanswered request older than `epicStaleHours`, and
+fails at `epicFailures` consecutive stopped applies, failed unanswered planning
+runs, or empty successful applies (a planning loop). A successful or recovered
+apply is not stale just because it is old; a done comment ends the streak.
+Unreadable records make the observation unavailable rather than reviving an
+older plan. The old `coordinator/v1` comments are not read. No option or caller
+setting changes, and collection remains read-only and bounded.
+`supervise trigger` decides whether the agent
 runs: on a failing check, outside a cooldown, or on the daily pass. It prints
 the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
 naming the configured `operator` as the one login whose text is instructions,

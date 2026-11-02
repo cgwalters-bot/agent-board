@@ -5702,7 +5702,7 @@ impl crate::github::GraphQl for Replay {
 
 mod blockers;
 mod cost;
-mod epics;
+pub(crate) mod epics;
 pub mod holds;
 pub mod lease;
 pub mod maintain;
