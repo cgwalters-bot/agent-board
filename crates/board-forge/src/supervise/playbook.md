@@ -43,8 +43,11 @@ Each request is exactly:
 
 The executor refuses the whole batch if any request is invalid. It also
 refuses an issue holding one of your comments, an issue that already has a
-run in flight, and a batch that would pass the
-day's cap. It never merges, enqueues, changes variables or reads secrets.
+run in flight. After every request passes preflight, requests past an action's
+daily cap are dropped in order and named in the executor's record; the rest
+go ahead. Policy `dailyUsed` shows each action's use in the last 24 hours
+(`dispatch` uses `maxDispatchesPerDay`); the executor recounts before writing.
+It never merges, enqueues, changes variables or reads secrets.
 
 Other actions are disabled unless their `dailyCaps` entry is positive. They
 use exactly these fields in addition to `type` and `action`:

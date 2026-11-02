@@ -722,10 +722,10 @@ fn the_daily_cap_is_counted_from_the_executors_own_log() {
         let mut fake = Fake::new(&block(&requests));
         fake.objects.insert("log".into(), json!(log));
         let outcome = run(&fake, &s, RESULT_URL, 1);
-        assert_eq!(outcome.ok, allowed, "{log:?} {n}");
+        assert!(outcome.ok, "{log:?} {n}: {outcome:?}");
         if !allowed {
-            assert!(outcome.lines[0].contains("daily dispatch cap"));
-            assert_eq!(fake.writes(), []);
+            assert!(outcome.lines.last().unwrap().contains("daily dispatch cap"));
+            assert_eq!(fake.writes().len(), 2, "record and one remaining dispatch");
         }
     }
     // A log too long to count refuses rather than undercounts.
@@ -904,7 +904,7 @@ fn the_cooldown_counts_earlier_runs_whose_agent_ran() {
 fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
     let s = settings();
     let p = policy(&s);
-    let task = compose(&checks("fail"), &p, "release failing").unwrap();
+    let task = compose(&checks("fail"), &p, "release failing", &Default::default()).unwrap();
     let (head, _) = PLAYBOOK.split_once(OPERATOR).unwrap();
     assert!(task.starts_with(head));
     assert!(task.contains("Why you run: release failing."));
@@ -916,7 +916,7 @@ fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
     let big: Vec<Value> = (0..2000)
         .map(|i| json!({"id": i, "evidence": ["https://github.com/o/r/issues/1"]}))
         .collect();
-    assert!(compose(&big, &p, "r").is_err());
+    assert!(compose(&big, &p, "r", &Default::default()).is_err());
 }
 
 #[test]
@@ -925,7 +925,7 @@ fn the_task_names_the_configured_operator_and_no_other_login() {
         let mut board = board();
         board["operator"] = json!(operator);
         let s = Settings::from_json(&board, &supervisor(), None).unwrap();
-        let task = compose(&checks("fail"), &policy(&s), "r").unwrap();
+        let task = compose(&checks("fail"), &policy(&s), "r", &Default::default()).unwrap();
         assert!(
             task.contains(&format!("anyone but\n{operator}, the policy's `operator`")),
             "{operator}"

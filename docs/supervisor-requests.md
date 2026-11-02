@@ -48,8 +48,14 @@ A dispatch is a run on an open issue in a `follow` repository, with a pool from
 the pools file and one of a fixed set of reasons.
 The executor writes the brief itself. A batch is refused whole if any request
 is invalid, if an issue holds a supervisor note, if an issue has a dispatch
-run in flight, or if the batch would pass
-`maxDispatchesPerPass` or `maxDispatchesPerDay`. The day's count comes from the
+run in flight, or if the batch would pass `maxDispatchesPerPass`.
+After preflight, only requests past an action's daily cap (including
+`maxDispatchesPerDay`) are dropped, in request order, and named in the log
+and ledger; the rest go ahead. The policy's `dailyUsed` reports rolling-day
+usage beside `dailyCaps`. Pass the previous executor ledger to `supervise
+trigger --ledger FILE` for ledger-based usage; without it usage comes from
+the log. This display is advisory: execute still validates and recounts.
+The day's count comes from the
 executor's own entries in the log issue, each written before the dispatches it
 names, or with `--requests` from the executor's ledger. That count holds only if
 the caller runs one executor at a time, as
