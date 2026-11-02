@@ -21,7 +21,7 @@ use crate::plan::Target;
 use crate::poll::pace::{Tiers, expand, tiers};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod handback;
 pub(super) mod judgment;
@@ -225,7 +225,12 @@ pub fn recent_agent(
 }
 
 /// The agent's task: the playbook, the policy it is held to and the report.
-pub fn compose(checks: &[Value], policy: &Policy, reason: &str) -> Result<String> {
+pub fn compose(
+    checks: &[Value],
+    policy: &Policy,
+    reason: &str,
+    daily_used: &BTreeMap<String, usize>,
+) -> Result<String> {
     let shown = json!({
         "operator": policy.settings.operator,
         "repositories": policy.settings.follow,
@@ -237,6 +242,7 @@ pub fn compose(checks: &[Value], policy: &Policy, reason: &str) -> Result<String
         "maxDispatchesPerPass": policy.agent.max_dispatches_per_pass,
         "maxDispatchesPerDay": policy.agent.max_dispatches_per_day,
         "dailyCaps": policy.agent.daily_caps,
+        "dailyUsed": daily_used,
         "state": policy.agent.state.as_ref().map(|s| json!({"repository": s.repository, "issue": s.issue})),
         "tracker": policy.agent.tracker,
         "project": policy.agent.project,
@@ -677,10 +683,30 @@ fn in_flight(api: &dyn Api, policy: &Policy, repository: &str, item: u64) -> Res
 /// The dispatches the executor recorded in its log since `since`: a line for
 /// each in its own run records, whatever the agent says. A line not
 /// attempted started nothing; one starting or failed may have.
-fn dispatches_since(api: &dyn Api, policy: &Policy, since: i64, action: &str) -> Result<usize> {
+/// Rolling-day usage for the policy shown to the agent. A supplied ledger is
+/// advisory here; execute independently validates its provenance and gaps.
+pub fn daily_usage(
+    api: &dyn Api,
+    policy: &Policy,
+    now: i64,
+    ledger: Option<&Ledger>,
+) -> Result<BTreeMap<String, usize>> {
+    let counted = match ledger {
+        Some(ledger) => ledger.usage_since(now - DAY_MS),
+        None => log_usage(api, policy, now - DAY_MS)?,
+    };
+    Ok(judgment::ACTIONS
+        .iter()
+        .copied()
+        .chain(["dispatch"])
+        .map(|action| (action.to_owned(), counted.get(action).copied().unwrap_or(0)))
+        .collect())
+}
+
+fn log_usage(api: &dyn Api, policy: &Policy, since: i64) -> Result<BTreeMap<String, usize>> {
     let IssueRef { repository, issue } = &policy.agent.log;
     let after = encode(&iso(since));
-    let mut count = 0;
+    let mut count = BTreeMap::new();
     for page in 1..=LOG_PAGES {
         let comments = api.get(&format!(
             "/repos/{repository}/issues/{issue}/comments?since={after}&per_page=100&page={page}"
@@ -695,12 +721,12 @@ fn dispatches_since(api: &dyn Api, policy: &Policy, since: i64, action: &str) ->
             {
                 continue;
             }
-            count += body
-                .lines()
-                .filter(|l| {
-                    l.starts_with(&format!("- `{action}` ")) && !l.ends_with(": not attempted")
-                })
-                .count();
+            for line in body.lines().filter(|l| !l.ends_with(": not attempted")) {
+                if let Some((action, _)) = line.strip_prefix("- `").and_then(|l| l.split_once("` "))
+                {
+                    *count.entry(action.to_owned()).or_default() += 1;
+                }
+            }
         }
         if comments.len() < 100 {
             return Ok(count);
@@ -774,6 +800,7 @@ fn prepare(
     policy: &Policy,
     ctx: &Run,
     ledger: &mut Option<Ledger>,
+    dropped: &mut Vec<String>,
 ) -> Result<(Vec<judgment::Checked>, Option<u64>)> {
     // A re-run would perform the same batch again, possibly long after the
     // pass that asked for it; the next scheduled pass asks afresh instead.
@@ -812,17 +839,21 @@ fn prepare(
     // Counted, then recorded: two executors at once could both count before
     // either records. The caller runs one at a time (supervisor.yml's
     // execute job has a concurrency group of its own).
-    for action in requests.iter().map(|r| r.action()).collect::<BTreeSet<_>>() {
-        let used = match ledger {
-            Some(ledger) => ledger.used(action),
-            None => dispatches_since(api, policy, ctx.now - DAY_MS, action)?,
-        };
-        let count = requests.iter().filter(|r| r.action() == action).count();
-        ensure!(
-            (used + count) as u64 <= judgment::cap(policy, action),
-            "The daily {action} cap is reached"
-        );
-    }
+    let mut used = daily_usage(api, policy, ctx.now, ledger.as_ref())?;
+    requests.retain(|r| {
+        let count = used.entry(r.action().to_owned()).or_default();
+        if (*count as u64) < judgment::cap(policy, r.action()) {
+            *count += 1;
+            true
+        } else {
+            dropped.push(format!(
+                "- dropped {}: The daily {} cap is reached",
+                r.describe(),
+                r.action()
+            ));
+            false
+        }
+    });
     if let Some(ledger) = ledger {
         ledger.reserve(&requests, ctx);
         return Ok((requests, None));
@@ -830,10 +861,11 @@ fn prepare(
     // Recorded before the first dispatch and edited with the outcome after,
     // so that a dispatch counts against the cap even when its outcome is
     // never logged.
-    let pending: Vec<String> = requests
+    let mut pending: Vec<String> = requests
         .iter()
         .map(|r| format!("- {}: starting", r.describe()))
         .collect();
+    pending.extend(dropped.iter().cloned());
     let recorded = api.send(
         "POST",
         &log_path(&policy.agent.log),
@@ -850,7 +882,8 @@ fn prepare(
 /// every target passed; stops at the first failed dispatch.
 pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
     let mut ledger = None;
-    let (requests, log_comment) = match prepare(api, policy, ctx, &mut ledger) {
+    let mut dropped = vec![];
+    let (requests, log_comment) = match prepare(api, policy, ctx, &mut ledger, &mut dropped) {
         Ok(prepared) => prepared,
         Err(error) => {
             // The messages are fixed text or name checked fields and logins.
@@ -884,7 +917,9 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
     }
     if let Some(ledger) = &mut ledger {
         ledger.settle(&lines);
+        ledger.record_dropped(&dropped, ctx);
     }
+    lines.extend(dropped);
     Outcome {
         ok,
         lines,

@@ -72,6 +72,9 @@ struct Trigger {
     /// The daily pass, which runs the agent with every check passing.
     #[arg(long)]
     daily: bool,
+    /// Previous executor ledger for advisory daily usage; omit when using the log path.
+    #[arg(long, value_name = "FILE")]
+    ledger: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -342,12 +345,30 @@ pub fn run(args: &Supervise) -> Result<()> {
                     hours,
                 )
             })?;
+            let ledger = args
+                .ledger
+                .as_deref()
+                .map(read)
+                .transpose()?
+                .as_ref()
+                .map(agent::handback::Ledger::parse)
+                .transpose()?;
+            let usage = if decision.act {
+                policy
+                    .as_ref()
+                    .map(|p| agent::daily_usage(&client, p, now(), ledger.as_ref()))
+                    .transpose()?
+                    .unwrap_or_default()
+            } else {
+                Default::default()
+            };
             let out = trigger_output(
                 &decision,
                 policy.as_ref(),
                 &pools,
                 checks,
                 &delimiter("task")?,
+                &usage,
             )?;
             std::io::stdout().lock().write_all(out.as_bytes())?;
             eprintln!(
@@ -545,13 +566,14 @@ fn trigger_output(
     pools: &Value,
     checks: &[Value],
     delimiter: &str,
+    usage: &std::collections::BTreeMap<String, usize>,
 ) -> Result<String> {
     let mut out = output_line("act", &decision.act.to_string())?;
     let Some(policy) = policy.filter(|_| decision.act) else {
         return Ok(out);
     };
     let pool = &pools[policy.agent.pool.as_str()];
-    let task = agent::compose(checks, policy, &decision.reason)?;
+    let task = agent::compose(checks, policy, &decision.reason, usage)?;
     out.push_str(&output_line("repo", &policy.agent.requests.repository)?);
     out.push_str(&output_line(
         "item",
@@ -589,7 +611,15 @@ mod tests {
             act: true,
             reason: "release failing".into(),
         };
-        let out = trigger_output(&run, policy.as_ref(), &pools, &checks, "task-d").unwrap();
+        let out = trigger_output(
+            &run,
+            policy.as_ref(),
+            &pools,
+            &checks,
+            "task-d",
+            &Default::default(),
+        )
+        .unwrap();
         assert!(out.starts_with(
             "act=true\nrepo=o/control\nitem=5\nagent=a\nmodel=m\nbudget=100\ntask<<task-d\n"
         ));
@@ -599,14 +629,42 @@ mod tests {
             reason: "no check fails".into(),
         };
         assert_eq!(
-            trigger_output(&skip, policy.as_ref(), &pools, &checks, "task-d").unwrap(),
+            trigger_output(
+                &skip,
+                policy.as_ref(),
+                &pools,
+                &checks,
+                "task-d",
+                &Default::default()
+            )
+            .unwrap(),
             "act=false\n"
         );
         // A pool value that would add an output line, or a delimiter the
         // task holds, is refused.
         let forged = json!({"large": {"agent": "a\ntask=forged", "model": "m", "budget": "1"}});
-        assert!(trigger_output(&run, policy.as_ref(), &forged, &checks, "task-d").is_err());
-        assert!(trigger_output(&run, policy.as_ref(), &pools, &checks, "release").is_err());
+        assert!(
+            trigger_output(
+                &run,
+                policy.as_ref(),
+                &forged,
+                &checks,
+                "task-d",
+                &Default::default()
+            )
+            .is_err()
+        );
+        assert!(
+            trigger_output(
+                &run,
+                policy.as_ref(),
+                &pools,
+                &checks,
+                "release",
+                &Default::default()
+            )
+            .is_err()
+        );
         assert!(output_line("x", "a\rb").is_err());
         // A session's prompt is task data under the delimiter; a pool value
         // cannot add a line.

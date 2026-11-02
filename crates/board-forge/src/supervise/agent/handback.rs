@@ -167,9 +167,29 @@ impl Ledger {
         })
     }
 
-    /// The writes of `action` it holds, all within the last day.
-    pub(super) fn used(&self, action: &str) -> usize {
-        self.entries.iter().filter(|e| e.action == action).count()
+    pub(super) fn usage_since(&self, since: i64) -> std::collections::BTreeMap<String, usize> {
+        let mut usage = std::collections::BTreeMap::new();
+        for e in self
+            .entries
+            .iter()
+            .filter(|e| e.at >= since && !e.action.is_empty())
+        {
+            *usage.entry(e.action.clone()).or_default() += 1;
+        }
+        usage
+    }
+
+    pub(super) fn record_dropped(&mut self, lines: &[String], ctx: &Run) {
+        // Only the latest batch's dropped requests need to reach the next
+        // pass. They are diagnostics, not write reservations; never let
+        // repeated capped batches grow the ledger without bound.
+        self.entries.retain(|e| !e.action.is_empty());
+        self.entries.extend(lines.iter().map(|line| Entry {
+            at: ctx.now,
+            action: String::new(),
+            run: ctx.run_url.clone(),
+            line: one_line(line.strip_prefix("- ").unwrap_or(line)),
+        }));
     }
 
     /// Reserves every request before the first write: one that may have

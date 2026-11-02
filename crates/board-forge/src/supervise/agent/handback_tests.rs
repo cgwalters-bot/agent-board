@@ -269,6 +269,110 @@ fn a_ledger_is_read_strictly_and_written_back_alike() {
 }
 
 #[test]
+fn caps_drop_only_excess_requests_after_a_successful_preflight() {
+    let mut cfg = supervisor();
+    cfg["agent"]["dailyCaps"] = json!({"replace_state": 1, "file_bug": 1});
+    cfg["agent"]["tracker"] = json!("example/control");
+    cfg["agent"]["state"] = json!({"repository": "example/control", "issue": 8});
+    let s = Settings::from_json(&board(), &cfg, None).unwrap();
+    let p = policy(&s);
+    let now = millis(&json!(NOW)).unwrap();
+    for handback in [false, true] {
+        for bad_preflight in [false, true] {
+            let batch = block(&[
+                request(json!({"item": 3})),
+                json!({"type": "supervisor_action", "action": "replace_state", "body": "Memory"}),
+                request(json!({"item": 4})),
+                json!({"type": "supervisor_action", "action": "file_bug", "title": "Failure", "body": "Evidence"}),
+            ]);
+            let mut fake = Fake::new(&batch);
+            fake.objects.insert(
+                "/repos/example/control/issues/8".into(),
+                json!({"state": "open", "labels": []}),
+            );
+            let before = ledger(40, Value::Null, &[(NOW, "dispatch"), (NOW, "dispatch")]);
+            let context = if handback {
+                let prior = previous(&mut fake, before.clone());
+                own_runs(&mut fake, &[]);
+                hand_back_ctx(&outputs(&batch), prior, 1)
+            } else {
+                fake.objects.insert(
+                    "log".into(),
+                    json!([{
+                        "user": {"login": "worker"}, "created_at": NOW,
+                        "body": format!("Supervisor [run](u), requests:\n- {DONE}\n- {DONE}")
+                    }]),
+                );
+                ctx(RESULT_URL)
+            };
+            if bad_preflight {
+                fake.issue(4, json!({"rest": {"state": "closed"}}));
+            }
+            let usage = daily_usage(
+                &fake,
+                &p,
+                now,
+                handback.then(|| Ledger::parse(&before).unwrap()).as_ref(),
+            )
+            .unwrap();
+            assert_eq!(usage["dispatch"], 2);
+            assert_eq!(usage["file_bug"], 0);
+            let task = compose(&[], &p, "daily", &usage).unwrap();
+            assert!(task.contains("\"dailyUsed\": {"));
+            let outcome = execute(&fake, &p, &context);
+            if bad_preflight {
+                assert!(!outcome.ok, "{handback}: {outcome:?}");
+                assert!(fake.writes().is_empty());
+                assert!(outcome.lines[0].starts_with("- refused the whole batch:"));
+                continue;
+            }
+            assert!(outcome.ok, "{handback}: {outcome:?}");
+            assert_eq!(
+                outcome
+                    .lines
+                    .iter()
+                    .filter(|l| l.contains(": done,"))
+                    .count(),
+                3
+            );
+            let dropped = outcome.lines.last().unwrap();
+            assert!(
+                dropped.starts_with("- dropped `dispatch` example/project #4"),
+                "{outcome:?}"
+            );
+            assert!(dropped.contains("daily dispatch cap"));
+            let body = record(&fake, &p, &context, &outcome).unwrap();
+            assert!(body.contains(dropped));
+            let after = outcome
+                .ledger
+                .as_ref()
+                .map(|l| Ledger::parse(&l.to_json()).unwrap());
+            if let Some(ledger) = &after {
+                assert!(
+                    ledger
+                        .entries
+                        .last()
+                        .unwrap()
+                        .line
+                        .contains("dropped `dispatch` example/project #4")
+                );
+            } else {
+                let pending = &fake.writes()[0].2["body"];
+                assert!(pending.as_str().unwrap().contains(dropped));
+                fake.objects.insert("log".into(), json!([
+                    {"user": {"login": "worker"}, "created_at": NOW, "body": format!("Supervisor [run](u), requests:\n- {DONE}\n- {DONE}")},
+                    {"user": {"login": "worker"}, "created_at": NOW, "body": body}
+                ]));
+            }
+            let usage = daily_usage(&fake, &p, now, after.as_ref()).unwrap();
+            assert_eq!(usage["dispatch"], 3);
+            assert_eq!(usage["replace_state"], 1);
+            assert_eq!(usage["file_bug"], 1);
+        }
+    }
+}
+
+#[test]
 fn a_hand_back_counts_from_its_ledger_and_blocks_a_day_after_a_lost_one() {
     let recent = "2026-10-16T08:00:00.000Z";
     let old = "2026-10-15T11:00:00.000Z";
@@ -426,13 +530,34 @@ fn a_hand_back_counts_from_its_ledger_and_blocks_a_day_after_a_lost_one() {
         );
         match refused {
             Some(message) => {
-                assert!(!outcome.ok, "{label}");
+                assert_eq!(outcome.ok, message == "daily dispatch cap", "{label}");
                 assert!(
-                    outcome.lines[0].contains(message),
+                    outcome.lines.iter().any(|l| l.contains(message)),
                     "{label}: {:?}",
                     outcome.lines
                 );
-                assert_eq!(fake.writes(), [], "{label}");
+                if message == "daily dispatch cap" {
+                    assert!(outcome.ok, "{label}");
+                    assert_eq!(fake.writes().len(), 1, "{label}");
+                    assert_eq!(
+                        ledger
+                            .entries
+                            .iter()
+                            .filter(|e| e.action == "dispatch")
+                            .count(),
+                        3
+                    );
+                    assert!(
+                        ledger
+                            .entries
+                            .last()
+                            .unwrap()
+                            .line
+                            .starts_with("dropped `dispatch`")
+                    );
+                } else {
+                    assert_eq!(fake.writes(), [], "{label}");
+                }
             }
             None => {
                 assert!(outcome.ok, "{label}: {:?}", outcome.lines);

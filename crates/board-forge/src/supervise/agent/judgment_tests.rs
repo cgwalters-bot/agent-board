@@ -819,6 +819,44 @@ fn a_created_issue_link_comes_from_the_tracker_and_the_receipt_number() {
 }
 
 #[test]
+fn a_capped_judgment_leaves_the_other_actions_in_the_batch() {
+    let s = configured();
+    for capped in ["plan_epic", "replace_state", "file_bug"] {
+        let batch: Vec<Value> = actions()
+            .into_iter()
+            .filter(|r| {
+                ["plan_epic", "replace_state", "file_bug"].contains(&r["action"].as_str().unwrap())
+            })
+            .collect();
+        let mut fake = Fake::new(&block(&batch));
+        evidence(&mut fake);
+        fake.objects.insert("log".into(), json!([{
+            "user": {"login": "worker"}, "created_at": NOW,
+            "body": format!("Supervisor [run](u), requests:\n- `{capped}` configured target: starting")
+        }]));
+        let outcome = run(&fake, &s, RESULT_URL, 1);
+        assert!(outcome.ok, "{capped}: {outcome:?}");
+        assert_eq!(
+            outcome
+                .lines
+                .iter()
+                .filter(|l| l.contains(": done,"))
+                .count(),
+            2
+        );
+        let dropped = outcome.lines.last().unwrap();
+        assert!(dropped.starts_with(&format!("- dropped `{capped}` ")));
+        assert!(
+            record(&fake, &policy(&s), &ctx(RESULT_URL), &outcome)
+                .unwrap()
+                .contains(dropped)
+        );
+        let usage = daily_usage(&fake, &policy(&s), millis(&json!(NOW)).unwrap(), None).unwrap();
+        assert_eq!(usage[capped], 1);
+    }
+}
+
+#[test]
 fn every_judgment_kind_is_off_by_default_and_obeys_its_daily_cap() {
     for r in actions() {
         refuses(&settings(), r.clone(), |_| {});
@@ -829,17 +867,44 @@ fn every_judgment_kind_is_off_by_default_and_obeys_its_daily_cap() {
             "Supervisor [run](earlier), requests:\n{}",
             vec![format!("- `{kind}` configured target: starting"); used as usize].join("\n")
         );
-        refuses(&s, r.clone(), |f| {
-            f.objects.insert(
-                "log".into(),
-                json!([{"user": {"login": "worker"}, "created_at": NOW, "body": body}]),
-            );
-        });
-        // More than a day's cap in this batch also refuses before writes.
+        let mut fake = Fake::new(&block(std::slice::from_ref(&r)));
+        evidence(&mut fake);
+        fake.objects.insert(
+            "log".into(),
+            json!([{"user": {"login": "worker"}, "created_at": NOW, "body": body}]),
+        );
+        let outcome = run(&fake, &s, RESULT_URL, 1);
+        assert!(outcome.ok, "{kind}: {outcome:?}");
+        assert!(outcome.lines[0].starts_with("- dropped "), "{kind}");
+        assert!(outcome.lines[0].contains(&format!("daily {kind} cap")));
+        assert_eq!(fake.writes().len(), 1, "only the log record");
+        // Duplicate targets still fail batch validation before any writes,
+        // even if cap filtering would have removed the duplicates.
         let mut fake = Fake::new(&block(&vec![r.clone(); used as usize + 1]));
         evidence(&mut fake);
-        assert!(!run(&fake, &s, RESULT_URL, 1).ok, "{kind}");
-        assert!(fake.writes().is_empty());
+        let outcome = run(&fake, &s, RESULT_URL, 1);
+        if outcome.ok {
+            assert_eq!(
+                outcome
+                    .lines
+                    .iter()
+                    .filter(|l| l.starts_with("- dropped "))
+                    .count(),
+                1,
+                "{kind}"
+            );
+            assert_eq!(
+                outcome
+                    .lines
+                    .iter()
+                    .filter(|l| l.contains(": done,"))
+                    .count(),
+                used as usize,
+                "{kind}"
+            );
+        } else {
+            assert!(fake.writes().is_empty(), "{kind}");
+        }
     }
     let mut cfg = supervisor();
     for caps in [

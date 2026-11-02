@@ -812,6 +812,7 @@ Options:
 - `--pools <FILE>`: The pools file naming each pool's agent, model and budget
 - `--health <FILE>`: The report `health` wrote (default: `health.json`)
 - `--daily`: The daily pass, which runs the agent with every check passing
+- `--ledger <FILE>`: Previous executor ledger for advisory daily usage; omit when using the log path
 
 ## agent-board supervise execute
 
