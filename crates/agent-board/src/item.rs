@@ -5,7 +5,9 @@
 use crate::ask::print_proposals;
 use anyhow::{Context, Result, ensure};
 use board_core::{ItemRef, Snapshot};
-use board_forge::github::{DEFAULT_HOST, FieldWrite, GitHub, Transport, field_writes};
+use board_forge::github::{
+    DEFAULT_HOST, FieldWrite, GitHub, Transport, already_member, field_writes,
+};
 use board_forge::items::{self, ITEM_CACHE_SCHEMA, ITEM_REQUEST_LIMIT, Select};
 use board_forge::pass::Config;
 use board_forge::poll::Rest;
@@ -218,11 +220,20 @@ pub fn write<T: Transport>(
     }
     let (item, action) = match member {
         Some(item) => (item, "present"),
-        None => {
-            let item = github.add_item(&project, &issue)?;
-            *added = Some(item.clone());
-            (item, "added")
-        }
+        None => match github.add_item(&project, &issue) {
+            Ok(item) => {
+                *added = Some(item.clone());
+                (item, "added")
+            }
+            // Someone else's add, such as the project's auto-add, got there
+            // first: present, and so never removed after a later failure.
+            Err(error) if already_member(&error) => {
+                let (_, item) = github.issue_item(&project, identity)?;
+                let item = item.context("GitHub refused to add a member that has no item")?;
+                (item, "present")
+            }
+            Err(error) => return Err(error),
+        },
     };
     writeln!(out, "{}\t{action}", identity.display())?;
     for write in &writes {
@@ -237,6 +248,7 @@ pub fn write<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use board_forge::github::ALREADY_IN_PROJECT;
     use std::cell::RefCell;
 
     /// A board whose membership and field values change with each mutation.
@@ -252,6 +264,9 @@ mod tests {
         truncated: bool,
         /// Report a different value than was written.
         lie: bool,
+        /// The project's auto-add puts the issue on it first, so GitHub
+        /// refuses the add (tracker#1151).
+        auto_added: bool,
     }
 
     impl Board {
@@ -264,6 +279,7 @@ mod tests {
                 lookup_repo: None,
                 truncated: false,
                 lie: false,
+                auto_added: false,
             }
         }
     }
@@ -313,6 +329,11 @@ mod tests {
                 assert_eq!(variables["project"], "P");
                 assert_eq!(variables["issue"], "I");
                 self.members.borrow_mut().push("M".into());
+                if self.auto_added {
+                    anyhow::bail!(
+                        "GitHub GraphQL: UNPROCESSABLE: {ALREADY_IN_PROJECT}; response may be partial"
+                    );
+                }
                 return Ok(json!({"addProjectV2ItemById":{"item":{"id":"M"}}}));
             }
             if query.contains("updateProjectV2ItemFieldValue(") {
@@ -383,6 +404,18 @@ mod tests {
                 true,
                 "example/intake#7\tpresent\nStatus\tDone\tset\nWhy\ta=b\tset\n",
                 vec!["F_status", "F_why"],
+                None,
+            ),
+            // An add GitHub refuses for a member made since the read sets the
+            // fields on its item, which is not this call's to remove.
+            (
+                |b| b.auto_added = true,
+                Mode::Add,
+                true,
+                edits(&["Priority=P1"]),
+                false,
+                "example/intake#7\tpresent\nPriority\tP1\tset\n",
+                vec!["F_priority"],
                 None,
             ),
             // Without --apply nothing is written; the proposal is printed instead.
@@ -597,7 +630,7 @@ mod tests {
                     .borrow()
                     .iter()
                     .any(|q| q.contains("addProjectV2ItemById(")),
-                was_added,
+                was_added || github.transport.auto_added,
                 "{label}"
             );
             match error {

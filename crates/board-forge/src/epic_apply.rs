@@ -7,7 +7,7 @@
 use crate::epic::{
     Action, Bounds, EPIC_PLAN_FENCE, Epic, EpicPlan, IssueRef, Target, epic_labelled_by, read_epic,
 };
-use crate::github::{API_ROOT, DEFAULT_HOST, Transport, is_github_login};
+use crate::github::{API_ROOT, DEFAULT_HOST, Transport, already_member, is_github_login};
 use crate::plan::{
     Comment, comment_id, fenced_json, has_fence, issue_comments, newest_fenced, plan_id, send,
     viewer,
@@ -1400,7 +1400,8 @@ pub fn links(issue: &IssueRef) -> String {
 }
 
 /// Puts `issue` on the project, where it may be already, and sets its
-/// Priority: one write step.
+/// Priority: one write step. GitHub returns an existing item, or refuses the
+/// add; on that refusal the item is looked up.
 fn set_priority<T: Transport>(
     client: &T,
     issue: &IssueRef,
@@ -1408,11 +1409,16 @@ fn set_priority<T: Transport>(
     config: &Config,
 ) -> Result<()> {
     let content = node_id(client, issue).context("priority target")?;
-    let data = client.graphql("mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }", json!({"project": config.project, "content": content}))?;
-    let item = data
-        .pointer("/addProjectV2ItemById/item/id")
-        .and_then(Value::as_str)
-        .context("project membership has no id")?;
+    let added = client.graphql("mutation($project: ID!, $content: ID!) { addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }", json!({"project": config.project, "content": content}));
+    let item = match added {
+        Ok(data) => data
+            .pointer("/addProjectV2ItemById/item/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .context("project membership has no id")?,
+        Err(error) if already_member(&error) => existing_item(client, issue, config)?,
+        Err(error) => return Err(error),
+    };
     let option = config
         .priorities
         .get(value)
@@ -1421,10 +1427,36 @@ fn set_priority<T: Transport>(
     Ok(())
 }
 
+/// The item of `issue` on the configured project, which GitHub said holds it.
+fn existing_item<T: Transport>(client: &T, issue: &IssueRef, config: &Config) -> Result<String> {
+    let (owner, name) = issue.repo.split_once('/').context("issue repository")?;
+    let data = client.graphql("query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { projectItems(first: 100) { nodes { id project { id } } pageInfo { hasNextPage } } } } }", json!({"owner": owner, "name": name, "number": issue.number}))?;
+    let items = data
+        .pointer("/repository/issue/projectItems")
+        .with_context(|| format!("{issue} is not an issue"))?;
+    let nodes = items["nodes"].as_array().context("missing project items")?;
+    let members: Vec<_> = (nodes.iter())
+        .filter(|node| node["project"]["id"].as_str() == Some(config.project.as_str()))
+        .collect();
+    // An item past the first page would be unknown, as in `GitHub::issue_item`.
+    match members[..] {
+        [item] => item["id"]
+            .as_str()
+            .map(str::to_owned)
+            .context("project membership has no id"),
+        [] if items["pageInfo"]["hasNextPage"] == true => {
+            bail!("{issue} is on more than 100 projects; its item is unknown")
+        }
+        [] => bail!("GitHub said {issue} is on the project, but it has no item there"),
+        _ => bail!("{issue} has more than one item on the project"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::epic::EPIC_PLAN_SCHEMA;
+    use crate::github::ALREADY_IN_PROJECT;
     use std::cell::{Cell, RefCell};
 
     fn config() -> Config {
@@ -1479,6 +1511,9 @@ mod tests {
         epic_reads: Cell<usize>,
         reads: Cell<usize>,
         login: &'static str,
+        /// The project's auto-add puts each issue on it first, so GitHub
+        /// refuses the add (tracker#1151).
+        auto_added: bool,
     }
 
     impl Forge {
@@ -1507,6 +1542,7 @@ mod tests {
                 epic_reads: Cell::new(0),
                 reads: Cell::new(0),
                 login: "planner",
+                auto_added: false,
             }
         }
 
@@ -1585,6 +1621,13 @@ mod tests {
                     json!({"repository": {"issue": {"id": "E", "state": state, "labels": {"nodes": if labelled { vec![json!({"name": "epic"})] } else { vec![] }}, "subIssues": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}}),
                 );
             }
+            if query.contains("projectItems(") {
+                self.log("graphql", "item", variables.clone())?;
+                let nodes = json!([{"id": "X", "project": {"id": "P_other"}}, {"id": "M", "project": {"id": "P_config"}}]);
+                return Ok(
+                    json!({"repository": {"issue": {"projectItems": {"nodes": nodes, "pageInfo": {"hasNextPage": false}}}}}),
+                );
+            }
             if query.starts_with("query") {
                 // A number that is no issue: none, or a pull request's.
                 if variables["number"] == 404 {
@@ -1611,6 +1654,11 @@ mod tests {
             if query.contains("addProjectV2ItemById(") {
                 self.log("graphql", "enroll", variables.clone())?;
                 assert_eq!(variables["project"], "P_config");
+                if self.auto_added {
+                    bail!(
+                        "GitHub GraphQL: UNPROCESSABLE: {ALREADY_IN_PROJECT}; response may be partial"
+                    );
+                }
                 return Ok(json!({"addProjectV2ItemById": {"item": {"id": "M"}}}));
             }
             assert!(query.contains("updateProjectV2ItemFieldValue("), "{query}");
@@ -1926,6 +1974,37 @@ mod tests {
             apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap(),
             [ALREADY_CLAIMED]
         );
+    }
+
+    /// tracker#1151: the project's auto-add got there first and GitHub refused
+    /// the add. Both the created sub-issue and an existing one get their
+    /// Priority on the item already there.
+    #[test]
+    fn a_refused_add_of_a_member_sets_the_existing_items_priority() {
+        let mut forge = Forge::new(json!([
+            {"type": "create_sub_issue", "repo": "example/work", "title": "child", "body": "scope"},
+            {"type": "set_priority", "new": 1, "value": "High"},
+            {"type": "set_priority", "issue": "example/work#2", "value": "Normal"}
+        ]));
+        forge.auto_added = true;
+        apply(&forge, &issue(), &config(), OffsetDateTime::UNIX_EPOCH).unwrap();
+        let writes: Vec<_> = (forge.requests.borrow().iter())
+            .filter(|(method, ..)| method == "graphql")
+            .map(|(_, target, body)| format!("{target} {}", body["option"]))
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                "link null",
+                "enroll null",
+                "item null",
+                "priority \"O_high\"",
+                "enroll null",
+                "item null",
+                "priority \"O_normal\"",
+            ]
+        );
+        assert_eq!(receipt(&forge).detail.outcome, Outcome::Applied);
     }
 
     #[test]
