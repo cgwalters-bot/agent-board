@@ -239,6 +239,7 @@
     "state": {"verdict": "refused", "reason": "the poll's cache, PR follow-up"},
     "pr.reviewWorkflow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.checkReruns": {"verdict": "refused", "reason": "PR check retries (stage 2) require GitHub checks and Actions runs"},
+    "pr.ownerBranches": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.reviewPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.fixPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.toilFixPool": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},

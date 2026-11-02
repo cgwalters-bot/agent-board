@@ -1248,6 +1248,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         {
             return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
         }
+        // And where apply would refuse to push to its head, as apply reads it.
+        if self.config.policy.owner_branches {
+            let from = &pull["head"]["repo"];
+            let owner = text(from, "/owner/login");
+            let own = from["fork"] == true && owner.eq_ignore_ascii_case(&self.config.bot);
+            if let Some(why) = self.owner_branches(text(from, "/full_name"), own) {
+                return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
+            }
+        }
         let marker = find_marker(read, &self.config.bot);
         // A stop whose label is gone was reset, as decide reads it.
         let carried = if marker.stopped {
@@ -2504,6 +2513,20 @@ pub(super) mod tests {
                 "left to the operator: repository upstream/app is outside the fix bounds",
                 false,
             ),
+            // With `ownerBranches`, nor on a branch of the repository itself
+            // that agentic-job's apply would refuse to push to (agent-board#598).
+            (
+                "inside apply's owner branches",
+                "fix round 2 -> https://github.com/upstream/tracker/actions/runs/1234",
+                false,
+            ),
+            (
+                "outside apply's owner branches",
+                &format!(
+                    "left to the operator: its head is a branch of upstream/app, not the bot's fork, and apply pushes there only once upstream/app's default branch has {OWNER_BRANCHES} naming it"
+                ),
+                false,
+            ),
         ] {
             let fake = github();
             let mut config = config();
@@ -2547,6 +2570,25 @@ pub(super) mod tests {
                         json!({"status": "completed"}),
                     );
                 }
+                "inside apply's owner branches" | "outside apply's owner branches" => {
+                    config.policy.owner_branches = true;
+                    fake.rest.borrow_mut().get_mut(&pull).unwrap()["head"] = json!({
+                        "sha": "abcdef0123456789", "ref": "dispatch/x",
+                        "repo": {"full_name": "upstream/app", "fork": false, "owner": {"login": "upstream"}}});
+                    let named = match case {
+                        "inside apply's owner branches" => "Upstream/App",
+                        _ => "upstream/tracker",
+                    };
+                    fake.page(
+                        &format!("repos/upstream/app/contents/{OWNER_BRANCHES}"),
+                        json!({"type": "file", "encoding": "base64", "size": named.len(),
+                            "content": crate::supervise::tests::base64(named)}),
+                    );
+                    fake.page(
+                        &format!("repos/{DISPATCH}/actions/runs/5"),
+                        json!({"status": "completed"}),
+                    );
+                }
                 _ => {
                     let (field, value) = if case == "closed" {
                         ("state", json!("closed"))
@@ -2567,7 +2609,7 @@ pub(super) mod tests {
                 ),
                 "{case}"
             );
-            let started = case == "inside the bounds";
+            let started = case.starts_with("inside");
             assert_eq!(
                 dispatches(&fake).iter().any(|i| i["kind"] == "fix"),
                 started,

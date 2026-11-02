@@ -251,6 +251,15 @@ const WITHHELD_WAIT: &str =
 /// takes it, labelled or not.
 const LEFT_TO_OPERATOR: &str = "left to the operator: ";
 
+/// agentic-job's apply pushes a round's commit to a head repository other
+/// than the bot's own fork only where that repository's default branch has
+/// this file naming it on a line of its own, as its own workflows would run
+/// the commit with their secrets. The poll reads it only to save a round
+/// apply would refuse (agent-board#598); apply stays the check.
+const OWNER_BRANCHES: &str = safe_outputs::apply::push::OWNER_BRANCHES;
+/// More than this is not an opt-in file, as apply reads it.
+const OWNER_BRANCHES_MAX: usize = 4096;
+
 // Both writes admit only the head we approved. A queue is required by the base
 // branch's rules, not an auto-merge fallback; GitHub owns revalidation after
 // admission. Auto-merge remains excluded because it can admit a later push.
@@ -279,6 +288,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
     pullRequest(number: $number) {
       id number url title body state isDraft mergeable mergeStateStatus headRefOid headRefName baseRefName isCrossRepository
       baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
+      headRepository { nameWithOwner }
       author { __typename login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
@@ -561,6 +571,10 @@ pub struct PollPolicy {
     /// The pass's `pr.checkReruns`: only the pre-fix check retry and its
     /// recovery wait. Off by default; legacy `reruns` also enables this path.
     pub check_reruns: bool,
+    /// The pass's `pr.ownerBranches`: a round on a head that is not the bot's
+    /// fork is skipped where agentic-job's apply would refuse to push there
+    /// ([`OWNER_BRANCHES`]). Off by default.
+    pub owner_branches: bool,
     /// The pass's `pr.reviewPools`: the pass starts the review job for a
     /// head that has no run of it, paced on these pools, and the runs it
     /// started count as the job's ([`reviews_head`]). Empty (the default)
@@ -875,6 +889,7 @@ impl PollPolicy {
             stale_days: 0,
             reruns: false,
             check_reruns: false,
+            owner_branches: false,
             review_pools: Vec::new(),
             review_wip: None,
             review_ranks: BTreeMap::new(),
@@ -5904,6 +5919,52 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         (line, false, Some(wait), stepped)
     }
 
+    /// Why agentic-job's apply would refuse to push a round's commit to a
+    /// pull request's head in repository `head`, unless it is the bot's own
+    /// fork (`own`): its default branch has no [`OWNER_BRANCHES`] naming it.
+    /// A read that fails is said too, as [`Self::shared_head`] says its own.
+    /// The decoder is looser than apply's, which can only let a round start
+    /// that apply then refuses.
+    fn owner_branches(&mut self, head: &str, own: bool) -> Option<String> {
+        if own {
+            return None;
+        }
+        // The name goes into a path: GitHub's, but checked as any other is.
+        if validate_repository(head).is_err() {
+            return Some("its head repository could not be read".into());
+        }
+        let file = match self.get(&format!("repos/{head}/contents/{OWNER_BRANCHES}")) {
+            Ok(file) => Some(file),
+            Err(error) if error.is::<crate::github::NotFound>() => None,
+            Err(error) => {
+                return Some(format!(
+                    "{head}'s {OWNER_BRANCHES} could not be read ({error:#})"
+                ));
+            }
+        };
+        let accepts = file.as_ref().is_some_and(|file| {
+            let content = file["content"].as_str().filter(|_| {
+                file["type"] == "file"
+                    && file["encoding"] == "base64"
+                    && file["size"]
+                        .as_u64()
+                        .is_some_and(|size| size <= OWNER_BRANCHES_MAX as u64)
+            });
+            let bytes = content.and_then(|c| crate::supervise::health::base64_decode(c).ok());
+            bytes.is_some_and(|bytes| {
+                bytes.len() <= OWNER_BRANCHES_MAX
+                    && String::from_utf8_lossy(&bytes)
+                        .split('\n')
+                        .any(|line| line.trim().eq_ignore_ascii_case(head))
+            })
+        });
+        (!accepts).then(|| {
+            format!(
+                "its head is a branch of {head}, not the bot's fork, and apply pushes there only once {head}'s default branch has {OWNER_BRANCHES} naming it"
+            )
+        })
+    }
+
     /// Why `pull` gets no round, if its head ref is also the head of an open
     /// pull request in a repository this pass does not follow, which the
     /// round's push would change too, such as an upstream's that only an
@@ -6271,6 +6332,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut left = round
             .then(|| bounds.refusal(repo, text(&pull, "/headRefName")))
             .flatten();
+        if round && left.is_none() && self.config.policy.owner_branches {
+            let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
+            let owner = text(&pull, "/headRepositoryOwner/login");
+            let own = cross && owner.eq_ignore_ascii_case(&self.config.bot);
+            let head = match cross {
+                true => text(&pull, "/headRepository/nameWithOwner"),
+                false => repo,
+            };
+            left = self.owner_branches(head, own);
+        }
         if round && left.is_none() {
             left = self.shared_head(owner, name, number);
         }
@@ -9934,6 +10005,8 @@ mod tests {
     struct Fake {
         /// ETag, Last-Modified, next page and body, by URL.
         rest: BTreeMap<String, Page>,
+        /// URLs GitHub answers 404 for.
+        missing: Vec<String>,
         pulls: BTreeMap<u64, Value>,
         /// Leave `Link` out of 304s, as a response without metadata may.
         bare_304: bool,
@@ -10003,6 +10076,10 @@ mod tests {
                 .push((url.into(), validator.map(|(n, v)| format!("{n}: {v}"))));
             if self.labelled_after.as_deref() == Some(url) {
                 *self.labelled.borrow_mut() = true;
+            }
+            if self.missing.iter().any(|m| m == url) {
+                return Err(anyhow::Error::from(crate::github::NotFound)
+                    .context(format!("GET {url}: GitHub HTTP status 404")));
             }
             let (etag, modified, next, body) = self
                 .rest
@@ -12987,6 +13064,19 @@ mod tests {
                 "repos = [\"{repos}\"]\n[outputs]\npush_to_pull_request_branch = {{ branches = [\"dispatch/**\", \"bot/**\"] }}\n"
             )
         };
+        // A `headOwners` fork of the repository, in the owner's account.
+        const FORK: &str = "cgwalters-forge/agentic-job-midstream";
+        let contents = |head: &str| format!("{API_ROOT}repos/{head}/contents/{OWNER_BRANCHES}");
+        let refused_owner = |head: &str| {
+            format!(
+                "skip: left to the operator: its head is a branch of {head}, not the bot's fork, and apply pushes there only once {head}'s default branch has {OWNER_BRANCHES} naming it"
+            )
+        };
+        let (refused_base, refused_fork) = (refused_owner(REPO), refused_owner(FORK));
+        let unread = format!(
+            "skip: left to the operator: {REPO}'s {OWNER_BRANCHES} could not be read (unexpected GET {})",
+            contents(REPO)
+        );
         #[rustfmt::skip]
         // Name, change, marker, refused mutations, dispatch answers, line, the
         // bot's writes, and the dispatcher's.
@@ -13123,6 +13213,94 @@ mod tests {
                 vec!["mergePullRequest".into()],
                 0,
             ),
+            // agentic-job's apply pushes to a head other than the bot's fork
+            // only where that repository names itself in OWNER_BRANCHES
+            // (agent-board#598); `accepts` is that file, null for none, and
+            // `own` a branch of a `headOwners` repository, the base unless named.
+            (
+                "a change request on the repository's own branch it does not accept starts nothing",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true, "own": true, "accepts": null}),
+                none.clone(),
+                vec![],
+                vec![],
+                &refused_base,
+                vec![],
+                0,
+            ),
+            (
+                "a change request on the repository's own branch it accepts starts a fix run",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true, "own": true,
+                    "accepts": "# fixes may push here\n  CGWalters-Forge/Agentic-Job  \n"}),
+                none.clone(),
+                vec![],
+                vec![(200, json!({"workflow_run_id": 1234}))],
+                "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![comment.clone(), patch(99), patch(99)],
+                1,
+            ),
+            (
+                "a file a fork inherited, naming its parent, is not its acceptance",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true, "own": true,
+                    "accepts": "cgwalters/agentic-job\ncgwalters-forge/agentic-job-x\n"}),
+                none.clone(),
+                vec![],
+                vec![],
+                &refused_base,
+                vec![],
+                0,
+            ),
+            (
+                "a file past apply's size bound is not read as acceptance",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true, "own": true,
+                    "accepts": {"size": OWNER_BRANCHES_MAX + 1, "text": REPO}}),
+                none.clone(),
+                vec![],
+                vec![],
+                &refused_base,
+                vec![],
+                0,
+            ),
+            (
+                "a head in another's fork is read under that fork's name",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true, "own": true,
+                    "isCrossRepository": true, "headRepository": {"nameWithOwner": FORK}, "accepts": null}),
+                none.clone(),
+                vec![],
+                vec![],
+                &refused_fork,
+                vec![],
+                0,
+            ),
+            (
+                "a head whose file cannot be read starts nothing, saying why",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true, "own": true}),
+                none.clone(),
+                vec![],
+                vec![],
+                &unread,
+                vec![],
+                0,
+            ),
+            (
+                "off by default, the repository's own branch is not read for",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "own": true}),
+                none.clone(),
+                vec![],
+                vec![(200, json!({"workflow_run_id": 1234}))],
+                "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![comment.clone(), patch(99), patch(99)],
+                1,
+            ),
+            (
+                "the bot's own fork is not read for",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "ownerBranches": true}),
+                none.clone(),
+                vec![],
+                vec![(200, json!({"workflow_run_id": 1234}))],
+                "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![comment.clone(), patch(99), patch(99)],
+                1,
+            ),
             (
                 "an API without run details is asked again without them",
                 changes.clone(),
@@ -13199,6 +13377,39 @@ mod tests {
                 .and_then(|c| c.remove("pushed"))
                 .map(|head| (470, head.as_str().unwrap().to_owned()));
             let bounds = change.as_object_mut().and_then(|c| c.remove("bounds"));
+            let mut cfg = config();
+            cfg.policy.owner_branches = change
+                .as_object_mut()
+                .and_then(|c| c.remove("ownerBranches"))
+                .is_some();
+            let own = change.as_object_mut().and_then(|c| c.remove("own"));
+            if own.is_some() {
+                cfg.policy.head_owners = vec!["cgwalters-forge".into()];
+                let fields = change.as_object_mut().unwrap();
+                fields.entry("isCrossRepository").or_insert(false.into());
+                // The review job's verdict does not count off the bot's fork.
+                fields.insert(
+                    "reviews".into(),
+                    json!({"nodes": [review("CHANGES_REQUESTED", user("cgwalters"), HEAD, "")]}),
+                );
+                fields.insert(
+                    "headRepositoryOwner".into(),
+                    json!({"login": "cgwalters-forge"}),
+                );
+            }
+            let head = text(&change, "/headRepository/nameWithOwner");
+            let url = contents(if head.is_empty() { REPO } else { head });
+            match change.as_object_mut().and_then(|c| c.remove("accepts")) {
+                None => {}
+                Some(Value::Null) => fake.missing.push(url),
+                Some(file) => {
+                    let text = file["text"].as_str().or(file.as_str()).unwrap();
+                    let size = file["size"].as_u64().unwrap_or(text.len() as u64);
+                    let body = json!({"type": "file", "encoding": "base64", "size": size,
+                        "content": crate::supervise::tests::base64(text)});
+                    fake.rest.insert(url, (None, None, None, body));
+                }
+            }
             let review_run = format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}");
             for (field, value) in change
                 .as_object_mut()
@@ -13226,7 +13437,6 @@ mod tests {
                 .answers
                 .borrow_mut()
                 .insert(DISPATCHES.into(), dispatch);
-            let mut cfg = config();
             // One file, or a list of them given as --fix-bounds repeats.
             let files = match bounds {
                 Some(Value::Array(files)) => files,

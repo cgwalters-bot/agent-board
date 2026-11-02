@@ -8753,6 +8753,13 @@ fn config_table() {
     assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
     assert!(parsed.pr.no_merge.is_empty());
     assert!(!parsed.pr.check_reruns && !parsed.poll(None).policy.check_reruns);
+    for (owner_branches, want) in [(json!(false), false), (json!(true), true)] {
+        let mut settings = minimal.clone();
+        settings["pr"] = json!({"ownerBranches": owner_branches});
+        let parsed = Config::parse(&settings.to_string()).unwrap();
+        assert_eq!(parsed.poll(None).policy.owner_branches, want);
+    }
+    assert!(!parsed.poll(None).policy.owner_branches);
     for (edit, checks, reruns) in [
         (json!({}), false, false),
         (json!({"pr": {"checkReruns": false}}), false, false),

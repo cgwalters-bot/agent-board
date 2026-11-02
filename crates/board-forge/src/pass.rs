@@ -766,6 +766,9 @@ pub struct Pr {
     /// Retry failed checks without enabling agent/review recovery or stack updates.
     #[serde(default)]
     pub check_reruns: bool,
+    /// [`PollPolicy::owner_branches`].
+    #[serde(default)]
+    pub owner_branches: bool,
     pub review_workflow: Option<String>,
     /// Pools the pass starts the review job on itself ([`PollPolicy::review_pools`]);
     /// empty leaves reviews to the job's `pull_request_target` runs.
@@ -1278,6 +1281,7 @@ impl Config {
             stale_days: self.pr.stale_days,
             reruns: self.reruns,
             check_reruns: self.pr.check_reruns,
+            owner_branches: self.pr.owner_branches,
             review_pools: self.pr.review_pools.clone(),
             ..PollPolicy::default()
         };
