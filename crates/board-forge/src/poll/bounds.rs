@@ -5,8 +5,9 @@
 //! boundary; this only saves the run it would refuse. The flag repeats, one
 //! file per bounds the caller dispatches with, read as a [`FixBoundsSet`].
 //!
-//! Only the top-level `repos` and `outputs.push_to_pull_request_branch.branches`
-//! are read; every other key is agentic-job's. A glob is evaluated only in
+//! Only the top-level `repos` and `outputs.push_to_pull_request_branch.branches`,
+//! under `[github]` since agentic-job v0.6.5, are read; every other key is
+//! agentic-job's. A glob is evaluated only in
 //! the forms below, and any other is refused rather than guessed at.
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
@@ -60,8 +61,11 @@ impl FixBounds {
 
     pub fn parse(text: &str) -> Result<Self> {
         let value: toml::Value = toml::from_str(text).context("decode TOML")?;
+        // agentic-job v0.6.5 moved `outputs` under the forge's section.
         let branches = value
-            .get("outputs")
+            .get("github")
+            .and_then(|g| g.get("outputs"))
+            .or_else(|| value.get("outputs"))
             .and_then(|o| o.get("push_to_pull_request_branch"))
             .and_then(|p| p.get("branches"));
         Ok(Self {
@@ -282,6 +286,19 @@ push_to_pull_request_branch = { max = 1, branches = ["bot/**"] }
             assert!(!set(&[]).admits_repo(repo), "{repo}");
         }
         assert_eq!(set(&[]).refusal("a/b", "c"), None);
+    }
+
+    /// `[outputs]` and agentic-job v0.6.5's `[github.outputs]` read the same.
+    #[test]
+    fn outputs_at_the_top_or_under_github() {
+        let body = "[{}.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]\n";
+        let [old, new] = ["outputs", "github.outputs"].map(|table| {
+            let text = format!("repos = [\"o/r\"]\n{}", body.replace("{}", table));
+            FixBounds::parse(&text).unwrap()
+        });
+        assert_eq!(old, new);
+        assert!(new.admits_pull("o/r", "dispatch/x"));
+        assert!(!new.admits_pull("o/r", "main"));
     }
 
     #[test]
