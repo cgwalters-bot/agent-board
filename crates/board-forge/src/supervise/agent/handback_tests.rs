@@ -317,7 +317,7 @@ fn caps_drop_only_excess_requests_after_a_successful_preflight() {
             .unwrap();
             assert_eq!(usage["dispatch"], 2);
             assert_eq!(usage["file_bug"], 0);
-            let task = compose(&[], &p, "daily", &usage).unwrap();
+            let task = compose(&[], &p, "daily", Some(&usage)).unwrap();
             assert!(task.contains("\"dailyUsed\": {"));
             let outcome = execute(&fake, &p, &context);
             if bad_preflight {

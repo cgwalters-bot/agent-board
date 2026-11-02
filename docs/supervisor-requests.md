@@ -54,7 +54,10 @@ After preflight, only requests past an action's daily cap (including
 and ledger; the rest go ahead. The policy's `dailyUsed` reports rolling-day
 usage beside `dailyCaps`. Pass the previous executor ledger to `supervise
 trigger --ledger FILE` for ledger-based usage; without it usage comes from
-the log. This display is advisory: execute still validates and recounts.
+the log. This display is advisory: if trigger cannot read or decode the usage
+or its supplied ledger, it warns on stderr and shows `dailyUsed: null`
+(unavailable), without stopping the agent. Execute still validates and recounts;
+unreadable accounting refuses writes, and exhausted caps still drop requests.
 The day's count comes from the
 executor's own entries in the log issue, each written before the dispatches it
 names, or with `--requests` from the executor's ledger. That count holds only if

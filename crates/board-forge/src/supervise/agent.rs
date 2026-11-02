@@ -225,11 +225,12 @@ pub fn recent_agent(
 }
 
 /// The agent's task: the playbook, the policy it is held to and the report.
+/// Missing advisory usage is shown as null, never as zero usage.
 pub fn compose(
     checks: &[Value],
     policy: &Policy,
     reason: &str,
-    daily_used: &BTreeMap<String, usize>,
+    daily_used: Option<&BTreeMap<String, usize>>,
 ) -> Result<String> {
     let shown = json!({
         "operator": policy.settings.operator,
