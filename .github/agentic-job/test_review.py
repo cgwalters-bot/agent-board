@@ -19,7 +19,7 @@ class ReviewContracts(unittest.TestCase):
             caller,
             r"uses: cgwalters-forge/actions/\.github/workflows/cgwalters-review\.yml@[0-9a-f]{40} # ",
         )
-        self.assertIn("@d8e22f71b2abbe5f41306a0c7ef1b6c3d2829cac # agentic-job v0.6.2", caller)
+        self.assertIn("@3bd115f01cc20d8255bc996bbe582b24542914c1 # agentic-job v0.6.5", caller)
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
         self.assertIn("github.event.issue.pull_request && startsWith", caller)
@@ -76,12 +76,15 @@ class ReviewContracts(unittest.TestCase):
                 self.assertEqual(bounds["repos"], ["cgwalters-forge/agent-board"])
                 self.assertEqual(bounds["bases"], ["main"])
                 self.assertEqual(bounds["max_outputs"], 1)
-                self.assertEqual(bounds["outputs"], {"add_comment": {"max": 1}, "noop": {"max": 1}})
-                self.assertEqual(bounds["trigger"]["events"], events)
-                self.assertEqual(bounds["trigger"]["roles"], roles)
-                self.assertEqual(bounds["trigger"]["bots"], bots)
-                self.assertTrue(bounds["trigger"]["forks"])
-                self.assertEqual(bounds["trigger"].get("commands"), ["/review"] if name == "review-command" else None)
+                self.assertNotIn("outputs", bounds)
+                self.assertNotIn("trigger", bounds)
+                github = bounds["github"]
+                self.assertEqual(github["outputs"], {"add_comment": {"max": 1}, "noop": {"max": 1}})
+                self.assertEqual(github["trigger"]["events"], events)
+                self.assertEqual(github["trigger"]["roles"], roles)
+                self.assertEqual(github["trigger"]["bots"], bots)
+                self.assertTrue(github["trigger"]["forks"])
+                self.assertEqual(github["trigger"].get("commands"), ["/review"] if name == "review-command" else None)
 
     def test_host_config_and_task(self):
         config = tomllib.loads((ROOT / ".github/agentic-job/hosted.toml").read_text())
