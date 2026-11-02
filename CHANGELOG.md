@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Disposable Forgejo live coverage for opt-in Status labels and private
+  append-only usage/hold snapshots, with preview, write/status caps, human
+  holds, unchanged readings and public-publication refusal checked against
+  the pinned service. No caller is activated (docs/forges.md#live-ci).
+
 - The Forgejo weekly sweep no longer stops at four pages of the bot's issues:
   it reads every page within half of the pass's requests left. An unusable
   issue or epic record (an edited comment, a pull request, a malformed
