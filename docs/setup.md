@@ -278,7 +278,14 @@ by hand.
 > - [`poll.yml`][poll], every ten minutes: `agent-board pass --config .github/pass.json`
 >   ([pass](pass.md)) with `--max-dispatch`, `--max-writes` and
 >   `--max-status-changes` caps; a scheduled pass adds `--apply` only once a
->   repository variable enables it.
+>   repository variable enables it. After an applying pass its `next` job
+>   starts the next one ten minutes after this one's start, and wakes the
+>   supervisor when it has slept 30 minutes, in shell at that revision;
+>   [`agent-board pass next`](pass.md#the-next-pass) is that job as one
+>   invocation, such as `agent-board pass next --workflow poll.yml --branch main
+>   --input apply=true --apply-title 'pass (apply)' --wait-minutes 10
+>   --supervisor-workflow supervisor.yml --supervisor-stale-minutes 30
+>   --supervisor-input prompt= --supervisor-input session=false`.
 > - [`release-train.yml`][release-train], hourly: `agent-board release-train --config .github/release-train/config.json`
 >   ([release train](release-train.md)), off until a repository variable
 >   enables it.
