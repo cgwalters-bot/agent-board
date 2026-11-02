@@ -408,6 +408,104 @@ fn newest_said<'c>(comments: &'c [Comment], bot: &str, marker: &str) -> Option<&
         .max_by_key(|c| c.changed)
 }
 
+/// The newest dispatch request, shared by the pass and its health reader.
+fn newest_request<'c>(comments: &'c [Comment], writers: &[&str]) -> Option<&'c Comment> {
+    let marker = format!("<!-- {DISPATCH_MARKER}: ");
+    comments
+        .iter()
+        .filter(|c| is(c.author.as_deref(), writers) && c.body.starts_with(&marker))
+        .max_by_key(|c| c.changed)
+}
+
+/// Health facts from the same records stage 3 reads, and unanswered planning
+/// runs, newest first. No board or sub-issue census is needed.
+pub(crate) fn health(comments: &[Comment], operator: &str, bot: &str) -> Result<(Value, Vec<u64>)> {
+    let writers = [operator, bot];
+    let (mut receipts, unread) = epic_apply::receipts(comments, &writers);
+    ensure!(unread.is_empty(), "unreadable epic apply receipts");
+    // As in decide/apply, only the oldest claim of each plan counts.
+    receipts.sort_by_key(|r| r.id);
+    let mut claimed = BTreeSet::new();
+    receipts.retain(|r| claimed.insert(r.detail.plan.clone()));
+    receipts.sort_by_key(|r| r.changed);
+    let plan = if no_fenced(comments, &writers, EPIC_PLAN_FENCE) {
+        None
+    } else {
+        let from = newest_fenced(comments, &writers, EPIC_PLAN_FENCE)?;
+        fenced_json(&from.body, EPIC_PLAN_FENCE)?.context("epic plan fence vanished")?;
+        Some(from)
+    };
+    let done = newest_said(comments, bot, &format!("<!-- {DONE_MARKER}: "));
+    let planning = planning_comment(comments, bot);
+    let request = newest_request(comments, &writers);
+    let latest = plan
+        .into_iter()
+        .chain(planning)
+        .chain(done)
+        .map(|c| c.changed)
+        .chain(receipts.iter().map(|r| r.changed))
+        .max();
+    let mut item = json!({"missing": latest.is_none() && request.is_none()});
+    let answered = plan.into_iter().chain(done).map(|c| c.changed).max();
+    if let Some(q) = request
+        && answered.is_none_or(|at| q.changed > at)
+    {
+        item["pending"] = json!({"at": stamp(q.changed)});
+        let marker = format!("<!-- {DISPATCH_MARKER}: ");
+        let mut requests: Vec<_> = comments
+            .iter()
+            .filter(|c| {
+                is(c.author.as_deref(), &writers)
+                    && c.body.starts_with(&marker)
+                    && answered.is_none_or(|at| c.changed > at)
+            })
+            .collect();
+        requests.sort_by_key(|c| std::cmp::Reverse(c.changed));
+        // A request whose run was not confirmed breaks the known streak.
+        let runs = requests.iter().map_while(|c| record_run(&c.body)).collect();
+        return Ok((item, runs));
+    }
+    if let Some(from) = plan {
+        let id = plan_id(from)?;
+        let claim = receipts
+            .iter()
+            .filter(|r| r.detail.plan == id)
+            .min_by_key(|r| r.id);
+        if done.is_none_or(|c| c.changed < from.changed) {
+            match claim {
+                Some(r) if r.detail.outcome.applied() => {}
+                Some(r) => item["pending"] = json!({"at": stamp(r.changed)}),
+                None => item["pending"] = json!({"at": stamp(from.changed)}),
+            }
+        }
+    }
+    if let Some(c) = planning
+        && latest == Some(c.changed)
+        && request.is_none_or(|q| q.changed < c.changed)
+    {
+        item["pending"] = json!({"at": stamp(c.changed)});
+    }
+    // Successful applies end a failure streak. Repeated empty applies are
+    // a loop, but a single no-op is normal and waits for sub-issue changes.
+    if done.is_none_or(|c| latest.is_some_and(|at| c.changed < at)) {
+        item["failures"] = json!(
+            receipts
+                .iter()
+                .rev()
+                .take_while(|r| r.detail.outcome == Outcome::Stopped)
+                .count()
+        );
+        item["loops"] = json!(
+            receipts
+                .iter()
+                .rev()
+                .take_while(|r| r.detail.outcome.applied() && r.detail.actions.is_empty())
+                .count()
+        );
+    }
+    Ok((item, vec![]))
+}
+
 /// When the operator last spoke on the epic: their newest comment that is
 /// neither a record, a receipt nor a plan, and not edited by anyone else.
 /// Never the bot's: where the operator is the bot, the planner's own report
@@ -615,13 +713,7 @@ pub(super) fn decide(i: &Inputs) -> Next {
         );
         return Next::Hold(Hold::new(HoldKind::NeedsOperator, why));
     }
-    let marker = format!("<!-- {DISPATCH_MARKER}: ");
-    let record = |c: &Comment| is(c.author.as_deref(), &writers) && c.body.starts_with(&marker);
-    let request = i
-        .comments
-        .iter()
-        .filter(|c| record(c))
-        .max_by_key(|c| c.changed);
+    let request = newest_request(i.comments, &writers);
     let direction = spoke(i, &receipts);
     let since = |at: OffsetDateTime| direction.is_some_and(|d| d > at);
     // Direction that may plan an epic whose plan cannot be applied or

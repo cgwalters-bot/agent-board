@@ -578,19 +578,6 @@ fn log_and_record_parsers() {
     );
     assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello");
     assert!(base64_decode("a*b").is_err());
-    let comments = vec![
-        json!({"author": {"login": "worker"}, "body": "<!-- coordinator/v1: {\"failures\":1} -->\nCheckpoint"}),
-        json!({"author": {"login": "worker"}, "editor": {"login": "someone"}, "lastEditedAt": "x",
-            "body": "<!-- coordinator/v1: {\"failures\":0} -->\nForged by an edit"}),
-    ];
-    assert_eq!(
-        checkpoint(&comments, "worker").unwrap(),
-        Some(json!({"failures": 1}))
-    );
-    assert_eq!(checkpoint(&comments[1..], "worker").unwrap(), None);
-    let invalid =
-        vec![json!({"author": {"login": "worker"}, "body": "<!-- coordinator/v1: nope -->\n"})];
-    assert!(checkpoint(&invalid, "worker").is_err());
     let usage = "<!-- bot-usage v1 -->\n```json\n{\"schema\":\"bot-usage/v1\",\"pools\":{}}\n```\n";
     assert_eq!(usage_snapshot(usage).unwrap()["schema"], USAGE_SCHEMA);
     assert!(usage_snapshot(&usage.replace("bot-usage/v1\"", "other\"")).is_none());
@@ -642,6 +629,207 @@ fn project_settings() -> Settings {
     let mut s = settings();
     s.follow = vec!["example/project".into()];
     s
+}
+
+#[test]
+fn epic_records_table() {
+    let (_, now) = recorded();
+    let s = settings();
+    let old = "2026-01-01T00:00:00Z";
+    let fresh = iso(now);
+    let comment = |id: u64, body: String, at: &str| {
+        json!({
+            "url": format!("https://github.com/{}/issues/1#issuecomment-{id}", s.epics_repository),
+            "body": body, "author": {"login": s.bot}, "createdAt": at,
+        })
+    };
+    let plan = comment(1, "```agent-board-epic-plan\n{}\n```".into(), old);
+    let receipt = |id, outcome: &str, actions: Value| {
+        comment(
+            id,
+            format!(
+                "```agent-board-epic-apply\n{}\n```",
+                json!({"schema": crate::epic_apply::RECEIPT_SCHEMA, "plan": format!("{}@{old}", id - 1), "outcome": outcome, "actions": actions})
+            ),
+            old,
+        )
+    };
+    let applied = receipt(2, "applied", json!([{"action":1,"type":"satisfied"}]));
+    let empty = receipt(2, "applied", json!([]));
+    let stopped = receipt(2, "stopped", json!([]));
+    let done = comment(
+        9,
+        "<!-- agent-board-epic-done: hash -->\nDone".into(),
+        &fresh,
+    );
+    let request = |id| {
+        comment(
+            id,
+            format!(
+                "<!-- agent-board-dispatch: 8@{old} -->\nhttps://github.com/{}/actions/runs/{id}",
+                s.dispatch_repo
+            ),
+            &fresh,
+        )
+    };
+    let mut foreign = plan.clone();
+    foreign["author"]["login"] = json!("outsider");
+    let mut edited = plan.clone();
+    edited["lastEditedAt"] = json!(fresh);
+    edited["editor"] = json!({"login":"outsider"});
+    let mut stale_request = request(2);
+    stale_request["createdAt"] = json!(old);
+    let mut duplicate = empty.clone();
+    duplicate["url"] = comment(3, String::new(), old)["url"].clone();
+    let mut duplicate2 = duplicate.clone();
+    duplicate2["url"] = comment(4, String::new(), old)["url"].clone();
+    for (name, comments, conclusion, expected) in [
+        ("missing", vec![], "success", "warn"),
+        (
+            "legacy ignored",
+            vec![comment(1, "<!-- coordinator/v1: {} -->\nOld".into(), old)],
+            "success",
+            "warn",
+        ),
+        ("pending plan", vec![plan.clone()], "success", "fail"),
+        (
+            "fresh plan",
+            vec![comment(1, plan["body"].as_str().unwrap().into(), &fresh)],
+            "success",
+            "ok",
+        ),
+        (
+            "old applied",
+            vec![plan.clone(), applied.clone()],
+            "success",
+            "ok",
+        ),
+        (
+            "recovered",
+            vec![
+                plan.clone(),
+                receipt(2, "recovered", json!([{"action":1,"type":"satisfied"}])),
+            ],
+            "success",
+            "ok",
+        ),
+        (
+            "unfinished apply",
+            vec![plan.clone(), receipt(2, "claimed", json!([]))],
+            "success",
+            "fail",
+        ),
+        (
+            "one no-op",
+            vec![plan.clone(), empty.clone()],
+            "success",
+            "ok",
+        ),
+        (
+            "duplicate claims",
+            vec![plan.clone(), empty.clone(), duplicate, duplicate2],
+            "success",
+            "ok",
+        ),
+        (
+            "loop",
+            vec![
+                plan.clone(),
+                empty.clone(),
+                receipt(3, "applied", json!([])),
+                receipt(4, "applied", json!([])),
+            ],
+            "success",
+            "fail",
+        ),
+        (
+            "failed applies",
+            vec![
+                plan.clone(),
+                stopped.clone(),
+                receipt(3, "stopped", json!([])),
+                receipt(4, "stopped", json!([])),
+            ],
+            "success",
+            "fail",
+        ),
+        ("done", vec![plan.clone(), stopped, done], "success", "ok"),
+        ("stale unanswered", vec![stale_request], "success", "fail"),
+        ("fresh unanswered", vec![request(2)], "success", "ok"),
+        ("one failed run", vec![request(2)], "failure", "ok"),
+        (
+            "successful runs",
+            vec![request(2), request(3), request(4)],
+            "success",
+            "ok",
+        ),
+        (
+            "failed runs",
+            vec![request(2), request(3), request(4)],
+            "failure",
+            "fail",
+        ),
+        ("foreign plan", vec![foreign], "success", "warn"),
+        (
+            "foreign edit",
+            vec![plan.clone(), edited],
+            "success",
+            "unavailable",
+        ),
+        (
+            "malformed plan",
+            vec![
+                plan.clone(),
+                comment(5, "```agent-board-epic-plan\nnope\n```".into(), &fresh),
+            ],
+            "success",
+            "unavailable",
+        ),
+        (
+            "malformed receipt",
+            vec![
+                plan,
+                comment(2, "```agent-board-epic-apply\n{}\n```".into(), old),
+            ],
+            "success",
+            "unavailable",
+        ),
+    ] {
+        let fake = Fake::new(|kind, path, _| {
+            if kind == "GRAPHQL" {
+                return Ok(
+                    json!({"repository":{"issue":{"comments":{"nodes":comments,"pageInfo":{"hasNextPage":false}}}}}),
+                );
+            }
+            if path.contains("/timeline?") {
+                return Ok(
+                    json!([{"event":"labeled", "label":{"name":"epic"}, "actor":{"login":s.operator}}]),
+                );
+            }
+            if path.contains("/actions/runs/") {
+                return Ok(
+                    json!({"status":"completed", "conclusion":conclusion, "html_url":"https://github.com/example/control/actions/runs/2"}),
+                );
+            }
+            assert!(path.contains("state=open&labels=epic"), "{path}");
+            Ok(json!([{"number":1}]))
+        });
+        let c = Collector {
+            api: &fake,
+            s: &s,
+            branch: "main".into(),
+            now,
+            root: format!("/repos/{}", s.dispatch_repo),
+            cache: RefCell::new(HashMap::new()),
+        };
+        let result = c.epics();
+        if expected == "unavailable" {
+            assert!(result.is_err(), "{name}");
+            continue;
+        }
+        let items = result.unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        assert_eq!(status("epics", json!(items), now), expected, "{name}");
+    }
 }
 
 fn wrapper(release: &str, tag: &str) -> Value {
