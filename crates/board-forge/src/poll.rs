@@ -558,6 +558,9 @@ pub struct PollPolicy {
     /// of a round's failed run or the review job's run with no review, run
     /// once more before a person is asked. Off by default.
     pub reruns: bool,
+    /// The pass's `pr.checkReruns`: only the pre-fix check retry and its
+    /// recovery wait. Off by default; legacy `reruns` also enables this path.
+    pub check_reruns: bool,
     /// The pass's `pr.reviewPools`: the pass starts the review job for a
     /// head that has no run of it, paced on these pools, and the runs it
     /// started count as the job's ([`reviews_head`]). Empty (the default)
@@ -871,6 +874,7 @@ impl PollPolicy {
             no_merge: Vec::new(),
             stale_days: 0,
             reruns: false,
+            check_reruns: false,
             review_pools: Vec::new(),
             review_wip: None,
             review_ranks: BTreeMap::new(),
@@ -6211,7 +6215,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         // Retry CI before charging a fix round or stopping, but never replace
         // a stack operation, an operator answer, or an in-flight round.
-        let retry_scope = self.config.policy.reruns
+        let retry_scope = (self.config.policy.reruns || self.config.policy.check_reruns)
             && !merge_only
             && !stack_step
             && !queue_stop
@@ -8682,6 +8686,8 @@ mod tests {
                 cfg.policy = PollPolicy::from_json(&policy).unwrap();
             }
             cfg.policy.reruns = fields.remove("reruns").is_some();
+            // Check-only must not affect any agent recovery or stack decision.
+            cfg.policy.check_reruns = true;
             if let Some(owners) = fields.remove("headOwners") {
                 cfg.policy.head_owners = serde_json::from_value(owners).unwrap();
             }
@@ -11839,6 +11845,7 @@ mod tests {
             );
             let mut cfg = config();
             cfg.policy.reruns = reruns;
+            cfg.policy.check_reruns = true;
             let dispatcher = Fake::default();
             let follow = [REPO.to_owned()];
             let outcome = run_capped(
@@ -11890,11 +11897,15 @@ mod tests {
     #[test]
     fn failed_checks_are_re_run_once_per_head_before_fixing_or_stopping() {
         let follow = [REPO.to_owned()];
-        for rounds in [0, MAX_FIX_ROUNDS] {
+        for (legacy, rounds) in [false, true]
+            .into_iter()
+            .flat_map(|legacy| [0, MAX_FIX_ROUNDS].map(|rounds| (legacy, rounds)))
+        {
             let mut fake = failed_check_github();
             let dispatcher = Fake::default();
             let mut cfg = config();
-            cfg.policy.reruns = true;
+            cfg.policy.reruns = legacy;
+            cfg.policy.check_reruns = !legacy;
             let comments = format!("repos/{REPO}/issues/470/comments?per_page=100");
             fake.page(
                 &comments,
@@ -12175,7 +12186,7 @@ mod tests {
 
     #[test]
     fn check_rerun_receipts_follow_the_check_across_runs_not_the_whole_head() {
-        for (name, workflow, event, check, expected) in [
+        for (legacy, (name, workflow, event, check, expected)) in [
             (
                 "fresh run of the same check",
                 42,
@@ -12199,7 +12210,10 @@ mod tests {
                 true,
             ),
             ("same name on another event", 42, "push", "ci", true),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|legacy| (legacy, case)))
+        {
             let mut fake = failed_check_github();
             let receipt = json!({
                 "rounds": 0, "checks_rerun": HEAD, "checks_runs": [76],
@@ -12231,7 +12245,8 @@ mod tests {
             fake.pulls.get_mut(&470).unwrap()["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
                 ["contexts"]["nodes"][0]["name"] = check.into();
             let mut cfg = config();
-            cfg.policy.reruns = true;
+            cfg.policy.reruns = legacy;
+            cfg.policy.check_reruns = !legacy;
             let dispatcher = Fake::default();
             let outcome = run(
                 &fake,
@@ -12419,7 +12434,7 @@ mod tests {
 
     #[test]
     fn check_reruns_respect_scope_attempts_and_authenticated_head_receipts() {
-        for (name, enabled, change, author, receipt, expected) in [
+        for (legacy, (name, enabled, change, author, receipt, expected)) in [
             ("off", false, json!({}), BOT, "older", false),
             ("eligible", true, json!({}), BOT, "older", true),
             (
@@ -12495,7 +12510,10 @@ mod tests {
                 HEAD,
                 true,
             ),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|case| [false, true].map(|legacy| (legacy, case.clone())))
+        {
             let mut fake = failed_check_github();
             let url = format!("{API_ROOT}repos/{REPO}/actions/runs/77");
             for (key, value) in change.as_object().unwrap() {
@@ -12506,7 +12524,8 @@ mod tests {
                 {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 0}), "Reset.")}
             ]));
             let mut cfg = config();
-            cfg.policy.reruns = enabled;
+            cfg.policy.reruns = enabled && legacy;
+            cfg.policy.check_reruns = enabled && !legacy;
             let outcome = run(
                 &fake,
                 &fake,
@@ -12638,6 +12657,7 @@ mod tests {
             );
             let mut cfg = config();
             cfg.policy.reruns = reruns;
+            cfg.policy.check_reruns = true;
             let dispatcher = Fake::default();
             let follow = [REPO.to_owned()];
             let outcome = run_capped(

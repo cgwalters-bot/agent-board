@@ -103,9 +103,13 @@ required one does. It has been exercised against recorded responses only.
 
 A transient CI or infrastructure failure can spend both paid fix rounds on
 work the agent cannot repair, then leave the PR at `needs-human`. The pass's
-[`reruns: true`](pass.md#reruns) (off by default; not a standalone poll option)
+[`pr.checkReruns: true`](pass.md#reruns) (off by default; not a standalone poll option)
 offers the failed Actions checks one rerun before a fix round or stop. This
 extends the existing rerun path, not a new workflow dispatch or failure classifier.
+It enables only check retries and their recovery wait, not failed agent or
+review-run recovery or stacked-retarget branch updates. Omission and `false`
+leave it off. Legacy `reruns: true` still enables this path and all its other
+effects, even with `pr.checkReruns: false`.
 Only completed `failure` runs on attempt 1, created within the last day, in
 the PR's repository and for its current head qualify. Status contexts and
 runs without a workflow ID or event do not qualify. The existing check

@@ -25,6 +25,7 @@
   "overlap": {},
   "reruns": true,
   "pr": {
+    "checkReruns": false,
     "fixPools": ["claude", "openai"],
     "reviewWorkflow": "review.yml",
     "reviewPools": ["claude"],
