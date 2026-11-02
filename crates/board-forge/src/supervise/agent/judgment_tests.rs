@@ -14,7 +14,7 @@ fn configured_with(generated_by: Option<&str>) -> Settings {
     let mut cfg = supervisor();
     cfg["agent"]["dailyCaps"] = json!({"comment": 2, "create_issue": 1, "close": 1,
         "remove_needs_human": 1, "replace_state": 1, "status_update": 1, "file_bug": 1,
-        "clear_needs_human": 1});
+        "clear_needs_human": 1, "plan_epic": 1});
     cfg["agent"]["tracker"] = json!("example/control");
     cfg["agent"]["state"] = json!({"repository": "example/control", "issue": 8});
     cfg["agent"]["project"] = json!("PVT_project");
@@ -71,10 +71,26 @@ fn actions_signed(footer: &Footer) -> Vec<Value> {
             "clear_needs_human",
             json!({"repository": "example/project", "item": 6, "evidence": "operator_comment", "comment": 31}),
         ),
+        action(
+            "plan_epic",
+            json!({"epic": 10, "reason": "no-runnable-work"}),
+        ),
     ]
 }
 
 fn evidence(fake: &mut Fake) {
+    fake.objects.insert(
+        "/repos/example/control/issues/10".into(),
+        json!({"state": "open", "labels": [{"name": "epic"}]}),
+    );
+    fake.objects.insert(
+        "/repos/example/control/issues/10/timeline?per_page=100&page=1".into(),
+        json!([{"event": "labeled", "label": {"name": "epic"}, "actor": {"login": "owner"}}]),
+    );
+    fake.objects.insert(
+        "/repos/example/control/issues/10/comments?per_page=100&page=1".into(),
+        json!([]),
+    );
     fake.objects.insert(
         "/repos/example/control/issues/8".into(),
         json!({"state": "open", "labels": []}),
@@ -198,6 +214,10 @@ fn signs_with(generated_by: Option<&str>) {
         assert!(out.lines[0].contains(": done"));
         let (method, path, body) = &writes[1];
         match r["action"].as_str().unwrap() {
+            "plan_epic" => {
+                assert_eq!(path, "/repos/example/control/issues/10/comments");
+                assert_eq!(body, &json!({"body": crate::plan::plan_epic_marker()}));
+            }
             "comment" => {
                 assert_eq!(path, "/repos/example/project/issues/3/comments");
                 // The visible note, then the attribution, last.
@@ -287,6 +307,112 @@ fn signs_with(generated_by: Option<&str>) {
             _ => unreachable!(),
         }
     }
+}
+
+#[test]
+fn plan_epic_refuses_nonlive_held_busy_and_recent_epics() {
+    let s = configured();
+    let req = action(
+        "plan_epic",
+        json!({"epic": 10, "reason": "no-runnable-work"}),
+    );
+    let issue = "/repos/example/control/issues/10";
+    let timeline = format!("{issue}/timeline?per_page=100&page=1");
+    let comments = format!("{issue}/comments?per_page=100&page=1");
+    let mark = |who, when| {
+        json!([{"user": {"login": who}, "created_at": when,
+        "body": crate::plan::plan_epic_marker()}])
+    };
+    for (name, path, value, accepted) in [
+        (
+            "closed",
+            issue.to_owned(),
+            json!({"state": "closed", "labels": [{"name": "epic"}]}),
+            false,
+        ),
+        (
+            "pull request",
+            issue.to_owned(),
+            json!({"state": "open", "pull_request": {}, "labels": [{"name": "epic"}]}),
+            false,
+        ),
+        (
+            "not epic",
+            issue.to_owned(),
+            json!({"state": "open", "labels": []}),
+            false,
+        ),
+        (
+            "needs human",
+            issue.to_owned(),
+            json!({"state": "open", "labels": [{"name": "epic"}, {"name": "Needs-Human"}]}),
+            false,
+        ),
+        (
+            "needs design",
+            issue.to_owned(),
+            json!({"state": "open", "labels": [{"name": "epic"}, {"name": "needs-design"}]}),
+            false,
+        ),
+        ("no provenance", timeline.clone(), json!([]), false),
+        (
+            "not operator",
+            timeline.clone(),
+            json!([{"event": "labeled", "label": {"name": "epic"}, "actor": {"login": "visitor"}}]),
+            false,
+        ),
+        (
+            "removed",
+            timeline,
+            json!([{"event": "unlabeled", "label": {"name": "epic"}, "actor": {"login": "owner"}}]),
+            false,
+        ),
+        (
+            "planning in flight",
+            "runs".into(),
+            json!({"workflow_runs": [{"display_title": "triage example/control#10 (small)"}]}),
+            false,
+        ),
+        (
+            "recent",
+            comments.clone(),
+            mark("worker", "2026-10-15T12:00:01Z"),
+            false,
+        ),
+        (
+            "future",
+            comments.clone(),
+            mark("worker", "2026-10-17T12:00:00Z"),
+            false,
+        ),
+        (
+            "one day",
+            comments.clone(),
+            mark("worker", "2026-10-15T12:00:00Z"),
+            true,
+        ),
+        ("forged", comments, mark("visitor", NOW), true),
+    ] {
+        let mut fake = Fake::new(&block(std::slice::from_ref(&req)));
+        evidence(&mut fake);
+        fake.objects.insert(path, value);
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert_eq!(out.ok, accepted, "{name}: {out:?}");
+        if !accepted {
+            assert!(fake.writes().is_empty(), "{name}");
+        }
+    }
+    let p = policy(&s);
+    for fields in [
+        json!({"epic": 10, "reason": "do this"}),
+        json!({"epic": 10, "reason": "no-runnable-work", "body": "new work"}),
+        json!({"epic": 10, "reason": "no-runnable-work", "repository": "elsewhere/repo"}),
+        json!({"epic": 0, "reason": "no-runnable-work"}),
+        json!({"epic": 9_007_199_254_740_992u64, "reason": "no-runnable-work"}),
+    ] {
+        assert!(judgment::parse_batch(&lines(&[action("plan_epic", fields)]), &p).is_err());
+    }
+    assert!(judgment::parse_batch(&lines(&[req.clone(), req]), &p).is_err());
 }
 
 fn refuses(s: &Settings, r: Value, change: impl FnOnce(&mut Fake)) {

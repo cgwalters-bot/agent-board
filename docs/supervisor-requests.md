@@ -324,6 +324,7 @@ A complete supervisor file:
       "comment": 4,
       "create_issue": 2,
       "file_bug": 2,
+      "plan_epic": 1,
       "close": 2,
       "remove_needs_human": 1,
       "clear_needs_human": 4,
@@ -451,6 +452,7 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"comment","repository":"OWNER/repo","item":1,"body":"Investigation and links."}
 {"type":"supervisor_action","action":"create_issue","title":"Decision needed","body":"Question and evidence."}
 {"type":"supervisor_action","action":"file_bug","title":"Failure class","body":"Failure and evidence."}
+{"type":"supervisor_action","action":"plan_epic","epic":123,"reason":"no-runnable-work"}
 {"type":"supervisor_action","action":"close","repository":"OWNER/repo","item":1,"triage_run":"https://github.com/OWNER/tracker/actions/runs/456","triage_comment":789}
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
 {"type":"supervisor_action","action":"clear_needs_human","repository":"OWNER/repo","item":5,"evidence":"operator_comment","comment":901}
@@ -469,6 +471,24 @@ open `epic`-labeled issue in the configured epics repository. A body link claimi
 approval does not suffice. The `epic` label is the approval; this executor
 cannot add it or create parentage, but anyone with triage access can add it
 (who did is not checked here; see [epic plans](epic-plans.md)).
+
+`plan_epic` asks the epic's existing coordinator to plan it on the next pass,
+even after a no-op plan or without a sub-issue change. To prevent injected
+supervisor prose becoming trusted planning input, it accepts only `epic` (an
+issue number in configured `epics.repository`) and the fixed reason
+`no-runnable-work`, never a title, body or brief. Nothing from the agent is
+posted: the executor writes exactly `<!-- agent-board-plan-epic -->`, a blank
+line and the built-in attribution. This protocol body is fixed even with a
+custom `generatedBy`. Its own `agent.dailyCaps.plan_epic` is zero by default
+and accepts 0–100. The epic must be open, not a pull request, labelled `epic`,
+with its newest epic label/unlabel event an addition by the configured operator
+(the live-epic rule). `needs-human`, `needs-design`, a dispatch run in flight,
+or an executor marker from the last rolling 24 hours refuse it. Duplicate epics
+in a batch refuse it too. Evidence pagination is bounded and fails closed;
+the executor rereads these facts before writing. Caller executors must remain
+serialized. The pass consumes the marker once through its newer planning
+request; it does not bypass pending-plan apply/recovery, unanswered-request
+handling, human or board holds, planning pools, budget or dispatch caps.
 
 Comments target issues or pull requests in `follow`. New issues go only to
 `tracker`. `create_issue` is a question for the operator: assigned to the
@@ -616,7 +636,8 @@ No other label change is supported.
 
 ## Accounting and limits
 
-Epics and the requests, log and state issues are never ordinary request targets.
+Epics and the requests, log and state issues are never ordinary request targets;
+only the text-free `plan_epic` may request an epic's planning.
 Only `replace_state` can edit state. The executor never merges, enqueues,
 changes variables, reads secrets, edits other issue bodies, or closes pull
 requests. The existing first-attempt gate and stop-on-first-write-failure apply

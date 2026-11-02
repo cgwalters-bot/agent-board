@@ -738,6 +738,19 @@ pub(super) fn decide(i: &Inputs) -> Next {
     if since(at.max(last)) {
         return Next::Plan("operator direction since it was last planned".into());
     }
+    let marker = plan::plan_epic_marker();
+    if i.comments.iter().any(|c| {
+        bots(c, i.bot)
+            && !c.edited
+            && c.body == marker
+            && c.changed > request.map_or(last, |q| q.changed)
+            && c.changed <= i.now
+    }) {
+        // The next planning request consumes this marker by being newer.
+        // Exact-body matching excludes copies in agent notes and reports.
+        return finished(i, "the supervisor requested an early plan", direction)
+            .unwrap_or_else(|| Next::Plan("early, at the supervisor executor's request".into()));
+    }
     // A record from before the direction was set carries no hash: setting it
     // plans no epic, changing it plans each once.
     let recorded = request.and_then(|q| plan::recorded_direction(&q.body));

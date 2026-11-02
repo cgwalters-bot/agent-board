@@ -576,10 +576,24 @@ pool=P: its sub-issues changed (…); early, with N slot(s) free and nothing
 started`, and its hold is taken back. Still one epic a pass: the rest keep
 their wait, and an epic a person holds (`needs-human`, `needs-design`,
 board Blocked) or with a planning run or request in flight is never one.
-Where stage 4 starts anything, the wait stands. Not noticed
+Where stage 4 starts anything, the wait stands.
+
+The opt-in supervisor [`plan_epic`](supervisor-requests.md#lines) action is an
+explicit exception: its executor's exact fixed marker comment, authored by the
+configured bot and unedited, newer than the epic's last planning request,
+requests an **early** plan on the next pass. It works even after a plan had
+nothing to do, or when no sub-issues changed. The next planning request is newer
+than the marker, consuming it once; previews or capped starts do not consume it.
+Other authors, edited comments, and copies inside an agent's supervisor note or
+report do not count. Pending plan apply/recovery and unanswered-request handling
+still take precedence, and all existing live-epic, human/board hold, in-flight,
+pool, budget and per-pass bounds remain. The supervisor action has its own
+off-by-default daily cap and cannot bring one epic forward twice in 24 hours.
+
+Not noticed
 (agent-board#429): edits of the epic's or a sub-issue's text, label and
 Priority churn, and a comment by anyone but the operator, whose word alone
-decides an epic's plan. The bot's comments never count, even where the
+decides an epic's plan. Other bot comments never count, even where the
 operator and the bot are one login: the planner's report and the run's status
 comment would otherwise read as direction after every run. Such an operator
 moves an epic by replacing its plan, or once its last request is answered by
