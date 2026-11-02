@@ -734,6 +734,25 @@ fn the_daily_cap_is_counted_from_the_executors_own_log() {
         .insert("log".into(), json!(vec![json!({}); 100]));
     assert!(run(&fake, &s, RESULT_URL, 1).lines[0].contains("too long"));
     assert_eq!(fake.writes(), []);
+
+    // An unavailable advisory count must not weaken executor accounting.
+    let mut fake = Fake::new(&block(&[request(json!({}))]));
+    fake.objects.insert("log".into(), Value::Null);
+    assert!(daily_usage(&fake, &policy(&s), millis(&json!(NOW)).unwrap(), None).is_err());
+    let outcome = run(&fake, &s, RESULT_URL, 1);
+    assert!(!outcome.ok);
+    assert!(outcome.lines[0].contains("log comments"));
+    assert_eq!(fake.writes(), []);
+
+    // A readable exhausted count still drops the request without dispatching.
+    fake.objects.insert(
+        "log".into(),
+        json!([entry("worker", "2026-10-16T08:00:00Z", &[one, one, one])]),
+    );
+    let outcome = run(&fake, &s, RESULT_URL, 1);
+    assert!(outcome.ok);
+    assert!(outcome.lines[0].contains("daily dispatch cap"));
+    assert_eq!(fake.writes().len(), 1, "only the log record, no dispatch");
 }
 
 #[test]
@@ -904,7 +923,7 @@ fn the_cooldown_counts_earlier_runs_whose_agent_ran() {
 fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
     let s = settings();
     let p = policy(&s);
-    let task = compose(&checks("fail"), &p, "release failing", &Default::default()).unwrap();
+    let task = compose(&checks("fail"), &p, "release failing", None).unwrap();
     let (head, _) = PLAYBOOK.split_once(OPERATOR).unwrap();
     assert!(task.starts_with(head));
     assert!(task.contains("Why you run: release failing."));
@@ -916,7 +935,7 @@ fn the_task_is_the_playbook_the_policy_and_the_report_bounded() {
     let big: Vec<Value> = (0..2000)
         .map(|i| json!({"id": i, "evidence": ["https://github.com/o/r/issues/1"]}))
         .collect();
-    assert!(compose(&big, &p, "r", &Default::default()).is_err());
+    assert!(compose(&big, &p, "r", None).is_err());
 }
 
 #[test]
@@ -925,7 +944,7 @@ fn the_task_names_the_configured_operator_and_no_other_login() {
         let mut board = board();
         board["operator"] = json!(operator);
         let s = Settings::from_json(&board, &supervisor(), None).unwrap();
-        let task = compose(&checks("fail"), &policy(&s), "r", &Default::default()).unwrap();
+        let task = compose(&checks("fail"), &policy(&s), "r", None).unwrap();
         assert!(
             task.contains(&format!("anyone but\n{operator}, the policy's `operator`")),
             "{operator}"

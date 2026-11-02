@@ -345,30 +345,26 @@ pub fn run(args: &Supervise) -> Result<()> {
                     hours,
                 )
             })?;
-            let ledger = args
-                .ledger
-                .as_deref()
-                .map(read)
-                .transpose()?
-                .as_ref()
-                .map(agent::handback::Ledger::parse)
-                .transpose()?;
-            let usage = if decision.act {
-                policy
-                    .as_ref()
-                    .map(|p| agent::daily_usage(&client, p, now(), ledger.as_ref()))
-                    .transpose()?
-                    .unwrap_or_default()
-            } else {
-                Default::default()
-            };
+            let usage = policy.as_ref().filter(|_| decision.act).and_then(|p| {
+                advisory_usage(|| {
+                    let ledger = args
+                        .ledger
+                        .as_deref()
+                        .map(read)
+                        .transpose()?
+                        .as_ref()
+                        .map(agent::handback::Ledger::parse)
+                        .transpose()?;
+                    agent::daily_usage(&client, p, now(), ledger.as_ref())
+                })
+            });
             let out = trigger_output(
                 &decision,
                 policy.as_ref(),
                 &pools,
                 checks,
                 &delimiter("task")?,
-                &usage,
+                usage.as_ref(),
             )?;
             std::io::stdout().lock().write_all(out.as_bytes())?;
             eprintln!(
@@ -558,6 +554,19 @@ fn session_output(outputs: &profile::Outputs, delimiter: &str) -> Result<String>
         .collect()
 }
 
+/// Usage informs the agent; only the executor's independent read gates writes.
+fn advisory_usage(
+    read: impl FnOnce() -> Result<std::collections::BTreeMap<String, usize>>,
+) -> Option<std::collections::BTreeMap<String, usize>> {
+    match read() {
+        Ok(usage) => Some(usage),
+        Err(error) => {
+            eprintln!("warning: supervisor daily usage unavailable: {error:#}");
+            None
+        }
+    }
+}
+
 /// The trigger's `$GITHUB_OUTPUT` lines: `act`, and when the agent runs, its
 /// wrapper inputs, the task under a delimiter it cannot contain.
 fn trigger_output(
@@ -566,7 +575,7 @@ fn trigger_output(
     pools: &Value,
     checks: &[Value],
     delimiter: &str,
-    usage: &std::collections::BTreeMap<String, usize>,
+    usage: Option<&std::collections::BTreeMap<String, usize>>,
 ) -> Result<String> {
     let mut out = output_line("act", &decision.act.to_string())?;
     let Some(policy) = policy.filter(|_| decision.act) else {
@@ -617,13 +626,28 @@ mod tests {
             &pools,
             &checks,
             "task-d",
-            &Default::default(),
+            Some(&Default::default()),
         )
         .unwrap();
         assert!(out.starts_with(
             "act=true\nrepo=o/control\nitem=5\nagent=a\nmodel=m\nbudget=100\ntask<<task-d\n"
         ));
         assert!(out.ends_with("```\n\ntask-d\n"));
+        let usage = advisory_usage(|| anyhow::bail!("failed usage read"));
+        assert!(usage.is_none());
+        let out = trigger_output(
+            &run,
+            policy.as_ref(),
+            &pools,
+            &checks,
+            "task-d",
+            usage.as_ref(),
+        )
+        .unwrap();
+        assert!(out.starts_with("act=true\n"));
+        assert!(out.contains("\"dailyUsed\": null"));
+        let usage = advisory_usage(|| Ok(Default::default()));
+        assert_eq!(usage, Some(Default::default()));
         let skip = agent::Decision {
             act: false,
             reason: "no check fails".into(),
@@ -635,7 +659,7 @@ mod tests {
                 &pools,
                 &checks,
                 "task-d",
-                &Default::default()
+                None
             )
             .unwrap(),
             "act=false\n"
@@ -650,7 +674,7 @@ mod tests {
                 &forged,
                 &checks,
                 "task-d",
-                &Default::default()
+                None
             )
             .is_err()
         );
@@ -661,7 +685,7 @@ mod tests {
                 &pools,
                 &checks,
                 "release",
-                &Default::default()
+                None
             )
             .is_err()
         );
