@@ -23,6 +23,13 @@ pub const PLAN_FENCE: &str = "agent-board-plan";
 /// The tag of the hidden first line of the comment that records a plan's
 /// dispatch: `<!-- agent-board-dispatch: PLAN-ID -->`.
 pub const DISPATCH_MARKER: &str = "agent-board-dispatch";
+
+/// The supervisor executor's text-free request to bring an epic forward.
+/// Match the whole body, not a copy in an agent's marked comment or report.
+pub(crate) fn plan_epic_marker() -> String {
+    format!("<!-- agent-board-plan-epic -->\n\n{}", crate::FOOTER)
+}
+
 /// The tag of the hidden line after it in the record of a plan the pass
 /// wrote with the operator's direction: `<!-- agent-board-direction: HASH -->`.
 pub const DIRECTION_MARKER: &str = "agent-board-direction";

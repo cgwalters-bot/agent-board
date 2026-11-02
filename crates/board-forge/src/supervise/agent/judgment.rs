@@ -13,6 +13,7 @@ pub const ACTIONS: &[&str] = &[
     "comment",
     "create_issue",
     "file_bug",
+    "plan_epic",
     "close",
     "remove_needs_human",
     "clear_needs_human",
@@ -34,9 +35,20 @@ pub enum Evidence {
     Closed,
 }
 
+/// No prose can be laundered into the coordinator's trusted inputs.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanReason {
+    NoRunnableWork,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Write {
+    PlanEpic {
+        epic: u64,
+        reason: PlanReason,
+    },
     Comment {
         repository: String,
         item: u64,
@@ -171,9 +183,13 @@ pub fn parse_batch(source: &str, policy: &Policy) -> Result<Vec<Checked>> {
     );
     // Reuse the closed dispatch protocol, including its per-pass bound.
     validate_batch(&dispatch.join("\n"), policy)?;
+    let mut epics = BTreeSet::new();
     for r in &requests {
         ensure!(cap(policy, r.action()) > 0, "Supervisor action is disabled");
         r.validate(policy)?;
+        if let Checked::Write(Write::PlanEpic { epic, .. }) = r {
+            ensure!(epics.insert(epic), "Duplicate epic planning request");
+        }
     }
     // Every target is checked before the first write, so a dispatch could not
     // see a comment posted earlier in its own batch; the run would read it.
@@ -271,6 +287,7 @@ impl Checked {
                 Write::Comment { .. } => "comment",
                 Write::CreateIssue { .. } => "create_issue",
                 Write::FileBug { .. } => "file_bug",
+                Write::PlanEpic { .. } => "plan_epic",
                 Write::Close { .. } => "close",
                 Write::RemoveNeedsHuman { .. } => "remove_needs_human",
                 Write::ClearNeedsHuman { .. } => "clear_needs_human",
@@ -305,6 +322,9 @@ impl Checked {
         }
         if let Self::Write(w) = self {
             match w {
+                Write::PlanEpic { epic, .. } => {
+                    target(p, &p.settings.epics_repository, *epic)?;
+                }
                 Write::Comment { body, .. } => text(body, 4000, true, &p.settings.footer)?,
                 Write::CreateIssue { title, body } | Write::FileBug { title, body } => {
                     let repo = p
@@ -385,6 +405,7 @@ impl Checked {
     pub fn describe(&self) -> String {
         match self {
             Self::Dispatch(r) => r.describe(),
+            Self::Write(Write::PlanEpic { epic, .. }) => format!("`plan_epic` epic #{epic}"),
             Self::Write(Write::StatusUpdate {
                 no_split: Some(reason),
                 ..
@@ -416,6 +437,9 @@ impl Checked {
             return format!("https://github.com/{repository}/issues/{item}#issuecomment-{id}");
         }
         let target = self.issue().or_else(|| match self {
+            Self::Write(Write::PlanEpic { epic, .. }) => {
+                Some((p.settings.epics_repository.as_str(), *epic))
+            }
             Self::Write(Write::CreateIssue { .. } | Write::FileBug { .. }) => p
                 .agent
                 .tracker
@@ -435,6 +459,9 @@ impl Checked {
 
     /// Checks the target as it is now; a status update reads its changes.
     pub fn preflight(&mut self, api: &dyn Api, p: &Policy, now: i64) -> Result<()> {
+        if let Self::Write(Write::PlanEpic { epic, .. }) = self {
+            return plan_epic_ready(api, p, *epic, now);
+        }
         if let Self::Write(Write::StatusUpdate {
             summary,
             notes,
@@ -563,6 +590,22 @@ impl Checked {
                 };
             }
             Self::Write(w) => match w {
+                Write::PlanEpic {
+                    epic,
+                    reason: PlanReason::NoRunnableWork,
+                } => {
+                    // Read the holds again after batch admission; never publish
+                    // the agent's reason, even though it is a closed enum.
+                    plan_epic_ready(api, p, *epic, ctx.now)?;
+                    (
+                        "POST",
+                        format!(
+                            "/repos/{}/issues/{epic}/comments",
+                            p.settings.epics_repository
+                        ),
+                        json!({"body": crate::plan::plan_epic_marker()}),
+                    )
+                }
                 Write::Comment {
                     repository,
                     item,
@@ -660,6 +703,56 @@ impl Checked {
         }
         Ok(receipt)
     }
+}
+
+/// A compromised agent must not activate an unapproved epic, override a
+/// person's hold, or repeatedly spend planning runs on the same epic.
+fn plan_epic_ready(api: &dyn Api, p: &Policy, epic: u64, now: i64) -> Result<()> {
+    let repo = &p.settings.epics_repository;
+    let issue = api.get(&format!("/repos/{repo}/issues/{epic}"))?;
+    ensure!(
+        issue["state"] == "open"
+            && issue.get("pull_request").is_none_or(Value::is_null)
+            && has_label(&issue, "epic"),
+        "Not an open epic"
+    );
+    ensure!(
+        !has_label(&issue, "needs-human") && !has_label(&issue, "needs-design"),
+        "The epic is held"
+    );
+    let events = paged(api, repo, epic, "timeline")?;
+    let last = events.iter().rfind(|e| {
+        (e["event"] == "labeled" || e["event"] == "unlabeled")
+            && e["label"]["name"]
+                .as_str()
+                .is_some_and(|l| l.eq_ignore_ascii_case("epic"))
+    });
+    ensure!(
+        last.is_some_and(|e| e["event"] == "labeled"
+            && e["actor"]["login"]
+                .as_str()
+                .is_some_and(|l| l.eq_ignore_ascii_case(&p.settings.operator))),
+        "The epic is not live"
+    );
+    ensure!(
+        !super::in_flight(api, p, repo, epic)?,
+        "The epic has a run in flight"
+    );
+    let marker = crate::plan::plan_epic_marker();
+    for c in paged(api, repo, epic, "comments")? {
+        if c["user"]["login"]
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case(&p.settings.bot))
+            && c["body"] == marker
+        {
+            let at = millis(&c["created_at"]).context("Epic request timestamp")?;
+            ensure!(
+                at <= now - 24 * HOUR_MS,
+                "The epic was brought forward in the last day"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `summary` and `notes` over the project's changes since its last status

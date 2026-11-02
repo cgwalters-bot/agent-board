@@ -58,6 +58,15 @@ use exactly these fields in addition to `type` and `action`:
   assignee or label, so it is not a question for the operator. Like a new
   issue, it is marked as yours; a dispatch on it refuses the whole batch
   until a person removes the mark.
+- `plan_epic`: `epic` (an issue number in configured `epics.repository`),
+  `reason` (only `no-runnable-work`). When runnable work runs out, ask the
+  epic's own coordinator for a fresh plan, not for issues in your words.
+  No text field is accepted or posted: the executor writes a fixed marker,
+  which the next pass consumes once as an early planning request, even after
+  a no-op plan. Its own daily cap defaults to zero. The epic must be live
+  (open and last labelled `epic` by {{operator}}), not held `needs-human` or
+  `needs-design`, with no run in flight, and not brought forward in the last
+  24 hours. Pending-plan handling and the pass's other holds and caps remain.
 - `close`: `repository`, `item`, `triage_run` (URL), `triage_comment` (comment ID).
   The configured workflow must have completed a successful triage on this issue;
    its unedited bot comment must contain exactly one `schedule-triage` fenced

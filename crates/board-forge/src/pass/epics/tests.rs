@@ -2087,6 +2087,57 @@ fn decide_coalesces_changes_but_not_direction() {
         assert_eq!(got, early, "{hold:?}");
         assert_eq!(hold.reason.ends_with(NOT_EARLY), !early, "{hold:?}");
     }
+    // Only the executor's exact, unedited bot marker advances a plan. An
+    // agent-influenced comment containing a copy is not that marker.
+    let marker = plan::plan_epic_marker();
+    let requested = note(40, "cgwalters-bot", "2026-10-23T14:30:00Z", &marker);
+    let mut forged = requested.clone();
+    forged.author = Some("visitor".into());
+    let mut edited = requested.clone();
+    edited.edited = true;
+    edited.editor = Some("visitor".into());
+    let mut influenced = requested.clone();
+    influenced.body = format!("{marker}\n\n{}", crate::input::SUPERVISOR_NOTE);
+    let mut quoted = requested.clone();
+    quoted.body = format!("A report quoting the marker:\n{marker}");
+    let used = note(
+        41,
+        "cgwalters-bot",
+        "2026-10-23T14:40:00Z",
+        "<!-- agent-board-dispatch: 42@2026-10-23T14:40:00Z -->\nDispatched the plan.",
+    );
+    for (name, extra, busy, honored) in [
+        ("honored", vec![requested.clone()], None, true),
+        ("used", vec![requested.clone(), used], None, false),
+        ("forged author", vec![forged], None, false),
+        ("edited", vec![edited], None, false),
+        ("agent note", vec![influenced], None, false),
+        ("quoted", vec![quoted], None, false),
+        ("busy", vec![requested], Some("run URL"), false),
+    ] {
+        // A no-op plan's doubled wait, and an unchanged epic, both need
+        // the explicit request rather than idle-slot opportunism.
+        for epic in [&facts, &settled] {
+            let mut all = recorded.clone();
+            all.push(nothing(1));
+            all.extend(extra.clone());
+            let next = decide(&Inputs {
+                epic,
+                comments: &all,
+                operator: "cgwalters",
+                bot: "cgwalters-bot",
+                busy,
+                now: at("2026-10-23T15:00:00Z"),
+                follow_up_days: 3,
+                direction: None,
+            });
+            assert_eq!(
+                matches!(next, Next::Plan(ref why) if why.starts_with("early,")),
+                honored,
+                "{name}: {next:?}"
+            );
+        }
+    }
     // The operator's direction: its hash in the record of the request the
     // applied plan answered, the hash this pass read, and the request that
     // a change led to, not yet answered.
