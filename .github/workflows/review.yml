@@ -17,7 +17,7 @@ jobs:
     # around agentic-job v0.6.5, pinned by commit: the permissions below go
     # to whatever this names, so a change to it is reviewed here. The
     # tailnet and inference broker must admit its job_workflow_ref.
-    uses: cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@3bd115f01cc20d8255bc996bbe582b24542914c1 # agentic-job v0.6.5
+    uses: cgwalters-forge/actions/.github/workflows/cgwalters-review.yml@7190c17a061d40c3c714629a1880b6ae70f91351 # agentic-job v0.6.5
     permissions:
       contents: read
       issues: read
