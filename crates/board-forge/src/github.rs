@@ -91,6 +91,16 @@ pub fn is_github_login(login: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
+/// GitHub's refusal of `addProjectV2ItemById` for an issue already on the
+/// project, as when the project's auto-add got there first (tracker#1151).
+pub const ALREADY_IN_PROJECT: &str = "Content already exists in this project";
+
+/// Whether `error` is GitHub refusing a project add because the issue is
+/// already a member, whose item the caller should look up instead.
+pub fn already_member(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains(ALREADY_IN_PROJECT)
+}
+
 pub fn validate_github_project(project: &Url) -> Result<()> {
     ensure!(
         project.scheme() == "https"
@@ -1729,7 +1739,8 @@ impl<T: Transport> GitHub<T> {
         Ok((text(found, "id")?.to_owned(), members.pop()))
     }
 
-    /// Add an issue to the project, returning its item ID.
+    /// Add an issue to the project, returning its item ID. GitHub may refuse an
+    /// issue already on it instead of returning its item ([`already_member`]).
     pub fn add_item(&self, project: &str, issue: &str) -> Result<String> {
         let data = self.diagnostic().graphql(
             "mutation($project:ID!,$issue:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$issue}){item{id}}}",
