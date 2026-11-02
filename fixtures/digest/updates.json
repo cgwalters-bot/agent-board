@@ -1,0 +1,5 @@
+[
+  {"createdAt":"2026-10-18T18:00:00Z","status":"ON_TRACK","body":"Visible progress<!-- hidden\nstate -->\n"},
+  {"createdAt":"2026-10-19T18:00:00Z","status":null,"body":"Newer progress"},
+  {"createdAt":"2026-10-25T18:00:00Z","status":"ON_TRACK","body":"Outside window"}
+]

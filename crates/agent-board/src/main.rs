@@ -7,6 +7,7 @@ mod cli_docs;
 mod cost;
 mod decisions;
 mod deploy;
+mod digest;
 mod dispatch;
 mod epic;
 mod intake;
@@ -183,6 +184,8 @@ enum Command {
     Status(org_status::Status),
     /// One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply).
     ReleaseTrain(release_train::ReleaseTrain),
+    /// Gather weekly public material and file or reuse its issue; preview unless --apply (docs/digest.md).
+    Digest(digest::Digest),
     /// Probe the inference broker and keep one outage issue open while it is unreachable.
     Broker {
         #[command(subcommand)]
@@ -1094,6 +1097,22 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 board_forge::github::Client::from_env,
                 &mut io::stdout().lock(),
             )
+        }
+        Command::Digest(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "digest reads its settings from --config only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            digest::run(args, &mut io::stdout().lock())
         }
         Command::Poll(args) => {
             ensure!(
