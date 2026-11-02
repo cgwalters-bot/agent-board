@@ -1142,17 +1142,28 @@ impl Pass<'_> {
         let base = self.default_branch(repo)?;
         let workspace = self.workspace(repo, &base)?;
         let q = format!("repo:{repo} is:pr is:merged base:{base} merged:>{published}");
-        let found = self.get(&format!(
-            "/search/issues?q={}&per_page={PAGE_SIZE}",
-            encode(&q)
-        ))?;
-        let items = list(&found["items"])?;
-        // Labels decide the bump and the urgency: all of them or none.
-        ensure!(
-            found["incomplete_results"] != true
-                && found["total_count"].as_u64().unwrap_or_default() <= items.len() as u64,
-            "merged pull requests truncated"
-        );
+        let path = format!("/search/issues?q={}&per_page={PAGE_SIZE}", encode(&q));
+        // Labels decide the bump and the urgency: all of them or none. Every
+        // page counts against REQUEST_LIMIT, which bounds the loop.
+        let mut items = vec![];
+        for page in 1.. {
+            let found = self.get(&if page == 1 {
+                path.clone()
+            } else {
+                format!("{path}&page={page}")
+            })?;
+            let batch = list(&found["items"])?;
+            items.extend(batch.iter().cloned());
+            let total = found["total_count"].as_u64().unwrap_or_default();
+            ensure!(
+                found["incomplete_results"] != true
+                    && (total <= items.len() as u64 || batch.len() as u64 == PAGE_SIZE),
+                "merged pull requests truncated"
+            );
+            if total <= items.len() as u64 {
+                break;
+            }
+        }
         let merged = items
             .iter()
             .map(|i| {

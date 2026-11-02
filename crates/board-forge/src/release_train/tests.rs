@@ -189,6 +189,14 @@ fn boundaries_hold_on_recorded_state() {
         )
     };
     let issue = "https://github.com/cgwalters-forge/tracker/issues/880";
+    let search = "/search/issues?q=repo:cgwalters-forge/agentic-job is:pr is:merged base:main merged:>2026-10-19T15:04:26Z&per_page=100";
+    let page2 = format!("{search}&page=2");
+    let page = |total: u64, numbers: std::ops::Range<u64>, incomplete: bool| {
+        let items: Vec<Value> = numbers
+            .map(|n| json!({"number": n, "title": format!("PR {n}"), "labels": []}))
+            .collect();
+        json!({"total_count": total, "incomplete_results": incomplete, "items": items})
+    };
     // The recorded state edited, then a line the pass must print or its error.
     for (fixture, expected) in [
         // Anyone may open an issue with the train's title; only the bot's count.
@@ -279,13 +287,31 @@ fn boundaries_hold_on_recorded_state() {
         ),
         // Labels decide the bump and the urgency: all of them or none.
         (
+            edited("duplicate-882", &[(search, page(100, 0..100, false))]),
+            Ok("due: 100 pull requests merged since v0.6.3; next is v0.6.4".to_owned()),
+        ),
+        (
             edited(
                 "duplicate-882",
-                &[(
-                    "/search/issues?q=repo:cgwalters-forge/agentic-job is:pr is:merged base:main merged:>2026-10-19T15:04:26Z&per_page=100",
-                    json!({"total_count": 101, "incomplete_results": false, "items": []}),
-                )],
+                &[
+                    (search, page(114, 0..100, false)),
+                    (page2.as_str(), page(114, 100..114, false)),
+                ],
             ),
+            Ok("due: 114 pull requests merged since v0.6.3; next is v0.6.4".to_owned()),
+        ),
+        (
+            edited(
+                "duplicate-882",
+                &[
+                    (search, page(114, 0..100, false)),
+                    (page2.as_str(), page(114, 100..114, true)),
+                ],
+            ),
+            Err("merged pull requests truncated"),
+        ),
+        (
+            edited("duplicate-882", &[(search, page(101, 0..0, false))]),
             Err("merged pull requests truncated"),
         ),
     ] {
