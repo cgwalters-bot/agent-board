@@ -653,42 +653,14 @@ mod tests {
             reason: "no check fails".into(),
         };
         assert_eq!(
-            trigger_output(
-                &skip,
-                policy.as_ref(),
-                &pools,
-                &checks,
-                "task-d",
-                None
-            )
-            .unwrap(),
+            trigger_output(&skip, policy.as_ref(), &pools, &checks, "task-d", None).unwrap(),
             "act=false\n"
         );
         // A pool value that would add an output line, or a delimiter the
         // task holds, is refused.
         let forged = json!({"large": {"agent": "a\ntask=forged", "model": "m", "budget": "1"}});
-        assert!(
-            trigger_output(
-                &run,
-                policy.as_ref(),
-                &forged,
-                &checks,
-                "task-d",
-                None
-            )
-            .is_err()
-        );
-        assert!(
-            trigger_output(
-                &run,
-                policy.as_ref(),
-                &pools,
-                &checks,
-                "release",
-                None
-            )
-            .is_err()
-        );
+        assert!(trigger_output(&run, policy.as_ref(), &forged, &checks, "task-d", None).is_err());
+        assert!(trigger_output(&run, policy.as_ref(), &pools, &checks, "release", None).is_err());
         assert!(output_line("x", "a\rb").is_err());
         // A session's prompt is task data under the delimiter; a pool value
         // cannot add a line.
