@@ -9497,7 +9497,8 @@ fn room_table() {
         let got = room(snap.as_ref(), "p", &settings, now).map(|r| (r * 1000.0).round() / 1000.0);
         assert_eq!(got, expected.map_err(str::to_owned), "{name}");
     }
-    // Every eligible pool gets a ticket regardless of headroom or order.
+    // Each eligible pool draws by its room, a and b 7.5 points, c 10, and
+    // the drawn ticket falls past the earlier pools' tickets.
     let pools = Pools(vec![
         ("a".into(), settings.clone()),
         ("b".into(), settings.clone()),
@@ -9511,27 +9512,30 @@ fn room_table() {
     ]);
     let three = json!({"updated_at": "2026-10-23T11:50:00Z", "pools": {"a": entry.clone(), "b": entry.clone(), "c": entry.clone()}});
     let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        choose_with(Some(&three), &pools, &names(&["a", "b"]), now, |_| Ok(0)),
-        Ok("a".into())
-    );
-    assert_eq!(
-        choose_with(Some(&three), &pools, &names(&["b", "a"]), now, |_| Ok(0)),
-        Ok("b".into())
-    );
-    assert_eq!(
-        choose_with(Some(&three), &pools, &names(&["a", "c"]), now, |_| Ok(1)),
-        Ok("c".into())
-    );
-    assert_eq!(
-        choose_with(Some(&three), &pools, &names(&["a", "c", "a"]), now, |len| {
-            assert_eq!(len, 2);
-            Ok(0)
-        }),
-        Ok("a".into())
-    );
     let mut held = three.clone();
     held["pools"]["c"]["hold"] = true.into();
+    let mut past = three.clone();
+    past["pools"]["b"]["used_percent"] = 60.0.into();
+    for (snap, candidates, total, ticket, expected) in [
+        (&three, &["a", "b"][..], 1500, 749, "a"),
+        (&three, &["a", "b"], 1500, 750, "b"),
+        (&three, &["b", "a"], 1500, 0, "b"),
+        (&three, &["a", "c"], 1750, 750, "c"),
+        (&three, &["a", "c", "a"], 1750, 749, "a"),
+        // b is 12.5 points past its pace but not held: it keeps the floor.
+        (&past, &["a", "b"], 850, 750, "b"),
+        (&held, &["a", "c", "b"], 1500, 1499, "b"),
+    ] {
+        let got = choose_with(Some(snap), &pools, &names(candidates), now, |len| {
+            assert_eq!(len, total, "{candidates:?}");
+            Ok(ticket)
+        });
+        assert_eq!(got, Ok(expected.into()), "{candidates:?} ticket {ticket}");
+    }
+    let two = names(&["a", "b"]);
+    // No entropy is a wait, not the first pool.
+    let failed = choose_with(Some(&three), &pools, &two, now, |_| Err("dry".into()));
+    assert_eq!(failed, Err("dry".into()));
     assert_eq!(
         choose(Some(&held), &pools, &names(&["c", "b"]), now),
         Ok("b".into())

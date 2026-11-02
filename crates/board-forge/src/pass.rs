@@ -1415,8 +1415,10 @@ fn allowed(target: f64, window_minutes: f64, resets: OffsetDateTime, now: Offset
     target * 100.0 * (1.0 - left / window_minutes).clamp(0.0, 1.0)
 }
 
-/// Uniformly choose among eligible configured pools. Headroom and configured
-/// order do not weight the draw. None qualifying is a wait.
+/// Draw among eligible configured pools, each in proportion to its [`room`]
+/// with a floor of one point, so a pool just past its pace keeps a small
+/// share. Configured order does not weight the draw. None qualifying, or no
+/// entropy for the draw, is a wait.
 pub fn choose(
     snapshot: Option<&Value>,
     pools: &Pools,
@@ -1441,14 +1443,14 @@ fn choose_with(
             continue;
         };
         match room(snapshot, name, settings, now) {
-            Ok(_) => eligible.push(name.clone()),
+            Ok(room) => eligible.push((name.clone(), room)),
             // One reason the snapshot gives every pool is said once.
             Err(reason) if !why.contains(&reason) => why.push(reason),
             Err(_) => {}
         }
     }
     if !eligible.is_empty() {
-        crate::pool_choice::choose(eligible, draw)
+        crate::pool_choice::choose_weighted(eligible, draw)
     } else if names.is_empty() {
         Err("no automatic pool is configured".into())
     } else {
