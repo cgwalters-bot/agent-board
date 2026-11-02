@@ -19,7 +19,7 @@ class ReviewContracts(unittest.TestCase):
             caller,
             r"uses: cgwalters-forge/actions/\.github/workflows/cgwalters-review\.yml@[0-9a-f]{40} # ",
         )
-        self.assertIn("@3bd115f01cc20d8255bc996bbe582b24542914c1 # agentic-job v0.6.5", caller)
+        self.assertIn("@7190c17a061d40c3c714629a1880b6ae70f91351 # agentic-job v0.6.5", caller)
         self.assertIn("types: [opened, synchronize, reopened, ready_for_review]", caller)
         self.assertIn("issue_comment:\n    types: [created]", caller)
         self.assertIn("github.event.issue.pull_request && startsWith", caller)
