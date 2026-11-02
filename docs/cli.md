@@ -649,7 +649,7 @@ agent-board pass [OPTIONS] --config <FILE>
 
 Commands:
 
-- [`next`](#agent-board-pass-next): After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake a stale supervisor, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass)
+- [`next`](#agent-board-pass-next): After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake optional stale auxiliary workflows, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass)
 
 Options:
 
@@ -664,7 +664,7 @@ Options:
 
 ## agent-board pass next
 
-After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake a stale supervisor, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass)
+After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake optional stale auxiliary workflows, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass)
 
 ```text
 agent-board pass next [OPTIONS] --workflow <FILE> --branch <BRANCH> --apply-title <TITLE> --wait-minutes <MINUTES>
@@ -680,6 +680,9 @@ Options:
 - `--supervisor-workflow <FILE>`: A supervisor workflow to start, before the pass, when its newest run on --branch, ignoring issue_comment runs, is at least --supervisor-stale-minutes old or is not among its newest 100. Its failures only warn
 - `--supervisor-stale-minutes <MINUTES>`: How old the supervisor's newest run may be before it is started
 - `--supervisor-input <NAME=VALUE>`: An input of the supervisor dispatch, such as session=false. Repeatable
+- `--train-workflow <FILE>`: A release-train workflow to start before the pass when its newest run on --branch is at least --train-stale-minutes old or is not among its newest 100. All run events count. Its failures only warn. Off unless supplied
+- `--train-stale-minutes <MINUTES>`: How old the train's newest run may be before it is started; independent of the supervisor
+- `--train-input <NAME=VALUE>`: An input of the train dispatch. Repeatable
 - `--dry-run`: Print what would wait and start; wait for and start nothing
 
 ## agent-board admit

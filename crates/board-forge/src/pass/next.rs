@@ -1,6 +1,6 @@
 //! `agent-board pass next` (docs/pass.md#the-next-pass): what starts after an
 //! applying pass. It waits out the pass interval from its own run's start,
-//! wakes a supervisor workflow whose newest run is stale, and dispatches the
+//! wakes optional auxiliary workflows whose newest runs are stale, and dispatches the
 //! pass workflow again unless a newer applying run will. Every name, input
 //! and interval is the caller's.
 use crate::github::API_ROOT;
@@ -51,7 +51,7 @@ pub struct Workflow {
     pub inputs: BTreeMap<String, String>,
 }
 
-/// The supervisor workflow to wake, and how old its newest run may grow.
+/// An auxiliary workflow to wake, and how old its newest run may grow.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Supervisor {
     pub workflow: Workflow,
@@ -75,6 +75,7 @@ pub struct Settings {
     /// started, and never more than this long from now.
     pub interval: Duration,
     pub supervisor: Option<Supervisor>,
+    pub train: Option<Supervisor>,
     /// Read and print what would start; wait for and start nothing.
     pub dry_run: bool,
 }
@@ -95,8 +96,8 @@ impl Settings {
             MAX_INTERVAL.as_secs() / 3600
         );
         validate_workflow(&self.pass.file)?;
-        if let Some(supervisor) = &self.supervisor {
-            validate_workflow(&supervisor.workflow.file)?;
+        for wake in [&self.supervisor, &self.train].into_iter().flatten() {
+            validate_workflow(&wake.workflow.file)?;
         }
         Ok(())
     }
@@ -158,8 +159,12 @@ pub fn supervisor_due(
 /// The creation time of the newest run in `runs` (newest first) that is not
 /// an [`IGNORED_SUPERVISOR_EVENT`]'s.
 pub fn newest_supervisor_run(runs: &[Value]) -> Result<Option<OffsetDateTime>> {
+    newest_auxiliary_run(runs, true)
+}
+
+fn newest_auxiliary_run(runs: &[Value], ignore_comments: bool) -> Result<Option<OffsetDateTime>> {
     for run in runs {
-        if text(run, "event")? != IGNORED_SUPERVISOR_EVENT {
+        if !ignore_comments || text(run, "event")? != IGNORED_SUPERVISOR_EVENT {
             return created(run).map(Some);
         }
     }
@@ -250,14 +255,16 @@ pub fn run(
         writeln!(out, "waiting {}s", wait.as_secs())?;
         clock.sleep(wait);
     }
-    if let Some(supervisor) = &settings.supervisor
-        && let Err(e) = next.wake(supervisor, out, err)
-    {
-        writeln!(
-            err,
-            "warning: could not start {}: {e:#}; continuing the chain",
-            supervisor.workflow.file
-        )?;
+    for (wake, ignore_comments) in [(&settings.supervisor, true), (&settings.train, false)] {
+        if let Some(wake) = wake
+            && let Err(e) = next.wake(wake, ignore_comments, out, err)
+        {
+            writeln!(
+                err,
+                "warning: could not start {}: {e:#}; continuing the chain",
+                wake.workflow.file
+            )?;
+        }
     }
     // A dispatch that failed may still have started a run, so the runs are
     // listed again before each try. That narrows, but cannot rule out, a
@@ -306,7 +313,9 @@ impl<R: Rest, C: Clock> Next<'_, R, C> {
                 Err(e) => writeln!(err, "attempt {attempt} of {what} failed: {e:#}")?,
             }
             attempt += 1;
-            self.clock.sleep(retry_wait(attempt));
+            if !self.settings.dry_run {
+                self.clock.sleep(retry_wait(attempt));
+            }
         }
     }
 
@@ -347,16 +356,17 @@ impl<R: Rest, C: Clock> Next<'_, R, C> {
         Ok(runs)
     }
 
-    /// Start the supervisor when its newest run that counts is stale. An
+    /// Start an auxiliary workflow when its newest run that counts is stale. An
     /// unreadable listing is an error, never an absent run.
     fn wake(
         &self,
         supervisor: &Supervisor,
+        ignore_comments: bool,
         out: &mut impl Write,
         err: &mut impl Write,
     ) -> Result<()> {
         let file = &supervisor.workflow.file;
-        let newest = newest_supervisor_run(&self.runs_page(err, file, 1)?)?;
+        let newest = newest_auxiliary_run(&self.runs_page(err, file, 1)?, ignore_comments)?;
         let now = self.clock.now();
         if !supervisor_due(newest, now, supervisor.stale) {
             let age = newest.map_or(0, |created| (now - created).whole_minutes());

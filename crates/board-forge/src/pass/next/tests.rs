@@ -56,6 +56,7 @@ fn settings() -> Settings {
             workflow: workflow("supervisor.yml", &[("prompt", ""), ("session", "false")]),
             stale: Duration::from_secs(30 * 60),
         }),
+        train: None,
         dry_run: false,
     }
 }
@@ -204,6 +205,7 @@ struct Fake {
     /// The runs listed once a dispatch was tried, as if it started one.
     successor: Option<Vec<Value>>,
     supervisor_runs: Vec<Value>,
+    train_runs: Vec<Value>,
     /// How many calls of each kind fail before the rest succeed.
     fail: BTreeMap<&'static str, usize>,
     calls: RefCell<BTreeMap<&'static str, usize>>,
@@ -220,6 +222,7 @@ impl Fake {
             successor: None,
             // Due, so every chain case wakes it too.
             supervisor_runs: Vec::new(),
+            train_runs: Vec::new(),
             fail: BTreeMap::new(),
             calls: RefCell::default(),
             log: RefCell::default(),
@@ -286,12 +289,21 @@ impl Rest for Fake {
                 }
                 Ok((200, Self::page(&self.supervisor_runs, path)))
             }
+            "GET" if workflow("train.yml", "runs?branch=main&") => {
+                if self.call("train list") {
+                    return Ok((500, json!({})));
+                }
+                Ok((200, Self::page(&self.train_runs, path)))
+            }
             "POST"
                 if workflow("pass.yml", "dispatches")
-                    || workflow("supervisor.yml", "dispatches") =>
+                    || workflow("supervisor.yml", "dispatches")
+                    || workflow("train.yml", "dispatches") =>
             {
                 let kind = if path.contains("pass.yml") {
                     "dispatch"
+                } else if path.contains("train.yml") {
+                    "train wake"
                 } else {
                     "wake"
                 };
@@ -549,19 +561,127 @@ fn supervisor_wake() {
 
 #[test]
 fn dry_run_starts_nothing() {
-    let fake = Fake::new(vec![me()]);
-    let settings = Settings {
+    let mut fake = Fake::new(vec![me()]);
+    fake.fail = [
+        ("lookup", 1),
+        ("supervisor list", 4),
+        ("train list", 1),
+        ("list", 1),
+    ]
+    .into_iter()
+    .collect();
+    let mut settings = Settings {
         dry_run: true,
         ..settings()
     };
+    settings.train = Some(train());
     let (result, out, _) = run_next(&fake, &settings);
     result.unwrap();
     assert_eq!(
         out,
-        "would wait 540s\nwould start supervisor.yml\nwould start pass.yml\n"
+        "would wait 540s\nwould start train.yml\nwould start pass.yml\n"
     );
     assert!(fake.bodies.borrow().is_empty());
     assert!(!fake.log.borrow().iter().any(|c| c.starts_with("sleep")));
+}
+
+fn train() -> Supervisor {
+    Supervisor {
+        workflow: Workflow {
+            file: "train.yml".into(),
+            inputs: [("release".into(), "true".into())].into_iter().collect(),
+        },
+        stale: Duration::from_secs(15 * 60),
+    }
+}
+
+#[test]
+fn train_without_supervisor_preserves_newer_pass_suppression() {
+    for supervisor_enabled in [false, true] {
+        let fake = Fake::new(vec![run(105, LATER, applying("queued")), me()]);
+        let mut settings = settings();
+        settings.train = Some(train());
+        if !supervisor_enabled {
+            settings.supervisor = None;
+        }
+        let (result, out, err) = run_next(&fake, &settings);
+        result.unwrap();
+        assert!(err.is_empty(), "{err}");
+        assert!(out.contains("run 105 continues the chain"), "{out}");
+        assert_eq!(fake.count("dispatch"), 0);
+        assert_eq!(fake.count("train wake"), 1);
+        assert_eq!(
+            fake.count("supervisor list"),
+            usize::from(supervisor_enabled)
+        );
+    }
+}
+
+#[test]
+fn independent_auxiliary_wakes() {
+    for (name, runs, enabled, fails, wakes) in [
+        ("omitted", vec![], false, None, 0),
+        ("recent", vec![run(1, T0, json!({}))], true, None, 0),
+        // At wake time the clock is T0 + ten minutes: exactly 15 minutes old.
+        ("threshold", vec![run(1, EARLIER, json!({}))], true, None, 1),
+        ("missing", vec![], true, None, 1),
+        (
+            "comment counts",
+            vec![run(1, T0, json!({"event": "issue_comment"}))],
+            true,
+            None,
+            0,
+        ),
+        (
+            "malformed timestamp",
+            vec![run(1, "yesterday", json!({}))],
+            true,
+            None,
+            0,
+        ),
+        ("unreadable listing", vec![], true, Some("train list"), 0),
+        ("exhausted dispatch", vec![], true, Some("train wake"), 4),
+        ("supervisor fails first", vec![], true, Some("wake"), 1),
+    ] {
+        let mut fake = Fake::new(vec![me()]);
+        fake.train_runs = runs;
+        if let Some(kind) = fails {
+            fake.fail.insert(kind, TRIES as usize);
+        }
+        let mut settings = settings();
+        settings.train = enabled.then(train);
+        let (result, out, err) = run_next(&fake, &settings);
+        let detail = format!("{name}: {result:?}\n{out}{err}");
+        assert!(result.is_ok(), "{detail}");
+        assert_eq!(fake.count("train wake"), wakes, "{detail}");
+        assert_eq!(
+            fake.count("train list"),
+            if fails == Some("train list") {
+                4
+            } else {
+                usize::from(enabled)
+            },
+            "{detail}"
+        );
+        assert_eq!(fake.count("dispatch"), 1, "{detail}");
+        assert_eq!(
+            fake.count("wake"),
+            if fails == Some("wake") { 4 } else { 1 },
+            "{detail}"
+        );
+        if fails.is_some() || name == "malformed timestamp" {
+            assert!(err.contains("continuing the chain"), "{detail}");
+        }
+        for (kind, body) in fake.bodies.borrow().iter() {
+            if kind == "train wake" {
+                assert_eq!(
+                    body,
+                    &json!({"ref": "main", "inputs": {"release": "true"}}),
+                    "{detail}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -575,6 +695,10 @@ fn invalid_settings() {
         ("branch", |s| s.branch = String::new()),
         ("workflow path", |s| s.pass.file = "../pass.yml".into()),
         ("workflow query", |s| s.pass.file = "pass.yml?x=1".into()),
+        ("train workflow path", |s| {
+            s.train = Some(train());
+            s.train.as_mut().unwrap().workflow.file = "../train.yml".into();
+        }),
         ("apply title", |s| s.apply_title = String::new()),
         ("interval", |s| {
             s.interval = MAX_INTERVAL + Duration::from_secs(1)
