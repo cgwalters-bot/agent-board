@@ -293,6 +293,26 @@ another admits is refused, since no single file allows that run. The line
 names the repository where no file admits it, and otherwise the head branch.
 The pass's direction check refuses a repository that any of the files admits.
 
+With the pass's [`pr.ownerBranches: true`](pass.md#one-configuration-file) (off by
+default; not a standalone poll option), a round is also skipped where
+agentic-job's apply step would refuse its push (agent-board#598). Apply pushes
+to a head other than the bot's own fork only where that head repository's
+default branch has `.github/agentic-job/accept-owner-branches` naming it
+(`owner/repo`) on a line of its own, as that repository's own workflows would
+run the agent's commit with their secrets; a file a fork inherited names its
+parent, not the fork. So for a round on any head but the bot's own fork, such
+as a branch of the base repository itself or of a `headOwners` fork, the poll
+reads that file (one request, cached by ETag) as apply does: a file of at most
+4096 bytes, its lines compared case-insensitively. Where it is missing or does
+not name the head repository, the round is skipped as above, its line saying
+`skip: left to the operator: its head is a branch of OWNER/REPO, not the bot's fork, and apply pushes there only once OWNER/REPO's default branch has .github/agentic-job/accept-owner-branches naming it`;
+where it cannot be read, the line says so and the round is skipped too. A fix
+round on the operator's comments is checked the same way. This only saves the
+run apply would refuse, after which the pull request was labelled
+`needs-human` anyway; apply reads the file again and stays the check. Adding
+the file is the head repository's own decision, made in a commit to its
+default branch; the poll never writes it.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`

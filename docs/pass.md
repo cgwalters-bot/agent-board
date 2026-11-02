@@ -2556,6 +2556,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
 | `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
+| `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
