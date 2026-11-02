@@ -6,11 +6,11 @@ max_outputs = 1
 max_patch_bytes = 1024
 max_patch_files = 1
 
-[outputs]
+[github.outputs]
 add_comment = { max = 1 }
 noop = { max = 1 }
 
-[trigger]
+[github.trigger]
 events = ["issue_comment"]
 roles = ["admin", "maintain", "write"]
 bots = []
