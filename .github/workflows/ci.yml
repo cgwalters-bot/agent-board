@@ -8,11 +8,14 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.ref }}
+  # Do not cancel a green main commit's publication when the next push arrives.
+  group: ci-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: true
 jobs:
   build:
     uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository] Check this revision's release build without publishing.
+    with:
+      release: build-${{ github.sha }}
   specs:
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -107,3 +110,76 @@ jobs:
       - env:
           RESULTS: ${{ toJSON(needs) }}
         run: jq -e 'all(.[]; .result == "success")' <<< "$RESULTS"
+
+  # Main-push only: never sign PR/merge-group artifacts or grant their code OIDC.
+  attest:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: ci
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-board
+          path: dist
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        id: attest
+        with:
+          subject-path: dist/release.json
+      - name: Stage verification bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          mkdir provenance
+          cp "$BUNDLE" provenance/provenance.jsonl
+      - name: Verify without a token
+        run: >-
+          GH_TOKEN='' GITHUB_TOKEN='' gh attestation verify dist/release.json
+          --bundle provenance/provenance.jsonl --repo "$GITHUB_REPOSITORY"
+          --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/ci.yml@refs/heads/main"
+          --source-ref refs/heads/main --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: provenance
+          path: provenance/
+          if-no-files-found: error
+
+  # Only this job can tag/publish; it executes no project code or built binary.
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ci, attest]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: build-${{ github.sha }}
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-board
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: provenance
+      - run: sha256sum --check SHA256SUMS
+      # Explicit creation refuses tag reuse rather than attaching these assets
+      # to another commit. A partial failure needs maintainer cleanup, not force.
+      - name: Tag green commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"
+          -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" --silent
+      - name: Publish prerelease (never Latest)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease --latest=false \
+            --title "$TAG" --notes "Static binaries for green main commit $GITHUB_SHA." \
+            "agent-board-$TARGET" "gh-agent-board-$TARGET" SHA256SUMS release.json provenance.jsonl
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false

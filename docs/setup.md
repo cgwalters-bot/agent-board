@@ -10,10 +10,11 @@ GitHub; see [forges](forges.md) for Forgejo and GitLab.
 
 ## Install
 
-Building agent-board needs Rust supporting edition 2024. No prebuilt release has
-been published yet; the [manual release path](release.md#manual-release-path)
-will provide Linux x86_64 static binaries when dispatched. It is not installable
-with `gh extension install`.
+Building agent-board needs Rust supporting edition 2024. The
+[manual release path](release.md#manual-release-path) provides versioned Linux
+x86_64 static binaries; [commit prereleases](release.md#commit-prereleases)
+provide the same assets for green main commits. It is not installable with
+`gh extension install`.
 
 ```sh
 cargo install --locked --git https://github.com/cgwalters-forge/agent-board agent-board
@@ -55,6 +56,32 @@ you need into a directory on `PATH`, for example
 does not remove the need for the system CA store described above. Callers still
 build from source until their own reviewed configuration adopts release downloads;
 this workflow does not change tracker or enroll agent-board in the release train.
+
+### Download and verify a commit prerelease
+
+Pin a reviewed full 40-character commit independently of downloaded assets, for
+example the caller's `AGENT_BOARD_REV`. Set `COMMIT` to that pin, not current main.
+The tag is `build-$COMMIT`; never resolve Latest to select a pinned build. In an
+empty directory, use a recent GitHub CLI, jq and sha256sum:
+
+```sh
+REPO=cgwalters-forge/agent-board
+TAG="build-$COMMIT"
+gh release download "$TAG" --repo "$REPO" --pattern '*-x86_64-unknown-linux-musl' --pattern SHA256SUMS --pattern release.json --pattern provenance.jsonl
+GH_TOKEN='' GITHUB_TOKEN='' gh attestation verify release.json --bundle provenance.jsonl --repo "$REPO" \
+  --cert-identity "https://github.com/$REPO/.github/workflows/ci.yml@refs/heads/main" \
+  --source-ref refs/heads/main --source-digest "$COMMIT" --deny-self-hosted-runners
+jq -e --arg repo "$REPO" --arg tag "$TAG" --arg commit "$COMMIT" \
+  '.schema == "agent-board.release.v1" and .repository == $repo and .tag == $tag and .commit == $commit and .target == "x86_64-unknown-linux-musl"' release.json
+jq -rj '.sha256sums' release.json > attested-SHA256SUMS
+cmp SHA256SUMS attested-SHA256SUMS
+sha256sum --check attested-SHA256SUMS
+```
+
+Stop on any failure; only then install as above. This policy accepts only CI's
+main-branch attestation for the pinned commit, not the manual release workflow's
+identity. A missing release means publication has not succeeded (or was removed);
+it is not permission to use a different commit or an unverified binary.
 
 ## Try it offline
 
