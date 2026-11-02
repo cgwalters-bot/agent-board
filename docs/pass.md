@@ -1198,9 +1198,13 @@ and its rerun failed on infrastructure; an operator/planner
 edit or replacement is needed. Research or
 triage plans explicitly posted on issues remain manual dispatches.
 
-Choose uniformly among the eligible configured automatic pools, using the same
-draw as poll pacing. Headroom (`target_percent * elapsed_fraction - used_percent`)
-and config order do not weight selection; duplicate names are one ticket.
+Draw among the eligible configured automatic pools, each in proportion to its
+room (`target_percent * elapsed_fraction - used_percent`, or a grant's allowed
+past used), counted from a floor of 1 point to a cap of 100, so a pool just
+past its pace, still within its burst, keeps a small share: room 23 against
+room -3 draws about 96% and 4%. The draw stays random, so every eligible pool
+keeps being exercised; config order does not weight it, a duplicated name
+counts once, and a draw that cannot get entropy waits.
 Exclude held, exhausted, reset, missing or stale readings (snapshot older than
 45 minutes or paced observation older than 30 hours), and readings more than five
 minutes in the future. If none qualifies, wait;
