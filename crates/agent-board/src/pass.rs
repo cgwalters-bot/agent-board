@@ -42,7 +42,7 @@ pub struct Pass {
 
 #[derive(clap::Subcommand)]
 pub enum PassCommand {
-    /// After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake a stale supervisor, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass).
+    /// After an applying pass in GitHub Actions (GITHUB_REPOSITORY, GITHUB_RUN_ID): wait until --wait-minutes after this run started, wake optional stale auxiliary workflows, then dispatch --workflow unless a newer applying run of it on --branch is still to finish; GH_TOKEN needs actions: write (docs/pass.md#the-next-pass).
     Next(Next),
 }
 
@@ -72,6 +72,15 @@ pub struct Next {
     /// An input of the supervisor dispatch, such as session=false. Repeatable.
     #[arg(long, value_name = "NAME=VALUE", value_parser = input, requires = "supervisor_workflow")]
     pub supervisor_input: Vec<(String, String)>,
+    /// A release-train workflow to start before the pass when its newest run on --branch is at least --train-stale-minutes old or is not among its newest 100. All run events count. Its failures only warn. Off unless supplied.
+    #[arg(long, value_name = "FILE", requires = "train_stale_minutes")]
+    pub train_workflow: Option<String>,
+    /// How old the train's newest run may be before it is started; independent of the supervisor.
+    #[arg(long, value_name = "MINUTES", requires = "train_workflow")]
+    pub train_stale_minutes: Option<u64>,
+    /// An input of the train dispatch. Repeatable.
+    #[arg(long, value_name = "NAME=VALUE", value_parser = input, requires = "train_workflow")]
+    pub train_input: Vec<(String, String)>,
     /// Print what would wait and start; wait for and start nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -118,6 +127,13 @@ fn next(args: &Next, out: &mut impl Write) -> Result<()> {
         apply_title: args.apply_title.clone(),
         interval: minutes(args.wait_minutes),
         supervisor,
+        train: match (&args.train_workflow, args.train_stale_minutes) {
+            (Some(file), Some(stale)) => Some(Supervisor {
+                workflow: workflow(file, &args.train_input)?,
+                stale: minutes(stale),
+            }),
+            _ => None,
+        },
         dry_run: args.dry_run,
     };
     settings.validate()?;
@@ -396,4 +412,100 @@ fn print_report(report: &Report, out: &mut impl Write) -> Result<()> {
         report.failures
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod next_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Args {
+        #[command(flatten)]
+        next: Next,
+    }
+
+    #[test]
+    fn next_flag_decoding() {
+        let base = [
+            "next",
+            "--workflow",
+            "pass.yml",
+            "--branch",
+            "main",
+            "--apply-title",
+            "pass (apply)",
+            "--wait-minutes",
+            "10",
+        ];
+        let decode = |extra: &[&str]| {
+            Args::try_parse_from(base.iter().copied().chain(extra.iter().copied()))
+        };
+        let omitted = decode(&[]).unwrap().next;
+        assert!(omitted.train_workflow.is_none());
+        assert!(omitted.train_stale_minutes.is_none());
+        assert!(omitted.train_input.is_empty());
+        let both = decode(&[
+            "--supervisor-workflow",
+            "supervisor.yml",
+            "--supervisor-stale-minutes",
+            "30",
+            "--supervisor-input",
+            "session=false",
+            "--train-workflow",
+            "train.yml",
+            "--train-stale-minutes",
+            "15",
+            "--train-input",
+            "release=true",
+            "--train-input",
+            "prompt=",
+        ])
+        .unwrap()
+        .next;
+        assert_eq!(both.supervisor_stale_minutes, Some(30));
+        assert_eq!(both.train_stale_minutes, Some(15));
+        assert_eq!(
+            both.train_input,
+            [
+                ("release".into(), "true".into()),
+                ("prompt".into(), "".into())
+            ]
+        );
+        for extra in [
+            vec!["--train-workflow", "train.yml"],
+            vec!["--train-stale-minutes", "15"],
+            vec!["--train-input", "release=true"],
+            vec![
+                "--train-workflow",
+                "train.yml",
+                "--train-stale-minutes",
+                "-1",
+            ],
+            vec![
+                "--train-workflow",
+                "train.yml",
+                "--train-stale-minutes",
+                "abc",
+            ],
+            vec![
+                "--train-workflow",
+                "train.yml",
+                "--train-stale-minutes",
+                "15",
+                "--train-input",
+                "release",
+            ],
+            vec![
+                "--train-workflow",
+                "train.yml",
+                "--train-stale-minutes",
+                "15",
+                "--train-input",
+                "=true",
+            ],
+        ] {
+            assert!(decode(&extra).is_err(), "{extra:?}");
+        }
+    }
 }

@@ -10,6 +10,59 @@ fn fixture() -> String {
 }
 
 #[test]
+fn pass_next_rejects_invalid_train_before_token_lookup() {
+    for (extra, diagnostic) in [
+        (
+            vec![
+                "--train-workflow",
+                "../train.yml",
+                "--train-stale-minutes",
+                "15",
+            ],
+            "invalid workflow",
+        ),
+        (
+            vec![
+                "--train-workflow",
+                "train.yml",
+                "--train-stale-minutes",
+                "15",
+                "--train-input",
+                "release=true",
+                "--train-input",
+                "release=false",
+            ],
+            "input release of train.yml given twice",
+        ),
+    ] {
+        let output = command()
+            .args([
+                "pass",
+                "next",
+                "--workflow",
+                "pass.yml",
+                "--branch",
+                "main",
+                "--apply-title",
+                "pass (apply)",
+                "--wait-minutes",
+                "10",
+            ])
+            .args(extra)
+            .env("GITHUB_REPOSITORY", "example/board")
+            .env("GITHUB_RUN_ID", "100")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(err.contains(diagnostic), "{err}");
+    }
+}
+
+#[test]
 fn deploy_preflight_report_is_offline_and_preview_only() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let output = command()

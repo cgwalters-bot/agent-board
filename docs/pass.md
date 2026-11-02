@@ -2388,7 +2388,15 @@ has a default. In order, it:
    the repository starts one), is at least `--supervisor-stale-minutes` old or
    there is none among its newest 100. An unreadable listing is unknown, not
    absent; a failure here only warns, and the chain goes on.
-3. Dispatches `--workflow` on `--branch` with its `--input`s, unless a newer
+3. Independently, with `--train-workflow` and `--train-stale-minutes`, wakes a
+   release-train workflow with its repeatable `--train-input NAME=VALUE`s by
+   the same bounded path. All run events count for the train. The workflow and
+   staleness flags require each other, and inputs require the workflow; omitting
+   them leaves train waking off and existing supervisor behavior unchanged.
+   Both auxiliary workflows can be enabled together, with different thresholds
+   and inputs. Either one's unreadable listing or exhausted retries only warns;
+   it does not prevent the other wake or the next pass.
+4. Dispatches `--workflow` on `--branch` with its `--input`s, unless a newer
    applying run of it on that branch is still queued, waiting, pending,
    requested or in progress: that run continues the chain, so two chains a
    few minutes apart become one. A run applies when it is a `schedule` run, or
@@ -2407,7 +2415,13 @@ it cannot read this run's start or the pass workflow's runs, or cannot start
 the pass. `--dry-run` reads as above but waits for and starts nothing,
 printing what it would wait and start. Only the caller's job conditions
 decide that a pass applied and the chain should go on; cancelling the waiting
-job ends the chain.
+job ends the chain. Dry-run skips retry waits too, even on failed reads, and
+never sends a POST. Each enabled auxiliary workflow adds at most four listing
+GETs (one page of 100 runs) and four dispatch POSTs, with no extra pagination or
+scheduler. Workflow names retain the API-path-segment validation; all listings
+and dispatches target the caller-supplied default `--branch`. There are no
+production workflow names, inputs or wake intervals compiled in, and this
+capability changes no caller configuration or deployment.
 
 ## One configuration file
 
