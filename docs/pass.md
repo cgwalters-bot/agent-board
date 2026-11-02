@@ -1383,6 +1383,17 @@ comment ([Forgejo](forges.md#the-weekly-sweep)):
 
 ## Reruns
 
+To avoid enabling failed agent/review recovery and stacked-retarget branch
+updates merely to retry CI, set `pr.checkReruns: true` (absent or `false` is
+off). It enables only the existing pre-fix failed-check retry and its recovery
+wait below, within the same receipts, one retry per head/check and write caps.
+It does not enable review-job, fix/rebase/continuation, triage or implement
+reruns, or stacked-retarget updates. A completed second check failure follows
+the normal fix/stop path. Legacy `reruns: true` retains all its effects,
+including check retries even when `pr.checkReruns` is absent or false. Neither
+setting classifies infrastructure failures or starts fresh CI. Forgejo refuses
+`pr.checkReruns`, like the other stage 2 options.
+
 A run that failed for a reason outside the work waited for a person: a
 review job failed during a usage outage left a green pull request at review
 required for three hours, and two failed triage runs waited 17 hours for the
@@ -2508,6 +2519,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.headOwners` | Logins whose head repositories the bot may push to, making its PRs there its own for fixes, rebases and merges; only the operator's review counts there; the fix bounds must admit those repositories and branches too; `[]`, the bot's fork alone |
 | `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
+| `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
 | `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, where stage 4b will promote its approved pull requests; the destination comes from here, never a pull request's body; a fork is named once ignoring case, is not its own upstream, nor in `follow` (its main moves only by sync); `base` non-empty; absent or `{}` (off) |

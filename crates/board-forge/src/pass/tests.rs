@@ -5111,6 +5111,22 @@ fn apply_reruns_a_failed_run_once() {
             0,
         ),
         (
+            "check-only does not retry a failed implement run",
+            json!({"pr": {"checkReruns": true}}),
+            vec![run(1)],
+            independent,
+            held,
+            0,
+        ),
+        (
+            "check-only does not retry a failed triage run",
+            json!({"pr": {"checkReruns": true}}),
+            vec![run(1)],
+            triage,
+            held,
+            0,
+        ),
+        (
             "on, its failed run is re-run",
             json!({"reruns": true}),
             vec![run(1)],
@@ -8707,6 +8723,8 @@ fn v1_representative_config() {
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_draft_hours, 4);
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_hours, 24);
     assert_eq!(cfg.pr.merge_queue.as_ref().unwrap().tries, 3);
+    assert!(!cfg.pr.check_reruns && !cfg.poll(None).policy.check_reruns);
+    assert!(cfg.reruns && cfg.poll(None).policy.reruns);
     assert!(cfg.grant().is_some());
     assert!(!cfg.leases && !cfg.triage_close && !cfg.body_plans);
     for (pointer, value) in [
@@ -8734,6 +8752,35 @@ fn config_table() {
     let parsed = Config::parse(&minimal.to_string()).unwrap();
     assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
     assert!(parsed.pr.no_merge.is_empty());
+    assert!(!parsed.pr.check_reruns && !parsed.poll(None).policy.check_reruns);
+    for (edit, checks, reruns) in [
+        (json!({}), false, false),
+        (json!({"pr": {"checkReruns": false}}), false, false),
+        (json!({"pr": {"checkReruns": true}}), true, false),
+        (json!({"reruns": true}), false, true),
+        (
+            json!({"reruns": true, "pr": {"checkReruns": false}}),
+            false,
+            true,
+        ),
+        (
+            json!({"reruns": true, "pr": {"checkReruns": true}}),
+            true,
+            true,
+        ),
+    ] {
+        let mut settings = minimal.clone();
+        settings
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        let parsed = Config::parse(&settings.to_string()).unwrap();
+        let policy = parsed.poll(None).policy;
+        assert_eq!(
+            (parsed.pr.check_reruns, policy.check_reruns, policy.reruns),
+            (checks, checks, reruns)
+        );
+    }
     assert!(parsed.poll(None).policy.no_merge.is_empty());
     for repositories in [
         json!([]),
@@ -8792,6 +8839,12 @@ fn config_table() {
             "config.pr.fixPools[0] is null",
         ),
         (json!({"pr": {"other": 1}}), "unknown field `other`"),
+        (
+            json!({"pr": {"checkReruns": null}}),
+            "config.pr.checkReruns is null",
+        ),
+        (json!({"pr": {"checkReruns": "true"}}), "expected a boolean"),
+        (json!({"pr": {"checkReruns": 1}}), "expected a boolean"),
         (
             json!({"pr": {"reviewPools": ["a"]}}),
             "pr reviewPools needs pr reviewWorkflow, the workflow it starts",
