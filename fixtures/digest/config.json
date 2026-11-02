@@ -1,0 +1,18 @@
+{
+  "owner": "example",
+  "project": 1,
+  "operator": "example-operator",
+  "bot": "example-bot",
+  "follow": ["example/tool", "example/private"],
+  "siteRepository": "example/site",
+  "title": "Weekly notes: week ending {week}",
+  "brief": "Material for {week}, from {since} to {until}.",
+  "task": "Write content/blog/{week}.md from this issue alone. Open a pull request that closes #{issue}.",
+  "priority": "P0",
+  "changesChars": 26000,
+  "releaseBytes": 10000,
+  "bodyBytes": 56000,
+  "dispatchRepository": "example/controller",
+  "dispatchWorkflow": "dispatch.yml",
+  "dispatchRef": "main"
+}

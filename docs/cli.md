@@ -39,6 +39,7 @@ Commands:
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
+- [`digest`](#agent-board-digest): Gather weekly public material and file or reuse its issue; preview unless --apply (docs/digest.md)
 - [`broker`](#agent-board-broker): Probe the inference broker and keep one outage issue open while it is unreachable
 - [`apps`](#agent-board-apps): Create the per-role GitHub Apps (docs/apps.md)
 - [`test`](#agent-board-test): Run the credential-bearing staging integration test
@@ -914,6 +915,21 @@ Options:
 
 - `--config <FILE>`: The train's configuration from a trusted default-branch checkout: the bot, the release repository, the wrappers and callers to pin, labels and thresholds
 - `--apply`: Take the pass's step with GH_TOKEN, the bot's; without it the pass only reads and prints
+
+## agent-board digest
+
+Gather weekly public material and file or reuse its issue; preview unless --apply (docs/digest.md)
+
+```text
+agent-board digest [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: Trusted caller-owned JSON settings; see docs/digest.md
+- `--partial`: Before Sunday 18:00 UTC, file the partial week up to now
+- `--dry-run`: Print the body and intended writes without making them (the default)
+- `--apply`: Create the issue, put it on the board and dispatch, with GH_TOKEN; DISPATCH_TOKEN starts the run if set
 
 ## agent-board broker
 
