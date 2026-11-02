@@ -1,7 +1,7 @@
 //! The Forgejo pass against a real, disposable Forgejo (#515, docs/forges.md
 //! "Live CI"), where the other tests have fakes: `agent-board pass` preview
 //! and capped `--apply`, the board writes, the dispatch adapter and leases,
-//! and stage 3's epic apply and its recovery (#544).
+//! stage 3's epic apply and its recovery (#544), and stage 5/private snapshots.
 //!
 //! Needs a fresh Forgejo at `AGENT_BOARD_TEST_FORGEJO` (`http://127.0.0.1:3000`)
 //! in the container `AGENT_BOARD_TEST_FORGEJO_CONTAINER`, where `docker exec`
@@ -30,7 +30,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -289,8 +289,21 @@ fn start_runner(api: &Api, admin: &str, dir: &Path) -> Runner {
 
 /// A credential-free broker whose reading leaves the `claude` pool room.
 fn broker() -> String {
+    controlled_broker().0
+}
+
+/// Fixed reset/observation times and an explicitly replaceable reading: a
+/// second pass must not depend on how long the live server took to answer.
+fn controlled_broker() -> (String, Arc<Mutex<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/usage", listener.local_addr().unwrap());
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let window = |reset: i64| json!({"utilization": 0.01, "reset": now + reset, "status": "allowed", "observed_at": now - 10});
+    let reading = Arc::new(Mutex::new(
+        json!({"schema": "praxis-broker-usage/v1", "started_at": now - 3600,
+        "anthropic": {"unified_5h": window(4 * 3600), "unified_7d": window(6 * 86400)}}),
+    ));
+    let served = reading.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -301,11 +314,7 @@ fn broker() -> String {
                 line.clear();
             }
             drop(reader);
-            let now = OffsetDateTime::now_utc().unix_timestamp();
-            let window = |reset: i64| json!({"utilization": 0.01, "reset": now + reset, "status": "allowed", "observed_at": now - 10});
-            let body = json!({"schema": "praxis-broker-usage/v1", "started_at": now - 3600,
-                "anthropic": {"unified_5h": window(4 * 3600), "unified_7d": window(6 * 86400)}})
-            .to_string();
+            let body = served.lock().unwrap().to_string();
             let _ = write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -313,7 +322,7 @@ fn broker() -> String {
             );
         }
     });
-    url
+    (url, reading)
 }
 
 /// `agent-board pass` on `config` with `flags`: its success and stdout.
@@ -755,14 +764,15 @@ fn pass_against_live_forgejo() {
     let config = dir.join("epics.json");
     std::fs::write(&config, file.to_string()).unwrap();
     epics(&api, (&admin, admin_id), (&bot, bot_id), &board, &config);
+    publication(&api, &admin, (&bot, bot_id), &file, &dir);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// What stage 3 may change in the fixture repositories: each issue's state,
+/// What the pass may change in the fixture repositories: each issue's state,
 /// labels and comment count, and the caller's runs.
 fn census(api: &Api, token: &str) -> Value {
     let mut issues = Vec::new();
-    for repository in [WORK, PLANS] {
+    for repository in [WORK, PLANS, PUBLICATION] {
         let path = format!("/repos/{repository}/issues?state=all&type=issues&limit=50");
         for issue in api.get(token, &path).as_array().unwrap() {
             let mut labels: Vec<_> = (issue["labels"].as_array().unwrap().iter())
@@ -778,7 +788,271 @@ fn census(api: &Api, token: &str) -> Value {
         }
     }
     issues.sort_by_key(ToString::to_string);
-    json!({"issues": issues, "runs": api.runs(token, WORKFLOW).len()})
+    let runs = api.get(token, &format!("/repos/{CALLER}/actions/runs?limit=50"));
+    assert_eq!(
+        runs["total_count"],
+        runs["workflow_runs"].as_array().unwrap().len()
+    );
+    // The run's embedded repository has asynchronous size/update metadata,
+    // unrelated to dispatch. Compare run identities and lifecycle, not that.
+    let runs: Vec<_> = runs["workflow_runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| json!([r["id"], r["status"], r["updated"]]))
+        .collect();
+    json!({"issues": issues, "runs": runs})
+}
+
+/// Stage 5 and snapshots opt in only on this labelled fixture, not the
+/// dispatch/epic scenario. No caller, agent or deployment is activated.
+fn publication(api: &Api, admin: &str, (bot, bot_id): (&str, u64), file: &Value, dir: &Path) {
+    const MEMBER: &str = "live-status";
+    let existing = api.get(admin, &format!("/repos/{WORK}/labels?limit=50"));
+    let mut ids = BTreeMap::new();
+    for name in [MEMBER, "status/blocked", "status/backlog", "status/done"] {
+        let label = existing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["name"] == name)
+            .cloned()
+            .unwrap_or_else(|| {
+                api.send(admin, "POST", &format!("/repos/{WORK}/labels"),
+                json!({"name": name, "color": "#5f6b7a", "exclusive": name.starts_with("status/")}))
+            });
+        ids.insert(name, label["id"].clone());
+    }
+    let mut numbers = Vec::new();
+    for (title, hold, closed) in [
+        ("Todo", None, false),
+        ("Done", None, true),
+        ("Person blocked", Some("status/blocked"), false),
+        ("Person backlog", Some("status/backlog"), true),
+    ] {
+        let number = issue(api, admin, title, Some("Live status fixture."));
+        let mut labels = vec![ids[MEMBER].clone()];
+        if let Some(hold) = hold {
+            labels.push(ids[hold].clone());
+        }
+        api.send(
+            admin,
+            "POST",
+            &format!("/repos/{WORK}/issues/{number}/labels"),
+            json!({"labels": labels}),
+        );
+        if closed {
+            api.send(
+                admin,
+                "PATCH",
+                &format!("/repos/{WORK}/issues/{number}"),
+                json!({"state": "closed"}),
+            );
+        }
+        numbers.push(number);
+    }
+    let mut on = Vec::new();
+    for title in ["Usage", "Holds"] {
+        let made = api.send(
+            admin,
+            "POST",
+            &format!("/repos/{PUBLICATION}/issues"),
+            json!({"title": title, "body": "Live CI."}),
+        );
+        on.push(made["number"].as_u64().unwrap());
+    }
+    let (url, reading) = controlled_broker();
+    let mut file = file.clone();
+    file.as_object_mut().unwrap().remove("epics");
+    file["board"]["membership"] = json!({"label": MEMBER});
+    file["board"]["statusLabels"] = true.into();
+    file["usage"] = json!({"url": url, "repository": PUBLICATION, "issue": on[0]});
+    file["holds"] = json!({"repository": PUBLICATION, "issue": on[1], "needsYou": true});
+    let config = dir.join("publication.json");
+    std::fs::write(&config, file.to_string()).unwrap();
+    let before = census(api, admin);
+    let (ok, stdout) = pass(&config, bot, &["--max-dispatch", "0"]);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("unset -> Todo") && stdout.contains("unset -> Done"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("a preview does not write it"), "{stdout}");
+    assert_eq!(census(api, admin), before, "publication preview wrote");
+    // Give Status real write headroom, without the two snapshot writes, so
+    // the status cap is not accidentally proved by the global write cap.
+    let mut status_only = file.clone();
+    status_only.as_object_mut().unwrap().remove("holds");
+    for key in ["repository", "issue"] {
+        status_only["usage"].as_object_mut().unwrap().remove(key);
+    }
+    let status_config = dir.join("status-cap.json");
+    std::fs::write(&status_config, status_only.to_string()).unwrap();
+    let (ok, stdout) = pass(
+        &status_config,
+        bot,
+        &[
+            "--apply",
+            "--max-dispatch",
+            "0",
+            "--max-writes",
+            "2",
+            "--max-status-changes",
+            "1",
+        ],
+    );
+    assert!(!ok, "{stdout}");
+    assert!(
+        stdout.contains("2 changes are more than --max-status-changes 1"),
+        "{stdout}"
+    );
+    assert_eq!(census(api, admin), before, "status cap wrote with headroom");
+    let (ok, stdout) = pass(
+        &config,
+        bot,
+        &[
+            "--apply",
+            "--max-dispatch",
+            "0",
+            "--max-writes",
+            "0",
+            "--max-status-changes",
+            "1",
+        ],
+    );
+    assert!(!ok, "{stdout}");
+    assert!(
+        stdout.contains("2 changes are more than --max-status-changes 1"),
+        "{stdout}"
+    );
+    assert_eq!(census(api, admin), before, "refused/capped pass wrote");
+
+    // One write per pass: usage first, then Todo, Done, then holds. Compare
+    // the whole census, not just the intended target, to expose stray writes.
+    let mut expected = before;
+    for (repository, number, label) in [
+        (PUBLICATION, on[0], None),
+        (WORK, numbers[0], Some("status/todo")),
+        (WORK, numbers[1], Some("status/done")),
+        (PUBLICATION, on[1], None),
+    ] {
+        let (ok, stdout) = pass(
+            &config,
+            bot,
+            &[
+                "--apply",
+                "--max-dispatch",
+                "0",
+                "--max-writes",
+                "1",
+                "--max-status-changes",
+                "2",
+            ],
+        );
+        assert!(ok, "{stdout}");
+        assert!(stdout.contains("dispatched 0/0, writes 1/1"), "{stdout}");
+        census_change(&mut expected, repository, number, label);
+        assert_eq!(census(api, admin), expected, "unexpected capped write");
+    }
+    let threads = || {
+        on.iter()
+            .map(|n| {
+                api.get(admin, &format!("/repos/{PUBLICATION}/issues/{n}/comments"))
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .collect::<Vec<_>>()
+    };
+    let original = threads();
+    for (thread, marker) in original
+        .iter()
+        .zip(["<!-- bot-usage v1 -->", "<!-- agent-board-holds v1 -->"])
+    {
+        assert_eq!(thread.len(), 1);
+        let comment = &thread[0];
+        assert_eq!(comment["user"]["id"], bot_id);
+        assert_eq!(comment["created_at"], comment["updated_at"]);
+        OffsetDateTime::parse(comment["created_at"].as_str().unwrap(), &Rfc3339).unwrap();
+        let body = comment["body"].as_str().unwrap();
+        assert!(body.starts_with(marker), "{body}");
+        assert!(fenced(body, "json").is_object());
+        let read = api.get(
+            admin,
+            &format!("/repos/{PUBLICATION}/issues/comments/{}", comment["id"]),
+        );
+        assert_eq!(read, *comment);
+    }
+    let (ok, stdout) = epic_pass(&config, bot, 2);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("usage: unchanged") && stdout.contains("holds: unchanged"),
+        "{stdout}"
+    );
+    assert_eq!(census(api, admin), expected);
+    assert_eq!(threads(), original, "unchanged snapshots were edited");
+    for window in ["unified_5h", "unified_7d"] {
+        reading.lock().unwrap()["anthropic"][window]["utilization"] = json!(0.02);
+    }
+    let (ok, stdout) = epic_pass(&config, bot, 1);
+    assert!(ok, "{stdout}");
+    assert!(
+        stdout.contains("usage: published") && stdout.contains("holds: unchanged"),
+        "{stdout}"
+    );
+    census_change(&mut expected, PUBLICATION, on[0], None);
+    assert_eq!(census(api, admin), expected);
+    let changed = threads();
+    assert_eq!(changed[0].len(), 2);
+    assert_eq!(changed[0][0], original[0][0], "old usage record was edited");
+    assert_eq!(changed[1], original[1], "hold record was edited");
+    let appended = &changed[0][1];
+    assert_ne!(appended["id"], original[0][0]["id"]);
+    assert_eq!(appended["user"]["id"], bot_id);
+    assert_eq!(appended["created_at"], appended["updated_at"]);
+    let body = appended["body"].as_str().unwrap();
+    assert!(body.starts_with("<!-- bot-usage v1 -->"));
+    assert_ne!(
+        fenced(body, "json"),
+        fenced(original[0][0]["body"].as_str().unwrap(), "json")
+    );
+
+    // WORK is already public: no new repository or visibility mutation is
+    // needed to prove both publication options refuse before stage 1.
+    for option in ["usage", "holds"] {
+        let mut public = file.clone();
+        public[option]["repository"] = WORK.into();
+        public[option]["issue"] = numbers[0].into();
+        std::fs::write(&config, public.to_string()).unwrap();
+        let (ok, stdout) = epic_pass(&config, bot, 10);
+        assert!(!ok, "{stdout}");
+        assert!(
+            stdout.contains(&format!("{option}.repository {WORK} is not private")),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("stage 1"), "{stdout}");
+        assert_eq!(census(api, admin), expected, "public publication wrote");
+        assert_eq!(threads(), changed);
+    }
+}
+
+/// Exactly one permitted effect, leaving human holds and every other issue,
+/// comment count and caller run intact.
+fn census_change(census: &mut Value, repository: &str, number: u64, label: Option<&str>) {
+    let key = format!("{repository}#{number}");
+    let issue = census["issues"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|i| i[0] == key)
+        .unwrap();
+    if let Some(label) = label {
+        let labels = issue[2].as_array_mut().unwrap();
+        labels.push(label.into());
+        labels.sort_by_key(ToString::to_string);
+    } else {
+        issue[3] = (issue[3].as_u64().unwrap() + 1).into();
+    }
 }
 
 /// The JSON of `body`'s block fenced as `fence`.

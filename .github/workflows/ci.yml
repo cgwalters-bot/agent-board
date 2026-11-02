@@ -47,7 +47,7 @@ jobs:
   # whose users and tokens the test makes at run time, and a pinned runner
   # container the test starts beside it. No secret of this repository, the
   # workflow's contents: read token and no persisted credentials. Not in the
-  # ci sentinel's needs until it has proven stable.
+  # Required by the ci sentinel, including Status/private snapshot coverage.
   forgejo:
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -99,7 +99,7 @@ jobs:
   # Require only ci in the ruleset, on both PR and merge-group commits.
   ci:
     if: ${{ always() }}
-    needs: [specs, rust, lint, build]
+    needs: [specs, rust, lint, build, forgejo]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions: {}

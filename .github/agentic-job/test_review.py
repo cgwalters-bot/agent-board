@@ -98,7 +98,7 @@ class ReviewContracts(unittest.TestCase):
         self.assertIn("merge_group:\n    types: [checks_requested]", ci)
         sentinel = ci.split("\n  ci:\n", 1)[1]
         self.assertIn("if: ${{ always() }}", sentinel)
-        jobs = ("specs", "rust", "lint", "build")
+        jobs = ("specs", "rust", "lint", "build", "forgejo")
         self.assertIn(f"needs: [{', '.join(jobs)}]", sentinel)
         expression = re.search(r"run: jq -e '([^']+)'", sentinel).group(1)
         for results in itertools.product(("success", "failure", "cancelled", "skipped"), repeat=len(jobs)):

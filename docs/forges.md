@@ -846,16 +846,14 @@ two admits on the container.
 
 ### The caller
 
-No agentic-job Forgejo caller exists. Audited on 30 October 2026: agentic-job
-`a45f34a50bf58b5de70bd00a0881e8272f8c8d96` has no `.forgejo/` or `.gitea/`
-workflows; its `dispatch.yml` is a GitHub workflow (inputs `task`, `repo`,
-`item`, `item-repo`, `kind`, `status-comment`; no `pool` or `base`). What it has
-for Forgejo is `agentic-job apply --forge forgejo` (comments, pull requests,
-labels, issues, closing, statuses; agentic-job#2122, #2123), the prose of its
-off-GitHub collect, check and apply flow, and a CI job that applies to a
-Forgejo service container (agentic-job#2109): a test, not a caller. Tracker,
-actions, agenthome, forge-infra and infra have no Forgejo workflow either, and
-no deployed instance URL is recorded anywhere.
+agentic-job now has a Forgejo Actions caller example at
+[`workflow/forgejo/dispatch.yml`](https://github.com/cgwalters-forge/agentic-job/blob/main/workflow/forgejo/dispatch.yml).
+It declares the six inputs and matching `run-name`, uses caller-provided
+runner labels and bounds, refuses an unsuitable sandbox host, and then
+**unconditionally stops** before the unwired session. Session, check and apply
+integration remains unresolved (agentic-job#2399); this is not an activated
+caller or proof of an agent sandbox. Its separate `apply --forge forgejo`
+and disposable-service CI do not supply that integration either.
 
 Before any Forgejo dispatch is enabled, these are needed, and none is in this
 repository:
@@ -889,8 +887,8 @@ Two proofs, kept apart (#515):
   the bot and their tokens with the server's CLI at run time, with passwords
   nobody keeps; nothing leaves the job. It provisions the work repository
   with the exclusive labels, a private caller with the lease branch and its
-  free slots, and a private publication repository, only checked to read
-  back as private, as the pass publishes nothing on Forgejo yet. Its caller is an inert
+   free slots, and a private publication repository with usage and holds
+   issues. Its caller is an inert
   workflow: `workflow_dispatch` with the six inputs and the `run-name`
   above, and one job that prints them, waits ten seconds and fails when its
   task is `fail`. A second workflow has no `workflow_dispatch`. A Forgejo
@@ -936,6 +934,19 @@ Two proofs, kept apart (#515):
   and the child, a pass records `recovered` with one write and creates
   nothing, and the pass after it writes nothing.
 
+  An isolated membership-labelled fixture then opts into `statusLabels` and
+  private usage/holds publication, with dispatch capped at zero. Preview
+  changes nothing. A low `--max-status-changes` refuses both derived changes;
+  successive `--max-writes 1` applies publish usage, derive and read back Todo
+  and Done, then publish holds. A person's Blocked and closed Backlog stay
+  unchanged. The census compares every fixture issue's state, labels and
+  comment count and all caller runs after each pass, not only the targets.
+  Snapshot comments read back with the bot's id, valid equal creation/update
+  times and the expected markers. A controlled broker reading proves an
+  unchanged pass posts nothing; a changed reading appends usage while leaving
+  both old comments intact. Either publication option targeting the existing
+  public work repository is refused before stage 1 without mutation.
+
   Three things only the live server showed. v17.0.1 serializes a dispatched
   run's `event` as `""` (`HookEventType.Event()` has no case for
   `workflow_dispatch`); only `trigger_event` names it. The adapter had
@@ -946,13 +957,15 @@ Two proofs, kept apart (#515):
   with `null`, not `[]`, and an `X-Total-Count` of that page alone, so every
   epic read as unreadable; the timeline read now takes `null` as its end.
 
-  It proves nothing about agents, the real caller, Status, snapshots or a
+  It proves nothing about agents, the real caller or a
   pass inside Forgejo Actions (it runs as a local pass, with both caps), and
   nothing about other Forgejo or runner versions. Of stage 3 it leaves out
   the planning run, closing a finished epic, the sweep and every refusal:
   a lost or ambiguous create, edited or foreign records, unsupported
   actions and plans cut short at a chosen write are proved offline, against
-  fakes, rather than by timing races here.
+  fakes, rather than by timing races here. Status relabelling races, duplicate
+  labels, edited/foreign snapshots, lost writes and readback mismatches also
+  stay offline; no timestamp, recorder, privacy or readback check is relaxed.
 * **Caller smoke, separately approved.** One no-mutation research run through
   the real caller above, once it exists, on an isolated instance and
   repositories, checking the receipt, run accounting and that check and apply
