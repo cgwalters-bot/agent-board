@@ -65,6 +65,8 @@ pub enum Write {
     FileBug {
         title: String,
         body: String,
+        #[serde(default)]
+        signature: Option<String>,
     },
     Close {
         repository: String,
@@ -184,11 +186,22 @@ pub fn parse_batch(source: &str, policy: &Policy) -> Result<Vec<Checked>> {
     // Reuse the closed dispatch protocol, including its per-pass bound.
     validate_batch(&dispatch.join("\n"), policy)?;
     let mut epics = BTreeSet::new();
+    let mut signatures = BTreeSet::new();
     for r in &requests {
         ensure!(cap(policy, r.action()) > 0, "Supervisor action is disabled");
         r.validate(policy)?;
         if let Checked::Write(Write::PlanEpic { epic, .. }) = r {
             ensure!(epics.insert(epic), "Duplicate epic planning request");
+        }
+        if let Checked::Write(Write::FileBug {
+            signature: Some(signature),
+            ..
+        }) = r
+        {
+            ensure!(
+                signatures.insert(signature),
+                "Duplicate bug signature in batch"
+            );
         }
     }
     // Every target is checked before the first write, so a dispatch could not
@@ -326,7 +339,7 @@ impl Checked {
                     target(p, &p.settings.epics_repository, *epic)?;
                 }
                 Write::Comment { body, .. } => text(body, 4000, true, &p.settings.footer)?,
-                Write::CreateIssue { title, body } | Write::FileBug { title, body } => {
+                Write::CreateIssue { title, body } | Write::FileBug { title, body, .. } => {
                     let repo = p
                         .agent
                         .tracker
@@ -338,6 +351,16 @@ impl Checked {
                     );
                     text(title, 256, true, &p.settings.footer)?;
                     text(body, 4000, true, &p.settings.footer)?;
+                    if let Write::FileBug { signature, .. } = w {
+                        ensure!(
+                            signature.as_deref().is_none_or(valid_signature),
+                            "Malformed bug signature"
+                        );
+                        ensure!(
+                            p.agent.bug_epic.is_none() || signature.is_some(),
+                            "Board bugs require a signature"
+                        );
+                    }
                 }
                 Write::ReplaceState { body } => {
                     let state = p
@@ -459,6 +482,9 @@ impl Checked {
 
     /// Checks the target as it is now; a status update reads its changes.
     pub fn preflight(&mut self, api: &dyn Api, p: &Policy, now: i64) -> Result<()> {
+        if let Self::Write(Write::FileBug { signature, .. }) = self {
+            bug_ready(api, p, signature.as_deref())?;
+        }
         if let Self::Write(Write::PlanEpic { epic, .. }) = self {
             return plan_epic_ready(api, p, *epic, now);
         }
@@ -625,16 +651,56 @@ impl Checked {
                     ),
                     json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE), &p.settings.footer), "assignees": [p.settings.operator], "labels": ["needs-human"]}),
                 ),
-                // Unheld, so the note alone keeps the supervisor from making
-                // the agent's words a later run's brief until a person removes it.
-                Write::FileBug { title, body } => (
-                    "POST",
-                    format!(
-                        "/repos/{}/issues",
-                        p.agent.tracker.as_deref().context("No tracker")?
-                    ),
-                    json!({"title": title, "body": signed(body, Some(crate::input::SUPERVISOR_NOTE), &p.settings.footer)}),
-                ),
+                Write::FileBug {
+                    title,
+                    body,
+                    signature,
+                } => {
+                    // Recheck after admission: earlier writes or another pass
+                    // may already have filed this signature. Callers serialize.
+                    let priority = bug_ready(api, p, signature.as_deref())?;
+                    let note = if p.agent.bug_epic.is_some() {
+                        None
+                    } else {
+                        Some(crate::input::SUPERVISOR_NOTE)
+                    };
+                    let mut body = signed(body, note, &p.settings.footer);
+                    if let Some(signature) = signature {
+                        body = signed(&body, Some(&bug_marker(signature)), &p.settings.footer);
+                    }
+                    let repo = p.agent.tracker.as_deref().context("No tracker")?;
+                    let receipt = api.send(
+                        "POST",
+                        &format!("/repos/{repo}/issues"),
+                        &json!({"title": title, "body": body}),
+                    )?;
+                    if let Some(epic) = p.agent.bug_epic {
+                        let id = receipt["id"].as_u64().context("Created bug has no ID")?;
+                        api.send(
+                            "POST",
+                            &format!(
+                                "/repos/{}/issues/{epic}/sub_issues",
+                                p.settings.epics_repository
+                            ),
+                            &json!({"sub_issue_id": id}),
+                        )?;
+                        let node = receipt["node_id"]
+                            .as_str()
+                            .context("Created bug has no node ID")?;
+                        let added = api.graphql("mutation($project:ID!,$content:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}}", json!({"project":p.agent.project,"content":node}))?;
+                        let item = added["addProjectV2ItemById"]["item"]["id"]
+                            .as_str()
+                            .context("Bug was not added to board")?;
+                        let (field, option) = priority.context("Missing P1 field")?;
+                        let updated = api.graphql("mutation($project:ID!,$item:ID!,$field:ID!,$option:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}", json!({"project":p.agent.project,"item":item,"field":field,"option":option}))?;
+                        ensure!(
+                            updated["updateProjectV2ItemFieldValue"]["projectV2Item"]["id"]
+                                .is_string(),
+                            "Bug Priority update failed"
+                        );
+                    }
+                    return Ok(receipt);
+                }
                 Write::Close {
                     repository, item, ..
                 } => (
@@ -704,6 +770,95 @@ impl Checked {
         Ok(receipt)
     }
 }
+
+fn valid_signature(signature: &str) -> bool {
+    signature.len() == 64
+        && signature
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn bug_marker(signature: &str) -> String {
+    format!("<!-- agent-board-failure-signature: {signature} -->")
+}
+
+pub(super) fn is_filed_bug(body: &str) -> bool {
+    body.contains("<!-- agent-board-failure-signature: ")
+}
+
+/// Stop a compromised supervisor from flooding the board with the same bug,
+/// or choosing an approval parent/Priority in its prose. Missing/truncated
+/// evidence refuses the write; no search index (which can lag issue creation).
+fn bug_ready(
+    api: &dyn Api,
+    p: &Policy,
+    signature: Option<&str>,
+) -> Result<Option<(String, String)>> {
+    if let Some(signature) = signature {
+        let repo = p.agent.tracker.as_deref().context("No tracker")?;
+        let marker = bug_marker(signature);
+        let mut complete = false;
+        for page in 1..=COMMENT_PAGES {
+            let issues = api.get(&format!(
+                "/repos/{repo}/issues?state=open&per_page=100&page={page}"
+            ))?;
+            let issues = issues.as_array().context("Open bugs unavailable")?;
+            ensure!(
+                !issues.iter().any(|i| i["pull_request"].is_null()
+                    && i["user"]["login"] == p.settings.bot
+                    && i["body"]
+                        .as_str()
+                        .is_some_and(|b| b.lines().any(|l| l == marker))),
+                "An open bug already carries this signature"
+            );
+            if issues.len() < 100 {
+                complete = true;
+                break;
+            }
+        }
+        ensure!(complete, "Open bugs truncated");
+    }
+    let Some(epic) = p.agent.bug_epic else {
+        return Ok(None);
+    };
+    target(p, &p.settings.epics_repository, epic)?;
+    let parent = api.get(&format!(
+        "/repos/{}/issues/{epic}",
+        p.settings.epics_repository
+    ))?;
+    ensure!(
+        parent["state"] == "open"
+            && parent["pull_request"].is_null()
+            && has_label(&parent, "epic")
+            && !["needs-human", "needs-design", "question"]
+                .iter()
+                .any(|l| has_label(&parent, l)),
+        "Bug epic is not open and unheld"
+    );
+    let events = paged(api, &p.settings.epics_repository, epic, "events")?;
+    let last = events.iter().rfind(|e| {
+        (e["event"] == "labeled" || e["event"] == "unlabeled") && e["label"]["name"] == "epic"
+    });
+    ensure!(
+        last.is_some_and(|e| e["event"] == "labeled" && e["actor"]["login"] == p.settings.operator),
+        "Bug epic is not operator-approved"
+    );
+    let read = api.graphql("query($id:ID!){node(id:$id){... on ProjectV2{field(name:\"Priority\"){... on ProjectV2SingleSelectField{id options{id name}}}}}}", json!({"id":p.agent.project}))?;
+    let field = &read["node"]["field"];
+    let id = field["id"].as_str().context("Priority field missing")?;
+    let options = field["options"]
+        .as_array()
+        .context("Priority options missing")?;
+    let option = options
+        .iter()
+        .find(|o| o["name"] == "P1")
+        .and_then(|o| o["id"].as_str())
+        .context("P1 option missing")?;
+    Ok(Some((id.to_owned(), option.to_owned())))
+}
+
+#[cfg(test)]
+mod bug_tests;
 
 /// A compromised agent must not activate an unapproved epic, override a
 /// person's hold, or repeatedly spend planning runs on the same epic.

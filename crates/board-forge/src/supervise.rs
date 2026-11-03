@@ -301,6 +301,9 @@ pub struct AgentSettings {
     pub daily_caps: BTreeMap<String, u64>,
     pub state: Option<IssueRef>,
     pub tracker: Option<String>,
+    /// Opt-in successor for file_bug: fixed native parent, board P1 and
+    /// signature deduplication. No request may choose its own approval epic.
+    pub bug_epic: Option<u64>,
     pub project: Option<String>,
     /// The reviewed profile and skill the agent's task starts with
     /// ([`profile`]); without it `compose` and `session` refuse.
@@ -343,6 +346,7 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "profile",
     "skipUnchangedFailures",
     "passConfig",
+    "bugEpic",
 ];
 /// The agent object's other keys, without which it stays off or is refused.
 const AGENT_REQUIRED: &[&str] = &["pool", "cooldownHours", "requests", "log"];
@@ -654,6 +658,17 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         })
         .transpose()?;
     let state = IssueRef::from_json(get("state")?, "supervisor agent.state")?;
+    let bug_epic = get("bugEpic")?
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| *n > 0 && *n < (1u64 << 53))
+                .context("supervisor agent.bugEpic: positive issue number")
+        })
+        .transpose()?;
+    ensure!(
+        bug_epic.is_none() || (tracker.is_some() && project.is_some()),
+        "bugEpic needs tracker and project"
+    );
     if let Some(state) = &state {
         ensure!(
             [&requests, &log]
@@ -677,6 +692,7 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
         daily_caps,
         state,
         tracker,
+        bug_epic,
         project,
         profile: profile::Profile::from_json(get("profile")?)?,
         skip_unchanged_failures: get("skipUnchangedFailures")?
@@ -1187,8 +1203,15 @@ pub(crate) mod tests {
             .collect();
         expected.push(CAPACITY_MARGIN.to_owned());
         expected.extend(
-            ["dailyCaps", "state", "tracker", "project", "passConfig"]
-                .map(|k| format!("agent.{k}")),
+            [
+                "dailyCaps",
+                "state",
+                "tracker",
+                "project",
+                "passConfig",
+                "bugEpic",
+            ]
+            .map(|k| format!("agent.{k}")),
         );
         assert_eq!(s.unset, expected);
         // A named option is set; null is unset.

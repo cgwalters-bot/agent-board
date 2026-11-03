@@ -1,8 +1,7 @@
 //! The health pass: observations read with a read-only token ([`collect`]),
 //! then judged by fixed thresholds ([`evaluate`]). No actor is called here;
-//! in particular, never `poll --apply` to gather facts. Only links reach the
-//! report, never remote titles or text, since the report becomes an agent's
-//! task and a public job summary.
+//! in particular, never `poll --apply` to gather facts. Signature excerpts are
+//! bounded untrusted data, not instructions; other checks publish only links.
 use super::{Api, HOUR_MS, Limits, Release, Settings, encode, iso, millis, run_title, word_repo};
 use crate::plan::DISPATCH_MARKER;
 use crate::poll::author_login as login;
@@ -12,8 +11,26 @@ use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+mod signatures;
+
 /// Each check, in report order, with what to do when it fails.
 pub const CHECKS: &[(&str, &str)] = &[
+    (
+        "signatures",
+        "File one bug for each recurring failure signature without an open bug.",
+    ),
+    (
+        "stranded",
+        "Inspect grouped pass holds and needs-human origins.",
+    ),
+    (
+        "main",
+        "Inspect failing default-branch checks in followed repositories.",
+    ),
+    (
+        "needs-you",
+        "Inspect missing questions and omitted needs-you asks.",
+    ),
     ("poll", "Inspect consecutive failed poll runs."),
     (
         "runs",
@@ -428,11 +445,24 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 // A feature merged off stays off until its option is named
                 // (tracker#733): each one left unset is shown, and only warns.
                 "unset" => items.iter().collect(),
+                "signatures" | "stranded" | "main" | "needs-you" => {
+                    items.iter().filter(|i| i["problem"] != false).collect()
+                }
                 _ => vec![],
             };
             // Bounded, so the agent's task stays inside the wrapper's limit.
             let mut evidence: Vec<&str> = vec![];
             for item in &bad {
+                for url in item["examples"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    if !evidence.contains(&url) {
+                        evidence.push(url);
+                    }
+                }
                 for key in [
                     "html_url",
                     "reason_url",
@@ -460,12 +490,16 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
             } else {
                 "fail"
             };
-            json!({
+            let mut check = json!({
                 "id": id,
                 "status": status,
                 "evidence": evidence,
                 "suggested_action": if bad.is_empty() { "None." } else { action },
-            })
+            });
+            if ["signatures", "stranded", "main", "needs-you"].contains(&id) {
+                check["signatures"] = json!(items);
+            }
+            check
         })
         .collect()
 }
@@ -475,7 +509,7 @@ const OPEN_PULLS: &str = r#"query($owner: String!, $name: String!) { repository(
     url isInMergeQueue isDraft mergeStateStatus author { __typename login } baseRepository { nameWithOwner }
     labels(first: 30) { nodes { name } }
     timelineItems(itemTypes: [LABELED_EVENT], last: 50) { nodes { ... on LabeledEvent { createdAt label { name } } } }
-    comments(last: 10) { nodes { url author { login } } }
+    comments(last: 10) { nodes { databaseId url body createdAt updatedAt author { login } } }
   } }
 } }"#;
 
@@ -1865,6 +1899,10 @@ pub fn collect(
     capture("unqueued", &|o| c.unqueued(got(o, "approved").as_ref()));
     capture("unclosed", &|_| c.unclosed());
     capture("scheduled", &|_| c.scheduled());
+    capture("signatures", &|_| c.failure_signatures());
+    capture("stranded", &|_| c.hold_signatures(false));
+    capture("needs-you", &|_| c.hold_signatures(true));
+    capture("main", &|_| c.main_signatures());
     // From the settings already read: no request.
     capture("unset", &|_| {
         Ok(s.unset.iter().map(|o| json!({"option": o})).collect())

@@ -246,6 +246,7 @@ pub fn compose(
         "dailyUsed": daily_used,
         "state": policy.agent.state.as_ref().map(|s| json!({"repository": s.repository, "issue": s.issue})),
         "tracker": policy.agent.tracker,
+        "bugEpic": policy.agent.bug_epic,
         "project": policy.agent.project,
     });
     // The operator is a checked login ([`Settings::from_json`]), so it
@@ -627,6 +628,12 @@ fn preflight(api: &dyn Api, policy: &Policy, r: &Request) -> Result<()> {
     ensure!(!held, "The issue is the operator's or held");
     conversation(api, &r.repository, r.item, false)?;
     if r.kind == "implement" {
+        // An agent-written bug is data for triage, never the supervisor's
+        // generic implement brief. Only the pass dispatches its accepted plan.
+        ensure!(
+            !issue["body"].as_str().is_some_and(judgment::is_filed_bug),
+            "A filed bug must be implemented by the pass from its accepted triage plan"
+        );
         // The supervisor must not turn an ordinary issue into approved work.
         // Native parentage and the operator's epic label are read, not supplied
         // by the request or inferred from links in attacker-controlled prose.
