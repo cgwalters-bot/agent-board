@@ -1,8 +1,8 @@
 //! The release train, moved from tracker's `.github/release-train/train.cjs`:
 //! cuts a release of the configured repository and moves its callers' pins,
 //! one step a pass, as a person would by hand: the version bump PR, the
-//! release workflow once it merges, the wrappers' pin PR once the release is
-//! out, then each caller's pin PR once that merges. A release cut outside
+//! release workflow once it merges, the optional secure-host image PR once
+//! published, the wrappers' pin PR, then each caller's pin PR once that merges. A release cut outside
 //! the train is followed from the wrappers' pin bump on, so the "due" rule
 //! governs only cutting releases. Every PR goes through its repository's
 //! review and queue like any other.
@@ -30,6 +30,96 @@ pub const REQUEST_LIMIT: u32 = 200;
 pub const PAGE_SIZE: u64 = 100;
 /// Release notes carried into a pin bump's description, in characters.
 const NOTES_LIMIT: usize = 30_000;
+const SECURE_HOST_PIN: &str = "secure-host/Containerfile.pin";
+const SECURE_HOST_IMAGE: &str = "ghcr.io/cgwalters-forge/secure-host";
+
+fn image_pin(version: &str, digest: &str) -> Result<String> {
+    if !digest.strip_prefix("sha256:").is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return stall("secure-host registry returned an invalid sha256 digest");
+    }
+    Ok(format!("FROM {SECURE_HOST_IMAGE}:v{version}@{digest}"))
+}
+
+fn repin_image(files: &[(String, String)], pin: &str) -> Result<Vec<(String, String)>> {
+    let [(path, text)] = files else {
+        return stall("expected one secure-host image pin");
+    };
+    let Some(rest) = text
+        .trim()
+        .strip_prefix(&format!("FROM {SECURE_HOST_IMAGE}:v"))
+    else {
+        return stall("unrecognized secure-host Containerfile.pin");
+    };
+    let Some((version, digest)) = rest.split_once('@') else {
+        return stall("secure-host pin needs tag@digest");
+    };
+    parse_version(version)?;
+    image_pin(version, digest)?;
+    if text.trim() == pin {
+        return stall("secure-host image is already pinned at this release");
+    }
+    Ok(vec![(path.clone(), format!("{pin}\n"))])
+}
+
+/// Bypass the release-tag forwarder: it predates the image that release
+/// publishes. Only secure-host changes source; other actions stay on the release.
+fn repin_host(
+    files: &[(String, String)],
+    merge: &str,
+    version: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut found = 0;
+    let mut out = files.to_vec();
+    for (_, text) in &mut out {
+        // Current wrappers check out policy's source for prepare and run.
+        // Only this local forwarder is replaced; keep the checkout and all
+        // inputs on the step untouched.
+        let local = "./.agentic-job-source/secure-host";
+        let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
+        let mut from = 0;
+        while let Some(at) = text[from..].find(local) {
+            let start = from + at;
+            let end = start + local.len();
+            if !pin_boundary(&text[end..]) {
+                // A configuration path under secure-host/ is not an action.
+                from = end;
+                continue;
+            }
+            text.replace_range(start..end, &replacement);
+            from = start + replacement.len();
+            found += 1;
+        }
+        for repo in ["cgwalters-forge/agentic-job", "cgwalters-forge/actions"] {
+            let needle = format!("{repo}/secure-host@");
+            let mut from = 0;
+            while let Some(at) = text[from..].find(&needle) {
+                let start = from + at;
+                let end = start + needle.len();
+                let pin = pin_at(&text[end..]).context("unrecognized secure-host action pin")?;
+                let len = pin.len();
+                if !pin_boundary(&text[end + len..]) {
+                    return stall("unrecognized secure-host action pin suffix");
+                }
+                let replacement = format!("cgwalters-forge/actions/secure-host@{merge}");
+                text.replace_range(start..end + len, &replacement);
+                from = start + replacement.len();
+                found += 1;
+            }
+        }
+    }
+    if found == 0 {
+        return stall(format!("no secure-host action pin to move for v{version}"));
+    }
+    Ok(out)
+}
+
+fn pin_boundary(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with([' ', '\t', '\n', '\r', '\'', '"', '`'])
+}
 const HOUR_MS: f64 = 3_600_000.0;
 /// How long a dispatched release run may take to show in the listing.
 const DISPATCH_GRACE: time::Duration = time::Duration::HOUR;
@@ -42,6 +132,7 @@ const KEYS: &[&str] = &[
     "labels",
     "wrappers",
     "callers",
+    "secureHost",
 ];
 
 /// A problem with what is to be edited rather than with the API: retrying
@@ -86,6 +177,13 @@ fn status(error: &anyhow::Error) -> Option<u16> {
 /// is another error.
 pub trait Api {
     fn request(&self, method: &str, path: &str, body: &Value) -> Result<Value>;
+
+    /// Resolve the tag once and verify its digest's attestation against the
+    /// release workflow and reviewed source commit. No unverified digest may
+    /// be returned. Implementations must bound their external requests.
+    fn secure_host_digest(&self, _version: &str, _source: &str, _workflow: &str) -> Result<String> {
+        stall("secure-host registry verification is unavailable")
+    }
 }
 
 impl Api for Client {
@@ -148,6 +246,8 @@ pub struct Config {
     pub wrappers: Target,
     /// Repositories that pin the wrappers by commit.
     pub callers: Vec<Target>,
+    /// Off unless configured: publish the image pin before its consumers.
+    pub secure_host: Option<Target>,
 }
 
 fn text(value: &Value, key: &str, what: &str) -> Result<String> {
@@ -232,6 +332,23 @@ impl Config {
         };
         let files = &["repository", "fork", "files"];
         let wrappers = target(&value["wrappers"], "wrappers", files)?;
+        let secure_host = value
+            .get("secureHost")
+            .map(|v| -> Result<Target> {
+                let fork = text(v, "fork", "secureHost")?;
+                check_keys(&[&["fork"]], v, "secureHost")?;
+                validate_repository(&fork)?;
+                ensure!(
+                    release.repository == "cgwalters-forge/agentic-job",
+                    "secureHost requires release.repository cgwalters-forge/agentic-job"
+                );
+                Ok(Target {
+                    repository: "cgwalters-forge/actions".into(),
+                    fork,
+                    files: vec![SECURE_HOST_PIN.into()],
+                })
+            })
+            .transpose()?;
         let callers = value["callers"]
             .as_array()
             .context("callers is not a list")?
@@ -248,6 +365,7 @@ impl Config {
             labels,
             wrappers,
             callers,
+            secure_host,
         })
     }
 
@@ -362,6 +480,8 @@ pub struct Facts {
     /// on the tracking issue, if it did.
     pub dispatched: Option<time::Duration>,
     pub wrappers: Option<Pull>,
+    pub secure_host_enabled: bool,
+    pub secure_host: Option<Pull>,
     /// Each caller's repository and PR.
     pub callers: Vec<(String, Option<Pull>)>,
 }
@@ -370,6 +490,7 @@ pub struct Facts {
 pub enum Step {
     Bump,
     Release,
+    SecureHost,
     Wrappers,
     /// The callers without a PR yet.
     Callers(Vec<String>),
@@ -383,6 +504,7 @@ impl std::fmt::Display for Step {
         match self {
             Step::Bump => f.write_str("bump"),
             Step::Release => f.write_str("release"),
+            Step::SecureHost => f.write_str("secure-host"),
             Step::Wrappers => f.write_str("wrappers"),
             Step::Callers(_) => f.write_str("callers"),
             Step::Done => f.write_str("done"),
@@ -437,6 +559,17 @@ pub fn next(f: &Facts) -> Step {
                 run.conclusion.as_deref().unwrap_or("null")
             )),
         };
+    }
+    if f.secure_host_enabled {
+        let Some(image) = &f.secure_host else {
+            return Step::SecureHost;
+        };
+        if let Some(stall) = closed(image, "the secure-host pin bump") {
+            return stall;
+        }
+        if !image.merged() {
+            return Step::Wait("the secure-host pin bump".into());
+        }
     }
     let Some(wrappers) = &f.wrappers else {
         return Step::Wrappers;
@@ -726,6 +859,16 @@ pub fn repin(
     project: &str,
     to: &Pin,
 ) -> Result<Vec<(String, String)>> {
+    repin_release(files, target, project, to, true)
+}
+
+fn repin_release(
+    files: &[(String, String)],
+    target: &str,
+    project: &str,
+    to: &Pin,
+    require_each: bool,
+) -> Result<Vec<(String, String)>> {
     let from = pin_of(files, target, project)?;
     if from.pin == to.pin {
         return stall(format!("{target} is already pinned at {}", from.pin));
@@ -770,7 +913,7 @@ pub fn repin(
             &escaped(&from.version),
             &escaped(&to.version),
         );
-        if moved == *text {
+        if require_each && moved == *text {
             return stall(format!("{path} has no pin of {target} to move"));
         }
         out.push((path.clone(), moved));
@@ -1450,6 +1593,12 @@ impl Pass<'_> {
             };
         }
         facts.wrappers = self.pull(&c.wrappers, &branch, since)?;
+        if let Some(image) = &c.secure_host {
+            facts.secure_host_enabled = true;
+            // Usually the same repository as wrappers: use a separate branch
+            // so each pass opens only its own producer or consumer PR.
+            facts.secure_host = self.pull(image, &format!("{branch}-secure-host"), since)?;
+        }
         for caller in &c.callers {
             let pr = self.pull(caller, &branch, since)?;
             facts.callers.push((caller.repository.clone(), pr));
@@ -1598,8 +1747,75 @@ impl Pass<'_> {
                 }
                 Ok(())
             }
+            Step::SecureHost => {
+                let (sha, _) = self.origin(version, facts)?;
+                let digest = self
+                    .api
+                    .secure_host_digest(version, &sha, &c.workflow)
+                    .map_err(|e| {
+                        Stall(format!(
+                            "secure-host:v{version} could not be verified: {e:#}"
+                        ))
+                    })?;
+                let pin = image_pin(version, &digest)?;
+                let target = c
+                    .secure_host
+                    .as_ref()
+                    .context("secure-host is not configured")?;
+                let why = format!(
+                    "Moves secure-host to the verified image for {project} v{version}, through the release train ({}).",
+                    issue.html_url
+                );
+                let text = Text {
+                    title: format!("secure-host: Pin {project} v{version}"),
+                    body: why.clone(),
+                    why,
+                };
+                let url = self.open(
+                    target,
+                    &format!("{branch}-secure-host"),
+                    &text,
+                    &target.files,
+                    |files| repin_image(files, &pin),
+                )?;
+                self.comment(
+                    issue,
+                    &format!(
+                        "Opened the secure-host pin bump: {}",
+                        url.as_deref().unwrap_or("(dry run)")
+                    ),
+                )
+            }
             Step::Wrappers => {
                 let (sha, origin) = self.origin(version, facts)?;
+                let host = if let Some(image) = &c.secure_host {
+                    let merge = facts
+                        .secure_host
+                        .as_ref()
+                        .and_then(|p| p.merge_commit_sha.as_deref())
+                        .context("the secure-host pin bump has no merge commit")?;
+                    self.on_default(&image.repository, merge, "the secure-host pin bump")?;
+                    // Re-resolve and verify the release digest; do not trust PR
+                    // metadata to say what image its reviewed merge contains.
+                    let digest = self
+                        .api
+                        .secure_host_digest(version, &sha, &c.workflow)
+                        .map_err(|e| {
+                            Stall(format!(
+                                "secure-host:v{version} could not be verified: {e:#}"
+                            ))
+                        })?;
+                    let expected = image_pin(version, &digest)?;
+                    let files = self.contents(&image.repository, merge, &image.files)?;
+                    if files[0].1.trim() != expected {
+                        return stall(
+                            "the merged secure-host pin does not match the verified release digest",
+                        );
+                    }
+                    Some(merge.to_owned())
+                } else {
+                    None
+                };
                 let why = format!(
                     "Moves the wrappers to {project} v{version} so callers get its changes, through the release train.{origin}"
                 );
@@ -1615,9 +1831,28 @@ impl Pass<'_> {
                     version: version.into(),
                 };
                 let target = &c.release.repository;
-                let url = self.open(&c.wrappers, branch, &text, &c.wrappers.files, |files| {
-                    repin(files, target, project, &to)
-                })?;
+                let url =
+                    self.open(
+                        &c.wrappers,
+                        branch,
+                        &text,
+                        &c.wrappers.files,
+                        |files| match &host {
+                            Some(merge) => {
+                                let moved = repin_release(files, target, project, &to, false)?;
+                                let moved = repin_host(&moved, merge, version)?;
+                                for ((path, before), (_, after)) in files.iter().zip(&moved) {
+                                    if before == after {
+                                        return stall(format!(
+                                            "{path} has no release or secure-host pin to move"
+                                        ));
+                                    }
+                                }
+                                Ok(moved)
+                            }
+                            None => repin(files, target, project, &to),
+                        },
+                    )?;
                 let url = url.as_deref().unwrap_or("(dry run)");
                 self.comment(issue, &format!("Opened the wrappers' pin bump: {url}"))
             }

@@ -1,0 +1,21 @@
+# Relevant wrapper smoke steps from actions/.github/workflows/secure-host.yml
+# (2026-11-03); release pins substituted by the recorded repository fixture.
+jobs:
+  wrapper-policy:
+    uses: cgwalters-forge/agentic-job/.github/workflows/policy.yml@RELEASE_PIN # agentic-job vVERSION
+  wrapper-sandbox:
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: cgwalters-forge/agentic-job
+          ref: RELEASE_PIN # agentic-job vVERSION
+          path: .agentic-job-source
+          persist-credentials: false
+      - uses: ./.agentic-job-source/prepare
+        with:
+          job-dir: /var/tmp/agentic-job
+      - uses: ./.agentic-job-source/secure-host
+        with:
+          config: ${{ runner.temp }}/agentic-job-host.toml
+      - name: The sandbox CLI matches the policy binary
+        run: python3 workflow/sandbox-binary-check.py

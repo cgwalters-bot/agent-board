@@ -53,9 +53,48 @@ fn decoded(path: &str) -> String {
 }
 
 impl Api for Fake {
+    fn secure_host_digest(&self, version: &str, source: &str, workflow: &str) -> Result<String> {
+        let responses = self.responses.borrow();
+        let image = responses
+            .get(&format!("registry/secure-host:v{version}"))
+            .context("published image tag is missing")?;
+        let digest = image["digest"].as_str().context("missing digest")?;
+        ensure!(
+            image["attestedDigest"] == digest,
+            "attestation digest mismatch"
+        );
+        ensure!(
+            image["source"] == source && image["workflow"] == workflow,
+            "attestation source or workflow mismatch"
+        );
+        Ok(digest.into())
+    }
+
     fn request(&self, method: &str, path: &str, body: &Value) -> Result<Value> {
         if method != "GET" {
             assert!(self.apply, "a preview wrote: {method} {path}");
+            if path.ends_with("/git/trees") {
+                let responses = self.responses.borrow();
+                if let Some(expected) = responses
+                    .get("expectedTreeContent")
+                    .and_then(Value::as_array)
+                {
+                    let content: String = body["tree"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|entry| entry["content"].as_str().unwrap())
+                        .collect();
+                    for needle in expected {
+                        assert!(content.contains(needle.as_str().unwrap()), "{content}");
+                    }
+                    assert!(
+                        !content.contains("uses: ./.agentic-job-source/secure-host\n")
+                            && !content.contains("uses: ./.agentic-job-source/secure-host #"),
+                        "{content}"
+                    );
+                }
+            }
             let mut writes = self.writes.borrow_mut();
             writes.push(format!("{method} {path}"));
             let id = writes.len();
@@ -85,6 +124,226 @@ impl Api for Fake {
 fn fixture(name: &str) -> Value {
     let (_, text, _) = CASES.iter().find(|(n, _, _)| *n == name).unwrap();
     serde_json::from_str(text).unwrap()
+}
+
+/// Extend the recorded repositories with an injected registry, without live
+/// registry access or a token. The producer and consumer share the image fixture.
+fn host_fixture() -> Value {
+    let mut f = fixture("wrappers-887");
+    f["config"]["secureHost"] = json!({"fork": "cgwalters-bot/actions-1"});
+    let r = &mut f["responses"];
+    r["registry/secure-host:v0.6.4"] = json!({
+        "digest": format!("sha256:{}", "a".repeat(64)),
+        "attestedDigest": format!("sha256:{}", "a".repeat(64)),
+        "source": "732db8c24295ee8d4a79de19f588e6f871d35fe0", "workflow": "release.yml"
+    });
+    r["/repos/cgwalters-forge/actions/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4-secure-host&per_page=100"] =
+        json!([]);
+    r["/repos/cgwalters-forge/actions/pulls?state=open&head=cgwalters-bot:release-train/v0.6.4-secure-host&per_page=100"] =
+        json!([]);
+    let old = image_pin("0.6.3", &format!("sha256:{}", "b".repeat(64))).unwrap();
+    r["/repos/cgwalters-forge/actions/contents/secure-host/Containerfile.pin?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"] =
+        json!({"encoding": "base64", "content": base64(&format!("{old}\n"))});
+    let wrapper = &mut r["/repos/cgwalters-forge/actions/contents/.github/workflows/cgwalters-agentic-job.yml?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"];
+    let text = decode(&wrapper["content"]).unwrap();
+    let pin = pin_of(
+        &[("wrapper".into(), text)],
+        "cgwalters-forge/agentic-job",
+        "agentic-job",
+    )
+    .unwrap();
+    let wrapper_text = include_str!("../../../../fixtures/release-train/host-wrapper.yml")
+        .replace("RELEASE_PIN", &pin.pin)
+        .replace("VERSION", &pin.version);
+    wrapper["content"] = json!(base64(&wrapper_text));
+    let smoke = include_str!("../../../../fixtures/release-train/host-smoke.yml")
+        .replace("RELEASE_PIN", &pin.pin)
+        .replace("VERSION", &pin.version);
+    r["/repos/cgwalters-forge/actions/contents/.github/workflows/smoke.yml?ref=53194b6ef757138027b8e4a7cca110cdfff08b19"] =
+        json!({"encoding": "base64", "content": base64(&smoke)});
+    f["config"]["wrappers"]["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(".github/workflows/smoke.yml"));
+    f
+}
+
+fn host_merged(f: &mut Value) {
+    let mut pr = f["responses"]["/repos/cgwalters-forge/agentic-job/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4&per_page=100"][0].clone();
+    pr["head"]["ref"] = json!("release-train/v0.6.4-secure-host");
+    pr["head"]["repo"]["full_name"] = json!("cgwalters-bot/actions-1");
+    pr["base"]["repo"]["full_name"] = json!("cgwalters-forge/actions");
+    pr["merge_commit_sha"] = json!("c".repeat(40));
+    let r = &mut f["responses"];
+    r["/repos/cgwalters-forge/actions/pulls?state=all&head=cgwalters-bot:release-train/v0.6.4-secure-host&per_page=100"] =
+        json!([pr]);
+    r[format!(
+        "/repos/cgwalters-forge/actions/compare/main...{}",
+        "c".repeat(40)
+    )] = json!({"status": "behind"});
+    let pin = image_pin("0.6.4", &format!("sha256:{}", "a".repeat(64))).unwrap();
+    r[format!(
+        "/repos/cgwalters-forge/actions/contents/secure-host/Containerfile.pin?ref={}",
+        "c".repeat(40)
+    )] = json!({"encoding": "base64", "content": base64(&format!("{pin}\n"))});
+}
+
+#[test]
+fn secure_host_producer_precedes_wrappers_and_refuses_unverified_images() {
+    let mut f = host_fixture();
+    f["responses"]["expectedTreeContent"] =
+        json!([image_pin("0.6.4", &format!("sha256:{}", "a".repeat(64))).unwrap()]);
+    let output = replay(&f, true).unwrap();
+    assert!(output.contains("v0.6.4: secure-host\n"), "{output}");
+    assert!(output.contains("changing secure-host/Containerfile.pin"));
+    assert!(!output.contains("Opened the wrappers' pin bump"));
+    for (key, value, reason) in [
+        ("registry/secure-host:v0.6.4", Value::Null, "missing digest"),
+        (
+            "registry/secure-host:v0.6.4",
+            json!({"digest": format!("sha256:{}", "a".repeat(64)), "attestedDigest": format!("sha256:{}", "b".repeat(64))}),
+            "digest mismatch",
+        ),
+    ] {
+        let mut broken = f.clone();
+        broken["responses"][key] = value;
+        let output = replay(&broken, true).unwrap();
+        assert!(
+            output.contains("Halted:") && output.contains(reason),
+            "{output}"
+        );
+        assert!(!output.contains("/git/trees"), "{output}");
+    }
+    let mut missing = f.clone();
+    missing["responses"]
+        .as_object_mut()
+        .unwrap()
+        .remove("registry/secure-host:v0.6.4");
+    assert!(
+        replay(&missing, true)
+            .unwrap()
+            .contains("published image tag is missing")
+    );
+}
+
+#[test]
+fn wrappers_select_the_actions_commit_containing_the_matching_release_image() {
+    let mut f = host_fixture();
+    host_merged(&mut f);
+    f["responses"]["expectedTreeContent"] = json!([
+        format!("cgwalters-forge/actions/secure-host@{}", "c".repeat(40)),
+        "run: python3 workflow/sandbox-binary-check.py",
+        "cgwalters-forge/agentic-job/.github/workflows/policy.yml@732db8c24295ee8d4a79de19f588e6f871d35fe0",
+        "uses: ./.agentic-job-source/prepare",
+        "uses: ./.agentic-job-source/run",
+        "config: ${{ runner.temp }}/agentic-job-host.toml",
+        "ref: ${{ needs.policy.outputs.source-sha }}"
+    ]);
+    let output = replay(&f, true).unwrap();
+    assert!(output.contains("v0.6.4: wrappers\n"), "{output}");
+    assert!(output.contains("Opened the wrappers' pin bump"), "{output}");
+    let path = format!(
+        "/repos/cgwalters-forge/actions/contents/secure-host/Containerfile.pin?ref={}",
+        "c".repeat(40)
+    );
+    f["responses"][path]["content"] = json!(base64(
+        &image_pin("0.6.3", &format!("sha256:{}", "a".repeat(64))).unwrap()
+    ));
+    let output = replay(&f, true).unwrap();
+    assert!(
+        output.contains("does not match the verified release digest"),
+        "{output}"
+    );
+    assert!(!output.contains("/git/trees"));
+}
+
+#[test]
+fn complete_wrapper_edit_updates_quoted_remote_pins_and_assertions() {
+    for quote in ["'", "\"", "`"] {
+        let mut f = host_fixture();
+        host_merged(&mut f);
+        let path = "/repos/cgwalters-forge/actions/contents/.github/workflows/smoke.yml?ref=53194b6ef757138027b8e4a7cca110cdfff08b19";
+        f["responses"][path]["content"] = json!(base64(&format!(
+            "uses: {quote}cgwalters-forge/actions/secure-host@{}{quote}\n",
+            "d".repeat(40)
+        )));
+        f["responses"]["expectedTreeContent"] = json!([format!(
+            "{quote}cgwalters-forge/actions/secure-host@{}{quote}",
+            "c".repeat(40)
+        )]);
+        let output = replay(&f, true).unwrap();
+        assert!(output.contains("Opened the wrappers' pin bump"), "{output}");
+    }
+}
+
+#[test]
+fn host_action_pins_bypass_the_forwarder_and_follow_subsequent_releases() {
+    for repo in ["cgwalters-forge/agentic-job", "cgwalters-forge/actions"] {
+        let files = vec![(
+            "workflow.yml".into(),
+            format!(
+                "uses: {repo}/secure-host@{} # agentic-job v0.6.3\nuses: cgwalters-forge/agentic-job/run@{}\n",
+                "a".repeat(40),
+                "a".repeat(40)
+            ),
+        )];
+        let moved = repin_host(&files, &"b".repeat(40), "0.6.4").unwrap();
+        assert!(moved[0].1.contains(&format!(
+            "uses: cgwalters-forge/actions/secure-host@{}",
+            "b".repeat(40)
+        )));
+        assert!(moved[0].1.contains(&format!(
+            "uses: cgwalters-forge/agentic-job/run@{}",
+            "a".repeat(40)
+        )));
+    }
+    assert!(repin_host(&[], &"b".repeat(40), "0.6.4").is_err());
+}
+
+#[test]
+fn optional_host_stage_waits_for_review_and_is_off_by_default() {
+    let f = host_fixture();
+    assert!(
+        Config::from_json(&fixture("wrappers-887")["config"])
+            .unwrap()
+            .secure_host
+            .is_none()
+    );
+    let mut config = f["config"].clone();
+    assert_eq!(
+        Config::from_json(&config)
+            .unwrap()
+            .secure_host
+            .unwrap()
+            .files,
+        [SECURE_HOST_PIN]
+    );
+    for bad in [
+        json!(null),
+        json!({"fork": "bad"}),
+        json!({"fork": "bot/actions", "image": "other"}),
+    ] {
+        config["secureHost"] = bad;
+        assert!(Config::from_json(&config).is_err());
+    }
+    let mut facts = Facts {
+        secure_host_enabled: true,
+        ..Facts::default()
+    };
+    assert_eq!(next(&facts), Step::Bump);
+    facts.release = Some(json!({}));
+    assert_eq!(next(&facts), Step::SecureHost);
+    facts.secure_host = Some(Pull {
+        state: "open".into(),
+        ..Pull::default()
+    });
+    assert!(matches!(next(&facts), Step::Wait(_)));
+    facts.secure_host.as_mut().unwrap().state = "closed".into();
+    assert!(matches!(next(&facts), Step::Stall(_)));
+    facts.secure_host.as_mut().unwrap().merged_at = Some("merged".into());
+    assert_eq!(next(&facts), Step::Wrappers);
+    facts.secure_host.as_mut().unwrap().stray = Some("skipped review".into());
+    assert!(matches!(next(&facts), Step::Stall(_)));
 }
 
 /// The pass's lines, then its writes; or its error.
