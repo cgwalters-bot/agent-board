@@ -8837,6 +8837,42 @@ fn config_table() {
     let reviewed = Config::parse(&reviewed.to_string()).unwrap();
     assert_eq!(reviewed.poll(None).policy.review_pools, ["b", "a"]);
     assert!(parsed.poll(None).policy.review_pools.is_empty());
+    assert!(
+        parsed
+            .poll(None)
+            .policy
+            .review_dispatch_repositories
+            .is_empty()
+    );
+    let mut routed = minimal.clone();
+    routed["follow"] = json!(["o/r"]);
+    routed["pr"] = json!({"reviewWorkflow": "review.yml", "reviewPools": ["a"],
+        "reviewDispatchRepositories": ["O/R"]});
+    assert_eq!(
+        Config::parse(&routed.to_string())
+            .unwrap()
+            .poll(None)
+            .policy
+            .review_dispatch_repositories,
+        ["O/R"]
+    );
+    for bad in [
+        json!(["o/other"]),
+        json!(["o/*"]),
+        json!(true),
+        json!(null),
+        json!(
+            (0..=POLL_REPOSITORY_LIMIT)
+                .map(|_| "o/r")
+                .collect::<Vec<_>>()
+        ),
+    ] {
+        routed["pr"]["reviewDispatchRepositories"] = bad.clone();
+        assert!(Config::parse(&routed.to_string()).is_err(), "{bad}");
+    }
+    routed["pr"]["reviewDispatchRepositories"] = json!(["o/r"]);
+    routed["pr"]["reviewPools"] = json!([]);
+    assert!(Config::parse(&routed.to_string()).is_err());
     let usage = json!({"url": "http://b.example/usage", "repository": "o/ops", "issue": 1});
     for (edit, error) in [
         (json!({"extra": 1}), "unknown field `extra`"),

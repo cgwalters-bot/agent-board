@@ -1742,6 +1742,99 @@ was not read, is said too; the holds of its items may still stall.
 
 ## Reviews
 
+### Ordinary dispatched reviews (opt-in)
+
+`pr.reviewDispatchRepositories`, absent or `[]` by default, selects exact base
+repositories from `follow` (at most 50). It needs `pr.reviewPools` and the existing
+`pr.reviewWorkflow` setting; repositories not selected keep the legacy route
+below. Nothing in tracker or any live caller is enabled by this change.
+
+The concrete threats are an unassociated author spending the shared inference
+budget, a read-only commenter starting paid work, a lost POST response starting
+the same work twice, and a review of another head or workflow authorizing a
+merge. This route uses the existing pacing, Priority order, WIP, dispatch caps
+and claim/reservation protocol, not a second queue or an unpaced fallback.
+
+For selected repositories, stage 2 considers at most ten additional open pull
+requests per pass, independent of `mergeAuthors`, and performs ordinary intake
+on at most ten PRs total. Existing merge/fix processing is not capped by these
+intake limits. Drafts, private repositories and human
+holds still get no review. Automatic admission reads the base repository's
+default-branch `workflow/review.toml`: exact `hosts`, `repos`, `bases`,
+`github.trigger.events`, `roles`, `bots` and `forks`. Only the current deployment
+policy shape is supported: `roles = ["all"]` plus an author association of
+OWNER, MEMBER or COLLABORATOR, or an otherwise-unassociated Bot whose login is
+in policy `bots` **and** whose numeric ID is in the base-owned Actions variable
+`REVIEW_BOT_IDS` (the pass token needs Actions variables read permission).
+No login-only bot exception is added. Both policies, including unreadable or
+missing policies, are cached per base repository for the pass. Policies are limited to
+64 KiB; unsupported trigger fields and unreadable facts fail closed. Wildcard
+host/repository/base policies are not interpreted by this intake. The caller
+still independently enforces its full bounds and isolates the head as data.
+
+Polling also reads the whole PR comment history for a person's exact `/review`
+comment, but adds at most one REST page of 100 comments per intake PR; if more
+pages exist it skips intake, never authorizing from partial history. The bot's
+existing complete merge/fix history reads are unchanged. Commands allow surrounding
+whitespace. It reads `workflow/review-command.toml` from the same trusted
+default branch, checks repo/base/event/forks/commands, and asks the **base**
+repository for the actor's current permission. Only admin, maintain or write
+listed in policy `roles` counts; association alone does not. Permission reads,
+including failures, are cached per actor, with at most ten distinct actors per
+pass. An unreadable command policy or actor skips that command route and falls
+back to automatic admission, without blocking existing merge/fix processing. A command can
+request another review of an already-reviewed head. Requests are taken oldest
+unconsumed first; each reservation keys the comment ID **and** head in the
+existing `review_head` field as `SHA/COMMENT_ID`, and its claim uses that same
+key. A command is consumed once regardless of subsequent head changes; only
+automatic admission or a new command can authorize a new head. A preview, paced
+hold or dispatch cap consumes nothing. The latest consumed request for the
+current head remains observable for its run/retry;
+explicit later requests can ask for another run.
+
+Starts go to `dispatch.yml` in the PR's **base repository**, from its default
+branch, with string inputs `kind=review`, `repo=OWNER/REPO`, `item=N`, `head=SHA`
+(the expected head), `pool=P` and a fixed `task` asking for the base-owned review
+task/bounds. Callers must expose these inputs, require a valid pool, reject a
+moved head, and publish `review OWNER/REPO#N SHA (POOL)` as their run name. The
+pass rechecks open/ready/head/base/hold immediately before taking a deferred
+start or rerun. `dispatch.yml` runs are recognized only with the existing
+base-repository, workflow, default-branch and exact head-title checks. A caller
+workflow already inventoried by pass is not counted a second time as an external
+review workflow. Superseded heads' active runs still occupy capacity.
+
+Review intake does **not** widen merge authority. The verdict reader retains
+its immutable Actions bot ID, current head, public bot-fork scope, cited run,
+dedicated `pr.reviewWorkflow`, base repository and submission-time checks. A
+general `dispatch.yml` run is not merge/fix provenance, even with a review-shaped
+title; caller kind/title attestation remains unproved. An ordinary review of a
+Dependabot, operator or in-repository branch is not new permission to merge it.
+
+There is no event cursor to lose: after an outage the next visit rescans waiting
+heads and unconsumed comments, through the same bounded machinery. A run that
+failed gets the existing one failed-jobs rerun with `reruns`; another failure,
+a completed run with no verified verdict, or a stranded claim/reservation is
+reported for human recovery, not blindly redispatched. Such intake holds on the
+bot's or `mergeAuthors` PRs fall through to their normal decision, so they cannot
+hide conflicts, fix rounds or existing needs-human handling. The existing one-page
+run-history window and ten-minute ambiguous-start wait below still apply.
+If reads cannot finish within a pass, the error is reported and the next visit
+tries again; no partial history authorizes a start.
+
+Offline transport tests cover the author classes, commands/permissions,
+duplicate passes, new heads, failed-job retries, lost dispatch responses,
+cache-free outage catch-up, and shared WIP. **Still unproved:** the actions
+wrapper's expected-head contract and real checked review submission, deployed
+`dispatch.yml` inputs/run names and reviewed pins, token permissions, broker and
+tailnet admission, live cancellation, and a live outage/cutover/rollback. The
+actions wrapper slice (actions#174) and caller changes must land before enabling
+this option. No live review workflow has exercised this route. Tracker's future
+pilot setting is `.github/pass.json`: `pr.reviewDispatchRepositories =
+["cgwalters-forge/review"]`, together with a nonempty `pr.reviewPools` drawn from
+its configured pools. Do not turn it on before the coordinated caller cutover.
+
+### Legacy review workflow route
+
 The review job starts on every `pull_request_target` push, on the model the
 repository's variables fix, out of sight of the pass's pacing, pools and
 WIP: on 28 October about 95 reviews took a subscription to 79% of its weekly
@@ -2568,6 +2661,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `state` | Optional disposable poll-cache path; absent means fresh reads |
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
+| `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |

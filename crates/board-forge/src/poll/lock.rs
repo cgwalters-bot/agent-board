@@ -497,6 +497,7 @@ mod tests {
             caps: None,
             writes: 0,
             review_runs: BTreeMap::new(),
+            review_intake: Default::default(),
             reviewing: 0,
             review_unread: None,
             deferred: Vec::new(),
