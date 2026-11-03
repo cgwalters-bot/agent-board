@@ -3,6 +3,7 @@ mod apps;
 mod ask;
 mod broker;
 mod budget;
+mod ci_health;
 mod cli_docs;
 mod cost;
 mod decisions;
@@ -176,6 +177,8 @@ enum Command {
     Budget(budget::Budget),
     /// What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md).
     Cost(cost::Cost),
+    /// Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md).
+    CiHealth(ci_health::CiHealth),
     /// Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md).
     Prune(prune::Prune),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
@@ -1199,6 +1202,29 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             budget::run(
                 args,
                 board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
+        }
+        Command::CiHealth(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "ci-health reads --config only; use --format json, not --json"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            ci_health::run(
+                args,
+                || {
+                    Ok(board_forge::github::Client::from_env()?
+                        .retry_within(std::time::Instant::now()))
+                },
                 &mut io::stdout().lock(),
             )
         }

@@ -35,6 +35,7 @@ Commands:
 - [`release`](#agent-board-release): Free a run's lease, as its last step
 - [`budget`](#agent-board-budget): What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree)
 - [`cost`](#agent-board-cost): What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md)
+- [`ci-health`](#agent-board-ci-health): Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md)
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
@@ -758,6 +759,20 @@ Options:
 - `--date <DATE>`: The UTC day, YYYY-MM-DD, whose completed runs count; not after today
 - `--human`: Print a short table instead of the agent-board/cost-day/v1 JSON
 - `--cache <DIR>`: A directory that keeps each run's summary.json by run id, so that a run read once is never downloaded again
+
+## agent-board ci-health
+
+Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md)
+
+```text
+agent-board ci-health [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: Trusted JSON with explicit targets and an optional reviewed classification index
+- `--until <UNTIL>`: Exclusive UTC date YYYY-MM-DD; defaults to today (30 complete UTC days)
+- `--format <FORMAT>`: Stable JSON report or a concise human summary with coverage warnings (possible values: `json`, `human`) (default: `json`)
 
 ## agent-board prune
 
