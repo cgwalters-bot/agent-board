@@ -774,6 +774,9 @@ pub struct Pr {
     /// empty leaves reviews to the job's `pull_request_target` runs.
     #[serde(default)]
     pub review_pools: Vec<String>,
+    /// Base repositories whose reviews use ordinary dispatch and separate intake.
+    #[serde(default)]
+    pub review_dispatch_repositories: Vec<String>,
     #[serde(default)]
     pub fix_pools: Vec<String>,
     pub toil_fix_pool: Option<String>,
@@ -1150,6 +1153,21 @@ impl Config {
             validate_workflow(workflow)?;
         }
         ensure!(
+            self.pr.review_dispatch_repositories.len() <= POLL_REPOSITORY_LIMIT,
+            "pr reviewDispatchRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
+        );
+        for repo in &self.pr.review_dispatch_repositories {
+            poll::validate_repository(repo)?;
+            ensure!(
+                self.follow.iter().any(|r| r.eq_ignore_ascii_case(repo)),
+                "pr reviewDispatchRepositories repository {repo} is not followed"
+            );
+        }
+        ensure!(
+            self.pr.review_dispatch_repositories.is_empty() || !self.pr.review_pools.is_empty(),
+            "pr reviewDispatchRepositories needs pr reviewPools"
+        );
+        ensure!(
             self.pr.review_pools.is_empty() || self.pr.review_workflow.is_some(),
             "pr reviewPools needs pr reviewWorkflow, the workflow it starts"
         );
@@ -1283,6 +1301,7 @@ impl Config {
             check_reruns: self.pr.check_reruns,
             owner_branches: self.pr.owner_branches,
             review_pools: self.pr.review_pools.clone(),
+            review_dispatch_repositories: self.pr.review_dispatch_repositories.clone(),
             ..PollPolicy::default()
         };
         poll::Config {
@@ -2981,6 +3000,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !config.pr.review_pools.is_empty() {
             let (wip, ranks) = self.review_bounds(git_ref, earlier);
             poll.policy.review_wip = wip;
+            poll.policy.review_caller_workflow = Some(config.dispatch_workflow.clone());
             poll.policy.review_ranks = ranks;
         }
         let apply = self.apply.then(|| poll::Apply {

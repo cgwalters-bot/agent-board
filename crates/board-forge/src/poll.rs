@@ -26,7 +26,10 @@ pub mod comments;
 pub mod lock;
 pub mod notify;
 pub mod pace;
+mod reviews;
 pub mod stale;
+
+use reviews::{ordinary_reviews, review_key, review_reserves, review_workflow};
 
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
 // Every GET and GraphQL query of one pass, 304s included. Exhaustion fails the
@@ -580,6 +583,10 @@ pub struct PollPolicy {
     /// started count as the job's ([`reviews_head`]). Empty (the default)
     /// leaves reviews to the job's own `pull_request_target` runs.
     pub review_pools: Vec<String>,
+    /// Explicit base-repository opt-in to ordinary dispatched review intake.
+    pub review_dispatch_repositories: Vec<String>,
+    /// Caller workflow already inventoried by pass, to avoid counting its reviews twice.
+    pub review_caller_workflow: Option<String>,
     /// The pass's `wip` as the review starts and reruns of
     /// [`Self::review_pools`] see it ([`Pass::review_admits`]); none, as for
     /// a pass that starts no work, bounds them by the dispatch caps alone.
@@ -891,6 +898,8 @@ impl PollPolicy {
             check_reruns: false,
             owner_branches: false,
             review_pools: Vec::new(),
+            review_dispatch_repositories: Vec::new(),
+            review_caller_workflow: None,
             review_wip: None,
             review_ranks: BTreeMap::new(),
         })
@@ -1630,6 +1639,19 @@ fn cited_run(body: &str) -> Option<(&str, u64)> {
 /// request with this head. They are trusted with the verdict, as is whoever
 /// can change what the workflow calls.
 fn review_run_matches(pull: &Value, review: &Value, run: Option<&Value>, config: &Config) -> bool {
+    // Ordinary intake uses the general dispatch caller, whose title is not
+    // proof of a review job. Merge/fix provenance stays on the dedicated
+    // review workflow even in a repository selected for ordinary intake.
+    review_run_for_workflow(pull, review, run, config, config.review_workflow.as_deref())
+}
+
+fn review_run_for_workflow(
+    pull: &Value,
+    review: &Value,
+    run: Option<&Value>,
+    config: &Config,
+    workflow: Option<&str>,
+) -> bool {
     let Some(run) = run else {
         return false;
     };
@@ -1637,7 +1659,7 @@ fn review_run_matches(pull: &Value, review: &Value, run: Option<&Value>, config:
     cited_run(text(review, "/body")).is_some_and(|(repo, id)| {
         repo == base
             && run["id"].as_u64() == Some(id)
-            && reviews_head(pull, run, config)
+            && reviews_head_for_workflow(pull, run, config, workflow)
             && run["status"] == "completed"
             && within(review, run)
     })
@@ -1655,7 +1677,21 @@ fn review_run_matches(pull: &Value, review: &Value, run: Option<&Value>, config:
 /// the pass gave it. Whoever can dispatch it can write to the repository, and
 /// is trusted with the verdict as above.
 fn reviews_head(pull: &Value, run: &Value, config: &Config) -> bool {
-    let Some(workflow) = &config.review_workflow else {
+    reviews_head_for_workflow(
+        pull,
+        run,
+        config,
+        review_workflow(config, text(pull, "/baseRepository/nameWithOwner")),
+    )
+}
+
+fn reviews_head_for_workflow(
+    pull: &Value,
+    run: &Value,
+    config: &Config,
+    workflow: Option<&str>,
+) -> bool {
+    let Some(workflow) = workflow else {
         return false;
     };
     let head = text(pull, "/headRefOid");
@@ -1668,9 +1704,13 @@ fn reviews_head(pull: &Value, run: &Value, config: &Config) -> bool {
             !config.policy.review_pools.is_empty()
                 && !default.is_empty()
                 && text(run, "/head_branch") == default
-                && named
-                    .strip_prefix(&title)
-                    .is_some_and(|pool| pool.is_empty() || pool.starts_with(" ("))
+                && named.strip_prefix(&title).is_some_and(|pool| {
+                    pool.is_empty()
+                        || pool
+                            .strip_prefix(" (")
+                            .and_then(|p| p.strip_suffix(')'))
+                            .is_some_and(|p| !p.is_empty() && !p.contains(['(', ')', '\n']))
+                })
         }
         _ => false,
     };
@@ -3559,7 +3599,7 @@ fn rest_comment(node: &Value) -> Result<Value> {
         .context("a pull request comment has no id")?;
     Ok(json!({
         "id": id,
-        "user": {"login": author_login(&node["author"])},
+        "user": {"login": author_login(&node["author"]), "type": node["author"]["__typename"]},
         "body": node["body"],
         "created_at": node["createdAt"],
         "updated_at": node["updatedAt"],
@@ -3620,6 +3660,8 @@ struct Pass<'a, R, G> {
     /// The review job's runs the pass started, by repository, read once a
     /// pass ([`Pass::review_start`]); none where they were not all read.
     review_runs: BTreeMap<String, Option<Vec<Value>>>,
+    /// Bounded ordinary intake and per-pass admission caches.
+    review_intake: reviews::Intake,
     /// See [`Outcome::reviewing`].
     reviewing: usize,
     /// Why the review job's runs counted toward `wip` may be too few: a
@@ -4811,7 +4853,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         pull: &Value,
         comments: &[Value],
     ) -> Result<Option<ReviewStep>> {
-        if self.config.review_workflow.is_none() {
+        if review_workflow(self.config, repo).is_none() {
             return Ok(None);
         }
         if pull["baseRepository"]["isPrivate"] != false {
@@ -4826,6 +4868,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mine: Vec<Value> = runs
             .into_iter()
             .filter(|r| reviews_head(pull, r, self.config))
+            .filter(|r| r["status"] != "completed" || reviews::after_request(pull, r))
             .collect();
         let Some(newest) = mine.first() else {
             return Ok(Some((self.review_unlisted(pull, comments), None)));
@@ -4839,16 +4882,35 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok(Some((step("wait", why), None)));
         }
         if !self.config.policy.reruns {
-            return Ok(None);
+            return Ok(ordinary_reviews(self.config, repo).then(|| {
+                (
+                    step(
+                        "needs-human",
+                        "the review run completed without a verified verdict; inspect it",
+                    ),
+                    None,
+                )
+            }));
         }
         let pool = text(newest, "/display_title")
             .strip_prefix(&review_title(pull))
             .and_then(|p| p.strip_prefix(" (")?.strip_suffix(')'))
             .filter(|p| !p.is_empty())
             .map(str::to_owned);
-        Ok(self
+        let retry = self
             .review_rerun_of(repo, pull, &mine, true)?
-            .map(|(step, id)| (step, Some((id, pool)))))
+            .map(|(step, id)| (step, Some((id, pool))));
+        Ok(retry.or_else(|| {
+            ordinary_reviews(self.config, repo).then(|| {
+                (
+                    step(
+                        "needs-human",
+                        "the review run completed without a verified verdict; inspect it",
+                    ),
+                    None,
+                )
+            })
+        }))
     }
 
     /// The review job's runs on `workflow_dispatch` in `repo` since the start
@@ -4861,8 +4923,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(runs) = self.review_runs.get(repo) {
             return Ok(runs.clone());
         }
-        let workflow = (self.config.review_workflow.clone())
-            .context("review runs without a review workflow")?;
+        let workflow =
+            review_workflow(self.config, repo).context("review runs without a review workflow")?;
         let since = (self.now - time::Duration::days(1)).date();
         let url = format!(
             "{API_ROOT}repos/{repo}/actions/workflows/{workflow}/runs?event={DISPATCH_EVENT}&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"
@@ -4873,10 +4935,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             format!("{WORKFLOWS_DIR}{workflow}"),
             format!("{REVIEW} {repo}#").to_ascii_lowercase(),
         );
+        let counted_by_caller = repo.eq_ignore_ascii_case(&self.config.dispatch_repo)
+            && Some(workflow) == self.config.policy.review_caller_workflow.as_deref()
+            && self.config.policy.review_wip.is_some();
         self.reviewing += page
             .iter()
             .filter(|r| {
-                r["status"] != "completed"
+                !counted_by_caller
+                    && r["status"] != "completed"
                     && text(r, "/event") == DISPATCH_EVENT
                     && text(r, "/path") == path
                     && text(r, "/repository/full_name").eq_ignore_ascii_case(repo)
@@ -4907,7 +4973,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .iter()
             .filter(|c| text(c, "/user/login") == bot)
             .filter_map(|c| parse_marker(MARKER, text(c, "/body")))
-            .find(|m| m["review_head"] == head);
+            .find(|m| review_reserves(m, pull));
         let (at, waiting, stop) = match receipt {
             Some(receipt) => (
                 receipt["review_at"].as_str().map(str::to_owned),
@@ -4917,20 +4983,22 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     short(head)
                 ),
             ),
-            None => match earliest_claim(comments, bot, &format!("{REVIEW}:{head}")) {
-                Some((_, at)) => (
-                    at,
-                    step("wait", REVIEW_CLAIMED),
-                    format!(
-                        "a review start for {} was claimed and never recorded; inspect the review job's runs before starting another",
-                        short(head)
+            None => {
+                match earliest_claim(comments, bot, &format!("{REVIEW}:{}", review_key(pull))) {
+                    Some((_, at)) => (
+                        at,
+                        step("wait", REVIEW_CLAIMED),
+                        format!(
+                            "a review start for {} was claimed and never recorded; inspect the review job's runs before starting another",
+                            short(head)
+                        ),
                     ),
-                ),
-                None => {
-                    let why = "no run of the review job for the head, so it starts";
-                    return step(REVIEW, why);
+                    None => {
+                        let why = "no run of the review job for the head, so it starts";
+                        return step(REVIEW, why);
+                    }
                 }
-            },
+            }
         };
         let age = timestamp(at.as_deref()).map(|at| (self.now - at).whole_seconds());
         if age.is_some_and(|age| age < REVIEW_START_SECONDS) {
@@ -5018,6 +5086,22 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
         let before = self.writes;
         let (repo, pull) = (review.repo.as_str(), &review.pull);
+        if ordinary_reviews(self.config, repo) {
+            let (owner, name) = repo.split_once('/').context("review repository")?;
+            let current = self.read_pull(owner, name, review.number)?;
+            if current["state"] != "OPEN"
+                || current["isDraft"] != false
+                || current["headRefOid"] != pull["headRefOid"]
+                || current["baseRefName"] != pull["baseRefName"]
+                || is_held(&current)
+                || labelled(&current)
+            {
+                return Ok((
+                    Some("not started: pull request changed or is held".into()),
+                    false,
+                ));
+            }
+        }
         let done = match &self.apply {
             None => {
                 self.planned += 1;
@@ -5068,7 +5152,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         pull: &Value,
         (marker, read): (&Marker, &[Value]),
     ) -> Result<String> {
-        let workflow = (self.config.review_workflow.clone())
+        let workflow = review_workflow(self.config, repo)
+            .map(str::to_owned)
             .context("a review start without a review workflow")?;
         let policy = &self.config.policy;
         let pools = pace::expand(&policy.tiers, &policy.review_pools);
@@ -5086,7 +5171,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "the default branch of {repo} was not read"
         );
         let head = text(pull, "/headRefOid");
-        let state = json!({"from": format!("{REVIEW}:{head}")});
+        let state = json!({"from": format!("{REVIEW}:{}", review_key(pull))});
         let claim = match self.claim(repo, number, marker, read, (state, REVIEW_START))? {
             Ok(claim) => claim,
             Err((id, _)) => {
@@ -5096,7 +5181,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         let mut reserved = Marker {
-            review_head: Some(head.to_owned()),
+            review_head: Some(review_key(pull)),
             review_at: Some(self.now.format(&Rfc3339)?),
             ..marker.clone()
         };
@@ -5104,7 +5189,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "Review: the review job starts for this head on {pool}; no later pass starts it again."
         );
         self.mark_claim(repo, claim, &mut reserved, &text)?;
-        let inputs = json!({"pr": number.to_string(), "head": head, "pool": pool});
+        let inputs = if ordinary_reviews(self.config, repo) {
+            json!({"kind": REVIEW, "repo": repo, "item": number.to_string(),
+                "head": head, "pool": pool, "task": "Review the pinned pull request head using the base-owned review task and bounds."})
+        } else {
+            json!({"pr": number.to_string(), "head": head, "pool": pool})
+        };
         // Counted once asked for, whatever follows: an answer lost on the
         // way may still have started it.
         self.dispatched += 1;
@@ -6023,8 +6113,26 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
+        let mut intake =
+            ordinary_reviews(self.config, repo) && self.review_intake.pulls < reviews::INTAKE_PULLS;
+        if intake {
+            self.review_intake.pulls += 1;
+        }
         let mut comments = if merge_only {
-            Vec::new()
+            if intake {
+                // These PRs previously needed no comment reads. Never follow
+                // an untrusted thread through unbounded REST pagination, nor
+                // dispatch from a partial history (which could omit a claim).
+                match self.review_comments(repo, number, &pull)? {
+                    Some(comments) => comments,
+                    None => {
+                        intake = false;
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            }
         } else {
             self.pull_comments(repo, number, &pull)?
         };
@@ -6048,6 +6156,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 None,
                 None,
             ));
+        }
+        if intake && let Some(result) = self.ordinary_review(repo, &pull, &comments, &marker)? {
+            return Ok(result);
         }
         if !(text(&pull, "/author/login") == self.config.bot
             || self
@@ -6254,7 +6365,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // and only from the bot's fork, the one head whose review job verdict
         // counts: a `headOwners` head waits for the operator's.
         let mut review_rerun = None;
-        let unreviewed = !merge_only
+        let unreviewed = !ordinary_reviews(self.config, repo)
+            && !merge_only
             && retarget.is_none()
             && decision.action == "wait"
             && decision.reason == NO_REVIEW
@@ -6563,13 +6675,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let mut numbers: Vec<(u64, bool)> = open
             .iter()
             .filter(|p| {
-                let followed = text(p, "/user/login") == self.config.bot
+                let managed = text(p, "/user/login") == self.config.bot
                     || self
                         .config
                         .policy
                         .merge_authors
                         .iter()
                         .any(|a| a == text(p, "/user/login"));
+                let extra = !managed
+                    && ordinary_reviews(self.config, repo)
+                    && self.review_intake.extra_pulls < reviews::INTAKE_PULLS;
+                if extra {
+                    self.review_intake.extra_pulls += 1;
+                }
+                let followed = managed || extra;
                 if !followed && let Some(number) = p["number"].as_u64() {
                     outcome.lines.push(format!(
                         "{repo}#{number} skip: pull request author is not followed"
@@ -6587,7 +6706,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // Read whether or not a head waits for a review: a run of a head
         // pushed over since, or of a pull request closed, still takes a slot.
         if !self.config.policy.review_pools.is_empty()
-            && self.config.review_workflow.is_some()
+            && review_workflow(self.config, repo).is_some()
             && let Err(error) = self.review_runs(repo)
         {
             outcome.errors += 1;
@@ -6746,6 +6865,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         caps,
         writes: 0,
         review_runs: BTreeMap::new(),
+        review_intake: reviews::Intake::default(),
         reviewing: 0,
         review_unread: None,
         deferred: Vec::new(),
@@ -6903,6 +7023,8 @@ mod tests {
     use super::*;
     use bounds::{FixBounds, FixBoundsSet};
     use std::cell::RefCell;
+
+    include!("poll/reviews_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.
     pub(super) fn marker_body(state: &Value, text: &str) -> String {
@@ -16453,6 +16575,7 @@ mod tests {
             caps: None,
             writes: 0,
             review_runs: BTreeMap::new(),
+            review_intake: reviews::Intake::default(),
             reviewing: 0,
             review_unread: None,
             deferred: Vec::new(),
