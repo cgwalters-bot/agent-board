@@ -7028,6 +7028,10 @@ fn maintain_plans_a_read_only_digest() {
         "whose checks all passed at the head listed below, with a reason that says so",
         "`date` is 2026-10-23.",
         "the full head listed above, copied exactly",
+        "Before requesting publication",
+        "agent-board check maintain-digest --body candidate.md",
+        "agent-board check maintain-digest`)",
+        "does not authorize publication or enforce validation at the safe-output boundary",
     ] {
         assert!(parsed.brief.contains(needle), "{needle}: {}", parsed.brief);
     }

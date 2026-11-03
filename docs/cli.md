@@ -107,7 +107,20 @@ agent-board check [OPTIONS] <COMMAND>
 
 Commands:
 
+- [`maintain-digest`](#agent-board-check-maintain-digest): Validate a candidate maintain digest offline; no credentials, network or publication
 - [`proposals`](#agent-board-check-proposals): Refuse outputs outside an identity's assignment and field policy
+
+## agent-board check maintain-digest
+
+Validate a candidate maintain digest offline; no credentials, network or publication
+
+```text
+agent-board check maintain-digest [OPTIONS]
+```
+
+Options:
+
+- `--body <FILE>`: Candidate Markdown file; reads stdin when omitted
 
 ## agent-board check proposals
 
