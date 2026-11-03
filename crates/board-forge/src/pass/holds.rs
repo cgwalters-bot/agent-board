@@ -1346,6 +1346,9 @@ fn earlier(a: &str, b: &str) -> bool {
     matches!((parse_time(a), parse_time(b)), (Some(a), Some(b)) if a < b)
 }
 
+/// The group reason of stranded drafts, whose target lists only drafts.
+const STRANDED_DRAFTS: &str = "drafts to inspect and promote";
+
 /// A list URL made only from validated repository/PR identities. Older v2
 /// consumers ignore `group` and can still open the representative PR action.
 fn group_target(ask: &Ask) -> Option<String> {
@@ -1355,7 +1358,7 @@ fn group_target(ask: &Ask) -> Option<String> {
     }
     let query = format!(
         "is:pr is:open{}",
-        if group.reason.starts_with("drafts ") {
+        if group.reason == STRANDED_DRAFTS {
             " draft:true"
         } else {
             ""
@@ -1387,7 +1390,7 @@ fn group_stranded(items: Vec<Ask>) -> Vec<Ask> {
                 if ask.ask.contains("draft with no checkpoint")
                     || ask.ask.starts_with("a stranded draft;")
                 {
-                    "drafts to inspect and promote".into()
+                    STRANDED_DRAFTS.into()
                 } else if ask.ask.starts_with("fix round ") && ask.ask.contains(" is blocked:") {
                     "fix round blocked".into()
                 } else if ask.ask.contains("fix rounds") && ask.ask.contains(" used") {
@@ -1648,7 +1651,9 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     for mut ask in asks {
         // A labelled-list shortcut cannot recover why the poll originally
         // stopped. Keep its published category while it is still labelled;
-        // fresh explicit reasons (especially drafts) take precedence.
+        // fresh explicit reasons (especially drafts) take precedence, and
+        // the poll reads a labelled draft as one, so this ask is no longer
+        // a draft: never restore the drafts category, whose list hides it.
         if ask.source == REVIEWS
             && ask.kind == "review-needs-human"
             && ask.ask == "labelled needs-human"
@@ -1661,6 +1666,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
                         .eq_ignore_ascii_case(&ask.action.repository)
                 })
                 .filter_map(|p| p.group.as_ref())
+                .filter(|g| g.reason != STRANDED_DRAFTS)
                 .find(|g| g.numbers.contains(&ask.action.number))
         {
             ask.ask = group.reason.clone();
@@ -1846,7 +1852,8 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 }
 
 /// `snapshot` within [`MAX_COMMENT_CHARS`] and its comment: where the whole
-/// is longer, the item holds that do not wait on the operator are left out,
+/// is longer, the needs-you list's summary cache goes first, then
+/// the item holds that do not wait on the operator are left out,
 /// in [`left_out_first`] order, then the holds a stall alarm watches
 /// ([`Published::watched`]), then the stall alarms, each with the hold it
 /// is on, then those on the holds issue, likewise, until it fits, and
@@ -1911,6 +1918,12 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
         if over == 0 {
             return Ok((fitted, body));
+        }
+        // The summary cache only saves the next pass downloads: it goes
+        // before any hold or ask does.
+        if let Some(list) = needs_you.as_mut().filter(|l| !l.summary_cache.is_empty()) {
+            list.summary_cache.clear();
+            continue;
         }
         // Each entry is its JSON and a ",\n"; the count may grow a digit,
         // which the next round sees.
@@ -2275,6 +2288,31 @@ mod tests {
         assert_eq!(fitted.truncated, 1);
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         assert_eq!(parse(&body).unwrap()["truncated"], 1);
+        // A summary cache that takes a list at the limit past it goes
+        // before any hold or ask does.
+        let with_list = |pad| {
+            let mut cached = bare(&board(59, pad));
+            cached.needs_you = Some(listed(&waiting(), None, (true, true)));
+            cached
+        };
+        let pad = MAX_COMMENT_CHARS - chars(&render(&with_list(0)).unwrap());
+        let mut cached = with_list(pad);
+        let list = cached.needs_you.as_mut().unwrap();
+        let asks = list.items.len();
+        list.summary_cache.insert(
+            "o/tracker#5001".into(),
+            Summary {
+                question: Some("Ship?".into()),
+                ..Summary::default()
+            },
+        );
+        let (uncached, uncached_body) = fit(cached).unwrap();
+        assert_eq!(
+            (uncached.truncated, chars(&uncached_body)),
+            (0, MAX_COMMENT_CHARS)
+        );
+        let list = uncached.needs_you.unwrap();
+        assert_eq!((list.items.len(), list.summary_cache.len()), (asks, 0));
         // Operator holds just under the cap, but not beside a needs-you
         // list's fields: every ask is cut, then the list, and the holds
         // are published.
@@ -3425,6 +3463,24 @@ mod tests {
         assert_eq!(
             refreshed.items[0].group.as_ref().unwrap().reason,
             "fix round blocked"
+        );
+        // The shortcut reads a labelled draft as one, so a generic stop is
+        // a promoted draft: its old drafts category does not return.
+        let promoted = stopped("o/bootc", 3, "labelled needs-human");
+        let refreshed = own_listed(
+            &[],
+            "2026-10-28T10:00:00Z",
+            (
+                collected(Read::Complete, vec![promoted], &[]),
+                Collected::off(),
+            ),
+            Some(&previous),
+        );
+        let ready = refreshed.items[0].group.as_ref().unwrap();
+        assert_eq!(ready.reason, "labelled needs-human");
+        assert_eq!(
+            refreshed.items[0].target,
+            "https://github.com/o/bootc/pulls?q=is%3Apr+is%3Aopen"
         );
     }
 

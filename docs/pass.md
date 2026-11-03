@@ -426,7 +426,8 @@ interval as unknown, not as current. So does a reader that finds no
 
 The JSON is compact, one entry a line, so that a board of a few hundred holds
 fits GitHub's 65,536-character comment. The comment is also capped at 60,000
-characters: past that, item holds that do not wait on the operator are left
+characters: past that, the `summary_cache` goes first, which only costs the
+next pass the bodies' downloads; then item holds that do not wait on the operator are left
 out until it fits, those without a Priority first, then the lowest Priority
 (`P3` before `P0`), then the newest (the highest number), and `truncated`
 counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
