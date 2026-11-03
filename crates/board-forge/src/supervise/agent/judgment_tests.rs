@@ -1902,6 +1902,19 @@ fn aggregate_green_cannot_hide_missing_required_checks_or_incomplete_evidence() 
 fn implement_requires_native_membership_under_an_epic_labeled_plan() {
     let s = configured();
     let r = request(json!({"kind": "implement"}));
+    // Board bugs are dispatched only by the pass from their accepted plan,
+    // never by the supervisor's generic implement request, even under an epic.
+    refuses(&s, r.clone(), |f| {
+        f.issue(3, json!({"rest":{"body":format!("Untrusted bug prose.\n<!-- agent-board-failure-signature: {} -->", "a".repeat(64))}}));
+        f.objects.insert(
+            "/repos/example/project/issues/3/parent".into(),
+            json!({"repository_url":"https://api.github.com/repos/example/control", "number":10}),
+        );
+        f.objects.insert(
+            "/repos/example/control/issues/10".into(),
+            json!({"state":"open", "labels":[{"name":"epic"}]}),
+        );
+    });
     refuses(&s, r.clone(), |_| {});
     for (repo, labels, state) in [
         ("evil/plan", json!([{"name": "epic"}]), "open"),

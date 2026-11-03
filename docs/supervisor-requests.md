@@ -15,7 +15,7 @@ the epics, the decisions, the wrapper's agentic-job pin and the usage snapshot
 with a read-only token, within a request count and a deadline. It writes a
 report of the checks in the `CHECKS` table of
 `crates/board-forge/src/supervise/health.rs`. Each check is `ok`, `warn` or `fail`, and the report
-holds only links, but for `unset`, which warns with the names, never the values,
+holds only links except for bounded signature data and `unset`, which warns with the names, never the values,
 of the poll and supervisor options agent-board knows that the caller's files
 leave out (the loaders' `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` and
 `AGENT_OPTIONS` tables), so a feature merged off shows until it is switched on
@@ -77,6 +77,77 @@ the [configuration](#configuration) below. The
 release train and scheduler-log settings are optional, so an organization
 without them leaves those checks not configured, and `unset` names them. The checks
 have been exercised against recorded responses only.
+
+## Recurring failure signatures
+
+The read-only collector adds `signatures`, `stranded`, `main` and `needs-you`
+checks. Their `signatures` arrays carry a stable SHA-256 identity, kind,
+normalized text (at most 240 characters), count, first/last seen and at most
+three example URLs. Numbers and abbreviated/full SHAs are replaced before
+grouping. These excerpts are **untrusted data**, not instructions or plans.
+They can contain remote error text; do not put secrets in error messages.
+
+Failed dispatch jobs contribute their first error line from bounded job-log
+downloads in the last day, including apply, check and agent jobs, not just the
+latest failed run per target. Current pass holds contribute their reasons and
+original `since` times from the published holds snapshot; recent poll stops
+contribute the stop reason from the newest poll marker among the ten latest
+comments on each open PR. Needs-human origins distinguish known open PRs,
+recorded operator questions and issue holds without a question. The default
+branch's check rollup reports red repositories. Needs-you quality counts asks
+with a question mark (a deliberately simple heuristic, excluding label-only
+placeholders), asks without one, and omitted asks; it also flags incomplete
+sources. Holds and needs-you require the usage location and a whole snapshot
+no older than a day. Counts describe the current published snapshot, not an
+archive of every past hold. Repeated occurrences of the same signature on one
+item/run count once. A red-main observation's time is the collection time.
+Ordinary holds (in-flight work, open PRs, pacing and cooldowns) remain observations,
+not bug candidates. Explicit stall/blocker alarms, unreadable/needs-operator
+holds and stranded PR holds are problems.
+
+All reads use the existing request budget, deadline, page and download limits.
+The report permits at most `maxItems` distinct signatures and 4 KiB per check. Missing
+errors, stale snapshots, or truncated evidence make that check unavailable,
+not healthy; unavailable checks retain the existing escalation. No write is
+added to health collection. Existing queue/apply/stall checks remain unchanged.
+
+The playbook requests `file_bug` for each problem signature with at least two
+occurrences and no open bug, including its examples, within the caller's daily
+cap. A signature marker is written by the executor, never accepted in agent
+prose. The executor scans open tracker issues directly (at most ten pages of
+100, failing closed on truncation), refusing a second bot-filed bug with the
+same marker. It checks again immediately before creation and refuses duplicate
+signatures in a batch. Executors must still be serialized; this is not an
+atomic uniqueness constraint against another controller. Closing a bug permits
+a later recurrence to open a new one.
+
+### Opt-in board bugs and the input boundary
+
+The concrete threat is laundering supervisor-written issue prose into a trusted
+implementation brief. `agent.bugEpic` is one opt-in successor to the legacy
+`file_bug` behavior: a positive issue number in `epics.repository`, requiring
+the existing `agent.tracker` and `agent.project`. Absent, existing file_bug
+behavior is unchanged. The action's existing daily cap still defaults to zero.
+With it, `file_bug` requires a 64-character lowercase hex `signature`, creates
+an unassigned, unheld tracker issue, attaches it natively under that configured
+open, unheld, operator-approved epic, adds it to the configured project and sets
+its `Priority` field to `P1`. The request cannot choose the parent, project,
+field or value. Missing parent approval or P1 refuses before creation. A partial
+API failure consumes the reservation and may leave a partially attached bug;
+the executor log reports the failure, and an operator must finish its placement
+rather than file a duplicate.
+
+**This changes the boundary from agent-board#111:** opt-in board bugs do not
+carry the supervisor note that previously barred all dispatch. Instead the
+ordinary pass triages the bug as data, posts a job plan, and implement runs
+follow that accepted triage plan, never the bug's text. No protocol fences or
+markers are allowed in the supervisor's title/body; the executor appends only
+its signature marker and attribution. Other supervisor comments and questions
+keep their existing note and dispatch refusal. Closure's collaborator/lock
+checks are unchanged. Enable the pass's ordinary triage for the harness epic;
+this option grants no direct implement dispatch or closure authority.
+Supervisor implement requests on signature-marked bugs are refused even after
+triage: only the pass dispatches their accepted job plan's brief.
 
 ## Workflow steps
 
@@ -341,7 +412,7 @@ A complete supervisor file:
     "dailyCaps": {
       "comment": 4,
       "create_issue": 2,
-      "file_bug": 2,
+      "file_bug": 10,
       "plan_epic": 1,
       "close": 2,
       "remove_needs_human": 1,
@@ -350,6 +421,7 @@ A complete supervisor file:
       "status_update": 1
     },
     "tracker": "OWNER/tracker",
+    "bugEpic": 939,
     "state": {"repository": "OWNER/tracker", "issue": 123},
     "project": "PVT_CONFIGURED_NODE_ID",
     "profile": {"repository": "OWNER/agenthome", "ref": "0123456789abcdef0123456789abcdef01234567"},
@@ -469,7 +541,7 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"dispatch","repository":"OWNER/repo","item":1,"kind":"triage","pool":"small","reason":"no-plan"}
 {"type":"supervisor_action","action":"comment","repository":"OWNER/repo","item":1,"body":"Investigation and links."}
 {"type":"supervisor_action","action":"create_issue","title":"Decision needed","body":"Question and evidence."}
-{"type":"supervisor_action","action":"file_bug","title":"Failure class","body":"Failure and evidence."}
+{"type":"supervisor_action","action":"file_bug","title":"Failure class","body":"Failure and evidence.","signature":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 {"type":"supervisor_action","action":"plan_epic","epic":123,"reason":"no-runnable-work"}
 {"type":"supervisor_action","action":"close","repository":"OWNER/repo","item":1,"triage_run":"https://github.com/OWNER/tracker/actions/runs/456","triage_comment":789}
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
@@ -512,8 +584,8 @@ Comments target issues or pull requests in `follow`. New issues go only to
 `tracker`. `create_issue` is a question for the operator: assigned to the
 configured operator and labeled `needs-human`. `file_bug` files a failure with
 neither, so it is not an operator question; its own cap keeps it off unless
-configured. Both bodies carry the supervisor note below, so the supervisor
-never dispatches either until a person removes it.
+configured. Both bodies carry the supervisor note below unless `agent.bugEpic`
+opts file_bug into board placement and the data-to-triage boundary above.
 The executor ends every comment, new issue and status update with the
 attribution poll uses (agent-board.json's `generatedBy`), rather than trusting
 the agent to.

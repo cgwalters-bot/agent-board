@@ -1,5 +1,9 @@
 {
   "now": "2026-10-15T12:00:00Z",
+  "signatures": [{"signature":"example", "count":2}],
+  "stranded": [{"signature":"example", "count":2}],
+  "main": [{"signature":"example", "count":1}],
+  "needs-you": [{"signature":"example", "count":2}],
   "poll": [{"status":"completed","conclusion":"failure"},{"status":"completed","conclusion":"timed_out"},{"status":"completed","conclusion":"failure"}],
   "runs": [{"status":"in_progress","run_started_at":"2026-10-15T00:00:00Z"}],
   "broker": [{"status":"completed","conclusion":"failure","updated_at":"2026-10-15T11:59:00Z"}],

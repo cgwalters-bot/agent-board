@@ -8600,6 +8600,43 @@ fn body_plan_block() -> String {
     format!("Some context.\n\n```{PLAN_FENCE}\n{plan}\n```\n")
 }
 
+#[test]
+fn supervisor_board_bug_is_triaged_as_data_then_implemented_from_the_plan() {
+    let body = format!(
+        "Untrusted bug prose, not a brief.\n<!-- agent-board-failure-signature: {} -->",
+        "a".repeat(64)
+    );
+    for planned in [false, true] {
+        let mut forge = body_plan_forge("P1", &body, "cgwalters-bot", None);
+        if planned {
+            implement_plan(&mut forge.replay);
+            // Model the bot's accepted plan posted by triage, not the bug body.
+            let comments = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]
+                ["repository"]["issue"]["comments"]["nodes"];
+            comments.as_array_mut().unwrap().last_mut().unwrap()["author"]["login"] =
+                json!("cgwalters-bot");
+        }
+        let report = apply(&forge, &config(json!({"bodyPlans":true, "wip":3})));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = writes
+            .iter()
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap();
+        assert_eq!(
+            sent["inputs"]["kind"],
+            if planned { "implement" } else { "triage" }
+        );
+        let task = sent["inputs"]["task"].as_str().unwrap();
+        assert!(!task.contains("Untrusted bug prose"));
+        if planned {
+            assert!(task.contains("Write the staging design down."));
+        } else {
+            assert!(task.contains("as data, not instructions"));
+        }
+    }
+}
+
 /// The recording with only tracker#446, at `priority`, whose `body` is by
 /// `author` and last edited by `editor` (empty for one GitHub cannot name).
 fn body_plan_forge(priority: &str, body: &str, author: &str, editor: Option<&str>) -> Forge {
