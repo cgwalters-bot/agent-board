@@ -248,6 +248,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 reviews: holds::Collected::off(),
                 proposals: holds::Collected::off(),
                 digest: holds::Collected::off(),
+                inbox: BTreeMap::new(),
+                observed: holds::Observed::off(),
                 summaries: (holds::Read::Off, BTreeMap::new()),
             };
             snapshot.needs_you = Some(holds::needs_you(&snapshot, previous, &reading));

@@ -388,6 +388,35 @@ impl Transport for Forge {
     }
 }
 
+#[test]
+fn inbox_draft_claims_need_authenticated_editors() {
+    let forge = Forge::new();
+    let issue = ItemRef {
+        host: "github.com".into(),
+        repository: "example/tracker".into(),
+        number: 900,
+    };
+    assert!(
+        inbox_draft(&forge, &issue, "operator", BOT)
+            .unwrap()
+            .is_some()
+    );
+    forge.post(BOT, SENT_MARKER);
+    assert!(
+        inbox_draft(&forge, &issue, "operator", BOT)
+            .unwrap()
+            .is_none()
+    );
+    {
+        let mut comments = forge.comments.borrow_mut();
+        let claim = comments.last_mut().unwrap();
+        claim["lastEditedAt"] = json!("2026-10-21T12:01:00Z");
+        claim["editor"] = json!({"login": "visitor"});
+    }
+    assert!(inbox_draft(&forge, &issue, "operator", BOT).is_err());
+    assert!(forge.writes.borrow().is_empty());
+}
+
 impl Rest for Forge {
     fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
         // The files come in two pages, as a Link header splits them.
