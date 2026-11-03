@@ -20,7 +20,19 @@ The steps of a train, each a pass:
    first, and only the bot's run of the workflow at the recorded commit counts
    as its run, so a later pass never dispatches it again; a recorded dispatch
    with no run after an hour stalls.
-3. **wrappers**: once the release is out, a PR on the wrappers repository
+3. **secure-host** (optional, off by default): once the release is out, resolve
+   `ghcr.io/cgwalters-forge/secure-host:vX.Y.Z` with `skopeo inspect`, then verify
+   the immutable digest with `gh attestation verify`. This stops an unattested
+   image, or one built from a different source commit, from being promoted to
+   the host. Verification uses the publisher's existing policy: the release
+   workflow's certificate identity on `refs/heads/main`, that source ref, the
+   reviewed release commit as source digest, and no self-hosted runners. No
+   attestation policy, egress or host security boundary changes. A missing tag,
+   failed verification or invalid digest stalls and is reported on the tracking
+   issue. Open a PR on `cgwalters-forge/actions`, from branch
+   `release-train/vX.Y.Z-secure-host`, moving `secure-host/Containerfile.pin` to
+   `FROM ghcr.io/cgwalters-forge/secure-host:vX.Y.Z@sha256:…`.
+4. **wrappers**: once the release is out (and the optional image PR merged), a PR on the wrappers repository
    moving its pins of the release's workflows to the commit of the release
    tag, checked to be on the default branch, with "`NAME vX.Y.Z`" beside
    them. A pin is never a tag, which could move after its review. A commit
@@ -28,9 +40,17 @@ The steps of a train, each a pass:
    that, from Dependabot's "`# vX.Y.Z`" right after it, which moves with it
    (the release's pins only: beside a caller's pin of the wrappers it is the
    wrappers' tag); pins or versions that disagree stall the train.
-4. **callers**: once that merges into the default branch, a PR on each caller
+   With `secureHost` configured, also move secure-host action references in the
+   configured wrapper files directly to `cgwalters-forge/actions/secure-host`
+   at the image PR's merge commit. Before doing so, check that commit is on
+   actions' default branch and its image pin matches the release's newly
+   resolved, verified digest. Subsequent trains move these direct pins too.
+   The release-tag forwarder cannot name the image its release has yet to
+   publish; bypassing only that forwarder breaks the cycle. All other release
+   workflow/action pins remain on the reviewed release commit.
+5. **callers**: once that merges into the default branch, a PR on each caller
    moving its commit pin of the wrappers to that merge commit.
-5. **done**: close the tracking issue.
+6. **done**: close the tracking issue.
 
 A pass keeps no state: it reads the stage from the one open tracking issue (an
 issue by the bot titled `NAME vX.Y.Z release train`, carrying the tracking
@@ -58,14 +78,19 @@ write it would make as `would: ...`. Outside those changed steps the lines
 are the ones train.cjs printed, so the two can be diffed on the same state. `--apply` makes the writes with
 `GH_TOKEN`, which must be the bot's: it opens the PRs from the bot's forks,
 comments on and labels the tracking issue, and dispatches the release workflow.
-A pass makes at most 200 requests. Run one pass at a time, for example in a
+A pass makes at most 200 GitHub API requests. The optional image stage and its
+wrapper consumer each invoke at most two external commands (no retry), each
+limited by GNU `timeout` to 60 seconds plus 5 seconds to kill. They require
+`timeout`, `skopeo` and a `gh` supporting attestation verification on the caller's
+runner, registry read access and the existing bot token. No image is run by the
+train. Run one pass at a time, for example in a
 workflow `concurrency` group without `cancel-in-progress`: passes that overlap
 race on the same step, though only one of them dispatches a release.
 
 ## Configuration
 
 The file comes from the caller's protected default branch; every key is
-required and unknown keys are refused. An example, with placeholder names:
+required except `secureHost`, and unknown keys are refused. An example, with placeholder names:
 
 ```json
 {
@@ -86,3 +111,30 @@ The shape is train.cjs's `config.json` with `bot` (formerly read from the
 poll's `agent-board.json`) added and `pageSize`, `maxRequests` and
 `requestTimeoutSeconds` removed: listings are one page of 100, the request
 bound is fixed, and every request has the client's 30-second timeout.
+
+### Caller settings
+
+For `cgwalters-forge/tracker`, add this optional key to
+`.github/release-train/config.json` and extend its config test to assert the
+fork. It is supported only for the `cgwalters-forge/agentic-job` release, with
+the fixed actions repository and image path:
+
+```json
+{"secureHost": {"fork": "cgwalters-bot/actions-1"}}
+```
+
+Keep `.github/workflows/cgwalters-agentic-job.yml` in `wrappers.files`: the
+train changes its `uses: ./.agentic-job-source/secure-host` (or an older remote
+`cgwalters-forge/agentic-job/secure-host@…` reference) to
+`uses: cgwalters-forge/actions/secure-host@<image PR merge commit>` in
+`cgwalters-forge/actions`. Keep `.github/workflows/secure-host.yml` (its wrapper
+smoke job) and `lint/tests/review_wrapper.rs` in `wrappers.files` too. The
+policy-source checkout and local prepare/run references are not changed.
+Update actions' wrapper tests to permit this separate secure-host commit while
+continuing to require all other agentic-job pins to match the release commit.
+Provision the verification tools in tracker's release-train workflow if absent.
+
+After the image and wrapper PRs merge, validate in a hosted job using that
+wrapper: print `agentic-job --version` on the host after secure-host, outside
+the agent's container, and compare it with the release. Fixture tests do not
+prove which binary a deployed hosted runner has on PATH.
