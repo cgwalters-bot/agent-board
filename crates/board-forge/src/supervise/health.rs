@@ -574,7 +574,7 @@ pub(crate) fn json_block(body: &str) -> Option<Value> {
 }
 
 /// The scheduler's line after the runner's timestamp: `^\S+Z (\[dry-run\] )?(.*)$`.
-fn log_line(line: &str) -> Option<&str> {
+pub(crate) fn log_line(line: &str) -> Option<&str> {
     let (stamp, rest) = line.split_once(' ')?;
     if stamp.len() < 2 || !stamp.ends_with('Z') || stamp.contains(char::is_whitespace) {
         return None;
@@ -583,7 +583,7 @@ fn log_line(line: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-fn strip_colours(text: &str) -> String {
+pub(crate) fn strip_colours(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("\x1b[") {
