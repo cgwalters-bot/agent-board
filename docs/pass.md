@@ -1121,7 +1121,10 @@ two writes under `--max-writes`, neither made in a preview. The label then
 keeps the issue out of the follow-up. An asking verdict is answered when a
 later comment by the operator or bot, unedited except by those writers,
 is followed by removal of `needs-human`. Run status, hold, dispatch and plan
-comments do not count as answers. With no newer plan, the issue goes back to
+comments do not count as answers. This sequence uses the answer's creation time,
+not its last edit: a later writer edit (including removing a plan block) does
+not undo the answer and removal. A comment posted before the verdict does not
+become an answer just by being edited afterward. With no newer plan, the issue goes back to
 triage at once, the brief linking the newest such answering comment as its
 decision context. A newer plan still dispatches normally. The pass reads at
 most the last 100 label-removal events, within its existing request/time bounds;

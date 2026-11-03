@@ -4960,7 +4960,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// A writer's newer word settles a hold only when a later label removal
-    /// confirms it. Run bookkeeping must never answer its own verdict.
+    /// confirms it. Later writer edits do not undo that sequence. Run
+    /// bookkeeping must never answer its own verdict.
     fn verdict_answer<'c>(
         &self,
         issue: &ItemRef,
@@ -4971,7 +4972,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let candidates: Vec<_> = comments
             .iter()
             .filter(|c| {
-                c.changed > verdict.changed
+                c.created > verdict.changed
                     && is(c.author.as_deref(), &writers)
                     && ((!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers))
                     && !c.body.ends_with(crate::supervise::health::STATUS_MARKER)
@@ -5000,7 +5001,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         Ok(candidates
             .into_iter()
-            .filter(|c| removed > Some(c.changed))
+            .filter(|c| removed > Some(c.created))
             .max_by_key(|c| c.changed))
     }
 
@@ -5581,6 +5582,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             author: None,
             edited: false,
             editor: None,
+            created,
             changed: created,
         })
     }

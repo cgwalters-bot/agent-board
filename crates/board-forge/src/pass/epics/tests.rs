@@ -1783,6 +1783,7 @@ fn decide_coalesces_changes_but_not_direction() {
         author: Some(author.into()),
         edited: false,
         editor: None,
+        created: at(when),
         changed: at(when),
     };
     let say = |author: &str, when: &str| note(9, author, when, "Direction.");

@@ -525,6 +525,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 author: author.map(str::to_owned),
                 edited: !crate::forgejo::unedited(c),
                 editor: None,
+                created: time(c)?,
                 changed,
             });
         }

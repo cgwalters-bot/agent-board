@@ -289,6 +289,8 @@ pub struct Comment {
     pub edited: bool,
     /// Who last edited it, if anyone: whoever may edit the comment, not only its author.
     pub editor: Option<String>,
+    /// When it was first posted, independent of later edits.
+    pub created: OffsetDateTime,
     /// When it last changed: its last edit, else its creation.
     pub changed: OffsetDateTime,
 }
@@ -498,6 +500,8 @@ pub(crate) fn comment(node: &Value) -> Result<Comment> {
         author: login(node, "author"),
         edited,
         editor: login(node, "editor"),
+        created: OffsetDateTime::parse(field("createdAt")?, &Rfc3339)
+            .context("comment creation time")?,
         changed: OffsetDateTime::parse(changed, &Rfc3339).context("comment time")?,
     })
 }
@@ -1249,6 +1253,7 @@ mod tests {
             author: Some(author.into()),
             edited: editor.is_some(),
             editor: editor.map(Into::into),
+            created: at(changed),
             changed: at(changed),
         }
     }
