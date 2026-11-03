@@ -1,13 +1,13 @@
 //! One operator-editable issue; the baseline is local, never hidden in its body.
 use anyhow::{Context, Result, ensure};
+use board_forge::decisions::{BODY_LIMIT, decision_id, entries, parse};
 use board_forge::github::{Client, Transport};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Write, path::PathBuf};
+use std::{io::Write, path::PathBuf};
 
 // Bound untrusted issue/history text and parsing work, not authority.
-const BODY_LIMIT: usize = 60_000;
 const HISTORY_LIMIT: usize = 100;
 
 #[derive(Args)]
@@ -263,84 +263,6 @@ fn fetch<T: Transport>(transport: &T, target: &Target, recover: bool) -> Result<
     })
 }
 
-// Byte spans let resolution move operator text without normalization or reflow.
-#[derive(Clone)]
-struct Entry {
-    start: usize,
-    end: usize,
-    done: bool,
-}
-
-fn entries(body: &str) -> Result<BTreeMap<u64, Entry>> {
-    ensure!(
-        body.len() <= BODY_LIMIT,
-        "decisions body exceeds {BODY_LIMIT} bytes"
-    );
-    let mut entries = BTreeMap::new();
-    let mut offset = 0;
-    let mut previous = None;
-    let mut done = false;
-    let mut fence: Option<char> = None;
-    let mut done_count = 0;
-    for line in body.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let c = trimmed.chars().next();
-            if fence == c {
-                fence = None;
-            } else if fence.is_none() {
-                fence = c;
-            }
-        }
-        if fence.is_none() && trimmed == "## Done" {
-            done_count += 1;
-            ensure!(done_count == 1, "duplicate Done section");
-            if let Some(id) = previous.take() {
-                let entry: &mut Entry = entries.get_mut(&id).context("missing entry")?;
-                entry.end = offset;
-            }
-            done = true;
-        }
-        if fence.is_none()
-            && let Some(rest) = trimmed.strip_prefix("### D")
-        {
-            let (id, title) = rest.split_once(' ').context("invalid decision heading")?;
-            let id = decision_id(&format!("D{id}"))?;
-            ensure!(!title.trim().is_empty(), "empty decision heading");
-            if let Some(previous) = previous {
-                let entry: &mut Entry = entries.get_mut(&previous).context("missing entry")?;
-                entry.end = offset;
-            }
-            ensure!(!entries.contains_key(&id), "duplicate decision D{id}");
-            entries.insert(
-                id,
-                Entry {
-                    start: offset,
-                    end: body.len(),
-                    done,
-                },
-            );
-            previous = Some(id);
-        }
-        offset += line.len();
-    }
-    ensure!(
-        fence.is_none(),
-        "unclosed Markdown fence in decisions document"
-    );
-    Ok(entries)
-}
-
-fn decision_id(id: &str) -> Result<u64> {
-    let number = id.strip_prefix('D').context("expected D<n>")?;
-    let n: u64 = number.parse().context("expected D<n>")?;
-    ensure!(
-        n > 0 && number == n.to_string(),
-        "expected canonical positive D<n>"
-    );
-    Ok(n)
-}
-
 fn single_line(text: &str) -> Result<()> {
     ensure!(
         !text.trim().is_empty() && !text.contains(['\r', '\n']),
@@ -355,7 +277,8 @@ fn edit(
     high_water: u64,
     operation: &Operation<'_>,
 ) -> Result<String> {
-    let current = entries(body)?;
+    let document = parse(body)?;
+    let current = &document.entries;
     match operation {
         Operation::Add(args) => {
             for text in [&args.question, &args.recommend, &args.item, &args.priority] {
@@ -403,7 +326,7 @@ fn edit(
                 entry.push('\n');
             }
             entry.push_str("\nReply:\n\n");
-            let at = done_offset(body);
+            let at = document.done_offset.unwrap_or(body.len());
             Ok(format!(
                 "{}{}{}{}",
                 &body[..at],
@@ -425,7 +348,7 @@ fn edit(
             if !next.ends_with('\n') {
                 next.push('\n');
             }
-            if done_offset(&next) == next.len() {
+            if parse(&next)?.done_offset.is_none() {
                 next.push_str("\n## Done\n\n");
             }
             next.push_str(&body[entry.start..entry.end]);
@@ -437,27 +360,6 @@ fn edit(
         }
         Operation::Read => anyhow::bail!("read is not a mutation"),
     }
-}
-
-fn done_offset(body: &str) -> usize {
-    // entries() has already checked structure; ignore literal headings in fences.
-    let mut fence = None;
-    let mut offset = 0;
-    for line in body.split_inclusive('\n') {
-        if line.starts_with("```") || line.starts_with("~~~") {
-            let c = line.chars().next();
-            if fence == c {
-                fence = None;
-            } else if fence.is_none() {
-                fence = c;
-            }
-        }
-        if fence.is_none() && line.trim_end_matches(['\r', '\n']) == "## Done" {
-            return offset;
-        }
-        offset += line.len();
-    }
-    body.len()
 }
 
 fn changes(before: &str, after: &str) -> Result<Value> {
@@ -763,6 +665,52 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn applied_mutations_share_fence_aware_done_boundary() {
+        for (open, inner, close) in [
+            ("````md", "```", "````"),
+            ("   ````md", "   ```", "   ````"),
+            ("   ~~~~md", "   ~~~", "   ~~~~"),
+        ] {
+            for done in ["", "## Done\n\n### D2 Old\nOutcome: kept\n"] {
+                let body = format!(
+                    "# Decisions\n\n{open}\n{inner}\n## Done\n### D99 Example\n{close}\n\n### D1 Ship?\nReply:\n\n{done}"
+                );
+                for resolve in [false, true] {
+                    let transport =
+                        Offline::new(vec![response(&body, json!([])), response(&body, json!([]))]);
+                    let args = add();
+                    let operation = if resolve {
+                        Operation::Resolve("D1", "Approved.")
+                    } else {
+                        Operation::Add(&args)
+                    };
+                    let result =
+                        execute(&transport, &target(), Some(&body), 2, operation, true).unwrap();
+                    let next = result.written.unwrap();
+                    let parsed = parse(&next).unwrap();
+                    assert!(!parsed.entries.contains_key(&99));
+                    assert!(next.contains(&format!(
+                        "{open}\n{inner}\n## Done\n### D99 Example\n{close}"
+                    )));
+                    if resolve {
+                        assert!(parsed.entries[&1].done);
+                        assert!(next.contains("Outcome: Approved."));
+                    } else {
+                        let added = &parsed.entries[&3];
+                        assert!(!added.done);
+                        assert_eq!(
+                            format!("{}{}", &next[..added.start], &next[added.end..]),
+                            body
+                        );
+                    }
+                    assert_eq!(transport.writes.borrow().len(), 1);
+                    assert_eq!(transport.writes.borrow()[0]["body"], next);
+                }
+            }
+        }
     }
 
     #[test]

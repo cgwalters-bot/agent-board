@@ -509,20 +509,55 @@ fn claims(thread: &[Comment], config: &Config) -> Vec<u64> {
 /// before it.
 fn newest_draft(thread: &[Comment], config: &Config) -> Result<usize> {
     let writers = [config.bot.as_str(), config.operator.as_str()];
+    newest_draft_by(thread, &writers)
+}
+
+fn newest_draft_by(thread: &[Comment], writers: &[&str]) -> Result<usize> {
     let newest = thread
         .iter()
         .rposition(|c| {
-            by(c, &writers) && (has_fence(&c.body, DRAFT_FENCE) || foreign_edit(c, &writers))
+            by(c, writers) && (has_fence(&c.body, DRAFT_FENCE) || foreign_edit(c, writers))
         })
         .context("no review draft on this issue from the bot or the operator")?;
     let draft = thread.get(newest).context("draft entry")?;
     ensure!(
-        !foreign_edit(draft, &writers),
+        !foreign_edit(draft, writers),
         "the newest draft {} was last edited by {}, who may not write drafts",
         draft.url,
         draft.editor.as_deref().unwrap_or("an unidentified account")
     );
     Ok(newest)
+}
+
+/// Read-only inbox source, using the send path's thread and newest-draft
+/// rules. A claim is not a new approval request, even after an uncertain send.
+/// The returned head is the draft's, not a claim that the PR is still at it.
+pub(crate) fn inbox_draft<T: Transport>(
+    client: &T,
+    issue: &ItemRef,
+    operator: &str,
+    bot: &str,
+) -> Result<Option<(Draft, Comment)>> {
+    let (thread, open, labelled) = read_thread(client, issue)?;
+    if !open || !labelled {
+        return Ok(None);
+    }
+    if let Some(claim) = thread
+        .iter()
+        .skip(1)
+        .find(|c| by(c, &[bot]) && c.body.lines().next() == Some(SENT_MARKER))
+    {
+        // A foreign editor must not be able to hide a pending draft by
+        // inserting a send marker into an otherwise trusted bot comment.
+        ensure!(
+            !foreign_edit(claim, &[bot]),
+            "review send claim has an unverified editor"
+        );
+        return Ok(None);
+    }
+    let index = newest_draft_by(&thread, &[operator, bot])?;
+    let source = thread.get(index).context("draft source")?;
+    Ok(Some((parse(&source.body, "")?, source.clone())))
 }
 
 /// The operator's approval of the draft at `index`, given after its last

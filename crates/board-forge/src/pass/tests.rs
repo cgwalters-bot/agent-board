@@ -3138,6 +3138,116 @@ fn comment_node(id: u64, author: &str, body: &str) -> Value {
         "author": {"login": author}, "editor": null})
 }
 
+/// The decisions document and the review-draft listing are read with the
+/// other needs-you sources, and each failure or cap marks only its own
+/// source: a refused listing is unread, a full page or an unreadable thread
+/// partial, and a document another account last edited unread.
+#[test]
+fn apply_reads_decision_and_draft_sources() {
+    let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    let listing = format!(
+        "{API_ROOT}repos/cgwalters-forge/tracker/issues?state=open&labels=review-draft&sort=created&direction=asc&per_page=100"
+    );
+    let config = config(json!({
+        "holds": {"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true,
+            "drafts": "cgwalters-forge/tracker"},
+        "decisions": {"repository": "cgwalters-forge/operator", "issue": 1}}));
+    let document = |editor: &str| {
+        json!({"data": {"repository": {"issue": {
+            "url": "https://github.com/cgwalters-forge/operator/issues/1",
+            "body": "# Decisions\n### D1 Ship it? (P0, blocks o/r#1)\n### D2 Wait?\n## Done\n### D3 Old?\n",
+            "createdAt": "2026-10-20T00:00:00Z", "lastEditedAt": "2026-10-21T00:00:00Z",
+            "author": {"login": "cgwalters"}, "editor": {"login": editor}, "state": "OPEN"}}}})
+    };
+    let pulls: Vec<Value> = (1..=100)
+        .map(|n| json!({"number": n, "pull_request": {}}))
+        .collect();
+    for (name, editor, (status, issues), read, error) in [
+        (
+            "listing refused",
+            "cgwalters",
+            (502, json!({})),
+            ("complete", "unread"),
+            Some("needs-you drafts error: "),
+        ),
+        (
+            "a full page",
+            "cgwalters-bot",
+            (200, json!(pulls)),
+            ("complete", "partial"),
+            None,
+        ),
+        (
+            "an unreadable thread, a foreign edit",
+            "visitor",
+            (200, json!([{"number": 7}])),
+            ("unread", "partial"),
+            Some("needs-you drafts error: cgwalters-forge/tracker#7: "),
+        ),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let variables = json!({"owner": "cgwalters-forge", "name": "operator", "number": 1});
+        let request = graphql_key(needs::inbox::DOCUMENT_QUERY, &variables);
+        forge
+            .replay
+            .requests
+            .push(json!({"request": request, "answer": document(editor)}));
+        for (url, status, body) in [
+            (bot_ops.clone(), 200, json!({"private": true})),
+            (
+                format!("{API_ROOT}user"),
+                200,
+                json!({"login": "cgwalters-bot"}),
+            ),
+            (listing.clone(), status, issues),
+        ] {
+            let answer = json!({"status": status, "link": null, "body": body});
+            let request = json!({"request": {"get": url}, "answer": answer});
+            forge.replay.requests.push(request);
+        }
+        let report = apply(&forge, &config);
+        let body = (forge.writes.borrow().iter())
+            .find(|(m, url, _)| m == "POST" && url.starts_with(&bot_ops))
+            .map(|(_, _, body)| text(body, "/body").to_owned())
+            .unwrap_or_else(|| panic!("{name}: {:#?}", report.lines));
+        let list = &holds::parse(&body).unwrap()["needs_you"];
+        let sources = &list["sources"];
+        assert_eq!(
+            json!([sources["decisions"], sources["drafts"], list["complete"]]),
+            json!([read.0, read.1, false]),
+            "{name}"
+        );
+        let decisions: Vec<_> = (list["items"].as_array().unwrap().iter())
+            .filter(|a| a["source"] == "decisions")
+            .map(|a| json!([a["key"], a["priority"], a["ask"]]))
+            .collect();
+        let expected = if read.0 == "complete" {
+            vec![
+                json!(["cgwalters-forge/operator#1/decision-1", "P0", "Ship it?"]),
+                json!(["cgwalters-forge/operator#1/decision-2", null, "Wait?"]),
+            ]
+        } else {
+            vec![]
+        };
+        assert_eq!(decisions, expected, "{name}");
+        assert_eq!(list["counts"]["decisions"], list["count"], "{name}");
+        let lines = &report.lines;
+        if let Some(error) = error {
+            assert!(
+                lines.iter().any(|l| l.starts_with(error)),
+                "{name}: {lines:#?}"
+            );
+        }
+        if editor == "visitor" {
+            let refused = "needs-you decisions error: ";
+            assert!(
+                lines.iter().any(|l| l.starts_with(refused)),
+                "{name}: {lines:#?}"
+            );
+        }
+    }
+}
+
 /// With `holds.needsYou`, the published snapshot lists the holds that wait
 /// on the operator, with their bot summaries' questions and
 /// recommendations, and each operator-action proposal, three on one issue
@@ -10008,6 +10118,18 @@ fn config_table() {
             json!({"holds": {"repository": "o/ops", "issue": 1,
                 "proposals": {"repository": "o/ops", "label": "act", "repositories": ["o/r"]}}}),
             "holds proposals needs holds needsYou",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "drafts": "o/r"}}),
+            "holds drafts needs holds needsYou",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true, "drafts": "../other"}}),
+            "holds drafts repository",
+        ),
+        (
+            json!({"decisions": {"repository": "o/ops", "issue": 0}}),
+            "decisions issue must be a positive GraphQL Int",
         ),
         (
             json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true,

@@ -518,7 +518,7 @@ const START_KINDS: &[&str] = &[
 ];
 
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Snapshot {
     pub schema: &'static str,
     /// The clock of the pass that wrote it.
@@ -1041,12 +1041,16 @@ pub struct Sources {
     pub reviews: Read,
     pub proposals: Read,
     pub digest: Read,
+    #[serde(flatten)]
+    pub inbox: BTreeMap<String, Read>,
 }
 
 /// The `source` of the asks each of [`Reading`]'s own sources lists.
 pub const REVIEWS: &str = "reviews";
 pub const PROPOSALS: &str = "proposals";
 pub const DIGEST: &str = "digest";
+pub const DECISIONS: &str = "decisions";
+pub const DRAFTS: &str = "drafts";
 
 /// What a [`Reference`] names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1218,8 +1222,16 @@ pub struct NeedsYou {
     /// even the compact inventory, with no detail card left, did not fit
     /// ([`fit`]); `complete` is then false. Otherwise zero.
     pub omitted: usize,
+    /// `omitted` by each left-out identity's `source`; absent where none is.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub omitted_sources: BTreeMap<String, usize>,
     /// How many decisions, including identities whose detail did not fit.
     pub count: usize,
+    /// Canonical decisions represented before display truncation. On a partial
+    /// read these are known counts, never an assertion about unread sources.
+    pub counts: Counts,
+    /// Non-actionable observations, deliberately excluded from all ask counts.
+    pub context: ContextFold,
     pub items: Vec<Ask>,
     /// Ranked decision inventory; incomplete when `omitted` is nonzero.
     pub identities: Vec<Identity>,
@@ -1321,6 +1333,182 @@ pub struct EpicActivity {
     pub complete: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Counts {
+    pub decisions: usize,
+    pub groups: usize,
+    pub members: usize,
+}
+
+/// The most context facts of each source: holds, steps, runs.
+const MAX_CONTEXT: [usize; 3] = [20, 10, 10];
+
+/// The `source` of each [`ContextFact`], in the order `context.items`
+/// lists them, so that [`fit`] cuts runs first and holds last.
+pub const CONTEXT_HOLD: &str = "hold";
+pub const CONTEXT_STEP: &str = "step";
+pub const CONTEXT_RUN: &str = "run";
+/// The `context.sources` key of the usage snapshot `context.limits` reads.
+const CONTEXT_USAGE: &str = "usage";
+
+/// The usage snapshot's fields `context.limits` keeps of a held pool, and
+/// of the budget; the rest is its pacing's own detail.
+const POOL_FIELDS: &[&str] = &[
+    "reason",
+    "used_percent",
+    "limit_percent",
+    "resets_at",
+    "next_dispatch_at",
+    "observed_at",
+];
+const BUDGET_FIELDS: &[&str] = &["reason", "weekly_usd", "spent_usd", "since"];
+
+/// The `context.limits` key of the budget, beside the pools' names.
+pub const BUDGET_LIMIT: &str = "budget";
+
+/// The limits' readings that move from pass to pass: like observation
+/// clocks, they alone are no change ([`requests::strip_observation_times`]).
+pub(super) const LIMIT_READINGS: &[&str] = &[
+    "used_percent",
+    "limit_percent",
+    "resets_at",
+    "next_dispatch_at",
+    "observed_at",
+    "spent_usd",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContextFold {
+    pub wip: Wip,
+    pub observed_at: String,
+    /// How much of each source besides the holds this pass read: an unread
+    /// one says nothing of what it would have listed.
+    pub sources: BTreeMap<&'static str, Read>,
+    pub omitted: usize,
+    pub items: Vec<ContextFact>,
+    /// The pools that hold new runs, and the budget where it does, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContextFact {
+    /// [`CONTEXT_HOLD`], [`CONTEXT_STEP`] or [`CONTEXT_RUN`].
+    pub source: &'static str,
+    pub item: Option<String>,
+    /// A hold's kind, a step's [`poll::Progress`] or a run's conclusion.
+    pub kind: String,
+    pub reason: String,
+    pub url: Option<String>,
+    /// When it began, where its source says: a hold's `since`, when a
+    /// step's head last moved, a run's last update.
+    pub since: Option<String>,
+    pub observed_at: Option<String>,
+}
+
+/// What the pass observed besides its holds, for the `context` fold, with
+/// how much of each it read; none of it is an ask.
+#[derive(Clone, Debug)]
+pub struct Observed {
+    /// Stage 2's step for each followed pull request no person moves.
+    pub steps: (Read, Vec<ContextFact>),
+    /// The caller's runs that failed in the last day.
+    pub runs: (Read, Vec<ContextFact>),
+    /// The usage snapshot the pass paced by.
+    pub usage: (Read, Option<Value>),
+}
+
+impl Observed {
+    pub fn off() -> Self {
+        Self {
+            steps: (Read::Off, Vec::new()),
+            runs: (Read::Off, Vec::new()),
+            usage: (Read::Off, None),
+        }
+    }
+}
+
+/// The held pools of the usage snapshot `usage`, and its budget where a
+/// budget hold says it holds, each cut to the fields that say why and until
+/// when.
+fn limits(usage: Option<&Value>, budget_held: bool) -> BTreeMap<String, Value> {
+    let keep = |entry: &Value, fields: &[&str]| {
+        let kept = fields
+            .iter()
+            .filter_map(|f| Some((f.to_string(), entry.get(*f)?.clone())));
+        Value::Object(kept.collect())
+    };
+    let Some(usage) = usage else {
+        return BTreeMap::new();
+    };
+    let pools = usage["pools"].as_object().into_iter().flatten();
+    let mut limits: BTreeMap<_, _> = pools
+        .filter(|(_, p)| p["hold"] == true)
+        .map(|(name, p)| (name.clone(), keep(p, POOL_FIELDS)))
+        .collect();
+    if budget_held && usage["budget"].is_object() {
+        limits.insert(BUDGET_LIMIT.into(), keep(&usage["budget"], BUDGET_FIELDS));
+    }
+    limits
+}
+
+fn context(snapshot: &Snapshot, previous: Option<&Value>, observed: &Observed) -> ContextFold {
+    let previous = published_list(previous);
+    let holds: Vec<_> = snapshot
+        .holds
+        .iter()
+        .filter(|h| !h.operator && h.kind != HoldKind::Closed)
+        .map(|h| {
+            let reason = one_line(&h.reason, MAX_ASK).unwrap_or_default();
+            let observed_at = if h.carried {
+                previous
+                    .and_then(|p| p["context"]["items"].as_array())
+                    .into_iter()
+                    .flatten()
+                    .find(|p| {
+                        p["source"] == CONTEXT_HOLD
+                            && p["item"].as_str() == h.item.as_deref()
+                            && p["kind"] == h.kind.name()
+                            && p["reason"] == reason.as_str()
+                    })
+                    .and_then(|p| not_after(&p["observed_at"], &snapshot.at))
+            } else {
+                Some(snapshot.at.clone())
+            };
+            ContextFact {
+                source: CONTEXT_HOLD,
+                item: h.item.clone(),
+                kind: h.kind.name().into(),
+                reason,
+                url: h.url.clone(),
+                since: Some(h.since.clone()).filter(|s| !s.is_empty()),
+                observed_at,
+            }
+        })
+        .collect();
+    let mut omitted = 0;
+    let mut items = Vec::new();
+    let all = [holds, observed.steps.1.clone(), observed.runs.1.clone()];
+    for (mut facts, max) in all.into_iter().zip(MAX_CONTEXT) {
+        facts.sort_by(|a, b| (&a.item, &a.kind, &a.reason).cmp(&(&b.item, &b.kind, &b.reason)));
+        omitted += facts.len().saturating_sub(max);
+        items.extend(facts.into_iter().take(max));
+    }
+    let budget_held = snapshot.holds.iter().any(|h| h.kind == HoldKind::Budget);
+    ContextFold {
+        wip: snapshot.wip.clone(),
+        observed_at: snapshot.at.clone(),
+        sources: BTreeMap::from([
+            (CONTEXT_STEP, observed.steps.0),
+            (CONTEXT_RUN, observed.runs.0),
+            (CONTEXT_USAGE, observed.usage.0),
+        ]),
+        omitted,
+        items,
+        limits: limits(observed.usage.1.as_ref(), budget_held),
+    }
+}
+
 impl NeedsYou {
     /// Evicts detail only; the complete identity inventory stays intact.
     fn cut(&mut self) -> Option<Ask> {
@@ -1387,6 +1575,8 @@ pub struct Reading<'a> {
     pub reviews: Collected,
     pub proposals: Collected,
     pub digest: Collected,
+    pub inbox: BTreeMap<String, Collected>,
+    pub observed: Observed,
     /// How much of the summaries was read, and each read by its issue's
     /// key, none where the issue has none.
     pub summaries: (Read, BTreeMap<String, Option<Summary>>),
@@ -1634,6 +1824,11 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         reviews: reading.reviews.read,
         proposals: reading.proposals.read,
         digest: reading.digest.read,
+        inbox: reading
+            .inbox
+            .iter()
+            .map(|(k, c)| (k.clone(), c.read))
+            .collect(),
     };
     // Without the board's options, the order the published list ranked its
     // Priorities in stands in for them, so that the order does not move.
@@ -1743,12 +1938,15 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         }
         approvals.insert(pull, joined);
     }
-    let published = published_asks(previous, &[REVIEWS, PROPOSALS, DIGEST]);
-    let own = [
+    let published = published_asks(previous, &[REVIEWS, PROPOSALS, DIGEST, DECISIONS, DRAFTS]);
+    let own: Vec<_> = [
         (REVIEWS, &reading.reviews),
         (PROPOSALS, &reading.proposals),
         (DIGEST, &reading.digest),
-    ];
+    ]
+    .into_iter()
+    .chain(reading.inbox.iter().map(|(k, c)| (k.as_str(), c)))
+    .collect();
     let mut asks: Vec<Ask> = (own.iter())
         .flat_map(|(_, c)| c.asks.iter().cloned())
         .collect();
@@ -1905,6 +2103,14 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         ask.recommendation = (ask.recommendation.as_deref()).and_then(|r| one_line(r, MAX_ASK));
     }
     let omitted = 0;
+    let mut counts = Counts {
+        decisions: semantic.len(),
+        groups: semantic.iter().filter(|a| a.group.is_some()).count(),
+        members: semantic
+            .iter()
+            .map(|a| a.group.as_ref().map_or(1, |g| g.numbers.len()))
+            .sum(),
+    };
     let requests: Vec<_> = semantic
         .iter()
         .filter(|ask| kept.iter().any(|card| card.key == ask.key))
@@ -1913,12 +2119,15 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     let mut request_sources = Vec::new();
     for request in &requests {
         for ask in evidence.iter().filter(|ask| {
-            matches!(ask.source.as_str(), REVIEWS | PROPOSALS | DIGEST)
-                && requests::identity(ask, &reading.on.host) == request.identity
+            matches!(
+                ask.source.as_str(),
+                REVIEWS | PROPOSALS | DIGEST | DECISIONS | DRAFTS
+            ) && requests::identity(ask, &reading.on.host) == request.identity
                 && ask.head == request.target.head
         }) {
             let raw = [&reading.reviews, &reading.proposals, &reading.digest]
                 .into_iter()
+                .chain(reading.inbox.values())
                 .flat_map(|c| &c.asks)
                 .find(|raw| raw.key == ask.key && raw.source_ref == ask.source_ref);
             let original = raw.unwrap_or(ask);
@@ -1933,7 +2142,10 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
                 } else {
                     previous_source.as_ref().and_then(|s| s.observed_at.clone())
                 },
-                source_time: if matches!(original.source.as_str(), PROPOSALS | DIGEST) {
+                source_time: if matches!(
+                    original.source.as_str(),
+                    PROPOSALS | DIGEST | DECISIONS | DRAFTS
+                ) {
                     raw.map(|a| a.waiting_since.clone())
                         .or_else(|| previous_source.and_then(|s| s.source_time))
                 } else {
@@ -2036,11 +2248,16 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
                                     .is_some_and(|i| i.eq_ignore_ascii_case(&identity.item))
                         })
                 }
-                REVIEWS | PROPOSALS | DIGEST => {
+                REVIEWS | PROPOSALS | DIGEST | DECISIONS | DRAFTS => {
                     let collected = match identity.source.as_str() {
                         REVIEWS => &reading.reviews,
                         PROPOSALS => &reading.proposals,
-                        _ => &reading.digest,
+                        DIGEST => &reading.digest,
+                        // An inbox source no longer configured lists nothing.
+                        inbox => match reading.inbox.get(inbox) {
+                            Some(collected) => collected,
+                            None => continue,
+                        },
                     };
                     collected.read == Read::Unread
                         || collected.read == Read::Partial
@@ -2063,6 +2280,9 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             {
                 identity.carried = true;
                 identities.push(identity);
+                // A decision carried without its card is still a known one.
+                counts.decisions += 1;
+                counts.members += 1;
             }
         }
     }
@@ -2117,13 +2337,20 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         .count();
     let mut list = NeedsYou {
         schema: NEEDS_YOU_SCHEMA,
-        complete: omitted == 0 && read.iter().all(|r| matches!(r, Read::Complete | Read::Off)),
+        complete: omitted == 0
+            && read
+                .iter()
+                .chain(sources.inbox.values())
+                .all(|r| matches!(r, Read::Complete | Read::Off)),
         validated_at: at.clone(),
         changed_at: at.clone(),
         sources,
         summaries: reading.summaries.0,
         omitted,
+        omitted_sources: BTreeMap::new(),
         count: identities.len(),
+        counts,
+        context: context(snapshot, previous, &reading.observed),
         items,
         identities,
         epics: BTreeMap::new(),
@@ -2313,6 +2540,12 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
             list.summary_cache.clear();
             continue;
         }
+        // Context is useful but must never evict an actionable decision.
+        if let Some(list) = needs_you.as_mut().filter(|l| !l.context.items.is_empty()) {
+            list.context.items.pop();
+            list.context.omitted += 1;
+            continue;
+        }
         // Each entry is its JSON and a ",\n"; the count may grow a digit,
         // which the next round sees.
         while over > 0 {
@@ -2383,6 +2616,7 @@ fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
                     over =
                         over.saturating_sub(serde_json::to_string(&identity)?.chars().count() + 1);
                     list.omitted += 1;
+                    *list.omitted_sources.entry(identity.source).or_default() += 1;
                 }
                 list.complete = false;
                 continue;
@@ -2793,10 +3027,18 @@ mod tests {
         // in `omitted` and no hold left out.
         let full = listed(&waiting(), None, (true, true));
         let count = full.count;
+        let mut omitted_sources = BTreeMap::<String, usize>::new();
+        for identity in &full.identities {
+            *omitted_sources.entry(identity.source.clone()).or_default() += 1;
+        }
+        let mut context = full.context.clone();
+        context.omitted += std::mem::take(&mut context.items).len();
         let mut asked = bare(&board(0, 0));
         asked.needs_you = Some(NeedsYou {
             complete: false,
             omitted: count,
+            omitted_sources,
+            context,
             details_omitted: count,
             items: Vec::new(),
             identities: Vec::new(),
@@ -3649,6 +3891,8 @@ mod tests {
             reviews: Collected::off(),
             proposals: Collected::off(),
             digest: Collected::off(),
+            inbox: BTreeMap::new(),
+            observed: Observed::off(),
             summaries: (Read::Complete, BTreeMap::new()),
         }
     }
@@ -3772,6 +4016,7 @@ mod tests {
                 reviews: Read::Off,
                 proposals: Read::Off,
                 digest: Read::Off,
+                inbox: BTreeMap::new(),
             };
             assert_eq!(list.sources, expected, "{name}");
             let whole = [on_epics, on_items]
@@ -4508,6 +4753,253 @@ mod tests {
         json!({"schema": HOLDS_SCHEMA, "needs_you": list})
     }
 
+    #[test]
+    fn inbox_sources_preserve_clocks_counts_and_partial_waits() {
+        let (on, options) = (item("o/ops", 1), options(&["P0", "P1"]));
+        let mut document = own(DECISIONS, ("o/ops", 2), RefKind::Issue, None);
+        document.key.push_str("/decision-1");
+        document.priority = Some("P0".into());
+        document.ask = "Ship the bounded inbox publication?".into();
+        let mut draft = own(DRAFTS, ("o/ops", 3), RefKind::Issue, None);
+        draft.key.push_str("/draft");
+        draft.ask = "Inspect the newest review draft?".into();
+        let fresh = || {
+            BTreeMap::from([
+                (
+                    DECISIONS.into(),
+                    collected(Read::Complete, vec![document.clone()], &[]),
+                ),
+                (
+                    DRAFTS.into(),
+                    collected(Read::Complete, vec![draft.clone()], &[]),
+                ),
+            ])
+        };
+        let mut board = snapshot(
+            &[entry(
+                Scope::Item(item("o/r", 4)),
+                HoldKind::InFlight,
+                "working",
+            )],
+            "2026-10-28T09:00:00Z".into(),
+            tally(),
+        );
+        let mut input = reading(&on, &options);
+        input.inbox = fresh();
+        let first = needs_you(&board, None, &input);
+        assert_eq!(
+            (first.count, first.counts.decisions, first.counts.members),
+            (2, 2, 2)
+        );
+        assert_eq!(first.context.items.len(), 1);
+        assert_eq!(first.requests[0].quality, "decision");
+        let previous = as_published(&first);
+        board.at = "2026-10-28T09:30:00Z".into();
+        let again = needs_you(&board, Some(&previous), &input);
+        assert_eq!(again.changed_at, first.changed_at);
+        assert_eq!(again.validated_at, board.at);
+        for read in [Read::Unread, Read::Partial] {
+            input
+                .inbox
+                .insert(DRAFTS.into(), collected(read, vec![], &["o/ops#3"]));
+            let partial = needs_you(&board, Some(&previous), &input);
+            assert!(!partial.complete);
+            assert_eq!(partial.counts, first.counts);
+            let carried = partial
+                .requests
+                .iter()
+                .find(|r| r.key == draft.key)
+                .unwrap();
+            assert_eq!(
+                carried.observed_at.as_deref(),
+                Some(first.validated_at.as_str())
+            );
+            assert_eq!(carried.quality, "unverified-carried");
+            assert!(
+                partial
+                    .items
+                    .iter()
+                    .find(|a| a.key == draft.key)
+                    .unwrap()
+                    .carried
+            );
+        }
+        input.inbox = fresh();
+        input.inbox.get_mut(DRAFTS).unwrap().asks.clear();
+        let resolved = needs_you(&board, Some(&previous), &input);
+        assert_eq!(resolved.counts.decisions, 1);
+        // Detail eviction never rewrites the canonical known totals.
+        let mut cut = first.clone();
+        cut.cut().unwrap();
+        assert_eq!((cut.count, cut.details_omitted), (2, 1));
+        assert_eq!(cut.counts, first.counts);
+        assert_eq!(cut.omitted, 0);
+        assert!(cut.omitted_sources.is_empty());
+    }
+
+    /// Steps, failed runs and held limits fold into `context` in source
+    /// order, each source capped, none of it counted as an ask; their
+    /// facts, readings and clocks alone write nothing, and an unread usage
+    /// snapshot lists no limit.
+    #[test]
+    fn context_folds_steps_runs_and_held_limits() {
+        let (on, options) = (item("o/ops", 1), options(&["P0"]));
+        let fact = |source, n: usize| ContextFact {
+            source,
+            item: Some(format!("o/r#{n}")),
+            kind: "waiting".into(),
+            reason: format!("wait: checks pending {n:02}"),
+            url: None,
+            since: None,
+            observed_at: Some("2026-10-28T09:00:00Z".into()),
+        };
+        let usage = |used: f64, at: &str| {
+            json!({"pools": {
+                "claude": {"hold": true, "reason": "pace", "used_percent": used, "limit_percent": 40.0,
+                    "resets_at": "2026-10-30T00:00:00Z", "observed_at": at, "burst": 5},
+                "openai": {"hold": false, "used_percent": 3.0},
+            }, "budget": {"weekly_usd": 100.0, "spent_usd": 101.0 + used, "prices": "list"}})
+        };
+        let mut board = snapshot(
+            &[
+                entry(Scope::Item(item("o/r", 4)), HoldKind::InFlight, "working"),
+                entry(Scope::Pass, HoldKind::Budget, "spent; new runs wait"),
+            ],
+            "2026-10-28T09:00:00Z".into(),
+            tally(),
+        );
+        let mut input = reading(&on, &options);
+        let off = needs_you(&board, None, &input);
+        input.observed = Observed {
+            steps: (Read::Complete, vec![fact(CONTEXT_STEP, 1)]),
+            runs: (
+                Read::Complete,
+                (0..12).map(|n| fact(CONTEXT_RUN, n)).collect(),
+            ),
+            usage: (Read::Complete, Some(usage(80.0, "2026-10-28T08:55:00Z"))),
+        };
+        let first = needs_you(&board, None, &input);
+        assert_eq!((first.counts.clone(), first.count), (off.counts, off.count));
+        let sources: Vec<_> = first.context.items.iter().map(|f| f.source).collect();
+        let mut expected = vec![CONTEXT_HOLD; 2];
+        expected.push(CONTEXT_STEP);
+        expected.extend([CONTEXT_RUN; 10]);
+        assert_eq!(sources, expected);
+        assert_eq!(first.context.omitted, 2);
+        assert_eq!(
+            serde_json::to_value(&first.context.limits).unwrap(),
+            json!({
+                "budget": {"weekly_usd": 100.0, "spent_usd": 181.0},
+                "claude": {"reason": "pace", "used_percent": 80.0, "limit_percent": 40.0,
+                    "resets_at": "2026-10-30T00:00:00Z", "observed_at": "2026-10-28T08:55:00Z"},
+            })
+        );
+        board.needs_you = Some(first.clone());
+        let (_, body) = fit(board.clone()).unwrap();
+        board.at = "2026-10-28T09:30:00Z".into();
+        input.observed.usage.1 = Some(usage(85.0, "2026-10-28T09:25:00Z"));
+        input.observed.steps.1[0].reason = "wait: checks pending 99".into();
+        input.observed.runs.1.pop();
+        let again = needs_you(&board, Some(&published(&body).unwrap()), &input);
+        assert_eq!(again.changed_at, first.changed_at);
+        board.needs_you = Some(again);
+        assert!(!changed(Some(&body), &board).unwrap());
+        input.observed.usage = (Read::Unread, None);
+        let unread = needs_you(&board, Some(&published(&body).unwrap()), &input);
+        assert_eq!(unread.context.sources[CONTEXT_USAGE], Read::Unread);
+        assert!(unread.context.limits.is_empty());
+        assert_ne!(unread.changed_at, first.changed_at);
+    }
+
+    /// The real 3 November publication and holds, spend removed, copied from
+    /// review's test/fixtures. Its own sources were partial, so the replay
+    /// reads none of them: every ask it listed is carried or a hold's.
+    const REAL_SNAPSHOT: &str = include_str!("../../../../fixtures/needs-you-real-2026-11-03.json");
+
+    #[test]
+    fn real_publication_replay() {
+        let raw: Value = serde_json::from_str(REAL_SNAPSHOT).unwrap();
+        assert_eq!(raw["schema"], HOLDS_SCHEMA);
+        let mut board = snapshot(&[], raw["at"].as_str().unwrap().into(), tally());
+        board.holds = serde_json::from_value(raw["holds"].clone()).unwrap();
+        board.wip.limit = raw["wip"]["limit"].as_u64().unwrap();
+        board.wip.in_flight = raw["wip"]["in_flight"].as_u64().map(|n| n as usize);
+        let (on, options) = (item("redacted/ops", 1), options(&["P0", "P1", "P2", "P3"]));
+        let mut input = reading(&on, &options);
+        input.considered = false;
+        input.reviews = Collected::of(Read::Unread);
+        input.proposals = Collected::of(Read::Unread);
+        input.digest = Collected::of(Read::Unread);
+        board.needs_you = Some(needs_you(&board, Some(&raw), &input));
+        let list = board.needs_you.as_ref().unwrap();
+        assert!(
+            !list.complete,
+            "the real snapshot is partial, not an empty/full census"
+        );
+        assert!(list.counts.decisions > raw["needs_you"]["count"].as_u64().unwrap() as usize);
+        let keys: BTreeSet<_> = list.requests.iter().map(|r| &r.identity).collect();
+        assert_eq!(keys.len(), list.counts.decisions);
+        assert!(list.counts.groups <= list.counts.decisions);
+        assert!(list.counts.members >= list.counts.decisions);
+        assert_eq!(list.count + list.omitted, list.counts.decisions);
+        // Global order: Priority, then age.
+        let rank = |a: &Ask| {
+            let priority = a.priority.as_deref();
+            let p = ["P0", "P1", "P2", "P3"]
+                .iter()
+                .position(|p| Some(*p) == priority);
+            (p.unwrap_or(usize::MAX), a.waiting_since.clone())
+        };
+        assert!(list.items.windows(2).all(|w| rank(&w[0]) <= rank(&w[1])));
+        let totals = list.counts.clone();
+        let (fitted, body) = fit(board.clone()).unwrap();
+        assert!(body.chars().count() <= MAX_COMMENT_CHARS);
+        let fitted = fitted.needs_you.unwrap();
+        assert_eq!(fitted.counts, totals);
+        assert_eq!(
+            fitted.omitted_sources.values().sum::<usize>(),
+            fitted.omitted
+        );
+        let previous = published(&body).unwrap();
+        board.at = (parse_time(&board.at).unwrap() + time::Duration::minutes(30))
+            .format(&Rfc3339)
+            .unwrap();
+        board.needs_you = Some(needs_you(&board, Some(&previous), &input));
+        let (_, again) = fit(board.clone()).unwrap();
+        let again = published(&again).unwrap();
+        assert_eq!(
+            again["needs_you"]["changed_at"],
+            previous["needs_you"]["changed_at"]
+        );
+        assert_eq!(again["needs_you"]["validated_at"], board.at.as_str());
+        // One more source, read and then failing: its ask is carried, the
+        // known totals stay, and the list does not claim to be complete.
+        let mut document = own(DECISIONS, ("redacted/ops", 2), RefKind::Issue, None);
+        document.key.push_str("/decision-1");
+        // Only a published ask can be carried: this one ranks first.
+        (document.priority, document.waiting_since) =
+            (Some("P0".into()), "2026-10-01T00:00:00Z".into());
+        input.inbox = BTreeMap::from([(
+            DECISIONS.into(),
+            collected(Read::Complete, vec![document.clone()], &[]),
+        )]);
+        let read = needs_you(&board, Some(&previous), &input);
+        assert_eq!(read.sources.inbox[DECISIONS], Read::Complete);
+        assert_eq!(read.counts.decisions, totals.decisions + 1);
+        board.needs_you = Some(read.clone());
+        let (_, read_body) = fit(board.clone()).unwrap();
+        input.inbox = BTreeMap::from([(DECISIONS.into(), Collected::of(Read::Unread))]);
+        let failed = needs_you(&board, Some(&published(&read_body).unwrap()), &input);
+        assert_eq!(failed.sources.inbox[DECISIONS], Read::Unread);
+        assert!(!failed.complete);
+        assert_eq!(failed.counts, read.counts);
+        let carried = failed.requests.iter().find(|r| r.key == document.key);
+        assert_eq!(
+            carried.map(|r| r.quality.as_str()),
+            Some("unverified-carried")
+        );
+    }
+
     /// An issue held on the operator's approval of its pull request and
     /// that pull request's review wait are one ask, the review's, with its
     /// head and the hold's Priority and question; without the review, the
@@ -4725,6 +5217,7 @@ mod tests {
         reading.proposals = Collected::of(Read::Unread);
         let unread = needs_you(&board, Some(&previous), &reading);
         assert_eq!(unread.count, 150);
+        assert_eq!((unread.counts.decisions, unread.counts.members), (150, 150));
         assert_eq!(unread.identities.len(), 150);
         assert!(unread.identities.iter().all(|i| i.carried));
         assert_eq!(unread.details_omitted, 150 - unread.items.len());
@@ -4735,6 +5228,26 @@ mod tests {
         reading.proposals = collected(Read::Partial, vec![], &["o/ops"]);
         assert_eq!(needs_you(&board, Some(&previous), &reading).count, 150);
         reading.proposals = Collected::of(Read::Complete);
+        assert_eq!(needs_you(&board, Some(&previous), &reading).count, 0);
+        // So do an inbox source's, until it is read whole or not configured.
+        let drafts = (1..=150)
+            .map(|n| {
+                let mut ask = own(DRAFTS, ("o/ops", n), RefKind::Issue, None);
+                ask.key.push_str("/draft");
+                ask
+            })
+            .collect();
+        reading.inbox = BTreeMap::from([(DRAFTS.into(), collected(Read::Complete, drafts, &[]))]);
+        let mut board = snapshot(&[], "2026-10-28T09:00:00Z".into(), tally());
+        board.needs_you = Some(needs_you(&board, None, &reading));
+        let (_, body) = fit(board.clone()).unwrap();
+        let previous = parse(&body).unwrap();
+        reading.inbox = BTreeMap::from([(DRAFTS.into(), Collected::of(Read::Unread))]);
+        let unread = needs_you(&board, Some(&previous), &reading);
+        assert_eq!((unread.count, unread.counts.decisions), (150, 150));
+        reading.inbox = BTreeMap::from([(DRAFTS.into(), Collected::of(Read::Complete))]);
+        assert_eq!(needs_you(&board, Some(&previous), &reading).count, 0);
+        reading.inbox.clear();
         assert_eq!(needs_you(&board, Some(&previous), &reading).count, 0);
     }
 

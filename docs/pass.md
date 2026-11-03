@@ -522,6 +522,90 @@ acceptance uses existing synthetic/redacted offline fixtures, not a saved live
 publication or authenticated review rendering. Live parity checks, including the
 #621 done-verdict-held-for-human pattern, remain unverified.
 
+#### Decisions and review-draft inbox sources
+
+With `holds.needsYou`, the existing top-level `decisions: {repository, issue}`
+also supplies outstanding `### D<n>` entries before `## Done`. The document
+must be open, authored and last edited by the configured operator or bot.
+Fenced examples do not count; duplicate IDs, malformed headings and unclosed
+fences leave the source unread. Checked answers stay pending until the entry
+moves to Done. At most 50 entries are published; a longer document is partial.
+Its issue's edit clock is `source_time`, not the creation time of every entry.
+Document keys include the stable decision ID, so two entries on one issue
+remain distinct. No resolution or answer-application mechanism is added.
+
+`holds.drafts: "OWNER/REPO"` optionally adds open `review-draft` issues from
+that repository. The concrete threat this scope control stops is collecting
+unrelated draft threads as requests for this operator; it gives no send
+authority. It requires `holds.needsYou` and supports GitHub only. One listing
+of at most 100 issues is read, oldest first, with at most 10 threads read
+within the pass's existing request/time reserve. A full listing page or a
+skipped/failed thread is partial. Draft selection, author/editor checks and
+parsing reuse the review-send path. Closed/unlabelled issues and threads with
+a send claim supply no new ask. A draft's PR head is quoted as source data,
+not represented as a freshly validated PR head or permission to send it.
+
+The optional `decisions` and `drafts` source statuses use the same complete,
+partial, unread and carry-forward contracts as the other sources; absent
+configuration omits these statuses. No collector runs without `holds.needsYou`.
+
+`counts: {decisions, groups, members}` gives canonical known totals of the
+asks read or carried this pass, before fitting: distinct semantic requests,
+grouped requests, and their represented membership (an ungrouped request
+contributes one member). These totals are not a census of unread sources and
+do not imply completeness; fitting never changes them. `omitted_sources`
+splits `omitted`, the identities fitting left out, by each one's `source`,
+and is absent when nothing is left out.
+
+`context` is the non-actionable status beside the asks, from what the pass
+already read; nothing is read again for it. It has WIP and `items`, each with
+a `source`, `item`, `kind`, clipped `reason`, `url`, `since` (when it began,
+where known) and `observed_at`, in source order:
+
+- `hold`: at most 20 holds that do not wait on the operator, `kind` the
+  hold's. Carried holds retain their previous observation time, or null if
+  unknown.
+- `step`: at most 10 of stage 2's controller decisions on followed pull
+  requests that no person takes, `kind` `moving`, `waiting`, `held` or
+  `unreviewed` and `reason` the step's action and reason; one only a person
+  takes is a review ask instead.
+- `run`: at most 10 of the caller's runs that failed in the last day (with
+  `reruns` or `starts`), `kind` their conclusion, `reason` their title and
+  `url` made from their repository and id.
+
+`limits` lists, by pool name, each pool of the usage snapshot that holds new
+runs, with its reason, used and limit percentages, reset, next dispatch and
+observation time, and, under `budget`, the weekly budget and trailing spend
+where a budget hold holds. `context.sources` says whether stage 2's steps,
+the failed-run listing and the usage snapshot were read this pass
+(`complete`, `partial`, `unread`, `off`): an unread one lists nothing, which
+says nothing of what it would have. Its own `omitted` counts facts left out,
+not decisions; context never changes actionable counts. Context is cut,
+runs first and holds last, before actionable cards when fitting the private
+comment. The context's facts, observation clocks and the limits' readings
+alone do not change `changed_at` or force a write, or a step's checks would
+write every pass; a source read or unread, or a pool that starts or stops
+holding, does, and hourly confirmation still refreshes the rest.
+
+`fixtures/needs-you-real-2026-11-03.json` is review's redacted copy of the
+real 3 November publication and holds, spend removed. `real_publication_replay`
+replays it: Priority/age order, canonical counts, fitting, an unchanged pass
+that keeps `changed_at` while `validated_at` advances, and one source read and
+then failing, its ask carried. The saved publication was itself partial and
+truncated, so this does not validate a complete live inbox or frontend
+rendering. There is no per-source age field beyond each request source's
+`observed_at` and the context facts' own clocks.
+
+Caller follow-up is in `cgwalters-forge/tracker`, not this repository:
+`.github/pass.json` needs `decisions = {"repository":
+"cgwalters-forge/operator", "issue": 1}` (already present only in the
+separate poll config), and `holds.drafts = "cgwalters-forge/tracker"`;
+keep `holds.needsYou = true`. Its `.github/workflows/poll.yml`
+`env.AGENT_BOARD_REV` must advance to the reviewed commit containing this
+change, not a moving branch. A producer merge alone is not deployment or
+acceptance; compare the private publication with review's authenticated
+rendering after that caller change.
+
 `sources` says how much of each source the pass read: `complete`;
 `partial`, read but not whole: an issue it could not read (an `unreadable`
 hold), in stage 4 a candidate it did not consider (the WIP limit, pools or
@@ -2898,6 +2982,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.repository`, `holds.issue` | Private destination of the hold snapshot for the review app (`agent-board/holds/v1`), the bot's own comment; may be the usage issue; absent (off) |
 | `holds.needsYou` | Add the ranked [needs-you list](#what-is-built) (`agent-board/needs-you/v2`) to the hold snapshot; needs `holds`; `false` |
 | `holds.proposals` | `{"repository", "label", "repositories", "org"?}`: list in the needs-you list the operator-action proposals on that repository's open issues with that label, checked as `action check` would with those `repositories` and `org`; needs `holds.needsYou`; absent (off) |
+| `holds.drafts` | Repository whose open `review-draft` issues the needs-you list reads with review-send's source rules; needs `holds.needsYou`, GitHub only; absent (off) |
+| `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |

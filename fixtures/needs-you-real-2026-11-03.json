@@ -1,0 +1,1739 @@
+{
+ "schema": "agent-board/holds/v1",
+ "at": "2026-11-03T17:41:35.039037224Z",
+ "truncated": 84,
+ "wip": {
+  "limit": 8,
+  "in_flight": 2
+ },
+ "pass": {
+  "mode": "actions",
+  "candidates": 152,
+  "started": 0,
+  "live_epics": 20,
+  "revisited": 0,
+  "progress_at": "2026-11-03T17:31:26.208152863Z"
+ },
+ "needs_you": {
+  "schema": "agent-board/needs-you/v2",
+  "complete": false,
+  "validated_at": "2026-11-03T17:41:35.039037224Z",
+  "changed_at": "2026-11-03T17:41:35.039037224Z",
+  "sources": {
+   "epics": "complete",
+   "items": "partial",
+   "reviews": "complete",
+   "proposals": "complete",
+   "digest": "partial"
+  },
+  "summaries": "complete",
+  "omitted": 85,
+  "count": 12,
+  "items": [
+   {
+    "key": "cgwalters-forge/agentic-job#2110",
+    "item": "cgwalters-forge/agentic-job#2110",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P0",
+    "waiting_since": "2026-10-30T02:55:08.848796368Z",
+    "ask": "labelled needs-human",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/agentic-job/issues/2110",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2110
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2110
+    }
+   },
+   {
+    "key": "cgwalters-forge/composefs-rs#33",
+    "item": "cgwalters-forge/composefs-rs#33",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P0",
+    "waiting_since": "2026-11-01T02:29:17.53577532Z",
+    "ask": "labelled needs-human",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/composefs-rs/issues/33",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/composefs-rs",
+     "number": 33
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/composefs-rs",
+     "number": 33
+    }
+   },
+   {
+    "key": "cgwalters-forge/agentic-job#2811",
+    "item": "cgwalters-forge/agentic-job#2811",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P0",
+    "waiting_since": "2026-11-03T03:42:09.640255247Z",
+    "ask": "labelled needs-human",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/agentic-job/issues/2811",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2811
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2811
+    }
+   },
+   {
+    "key": "cgwalters-forge/agent-board#308",
+    "item": "cgwalters-forge/agent-board#308",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P0",
+    "waiting_since": "2026-11-03T16:50:40.497677855Z",
+    "ask": "cgwalters, confirm whether the standalone scope replaces the merged contract, including comment approvals and unconditional sign-off, and whether its omitted policy, stack, draft and behind-upstream gates and fork-close/Status behavior are retained. Recommendation: follow the standalone direction in the title, but retain the existing safety gates unless explicitly changed.",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/agent-board/issues/308",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agent-board",
+     "number": 308
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/agent-board",
+     "number": 308
+    }
+   },
+   {
+    "key": "cgwalters-forge/composefs-rs#32",
+    "item": "cgwalters-forge/composefs-rs#32",
+    "source": "items",
+    "kind": "needs-operator",
+    "priority": "P0",
+    "waiting_since": "2026-11-03T16:50:40.497677855Z",
+    "ask": "its newest plan is invalid: newest plan https://github.com/cgwalters-forge/composefs-rs/issues/32#issuecomment-6610030596: plan is not valid JSON: control character (\\^@-\\^_) found while parsing a string at line 8 column 0",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/composefs-rs/issues/32",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/composefs-rs",
+     "number": 32
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/composefs-rs",
+     "number": 32
+    }
+   },
+   {
+    "key": "cgwalters-forge/tracker#430",
+    "item": "cgwalters-forge/tracker#430",
+    "source": "items",
+    "kind": "epic-not-live",
+    "priority": "P1",
+    "waiting_since": "2026-10-30T02:55:08.848796368Z",
+    "ask": "not a live epic, so its 1 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#441 (P1)",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/tracker/issues/430",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 430
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/tracker",
+     "number": 430
+    }
+   },
+   {
+    "key": "cgwalters-forge/agentic-job#2026",
+    "item": "cgwalters-forge/agentic-job#2026",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P1",
+    "waiting_since": "2026-10-31T19:28:14.199002617Z",
+    "ask": "Will you remove the corpus fixture that contains private-key headers by hand? A run can't do it, because the handback checker flags the removed lines. Also, should the gh-aw parity drivers (validation.mjs, the safe-outputs probe and CI's apply-guard re-run) be documented exceptions to the no-JS bar?",
+    "recommendation": "Yes to both. The bot then drops the old-tree CI dependency, narrows the corpus exception and documents the remaining JS.",
+    "target": "https://github.com/cgwalters-forge/agentic-job/issues/2026",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2026
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2026
+    }
+   },
+   {
+    "key": "cgwalters-forge/tracker#12",
+    "item": "cgwalters-forge/tracker#12",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P1",
+    "waiting_since": "2026-11-01T02:29:17.53577532Z",
+    "ask": "May the bot force-push forge composefs-rs#30 onto upstream https://github.com/composefs/composefs-rs/pull/408 once #409's review is addressed (A), or should #408 wait or close (B)?",
+    "recommendation": "A. #408 and #409 are the bot's own PRs, and the push only brings #408 up to the stack you'll already have reviewed in #409.",
+    "target": "https://github.com/cgwalters-forge/tracker/issues/12",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 12
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/tracker",
+     "number": 12
+    }
+   },
+   {
+    "key": "cgwalters-forge/tracker#163",
+    "item": "cgwalters-forge/tracker#163",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P1",
+    "waiting_since": "2026-11-01T02:29:17.53577532Z",
+    "ask": "https://github.com/osbuild/osbuild/pull/2575 was closed without merging; drop this (Done) or redo it? | was: Draft at forge osbuild#1 (tested, ready). osbuild/osbuild record is human-text: needs your review, your PR text and /promote --human-text",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/tracker/issues/163",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 163
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/tracker",
+     "number": 163
+    }
+   },
+   {
+    "key": "cgwalters-forge/tracker#24",
+    "item": "cgwalters-forge/tracker#24",
+    "source": "items",
+    "kind": "needs-operator",
+    "priority": "P1",
+    "waiting_since": "2026-11-01T02:29:17.53577532Z",
+    "ask": "its plan's cgwalters-forge/image-builder#5 is not in a work repository",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/tracker/issues/24",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 24
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/tracker",
+     "number": 24
+    }
+   },
+   {
+    "key": "cgwalters-forge/tracker#308",
+    "item": "cgwalters-forge/tracker#308",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P1",
+    "waiting_since": "2026-11-01T02:29:17.53577532Z",
+    "ask": "Review https://github.com/cgwalters-forge/composefs-rs/pull/13 (apply whiteouts per the OCI spec by reading each layer twice): (A) /promote, (B) rework, or (C) close?",
+    "recommendation": "A. The second read costs I/O but adds no metadata to the tree, and it fixes a real spec violation that's still on upstream main.",
+    "target": "https://github.com/cgwalters-forge/tracker/issues/308",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 308
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/tracker",
+     "number": 308
+    }
+   },
+   {
+    "key": "cgwalters-forge/tracker#7",
+    "item": "cgwalters-forge/tracker#7",
+    "source": "items",
+    "kind": "needs-human",
+    "priority": "P1",
+    "waiting_since": "2026-11-01T02:29:17.53577532Z",
+    "ask": "bootc CI stack: (A) review forge bootc#30 as the single upstream PR and close #18 (recommended), (B) authorize a bot refresh of #18 that may touch ci.yml, or (C) drop the extra CI cost and close as not planned?",
+    "recommendation": null,
+    "target": "https://github.com/cgwalters-forge/tracker/issues/7",
+    "head": null,
+    "action": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 7
+    },
+    "source_ref": {
+     "type": "hold",
+     "repository": "cgwalters-forge/tracker",
+     "number": 7
+    }
+   }
+  ],
+  "requests": [
+   {
+    "key": "cgwalters-forge/agentic-job#2110",
+    "identity": "github.com/cgwalters-forge/agentic-job#2110/question/60735d09af59e9fa09c473a944fc9d087d5ad300fe41435cce1134cec7d2d4ad",
+    "forge": "github.com",
+    "question": "labelled needs-human",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2110
+    },
+    "revision": "abaf716b7c4642af634e28e25256dc99e4bf059f0f1906656856c61797b14448",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/agentic-job",
+      "number": 2110
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "missing-concrete-decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/composefs-rs#33",
+    "identity": "github.com/cgwalters-forge/composefs-rs#33/question/60735d09af59e9fa09c473a944fc9d087d5ad300fe41435cce1134cec7d2d4ad",
+    "forge": "github.com",
+    "question": "labelled needs-human",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/composefs-rs",
+     "number": 33
+    },
+    "revision": "77e4ef892205d22b499f5f80643bffa599cadd4d0fe3fd09fe2e00c1c4a3e7d2",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/composefs-rs",
+      "number": 33
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "missing-concrete-decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/agentic-job#2811",
+    "identity": "github.com/cgwalters-forge/agentic-job#2811/question/60735d09af59e9fa09c473a944fc9d087d5ad300fe41435cce1134cec7d2d4ad",
+    "forge": "github.com",
+    "question": "labelled needs-human",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2811
+    },
+    "revision": "38edde7deb278dec4de44e5f1b1233aebaae8415185300184a57fe70ada811b4",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/agentic-job",
+      "number": 2811
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "missing-concrete-decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/agent-board#308",
+    "identity": "github.com/cgwalters-forge/agent-board#308/question/a75c1ada033334b3ad319fa7c4554df75dcc44ba108b7d086de3b41afaacd729",
+    "forge": "github.com",
+    "question": "cgwalters, confirm whether the standalone scope replaces the merged contract, including comment approvals and unconditional sign-off, and whether its omitted policy, stack, draft and behind-upstream gates and fork-close/Status behavior are retained. Recommendation: follow the standalone direction in the title, but retain the existing safety gates unless explicitly changed.",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agent-board",
+     "number": 308
+    },
+    "revision": "115c1e744e21e9753a530aa0f5b9fb1db2396acd3070ee08b5f4c83ed09abaf9",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/agent-board",
+      "number": 308
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/composefs-rs#32",
+    "identity": "github.com/cgwalters-forge/composefs-rs#32/question/b47a4673839e2d0cad97564e8a745d4e0f85d40928b8642728ae326e1a5faef8",
+    "forge": "github.com",
+    "question": "its newest plan is invalid: newest plan https://github.com/cgwalters-forge/composefs-rs/issues/32#issuecomment-6610030596: plan is not valid JSON: control character (\\^@-\\^_) found while parsing a string at line 8 column 0",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/composefs-rs",
+     "number": 32
+    },
+    "revision": "7df5e36296413b6d54dbd06198261692e419223f052436c09f721519e51f73fc",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/composefs-rs",
+      "number": 32
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "its newest plan is invalid: newest plan https://github.com/cgwalters-forge/composefs-rs/issues/32#issuecomment-6610030596: plan is not valid JSON: control character (\\^@-\\^_) found while parsing a string at line 8 column 0",
+    "quality": "missing-concrete-decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/tracker#430",
+    "identity": "github.com/cgwalters-forge/tracker#430/question/60e7232372c79b449c3e7046f1a21aefc8ff7b1cb140cafc3202a652f3e5f77b",
+    "forge": "github.com",
+    "question": "not a live epic, so its 1 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#441 (P1)",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 430
+    },
+    "revision": "d7665abe323b7c0530b2dafd327b2939b4aee66847570f5397a27dc2bf150426",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/tracker",
+      "number": 430
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "not a live epic, so its 1 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#441 (P1)",
+    "quality": "missing-concrete-decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/agentic-job#2026",
+    "identity": "github.com/cgwalters-forge/agentic-job#2026/question/da55d94351a0adcc1d81aae14e8b26151b0b9d6d4795253c39656571c1c7f015",
+    "forge": "github.com",
+    "question": "Will you remove the corpus fixture that contains private-key headers by hand? A run can't do it, because the handback checker flags the removed lines. Also, should the gh-aw parity drivers (validation.mjs, the safe-outputs probe and CI's apply-guard re-run) be documented exceptions to the no-JS bar?",
+    "recommendation": "Yes to both. The bot then drops the old-tree CI dependency, narrows the corpus exception and documents the remaining JS.",
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/agentic-job",
+     "number": 2026
+    },
+    "revision": "5c17200e16fccde9044935aa26725d726d868206ce2069a78023893e8e41c417",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/agentic-job",
+      "number": 2026
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/tracker#12",
+    "identity": "github.com/cgwalters-forge/tracker#12/question/1f88ad275bcd70f5097636ba14e0afe46dddd2369f19f349b675dd292327c4b5",
+    "forge": "github.com",
+    "question": "May the bot force-push forge composefs-rs#30 onto upstream https://github.com/composefs/composefs-rs/pull/408 once #409's review is addressed (A), or should #408 wait or close (B)?",
+    "recommendation": "A. #408 and #409 are the bot's own PRs, and the push only brings #408 up to the stack you'll already have reviewed in #409.",
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 12
+    },
+    "revision": "9bbdde9e098c65ce5c75dc38a19f41a2405b6ac78fe055807639c256c1fa41b5",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/tracker",
+      "number": 12
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/tracker#163",
+    "identity": "github.com/cgwalters-forge/tracker#163/question/e118196e4da6a65dcaa949cf3d186bed41fbe034a382cb97f48253a2bcaeedc5",
+    "forge": "github.com",
+    "question": "https://github.com/osbuild/osbuild/pull/2575 was closed without merging; drop this (Done) or redo it? | was: Draft at forge osbuild#1 (tested, ready). osbuild/osbuild record is human-text: needs your review, your PR text and /promote --human-text",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 163
+    },
+    "revision": "84a65538b548d7168c57fcb5818e2cbc12c5dcadffe0fa29e0b8b7756d35584c",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/tracker",
+      "number": 163
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/tracker#24",
+    "identity": "github.com/cgwalters-forge/tracker#24/question/b21068c837b64970cf656b864f927dd338260d80f34d81c5470005d471c4f3a7",
+    "forge": "github.com",
+    "question": "its plan's cgwalters-forge/image-builder#5 is not in a work repository",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 24
+    },
+    "revision": "bc0b297c207d133e9838cceb0f967b1440c24416db4f47be5dcae89b14892720",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/tracker",
+      "number": 24
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "its plan's cgwalters-forge/image-builder#5 is not in a work repository",
+    "quality": "missing-concrete-decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/tracker#308",
+    "identity": "github.com/cgwalters-forge/tracker#308/question/f8f43abc772b585dfd32de7fa71f8a36fd5d795c0debb449f9a5d92dff7aa178",
+    "forge": "github.com",
+    "question": "Review https://github.com/cgwalters-forge/composefs-rs/pull/13 (apply whiteouts per the OCI spec by reading each layer twice): (A) /promote, (B) rework, or (C) close?",
+    "recommendation": "A. The second read costs I/O but adds no metadata to the tree, and it fixes a real spec violation that's still on upstream main.",
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 308
+    },
+    "revision": "cecba6f88f7dd069d6ed678a7cae7331153ff0a9d617c000e1eee091aa485b2e",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/tracker",
+      "number": 308
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   },
+   {
+    "key": "cgwalters-forge/tracker#7",
+    "identity": "github.com/cgwalters-forge/tracker#7/question/5781176a13117c85146de5b89f57728cf4963f2feb168b0a5a993cb25d6d07c2",
+    "forge": "github.com",
+    "question": "bootc CI stack: (A) review forge bootc#30 as the single upstream PR and close #18 (recommended), (B) authorize a bot refresh of #18 that may touch ci.yml, or (C) drop the extra CI cost and close as not planned?",
+    "recommendation": null,
+    "target": {
+     "type": "issue",
+     "repository": "cgwalters-forge/tracker",
+     "number": 7
+    },
+    "revision": "7c588b4ccd5d300c56f8092152b14551d4bce8c97c95363d1ff149b55479ff8d",
+    "requested_operator": "cgwalters",
+    "requester": "pass policy",
+    "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+    "sources": [
+     {
+      "type": "hold",
+      "repository": "cgwalters-forge/tracker",
+      "number": 7
+     }
+    ],
+    "observed_at": "2026-11-03T17:41:35.039037224Z",
+    "source_time": null,
+    "facts": "labelled needs-human",
+    "quality": "decision",
+    "actions": [
+     {
+      "kind": "promote",
+      "supported": false,
+      "reason": "Upstream promotion evaluation and writes are not implemented."
+     },
+     {
+      "kind": "merge-or-enqueue",
+      "supported": false,
+      "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+     },
+     {
+      "kind": "reply",
+      "supported": false,
+      "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+     },
+     {
+      "kind": "close",
+      "supported": false,
+      "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+     }
+    ],
+    "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+   }
+  ]
+ },
+ "holds": [
+  {
+   "item": "cgwalters-forge/actions#103",
+   "url": "https://github.com/cgwalters-forge/actions/issues/103",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "Drop the unused inference-register: api-key mode and INFERENCE_API_KEY from the wrappers? (A) yes, drop them (B) keep, wait for broker registration. Also: should the network action live in every caller (A) or as an upstream agentic-job hook (B)?",
+   "since": "2026-11-02T20:15:13.7086491Z"
+  },
+  {
+   "item": "cgwalters-forge/agent-board#244",
+   "url": "https://github.com/cgwalters-forge/agent-board/issues/244",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T16:50:40.497677855Z"
+  },
+  {
+   "item": "cgwalters-forge/agent-board#271",
+   "url": "https://github.com/cgwalters-forge/agent-board/issues/271",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-01T18:51:49.238754479Z"
+  },
+  {
+   "item": "cgwalters-forge/agent-board#282",
+   "url": "https://github.com/cgwalters-forge/agent-board/issues/282",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "Stage deploy MVP: (A) start now, on demand only, fake engine, report to a stage-org issue, recording the two copied workflows as findings; (B) wait for tracker#890. Which repo/environment may hold a stage token that can create/delete repos?",
+   "since": "2026-11-02T20:15:13.7086491Z"
+  },
+  {
+   "item": "cgwalters-forge/agent-board#308",
+   "url": "https://github.com/cgwalters-forge/agent-board/issues/308",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P0",
+   "question": null,
+   "since": "2026-11-03T16:50:40.497677855Z"
+  },
+  {
+   "item": "cgwalters-forge/agent-board#534",
+   "url": "https://github.com/cgwalters-forge/agent-board/issues/534",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/agenthome#52",
+   "url": "https://github.com/cgwalters-forge/agenthome/issues/52",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:50:40.497677855Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#426",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/426",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "plan 6225538274@2026-11-03T16:33:28Z is for triage, which is dispatched by hand",
+   "operator": true,
+   "priority": null,
+   "question": null,
+   "since": "2026-11-02T20:45:39.671258572Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#536",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/536",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:05:00.386330095Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#556",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/556",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "Commit the two-line CODEOWNERS (merge.toml and CODEOWNERS owned by you) and turn on 'require review from code owners'? (A) yes, I'll do it (B) drop that part and close",
+   "since": "2026-11-01T06:32:26.202189418Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#589",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/589",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-02T20:15:13.7086491Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#1618",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/1618",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "Close the core-dump route by (A) host-wide discard of same-uid core dumps under deny-runner-reads, or (B) PR_SET_DUMPABLE in run only; and which of api_key / mcp / identity_request to lift once probes pass?",
+   "since": "2026-11-02T20:35:27.945242057Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#2026",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/2026",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-10-31T19:28:14.199002617Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#2110",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/2110",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P0",
+   "question": null,
+   "since": "2026-10-30T02:55:08.848796368Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#2397",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/2397",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:45:39.671258572Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#2398",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/2398",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:45:39.671258572Z"
+  },
+  {
+   "item": "cgwalters-forge/agentic-job#2811",
+   "url": "https://github.com/cgwalters-forge/agentic-job/issues/2811",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P0",
+   "question": null,
+   "since": "2026-11-03T03:42:09.640255247Z"
+  },
+  {
+   "item": "cgwalters-forge/composefs-rs#32",
+   "url": "https://github.com/cgwalters-forge/composefs-rs/issues/32",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "its newest plan is invalid: newest plan https://github.com/cgwalters-forge/composefs-rs/issues/32#issuecomment-6610030596: plan is not valid JSON: control character (\\^@-\\^_) found while parsing a string at line 8 column 0",
+   "operator": true,
+   "priority": "P0",
+   "question": null,
+   "since": "2026-11-03T16:50:40.497677855Z"
+  },
+  {
+   "item": "cgwalters-forge/composefs-rs#33",
+   "url": "https://github.com/cgwalters-forge/composefs-rs/issues/33",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P0",
+   "question": null,
+   "since": "2026-11-01T02:29:17.53577532Z"
+  },
+  {
+   "item": "cgwalters-forge/composefs-rs#35",
+   "url": "https://github.com/cgwalters-forge/composefs-rs/issues/35",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:35:27.945242057Z"
+  },
+  {
+   "item": "cgwalters-forge/composefs-rs#42",
+   "url": "https://github.com/cgwalters-forge/composefs-rs/issues/42",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/composefs-rs#43",
+   "url": "https://github.com/cgwalters-forge/composefs-rs/issues/43",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#7",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/7",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "bootc CI stack: (A) review forge bootc#30 as the single upstream PR and close #18 (recommended), (B) authorize a bot refresh of #18 that may touch ci.yml, or (C) drop the extra CI cost and close as not planned?",
+   "since": "2026-11-01T02:29:17.53577532Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#9",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/9",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "Review forge bootc#26 (reject composefs backend on an existing ostree system): (A) /promote as is, (B) request changes, (C) close?",
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#12",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/12",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "May the bot force-push forge composefs-rs#30 onto upstream #408 after #409's review is addressed (A), or should #408 wait/close (B)?",
+   "since": "2026-11-01T02:29:17.53577532Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#21",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/21",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "its plan's cgwalters-forge/image-builder#2 is not in a work repository",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#24",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/24",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "its plan's cgwalters-forge/image-builder#5 is not in a work repository",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-01T02:29:17.53577532Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#25",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/25",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "FIPS HMAC for sealed UKIs: (a) ukify writes it by default, (b) opt-in flag, (c) external signer writes it; or just go ahead with the Type 1/BLS part now?",
+   "since": "2026-11-02T19:54:51.92367626Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#33",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/33",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "rbe c10s branch: (a) re-review rbe#1-#4 as they stand, (b) ask for rework (fold #1-#3 into #4 or unsealed only), or (c) drop the fork-PR route and close?",
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#37",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/37",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#40",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/40",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#42",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/42",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#44",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/44",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T13:37:27.593437701Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#52",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/52",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#56",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/56",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#66",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/66",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:05:00.386330095Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#68",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/68",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T13:37:27.593437701Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#86",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/86",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#94",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/94",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "its newest plan is invalid: newest plan https://github.com/cgwalters-forge/tracker/issues/94#issuecomment-6331425065: plan has no item",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#99",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/99",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T17:41:35.039037224Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#102",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/102",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#104",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/104",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "bless-boot SELinux rule: (a) you file Fedora issue/PR and RHEL Jira, (b) add a selinux-policy fork to bounds so the bot stages the PR, or (c) park until forge bootc#25 lands?",
+   "since": "2026-11-02T19:44:38.48868541Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#163",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/163",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "https://github.com/osbuild/osbuild/pull/2575 was closed without merging; drop this (Done) or redo it? | was: Draft at forge osbuild#1 (tested, ready). osbuild/osbuild record is human-text: needs your review, your PR text and /promote --human-text",
+   "since": "2026-11-01T02:29:17.53577532Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#208",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/208",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:15:13.7086491Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#232",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/232",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:50:40.497677855Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#247",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/247",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:54:51.92367626Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#248",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/248",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#249",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/249",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#252",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/252",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:54:51.92367626Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#258",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/258",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-02T20:15:13.7086491Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#260",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/260",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "Non-x86 composefs testing: (a) document as a limitation now, (b) aarch64 via Testing Farm, (c) paid/self-hosted arm runner, or (d) s390x/ppc64le via internal Testing Farm?",
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#263",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/263",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "bootc#2581 regex-anchor fix: (A) comment on #2581 asking for it so the bot runs fix round 2 (recommended), (B) open a forge bootc issue to plan it, or (C) push it yourself?",
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#266",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/266",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "its plan's bootc-dev/bootc#266 is not in a work repository",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T19:54:51.92367626Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#308",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/308",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "Review forge composefs-rs#13 (whiteouts per OCI spec, reads each layer twice): (A) /promote, (B) rework, (C) close?",
+   "since": "2026-11-01T02:29:17.53577532Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#311",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/311",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T16:40:35.350853372Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#313",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/313",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:25:39.312125972Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#314",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/314",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T13:37:27.593437701Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#318",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/318",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-02T19:54:51.92367626Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#321",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/321",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:05:00.386330095Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#331",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/331",
+   "epic": true,
+   "kind": "needs-operator",
+   "reason": "plan 6478062789@2026-10-28T19:05:30Z is not applied: the plan cannot be applied: epic plan refused:\n  action 8 (rescope_sub_issue): cgwalters-forge/tracker#336 is a closed sub-issue; a plan may not change it\n  action 11 (set_priority): new names action 1, which does not create a sub-issue\n  action 13 (set_priority): new names action 2, which does not create a sub-issue; a person replaces it",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-03T13:37:27.593437701Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#353",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/353",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-01T06:32:26.202189418Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#357",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/357",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "Review forge composefs-rs#27 (unwrap -> errors in cfsctl): /promote (A) or close (B)?",
+   "since": "2026-11-02T20:05:00.386330095Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#383",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/383",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": null,
+   "since": "2026-11-02T20:35:27.945242057Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#430",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/430",
+   "epic": true,
+   "kind": "epic-not-live",
+   "reason": "not a live epic, so its 1 open child issue(s) wait until the operator or the bot labels it epic, among them cgwalters-forge/tracker#441 (P1)",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-10-30T02:55:08.848796368Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#452",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/452",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "Broker workflow admission: (a) admit only the pinned agentic-job/review workflows and edit the host policy (recommended), (b) keep owner/tailnet admission and close as not planned, or (c) leave open?",
+   "since": "2026-11-02T20:35:27.945242057Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#485",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/485",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "bootc#2437: enable timer/units on composefs with a release note (A) or keep them off and document (B); and send direction to godvino or take it over?",
+   "since": "2026-11-02T19:34:33.29583353Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#524",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/524",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": "Once the wrapper pin is past v0.6.3, should mistral take triage only (A) or also rebase/commit-message fix rounds (B)?",
+   "since": "2026-11-03T13:37:27.593437701Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#544",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/544",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T15:49:38.961679864Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#569",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/569",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "jmarrero-bot asks: you reply on harness-coordination#1 and close (a), grant the dispatcher token access so a run replies (b), or have the bot write a second-deployment walkthrough in bring-up.md (c)?",
+   "since": "2026-11-03T16:50:40.497677855Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#571",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/571",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "octo-sts: self-hosted minting for #766's per-role Apps (A) or one separate App / public instance (B); and pick (a)/(b)/(c) for apply's fork-and-PR user token?",
+   "since": "2026-11-02T20:35:27.945242057Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#633",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/633",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P2",
+   "question": "Create the org ruleset requiring actions/.github/workflows/workflows-check.yml@0e4e016 in Evaluate mode (or tell us it already exists)?",
+   "since": "2026-11-02T20:35:27.945242057Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#680",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/680",
+   "epic": true,
+   "kind": "needs-operator",
+   "reason": "the apply of plan 6577032663@2026-11-02T12:23:12Z was stopped after a failed request, and is not proved: action 4 (create_sub_issue): cgwalters-forge/tracker#1147's writes were not all confirmed; it is never replayed: a person inspects https://github.com/cgwalters-forge/tracker/issues/680#issuecomment-6577063919, then replaces the plan or comments",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-02T14:40:45.741386532Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#938",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/938",
+   "epic": false,
+   "kind": "needs-operator",
+   "reason": "plan 6408199980@2026-10-26T04:24:49Z is for research, which is dispatched by hand",
+   "operator": true,
+   "priority": "P1",
+   "question": "Check which secret visible to the wrapper's target job matches ordinary text (likely a multi-line one); and OK for the bot to file an actions issue to stop passing the task as a job output (yes/no)?",
+   "since": "2026-11-02T20:15:13.7086491Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#1171",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/1171",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-02T23:48:17.739716072Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#1205",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/1205",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T14:58:50.979744149Z"
+  },
+  {
+   "item": "cgwalters-forge/tracker#1208",
+   "url": "https://github.com/cgwalters-forge/tracker/issues/1208",
+   "epic": false,
+   "kind": "needs-human",
+   "reason": "labelled needs-human",
+   "operator": true,
+   "priority": "P1",
+   "question": null,
+   "since": "2026-11-03T16:50:40.497677855Z"
+  }
+ ]
+}

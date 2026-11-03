@@ -478,6 +478,8 @@ pub struct Config {
     pub usage: Option<Usage>,
     /// Off unless set.
     pub holds: Option<HoldsAt>,
+    /// Existing operator decisions document, read only with holds.needsYou.
+    pub decisions: Option<DirectionAt>,
     /// The stall alarms in the hold snapshot, on wherever `holds` is: this
     /// only tunes them ([`holds::alarm`]).
     pub stall: Option<holds::Stall>,
@@ -722,6 +724,8 @@ pub struct HoldsAt {
     /// Off unless set: the issues whose operator-action proposals the
     /// needs-you list includes; needs `needsYou`.
     pub proposals: Option<needs::ProposalsAt>,
+    /// Repository containing review-draft issues. Read-only, off unless set.
+    pub drafts: Option<String>,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -1090,10 +1094,29 @@ impl Config {
                 .validate_repository(&holds.repository)
                 .context("holds repository")?;
             ensure!(holds.issue > 0, "holds issue is not a positive number");
+            if let Some(repository) = &holds.drafts {
+                ensure!(holds.needs_you, "holds drafts needs holds needsYou");
+                ensure!(
+                    self.forgejo_board().is_none(),
+                    "holds drafts supports only GitHub"
+                );
+                validate_repository(repository).context("holds drafts repository")?;
+            }
             if let Some(proposals) = &holds.proposals {
                 ensure!(holds.needs_you, "holds proposals needs holds needsYou");
                 proposals.check(self)?;
             }
+        }
+        if let Some(decisions) = &self.decisions {
+            ensure!(
+                self.forgejo_board().is_none(),
+                "decisions supports only GitHub"
+            );
+            validate_repository(&decisions.repository).context("decisions repository")?;
+            ensure!(
+                (1..=i32::MAX as u64).contains(&decisions.issue),
+                "decisions issue must be a positive GraphQL Int"
+            );
         }
         if let Some(stall) = &self.stall {
             ensure!(self.holds.is_some(), "stall needs holds");
@@ -2589,6 +2612,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         kept: RefCell::default(),
         ignored: RefCell::default(),
         failed: BTreeMap::new(),
+        failed_listed: false,
         infra: RefCell::new(BTreeMap::new()),
         alarms: None,
         direction: None,
@@ -2905,6 +2929,8 @@ struct Scheduler<'a, C> {
     /// The caller's runs that failed in the last day, by id, where
     /// [`Config::reruns`] or [`Config::starts`] is set ([`Self::failed_runs`]).
     failed: BTreeMap<u64, Value>,
+    /// Whether `failed` was listed this pass.
+    failed_listed: bool,
     /// Whether each failed run looked at failed on infrastructure, and how,
     /// by id ([`Self::before_agent`]).
     infra: RefCell<BTreeMap<u64, Option<starts::Infra>>>,
@@ -3223,7 +3249,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.top = Some(top(&board.options).to_vec());
         if config.reruns || config.starts.is_some() {
             match self.failed_runs(&target) {
-                Ok(failed) => self.failed = failed,
+                Ok(failed) => (self.failed, self.failed_listed) = (failed, true),
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("rerun error: {error:#}; no run is re-run"));

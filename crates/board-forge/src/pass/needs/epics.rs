@@ -336,6 +336,8 @@ mod tests {
             reviews: review_asks(true, Some(&(waits, BTreeSet::new())), at),
             proposals: Collected::off(),
             digest: Collected::off(),
+            inbox: BTreeMap::new(),
+            observed: holds::Observed::off(),
             summaries: (Read::Complete, BTreeMap::new()),
         };
         let mut snapshot = holds::snapshot(&[], at.into(), Default::default());

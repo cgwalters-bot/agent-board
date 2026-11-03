@@ -3,8 +3,23 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-/// Observation clocks alone do not change a decision or force a write.
+/// Observation clocks, limit readings and the context's facts alone do not
+/// change a decision or force a write: a step's checks or a run aging out of
+/// the day would otherwise write every pass. Hourly confirmation refreshes
+/// them; which sources were read and which limits hold still count.
 pub(super) fn strip_observation_times(list: &mut serde_json::Map<String, Value>) {
+    if let Some(context) = list.get_mut("context").and_then(Value::as_object_mut) {
+        for field in ["observed_at", "wip", "omitted", "items"] {
+            context.remove(field);
+        }
+        if let Some(limits) = context.get_mut("limits").and_then(Value::as_object_mut) {
+            for fields in limits.values_mut().filter_map(Value::as_object_mut) {
+                for reading in super::LIMIT_READINGS {
+                    fields.remove(*reading);
+                }
+            }
+        }
+    }
     for name in ["requests", "request_sources"] {
         if let Some(records) = list.get_mut(name).and_then(Value::as_array_mut) {
             for record in records {
@@ -79,6 +94,7 @@ pub(super) fn identity(ask: &Ask, host: &str) -> String {
         RefKind::ReplyPullRequest => "reply".to_owned(),
         RefKind::ClosePullRequest => "close".to_owned(),
         RefKind::OperatorAction => format!("proposal/{}", action.comment.unwrap_or_default()),
+        _ if ask.source == DECISIONS || ask.source == DRAFTS => ask.key.clone(),
         // Preserve the existing pass-alarm grouping. Other issue questions
         // must not collapse merely because they share an issue number.
         _ if ask.source == "pass" => "pass-alarm".to_owned(),
@@ -121,11 +137,16 @@ pub(super) fn describe(
         | RefKind::ReviewPullRequest
         | RefKind::ReplyPullRequest
         | RefKind::ClosePullRequest => true,
-        _ if ask.kind == "review-promote" => true,
+        _ if ask.kind == "review-promote" || matches!(ask.source.as_str(), DECISIONS | DRAFTS) => {
+            true
+        }
         _ => hold.is_some_and(|h| h.question.is_some() || h.reason != ask.ask),
     };
     let known = hold.is_some_and(|h| h.kind != HoldKind::Other)
-        || matches!(ask.source.as_str(), REVIEWS | PROPOSALS | DIGEST);
+        || matches!(
+            ask.source.as_str(),
+            REVIEWS | PROPOSALS | DIGEST | DECISIONS | DRAFTS
+        );
     let source_read = match ask.source.as_str() {
         "epics" => {
             if reading.epics && snapshot.pass.live_epics.is_none() {
@@ -150,9 +171,10 @@ pub(super) fn describe(
         .flatten()
         .find(|r| r["identity"] == identity && r["target"]["head"].as_str() == ask.head.as_deref());
     let previous_source = previous_source(ask, previous);
-    let source_time = if matches!(ask.source.as_str(), PROPOSALS | DIGEST) {
+    let source_time = if matches!(ask.source.as_str(), PROPOSALS | DIGEST | DECISIONS | DRAFTS) {
         [&reading.proposals, &reading.digest]
             .into_iter()
+            .chain(reading.inbox.values())
             .flat_map(|c| &c.asks)
             .find(|raw| raw.key == ask.key && raw.source_ref == ask.source_ref)
             .map(|raw| raw.waiting_since.clone())
@@ -241,16 +263,19 @@ pub(super) fn describe(
         requester: match ask.source.as_str() {
             PROPOSALS => "operator-or-bot (authenticated proposal author)",
             DIGEST => "configured bot (authenticated digest)",
+            DECISIONS | DRAFTS => "operator-or-bot (authenticated source)",
             _ => "pass policy",
         }.into(),
         ownership_evidence: match ask.source.as_str() {
             REVIEWS => "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
             PROPOSALS => "Scoped action-check accepted a proposal comment written and last edited by the configured operator or bot; this is a request, not authorization.",
             DIGEST => "Newest digest written and last edited by the configured bot requests operator attention; freshness must be rechecked.",
+            DECISIONS => "Outstanding entry in the configured decisions document, written and last edited by the operator or bot; checked answers are not resolution.",
+            DRAFTS => "Newest review draft written and last edited by the operator or bot on an open labelled issue; source inspection is not authorization to send.",
             _ => "Pass hold has operator=true; a done verdict alone does not release the hold.",
         }.into(),
         sources,
-        observed_at: if fresh { Some(snapshot.at.clone()) } else if matches!(ask.source.as_str(), REVIEWS | PROPOSALS | DIGEST) {
+        observed_at: if fresh { Some(snapshot.at.clone()) } else if matches!(ask.source.as_str(), REVIEWS | PROPOSALS | DIGEST | DECISIONS | DRAFTS) {
             previous_source.and_then(|s| s.observed_at)
         } else {
             previous_request.and_then(|p| p["observed_at"].as_str()).map(str::to_owned)

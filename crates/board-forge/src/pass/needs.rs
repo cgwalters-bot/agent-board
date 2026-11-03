@@ -17,6 +17,7 @@ use crate::plan::{Comment, comment_id, fenced_json};
 use sha2::{Digest, Sha256};
 
 pub(super) mod epics;
+pub(super) mod inbox;
 
 /// The most issues labelled for proposals read a pass, oldest first; the
 /// rest are unread, and their published asks kept.
@@ -180,6 +181,115 @@ pub(super) fn review_asks(
         collected.read = Read::Partial;
     }
     collected
+}
+
+/// Stage 2's steps observed at `at` that no person has to take, as the
+/// needs-you context: a pull request that moves, waits on what the poll
+/// follows, or was held. Read as [`review_asks`] reads the waits; one whose
+/// reference does not validate is left out, and the read partial.
+pub(super) fn step_facts(
+    configured: bool,
+    followed: Option<&BTreeSet<String>>,
+    stepped: &[poll::Stepped],
+    at: &str,
+) -> (Read, Vec<holds::ContextFact>) {
+    let Some(undecided) = followed.filter(|_| configured) else {
+        let read = if configured { Read::Unread } else { Read::Off };
+        return (read, Vec::new());
+    };
+    let mut read = match undecided.is_empty() {
+        true => Read::Complete,
+        false => Read::Partial,
+    };
+    let mut facts = Vec::new();
+    for step in stepped {
+        let progress = step.progress();
+        if progress == poll::Progress::Person {
+            continue;
+        }
+        let Some((repository, number)) = pull_ref(&format!("{}#{}", step.repository, step.number))
+        else {
+            read = Read::Partial;
+            continue;
+        };
+        let reason = format!("{}: {}", step.action, step.reason);
+        facts.push(holds::ContextFact {
+            source: holds::CONTEXT_STEP,
+            item: Some(format!("{repository}#{number}")),
+            kind: format!("{progress:?}").to_ascii_lowercase(),
+            reason: holds::one_line(&reason, holds::MAX_ASK).unwrap_or_default(),
+            url: Some(Reference::new(RefKind::PullRequest, &repository, number).url()),
+            since: step.moved_at.and_then(|t| t.format(&Rfc3339).ok()),
+            observed_at: Some(at.to_owned()),
+        });
+    }
+    (read, facts)
+}
+
+/// The caller's runs that failed in the last day, `failed` by id where
+/// they were listed, as the needs-you context observed at `at`. A run's
+/// link is made from its repository and id; its title is data.
+pub(super) fn run_facts(
+    configured: bool,
+    failed: Option<&BTreeMap<u64, Value>>,
+    at: &str,
+) -> (Read, Vec<holds::ContextFact>) {
+    let Some(failed) = failed.filter(|_| configured) else {
+        let read = if configured { Read::Unread } else { Read::Off };
+        return (read, Vec::new());
+    };
+    // One page is listed: a full one may leave runs out.
+    let mut read = match failed.len() as u64 >= RUNS_PER_PAGE {
+        true => Read::Partial,
+        false => Read::Complete,
+    };
+    let mut facts = Vec::new();
+    for (id, run) in failed {
+        let repository = text(run, "/repository/full_name");
+        if validate_repository(repository).is_err() {
+            read = Read::Partial;
+            continue;
+        }
+        let title = text(run, "/display_title");
+        facts.push(holds::ContextFact {
+            source: holds::CONTEXT_RUN,
+            item: None,
+            kind: Some(text(run, "/conclusion"))
+                .filter(|c| !c.is_empty())
+                .unwrap_or("failure")
+                .to_owned(),
+            reason: holds::one_line(title, holds::MAX_ASK).unwrap_or_default(),
+            url: Some(format!(
+                "https://{DEFAULT_HOST}/{repository}/actions/runs/{id}"
+            )),
+            since: run["updated_at"]
+                .as_str()
+                .filter(|t| OffsetDateTime::parse(t, &Rfc3339).is_ok())
+                .map(str::to_owned),
+            observed_at: Some(at.to_owned()),
+        });
+    }
+    (read, facts)
+}
+
+impl<C: Rest + Transport> Scheduler<'_, C> {
+    /// What the pass observed besides its holds, for the needs-you context
+    /// at `at`; nothing is read again for it.
+    fn observed(&self, at: &str) -> holds::Observed {
+        let config = self.config;
+        let followed = self.followed.as_ref().map(|(_, undecided)| undecided);
+        let reruns = config.reruns || config.starts.is_some();
+        let usage = match (&config.usage, &self.snapshot) {
+            (None, _) => (Read::Off, None),
+            (Some(_), Some(Some(snapshot))) => (Read::Complete, Some(snapshot.clone())),
+            (Some(_), _) => (Read::Unread, None),
+        };
+        holds::Observed {
+            steps: step_facts(!config.follow.is_empty(), followed, &self.stepped, at),
+            runs: run_facts(reruns, self.failed_listed.then_some(&self.failed), at),
+            usage,
+        }
+    }
 }
 
 /// The proposals on `issue` among its `comments`, one an ask, and whether
@@ -382,6 +492,8 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             reviews,
             proposals,
             digest,
+            inbox: self.inbox(),
+            observed: self.observed(&snapshot.at),
             summaries: (Read::Complete, BTreeMap::new()),
         };
         let list = holds::needs_you(snapshot, previous, &reading);
@@ -703,7 +815,7 @@ mod tests {
 
     /// Comment `id` by `author`, edited by `editor` if any, `minutes` after
     /// 08:00 on 28 October.
-    fn comment(
+    pub(super) fn comment(
         id: u64,
         (author, editor): (&str, Option<&str>),
         minutes: i64,
@@ -802,6 +914,95 @@ mod tests {
                 .unread
                 .contains("cgwalters-bot/praxis-credential-broker")
         );
+    }
+
+    /// Steps no person takes, and failed runs, are context with their
+    /// progress or conclusion and links made from validated parts; a step
+    /// only a person takes is an ask, not context. Each source is off,
+    /// unread, partial or complete as stage 2 and the run listing were.
+    #[test]
+    fn context_steps_and_runs() {
+        let at = "2026-10-28T09:00:00Z";
+        let step = |repository: &str, number, action, reason: &str, ran| poll::Stepped {
+            repository: repository.into(),
+            number,
+            head: HEAD.into(),
+            action,
+            reason: reason.into(),
+            ran,
+            moved_at: OffsetDateTime::parse("2026-10-28T08:00:00Z", &Rfc3339).ok(),
+        };
+        let stepped = [
+            step("o/r", 1, "wait", "checks pending: build", false),
+            step("o/r", 2, "merge", "checks green", true),
+            step("o/r", 3, "dispatch", "not paced", false),
+            step("o/r", 4, "needs-human", "labelled", false),
+            step("bad repo", 5, "merge", "checks green", true),
+        ];
+        let none = BTreeSet::new();
+        let (read, facts) = step_facts(true, Some(&none), &stepped, at);
+        assert_eq!(read, Read::Partial);
+        let got: Vec<_> = (facts.iter())
+            .map(|f| json!([f.item, f.kind, f.reason, f.url, f.since]))
+            .collect();
+        let pull = |n| format!("https://github.com/o/r/pull/{n}");
+        let since = "2026-10-28T08:00:00Z";
+        assert_eq!(
+            got,
+            [
+                json!([
+                    "o/r#1",
+                    "waiting",
+                    "wait: checks pending: build",
+                    pull(1),
+                    since
+                ]),
+                json!(["o/r#2", "moving", "merge: checks green", pull(2), since]),
+                json!(["o/r#3", "held", "dispatch: not paced", pull(3), since]),
+            ]
+        );
+        assert_eq!(
+            step_facts(true, Some(&none), &stepped[..3], at).0,
+            Read::Complete
+        );
+        let undecided = ["o/x".to_owned()].into();
+        assert_eq!(step_facts(true, Some(&undecided), &[], at).0, Read::Partial);
+        assert_eq!(step_facts(true, None, &stepped, at), (Read::Unread, vec![]));
+        assert_eq!(
+            step_facts(false, Some(&none), &stepped, at),
+            (Read::Off, vec![])
+        );
+
+        let run = |repository: &str| {
+            json!({"repository": {"full_name": repository}, "conclusion": "failure",
+                "display_title": "dispatch agent-board#7\nmore", "html_url": "https://evil.example/",
+                "updated_at": "2026-10-28T07:00:00Z"})
+        };
+        let failed = BTreeMap::from([(7, run("o/tracker")), (8, run("../x"))]);
+        let (read, facts) = run_facts(true, Some(&failed), at);
+        assert_eq!(read, Read::Partial);
+        let got: Vec<_> = (facts.iter())
+            .map(|f| json!([f.source, f.kind, f.reason, f.url, f.since, f.observed_at]))
+            .collect();
+        assert_eq!(
+            got,
+            [json!([
+                holds::CONTEXT_RUN,
+                "failure",
+                "dispatch agent-board#7",
+                "https://github.com/o/tracker/actions/runs/7",
+                "2026-10-28T07:00:00Z",
+                at
+            ])]
+        );
+        let one = BTreeMap::from([(7, run("o/tracker"))]);
+        assert_eq!(run_facts(true, Some(&one), at).0, Read::Complete);
+        let page: BTreeMap<_, _> = (0..RUNS_PER_PAGE)
+            .map(|id| (id, run("o/tracker")))
+            .collect();
+        assert_eq!(run_facts(true, Some(&page), at).0, Read::Partial);
+        assert_eq!(run_facts(true, None, at), (Read::Unread, vec![]));
+        assert_eq!(run_facts(false, Some(&one), at), (Read::Off, vec![]));
     }
 
     /// Each writer's valid proposal on an issue is its own ask, keyed by
