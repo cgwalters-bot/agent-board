@@ -145,7 +145,7 @@ pub(super) fn review_asks(
             continue;
         };
         let kind = match wait.kind {
-            "needs-human" => RefKind::PullRequest,
+            "needs-human" | "promote" => RefKind::PullRequest,
             _ => RefKind::ApprovePullRequest,
         };
         let item = format!("{repository}#{number}");

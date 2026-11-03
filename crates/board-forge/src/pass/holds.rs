@@ -1349,6 +1349,10 @@ fn earlier(a: &str, b: &str) -> bool {
 /// The group reason of stranded drafts, whose target lists only drafts.
 const STRANDED_DRAFTS: &str = "drafts to inspect and promote";
 
+/// The group reason of clean, green midstream drafts (`review-promote`),
+/// whose target lists only drafts too.
+const PROMOTE_DRAFTS: &str = "drafts waiting for promotion";
+
 /// A list URL made only from validated repository/PR identities. Older v2
 /// consumers ignore `group` and can still open the representative PR action.
 fn group_target(ask: &Ask) -> Option<String> {
@@ -1358,7 +1362,7 @@ fn group_target(ask: &Ask) -> Option<String> {
     }
     let query = format!(
         "is:pr is:open{}",
-        if group.reason == STRANDED_DRAFTS {
+        if group.reason == STRANDED_DRAFTS || group.reason == PROMOTE_DRAFTS {
             " draft:true"
         } else {
             ""
@@ -1374,11 +1378,14 @@ fn group_target(ask: &Ask) -> Option<String> {
 /// Stranded PRs are housekeeping, not one independent decision per head.
 /// Keep the lowest numbered PR as a parser-compatible representative and
 /// publish membership optionally; never combine approvals with these groups.
+/// Midstream drafts waiting for promotion are grouped the same way.
 fn group_stranded(items: Vec<Ask>) -> Vec<Ask> {
+    const NEEDS_HUMAN: &str = "review-needs-human";
+    const PROMOTE: &str = "review-promote";
     let mut kept = Vec::new();
     let mut groups: BTreeMap<(String, String), Vec<Ask>> = BTreeMap::new();
     for ask in items {
-        if ask.source != REVIEWS || ask.kind != "review-needs-human" {
+        if ask.source != REVIEWS || !matches!(ask.kind.as_str(), NEEDS_HUMAN | PROMOTE) {
             kept.push(ask);
             continue;
         }
@@ -1387,7 +1394,9 @@ fn group_stranded(items: Vec<Ask>) -> Vec<Ask> {
             .as_ref()
             .map(|g| g.reason.clone())
             .unwrap_or_else(|| {
-                if ask.ask.contains("draft with no checkpoint")
+                if ask.kind == PROMOTE {
+                    PROMOTE_DRAFTS.into()
+                } else if ask.ask.contains("draft with no checkpoint")
                     || ask.ask.starts_with("a stranded draft;")
                 {
                     STRANDED_DRAFTS.into()
@@ -3372,13 +3381,28 @@ mod tests {
             RefKind::ApprovePullRequest,
             Some(HEAD_A),
         ));
+        // Midstream drafts waiting for promotion are a group of their own.
+        for number in [50, 49] {
+            let mut ask = stopped(
+                "o/bootc",
+                number,
+                "a midstream draft, waiting for promotion",
+            );
+            ask.kind = "review-promote".into();
+            asks.push(ask);
+        }
         let listed = own_listed(
             &[],
             "2026-10-28T09:00:00Z",
             (collected(Read::Complete, asks, &[]), Collected::off()),
             None,
         );
-        assert_eq!(listed.count, 4);
+        assert_eq!(listed.count, 5);
+        let promote = listed.items.iter().find(|a| a.key == "o/bootc#49").unwrap();
+        assert_eq!(promote.ask, "bootc: 2 drafts waiting for promotion");
+        assert_eq!(promote.kind, "review-promote");
+        assert_eq!(promote.group.as_ref().unwrap().numbers, [49, 50]);
+        assert!(promote.target.ends_with("draft%3Atrue"));
         let group = listed.items.iter().find(|a| a.key == "o/bootc#1").unwrap();
         assert_eq!(group.ask, "bootc: 44 drafts to inspect and promote");
         assert_eq!(
@@ -3401,7 +3425,7 @@ mod tests {
             (collected(Read::Unread, vec![], &[]), Collected::off()),
             Some(&previous),
         );
-        assert_eq!(carried.count, 4);
+        assert_eq!(carried.count, 5);
         assert!(carried.items.iter().all(|a| a.carried));
         assert_eq!(
             carried
