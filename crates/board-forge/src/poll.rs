@@ -318,7 +318,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
 pub(crate) const LABELLED_QUERY: &str = r#"query($owner: String!, $name: String!, $label: String!, $pulls: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, labels: [$label], first: $pulls) {
-      nodes { number headRefOid mergeable commits(last: 1) { nodes { commit { committedDate } } }
+      nodes { number headRefOid isDraft mergeable commits(last: 1) { nodes { commit { committedDate } } }
         reviews(last: 100) { nodes { state submittedAt } pageInfo { hasPreviousPage } } }
     }
   }
@@ -3622,6 +3622,15 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
     }
 }
 
+/// Keep draft housekeeping distinct even on the labelled-list shortcut.
+fn needs_you_reason(pull: &Value, reason: &str) -> String {
+    if pull["isDraft"] == true && reason == "labelled needs-human" {
+        "a stranded draft; inspect its checkpoint and promote if complete".into()
+    } else {
+        reason.into()
+    }
+}
+
 struct Pass<'a, R, G> {
     rest: &'a R,
     graphql: &'a G,
@@ -5994,7 +6003,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             number,
             head: head.to_owned(),
             kind: "needs-human",
-            reason: reason.clone(),
+            reason: needs_you_reason(listed, &reason),
         };
         let stepped = (!merge_only).then(|| Stepped {
             repository: repo.to_owned(),
@@ -6612,7 +6621,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             number,
             head: head.to_owned(),
             kind,
-            reason: decision.reason.clone(),
+            reason: needs_you_reason(&pull, &decision.reason),
         });
         let stepped = (text(&pull, "/author/login") == self.config.bot).then(|| Stepped {
             repository: repo.to_owned(),

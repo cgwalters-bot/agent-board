@@ -520,6 +520,21 @@ pub fn pull_request_comments<T: Transport>(transport: &T, pull: &ItemRef) -> Res
     )
 }
 
+/// Comment identities, edit times and writers, without downloading bodies.
+/// Uses the same complete, bounded pagination as the body read.
+pub(crate) fn comment_metadata<T: Transport>(
+    transport: &T,
+    item: &ItemRef,
+    pull: bool,
+) -> Result<Vec<Comment>> {
+    let (query, field, what) = if pull {
+        (PULL_REQUEST_COMMENTS_QUERY, "pullRequest", "a pull request")
+    } else {
+        (COMMENTS_QUERY, "issue", "an issue")
+    };
+    comments(transport, item, &query.replace(" body ", " "), field, what)
+}
+
 /// Every comment on `issue`'s `field` (`issue` or `pullRequest`), read by `query`.
 fn comments<T: Transport>(
     transport: &T,
@@ -548,7 +563,11 @@ fn comments<T: Transport>(
             .as_array()
             .context("comments have no nodes")?
         {
-            comments.push(comment(node)?);
+            let mut node = node.clone();
+            if !query.contains(" body ") {
+                node["body"] = Value::String(String::new());
+            }
+            comments.push(comment(&node)?);
         }
         match connection["pageInfo"]["hasNextPage"].as_bool() {
             Some(false) => return Ok(comments),

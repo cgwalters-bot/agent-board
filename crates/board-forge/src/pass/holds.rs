@@ -1164,6 +1164,16 @@ pub struct Ask {
     /// whole ([`Collected::unread`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub carried: bool,
+    /// Optional v2 extension: stranded PRs represented by this card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<AskGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskGroup {
+    pub reason: String,
+    pub numbers: Vec<u64>,
 }
 
 /// The needs-you list ([`NEEDS_YOU_SCHEMA`]).
@@ -1187,6 +1197,9 @@ pub struct NeedsYou {
     /// How many `items`: always their number.
     pub count: usize,
     pub items: Vec<Ask>,
+    /// Optional v2 extension; bodies are reused only after metadata validation.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub summary_cache: BTreeMap<String, Summary>,
 }
 
 impl NeedsYou {
@@ -1194,6 +1207,7 @@ impl NeedsYou {
     /// is not complete; none where it has none.
     fn cut(&mut self) -> Option<Ask> {
         let ask = self.items.pop()?;
+        self.summary_cache.remove(&ask.key);
         self.omitted += 1;
         self.count = self.items.len();
         self.complete = false;
@@ -1228,10 +1242,12 @@ impl Collected {
 
 /// A trusted bot summary's one-line question and recommendation
 /// ([`summary`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Summary {
     pub question: Option<String>,
     pub recommendation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// What [`needs_you`] knows of the pass besides its snapshot.
@@ -1253,26 +1269,29 @@ pub struct Reading<'a> {
     pub summaries: (Read, BTreeMap<String, Option<Summary>>),
 }
 
-/// The bold lines of a bot summary [`summary`] reads.
-const DECISION_NEEDED: &str = "Decision needed";
-const RECOMMENDATION: &str = "Recommendation";
-
 /// What a bot summary `body` asks and recommends, read as data: the rest
 /// of its first `**Decision needed:**` and `**Recommendation:**` line (the
 /// colon inside or outside the bold, the line perhaps a list item), one
 /// line each. One that is empty is absent, so that the hold's own question
 /// or reason stands.
 pub fn summary(body: &str) -> Summary {
-    let field = |label: &str| {
-        let (inside, outside) = (format!("**{label}:**"), format!("**{label}**:"));
+    let field = |labels: &[&str]| {
         body.lines()
             .map(|l| l.trim().strip_prefix("- ").unwrap_or(l.trim()))
-            .find_map(|l| l.strip_prefix(&inside).or_else(|| l.strip_prefix(&outside)))
+            .find_map(|l| {
+                let (label, rest) = l.split_once(':')?;
+                let label = label.trim().trim_matches('*').trim();
+                labels
+                    .iter()
+                    .any(|s| label.eq_ignore_ascii_case(s))
+                    .then(|| rest.trim_start_matches('*').trim())
+            })
             .and_then(|rest| one_line(rest, MAX_ASK))
     };
     Summary {
-        question: field(DECISION_NEEDED),
-        recommendation: field(RECOMMENDATION),
+        question: field(&["Decision needed", "Question for the operator"]),
+        recommendation: field(&["Recommendation", "Recommended"]),
+        revision: None,
     }
 }
 
@@ -1313,7 +1332,7 @@ fn published_asks(previous: Option<&Value>, sources: &[&str]) -> Vec<Ask> {
         .filter(|a| parse_time(&a.waiting_since).is_some())
         .filter_map(|a| {
             Some(Ask {
-                target: a.action.url(),
+                target: group_target(&a).unwrap_or_else(|| a.action.url()),
                 ask: one_line(&a.ask, MAX_ASK)?,
                 recommendation: (a.recommendation.as_deref()).and_then(|r| one_line(r, MAX_ASK)),
                 ..a
@@ -1325,6 +1344,94 @@ fn published_asks(previous: Option<&Value>, sources: &[&str]) -> Vec<Ask> {
 /// Whether the time `a` is earlier than `b`; not where either is no time.
 fn earlier(a: &str, b: &str) -> bool {
     matches!((parse_time(a), parse_time(b)), (Some(a), Some(b)) if a < b)
+}
+
+/// A list URL made only from validated repository/PR identities. Older v2
+/// consumers ignore `group` and can still open the representative PR action.
+fn group_target(ask: &Ask) -> Option<String> {
+    let group = ask.group.as_ref()?;
+    if group.numbers.is_empty() || group.numbers.contains(&0) {
+        return None;
+    }
+    let query = format!(
+        "is:pr is:open{}",
+        if group.reason.starts_with("drafts ") {
+            " draft:true"
+        } else {
+            ""
+        }
+    );
+    let query: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    Some(format!(
+        "https://{DEFAULT_HOST}/{}/pulls?q={query}",
+        ask.action.repository
+    ))
+}
+
+/// Stranded PRs are housekeeping, not one independent decision per head.
+/// Keep the lowest numbered PR as a parser-compatible representative and
+/// publish membership optionally; never combine approvals with these groups.
+fn group_stranded(items: Vec<Ask>) -> Vec<Ask> {
+    let mut kept = Vec::new();
+    let mut groups: BTreeMap<(String, String), Vec<Ask>> = BTreeMap::new();
+    for ask in items {
+        if ask.source != REVIEWS || ask.kind != "review-needs-human" {
+            kept.push(ask);
+            continue;
+        }
+        let reason = ask
+            .group
+            .as_ref()
+            .map(|g| g.reason.clone())
+            .unwrap_or_else(|| {
+                if ask.ask.contains("draft with no checkpoint")
+                    || ask.ask.starts_with("a stranded draft;")
+                {
+                    "drafts to inspect and promote".into()
+                } else if ask.ask.starts_with("fix round ") && ask.ask.contains(" is blocked:") {
+                    "fix round blocked".into()
+                } else if ask.ask.contains("fix rounds") && ask.ask.contains(" used") {
+                    "fix rounds exhausted".into()
+                } else {
+                    ask.ask.clone()
+                }
+            });
+        groups
+            .entry((ask.action.repository.to_ascii_lowercase(), reason))
+            .or_default()
+            .push(ask);
+    }
+    for ((_, reason), mut asks) in groups {
+        asks.sort_by_key(|a| a.action.number);
+        let mut representative = asks[0].clone();
+        let mut numbers = BTreeSet::new();
+        for ask in asks {
+            numbers.extend(
+                ask.group
+                    .map(|g| g.numbers)
+                    .unwrap_or_else(|| vec![ask.action.number]),
+            );
+            representative.carried |= ask.carried;
+            if earlier(&ask.waiting_since, &representative.waiting_since) {
+                representative.waiting_since = ask.waiting_since;
+            }
+        }
+        let repo = representative
+            .action
+            .repository
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        representative.ask = format!("{repo}: {} {reason}", numbers.len());
+        representative.group = Some(AskGroup {
+            reason,
+            numbers: numbers.into_iter().collect(),
+        });
+        representative.target =
+            group_target(&representative).unwrap_or_else(|| representative.action.url());
+        kept.push(representative);
+    }
+    kept
 }
 
 /// What `snapshot`, once [`alarm`] has added its alarms, has wait on the
@@ -1434,6 +1541,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
                 .map(|p| Summary {
                     question: Some(p.ask.clone()).filter(|q| *q != h.reason),
                     recommendation: p.recommendation.clone(),
+                    revision: None,
                 })
                 .unwrap_or_default(),
         };
@@ -1461,6 +1569,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             source_ref: Reference::new(RefKind::Hold, &repository, number),
             action,
             carried: false,
+            group: None,
         };
         let Some(pull) = approval_of(&h.reason).map(str::to_ascii_lowercase) else {
             items.push(ask);
@@ -1491,23 +1600,71 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         if matches!(collected.read, Read::Complete | Read::Off) {
             continue;
         }
-        for ask in published.iter().filter(|p| p.source == source) {
+        for old in published.iter().filter(|p| p.source == source) {
+            let mut ask = old.clone();
+            if let Some(group) = &mut ask.group {
+                // A freshly read decision supersedes the old housekeeping
+                // membership, even when another read in its repository failed.
+                group.numbers.retain(|number| {
+                    !collected.asks.iter().any(|fresh| {
+                        fresh
+                            .action
+                            .repository
+                            .eq_ignore_ascii_case(&ask.action.repository)
+                            && fresh.action.number == *number
+                    })
+                });
+                let Some(number) = group.numbers.iter().min().copied() else {
+                    continue;
+                };
+                if number != ask.action.number {
+                    ask.action.number = number;
+                    ask.source_ref.number = number;
+                    ask.item = format!("{}#{number}", ask.action.repository);
+                    ask.key = ask.item.to_ascii_lowercase();
+                    // Only the old representative's head was published.
+                    ask.head = None;
+                    ask.action.head = None;
+                    ask.source_ref.head = None;
+                }
+            }
             let item = ask.item.to_ascii_lowercase();
             let repository = item.rsplit_once('#').map_or(item.as_str(), |(r, _)| r);
             let unread = collected.read == Read::Unread
                 || collected.unread.contains(&item)
                 || collected.unread.contains(repository);
             let listed = |a: &Ask| a.key == ask.key;
-            if unread && !items.iter().any(listed) && !asks.iter().any(listed) {
+            if unread
+                && (ask.group.is_some() || (!items.iter().any(listed) && !asks.iter().any(listed)))
+            {
                 asks.push(Ask {
                     carried: true,
-                    ..ask.clone()
+                    ..ask
                 });
             }
         }
     }
     // A carried ask is joined with its hold as a live one is.
     for mut ask in asks {
+        // A labelled-list shortcut cannot recover why the poll originally
+        // stopped. Keep its published category while it is still labelled;
+        // fresh explicit reasons (especially drafts) take precedence.
+        if ask.source == REVIEWS
+            && ask.kind == "review-needs-human"
+            && ask.ask == "labelled needs-human"
+            && let Some(group) = published
+                .iter()
+                .filter(|p| p.source == REVIEWS)
+                .filter(|p| {
+                    p.action
+                        .repository
+                        .eq_ignore_ascii_case(&ask.action.repository)
+                })
+                .filter_map(|p| p.group.as_ref())
+                .find(|g| g.numbers.contains(&ask.action.number))
+        {
+            ask.ask = group.reason.clone();
+        }
         let seen = (published.iter())
             .find(|p| p.key == ask.key && p.kind == ask.kind && p.head == ask.head)
             .and_then(|p| not_after(&Value::from(p.waiting_since.as_str()), at));
@@ -1530,6 +1687,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         items.push(ask);
     }
     items.extend(approvals.into_values().map(|(ask, _)| ask));
+    items = group_stranded(items);
     items.sort_by_key(rank);
     let mut first: BTreeMap<String, usize> = BTreeMap::new();
     let mut kept: Vec<Ask> = Vec::with_capacity(items.len());
@@ -1549,6 +1707,25 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     let omitted = kept.len().saturating_sub(MAX_NEEDS_YOU);
     kept.truncate(MAX_NEEDS_YOU);
     let items = kept;
+    let cached = published_list(previous).map(|p| &p["summary_cache"]);
+    let summary_cache = items
+        .iter()
+        .filter_map(|ask| {
+            if ask.source_ref.kind != RefKind::Hold || ask.source == "pass" {
+                return None;
+            }
+            let said = reading
+                .summaries
+                .1
+                .get(&ask.key)
+                .cloned()
+                .flatten()
+                .or_else(|| {
+                    cached.and_then(|c| serde_json::from_value::<Summary>(c[&ask.key].clone()).ok())
+                })?;
+            Some((ask.key.clone(), said))
+        })
+        .collect();
     let read = [
         sources.epics,
         sources.items,
@@ -1566,6 +1743,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         omitted,
         count: items.len(),
         items,
+        summary_cache,
     };
     let previous = published_list(previous);
     // How much of the summaries was read is no change: what they said is
@@ -1573,7 +1751,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     let content = |list: &Value| {
         let mut list = list.clone();
         if let Some(fields) = list.as_object_mut() {
-            for field in ["validated_at", "changed_at", "summaries"] {
+            for field in ["validated_at", "changed_at", "summaries", "summary_cache"] {
                 fields.remove(field);
             }
         }
@@ -3121,12 +3299,133 @@ mod tests {
             source_ref: Reference::new(RefKind::Comment, repository, number),
             action,
             carried: false,
+            group: None,
         }
     }
 
     fn collected(read: Read, asks: Vec<Ask>, unread: &[&str]) -> Collected {
         let unread = unread.iter().map(|&u| u.to_owned()).collect();
         Collected { read, asks, unread }
+    }
+
+    #[test]
+    fn stranded_reviews_group_by_repository_and_reason() {
+        let stopped = |repo: &str, number, reason: &str| {
+            let mut ask = own(REVIEWS, (repo, number), RefKind::PullRequest, Some(HEAD_A));
+            ask.kind = "review-needs-human".into();
+            ask.ask = reason.into();
+            ask
+        };
+        let draft = "a draft with no checkpoint; mark it ready if the work is complete";
+        let mut asks: Vec<_> = (1..=44)
+            .rev()
+            .map(|n| stopped("o/bootc", n, draft))
+            .collect();
+        asks.push(stopped("o/other", 45, draft));
+        asks.push(stopped("o/bootc", 46, "fix round 1 is blocked: no pool"));
+        asks.push(stopped(
+            "o/bootc",
+            47,
+            "fix round 2 is blocked: no capacity",
+        ));
+        asks.push(own(
+            REVIEWS,
+            ("o/bootc", 48),
+            RefKind::ApprovePullRequest,
+            Some(HEAD_A),
+        ));
+        let listed = own_listed(
+            &[],
+            "2026-10-28T09:00:00Z",
+            (collected(Read::Complete, asks, &[]), Collected::off()),
+            None,
+        );
+        assert_eq!(listed.count, 4);
+        let group = listed.items.iter().find(|a| a.key == "o/bootc#1").unwrap();
+        assert_eq!(group.ask, "bootc: 44 drafts to inspect and promote");
+        assert_eq!(
+            group.group.as_ref().unwrap().numbers,
+            (1..=44).collect::<Vec<_>>()
+        );
+        assert_eq!(group.action.kind, RefKind::PullRequest);
+        assert_eq!(
+            group.target,
+            "https://github.com/o/bootc/pulls?q=is%3Apr+is%3Aopen+draft%3Atrue"
+        );
+        let blocked = listed.items.iter().find(|a| a.key == "o/bootc#46").unwrap();
+        assert_eq!(blocked.ask, "bootc: 2 fix round blocked");
+        // Unread repositories retain the grouped membership; a complete
+        // empty read drops it. No new v2 action or key grammar is needed.
+        let previous = json!({"schema": HOLDS_SCHEMA, "needs_you": listed});
+        let carried = own_listed(
+            &[],
+            "2026-10-28T10:00:00Z",
+            (collected(Read::Unread, vec![], &[]), Collected::off()),
+            Some(&previous),
+        );
+        assert_eq!(carried.count, 4);
+        assert!(carried.items.iter().all(|a| a.carried));
+        assert_eq!(
+            carried
+                .items
+                .iter()
+                .find(|a| a.key == group.key)
+                .unwrap()
+                .group,
+            group.group
+        );
+        let cleared = own_listed(
+            &[],
+            "2026-10-28T10:00:00Z",
+            (collected(Read::Complete, vec![], &[]), Collected::off()),
+            Some(&previous),
+        );
+        assert_eq!(cleared.count, 0);
+        // A partial next pass has a fresh approval for the old group's
+        // representative. It must not be overwritten by that carried group.
+        let mut approve = own(
+            REVIEWS,
+            ("o/bootc", 1),
+            RefKind::ApprovePullRequest,
+            Some(HEAD_B),
+        );
+        approve.kind = "review-approve".into();
+        let partial = own_listed(
+            &[],
+            "2026-10-28T10:00:00Z",
+            (
+                collected(Read::Partial, vec![approve], &["o/bootc"]),
+                Collected::off(),
+            ),
+            Some(&previous),
+        );
+        let approval = partial.items.iter().find(|a| a.key == "o/bootc#1").unwrap();
+        assert_eq!(approval.action.kind, RefKind::ApprovePullRequest);
+        assert_eq!(approval.head.as_deref(), Some(HEAD_B));
+        assert!(approval.group.is_none());
+        let drafts = partial.items.iter().find(|a| a.key == "o/bootc#2").unwrap();
+        assert_eq!(
+            drafts.group.as_ref().unwrap().numbers,
+            (2..=44).collect::<Vec<_>>()
+        );
+        assert_eq!(drafts.action.number, 2);
+        assert!(drafts.head.is_none());
+        // The normal labelled shortcut preserves a previously published
+        // specific stop category instead of collapsing it to a generic one.
+        let generic = stopped("o/bootc", 46, "labelled needs-human");
+        let refreshed = own_listed(
+            &[],
+            "2026-10-28T10:00:00Z",
+            (
+                collected(Read::Complete, vec![generic], &[]),
+                Collected::off(),
+            ),
+            Some(&previous),
+        );
+        assert_eq!(
+            refreshed.items[0].group.as_ref().unwrap().reason,
+            "fix round blocked"
+        );
     }
 
     /// The list of `entries` at `at` with `reviews` and `proposals` read,
@@ -3397,7 +3696,27 @@ mod tests {
                 Some("Yes."),
             ),
             ("**Decision needed:**\n**Recommendation:**   ", None, None),
-            ("Decision needed: Ship?\n*Recommendation:* Yes.", None, None),
+            (
+                "Decision needed: Ship?\nRecommendation: Yes.",
+                Some("Ship?"),
+                Some("Yes."),
+            ),
+            (
+                "**QUESTION FOR THE OPERATOR:** Ship?\n**RECOMMENDED:** Yes.",
+                Some("Ship?"),
+                Some("Yes."),
+            ),
+            (
+                "Question for the operator: Ship?\nRecommended: Yes.",
+                Some("Ship?"),
+                Some("Yes."),
+            ),
+            (
+                "- **Question for the operator**: Ship?\n- **Recommended**: Yes.",
+                Some("Ship?"),
+                Some("Yes."),
+            ),
+            ("A bold opening is not a question.\n**Ship?**", None, None),
             (
                 "**Decision needed:** First\n**Decision needed:** Second",
                 Some("First"),
@@ -3409,6 +3728,7 @@ mod tests {
             let expected = Summary {
                 question: question.map(Into::into),
                 recommendation: recommendation.map(Into::into),
+                revision: None,
             };
             assert_eq!(said, expected, "{body}");
         }
@@ -3429,6 +3749,7 @@ mod tests {
         let said = |question: Option<&str>| Summary {
             question: question.map(Into::into),
             recommendation: Some("Do it.".into()),
+            revision: None,
         };
         for (question, expected) in [
             (Some("Ship 1.0?"), ["Ship 1.0?", "Ship 1.0?"]),
