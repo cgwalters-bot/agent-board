@@ -1043,14 +1043,23 @@ unless `triageFollowUpDays` is set. Then the triage brief asks for a
 `schedule-triage` verdict, and once the run is no longer in flight the pass
 reads the newest one the bot posted after the dispatch record, unedited but by
 a writer; a visitor's comment is never a verdict. A comment by the operator
-after it (or after the record, with no verdict) triages the issue again.
+after a non-asking verdict (or after the record, with no verdict) triages the issue again.
 Otherwise `done`, `obsolete`, `needs-design` and `needs-operator` label it
 `needs-human`, so it shows as the operator's ask, and post one comment
 whose hidden first line, `<!-- agent-board-hold: verdict COMMENT-ID -->`,
 names the verdict comment it holds, then a sentence saying so: one step of
 two writes under `--max-writes`, neither made in a preview. The label then
-keeps the issue out of the follow-up; taken off with no operator comment,
-the same verdict labels it and posts the comment again.
+keeps the issue out of the follow-up. An asking verdict is answered when a
+later comment by the operator or bot, unedited except by those writers,
+is followed by removal of `needs-human`. Run status, hold, dispatch and plan
+comments do not count as answers. With no newer plan, the issue goes back to
+triage at once, the brief linking the newest such answering comment as its
+decision context. A newer plan still dispatches normally. The pass reads at
+most the last 100 label-removal events, within its existing request/time bounds;
+without evidence of a removal after the answer, the same verdict labels it
+and posts the hold comment again. The decision line names `rule answered-verdict`
+when released for triage or `rule unanswered-verdict` when held again. This
+uses the existing off-by-default `triageFollowUpDays`; it adds no option.
 
 With `triageClose` (agent-board#428), `done` instead closes the issue as
 completed and `obsolete` as not planned, and the pass posts one line
@@ -1093,8 +1102,11 @@ fingerprint.
 An issue triaged before the pass's own triage, as by a supervisor's
 dispatch, can already carry a verdict. With `triageFollowUpDays`, before a
 first triage the pass reads the newest verdict the bot posted on the issue,
-unedited but by a writer, and takes it as the triage's when nothing happened
-after it: no comment posted or edited since but agentic-job's status
+unedited but by a writer. Asking verdicts use the same answer-plus-removal
+rule above; the pass's own hold marker does not invalidate them, nor does
+an answer without a later removal. A body or title edit still invalidates
+an earlier verdict. For other verdicts it takes the verdict as the triage's
+when nothing happened after it: no comment posted or edited since but agentic-job's status
 comments, the bot's own other comments included (an `ask create` hold is
 one), and no edit of the issue's body or title (one more read, made only
 when such a verdict exists). It is then

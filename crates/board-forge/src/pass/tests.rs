@@ -2389,6 +2389,9 @@ impl Transport for Forge {
             Err(_) if query == CLOSE_QUERY => {
                 close_read(&variables, Some("2026-10-01T00:00:00Z".into()), None)
             }
+            Err(_) if query == VERDICT_REMOVALS_QUERY => {
+                json!({"repository": {"issue": {"removals": {"nodes": []}}}})
+            }
             // A comment whose edits were not recorded: the bot's, unedited.
             Err(_) if query == needs::EDITS_QUERY => {
                 json!({"node": {"author": {"login": "cgwalters-bot"}, "lastEditedAt": null, "editor": null}})
@@ -4501,6 +4504,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             answered(&forge, (author, editor), &body, days);
         }
         let added = forge.added.borrow()[&("cgwalters-forge/tracker".to_owned(), 446)].clone();
+        if name == "the operator's comment after the verdict triages it again, unlabelled" {
+            verdict_removal(&mut forge, "needs-human", "2026-11-03T13:33:00Z");
+        }
         // The first verdict, after the plan and its record.
         let first = (added[2..].iter())
             .find(|c| text(c, "/body").contains(TRIAGE_FENCE))
@@ -4573,6 +4579,207 @@ fn apply_follows_up_a_triage_by_its_verdict() {
     }
 }
 
+fn verdict_removal(forge: &mut Forge, label: &str, at: &str) {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
+    forge.replay.requests.push(json!({
+        "request": graphql_key(VERDICT_REMOVALS_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {"removals": {"nodes": [
+            {"createdAt": at, "label": {"name": label}}
+        ]}}}}}
+    }));
+}
+
+/// actions#103: a controller answer followed by removal releases the old
+/// verdict. A removal alone does not, and a newer plan still dispatches.
+#[test]
+fn answered_verdict_release_rules() {
+    for (name, author, body, removal, plan, released) in [
+        (
+            "controller answer",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            false,
+            true,
+        ),
+        (
+            "operator answer",
+            "cgwalters",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            false,
+            true,
+        ),
+        (
+            "removal alone",
+            "",
+            "",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            false,
+            false,
+        ),
+        (
+            "new plan",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            true,
+            false,
+        ),
+        (
+            "no removal",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            None,
+            false,
+            false,
+        ),
+        (
+            "removal before answer",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-10-20T00:00:00Z")),
+            false,
+            false,
+        ),
+        (
+            "other label",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            Some(("needs-design", "2026-11-03T13:33:00Z")),
+            false,
+            false,
+        ),
+        (
+            "visitor",
+            "visitor",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            false,
+            false,
+        ),
+        (
+            "status",
+            "cgwalters-bot",
+            "status",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            false,
+            false,
+        ),
+        (
+            "hold",
+            "cgwalters-bot",
+            "hold",
+            Some(("needs-human", "2026-11-03T13:33:00Z")),
+            false,
+            false,
+        ),
+    ] {
+        for board_triage in [true, false] {
+            let config = config(json!({"triageFollowUpDays": 3}));
+            let mut forge = Forge::new(None, false);
+            only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+            if board_triage {
+                assert_eq!(apply(&forge, &config).failures, 0);
+            }
+            answered(
+                &forge,
+                ("cgwalters-bot", None),
+                &format!("```{TRIAGE_FENCE}\n{{\"verdict\":\"needs-operator\"}}\n```"),
+                0,
+            );
+            let verdict_id = forge.ids.get();
+            // First hold it, including the real marker. The fake transport does
+            // not persist label writes, so the next pass sees the label absent.
+            let held = apply(&forge, &config);
+            assert_eq!(held.failures, 0, "{name}: {:?}", held.lines);
+            assert!(
+                held.lines
+                    .iter()
+                    .any(|l| l.contains("rule unanswered-verdict:")),
+                "{name}"
+            );
+            if !author.is_empty() {
+                let body = match body {
+                    "status" => format!("Done.{}", crate::supervise::health::status_end(42)),
+                    "hold" => hold_marker(verdict_id),
+                    other => other.to_owned(),
+                };
+                answered(&forge, (author, None), &body, 0);
+            }
+            let answer_id = forge.ids.get();
+            if let Some((label, at)) = removal {
+                verdict_removal(&mut forge, label, at);
+            }
+            if plan {
+                let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,
+                "kind": "implement", "runner": "hosted", "brief": "Implement the bounded fix."});
+                answered(
+                    &forge,
+                    ("cgwalters-bot", None),
+                    &format!("```{PLAN_FENCE}\n{job}\n```"),
+                    0,
+                );
+                unpathed(&mut forge.replay);
+            }
+            let before = forge.writes.borrow().len();
+            let preview = block(run(
+                &forge,
+                &forge,
+                &config,
+                State::default(),
+                (Mode::Preview, Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(forge.writes.borrow().len(), before, "{name}");
+            assert_eq!(preview.failures, 0, "{name}: {:?}", preview.lines);
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+            let rule = if released {
+                "rule answered-verdict:"
+            } else {
+                "rule unanswered-verdict:"
+            };
+            if !plan {
+                for report in [&preview, &report] {
+                    assert!(
+                        report.lines.iter().any(|l| l.contains(rule)),
+                        "{name}: {:?}",
+                        report.lines
+                    );
+                }
+            }
+            let writes = forge.writes.borrow();
+            let sent: Vec<_> = writes[before..]
+                .iter()
+                .filter(|(_, url, _)| url.ends_with("/dispatches"))
+                .collect();
+            assert_eq!(sent.len(), usize::from(released || plan), "{name}");
+            if let Some((_, _, sent)) = sent.first() {
+                assert_eq!(
+                    sent["inputs"]["kind"],
+                    if plan { "implement" } else { "triage" },
+                    "{name}"
+                );
+                if released {
+                    let task = text(sent, "/inputs/task");
+                    assert!(
+                        task.contains(&format!("#issuecomment-{answer_id}"))
+                            && task.contains("newest decision context"),
+                        "{name}: {task}"
+                    );
+                }
+            }
+            let labels: Vec<_> = writes[before..]
+                .iter()
+                .filter(|(_, url, _)| url.ends_with("/labels"))
+                .collect();
+            assert_eq!(labels.len(), usize::from(!released && !plan), "{name}");
+        }
+    }
+}
+
 /// Before a first triage, the bot's earlier verdict with nothing after it
 /// but the bot's comments, and the issue's body and title not edited since,
 /// is acted on as a follow-up's would be, rather than triaged again. Each
@@ -4635,7 +4842,7 @@ fn apply_takes_an_earlier_triage_verdict() {
             None,
         ),
         (
-            "so does an edit since of an earlier comment",
+            "an edit of an earlier comment does not confirm an answer to an asking verdict",
             &close,
             vec![
                 ("cgwalters", None, "Also the docs.", -5),
@@ -4643,7 +4850,10 @@ fn apply_takes_an_earlier_triage_verdict() {
                 ("", None, "edit-first", -3),
             ],
             "",
-            None,
+            Some((
+                "earlier triage verdict done, {answer}; label needs-human, not closed: no lock is known to have covered its triage",
+                LABEL,
+            )),
         ),
         (
             "and is triaged after them",
@@ -4673,11 +4883,14 @@ fn apply_takes_an_earlier_triage_verdict() {
             None,
         ),
         (
-            "so does the operator's",
+            "the operator's answer needs a later label removal",
             &close,
             vec![(bot, None, "done", -4), ("cgwalters", None, "No.", -3)],
             "",
-            None,
+            Some((
+                "earlier triage verdict done, {answer}; label needs-human, not closed: no lock is known to have covered its triage",
+                LABEL,
+            )),
         ),
         (
             "so does an edit of the body since",
@@ -4906,7 +5119,7 @@ fn triage_scope_epics_follows_up_no_issue_outside_them() {
         (
             "done still asks the operator",
             vec![(bot, verdict("done"), 0)],
-            "; label needs-human",
+            "; label needs-human; rule unanswered-verdict: no later writer answer followed by needs-human removal",
         ),
         (
             "partly, its day past and changed since, is not triaged again",
