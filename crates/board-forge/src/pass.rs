@@ -428,6 +428,9 @@ pub struct Config {
     /// epic's planning backs off.
     #[serde(default)]
     pub triage_follow_up_days: u64,
+    /// Avoid duplicate planning while a PR or research answer owns the work.
+    #[serde(default)]
+    pub skip_active_work: bool,
     /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
     /// issue rather than asking the operator; needs `triageFollowUpDays`.
     #[serde(default)]
@@ -2331,6 +2334,8 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    /// Suppressed candidates, by rule; absent from the summary when disabled.
+    pub triage_skipped: RefCell<BTreeMap<String, u64>>,
     /// Confirmed effects only, independently of the step caps.
     pub effects: Effects,
     /// Previewed starts, never included in confirmed effects or daily totals.
@@ -2361,8 +2366,13 @@ impl Report {
         } else {
             String::new()
         };
+        let skipped = if self.triage_skipped.borrow().is_empty() {
+            String::new()
+        } else {
+            format!(", triages skipped {}", json!(*self.triage_skipped.borrow()))
+        };
         format!(
-            "{}, {}, starts {}, comments created {}, edited {}{planned}",
+            "{}, {}, starts {}, comments created {}, edited {}{planned}{skipped}",
             self.summary,
             self.spent,
             json!(self.effects.starts),
@@ -2474,6 +2484,12 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         Mode::Local => (true, None, "local"),
     };
     let mut report = Report::default();
+    if config.skip_active_work {
+        report
+            .triage_skipped
+            .get_mut()
+            .extend([("pull-request".into(), 0), ("research".into(), 0)]);
+    }
     report.tally.0.limit = config.wip;
     report.tally.1.mode = name;
     report.tally.1.revisited = config.revisit.as_ref().map(|_| None);
@@ -3964,6 +3980,30 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         for (at, of) in read {
             let facts = self.fresh(at)?;
+            if self.config.skip_active_work {
+                if let Some(pull) = active::trusted_pull(&facts, &writers) {
+                    let held = Hold::new(
+                        HoldKind::PrOpen,
+                        format!(
+                            "{of}pull request {}#{} is open",
+                            pull.repository, pull.number
+                        ),
+                    );
+                    return Ok(Some(self.active_hold("pull-request", held)));
+                }
+                let comments = plan::issue_comments(&self.client, at)?;
+                // This is the final fresh read, not the candidate's look-ahead.
+                self.kept.borrow_mut().reads.clear();
+                if let Some((rule, held)) = self.active_work(&facts, &comments, target)? {
+                    return Ok(Some(self.active_hold(
+                        rule,
+                        Hold {
+                            reason: format!("{of}{}", held.reason),
+                            ..held
+                        },
+                    )));
+                }
+            }
             if let Some(held) = rule(&facts, &busy, &writers) {
                 let why = format!("{of}{}", held.reason);
                 return Ok(Some(Step::Hold(Hold::new(held.kind, why))));
@@ -4002,11 +4042,49 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let why = format!("its pull requests could not all be read: {error:#}");
             return Ok(Step::Hold(Hold::new(HoldKind::Unreadable, why)));
         }
-        if let Some(held) = hold(&facts, busy, &writers) {
+        if config.skip_active_work
+            && let Some(pull) = active::trusted_pull(&facts, &writers)
+        {
+            let held = under_way(&facts, busy, &writers).unwrap_or_else(|| {
+                Hold::new(
+                    HoldKind::PrOpen,
+                    format!("pull request {}#{} is open", pull.repository, pull.number),
+                )
+            });
+            return Ok(self.active_hold("pull-request", held));
+        }
+        let no_runs = BTreeMap::new();
+        if let Some(held) = hold(
+            &facts,
+            if config.skip_active_work {
+                &no_runs
+            } else {
+                busy
+            },
+            &writers,
+        ) {
             return Ok(Step::Hold(held));
         }
         let issue = &facts.issue;
         let comments = plan::issue_comments(&self.client, issue)?;
+        if config.skip_active_work {
+            match self.active_work(&facts, &comments, target) {
+                Ok(Some((rule, held))) => return Ok(self.active_hold(rule, held)),
+                Ok(None) => (),
+                Err(error) => {
+                    return Ok(Step::Hold(Hold::new(
+                        HoldKind::Unreadable,
+                        format!("active work could not be read: {error:#}"),
+                    )));
+                }
+            }
+            if let Some(held) = hold(&facts, busy, &writers) {
+                return Ok(Step::Hold(held));
+            }
+            if plan::newest_plan(&comments, &writers).is_ok_and(|(p, _)| p.kind == "research") {
+                return self.triage((&facts, &comments), AGAIN, (snapshot, target, slots));
+            }
+        }
         let read = (&facts, comments.as_slice());
         // The body's plan, posted as a comment at its start, which the plan
         // protocol then dispatches and records as any other.
@@ -4577,14 +4655,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
     /// verdict [`Self::follow_up`] reads. Nothing without it.
     fn verdict_ask(&self) -> String {
+        let active = if self.config.skip_active_work {
+            " If the work is already in an open pull request, link it and report waiting on that PR, without adding needs-human or posting another implement plan. Use not-done rather than needs-operator for that wait."
+        } else {
+            ""
+        };
         if self.config.triage_follow_up_days == 0 {
-            return String::new();
+            return active.to_owned();
         }
         format!(
             " If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
              {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
              obsolete (no longer wanted: close as not planned), needs-design, needs-operator, \
-             partly or not-done."
+             partly or not-done.{active}"
         )
     }
 
@@ -5154,6 +5237,29 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         (slots, target, rule): (&Slots, &Target, HoldRule),
     ) -> Result<Step> {
         let holds = vec![issue.clone()];
+        if self.config.skip_active_work
+            && let Some((facts, comments)) = read
+        {
+            if let Some(pull) = active::trusted_pull(facts, &self.writers()) {
+                return Ok(self.active_hold(
+                    "pull-request",
+                    Hold::new(
+                        HoldKind::PrOpen,
+                        format!("pull request {}#{} is open", pull.repository, pull.number),
+                    ),
+                ));
+            }
+            match self.active_work(facts, comments, target) {
+                Ok(Some((rule, held))) => return Ok(self.active_hold(rule, held)),
+                Ok(None) => (),
+                Err(error) => {
+                    return Ok(Step::Hold(Hold::new(
+                        HoldKind::Unreadable,
+                        format!("active work could not be read: {error:#}"),
+                    )));
+                }
+            }
+        }
         if let Some(step) = self.capped(&line) {
             return Ok(step);
         }
@@ -5726,6 +5832,7 @@ impl crate::github::GraphQl for Replay {
     }
 }
 
+mod active;
 mod blockers;
 mod cost;
 pub(crate) mod epics;

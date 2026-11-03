@@ -712,6 +712,34 @@ dispatching it with the job-plan protocol, so the dispatch record is the claim.
 A pass interrupted between that post and its dispatch leaves a triage plan,
 which is a manual dispatch; a person dispatches or replaces it.
 
+With `skipActiveWork: true` (off by default, GitHub only), stage 4 avoids
+duplicate planning while the work already lives elsewhere. An open closing PR
+by the operator or the bot, draft or not, holds the issue as `pr-open`; a
+visitor's does not, so that a visitor cannot keep work off an issue. A cross-reference
+also holds it when the PR is open, authored by the bot in the issue's repository,
+and its `dispatch/implement/agent-run-ID` branch names a recorded run of an
+accepted implement plan on that issue. A mere mention by someone else does not.
+Drafts never age out of this check; closing the PR releases the hold. This check
+precedes triage verdict effects, so a verdict that found that PR does not add
+`needs-human`: the operator acts on the PR instead.
+
+The same setting skips an issue whose last accepted plan is research, or whose
+recorded research run is answering it. An active research run holds it until it
+ends. Then an issue-body edit, a non-bot comment or edit, or any issue update
+after the run makes it eligible for triage again; a later bot comment counts too,
+as the issue's latest update time cannot tell it from a label or title change
+before it. Without a recorded run, the research plan's time is the baseline. The
+research run's own answer does not cause another triage. A newer accepted implement plan supersedes completed
+research and is considered normally, rather than waiting for another triage.
+Existing human holds still apply. These are scheduling
+heuristics, not new mutation authority. Cross-references are read at most three
+pages of 100 within the existing pass request/time bounds; unreadable or longer
+listings hold rather than dispatch. The summary appends
+`triages skipped {"pull-request":N,"research":N}` (including zeroes), counting
+the candidates suppressed by each rule, once per consideration. Disabled passes
+keep their old summary and reads. No caller configuration is changed here; the
+tracker caller must set `skipActiveWork: true` in `.github/pass.json` to enable it.
+
 In a GitHub Actions run, stage 4 of an `--apply` pass starts nothing while
 another run of the same workflow is in progress (`hold wip: another pass is in
 progress`): two passes that both saw a free slot could otherwise both take it.
@@ -2648,6 +2676,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
+| `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
