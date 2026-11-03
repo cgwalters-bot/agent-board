@@ -613,9 +613,13 @@ checkpoint says REASON`. Continuation rounds are counted in the marker apart
 from fix rounds; `continuation.rounds` (0 to 5, default 2) caps them, past
 which, or for a malformed checkpoint, the pull request gets `needs-human`
 with the reason. A draft with no checkpoint also goes to `needs-human`
-instead of being marked ready on green checks. `continuation.pools` (absent
-by default) names a pool for a `budget`, `runtime` or `cap` checkpoint, as
-pools are how a run gets more budget, time or a higher cap; the `cap` pool
+instead of being marked ready on green checks, except on a base repository
+in the pass's `pr.noMerge`, where a draft is the finished state: its fix
+and rebase rounds run as for any other (a conflict is rebased without the
+approval the review job never gives a draft), and once clean and green it
+waits with `a midstream draft, waiting for promotion`, unlabelled.
+`continuation.pools` (absent by default) names a pool for a `budget`,
+`runtime` or `cap` checkpoint, as pools are how a run gets more budget, time or a higher cap; the `cap` pool
 is used once a pull request. A continuation that completes is marked ready
 by agentic-job, which in v0.5.1 does not rewrite the title or description
 from its commits. With `continuation.retitle: true` (off by default) the poll

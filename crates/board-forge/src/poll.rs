@@ -250,6 +250,9 @@ const AUTO_MERGE: &str = "auto-merge already on";
 /// Why a head the review job withheld its approval of ([`WITHHELD`]) waits.
 const WITHHELD_WAIT: &str =
     "the review withheld its approval of the head; it needs a human approval";
+/// Why the bot's clean, green draft on a `pr.noMerge` base waits: a draft
+/// is the finished state there, and only the operator promotes it.
+const PROMOTE_WAIT: &str = "a midstream draft, waiting for promotion";
 /// How a round outside the caller's fix bounds is skipped: the operator
 /// takes it, labelled or not.
 const LEFT_TO_OPERATOR: &str = "left to the operator: ";
@@ -2723,12 +2726,18 @@ fn conflict_text(base: &str) -> String {
 }
 
 /// The task of a rebase round ([`PollPolicy::rebase_rounds`]): only the
-/// conflict, as the review approved the change and nothing else failed.
-pub fn rebase_task(repo: &str, pull: &Value, round: u64, rounds: u64) -> String {
+/// conflict, as the review approved the change, or it is a midstream draft
+/// the review job never reviews, and nothing else failed.
+pub fn rebase_task(repo: &str, pull: &Value, approved: bool, round: u64, rounds: u64) -> String {
     let head = text(pull, "/headRefOid");
     let number = pull["number"].as_u64().unwrap_or_default();
+    let state = if approved {
+        "was approved but"
+    } else {
+        "is a draft, not approved, and"
+    };
     format!(
-        "Pull request {repo}#{number} at head {head} was approved but cannot merge as it is. Change nothing but what rebasing it needs. This is rebase round {round} of {rounds}.\n\n{}",
+        "Pull request {repo}#{number} at head {head} {state} cannot merge as it is. Change nothing but what rebasing it needs. This is rebase round {round} of {rounds}.\n\n{}",
         conflict_text(text(pull, "/baseRefName"))
     )
 }
@@ -3124,6 +3133,7 @@ pub fn decide(
     // and review are of unfinished work. A draft without one is no longer
     // marked ready on its checks; see below.
     let draft = pull["isDraft"].as_bool().unwrap_or(false);
+    let midstream = harness && draft && no_merge(config, pull);
     if harness && draft {
         match checkpoint(pull) {
             // Only the outermost message, which is ours: the JSON error under
@@ -3171,13 +3181,23 @@ pub fn decide(
         }
         // Only a conflict, on a head the review approved: the base moved, and
         // the change did not fail. Past its own rounds it is a fix as before.
+        // A midstream draft is finished work the review job never reviews
+        // (it skips drafts), so its conflict is rebased unapproved.
         let rebases = config.policy.rebase_rounds;
         let conflict_only = failing.len() == 1 && pull["mergeable"] == CONFLICTING;
-        if conflict_only && review == Some(Review::Approved) && marker.rebased < rebases {
+        let approved = if review == Some(Review::Approved) {
+            "approved"
+        } else {
+            "a midstream draft"
+        };
+        if conflict_only
+            && (midstream || review == Some(Review::Approved))
+            && marker.rebased < rebases
+        {
             let round = marker.rebased + 1;
             return Decision {
                 action: "rebase",
-                reason: format!("{why}; approved, so rebase round {round} of {rebases}"),
+                reason: format!("{why}; {approved}, so rebase round {round} of {rebases}"),
                 round: Some(round),
                 queue: None,
             };
@@ -3255,6 +3275,20 @@ pub fn decide(
         } else {
             step("skip", format!("{what}; {not_ours}"))
         };
+    }
+    // On a midstream fork every pull request stays a draft, and only the
+    // operator promotes it; its rounds above run as anywhere else, and a
+    // clean, green one waits for that promotion rather than a label, which
+    // would stop its later rounds (agent-board#628).
+    if midstream {
+        let why = if !checks.pending.is_empty() {
+            format!("{CHECKS_PENDING}{}", checks.pending.join(", "))
+        } else if pull["mergeable"] != "MERGEABLE" {
+            format!("{MERGEABILITY}{base} not known yet")
+        } else {
+            PROMOTE_WAIT.to_owned()
+        };
+        return step("wait", why);
     }
     // agentic-job marks complete work ready itself, so a draft of ours with
     // no checkpoint says nothing of how to go on: a person marks it ready or
@@ -3345,13 +3379,7 @@ pub fn decide(
     // Approval on a midstream fork can mean consent to promote upstream,
     // not to land on the fork. Keep this after rounds and review holds, and
     // before the single merge decision that also feeds queue retries.
-    let repository = text(pull, "/baseRepository/nameWithOwner");
-    if config
-        .policy
-        .no_merge
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(repository))
-    {
+    if no_merge(config, pull) {
         return step(
             "wait",
             "pr.noMerge: merging into this base repository is disabled",
@@ -3492,8 +3520,9 @@ pub struct Outcome {
 /// A followed pull request that waits on the operator, at the head the
 /// pass read: `approve` (its approval of the head, under
 /// [`OPERATOR_APPROVAL_LABEL`]), `withheld` (the review job withheld its
-/// approval) or `needs-human` (labelled so, stopped by this step, or a
-/// round outside the fix bounds left to the operator).
+/// approval), `promote` (a clean, green midstream draft, [`PROMOTE_WAIT`])
+/// or `needs-human` (labelled so, stopped by this step, or a round outside
+/// the fix bounds left to the operator).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Wait {
     pub repository: String,
@@ -3618,8 +3647,19 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
         }
         "wait" if decision.reason == WITHHELD_WAIT => Some("withheld"),
         "wait" if decision.reason.starts_with(&approval) => Some("approve"),
+        "wait" if decision.reason == PROMOTE_WAIT => Some("promote"),
         _ => None,
     }
+}
+
+/// Whether `pull`'s base repository is in `pr.noMerge`.
+fn no_merge(config: &Config, pull: &Value) -> bool {
+    let repository = text(pull, "/baseRepository/nameWithOwner");
+    config
+        .policy
+        .no_merge
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(repository))
 }
 
 /// Keep draft housekeeping distinct even on the labelled-list shortcut.
@@ -4260,7 +4300,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
         let task = match &checkpoint {
             Some(at) => continue_task(repo, pull, at, round, rounds),
-            None if rebasing => rebase_task(repo, pull, round, self.config.policy.rebase_rounds),
+            None if rebasing => {
+                let approved = matches!(review, Some((Review::Approved, _)));
+                rebase_task(
+                    repo,
+                    pull,
+                    approved,
+                    round,
+                    self.config.policy.rebase_rounds,
+                )
+            }
             None => {
                 let review = match review {
                     Some((Review::ChangesRequested, body)) => Some(body),
@@ -7429,6 +7478,16 @@ mod tests {
                 "rebase",
                 Some(1),
             ),
+            // With `pr.noMerge` too (below): a midstream draft is followed.
+            (
+                "an approved draft with no checkpoint that conflicts is rebased",
+                "pull-470",
+                json!({"isDraft": true, "mergeable": CONFLICTING, "policy": rebase.clone()}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "rebase",
+                Some(1),
+            ),
             (
                 "the next rebase round counts on from the marker",
                 "pull-470",
@@ -8968,6 +9027,20 @@ mod tests {
                         );
                         assert_eq!(queued, suppressed, "{name}");
                     }
+                } else if listed && got.reason.starts_with("a draft with no checkpoint") {
+                    // A draft is the finished state on a midstream fork: it
+                    // waits for its checks, then for promotion, unlabelled.
+                    let pending = classify_checks(&p, &required()).pending;
+                    let reason = if pending.is_empty() {
+                        PROMOTE_WAIT.to_owned()
+                    } else {
+                        format!("{CHECKS_PENDING}{}", pending.join(", "))
+                    };
+                    assert_eq!(
+                        (suppressed.action, suppressed.reason.as_str()),
+                        ("wait", reason.as_str()),
+                        "{name}"
+                    );
                 } else {
                     assert_eq!(suppressed, got, "{name}");
                 }
@@ -11153,6 +11226,126 @@ mod tests {
                     assert!(dispatcher.writes.borrow().is_empty());
                 }
             }
+        }
+    }
+
+    /// The review job skips drafts, so a midstream one's conflict is rebased
+    /// unapproved, within the rebase rounds; elsewhere it is a fix round.
+    #[test]
+    fn a_conflicting_midstream_draft_is_rebased_unapproved() {
+        let p = pull(
+            "pull-470",
+            json!({"isDraft": true, "mergeable": CONFLICTING, "contexts": {"review": null}}),
+        );
+        for (repositories, rebased, want) in [
+            (vec![], 0, ("fix", "conflicts with main")),
+            (
+                vec![REPO.to_owned()],
+                0,
+                (
+                    "rebase",
+                    "conflicts with main; a midstream draft, so rebase round 1 of 2",
+                ),
+            ),
+            (vec![REPO.to_owned()], 2, ("fix", "conflicts with main")),
+        ] {
+            let mut cfg = config();
+            cfg.policy.rebase_rounds = 2;
+            cfg.policy.no_merge = repositories;
+            let got = decide(
+                &cfg,
+                &p,
+                &classify_checks(&p, &required()),
+                &marker(json!({"rounds": 0, "rebased": rebased, "sha": "older"})),
+                (None, None),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!((got.action, got.reason.as_str()), want);
+        }
+
+        // Its dispatched brief does not claim an approval it never had.
+        let mut fake = github();
+        fake.pulls.insert(470, p);
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            DISPATCHES.into(),
+            vec![(200, json!({"workflow_run_id": 1234}))],
+        );
+        let mut cfg = config();
+        cfg.policy.rebase_rounds = 2;
+        cfg.policy.no_merge = vec![REPO.to_owned()];
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[REPO.into()],
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        let writes = dispatcher.writes.borrow();
+        let task = writes
+            .first()
+            .and_then(|(_, request)| request["inputs"]["task"].as_str())
+            .unwrap_or_else(|| panic!("no dispatch: {:?}", outcome.lines));
+        assert!(
+            task.contains("is a draft, not approved, and cannot merge"),
+            "{task}"
+        );
+        assert!(!task.contains("was approved"), "{task}");
+        assert!(task.contains("This is rebase round 1 of 2."), "{task}");
+    }
+
+    #[test]
+    fn a_clean_midstream_draft_waits_for_promotion_unlabelled() {
+        for repositories in [vec![], vec![REPO.to_owned()]] {
+            let midstream = !repositories.is_empty();
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"isDraft": true})));
+            let mut cfg = config();
+            cfg.policy.no_merge = repositories;
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let line = |text: &str| outcome.lines.iter().any(|l| l.contains(text));
+            let kinds: Vec<_> = outcome.waits.iter().map(|w| w.kind).collect();
+            let labels = fake
+                .writes
+                .borrow()
+                .iter()
+                .any(|(q, _)| q.contains("/labels"));
+            if midstream {
+                assert!(
+                    line(&format!("wait: {PROMOTE_WAIT}")),
+                    "{:?}",
+                    outcome.lines
+                );
+                assert_eq!(kinds, ["promote"]);
+                assert!(fake.writes.borrow().is_empty());
+            } else {
+                assert!(
+                    line("needs-human: a draft with no checkpoint"),
+                    "{:?}",
+                    outcome.lines
+                );
+                assert_eq!(kinds, ["needs-human"]);
+                assert!(labels);
+            }
+            assert!(dispatcher.writes.borrow().is_empty());
         }
     }
 
@@ -14074,6 +14267,7 @@ mod tests {
         );
         let (_, request) = dispatcher.writes.borrow()[0].clone();
         let task = request["inputs"]["task"].as_str().unwrap();
+        assert!(task.contains("was approved but cannot merge"), "{task}");
         assert!(task.contains("This is rebase round 1 of 2."), "{task}");
         assert!(task.contains("Its branch conflicts with main."), "{task}");
         assert!(!task.contains("fix round"), "{task}");
@@ -16231,6 +16425,7 @@ mod tests {
                 "pr.noMerge: merging into this base repository is disabled".into(),
                 Person,
             ),
+            (PROMOTE_WAIT.into(), Person),
             ("a wait nobody wrote yet".into(), Person),
         ];
         // One case a wait the poll decides, and one it does not know.

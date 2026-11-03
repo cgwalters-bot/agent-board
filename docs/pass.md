@@ -306,12 +306,16 @@ The asks come from five sources, each named by an item's `source`:
   whose step waits on the operator, at the head the poll read: `review-approve`
   (labelled `needs-operator-approval`, it waits on the operator's approval of
   the head), `review-withheld` (the review job withheld its approval, so a
-  person approves) and `review-needs-human` (labelled `needs-human`, or
-  stopped so by this pass's step, a draft with no checkpoint among them, or
+  person approves), `review-promote` (a clean, green draft of the bot on a
+  `pr.noMerge` base, which only the operator promotes) and
+  `review-needs-human` (labelled `needs-human`, or
+  stopped so by this pass's step, a draft with no checkpoint outside
+  `pr.noMerge` among them, or
    a round outside the fix bounds it leaves to the operator, labelled or not).
    Stranded `review-needs-human` pull requests are grouped by repository and
    reason (drafts to inspect/promote, blocked fix rounds, exhausted fix rounds,
-   otherwise the step's reason). Approval and withheld-review decisions stay
+   otherwise the step's reason), and `review-promote` ones by repository as
+   drafts waiting for promotion. Approval and withheld-review decisions stay
    separate. A group uses its lowest numbered PR's existing key, item and
    action, the earliest wait, and optional `group: {"reason", "numbers"}`
    metadata with sorted PR numbers. Its `target` links the repository's open
@@ -835,6 +839,14 @@ A pass captures one clock and performs these stages in order:
     and existing `needs-human` holds stay unchanged. An otherwise merge-ready
     head waits with `pr.noMerge: merging into this base repository is disabled`,
     without labelling it `needs-human`, which would block fix rounds.
+    There every pull request of the bot is a draft by design, so a draft with
+    no checkpoint is finished work, never marked ready: its fix and rebase
+    rounds run within the usual limits (a conflict alone takes a rebase round
+    without an approval, as the review job skips drafts), and once its checks
+    are green and it merges cleanly it waits with `a midstream draft, waiting
+    for promotion`, unlabelled, listed as `review-promote`. Elsewhere such a
+    draft still goes to `needs-human`. A midstream draft already labelled
+    `needs-human` keeps its label until the operator removes it.
     Already queued PRs and externally enabled auto-merge are not revoked;
     this option prevents new merge admissions only. Upstream promotion (#308)
     remains unbuilt.
