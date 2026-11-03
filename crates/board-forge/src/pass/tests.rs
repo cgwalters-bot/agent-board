@@ -10400,6 +10400,42 @@ fn labelled_drafts_publish_one_group_on_successive_passes() {
         let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
         *comments = json!([{"id": 7, "node_id": "IC_7", "user": {"login": "cgwalters-bot"}, "body": published}]);
     }
+    // #10 is promoted but keeps its label: the fresh non-draft evidence wins
+    // over the drafts category it was published in, whose list hides it.
+    let labelled = graphql_key(poll::LABELLED_QUERY, &variables);
+    let promoted = (forge.replay.requests.iter_mut())
+        .rfind(|e| e["request"] == labelled)
+        .unwrap();
+    promoted["answer"]["data"]["repository"]["pullRequests"]["nodes"][1]["isDraft"] = json!(false);
+    let report = apply(&forge, &config);
+    let published = (forge.writes.borrow().iter().rev())
+        .find(|(method, url, _)| {
+            (method == "POST" || method == "PATCH")
+                && url.contains("bot-ops/issues/")
+                && url.contains("comments")
+        })
+        .map(|(_, _, b)| text(b, "/body").to_owned())
+        .unwrap_or_else(|| panic!("{:?}", report.lines));
+    let snapshot = holds::parse(&published).unwrap();
+    let asks = snapshot["needs_you"]["items"].as_array().unwrap();
+    let reviews: Vec<_> = asks.iter().filter(|a| a["source"] == "reviews").collect();
+    assert_eq!(reviews.len(), 2, "{asks:#?}");
+    let drafts = reviews.iter().find(|a| a["action"]["number"] == 9).unwrap();
+    assert_eq!(
+        drafts["ask"],
+        "agentic-job: 1 drafts to inspect and promote"
+    );
+    assert_eq!(drafts["group"]["numbers"], json!([9]));
+    let ready = reviews
+        .iter()
+        .find(|a| a["action"]["number"] == 10)
+        .unwrap();
+    assert_eq!(ready["group"]["reason"], "labelled needs-human");
+    assert_eq!(ready["group"]["numbers"], json!([10]));
+    assert_eq!(
+        ready["target"],
+        format!("https://github.com/{repo}/pulls?q=is%3Apr+is%3Aopen")
+    );
 }
 
 /// A pull request's comments come with its query, the REST list only past its
