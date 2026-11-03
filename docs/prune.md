@@ -84,7 +84,104 @@ whether a linked pull request is still being worked on beyond its
 cross-reference. A duplicate keeps the oldest issue, not the one with a pull
 request.
 
+## Readiness inventory — 3 November 2026
+
+This read-only refresh for [#631](https://github.com/cgwalters-forge/agent-board/issues/631)
+under [tracker#939](https://github.com/cgwalters-forge/tracker/issues/939) supersedes
+the October audit **for current readiness**. The old audit below is historical,
+including its then-open issues, implementation gaps and unapplied recommendations.
+Neither inventory authorizes metadata changes or makes a live gate met.
+
+### Observation and authority
+
+Observed **2026-11-03**: REST open issues and GraphQL agree on **14 issues**
+(excluding PRs). Bodies, comment threads, GraphQL `parent` and labels were read;
+all 14 comment connections and the issue connection returned `hasNextPage: false`.
+No cgwalters-authored comment was returned in these open threads. A bot comment
+headed “Controller decision,” a bot quotation of the operator, and an issue's
+closure are not fresh cgwalters approval. The scope/deferral proposals below
+therefore remain proposals. Preserve the existing
+[operator security decisions](design.md#operator-decisions-cgwalters-2026-10-07).
+
+The [Workstream project](https://github.com/orgs/cgwalters-forge/projects/1) was
+read directly through `organization.projectV2(number:1).items`, following all
+**nine** pages to `hasNextPage: false`. Priority below is that single-select
+value, not a label or an empty issue-side project connection. “Not on board”
+means absent from this complete read; it is not P2. No Priority access failed
+in this observation; in a future inaccessible read the value must be **unknown**,
+not an assumed P2. `none` parent means GitHub returned null.
+
+All four inspected default branches are `main`. Immutable source snapshots:
+[agent-board `c343eae54bf4ddb8bc60e870c5509040b043f45a`](https://github.com/cgwalters-forge/agent-board/tree/c343eae54bf4ddb8bc60e870c5509040b043f45a),
+[tracker `72564da07de0d2e9294975185d8e0c3ef0947682`](https://github.com/cgwalters-forge/tracker/tree/72564da07de0d2e9294975185d8e0c3ef0947682),
+[review `fa9f1954fad81c5de78fffcfc330840421ca69d4`](https://github.com/cgwalters-forge/review/tree/fa9f1954fad81c5de78fffcfc330840421ca69d4),
+[actions `1b4539dd00edff3f89cb130e72e535e8d9c6a67a`](https://github.com/cgwalters-forge/actions/tree/1b4539dd00edff3f89cb130e72e535e8d9c6a67a).
+Public source and release records are observable; credential capabilities,
+private broker/tailnet admission and authenticated frontend parity are not
+established by these reads. Offline tests are not live acceptance evidence.
+
+### Every currently open issue
+
+Labels are complete at this observation; `none` means no labels. “v1” proposes
+retention/enrollment as an acceptance or correctness owner, not that all its
+ambitions must ship. “Post-v1” requires acceptance and, where necessary, P2/label
+changes; a different parent does not itself satisfy #939's literal criterion.
+
+| Issue | Current parent; Priority; labels | Proposed disposition and exact remaining owner/evidence |
+| --- | --- | --- |
+| [#244 — Forgejo intake](https://github.com/cgwalters-forge/agent-board/issues/244) | tracker#786; P1; `needs-human` | Post-v1 remainder, propose P2. [#560](https://github.com/cgwalters-forge/agent-board/pull/560) shipped read-only standalone intake, not pass routing/claims. cgwalters must choose separate bot versus shared-account authority and one instance versus multiple sources before dispatch; a missing generated trailer is not authenticated intent. |
+| [#257 — repository maintainers](https://github.com/cgwalters-forge/agent-board/issues/257) | tracker#939; P2; `needs-design` | Post-v1 proposal remains unapplied as a scope decision despite P2/parent. cgwalters must accept read-only merge/conflict planning first or define triggers, shared budgets, per-repository authority and moved lanes for autonomous maintainers. Existing maintain digests do not implement that split; resolve `needs-design` explicitly. |
+| [#271 — Forgejo writes/dispatch](https://github.com/cgwalters-forge/agent-board/issues/271) | tracker#786; P1; `needs-human` | Post-v1 remainder, propose P2. cgwalters chooses minimal write set/recorder identity, caller forge and async transport before a bounded backend start/confirmation slice. Forgejo read-only live CI now exists; the old “no Forgejo CI” triage is historical, not a new deployment blocker. No board write backend or confirmed dispatch follows from HTTP 204. |
+| [#282 — fresh stage deployment](https://github.com/cgwalters-forge/agent-board/issues/282) | tracker#939; P1; `needs-human` | v1 acceptance owner. #464/#465 shipped preflight and fake smoke/template, not a real Actions dispatch/scheduler round trip. cgwalters chooses stage-only credential/environment/capabilities, report destination, real-inference admission/budget if any, copied callers versus #890, and weekly/release authorization; staging maintainer then implements/proves the real path, saves a green report and installed recurrence. |
+| [#283 — upstream comment safety](https://github.com/cgwalters-forge/agent-board/issues/283) | tracker#939; P0; `needs-human` | v1 safety/decision owner; propose post-v1 broader automation only after acceptance. [#564](https://github.com/cgwalters-forge/agent-board/pull/564)/[#566](https://github.com/cgwalters-forge/agent-board/pull/566) keep claims/results first-party and record unaddressed intake without dispatch. cgwalters still chooses board admission/ranking, complaint feedback destination/classification, reply-draft approval and any automatic confidence/value bar. Keep results internal; no authorization to enable upstream replies is inferred. |
+| [#294 — GitLab](https://github.com/cgwalters-forge/agent-board/issues/294) | none; not on board; `needs-design` | Post-v1, propose board P2 and explicit deferral with label resolution. cgwalters chooses tier/label/epic mapping before a read-only adapter; unsupported facts stay incomplete. GitHub v1 needs no GitLab writes/dispatch. |
+| [#308 — promotion](https://github.com/cgwalters-forge/agent-board/issues/308) | tracker#786; P0; `needs-human` | Propose post-v1/P2, not silently accepted. [#517](https://github.com/cgwalters-forge/agent-board/pull/517) shipped inert config/stage only. cgwalters must reconcile standalone command/comment approval/unconditional sign-off with merged pass-stage/review-only/DCO-conditional contract, preserving policy, stack, draft, behind-upstream and close/Status gates unless explicitly changed. Recorded bot-fork staging and fresh approval/atomic-ref proof remain prerequisites to writes. |
+| [#489 — lower-slice in-flight wait](https://github.com/cgwalters-forge/agent-board/issues/489) | none; not on board; none | Propose enroll v1 under #939, P1: existing stack owner should hold while the lower dispatch has no PR yet but is still running; add replay evidence. No operator policy decision identified; coordinator must accept enrollment/priority, not create a duplicate. |
+| [#492 — followed-wait clock](https://github.com/cgwalters-forge/agent-board/issues/492) | none; not on board; none | Propose enroll v1 under #939, P1: time from actual round/claim start and preserve typed followed-wait semantics, including broker refund. Current failure is noisy early alarms/cards, not silence. Coordinator accepts disposition; implementation owner supplies replay regressions, not a new alarm policy. |
+| [#534 — runners/maintenance](https://github.com/cgwalters-forge/agent-board/issues/534) | tracker#1054; P1; `needs-human` | Propose post-v1/P2 while retaining rollout owner. #535 migrated owned VM labels; reuse [draft #555](https://github.com/cgwalters-forge/agent-board/pull/555), not another preset PR. Maintainer/cgwalters decide resume/rebase versus supersede; operator confirms Renovate access (prior 401 means unknown) and supplies live update evidence. Recheck remaining provider/runner ownership and preset extraction before acceptance. |
+| [#570 — no midstream merges](https://github.com/cgwalters-forge/agent-board/issues/570) | tracker#939; P1; none | v1 residual evidence check, not another configuration task. [#571](https://github.com/cgwalters-forge/agent-board/pull/571) shipped `pr.noMerge`; current tracker already lists bootc, composefs-rs, bcvk and rpm-ostree and corrected `midstream.toml`. Acceptance owner must link deployed revision, direct/queue/retry refusal and permitted fix/rebase tests plus available read-only pass diagnostics. Already queued/external auto-merge is not revoked; no live merge/fix should be triggered just to prove this. |
+| [#617 — supervisor health gaps](https://github.com/cgwalters-forge/agent-board/issues/617) | tracker#680; P0; none | Propose v1 dependency, enroll under #939 or obtain explicit cross-epic acceptance; do not duplicate its collector work. Implementation owner supplies bounded stuck-queue, missing-current-head-review, successful-agent/failed-apply and grouped-stall regressions/playbook. cgwalters still defines overall four-week health acceptance; these diagnostics do not define it. |
+| [#621 — useful needs-you](https://github.com/cgwalters-forge/agent-board/issues/621) | tracker#976; P0; `needs-human` | Propose v1 dependency/acceptance record or explicit cross-epic decision, not duplicate code. [#623](https://github.com/cgwalters-forge/agent-board/pull/623) merged aliases, bounded reads/cache and grouping. The [bot done verdict](https://github.com/cgwalters-forge/agent-board/issues/621#issuecomment-6595143708) is offline evidence only; deployment/review maintainers must save matching live publication and rendered frontend, including completeness and promoted-member behavior. |
+| [#631 — this ledger](https://github.com/cgwalters-forge/agent-board/issues/631) | tracker#939; P1; none | v1 documentation slice. Maintainer reviews/merges this refresh; coordinator accepts/applies dispositions separately and reruns the inventory. Closing this issue cannot satisfy the backlog or live gates. |
+
+### Existing owners, not duplicate implementation
+
+[#504/#506](https://github.com/cgwalters-forge/agent-board/pull/506) merged the
+remaining baseline fixtures and decoded-limit assertions; cgwalters's config
+approval still owns acceptance. [#567/#568](https://github.com/cgwalters-forge/agent-board/pull/568)
+and [#614/#615](https://github.com/cgwalters-forge/agent-board/pull/615) shipped
+versioned releases and commit prereleases. [v0.1.0 and its real release run](release.md#gates)
+are 0.1 evidence, not v1. [Tracker#956/#1164](https://github.com/cgwalters-forge/tracker/pull/1164)
+migrated ordinary installs to verified binaries; open [tracker#1167](https://github.com/cgwalters-forge/tracker/issues/1167)
+owns session provisioning, real signed negative tests, token-isolation tests and
+documentation follow-ups. Do not repeat the producer or migration.
+
+[#618/#620](https://github.com/cgwalters-forge/agent-board/pull/620) shipped dormant
+ordinary-review routing. [actions#174](https://github.com/cgwalters-forge/actions/issues/174)
+owns wrapper execution/submission and [tracker#1171](https://github.com/cgwalters-forge/tracker/issues/1171)
+owns reviewed callers, admission and pilot/cutover. Current tracker has no review
+pools/routes enabled. Bot controller recommendations on #1171 are not cgwalters
+policy approval; private admission and live all-author/head-bound verdict, retry
+and outage evidence remain unverified. See the [release ledger](release.md#ordinary-review-rollout).
+
+The [release gates](release.md#gates) remain blocked: config approval, README-only
+live setup, real stage Actions and scheduler round trip, installed weekly/release
+recurrence, remaining deployment logic, frontend parity, reconciled backlog,
+v1 publication and v1 changelog. #282 owns stage acceptance; the release maintainer
+must obtain a fresh-agent README trial and frontend maintainers' parity receipt,
+not substitute fixture runs. For tracker#939's separate four-week measure,
+cgwalters must define health and `budget.harnessRepositories`; the reporting owner
+then saves fixed-`--until`, exit-0 weekly evidence with coverage qualifications.
+Current tracker sets only `budget.weeklyUsd`; no harness classification or health
+policy is invented here. No live trials, provisioning, settings, issue, label,
+parent or Priority writes were performed by this refresh.
+
 ## Readiness audit — 30 October 2026
+
+**Historical snapshot, not the current inventory.** Every “current,” “open,”
+“still,” Priority and implementation assertion in the remainder of this page
+means the October cutoff below. Use the November inventory above for readiness;
+do not reapply these old proposals without rechecking.
 
 This is the read-only inventory for [#461](https://github.com/cgwalters-forge/agent-board/issues/461)
 against [tracker#939](https://github.com/cgwalters-forge/tracker/issues/939),

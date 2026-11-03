@@ -194,6 +194,20 @@ fn release_readiness_refusals() {
             &["version 1.0.0 without a `## v1.0.0` changelog section"],
         ),
         (
+            "published v0 is not a v1 changelog",
+            all(MET),
+            "## v0.1.0\n",
+            "1.0.0",
+            &["version 1.0.0 without a `## v1.0.0` changelog section"],
+        ),
+        (
+            "linked source and release do not override a blocked live gate",
+            without("fresh-deploy") + &row("fresh-deploy", link, link, BLOCKED),
+            v1,
+            "1.0.0",
+            &["version 1.0.0 with blocked gates: fresh-deploy"],
+        ),
+        (
             "missing gate",
             without("backlog"),
             "",
