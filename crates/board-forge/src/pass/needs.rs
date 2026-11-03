@@ -369,6 +369,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             None => Collected::off(),
         };
         let mut reading = holds::Reading {
+            operator: &config.operator,
             epics: config.epics.is_some(),
             considered: self.unconsidered == 0,
             options: &options,

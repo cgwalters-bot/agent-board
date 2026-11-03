@@ -1176,6 +1176,8 @@ pub struct AskGroup {
     pub numbers: Vec<u64>,
 }
 
+pub mod requests;
+
 /// The needs-you list ([`NEEDS_YOU_SCHEMA`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NeedsYou {
@@ -1197,6 +1199,12 @@ pub struct NeedsYou {
     /// How many `items`: always their number.
     pub count: usize,
     pub items: Vec<Ask>,
+    /// Optional list-level extension; strict v2 Ask records are unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<requests::Request>,
+    /// Source-specific carry state, including aliases hidden by semantic dedupe.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub request_sources: Vec<requests::SourceAsk>,
     /// Optional v2 extension; bodies are reused only after metadata validation.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub summary_cache: BTreeMap<String, Summary>,
@@ -1207,6 +1215,8 @@ impl NeedsYou {
     /// is not complete; none where it has none.
     fn cut(&mut self) -> Option<Ask> {
         let ask = self.items.pop()?;
+        self.requests.retain(|r| r.key != ask.key);
+        self.request_sources.retain(|r| r.key != ask.key);
         self.summary_cache.remove(&ask.key);
         self.omitted += 1;
         self.count = self.items.len();
@@ -1252,6 +1262,7 @@ pub struct Summary {
 
 /// What [`needs_you`] knows of the pass besides its snapshot.
 pub struct Reading<'a> {
+    pub operator: &'a str,
     /// Whether stage 3 is configured (`epics`).
     pub epics: bool,
     /// Whether stage 4 decided a hold, or a start, for each of its ranked
@@ -1321,12 +1332,31 @@ fn published_list(previous: Option<&Value>) -> Option<&Value> {
 /// still well formed: its references valid, its `target` made again from
 /// its action and its texts cut again.
 fn published_asks(previous: Option<&Value>, sources: &[&str]) -> Vec<Ask> {
-    let items = published_list(previous)
+    let list = published_list(previous);
+    let items = list
         .and_then(|n| n["items"].as_array())
         .into_iter()
         .flatten();
-    items
+    let aliases = list
+        .and_then(|n| n["request_sources"].as_array())
+        .into_iter()
+        .flatten()
+        .map(|source| &source["ask"]);
+    let aliases: Vec<Ask> = aliases
         .filter_map(|a| serde_json::from_value::<Ask>(a.clone()).ok())
+        .filter(|a| {
+            a.action.valid() && a.source_ref.valid() && parse_time(&a.waiting_since).is_some()
+        })
+        .collect();
+    let items = items.filter(|item| {
+        !aliases
+            .iter()
+            .any(|a| item["key"] == a.key && item["source"] == a.source)
+    });
+    aliases
+        .iter()
+        .cloned()
+        .chain(items.filter_map(|a| serde_json::from_value::<Ask>(a.clone()).ok()))
         .filter(|a| sources.contains(&a.source.as_str()))
         .filter(|a| a.action.valid() && a.source_ref.valid())
         .filter(|a| parse_time(&a.waiting_since).is_some())
@@ -1645,7 +1675,12 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             let unread = collected.read == Read::Unread
                 || collected.unread.contains(&item)
                 || collected.unread.contains(repository);
-            let listed = |a: &Ask| a.key == ask.key;
+            let listed = |a: &Ask| {
+                a.source == ask.source
+                    && a.head == ask.head
+                    && requests::identity(a, &reading.on.host)
+                        == requests::identity(&ask, &reading.on.host)
+            };
             if unread
                 && (ask.group.is_some() || (!items.iter().any(listed) && !asks.iter().any(listed)))
             {
@@ -1704,15 +1739,50 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     items.extend(approvals.into_values().map(|(ask, _)| ask));
     items = group_stranded(items);
     items.sort_by_key(rank);
+    let evidence = items.clone();
     let mut first: BTreeMap<String, usize> = BTreeMap::new();
     let mut kept: Vec<Ask> = Vec::with_capacity(items.len());
     for ask in items {
-        match first.get(&ask.key) {
-            Some(&n) => kept[n].ask = format!("{}; {}", kept[n].ask, ask.ask),
+        let identity = requests::identity(&ask, &reading.on.host);
+        let decision_key = format!("{identity}@{}", ask.head.as_deref().unwrap_or_default());
+        match first.get(&decision_key) {
+            Some(&n) => {
+                let since = if earlier(&ask.waiting_since, &kept[n].waiting_since) {
+                    ask.waiting_since.clone()
+                } else {
+                    kept[n].waiting_since.clone()
+                };
+                if ask.source == "pass" {
+                    kept[n].ask = format!("{}; {}", kept[n].ask, ask.ask);
+                } else if ask.source == REVIEWS && kept[n].source == DIGEST {
+                    let priority = kept[n].priority.clone();
+                    let since = kept[n].waiting_since.clone();
+                    kept[n] = ask;
+                    kept[n].priority = kept[n].priority.clone().or(priority);
+                    if earlier(&since, &kept[n].waiting_since) {
+                        kept[n].waiting_since = since;
+                    }
+                }
+                kept[n].waiting_since = since;
+            }
             None => {
-                first.insert(ask.key.clone(), kept.len());
+                first.insert(decision_key, kept.len());
                 kept.push(ask);
             }
+        }
+    }
+    // Preserve v2's unique per-card keys. Multiple semantic decisions can
+    // describe one legacy card; new readers use identity + revision, not key.
+    kept.sort_by_key(rank);
+    let semantic = kept;
+    let mut kept: Vec<Ask> = Vec::new();
+    let mut cards: BTreeMap<String, usize> = BTreeMap::new();
+    for ask in &semantic {
+        if let Some(&n) = cards.get(&ask.key) {
+            kept[n].ask = format!("{}; {}", kept[n].ask, ask.ask);
+        } else {
+            cards.insert(ask.key.clone(), kept.len());
+            kept.push(ask.clone());
         }
     }
     for ask in &mut kept {
@@ -1721,6 +1791,51 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     }
     let omitted = kept.len().saturating_sub(MAX_NEEDS_YOU);
     kept.truncate(MAX_NEEDS_YOU);
+    let requests: Vec<_> = semantic
+        .iter()
+        .filter(|ask| kept.iter().any(|card| card.key == ask.key))
+        .map(|ask| requests::describe(ask, &evidence, snapshot, reading, previous))
+        .collect();
+    let mut request_sources = Vec::new();
+    for request in &requests {
+        for ask in evidence.iter().filter(|ask| {
+            matches!(ask.source.as_str(), REVIEWS | PROPOSALS | DIGEST)
+                && requests::identity(ask, &reading.on.host) == request.identity
+                && ask.head == request.target.head
+        }) {
+            let raw = [&reading.reviews, &reading.proposals, &reading.digest]
+                .into_iter()
+                .flat_map(|c| &c.asks)
+                .find(|raw| raw.key == ask.key && raw.source_ref == ask.source_ref);
+            let original = raw.unwrap_or(ask);
+            let previous_source = requests::previous_source(ask, previous);
+            let mut source = requests::SourceAsk {
+                key: request.key.clone(),
+                // Keep grouped membership and this source's question, not
+                // the raw representative or the combined legacy card text.
+                ask: ask.clone(),
+                observed_at: if raw.is_some() && !original.carried {
+                    Some(snapshot.at.clone())
+                } else {
+                    previous_source.as_ref().and_then(|s| s.observed_at.clone())
+                },
+                source_time: if matches!(original.source.as_str(), PROPOSALS | DIGEST) {
+                    raw.map(|a| a.waiting_since.clone())
+                        .or_else(|| previous_source.and_then(|s| s.source_time))
+                } else {
+                    None
+                },
+            };
+            if source.ask.source == REVIEWS {
+                // Review waits have no source edit clock; preserve wait age,
+                // rather than changing the publication on every observation.
+                source.ask.waiting_since = ask.waiting_since.clone();
+            }
+            if !request_sources.contains(&source) {
+                request_sources.push(source);
+            }
+        }
+    }
     let items = kept;
     let cached = published_list(previous).map(|p| &p["summary_cache"]);
     let summary_cache = items
@@ -1758,6 +1873,8 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         omitted,
         count: items.len(),
         items,
+        requests,
+        request_sources,
         summary_cache,
     };
     let previous = published_list(previous);
@@ -1769,6 +1886,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             for field in ["validated_at", "changed_at", "summaries", "summary_cache"] {
                 fields.remove(field);
             }
+            requests::strip_observation_times(fields);
         }
         list
     };
@@ -1794,6 +1912,7 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
     let mut now = serde_json::to_value(snapshot)?;
     let validated = |s: &mut Value| {
         let list = s.get_mut("needs_you").and_then(Value::as_object_mut)?;
+        requests::strip_observation_times(list);
         list.remove("validated_at")?.as_str().map(str::to_owned)
     };
     let refresh = validated(&mut now);
@@ -1939,15 +2058,16 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         while over > 0 {
             let Some(group) = order.next() else {
                 // With no ask left to cut, the list's own fields go too.
-                let Some(ask) = needs_you.as_mut().and_then(NeedsYou::cut) else {
+                let Some(_) = needs_you.as_mut().and_then(NeedsYou::cut) else {
                     ensure!(
                         needs_you.take().is_some(),
                         "the hold snapshot is over {MAX_COMMENT_CHARS} characters with only the operator's holds and those of every new run left"
                     );
                     break;
                 };
-                over = over.saturating_sub(serde_json::to_string(&ask)?.chars().count() + 1);
-                continue;
+                // A cut removes its descriptor too; re-render before cutting
+                // again so that the additional savings do not overcut asks.
+                break;
             };
             for n in group {
                 let len = serde_json::to_string(&holds[n])?.chars().count() + 2;
@@ -2300,7 +2420,7 @@ mod tests {
         // A summary cache that takes a list at the limit past it goes
         // before any hold or ask does.
         let with_list = |pad| {
-            let mut cached = bare(&board(59, pad));
+            let mut cached = bare(&board(40, pad));
             cached.needs_you = Some(listed(&waiting(), None, (true, true)));
             cached
         };
@@ -3024,6 +3144,7 @@ mod tests {
     /// list's own sources off and no summaries.
     fn reading<'a>(on: &'a ItemRef, options: &'a [String]) -> Reading<'a> {
         Reading {
+            operator: "operator",
             epics: true,
             considered: true,
             options,
@@ -3274,7 +3395,9 @@ mod tests {
                         "labelled needs-human",
                     );
                     let q = if n == 4 { first } else { "q" };
-                    asked.why = Some(format!("Q: {n} {}?", q.repeat(300)));
+                    // Leave room for the descriptors as well as the holds;
+                    // the full list still exceeds the publication size cap.
+                    asked.why = Some(format!("Q: {n} {}?", q.repeat(30)));
                     asked.priority = Some(format!("P{}", n % 4));
                     asked
                 })
@@ -3353,6 +3476,331 @@ mod tests {
     fn collected(read: Read, asks: Vec<Ask>, unread: &[&str]) -> Collected {
         let unread = unread.iter().map(|&u| u.to_owned()).collect();
         Collected { read, asks, unread }
+    }
+
+    #[test]
+    fn semantic_requests_replay_sources_revisions_and_answers() {
+        let board = snapshot(&[], "2026-10-28T09:00:00Z".into(), tally());
+        let on = item("o/ops", 1);
+        let mut reading = reading(&on, &[]);
+        let mut live = own(
+            REVIEWS,
+            ("o/r", 9),
+            RefKind::ApprovePullRequest,
+            Some(HEAD_A),
+        );
+        live.kind = "review-approve".into();
+        live.ask = "Approve the reviewed head to release the approval wait?".into();
+        let mut digest = own(
+            DIGEST,
+            ("o/r", 9),
+            RefKind::ApprovePullRequest,
+            Some(HEAD_A),
+        );
+        digest.kind = "digest-approve".into();
+        digest.source_ref.comment = Some(17);
+        digest.waiting_since = "2026-10-27T08:00:00Z".into();
+        reading.reviews = collected(Read::Complete, vec![live.clone()], &[]);
+        reading.digest = collected(Read::Complete, vec![digest], &[]);
+        let list = needs_you(&board, None, &reading);
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].source, REVIEWS);
+        let request = &list.requests[0];
+        assert_eq!(request.sources.len(), 2);
+        assert_eq!(request.revision.as_deref(), Some(HEAD_A));
+        assert_eq!(request.requested_operator, "operator");
+        assert_eq!(request.quality, "decision");
+        assert!(
+            request
+                .actions
+                .iter()
+                .any(|a| a.kind == "review-at-head" && a.supported)
+        );
+        assert!(
+            request
+                .actions
+                .iter()
+                .filter(|a| !a.supported)
+                .all(|a| !a.reason.is_empty())
+        );
+        // Same semantic question, new target revision. The old digest is not
+        // equivalent to authorization for the new head.
+        let published = as_published(&list);
+        live.head = Some(HEAD_B.into());
+        live.action.head = live.head.clone();
+        reading.reviews.asks = vec![live];
+        reading.digest.asks.clear();
+        let changed = needs_you(&board, Some(&published), &reading);
+        assert_eq!(changed.requests[0].identity, request.identity);
+        assert_ne!(changed.requests[0].revision, request.revision);
+        assert_eq!(changed.items[0].waiting_since, "2026-10-28T08:00:00Z");
+        // Already answered waits are absent from the poll's complete result.
+        reading.reviews.asks.clear();
+        assert!(
+            needs_you(&board, Some(&published), &reading)
+                .items
+                .is_empty()
+        );
+        reading.reviews.read = Read::Unread;
+        let carried = needs_you(&board, Some(&published), &reading);
+        assert_eq!(carried.requests[0].quality, "unverified-carried");
+        assert!(carried.requests[0].actions.iter().all(|a| !a.supported));
+    }
+
+    #[test]
+    fn request_quality_and_distinct_proposal_comments() {
+        let list = listed(&waiting(), None, (true, true));
+        assert!(
+            list.requests
+                .iter()
+                .any(|r| r.quality == "missing-concrete-decision")
+        );
+        assert!(
+            list.requests
+                .iter()
+                .all(|r| r.resolution.starts_with("Pending"))
+        );
+        // A bot's done verdict cannot make a still-held needs-human item
+        // complete; machine reruns and design parking stay out of the list.
+        assert!(
+            !list
+                .items
+                .iter()
+                .any(|a| matches!(a.kind.as_str(), "in-flight" | "needs-design" | "closed"))
+        );
+        let proposals = [21, 22].map(|id| {
+            let mut ask = own(PROPOSALS, ("o/ops", 5), RefKind::OperatorAction, None);
+            ask.action.comment = Some(id);
+            ask.source_ref.comment = Some(id);
+            ask.key = format!("o/ops#5/comment-{id}");
+            ask
+        });
+        let list = own_listed(
+            &[],
+            "2026-10-28T09:00:00Z",
+            (
+                Collected::off(),
+                collected(Read::Complete, proposals.into(), &[]),
+            ),
+            None,
+        );
+        assert_eq!(list.requests.len(), 2);
+        assert_ne!(list.requests[0].identity, list.requests[1].identity);
+        // The extension stays outside Ask: strict old record readers still
+        // deserialize every legacy item without learning any new fields.
+        for ask in serde_json::to_value(&list).unwrap()["items"]
+            .as_array()
+            .unwrap()
+        {
+            serde_json::from_value::<Ask>(ask.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn request_replays_keep_source_clocks_and_unread_aliases() {
+        let on = item("o/ops", 1);
+        let board = snapshot(&[], "2026-10-28T09:00:00Z".into(), tally());
+        let mut reading = reading(&on, &[]);
+        let mut proposal = own(PROPOSALS, ("o/ops", 5), RefKind::OperatorAction, None);
+        proposal.action.comment = Some(21);
+        proposal.source_ref.comment = Some(21);
+        proposal.key = "o/ops#5/comment-21".into();
+        proposal.ask = "Apply the scoped label proposal?".into();
+        reading.proposals = collected(Read::Complete, vec![proposal.clone()], &[]);
+        let first = needs_you(&board, None, &reading);
+        proposal.waiting_since = "2026-10-28T08:30:00Z".into();
+        proposal.ask = "Apply the amended scoped label proposal?".into();
+        reading.proposals.asks = vec![proposal];
+        let edited = needs_you(&board, Some(&as_published(&first)), &reading);
+        assert_eq!(edited.items[0].waiting_since, first.items[0].waiting_since);
+        assert_eq!(edited.requests[0].identity, first.requests[0].identity);
+        assert_ne!(edited.requests[0].revision, first.requests[0].revision);
+        assert_eq!(
+            edited.requests[0].source_time.as_deref(),
+            Some("2026-10-28T08:30:00Z")
+        );
+
+        let mut live = own(
+            REVIEWS,
+            ("o/r", 9),
+            RefKind::ApprovePullRequest,
+            Some(HEAD_A),
+        );
+        live.ask = "Approve this reviewed head?".into();
+        live.priority = Some("P0".into());
+        let mut digest = own(
+            DIGEST,
+            ("o/r", 9),
+            RefKind::ApprovePullRequest,
+            Some(HEAD_A),
+        );
+        digest.ask = "Approve at the assessed head?".into();
+        digest.source_ref.comment = Some(17);
+        digest.waiting_since = "2026-10-27T08:00:00Z".into();
+        reading.proposals = Collected::off();
+        reading.reviews = collected(Read::Complete, vec![live], &[]);
+        reading.digest = collected(Read::Complete, vec![digest], &[]);
+        let first = needs_you(&board, None, &reading);
+        assert_eq!(first.items[0].waiting_since, "2026-10-27T08:00:00Z");
+        reading.digest = Collected::of(Read::Unread);
+        let mut later = board;
+        later.at = "2026-10-28T10:00:00Z".into();
+        let middle = needs_you(&later, Some(&as_published(&first)), &reading);
+        assert_ne!(
+            middle.requests[0].observed_at,
+            first.requests[0].observed_at
+        );
+        reading.reviews.asks.clear();
+        later.at = "2026-10-28T10:30:00Z".into();
+        let unread = needs_you(&later, Some(&as_published(&middle)), &reading);
+        assert_eq!(unread.items.len(), 1);
+        assert_eq!(unread.items[0].source, DIGEST);
+        assert_eq!(unread.requests[0].quality, "unverified-carried");
+        assert_eq!(
+            unread.requests[0].source_time.as_deref(),
+            Some("2026-10-27T08:00:00Z")
+        );
+        assert_eq!(
+            unread.requests[0].observed_at,
+            first.requests[0].observed_at
+        );
+        later.at = "2026-10-28T11:00:00Z".into();
+        let still_unread = needs_you(&later, Some(&as_published(&unread)), &reading);
+        assert_eq!(
+            still_unread.requests[0].observed_at,
+            first.requests[0].observed_at
+        );
+    }
+
+    #[test]
+    fn carried_hold_and_shared_legacy_card_remain_explicit() {
+        let on = item("o/ops", 1);
+        let mut reading = reading(&on, &[]);
+        let mut board = waiting();
+        // Modeled #621 pattern: a bot reports done while a human acceptance
+        // decision is still held. The summary never releases that hold.
+        reading.summaries.1.insert(
+            "o/t#1".into(),
+            Some(Summary {
+                question: Some("Accept the offline result pending live parity evidence?".into()),
+                recommendation: Some(
+                    "Bot verdict: done; live acceptance has not been recorded.".into(),
+                ),
+                revision: None,
+            }),
+        );
+        let first = needs_you(&board, None, &reading);
+        let done = first.requests.iter().find(|r| r.key == "o/t#1").unwrap();
+        assert_eq!(done.quality, "decision");
+        assert!(done.resolution.starts_with("Pending"));
+        board.at = "2026-10-28T10:00:00Z".into();
+        board
+            .holds
+            .iter_mut()
+            .find(|h| h.item.as_deref() == Some("o/t#1"))
+            .unwrap()
+            .carried = true;
+        reading.considered = false;
+        let partial = needs_you(&board, Some(&as_published(&first)), &reading);
+        let held = partial.requests.iter().find(|r| r.key == "o/t#1").unwrap();
+        assert_eq!(held.quality, "unverified-carried");
+        assert_eq!(
+            held.observed_at,
+            first
+                .requests
+                .iter()
+                .find(|r| r.key == "o/t#1")
+                .unwrap()
+                .observed_at
+        );
+
+        let blocked = entry(
+            Scope::Item(item("o/r", 9)),
+            HoldKind::Blocking,
+            "Inspect this stopped pull request",
+        );
+        let mut board = snapshot(&[blocked], "2026-10-28T09:00:00Z".into(), tally());
+        reading.reviews = collected(
+            Read::Complete,
+            vec![own(
+                REVIEWS,
+                ("o/r", 9),
+                RefKind::ApprovePullRequest,
+                Some(HEAD_A),
+            )],
+            &[],
+        );
+        let list = needs_you(&board, None, &reading);
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.requests.len(), 2);
+        assert_ne!(list.requests[0].identity, list.requests[1].identity);
+        assert!(list.requests.iter().all(|r| r.key == list.items[0].key));
+        reading.reviews = Collected::of(Read::Unread);
+        let unread = needs_you(&board, Some(&as_published(&list)), &reading);
+        assert_eq!(unread.items.len(), 1);
+        assert_eq!(unread.requests.len(), 2);
+        assert!(
+            unread
+                .requests
+                .iter()
+                .any(|r| r.target.kind == RefKind::ApprovePullRequest
+                    && r.quality == "unverified-carried")
+        );
+        // Source aliases, not the combined display question, survive when
+        // the blocking hold disappears without a fresh review-source read.
+        let empty = snapshot(&[], "2026-10-28T10:00:00Z".into(), tally());
+        let only_review = needs_you(&empty, Some(&as_published(&unread)), &reading);
+        assert_eq!(only_review.requests.len(), 1);
+        assert_eq!(only_review.requests[0].question, "Act?");
+        board.needs_you = Some(list);
+        let pad = MAX_COMMENT_CHARS - chars(&render(&board).unwrap()) + 1;
+        board.holds[0].reason.push_str(&"p".repeat(pad));
+        let (fitted, body) = fit(board).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        let list = fitted.needs_you.unwrap();
+        assert!(
+            list.items.is_empty() && list.requests.is_empty() && list.request_sources.is_empty()
+        );
+        assert_eq!(list.omitted, 1);
+    }
+
+    #[test]
+    fn semantic_identity_precedes_display_clipping_and_names_the_forge() {
+        let on = item("o/ops", 1);
+        let reading = reading(&on, &[]);
+        let entries: Vec<_> = ["first?", "second?"]
+            .map(|suffix| {
+                let mut held = entry(
+                    Scope::Item(item("o/r", 9)),
+                    HoldKind::NeedsHuman,
+                    "labelled needs-human",
+                );
+                held.why = Some(format!("Q: {} {suffix}", "long ".repeat(MAX_ASK)));
+                held
+            })
+            .into();
+        let board = snapshot(&entries, "2026-10-28T09:00:00Z".into(), tally());
+        let list = needs_you(&board, None, &reading);
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.requests.len(), 2);
+        assert_ne!(list.requests[0].identity, list.requests[1].identity);
+        assert!(
+            list.requests
+                .iter()
+                .all(|r| !r.sources.is_empty() && r.question.chars().count() <= MAX_ASK + 1)
+        );
+        let mut forgejo = on.clone();
+        forgejo.host = "https://forge.example:8443/subpath".into();
+        let other = needs_you(
+            &board,
+            None,
+            &Reading {
+                on: &forgejo,
+                ..reading
+            },
+        );
+        assert_ne!(list.requests[0].identity, other.requests[0].identity);
+        assert!(other.requests[0].identity.starts_with(&forgejo.host));
     }
 
     #[test]

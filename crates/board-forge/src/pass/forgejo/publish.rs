@@ -240,6 +240,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         if self.config.holds.as_ref().is_some_and(|h| h.needs_you) {
             let options = PRIORITIES.map(str::to_owned);
             let reading = holds::Reading {
+                operator: &self.config.operator,
                 epics: self.config.epics.is_some(),
                 considered: self.unconsidered == 0,
                 options: &options,

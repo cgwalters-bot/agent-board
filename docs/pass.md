@@ -397,6 +397,73 @@ the pass did not read the board, the order the published list had), then
 the longest waiting, then `key`; past 100, the rest are counted in `omitted`
 and left out. `count` is the number of items listed.
 
+#### Semantic operator requests (optional v2 extension)
+
+`needs_you.requests` is optional list-level metadata. Each descriptor joins a legacy
+card by `key`; multiple distinct decisions can describe one combined legacy card.
+New readers identify decisions by `identity` plus `revision`, not by card key;
+`requests.length` counts decisions and `count` still counts legacy cards. Each
+descriptor includes its own clipped question and recommendation. It adds no fields to the strict v2 `Ask` record: old consumers,
+including review's `src/github/holds.ts`, can keep reading `items`, `action` and
+`source_ref`. Existing grouping, summary parsing, cache validation and request/time
+caps remain in force. Descriptors derive only from existing reads; the publication
+size cap cuts all descriptors with their card and counts omitted cards as incomplete.
+Optional `request_sources` retains validated source-specific asks (including digest
+aliases hidden by deduplication), observation clocks and source edit times, so an
+unread source can still carry its own wait. Source records take precedence over
+combined legacy display cards during recovery; a refreshed equivalent review does
+not refresh an unread digest's clock. Grouped records retain their full membership.
+
+Each descriptor has a canonical `identity`, independent of source and revision,
+plus `forge` (including a Forgejo instance's scheme, port and path), `target` and
+`revision` (full PR head, summary metadata revision, or proposal
+edit time where known). Live PR and digest approvals at the same head count once;
+different heads do not. Distinct proposal comments stay independent even with
+identical titles. Issue question identities hash whitespace-normalized question
+text before display clipping: typed-action/exact-question equivalence, not fuzzy language matching. Distinct
+questions are not collapsed merely because they share an issue. Pass alarms keep
+their combined card. Priority then oldest-wait ordering remains; a live decision
+supplies the representative when a digest duplicates it.
+
+`requested_operator` names the configured operator. `requester` describes the
+known role (pass policy, authenticated bot digest, or authenticated operator-or-bot
+proposal author), without guessing the proposal author's login. `ownership_evidence`
+explains the existing policy/author check; `sources` retains equivalent references.
+`facts` is the hold reason or source question, not an inference from a bot verdict.
+`observed_at` is the read clock (the last matching decision observation for carried
+data, or null if unknown; repeated unread publications never advance it);
+`source_time` is the proposal/digest edit time when known. Null revision or source
+time means unknown: publication time and wait age do not prove target freshness.
+
+`quality` is `decision`, `missing-concrete-decision`, `unknown-request`, or
+`unverified-carried`. Generic asks stay visible as diagnostics, not silently
+discarded or marked complete. This is not a general-language question validator.
+A `needs-human` hold with a bot **done** verdict stays pending until its underlying
+label/Why/policy changes; a verdict is not human acceptance. Reruns, in-flight work,
+design/bot parking, and waits the poll already acts on remain machine work, not new
+human cards. Unknown/unread sources retain the existing completeness indicators.
+
+`actions` and `resolution` describe next steps, not write authority. Fresh head-bound
+PR reviews and scoped `action check` proposals use existing backend paths.
+Promotion, merge/enqueue, reply and close are explicitly unavailable here with
+reasons: promotion writes are not implemented, the poll alone revalidates merge
+policy, and publication has no checked reply/close endpoint or acknowledgement
+protocol. Manual source inspection is still possible. Approval only releases its
+approval wait, not checks or merge policy. The concrete threat avoided is treating
+stale digest/bot prose or a done verdict as operator authorization for a changed
+head or an unresolved human hold. No option, endpoint, credential or write is added.
+
+Caller/review compatibility: publication stays off by default behind existing
+`holds.needsYou`; deployments already using it need no config change. Review can
+adopt descriptors independently, must retain legacy rendering when absent, show
+quality diagnostics, and re-read targets before acting. No caller option is added.
+Replay tests cover generic holds, digest/live equivalence, distinct proposal
+comments, changed heads and answered waits. Authorized live
+`cgwalters-forge/bot-ops` data was inaccessible (HTTP 404) during implementation;
+acceptance uses existing synthetic/redacted offline fixtures, not a saved live
+publication or authenticated review rendering. Live parity checks, including the
+#621 done-verdict-held-for-human pattern, remain unverified.
+
 `sources` says how much of each source the pass read: `complete`;
 `partial`, read but not whole: an issue it could not read (an `unreadable`
 hold), in stage 4 a candidate it did not consider (the WIP limit, pools or
