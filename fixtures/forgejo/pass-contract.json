@@ -188,6 +188,7 @@
     "triagePools": {"verdict": "same"},
     "triageFollowUpDays": {"verdict": "native", "forgejo": "verdict blocks in unedited bot comments"},
     "triageClose": {"verdict": "native", "forgejo": "close with a comment naming the verdict; no close reason"},
+    "skipActiveWork": {"verdict": "refused", "reason": "active work suppression is only built for GitHub"},
     "replanAfterDays": {"verdict": "refused", "reason": "needs a merged pull request's closing issues, which Forgejo's API does not name"},
     "bodyPlans": {"verdict": "refused", "reason": "an issue body's last editor cannot be read"},
     "revisit.perPass": {"verdict": "native", "forgejo": "issue updated_at"},

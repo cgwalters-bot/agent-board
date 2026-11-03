@@ -27,6 +27,326 @@ pub(super) fn replay() -> Replay {
 /// tracker#468's implement run, whose dispatch record the recording has.
 const MERGED_RUN: u64 = 39718949900;
 
+#[test]
+fn active_work_suppresses_replans_and_research_triage() {
+    for (kind, author, state, changed, expected) in [
+        (
+            "implement",
+            "cgwalters-bot",
+            "OPEN",
+            "none",
+            Some("pull-request"),
+        ),
+        ("implement", "someone-else", "OPEN", "none", None),
+        ("implement", "cgwalters-bot", "CLOSED", "none", None),
+        (
+            "research",
+            "cgwalters-bot",
+            "OPEN",
+            "none",
+            Some("research"),
+        ),
+        ("research", "cgwalters-bot", "OPEN", "body", None),
+        ("research", "cgwalters-bot", "OPEN", "labels", None),
+        (
+            "research-active",
+            "cgwalters-bot",
+            "OPEN",
+            "body",
+            Some("research"),
+        ),
+        (
+            "research-plan",
+            "cgwalters-bot",
+            "OPEN",
+            "none",
+            Some("research"),
+        ),
+    ] {
+        let mut replay = without_epics(replay());
+        if kind.starts_with("research") {
+            for comment in comments_468(&mut replay) {
+                if let Some(body) = comment["body"].as_str() {
+                    comment["body"] = body.replace("\"implement\"", "\"research\"").into();
+                }
+            }
+            if kind == "research-plan" {
+                comments_468(&mut replay)
+                    .retain(|c| !text(c, "/body").contains(plan::DISPATCH_MARKER));
+            }
+            let status = if kind == "research-active" {
+                "in_progress"
+            } else {
+                "completed"
+            };
+            replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/{MERGED_RUN}")},
+                "answer": {"status": 200, "headers": {}, "body": {
+                    "status": status, "updated_at": "2026-10-23T14:00:00Z"}}}));
+        }
+        let variables =
+            json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468, "cursor": null});
+        let edited = (changed == "body").then_some("2026-10-23T15:00:00Z");
+        let updated = (changed != "none").then_some("2026-10-23T15:00:00Z");
+        replay
+            .requests
+            .push(json!({"request": graphql_key(active::LINKS, &variables),
+            "answer": {"data": {"repository": {"issue": {"lastEditedAt": edited, "updatedAt": updated,
+                "timelineItems": {"nodes": [{"source": {"number": 999, "state": state,
+                    "isDraft": true, "author": {"login": author},
+                    "headRefName": format!("{IMPLEMENT_BRANCH_PREFIX}{MERGED_RUN}"),
+                    "repository": {"nameWithOwner": "cgwalters-forge/tracker"}}}],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}}}));
+        let config = config(json!({"skipActiveWork": true, "replanAfterDays": 1}));
+        let report = preview(&config, &replay);
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.contains("tracker#468") && l.contains("could not be read")),
+            "{:?}",
+            report.lines
+        );
+        let held = report
+            .holds
+            .iter()
+            .find(|h| h.line().contains("tracker#468:"));
+        if let Some(rule) = expected {
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("start ") && l.contains("tracker#468")),
+                "{:?}",
+                report.lines
+            );
+            assert!(
+                report.triage_skipped.borrow()[rule] > 0,
+                "{kind} {author} {state}: {:?}",
+                report.lines
+            );
+            assert!(held.is_some(), "{:?}", report.lines);
+            assert!(
+                report.lines.iter().any(|l| l.contains("tracker#468")
+                    && (l.contains("pull request")
+                        || l.contains("research plan")
+                        || l.contains("research run"))),
+                "{:?}",
+                report.lines
+            );
+        } else {
+            if kind == "research" {
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with("start triage cgwalters-forge/tracker#468")),
+                    "{:?}",
+                    report.lines
+                );
+            }
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("tracker#468: pull request")
+                        || l.contains("tracker#468: its research plan")),
+                "{:?}",
+                report.lines
+            );
+        }
+        assert!(report.summary_line().contains("triages skipped"));
+    }
+}
+
+#[test]
+fn active_work_unreadable_or_overlong_links_hold_without_a_start() {
+    for pages in [0, 3] {
+        let mut replay = without_epics(replay());
+        only(&mut replay, &["cgwalters-forge/tracker#468"]);
+        for page in 0..pages {
+            let cursor = if page == 0 {
+                Value::Null
+            } else {
+                json!(page.to_string())
+            };
+            let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 468, "cursor": cursor});
+            replay.requests.push(json!({"request": graphql_key(active::LINKS, &variables),
+                "answer": {"data": {"repository": {"issue": {"lastEditedAt": null, "updatedAt": null,
+                    "timelineItems": {"nodes": [], "pageInfo": {"hasNextPage": true, "endCursor": (page + 1).to_string()}}}}}}}));
+        }
+        let report = preview(
+            &config(json!({"skipActiveWork": true, "replanAfterDays": 1})),
+            &replay,
+        );
+        assert!(
+            report.lines.iter().any(|l| l
+                .starts_with("hold cgwalters-forge/tracker#468: active work could not be read:")),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("start ") && l.contains("tracker#468")),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn active_closing_pulls_preempt_triage_verdict_labels() {
+    // The bot's and the operator's pull requests hold; a visitor's does not.
+    for (author, holds) in [
+        ("cgwalters-bot", true),
+        ("cgwalters", true),
+        ("someone-else", false),
+    ] {
+        for draft in [false, true] {
+            for verdict in ["needs-operator", "needs-design", "done"] {
+                let mut forge = Forge::new(None, false);
+                answered(
+                    &forge,
+                    ("cgwalters-bot", None),
+                    &format!(
+                        "The work is already in PR #999.\n\n```{TRIAGE_FENCE}\n{{\"verdict\":\"{verdict}\"}}\n```"
+                    ),
+                    0,
+                );
+                on_446(&mut forge, |node| {
+                    node["content"]["closedByPullRequestsReferences"] = json!({
+                        "totalCount": 1, "nodes": [{"number": 999, "state": "OPEN",
+                            "author": {"login": author}, "isDraft": draft,
+                            "repository": {"nameWithOwner": "cgwalters-forge/tracker"}}]});
+                });
+                let report = apply(
+                    &forge,
+                    &config(json!({"skipActiveWork": true, "triageFollowUpDays": 3})),
+                );
+                let line = "hold cgwalters-forge/tracker#446: pull request cgwalters-forge/tracker#999 is open";
+                assert_eq!(
+                    report.lines.iter().any(|l| l == line),
+                    holds,
+                    "{author}: {:?}",
+                    report.lines
+                );
+                assert_eq!(report.triage_skipped.borrow()["pull-request"] > 0, holds);
+                if holds {
+                    assert!(
+                        !forge
+                            .writes
+                            .borrow()
+                            .iter()
+                            .any(|(_, url, _)| url.ends_with("/issues/446/labels"))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn active_work_rechecks_a_new_closing_pull_before_writing() {
+    for (author, holds) in [
+        ("cgwalters-bot", true),
+        ("cgwalters", true),
+        ("someone-else", false),
+    ] {
+        let mut forge = Forge::new(None, false);
+        forge.late = Some(Box::new(move |request, answer| {
+            if request.contains(r#""number":459"#) {
+                answer["repository"]["issue"]["closedByPullRequestsReferences"] = json!({
+                    "totalCount": 1, "nodes": [{"number": 999, "state": "OPEN",
+                        "author": {"login": author}, "repository": {"nameWithOwner": "cgwalters-forge/tracker"}}]});
+            }
+        }));
+        let report = apply(&forge, &config(json!({"skipActiveWork": true})));
+        let line =
+            "hold cgwalters-forge/tracker#459: pull request cgwalters-forge/tracker#999 is open";
+        assert_eq!(
+            report.lines.iter().any(|l| l == line),
+            holds,
+            "{author}: {:?}",
+            report.lines
+        );
+        assert_eq!(
+            forge.dispatches().iter().any(|d| d.ends_with("#459")),
+            !holds,
+            "{author}: {:?}",
+            report.lines
+        );
+        if holds {
+            assert!(forge.comments_on("cgwalters-forge/tracker", 459).is_empty());
+        }
+    }
+}
+
+#[test]
+fn accepted_implementation_supersedes_completed_research() {
+    // Run 42 is not in the configured workflow's listing, so only the
+    // research record's own run read can hold it.
+    for (status, starts) in [("completed", true), ("in_progress", false)] {
+        accepted_implementation_after_research(status, starts);
+    }
+}
+
+fn accepted_implementation_after_research(status: &str, starts: bool) {
+    let mut forge = Forge::new(None, false);
+    only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+    implement_plan(&mut forge.replay);
+    unpathed(&mut forge.replay);
+    let comments = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]["repository"]
+        ["issue"]["comments"]["nodes"];
+    let comments = comments.as_array_mut().unwrap();
+    let mut research = comments.last().unwrap().clone();
+    research["url"] = "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-8".into();
+    research["createdAt"] = "2026-10-20T00:00:00Z".into();
+    research["body"] = text(&research, "/body")
+        .replace("\"implement\"", "\"research\"")
+        .into();
+    comments.last_mut().unwrap()["author"] = json!({"login": "cgwalters-bot"});
+    comments.push(research.clone());
+    research["url"] =
+        "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-10".into();
+    research["createdAt"] = "2026-10-20T01:00:00Z".into();
+    research["body"] = format!("<!-- {}: 8@2026-10-20T00:00:00Z -->\nhttps://github.com/cgwalters-forge/tracker/actions/runs/42", plan::DISPATCH_MARKER).into();
+    comments.push(research);
+    let variables =
+        json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446, "cursor": null});
+    forge.replay.requests.push(json!({"request": graphql_key(active::LINKS, &variables),
+        "answer": {"data": {"repository": {"issue": {"lastEditedAt": null, "updatedAt": "2026-10-23T00:00:00Z",
+            "timelineItems": {"nodes": [], "pageInfo": {"hasNextPage": false}}}}}}}));
+    forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/42")},
+        "answer": {"status": 200, "headers": {}, "body": {
+            "status": status, "updated_at": "2026-10-20T02:00:00Z"}}}));
+    let report = apply(&forge, &config(json!({"skipActiveWork": true})));
+    assert_eq!(report.failures, 0, "{status}: {:?}", report.lines);
+    assert_eq!(
+        forge.dispatches().iter().any(|d| d.ends_with("#446")),
+        starts,
+        "{status}: {:?}",
+        report.lines
+    );
+    assert_eq!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start implement cgwalters-forge/tracker#446")),
+        starts,
+        "{status}: {:?}",
+        report.lines
+    );
+    if !starts {
+        assert!(
+            report.lines.iter().any(|l| l
+                == "hold cgwalters-forge/tracker#446: research run 42 is answering this issue"),
+            "{:?}",
+            report.lines
+        );
+    }
+}
+
 /// tracker#468's implement run's head branch with one merged pull request
 /// by `author` saying `body`, merged into `base`.
 fn merged(replay: &mut Replay, author: &str, body: &str, base: &str) {
