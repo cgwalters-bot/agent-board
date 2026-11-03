@@ -1028,6 +1028,7 @@ mod tests {
             author: Some("PLANNER-BOT".into()),
             edited: false,
             editor: None,
+            created: time::OffsetDateTime::UNIX_EPOCH,
             changed: time::OffsetDateTime::UNIX_EPOCH,
         };
         assert!(newest_action(std::slice::from_ref(&original), &config).is_ok());

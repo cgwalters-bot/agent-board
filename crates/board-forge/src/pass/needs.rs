@@ -708,6 +708,7 @@ mod tests {
             author: Some(author.into()),
             edited: editor.is_some(),
             editor: editor.map(Into::into),
+            created: at + time::Duration::minutes(minutes),
             changed: at + time::Duration::minutes(minutes),
         }
     }

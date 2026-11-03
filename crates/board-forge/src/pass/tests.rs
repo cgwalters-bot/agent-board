@@ -4611,6 +4611,22 @@ fn answered_verdict_release_rules() {
             true,
         ),
         (
+            "tracker#263 controller answer edited after removal",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-11-03T14:49:22Z")),
+            false,
+            true,
+        ),
+        (
+            "tracker#263 older comment edited after verdict",
+            "cgwalters-bot",
+            "Proceed with the bounded fix.",
+            Some(("needs-human", "2026-11-03T14:49:22Z")),
+            false,
+            false,
+        ),
+        (
             "removal alone",
             "",
             "",
@@ -4682,6 +4698,15 @@ fn answered_verdict_release_rules() {
             if board_triage {
                 assert_eq!(apply(&forge, &config).failures, 0);
             }
+            let edited_answer = name.starts_with("tracker#263");
+            if edited_answer {
+                forge.replay.now = at("2026-11-02T12:00:00Z");
+                let mut snapshot = usage(&mut forge.replay);
+                snapshot["updated_at"] = json!("2026-11-02T12:00:00Z");
+                snapshot["pools"]["claude"] = json!({"source": "grant", "hold": false,
+                    "allowed_percent": 50, "used_percent": 0});
+                set_usage(&mut forge.replay, &snapshot);
+            }
             answered(
                 &forge,
                 ("cgwalters-bot", None),
@@ -4697,7 +4722,8 @@ fn answered_verdict_release_rules() {
                 held.lines
                     .iter()
                     .any(|l| l.contains("rule unanswered-verdict:")),
-                "{name}"
+                "{name}: {:?}",
+                held.lines
             );
             if !author.is_empty() {
                 let body = match body {
@@ -4706,6 +4732,27 @@ fn answered_verdict_release_rules() {
                     other => other.to_owned(),
                 };
                 answered(&forge, (author, None), &body, 0);
+                if edited_answer {
+                    // tracker#263: the bot posted its decision, then removed
+                    // needs-human a second later. Removing its plan block in
+                    // a later edit must not revive the 2 November verdict.
+                    let mut added = forge.added.borrow_mut();
+                    let answer = added
+                        .get_mut(&("cgwalters-forge/tracker".to_owned(), 446))
+                        .unwrap()
+                        .last_mut()
+                        .unwrap();
+                    answer["createdAt"] = json!("2026-11-03T14:49:21Z");
+                    answer["lastEditedAt"] = json!("2026-11-03T16:33:00Z");
+                    answer["editor"] = json!({"login": "cgwalters-bot"});
+                    if name.contains("older comment") {
+                        answer["createdAt"] = json!("2026-11-01T14:49:21Z");
+                    }
+                    forge.replay.now = at("2026-11-03T16:33:50Z");
+                    let mut snapshot = usage(&mut forge.replay);
+                    snapshot["updated_at"] = json!("2026-11-03T16:33:50Z");
+                    set_usage(&mut forge.replay, &snapshot);
+                }
             }
             let answer_id = forge.ids.get();
             if let Some((label, at)) = removal {

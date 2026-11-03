@@ -244,6 +244,7 @@ mod tests {
                 author: Some(author.into()),
                 edited: editor.is_some(),
                 editor: editor.map(str::to_owned),
+                created: changed,
                 changed,
             };
             assert_eq!(
