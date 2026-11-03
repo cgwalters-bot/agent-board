@@ -10,6 +10,42 @@ fn fixture() -> String {
 }
 
 #[test]
+fn maintain_digest_check_is_offline_for_file_and_stdin() {
+    let valid = include_str!("../../../fixtures/pass/maintain-digest.md");
+    for (body, code, diagnostic) in [
+        (valid.to_owned(), 0, "Valid maintain digest"),
+        (valid.replace("\"up/proj#7\"", "7"), 1, "approve[0].pr"),
+        (
+            "not a digest".into(),
+            1,
+            "missing agent-board-maintain-digest",
+        ),
+    ] {
+        let result = command()
+            .args(["check", "maintain-digest"])
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .write_stdin(body)
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert!(result.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&result.stderr).contains(diagnostic));
+    }
+    command()
+        .args(["check", "maintain-digest", "--body"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/pass/maintain-digest.md"
+        ))
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success();
+}
+
+#[test]
 fn pass_next_rejects_invalid_train_before_token_lookup() {
     for (extra, diagnostic) in [
         (

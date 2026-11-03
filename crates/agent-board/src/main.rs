@@ -362,6 +362,12 @@ enum Output {
 
 #[derive(Subcommand)]
 enum Check {
+    /// Validate a candidate maintain digest offline; no credentials, network or publication.
+    MaintainDigest {
+        /// Candidate Markdown file; reads stdin when omitted.
+        #[arg(long, value_name = "FILE")]
+        body: Option<PathBuf>,
+    },
     /// Refuse outputs outside an identity's assignment and field policy.
     Proposals {
         /// Identity from the policy whose bounds the proposals must stay within.
@@ -544,6 +550,27 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 board_forge::github::Client::from_env,
                 &mut io::stdout().lock(),
             )
+        }
+        Command::Check {
+            command: Check::MaintainDigest { body },
+        } => {
+            use board_forge::pass::maintain::{DIGEST_MAX_BYTES, validate_digest};
+            use std::io::Read;
+            let reader: Box<dyn Read> = match body {
+                Some(path) => Box::new(
+                    std::fs::File::open(path)
+                        .with_context(|| format!("read candidate {}", path.display()))?,
+                ),
+                None => Box::new(io::stdin()),
+            };
+            let mut candidate = String::new();
+            reader
+                .take(DIGEST_MAX_BYTES as u64 + 1)
+                .read_to_string(&mut candidate)
+                .context("read candidate Markdown as UTF-8")?;
+            validate_digest(&candidate)?;
+            eprintln!("Valid maintain digest; nothing was published.");
+            Ok(())
         }
         Command::Check {
             command:

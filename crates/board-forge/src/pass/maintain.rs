@@ -26,6 +26,9 @@ use super::*;
 use serde::Serialize;
 use std::cell::Cell;
 
+#[cfg(test)]
+mod digest_tests;
+
 /// Track the dispatch transport, not the plan protocol's preparatory writes.
 /// Once a request reaches this transport a lost response can hide a start.
 struct Attempt<'a, C> {
@@ -54,6 +57,104 @@ impl<C: Rest> Rest for Attempt<'_, C> {
 pub const DIGEST_SCHEMA: &str = "agent-board/maintain-digest/v1";
 /// The info string of that block's fence.
 pub const DIGEST_FENCE: &str = "agent-board-maintain-digest";
+/// Bound local candidate parsing, including the surrounding Markdown.
+pub const DIGEST_MAX_BYTES: usize = 1024 * 1024;
+/// The v1 view accepts at most 100 entries in each group.
+const DIGEST_GROUP_LIMIT: usize = 100;
+
+/// Check a candidate's v1 contract without forge facts or publication authority.
+/// This is deliberately separate from partial acknowledgement and provenance.
+pub fn validate_digest(body: &str) -> Result<()> {
+    ensure!(
+        body.len() <= DIGEST_MAX_BYTES,
+        "candidate exceeds {DIGEST_MAX_BYTES} bytes"
+    );
+    let digest = plan::fenced_json(body, DIGEST_FENCE)
+        .with_context(|| format!("{DIGEST_FENCE} block"))?
+        .with_context(|| format!("missing {DIGEST_FENCE} fenced block"))?;
+    ensure!(digest.is_object(), "digest must be a JSON object");
+    ensure!(
+        digest["schema"] == DIGEST_SCHEMA,
+        "schema must be {DIGEST_SCHEMA}"
+    );
+    let date = digest["date"].as_str().context("date must be YYYY-MM-DD")?;
+    crate::cost::parse_date(date).context("date")?;
+    let mut seen = BTreeMap::new();
+    for (group, headed) in DIGEST_GROUPS {
+        let entries = digest[*group]
+            .as_array()
+            .with_context(|| format!("{group} must be an array (use [] when empty)"))?;
+        ensure!(
+            entries.len() <= DIGEST_GROUP_LIMIT,
+            "{group} exceeds {DIGEST_GROUP_LIMIT} entries"
+        );
+        for (index, entry) in entries.iter().enumerate() {
+            let at = format!("{group}[{index}]");
+            ensure!(entry.is_object(), "{at} must be an object");
+            let pr = entry["pr"].as_str().filter(|p| crate::changes::parse_ref(p).is_some())
+                .with_context(|| format!("{at}.pr must be a qualified OWNER/REPO#N string; numeric PRs are not resolved"))?;
+            let previous = seen.insert(pr.to_ascii_lowercase(), at.clone());
+            ensure!(
+                previous.is_none(),
+                "{at}.pr duplicates {}",
+                previous.unwrap_or_default()
+            );
+            if *headed || entry.get("head").is_some() {
+                ensure!(
+                    entry["head"].as_str().is_some_and(holds::full_head),
+                    "{at}.head must be a full 40-character lowercase hexadecimal commit"
+                );
+            }
+            let field = match *group {
+                "closer" => "concern",
+                "waiting" => "reply",
+                _ => "reason",
+            };
+            ensure!(
+                entry[field].as_str().is_some_and(|s| !s.trim().is_empty()),
+                "{at}.{field} must be nonempty text"
+            );
+            if *group != "closer" {
+                continue;
+            }
+            ensure!(
+                entry["minutes"]
+                    .as_u64()
+                    .is_some_and(|n| (1..=480).contains(&n)),
+                "{at}.minutes must be an integer from 1 to 480"
+            );
+            let links = entry["links"]
+                .as_array()
+                .filter(|links| !links.is_empty())
+                .with_context(|| {
+                    format!("{at}.links must be a nonempty array of file/line links")
+                })?;
+            for (index, link) in links.iter().enumerate() {
+                let at = format!("{at}.links[{index}]");
+                let path = link["path"].as_str().unwrap_or_default();
+                ensure!(
+                    !path.is_empty()
+                        && !path.contains(['\\', ':', '?', '#'])
+                        && !path.chars().any(char::is_control)
+                        && path.split('/').all(|p| !matches!(p, "" | "." | "..")),
+                    "{at}.path must be a repository-relative file path without traversal"
+                );
+                let start = link["start"]
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .with_context(|| format!("{at}.start must be a positive integer line"))?;
+                if let Some(end) = link.get("end") {
+                    ensure!(
+                        end.as_u64().is_some_and(|n| n >= start),
+                        "{at}.end must be an integer line at or after start"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The digest's groups, and whether an entry of each names its head.
 pub(super) const DIGEST_GROUPS: &[(&str, bool)] = &[
     ("approve", true),
@@ -458,7 +559,10 @@ fn brief(
          other field is read. `pr` is OWNER/REPO#N. `head`, in approve and closer, is the full head listed \
          above, copied exactly: {operator} approves at it, and the links open the files there. `minutes` is \
          1 to 480. A link's `path` is relative to the repository root, and `start` and the optional `end` \
-         are line numbers from 1.\n",
+         are line numbers from 1. Before requesting publication, save the candidate Markdown and run \
+         `agent-board check maintain-digest --body candidate.md` (or pipe the candidate to \
+         `agent-board check maintain-digest`). Fix any diagnostics first. This offline check does not \
+         authorize publication or enforce validation at the safe-output boundary.\n",
         example = example(date),
         operator = config.operator,
     ));

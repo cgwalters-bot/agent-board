@@ -2247,6 +2247,27 @@ that breaks these rules, and skips approving a pull request whose head has
 moved since. These are the run's output: the pass compares them with the
 heads it planned, and never records one the run chose.
 
+Before requesting publication, runs should save their candidate Markdown and run:
+
+```sh
+agent-board check maintain-digest --body candidate.md
+```
+
+Or pipe the Markdown to `agent-board check maintain-digest` for stdin. This opt-in,
+credential-free command makes no network requests or writes. It rejects malformed
+or repeated blocks, invalid fields (with zero-based group/link indices), numeric
+or unqualified PR references and duplicate PRs across or within groups, rather
+than guessing a repository. Required text must be nonempty; closer entries need
+nonempty file/line links with repository-relative paths and ordered positive lines.
+Candidates are bounded to 1 MiB and 100 entries per group. Invalid input exits
+nonzero; fix the diagnostics before requesting publication. All four arrays are
+required, but partial assessments and empty arrays are valid: the check does not
+require every planned PR or disclose intentional omissions. It cannot verify
+heads against a live plan, file existence, checks or review judgments.
+This is not enforcement at the safe-output boundary and does not authorize
+publication. Controller provenance, assessed-head matching, partial acknowledgement
+and same-day dispatch protections are unchanged.
+
 ## Epic planning and recovery
 
 A live, unheld epic is due initially, after changed intent/operator direction
