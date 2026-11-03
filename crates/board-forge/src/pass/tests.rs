@@ -2793,12 +2793,19 @@ fn confirmed_comment_effects() {
 fn comments_on(forge: &mut Forge, (repo, number): (&str, u64), nodes: Vec<Value>) {
     let (owner, name) = repo.split_once('/').unwrap();
     let variables = json!({"owner": owner, "name": name, "number": number, "after": null});
-    let request = graphql_key(plan::COMMENTS_QUERY, &variables);
-    forge.replay.requests.retain(|e| e["request"] != request);
     let page = json!({"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}});
     let answer = json!({"data": {"repository": {"issue": {"comments": page}}}});
-    let entry = json!({"request": request, "answer": answer});
-    forge.replay.requests.push(entry);
+    for query in [
+        plan::COMMENTS_QUERY.to_owned(),
+        plan::COMMENTS_QUERY.replace(" body ", " "),
+    ] {
+        let request = graphql_key(&query, &variables);
+        forge.replay.requests.retain(|e| e["request"] != request);
+        forge
+            .replay
+            .requests
+            .push(json!({"request": request, "answer": answer}));
+    }
 }
 
 /// A comment `id` by `author`, unedited, written on 20 October.
@@ -2922,6 +2929,63 @@ fn apply_publishes_what_needs_you() {
             .unwrap_or_else(|| panic!("{:#?}", report.lines))
     };
     let body = published(&config);
+    // Every listed hold, not only the first ten, gets its summary.
+    let mut many = forge_with(None);
+    for request in &mut many.replay.requests {
+        let Some(nodes) = request["answer"]
+            .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(template) = nodes
+            .iter()
+            .find(|n| n["content"]["number"] == 446)
+            .cloned()
+        else {
+            continue;
+        };
+        for number in 1000..1012 {
+            let mut node = template.clone();
+            node["id"] = json!(format!("PVTI_{number}"));
+            node["content"]["id"] = json!(format!("I_{number}"));
+            node["content"]["number"] = json!(number);
+            node["content"]["url"] = json!(format!(
+                "https://github.com/cgwalters-forge/tracker/issues/{number}"
+            ));
+            nodes.push(node);
+        }
+    }
+    for number in 1000..1012 {
+        comments_on(
+            &mut many,
+            ("cgwalters-forge/tracker", number),
+            vec![comment_node(
+                number,
+                "cgwalters-bot",
+                &format!("Question for the operator: Ship {number}?"),
+            )],
+        );
+    }
+    let report = apply(&many, &config);
+    let many_body = many
+        .writes
+        .borrow()
+        .iter()
+        .find(|(m, url, _)| m == "POST" && url.starts_with(&bot_ops))
+        .map(|(_, _, body)| text(body, "/body").to_owned())
+        .unwrap_or_else(|| panic!("{:?}", report.lines));
+    let many_snapshot = holds::parse(&many_body).unwrap();
+    for number in 1000..1012 {
+        let ask = many_snapshot["needs_you"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == format!("cgwalters-forge/tracker#{number}"))
+            .unwrap();
+        assert_eq!(ask["ask"], format!("Ship {number}?"));
+    }
+    assert_eq!(many_snapshot["needs_you"]["summaries"], "complete");
     let snapshot = holds::parse(&body).unwrap();
     let list = &snapshot["needs_you"];
     assert_eq!(list["schema"], holds::NEEDS_YOU_SCHEMA);
@@ -3162,10 +3226,17 @@ fn apply_publishes_what_needs_you() {
     assert_ne!(older, body);
     for (name, unread, summaries) in [("same", false, "complete"), ("unread", true, "partial")] {
         let mut forge = forge_with(Some(&older));
-        if unread {
+        // An unchanged comment's body is not fetched again; unavailable
+        // metadata, in contrast, must never be treated as a cache hit.
+        {
             let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446,
                 "after": null});
-            let request = graphql_key(plan::COMMENTS_QUERY, &variables);
+            let query = if unread {
+                plan::COMMENTS_QUERY.replace(" body ", " ")
+            } else {
+                plan::COMMENTS_QUERY.to_owned()
+            };
+            let request = graphql_key(&query, &variables);
             forge.replay.requests.retain(|e| e["request"] != request);
         }
         let report = apply(&forge, &config);
@@ -10250,6 +10321,87 @@ fn labelled_pull_requests_are_read_only_to_act_on() {
     assert_eq!(report.failures, 0);
 }
 
+/// The actual labelled-list shortcut retains draft classification across
+/// publication and a subsequent pass, without reading each PR separately.
+#[test]
+fn labelled_drafts_publish_one_group_on_successive_passes() {
+    let repo = "cgwalters-forge/agentic-job";
+    let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut settings =
+        json!({"holds": {"repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true}});
+    let mut forge = Forge::new(None, false);
+    for (path, body) in [
+        ("user", json!({"login": "cgwalters-bot"})),
+        ("repos/cgwalters-forge/bot-ops", json!({"private": true})),
+    ] {
+        forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}{path}")}, "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    followed_labelled(
+        &mut forge.replay,
+        &mut settings,
+        json!({"fixPools": ["claude"]}),
+    );
+    forge
+        .replay
+        .requests
+        .retain(|e| e["request"]["graphql"] != fnv(poll::PULL_QUERY));
+    let list = format!("{API_ROOT}repos/{repo}/pulls?state=open");
+    let open = forge
+        .replay
+        .requests
+        .iter_mut()
+        .rfind(|e| {
+            e["request"]["get"]
+                .as_str()
+                .is_some_and(|u| u.starts_with(&list))
+        })
+        .unwrap();
+    let mut second = open["answer"]["body"][0].clone();
+    second["number"] = json!(10);
+    open["answer"]["body"].as_array_mut().unwrap().push(second);
+    let nodes: Vec<_> = [9, 10]
+        .into_iter()
+        .map(|number| {
+            json!({"number": number,
+        "headRefOid": head, "isDraft": true, "mergeable": "MERGEABLE",
+        "reviews": {"nodes": [], "pageInfo": {"hasPreviousPage": false}}})
+        })
+        .collect();
+    let variables = json!({"owner": "cgwalters-forge", "name": "agentic-job", "label": "needs-human", "pulls": 100});
+    forge.replay.requests.push(
+        json!({"request": graphql_key(poll::LABELLED_QUERY, &variables),
+        "answer": {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}}),
+    );
+    let config = config(settings);
+    let mut previous = None;
+    for _ in 0..2 {
+        let report = apply(&forge, &config);
+        let published = forge
+            .writes
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(method, url, _)| {
+                (method == "POST" || method == "PATCH")
+                    && url.contains("bot-ops/issues/")
+                    && url.contains("comments")
+            })
+            .map(|(_, _, b)| text(b, "/body").to_owned())
+            .unwrap_or_else(|| panic!("{:?}", report.lines));
+        let snapshot = holds::parse(&published).unwrap();
+        let asks = snapshot["needs_you"]["items"].as_array().unwrap();
+        let group = asks.iter().find(|a| a["source"] == "reviews").unwrap();
+        assert_eq!(group["ask"], "agentic-job: 2 drafts to inspect and promote");
+        assert_eq!(group["group"]["numbers"], json!([9, 10]));
+        if let Some(previous) = &previous {
+            assert_eq!(group, previous);
+        }
+        previous = Some(group.clone());
+        let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+        *comments = json!([{"id": 7, "node_id": "IC_7", "user": {"login": "cgwalters-bot"}, "body": published}]);
+    }
+}
+
 /// A pull request's comments come with its query, the REST list only past its
 /// page; a stop with no label reads the label again while the stop is new.
 #[test]
@@ -10649,10 +10801,15 @@ fn blockers_move_or_are_carded() {
             let summary = comment_node(9, "cgwalters-bot", "**Decision needed:** Close #889?");
             let page =
                 json!({"nodes": [summary], "pageInfo": {"hasNextPage": false, "endCursor": null}});
-            forge.replay.requests.push(json!({
-                "request": graphql_key(plan::PULL_REQUEST_COMMENTS_QUERY, &variables),
-                "answer": {"data": {"repository": {"pullRequest": {"comments": page}}}},
-            }));
+            for query in [
+                plan::PULL_REQUEST_COMMENTS_QUERY.to_owned(),
+                plan::PULL_REQUEST_COMMENTS_QUERY.replace(" body ", " "),
+            ] {
+                forge.replay.requests.push(json!({
+                    "request": graphql_key(&query, &variables),
+                    "answer": {"data": {"repository": {"pullRequest": {"comments": page}}}},
+                }));
+            }
         }
         match read {
             Read::Followed(change, comments, besides) => {

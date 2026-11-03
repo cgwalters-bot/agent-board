@@ -308,7 +308,17 @@ The asks come from five sources, each named by an item's `source`:
   the head), `review-withheld` (the review job withheld its approval, so a
   person approves) and `review-needs-human` (labelled `needs-human`, or
   stopped so by this pass's step, a draft with no checkpoint among them, or
-  a round outside the fix bounds it leaves to the operator, labelled or not).
+   a round outside the fix bounds it leaves to the operator, labelled or not).
+   Stranded `review-needs-human` pull requests are grouped by repository and
+   reason (drafts to inspect/promote, blocked fix rounds, exhausted fix rounds,
+   otherwise the step's reason). Approval and withheld-review decisions stay
+   separate. A group uses its lowest numbered PR's existing key, item and
+   action, the earliest wait, and optional `group: {"reason", "numbers"}`
+   metadata with sorted PR numbers. Its `target` links the repository's open
+   PR list (drafts only for draft groups); that list may include other PRs,
+   but also includes stops not yet labelled. Existing v2 readers, including review's
+   `src/github/holds.ts`, ignore the optional field and still open the
+   representative PR via `action`; group-aware readers can show the full list.
   What the poll goes on with by itself is not listed: a run, check, review,
   queue or rerun it waits for, or an answer it already acts on.
 - `proposals` (with `holds.proposals`): each
@@ -340,15 +350,26 @@ with the most urgent Priority, waiting since the earlier.
 null. For a hold, they are the newest summary comment on its issue (a
 `blocking` hold's pull request) that the bot wrote and last edited, read
 as data: the rest of its first
-`**Decision needed:**` and `**Recommendation:**` lines (the colon may follow
-the bold). Such a line left empty is absent, and the ask falls back to the
+`Decision needed:` or `Question for the operator:` line, and
+`Recommendation:` or `Recommended:` line. Labels are case-insensitive, may
+be plain or bold (the colon inside or outside the bold), and may be list
+items. An unlabelled bold opening sentence does not count. Such a line left
+empty is absent, and the ask falls back to the
 board Why's question (a Why starting `Q:`), else the hold's reason. The
-summaries of the 10 highest ranked held issues are read, and `summaries`
+summaries of every listed held issue are read, and `summaries`
 says whether they all were (`complete` or `partial`). A hold whose summary
-was not read (past the 10, or the read failed) keeps the `ask` and
+was not read (the pass's request/time bound was reached, or the read failed) keeps the `ask` and
 `recommendation` published for it, while its `kind`, `since` and Why
-question stay the same, rather than fall back. Summaries enrich asks and
-are no source of them, so they do not make the list incomplete. A review
+question stay the same, rather than fall back. Summaries
+are cached in optional v2 `summary_cache` metadata for the listed holds.
+Each pass validates all comment identities, edit times, authors and editors
+with bounded, paginated metadata reads; unchanged bodies are not downloaded
+again. New comments, deletions and edits invalidate the cached summary,
+including edits by someone other than the bot. Metadata still costs API
+reads; a cache miss additionally reads bodies within the same existing pass
+bounds, reserving room for both reads and hold publication. This adds no
+option or mutation authority; it remains off unless `holds.needsYou` is set.
+Summaries enrich asks but are no source of them, so they do not make the list incomplete. A review
 wait asks its step's reason; a proposal its title, recommending the first
 line of its `why`; a digest entry what its group asks, recommending its
 reason, concern or drafted reply. Every text is its first line, cut to 500

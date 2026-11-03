@@ -14,6 +14,7 @@ use super::holds::{
 use super::*;
 use crate::action::{self, ACTION_FENCE, Proposal};
 use crate::plan::{Comment, comment_id, fenced_json};
+use sha2::{Digest, Sha256};
 
 /// The most issues labelled for proposals read a pass, oldest first; the
 /// rest are unread, and their published asks kept.
@@ -22,9 +23,6 @@ const MAX_PROPOSAL_ISSUES: usize = 10;
 const MAX_PROPOSALS_PER_ISSUE: usize = 10;
 /// The most entries listed of a digest.
 const MAX_DIGEST_ASKS: usize = 50;
-/// The most held issues whose summaries are read a pass, the highest
-/// ranked first.
-const MAX_SUMMARIES: usize = 10;
 /// The longest label `holds.proposals.label` may be, as GitHub's.
 const LABEL_LIMIT: usize = 50;
 /// Requests left before each read for the hold snapshot's own: its reads,
@@ -172,6 +170,7 @@ pub(super) fn review_asks(
             },
             action,
             carried: false,
+            group: None,
         });
     }
     if !collected.unread.is_empty() {
@@ -232,6 +231,7 @@ pub(super) fn proposal_asks(
             source_ref: at(RefKind::Comment),
             action,
             carried: false,
+            group: None,
         });
     }
     (asks, whole)
@@ -314,6 +314,7 @@ pub(super) fn digest_asks(
                 },
                 action,
                 carried: false,
+                group: None,
             });
         }
     }
@@ -514,29 +515,34 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         }
     }
 
-    /// The bot's summaries of the first [`MAX_SUMMARIES`] held issues and
-    /// blocking pull requests of `list`, by key, each read, none where it
-    /// has none.
+    /// Every listed hold's summary, within the pass's request/time bounds.
+    /// Metadata is checked before reusing a body, including writers and
+    /// editors: a foreign edit must invalidate a previously trusted summary.
     fn summaries(&mut self, list: &NeedsYou) -> (Read, BTreeMap<String, Option<Summary>>) {
         let (mut read, mut said) = (Read::Complete, BTreeMap::new());
         let held = (list.items.iter())
             .filter(|a| a.source_ref.kind == RefKind::Hold && a.source != "pass");
-        for (n, ask) in held.enumerate() {
+        for ask in held {
             let issue = on_github(&ask.source_ref.repository, ask.source_ref.number);
-            if n == MAX_SUMMARIES || !self.room() {
+            if !self.room()
+                || self.client.bounds.left.get() <= NEEDS_READS + plan::PLAN_COMMENT_PAGES
+            {
                 read = Read::Partial;
                 break;
             }
             // A blocking hold is on a pull request, whose summary an issue
             // read cannot find.
-            let comments = match ask.action.kind {
-                RefKind::PullRequest => plan::pull_request_comments(&self.client, &issue),
-                _ => plan::issue_comments(&self.client, &issue),
-            };
-            match comments {
-                Ok(comments) => {
-                    let summary = bot_summary(&comments, &self.config.bot);
-                    said.insert(ask.key.clone(), summary);
+            let pull = ask.action.kind == RefKind::PullRequest;
+            let summary = cached_summary(
+                &self.client,
+                &issue,
+                pull,
+                &self.config.bot,
+                list.summary_cache.get(&ask.key),
+            );
+            match summary {
+                Ok(summary) => {
+                    said.insert(ask.key.clone(), Some(summary));
                 }
                 Err(error) => {
                     read = Read::Partial;
@@ -549,12 +555,142 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     }
 }
 
+/// Hash all bounded comment metadata, not just the selected summary: a new
+/// comment, deletion or edit to any candidate must invalidate the cache.
+fn revision(comments: &[Comment], bot: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(bot.to_ascii_lowercase());
+    for c in comments {
+        hash.update(format!(
+            "{:?}",
+            (&c.url, c.changed, &c.author, c.edited, &c.editor)
+        ));
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn cached_summary<T: Transport>(
+    client: &T,
+    issue: &ItemRef,
+    pull: bool,
+    bot: &str,
+    cached: Option<&Summary>,
+) -> Result<Summary> {
+    let metadata = plan::comment_metadata(client, issue, pull)?;
+    let current = revision(&metadata, bot);
+    if let Some(cached) = cached.filter(|s| s.revision.as_deref() == Some(current.as_str())) {
+        return Ok(cached.clone());
+    }
+    let comments = if pull {
+        plan::pull_request_comments(client, issue)?
+    } else {
+        plan::issue_comments(client, issue)?
+    };
+    let mut summary = bot_summary(&comments, bot).unwrap_or_default();
+    // Use the body's own metadata, so an intervening edit cannot cache a
+    // stale body under the revision observed before it was downloaded.
+    summary.revision = Some(revision(&comments, bot));
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const BOT: &str = "cgwalters-bot";
     const HEAD: &str = "488f45ebacd03a8bc88dceb3d703a5322850ce77";
+
+    #[test]
+    fn summary_cache_revalidates_edits_deletions_and_writers() {
+        struct Comments {
+            nodes: Vec<Value>,
+            bodies: std::cell::Cell<usize>,
+        }
+        impl Transport for Comments {
+            fn graphql(&self, query: &str, _: Value) -> Result<Value> {
+                let body = query.contains(" body ");
+                if body {
+                    self.bodies.set(self.bodies.get() + 1);
+                }
+                let nodes: Vec<_> = self
+                    .nodes
+                    .iter()
+                    .cloned()
+                    .map(|mut n| {
+                        if !body {
+                            n.as_object_mut().unwrap().remove("body");
+                        }
+                        n
+                    })
+                    .collect();
+                Ok(json!({"repository": {"issue": {"comments": {"nodes": nodes,
+                    "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}))
+            }
+        }
+        let node = json!({"url": "https://github.com/o/r/issues/1#issuecomment-1",
+            "body": "Question for the operator: Ship?\nRecommended: Yes.",
+            "createdAt": "2026-10-28T08:00:00Z", "lastEditedAt": null,
+            "author": {"login": BOT}, "editor": null});
+        let mut client = Comments {
+            nodes: vec![node.clone()],
+            bodies: std::cell::Cell::new(0),
+        };
+        let issue = on_github("o/r", 1);
+        let cached = cached_summary(&client, &issue, false, BOT, None).unwrap();
+        assert_eq!(cached.question.as_deref(), Some("Ship?"));
+        assert_eq!(client.bodies.get(), 1);
+        assert_eq!(
+            cached_summary(&client, &issue, false, BOT, Some(&cached)).unwrap(),
+            cached
+        );
+        assert_eq!(
+            client.bodies.get(),
+            1,
+            "unchanged body must not be read again"
+        );
+        let changed = |patch: Value| {
+            let mut n = node.clone();
+            n.as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            n
+        };
+        for (name, nodes, question) in [
+            (
+                "edit",
+                vec![changed(
+                    json!({"lastEditedAt": "2026-10-28T09:00:00Z", "editor": {"login": BOT},
+                "body": "Decision needed: Wait?"}),
+                )],
+                Some("Wait?"),
+            ),
+            (
+                "foreign edit",
+                vec![changed(
+                    json!({"lastEditedAt": "2026-10-28T09:00:00Z", "editor": {"login": "visitor"}}),
+                )],
+                None,
+            ),
+            ("deletion", vec![], None),
+            (
+                "new summary",
+                vec![
+                    node.clone(),
+                    changed(
+                        json!({"url": "https://github.com/o/r/issues/1#issuecomment-2",
+                "createdAt": "2026-10-28T09:00:00Z", "body": "Decision needed: Wait?"}),
+                    ),
+                ],
+                Some("Wait?"),
+            ),
+        ] {
+            client.nodes = nodes;
+            let before = client.bodies.get();
+            let said = cached_summary(&client, &issue, false, BOT, Some(&cached)).unwrap();
+            assert_eq!(said.question.as_deref(), question, "{name}");
+            assert_eq!(client.bodies.get(), before + 1, "{name}");
+        }
+    }
 
     /// Comment `id` by `author`, edited by `editor` if any, `minutes` after
     /// 08:00 on 28 October.
