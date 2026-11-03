@@ -105,6 +105,14 @@ try again. Anyone who can delete comments on the issue can remove a record and
 so have its plan dispatched again. The run is started with `DISPATCH_TOKEN` if
 it is set, else with `GH_TOKEN`.
 
+The scheduled [pass](pass.md#scheduling) dispatches the newest accepted,
+unrecorded `implement` or `triage` plan by this protocol, once per plan, so a
+run that has ended does not start its plan again. A `triage` plan is not
+checked for [overlap](#overlap), [stacked](#stacking) or
+[batched](#batching), as its run changes no files. A `triage` plan of another
+issue than the one it is on, and a `research` plan, stay manual dispatches:
+the pass would not follow up either run's output.
+
 ## Collaborator input
 
 `--collaborators-only` (off by default; from the caller's configuration)
