@@ -160,8 +160,9 @@ releases: `needs-human` (labelled so, by a person or a triage verdict),
 `epic-unplanned` (an epic's planning request got no plan) and
 `needs-operator` (an invalid or refused plan, a plan that names a pull
 request, an apply cut short and not
-proved, a plan dispatched by hand, no plan with triage off, or a run that
-failed again after its [rerun](#reruns)), and `pr-open` on an issue labelled
+proved, a plan dispatched by hand (an issue's research plan, or a triage plan
+of another issue), no plan with triage off, or a run that failed again after
+its [rerun](#reruns)), and `pr-open` on an issue labelled
 `needs-operator-approval` (below). The one
 exception the other way is an epic whose first planning request got no plan and that the
 pass retries once by itself after the cooldown (`… got no plan; planned once
@@ -780,8 +781,9 @@ can show more free slots than an applying pass would.
 
 A triage run is started by posting the bot's `triage` job plan on the issue and
 dispatching it with the job-plan protocol, so the dispatch record is the claim.
-A pass interrupted between that post and its dispatch leaves a triage plan,
-which is a manual dispatch; a person dispatches or replaces it.
+A pass interrupted between that post and its dispatch leaves an accepted,
+unrecorded triage plan, which a later pass dispatches once as any such plan
+(see [scheduling](#scheduling)).
 
 With `skipActiveWork: true` (off by default, GitHub only), stage 4 avoids
 duplicate planning while the work already lives elsewhere. An open closing PR
@@ -1332,12 +1334,28 @@ broker lost mid-run, is that, by the rule of
 [start failures](#start-failures); without it, [`reruns`](#reruns) re-runs
 any failed run once, and a second failure is left for a person.
 
-With an accepted implement plan, dispatch precisely that plan once. An invalid
+With an accepted implement or triage plan, dispatch precisely that plan once,
+its brief and kind as written (agent-board#643): an operator or planner triage
+plan that steers a triage, for example with a decision as context, starts as
+`start triage OWNER/REPO#N plan=ID pool=P` within the same work-repository
+and target checks, WIP, pool choice (its own pool, or without one the
+`triagePools`), `--max-dispatch`, lease and recheck as an implement plan, and
+counts as a triage start. A triage run changes no files, so it is not checked
+for overlap, stacked or batched. An invalid
 newest plan does not mean “no plan”; report it, never fall back. Recorded plans
-do not run again, except by the rerun above, or with `starts` once their run
-and its rerun failed on infrastructure; an operator/planner
-edit or replacement is needed. Research or
-triage plans explicitly posted on issues remain manual dispatches.
+do not run again, except by the rerun above, or with `starts` once an
+implement plan's run and its rerun failed on infrastructure; an operator/planner
+edit or replacement is needed. A recorded triage plan whose run has ended is
+never started again: with `triageFollowUpDays` it is followed up as the pass's
+own triage plans are, else held as `dispatched`. Two kinds of plan stay
+manual dispatches (`needs-operator`): a triage plan of another issue than the
+one it is on (`hold OWNER/REPO#N: plan ID triages OWNER/REPO#M, not this
+issue; …`), whose run's verdict or plan would land where this issue's
+follow-up does not look; and an issue's research plan (`hold OWNER/REPO#N:
+plan ID is for research, which is dispatched by hand; …`), whose report no
+step of the pass follows up. With `skipActiveWork` a research plan is handled
+as that setting says instead. The maintain digest's research run is
+the pass's own, not an issue's plan.
 
 Draw among the eligible configured automatic pools, each in proportion to its
 room (`target_percent * elapsed_fraction - used_percent`, or a grant's allowed

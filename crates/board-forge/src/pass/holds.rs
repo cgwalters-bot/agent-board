@@ -113,7 +113,8 @@ pub enum HoldKind {
     EpicUnplanned,
     /// A plan, receipt or request the pass will not act on by itself: an
     /// invalid or refused plan, an apply cut short and not proved, a plan
-    /// dispatched by hand, or no plan with triage off.
+    /// dispatched by hand (research, or a triage of another issue), or no
+    /// plan with triage off.
     NeedsOperator,
     /// Its parent is not a live epic; the operator's only where its
     /// Priority is among the board's first ([`Hold::operator`]).

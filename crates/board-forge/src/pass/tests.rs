@@ -8603,14 +8603,26 @@ fn apply_interrupted_at_each_write_reruns_without_duplicates() {
             "{boundary}: the failed start must keep its slot: {:#?}",
             first.lines
         );
+        // A plan posted without its dispatch was never started: the next
+        // pass starts it once, by its record, and the pass after holds it.
+        let stranded = boundary == "the triage plan's post";
+        if stranded {
+            let second = apply(&forge, &config);
+            let line = "start triage cgwalters-forge/tracker#446 plan=";
+            assert!(
+                second.lines.iter().any(|l| l.starts_with(line)),
+                "{boundary}: {:#?}",
+                second.lines
+            );
+        }
         let posted = forge.comments_on("cgwalters-forge/tracker", 446);
         let dispatched = forge.dispatches().len();
-        let second = apply(&forge, &config);
+        let later = apply(&forge, &config);
         assert_eq!(
             forge.comments_on("cgwalters-forge/tracker", 446).len(),
             posted.len(),
             "{boundary}: the rerun wrote on #446 again: {:#?}",
-            second.lines
+            later.lines
         );
         assert!(
             forge.dispatches()[dispatched..]
@@ -8619,12 +8631,12 @@ fn apply_interrupted_at_each_write_reruns_without_duplicates() {
             "{boundary}: #446 dispatched again"
         );
         assert!(
-            second
+            later
                 .lines
                 .iter()
                 .any(|l| l.starts_with("hold cgwalters-forge/tracker#446: ")),
             "{boundary}: {:#?}",
-            second.lines
+            later.lines
         );
     }
 }
@@ -8900,16 +8912,136 @@ fn apply_keeps_a_starts_requests_for_it() {
 
 /// The operator's implement plan for tracker#446, without a pool.
 fn implement_plan(replay: &mut Replay) {
+    job_plan(replay, ("implement", 446), "cgwalters", None);
+}
+
+/// `author`'s `kind` plan of tracker `item` on tracker#446, comment 9, with
+/// `pool` if any.
+fn job_plan(replay: &mut Replay, (kind, item): (&str, u64), author: &str, pool: Option<&str>) {
     let comments = &mut answer(replay, r#""name":"tracker","number":446"#)["data"]["repository"]["issue"]
         ["comments"]["nodes"];
-    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 446,
-        "kind": "implement", "runner": "hosted", "brief": "Write the staging design down."});
+    let mut plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": item,
+        "kind": kind, "runner": "hosted", "brief": "Write the staging design down."});
+    if let Some(pool) = pool {
+        plan["pool"] = pool.into();
+    }
     comments.as_array_mut().unwrap().push(json!({
         "url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-9",
         "body": format!("```{PLAN_FENCE}\n{plan}\n```"),
         "createdAt": "2026-10-23T00:00:00Z", "lastEditedAt": null,
-        "author": {"login": "cgwalters"}, "editor": null,
+        "author": {"login": author}, "editor": null,
     }));
+}
+
+/// An accepted, unrecorded triage plan, the operator's or the planner's,
+/// starts once through the plan protocol, with its exact brief and kind,
+/// counted as a triage start and checked for no overlap (the recording has
+/// no text of tracker#446 for one); its record, once the run is done, holds
+/// it on the next pass. An explicit held pool, a held `triagePools` for one
+/// without a pool and `--max-dispatch` hold it writing nothing,
+/// `--max-writes` does not (a start is a dispatch), the pass's own triage is
+/// as before, and a research plan, or a triage of another issue, whose
+/// follow-up this issue's would miss, stays manual.
+#[test]
+fn accepted_triage_plans_start_once() {
+    let plan = "plan=9@2026-10-23T00:00:00Z";
+    let start = format!("start triage cgwalters-forge/tracker#446 {plan} pool=claude record=");
+    let generated = "start triage cgwalters-forge/tracker#446 pool=claude record=";
+    let held = format!("held by --max-dispatch: start triage cgwalters-forge/tracker#446 {plan}");
+    let research = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z is for research, which is dispatched by hand; the pass starts only implement and triage plans";
+    let other = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z triages cgwalters-forge/tracker#527, not this issue; it is dispatched by hand";
+    let pool = "hold cgwalters-forge/tracker#446: no pool: openai is held";
+    let limits = |dispatch, writes| Limits {
+        dispatch,
+        writes,
+        ..Limits::default()
+    };
+    let none = Limits::default();
+    // Name, the plan's kind and item, author and pool (no plan for the
+    // pass's own triage), the config's `triagePools`, the caps, and the
+    // issue's line.
+    type Plan<'a> = Option<((&'a str, u64), &'a str, Option<&'a str>)>;
+    type Case<'a> = (&'a str, Plan<'a>, Option<&'a str>, Limits, &'a str);
+    let triage = ("triage", 446);
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("the operator's", Some((triage, "cgwalters", None)), None, none, &start),
+        ("the planner's", Some((triage, "cgwalters-bot", None)), None, none, &start),
+        ("at --max-writes 0", Some((triage, "cgwalters", None)), None, limits(None, Some(0)), &start),
+        ("at --max-dispatch 0", Some((triage, "cgwalters", None)), None, limits(Some(0), None), &held),
+        ("on a held pool", Some((triage, "cgwalters", Some("openai"))), None, none, pool),
+        ("on held triagePools", Some((triage, "cgwalters", None)), Some("openai"), none, pool),
+        ("a research plan", Some((("research", 446), "cgwalters-bot", None)), None, none, research),
+        ("another issue's", Some((("triage", 527), "cgwalters", None)), None, none, other),
+        ("no plan", None, None, none, generated),
+    ];
+    for (name, planned, pools, limits, expected) in cases {
+        let config = match pools {
+            Some(pool) => config(json!({"wip": 3, "triagePools": [pool]})),
+            None => config(json!({"wip": 3})),
+        };
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        if let Some((plan, author, pool)) = planned {
+            job_plan(&mut forge.replay, plan, author, pool);
+        }
+        let mode = (Mode::Actions(&own()), limits);
+        let at = forge.replay.now;
+        let first = block(run(&forge, &forge, &config, State::default(), mode, at));
+        let first = first.unwrap();
+        assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
+        assert!(
+            first.lines.iter().any(|l| l.starts_with(expected)),
+            "{name}: no line {expected:?} in {:#?}",
+            first.lines
+        );
+        if !expected.starts_with("start ") {
+            assert!(forge.writes.borrow().is_empty(), "{name}");
+            assert!(first.effects.starts.is_empty(), "{name}");
+            continue;
+        }
+        assert_eq!(
+            first.effects.starts,
+            BTreeMap::from([("triage".into(), 1)]),
+            "{name}"
+        );
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = (writes.iter())
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap();
+        assert_eq!(sent["inputs"]["kind"], "triage", "{name}");
+        assert_eq!(sent["inputs"]["pool"], "claude", "{name}");
+        let brief = sent["inputs"]["task"].as_str().unwrap();
+        assert_eq!(
+            brief == "Write the staging design down.",
+            planned.is_some(),
+            "{name}: {brief}"
+        );
+        drop(writes);
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        // The pass's own triage posts its plan before the record.
+        assert_eq!(comments.len(), 1 + usize::from(planned.is_none()), "{name}");
+        assert!(
+            comments
+                .last()
+                .unwrap()
+                .starts_with("<!-- agent-board-dispatch: "),
+            "{name}"
+        );
+        // Its record holds it, the run done: not started again.
+        let second = apply(&forge, &config);
+        assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        assert_eq!(forge.dispatches().len(), 1, "{name}: {:#?}", second.lines);
+        let recorded = |l: &String| {
+            l.starts_with("hold cgwalters-forge/tracker#446: plan ")
+                && l.contains(" was dispatched already, ")
+        };
+        assert!(
+            second.lines.iter().any(recorded),
+            "{name}: {:#?}",
+            second.lines
+        );
+    }
 }
 
 /// Unlike standalone dispatch, the pass waits when its overlap check cannot

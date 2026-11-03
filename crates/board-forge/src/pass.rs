@@ -140,6 +140,9 @@ const RUN_LIST_LIMIT: u64 = 1000;
 const RUNS_PER_PAGE: u64 = 100;
 /// The runner a triage plan asks for.
 const TRIAGE_RUNNER: &str = "hosted";
+/// The plan kinds the pass dispatches from an accepted, unrecorded plan; a
+/// research plan is dispatched by hand.
+const PASS_PLAN_KINDS: &[&str] = &["implement", "triage"];
 /// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// `overlap.staleDraftHours` when the key is left out, and the most it may
@@ -4176,13 +4179,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         };
-        if plan.kind != "implement" && failed.is_none() {
+        // An issue's research run's report has no follow-up here: the pass
+        // starts implement and triage plans only.
+        if !PASS_PLAN_KINDS.contains(&plan.kind.as_str()) && failed.is_none() {
             let why = format!(
-                "plan {id} is for {}, which is dispatched by hand",
+                "plan {id} is for {}, which is dispatched by hand; the pass starts only implement and triage plans",
                 plan.kind
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
+        let implement = plan.kind == "implement";
         let dest = ItemRef {
             repository: plan.repo.clone(),
             number: plan.item,
@@ -4214,6 +4220,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 slots,
                 (snapshot, target, &waiver),
             );
+        }
+        // Its verdict or plan would land on the other issue, where this
+        // issue's follow-up does not look.
+        if !implement && dest != *issue {
+            let why = format!(
+                "plan {id} triages {}, not this issue; it is dispatched by hand",
+                dest.display()
+            );
+            return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
         if !config.works_in(&dest.repository) {
             let dest = dest.display();
@@ -4255,7 +4270,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 (snapshot, target, &waiver),
             );
         }
+        // A triage plan without a pool runs where the pass's own triage would.
         let names: Vec<String> = match plan.pool.is_empty() {
+            true if !implement && !config.triage_pools().is_empty() => {
+                config.triage_pools().clone()
+            }
             true => config.pools.0.iter().map(|(n, _)| n.clone()).collect(),
             false => vec![plan.pool.clone()],
         };
@@ -4271,7 +4290,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             false => format!(" target={}", dest.display()),
         };
         let line = format!(
-            "start implement {} plan={id}{on} pool={pool}",
+            "start {} {} plan={id}{on} pool={pool}",
+            plan.kind,
             issue.display()
         );
         let holds = vec![issue.clone(), dest.clone()];
@@ -4289,7 +4309,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(Step::Hold(Hold::new(HoldKind::WaitingOn, wait.sentence())));
             }
         };
-        if base.is_none() {
+        // A triage run changes no files, so it neither waits on overlap nor
+        // stacks (a triage plan has no `stacks_on`).
+        if implement && base.is_none() {
             let decision = overlap::decide_strict(
                 &self.kept(),
                 (issue, &dest),
@@ -4339,7 +4361,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             // A plan written by hand carries no direction.
             direction: None,
         };
-        let options = (0, Some(config.bot.as_str()), None, scheduled);
+        // Without the bot, dispatch checks no overlap; it batches implement
+        // plans only, and the pass asks for no batch either way.
+        let bot = implement.then_some(config.bot.as_str());
+        let options = (0, bot, None, scheduled);
         let dispatcher = self.lease_dispatch(&dest, &pool);
         self.dispatcher.start_kind(start_line_kind(&line));
         let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
