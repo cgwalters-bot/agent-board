@@ -35,6 +35,10 @@ cli-docs:
 test-action-schema:
     node tests/operator-actions.cjs
 
+# NODE_PATH must provide graphql 16 for GitHub inventory schema validation.
+test-inventory-schema:
+    node tests/inbox-inventory.cjs
+
 # The documentation site in site/, a rendering of docs/ and the README, as
 # agentic-job's (its Justfile has the same recipes). Dependencies come from
 # the lock alone, without their install scripts. SITE_BASE, SITE_URL and

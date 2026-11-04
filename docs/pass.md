@@ -447,7 +447,13 @@ the last seven days). Windows include their boundary and exclude future
 timestamps. Completed runs use GitHub's `updated_at` completion clock.
 
 Context reads share the existing pass request/time budget, reserving publication
-requests. Each issue context reads at most 100 children and the latest 100
+requests. Before optional summaries or descendant activity, the pass queries
+state, labels and parentage for every inbox identity, including carried and
+cross-repository identities, in batches of at most 100. Shared ancestors are
+read once per pass in subsequent batches; descendants cannot consume the budget
+needed for those chains. Label connections are capped at 100 and PR closing
+issues at two (only zero or one gives an unambiguous chain).
+Each issue activity context reads at most 100 children and the latest 100
 comments; incomplete connections and unread descendants make epic activity
 `complete: false`, not proof of inactivity. All live epics already found by the
 pass remain listed even when their context is unread. This adds no option or
@@ -619,8 +625,22 @@ failed, or no maintain day is known); or `off` (stage 3 without `epics`,
 stage 2 without `follow`, no `holds.proposals`, no `maintain`). Where a
 source is `unread`, the asks it published before are kept, and where it is
 `partial`, those of the repositories and issues it did not read; each has
-`"carried": true`, and is listed again only while well formed. No part of a
-published list is carried, including its `waiting_since`, questions or
+`"carried": true`, and is listed again only while well formed. Each pass also
+revalidates carried identities against current state and labels: closed or merged
+targets are dropped, as are label-backed `needs-human` waits whose label was cleared and
+operator-action proposals whose configured proposal label was cleared. Other
+hold causes still depend on their source's full read. Review identities record
+`label_backed` before grouping: an unlabelled policy refusal (or an older identity
+without that evidence) needs a full review-source decision, not just a cleared label.
+State/labels alone cannot
+prove, for example, that a board question has been answered. A missing, failed,
+truncated or budget-skipped check keeps the identity and its source records as
+unverified carry data, leaves the list incomplete, and retries next pass; it never
+refreshes stale carry data as current. Detail cards,
+group membership and source carry records are pruned with the inventory. If a group's
+representative is removed, its semantic request follows the surviving representative
+without carrying over facts or authority bound to the removed PR's head.
+No part of a published list is carried, including its `waiting_since`, questions or
 `changed_at`, unless GitHub says the bot both wrote and last edited its
 comment (one GraphQL read): anyone with write access may edit it. Stage 4's
 holds are carried as above. `complete` is true only where each source is
