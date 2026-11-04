@@ -1,0 +1,9 @@
+{
+  "asks": [
+    {"body": "/bot triage please", "kind": "triage"},
+    {"body": "@BOT research this", "kind": "research"},
+    {"body": "/bot investigate\n\nGenerated-by: https://github.com/cgwalters/#llms", "kind": "research"},
+    {"body": "/bot triage\n```text\nGenerated-by: example\n```", "kind": "triage"},
+    {"body": "/bot triage\n> Generated-by: example", "kind": "triage"}
+  ]
+}

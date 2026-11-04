@@ -10,6 +10,7 @@ use crate::forgejo::{
 use crate::{BoardOperation, BoardWrite, Forge};
 
 mod epics;
+pub mod intake;
 mod publish;
 mod record;
 mod status;
@@ -150,6 +151,19 @@ fn identity(
         board.recorders.contains(&operator_id),
         "operator id {operator_id} is not in board.recorders; verify the operator's numeric id, not a reused login"
     );
+    if config.forgejo_intake.is_some() {
+        ensure!(
+            bot_id != operator_id,
+            "Forgejo intake requires distinct bot and operator ids"
+        );
+        ensure!(
+            board
+                .intake
+                .as_ref()
+                .is_some_and(|i| i.operator_id == operator_id),
+            "board.intake.operatorId does not match resolved operator id"
+        );
+    }
     let line = format!(
         "identity: bot {} (id {bot_id}), operator {} (id {operator_id}); both in recorders",
         config.bot, config.operator
@@ -274,6 +288,10 @@ fn run_within(
     };
     schedule.epics(snapshot.as_ref());
     bounds.enter(Stage::Schedule);
+    if let Err(error) = schedule.intake(snapshot.as_ref()) {
+        schedule.report.failures += 1;
+        schedule.line(format!("intake error: {error:#}"));
+    }
     if let Err(error) = schedule.run(snapshot.as_ref()) {
         schedule.report.failures += 1;
         schedule.line(format!("schedule error: {error:#}"));
@@ -370,6 +388,7 @@ struct Accepted {
     id: u64,
     plan: plan::JobPlan,
     revisit: bool,
+    intake: Option<intake::Record>,
 }
 
 impl Accepted {
@@ -541,10 +560,10 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             }
             let id = comment["id"].as_u64().context("plan has no id")?;
             if newest.as_ref().is_none_or(|(n, _)| id > *n) {
-                newest = Some((id, (parsed, body.starts_with(revisit::REVISIT))));
+                newest = Some((id, (parsed, body.starts_with(revisit::REVISIT), comment)));
             }
         }
-        let Some((id, (parsed, revisit))) = newest else {
+        let Some((id, (parsed, revisit, comment))) = newest else {
             return Ok(None);
         };
         let value = parsed?.context("plan missing")?;
@@ -558,7 +577,13 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             "stacked plans are not wired on Forgejo; held"
         );
         ensure!(!revisit || plan.kind == "triage", "revisit is not triage");
-        Ok(Some(Accepted { id, plan, revisit }))
+        let intake = self.intake_source(issue, comment, &plan)?;
+        Ok(Some(Accepted {
+            id,
+            plan,
+            revisit,
+            intake,
+        }))
     }
 
     // BoardWrite's normalized snapshot identities use the hostname, whereas
@@ -674,6 +699,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let latest = self.accepted(&facts.issue)?;
         ensure!(
             latest.id == accepted.id
+                && latest.intake == accepted.intake
                 && (latest.plan == accepted.plan || {
                     let mut selected = latest.plan.clone();
                     selected.pool = accepted.plan.pool.clone();
@@ -708,6 +734,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 "sweep issue is no longer open; held"
             );
         } else {
+            if let Some(source) = &accepted.intake {
+                self.check_intake_source(&facts.issue, source, &accepted.plan)?;
+            }
             if accepted.revisit {
                 let revisit = self.config.revisit.as_ref().context("revisit is off")?;
                 ensure!(
