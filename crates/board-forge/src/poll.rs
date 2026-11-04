@@ -256,6 +256,10 @@ const PROMOTE_WAIT: &str = "a midstream draft, waiting for promotion";
 /// How a round outside the caller's fix bounds is skipped: the operator
 /// takes it, labelled or not.
 pub(crate) const LEFT_TO_OPERATOR: &str = "left to the operator: ";
+/// Why a step, after its repository, is left to the operator with
+/// [`PollPolicy::own_space_only`].
+const NOT_OURS: &str =
+    "is outside our own space (pr.ownSpaceOnly), so the pass writes nothing there";
 
 /// agentic-job's apply pushes a round's commit to a head repository other
 /// than the bot's own fork only where that repository's default branch has
@@ -403,6 +407,23 @@ pub struct Config {
     /// reviews of a head count as its verdict; none counts only the operator's.
     pub review_workflow: Option<String>,
     pub policy: PollPolicy,
+}
+
+impl Config {
+    /// Whether `repo` is in our own space: the organization of
+    /// [`Self::dispatch_repo`], or the bot's own account.
+    pub(crate) fn ours(&self, repo: &str) -> bool {
+        let home = self.dispatch_repo.split_once('/').map(|(o, _)| o);
+        let ours = [home.unwrap_or(&self.dispatch_repo), &self.bot];
+        comments::in_scope(&ours.map(|owner| format!("{owner}/*")), repo)
+    }
+
+    /// Whether the pass may write in `repo` ([`PollPolicy::own_space_only`]):
+    /// a write where the bot does not maintain would at best be refused, and
+    /// at worst a label or comment no one there asked for.
+    pub(crate) fn writes_in(&self, repo: &str) -> bool {
+        !self.policy.own_space_only || self.ours(repo)
+    }
 }
 
 /// The optional poll settings of agent-board.json, which [`PollPolicy`] and
@@ -588,6 +609,12 @@ pub struct PollPolicy {
     /// fork is skipped where agentic-job's apply would refuse to push there
     /// ([`OWNER_BRANCHES`]). Off by default.
     pub owner_branches: bool,
+    /// The pass's `pr.ownSpaceOnly` (agent-board#675): the pass writes only
+    /// in our own space ([`Config::ours`]). A step in any other followed
+    /// repository is left to the operator, a `needs-human` wait the inbox
+    /// lists, with nothing written there ([`Config::writes_in`]). Off by
+    /// default.
+    pub own_space_only: bool,
     /// The pass's `pr.reviewPools`: the pass starts the review job for a
     /// head that has no run of it, paced on these pools, and the runs it
     /// started count as the job's ([`reviews_head`]). Empty (the default)
@@ -908,6 +935,7 @@ impl PollPolicy {
             check_reruns: false,
             unstall: false,
             owner_branches: false,
+            own_space_only: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
             review_caller_workflow: None,
@@ -3903,6 +3931,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         body: Value,
         allowed: u16,
     ) -> Result<(u16, Value)> {
+        self.writable(path)?;
         self.spend()?;
         self.writes += 1;
         let (status, response) = client.send(method, &format!("{API_ROOT}{path}"), &body)?;
@@ -3914,6 +3943,19 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .unwrap_or("message unavailable")
         );
         Ok((status, response))
+    }
+
+    /// The backstop to the steps' own [`Config::writes_in`]: no REST write
+    /// reaches a repository outside our own space with `pr.ownSpaceOnly`,
+    /// whichever path asks for it. GraphQL mutations name nodes, not
+    /// repositories, and are only the merge and update steps, which the
+    /// step's skip already holds.
+    fn writable(&self, path: &str) -> Result<()> {
+        if let Some(rest) = path.strip_prefix("repos/") {
+            let repo = rest.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
+            ensure!(self.config.writes_in(&repo), "{path}: {repo} {NOT_OURS}");
+        }
+        Ok(())
     }
 
     fn mutate(&mut self, mutation: &str, variables: Value) -> Result<()> {
@@ -5367,6 +5409,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Err(why) = self.paced(pool, &candidates) {
             return Ok(format!("not re-run: {why}"));
         }
+        self.writable(&format!("repos/{repo}/"))?;
         self.spend()?;
         self.writes += 1;
         let url = format!("{API_ROOT}repos/{repo}/actions/runs/{id}/rerun-failed-jobs");
@@ -6604,6 +6647,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if let Some(why) = &left {
             answer.clear();
             decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
+        }
+        // With `ownSpaceOnly`, every step that writes outside our own space,
+        // a stop included, is the operator's. Its `needs-human` wait is the
+        // hold, in the pass's own state and inbox, decided again each pass.
+        let writes = step_kind(decision.action).is_some() || !answer.is_empty();
+        if (writes || retarget.is_some()) && !self.config.writes_in(repo) {
+            answer.clear();
+            retarget = None;
+            decision = step(
+                "skip",
+                format!(
+                    "{LEFT_TO_OPERATOR}{repo} {NOT_OURS} ({}: {})",
+                    decision.action, decision.reason
+                ),
+            );
         }
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
@@ -14156,6 +14214,110 @@ mod tests {
                     assert_eq!(variables["head"], HEAD, "{name}");
                 }
             }
+        }
+    }
+
+    /// With `pr.ownSpaceOnly`, a followed repository outside our own space,
+    /// as bootc-dev/bootc is (agent-board#675), gets no write: a step that
+    /// would write there is the operator's wait instead, and the pass does
+    /// not fail. Off, or in our own space, the stop labels as it did.
+    #[test]
+    fn own_space_only_writes_nothing_upstream() {
+        const UPSTREAM: &str = "bootc-dev/bootc";
+        let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
+        let used_up = json!({"rounds": 2, "sha": "older"});
+        // The recorded pull request and its reads, moved to `repo`; GraphQL
+        // reads go by number.
+        let moved = |repo: &str, change: Value, marker: &Value| {
+            let at = |v: &Value| -> Value {
+                serde_json::from_str(&v.to_string().replace(REPO, repo)).unwrap()
+            };
+            let mut fake = github();
+            fake.pulls.insert(470, pull("pull-470", change));
+            if !marker.is_null() {
+                let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+                fake.rest.get_mut(&comments).unwrap().3 = json!([
+                    {"id": 5, "user": {"login": BOT}, "body": marker_body(marker, "Fix round 2 of 2.")}
+                ]);
+            }
+            fake.rest = std::mem::take(&mut fake.rest)
+                .into_iter()
+                .map(|(url, (etag, modified, next, body))| {
+                    let next = next.map(|n| n.replace(REPO, repo));
+                    (url.replace(REPO, repo), (etag, modified, next, at(&body)))
+                })
+                .collect();
+            fake.pulls = (fake.pulls.iter()).map(|(n, p)| (*n, at(p))).collect();
+            // The label exists already.
+            fake.answers.borrow_mut().insert(
+                format!("{API_ROOT}repos/{repo}/labels"),
+                vec![(422, json!({}))],
+            );
+            fake
+        };
+        // The step decided, the repository followed, `ownSpaceOnly`, and
+        // whether the stop labels and posts its marker.
+        for (action, change, marker, repo, own_space_only, stops) in [
+            ("needs-human", &changes, &used_up, UPSTREAM, true, false),
+            ("fix", &changes, &Value::Null, UPSTREAM, true, false),
+            ("merge", &json!({}), &Value::Null, UPSTREAM, true, false),
+            ("needs-human", &changes, &used_up, UPSTREAM, false, true),
+            ("needs-human", &changes, &used_up, REPO, true, true),
+        ] {
+            let name = format!("{action} in {repo}, ownSpaceOnly {own_space_only}");
+            let fake = moved(repo, change.clone(), marker);
+            let mut cfg = config();
+            cfg.policy.own_space_only = own_space_only;
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[repo.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            let got = outcome.lines.last().unwrap();
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            if stops {
+                let writes = [
+                    format!("POST repos/{repo}/labels"),
+                    format!("POST repos/{repo}/issues/470/labels"),
+                    format!("POST repos/{repo}/issues/470/comments"),
+                ];
+                assert!(got.ends_with("-> labelled needs-human"), "{name}: {got}");
+                assert_eq!(written(&fake.writes), writes, "{name}");
+                continue;
+            }
+            let why = format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS} ({action}: ");
+            assert!(got.contains(&format!("skip: {why}")), "{name}: {got}");
+            assert!(fake.writes.borrow().is_empty(), "{name}: {got}");
+            let waits: Vec<_> = (outcome.waits.iter())
+                .map(|w| (w.kind, w.reason.starts_with(&why)))
+                .collect();
+            assert_eq!(waits, [("needs-human", true)], "{name}");
+        }
+    }
+
+    #[test]
+    fn own_space_table() {
+        // dispatch_repo is cgwalters-forge/tracker and the bot cgwalters-bot.
+        for (repo, ours) in [
+            ("cgwalters-forge/agent-board", true),
+            ("CGWalters-Forge/agent-board", true),
+            ("cgwalters-bot/bootc", true),
+            ("bootc-dev/bootc", false),
+            ("composefs/composefs-rs", false),
+            ("cgwalters-forge-x/agent-board", false),
+        ] {
+            let mut cfg = config();
+            assert!(cfg.writes_in(repo), "{repo}: off writes everywhere");
+            cfg.policy.own_space_only = true;
+            assert_eq!(cfg.writes_in(repo), ours, "{repo}");
         }
     }
 

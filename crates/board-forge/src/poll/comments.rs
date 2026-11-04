@@ -1125,7 +1125,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // issues hold the claims, read with any left on the thread before.
         // The checks that need no lookup go first, as each lookup is a search.
         let mine = pull && text(hit, "/user/login") == bot;
-        let routed = !said.is_empty() && !mine && !self.ours(repo);
+        let routed = !said.is_empty() && !mine && !self.config.ours(repo);
         if routed && addressed && !said.iter().any(|s| explicit(&s.body, &bot)) {
             return Ok(None);
         }
@@ -1248,6 +1248,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         ensure!(!head.is_empty(), "the pull request has no head");
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
             return Ok((true, format!("left to a person: labelled {LABEL}")));
+        }
+        if !self.config.writes_in(repo) {
+            return Ok((true, format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS}")));
         }
         // As on a followed pull request: the policy step would refuse the run.
         if let Some(why) = self
@@ -1795,14 +1798,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         }
         Ok((issue, Vec::new()))
-    }
-
-    /// Whether `repo` is in our own space: the organization of
-    /// `Config::dispatch_repo`, or the bot's own account.
-    fn ours(&self, repo: &str) -> bool {
-        let home = self.config.dispatch_repo.split_once('/').map(|(o, _)| o);
-        let ours = [home.unwrap_or(&self.config.dispatch_repo), &self.config.bot];
-        in_scope(&ours.map(|owner| format!("{owner}/*")), repo)
     }
 
     /// The bot's issues in the tracker that track a thread outside our own

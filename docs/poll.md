@@ -317,6 +317,23 @@ run apply would refuse, after which the pull request was labelled
 the file is the head repository's own decision, made in a commit to its
 default branch; the poll never writes it.
 
+With the pass's [`pr.ownSpaceOnly: true`](pass.md#one-configuration-file) (off
+by default; not a standalone poll option), the poll writes nothing in a
+followed repository outside our own space, the organization of `dispatchRepo`
+and the bot's own account (agent-board#675). The bot has no say in an upstream
+repository such as `bootc-dev/bootc`: creating `needs-human` there was refused
+with a 404 that failed every pass, and a label or comment that went through
+would be the bot's noise in someone else's project. So any step there that
+writes, a fix round, merge, update, rerun, retarget or stop, is skipped instead,
+its line saying `skip: left to the operator: OWNER/REPO is outside our own space
+(pr.ownSpaceOnly), so the pass writes nothing there (STEP: REASON)`. That is a
+`needs-human` wait, which the pass's inbox lists: the hold lives in the pass's
+own state, decided again each pass, not in a label. An operator's comment there
+starts no round, and `lockCollaboratorItems` locks nothing there. Every REST
+write the poll makes is checked once more before it is sent. Fix rounds on such
+a pull request need their claims and markers kept off the thread first, which
+this does not do.
+
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more
 round, the diagnostic round, on that pool, before `needs-human`
