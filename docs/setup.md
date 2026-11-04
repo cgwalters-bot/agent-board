@@ -256,7 +256,7 @@ dispatch caller (step 2) and the review caller (step 4); each says so.
    applies. Audit dispatch and fix bounds and pools before enabling a scheduled
    applier, and never run two appliers against one board.
 
-Operator-only work, which no agent and no guide can do: authorize the network
+Only the operator can do the following; no agent or guide can do it: authorize the network
 identity and its ACLs, admit the specific repository and workflow identities and
 finite budgets at the broker, keep model credentials only at the broker, and
 provision the protected apply, reconcile and live-test secrets with effective
@@ -455,7 +455,7 @@ did not create.
 
 The `agent-board.deploy-smoke.v1` report adds `writes` (cleanup included) and a
 `smoke` object with `steps` (`ok`, `failed` or `cancelled`), `receipts`, `cleanup`
-(`deleted` or `failed`) and `leftovers`, which are to be removed by hand using
+(`deleted` or `failed`) and `leftovers`. Remove leftovers by hand using
 the IDs or names in the report. Exit status 0 means every step passed and nothing
 was left, 2 means the deadline stopped the run (cleanup still ran), 4 means
 GitHub refused the credentials, and 1 means any other failure, a refused

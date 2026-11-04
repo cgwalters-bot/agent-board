@@ -7,9 +7,9 @@ For proposals of human-executed issue and PR mutations, see
 
 A job plan is a proposed agent run, written as a comment on the issue it
 serves ([#46](https://github.com/cgwalters-forge/agent-board/issues/46)).
-Dispatch starts exactly the job the newest accepted plan describes and adds
-nothing of its own, so where and how a job runs is a record on the issue rather
-than a decision made in the controller.
+Dispatch starts exactly the job the newest accepted plan describes and doesn't
+add anything. The issue records where and how a job runs; the controller
+doesn't make that decision.
 
 ## Format
 
@@ -45,9 +45,9 @@ start of a line, holding one JSON object:
 Every field but `schema` and `runner` maps onto one input of the caller's dispatch workflow
 ([dispatch](dispatch.md#the-request); `brief` is `task`; `stacks_on` becomes
 `base`, a branch dispatch finds).
-Anything else, including `null` for a field, is refused: the base branch,
-budget and allowed outputs have no caller input yet, and a plan that names
-them must not look honoured when it is not. A `devspace` runner is refused for the same reason; the caller has no
+Anything else, including `null` for a field, is refused: the caller has no inputs
+for the base branch, budget or allowed outputs yet, so a plan must not appear to
+set them. A `devspace` runner is refused for the same reason; the caller has no
 devspace runner for upstream forks yet. Each is added to the schema when the
 caller can carry it. One plan per comment; a comment with two is refused.
 
@@ -126,8 +126,8 @@ The scheduled [pass](pass.md#scheduling) dispatches the newest accepted,
 unrecorded `implement` or `triage` plan by this protocol, once per plan, so a
 run that has ended does not start its plan again. A `triage` plan is not
 checked for [overlap](#overlap), [stacked](#stacking) or
-[batched](#batching), as its run changes no files. A `triage` plan of another
-issue than the one it is on, and a `research` plan, stay manual dispatches:
+[batched](#batching), as its run changes no files. A `triage` plan targeting an
+issue other than the one it is on, and a `research` plan, stay manual dispatches:
 the pass would not follow up either run's output.
 
 ## Collaborator input
@@ -144,7 +144,7 @@ where it wrote; `--dry-run` checks the same. Nothing requires it: the
 supervisor's dispatches do not (agent-board#155), as the sandbox, the bounded
 safe outputs and the review before merge are the boundary.
 
-It reads whole or refuses: an item with more than 100 of any of those, or more
+It requires complete reads: an item with more than 100 of any of those, or more
 than 30 distinct writers, is refused, as is a deleted or unnamed account, any
 app bot, or an issue whose repository's collaborators `GH_TOKEN` cannot read
 (a target in a repository we do not own).
@@ -235,7 +235,7 @@ runs in flight are never waived.
 `agent-board overlap -R OWNER/REPO --caller OWNER/REPO --workflow FILE` with
 one of `--paths P…`, `--branch B` or `--pr N` answers the same question for a
 change before anyone starts it ([#297](https://github.com/cgwalters-forge/agent-board/issues/297)):
-which open pull requests of the repository, of any author, and which implement
+which open pull requests in the repository, by any author, and which implement
 runs in flight on the caller's workflow share a path with it. It reads them as
 the check above does, with the same function: each pull request's first 100
 files (of the newest 250 open ones, said when there are more), and the paths

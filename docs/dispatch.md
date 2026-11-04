@@ -14,7 +14,7 @@ Actions `workflow_dispatch`. The Forgejo pass's stage 4 also uses native
 Forgejo adapters (see below); closed
 [agent-board#295](https://github.com/cgwalters-forge/agent-board/issues/295)
 delivered only the start request.
-This page describes the interface as it exists.
+This page describes the current interface.
 
 ## Who dispatches
 

@@ -33,7 +33,7 @@ which the command refuses to run:
 
 An issue labelled `review-draft` holds drafts in its body or in comments by the
 bot or the operator. The newest is the last such block in the thread, the body
-first; one edited by anyone else is refused. Its header names the pull request,
+first. A draft edited by anyone else is refused. Its header names the pull request,
 the head its lines refer to and the review event:
 
 ````markdown
@@ -87,9 +87,9 @@ Otherwise it claims the issue with a comment whose first line is
 `head` (else the claim becomes the refusal), posts one review at `head` whose
 body starts with a line saying the operator approved sending it, records the
 review's URL in the claim and closes the issue as completed. An issue with a
-claim is never sent again, even after a failure, which needs the operator to
-look before removing the claim.
+claim is never sent again, even after a failure. The operator must inspect the
+failure before removing the claim.
 
-The bot never rewrites the issue's body, its box included: GitHub has no
+The bot never rewrites the issue's body, including its checkbox: GitHub has no
 conditional issue update, so a rewrite could overwrite an edit made while it
 ran. A box left ticked after a refusal or a send approves nothing more.

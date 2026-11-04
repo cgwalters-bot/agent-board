@@ -394,7 +394,7 @@ including edits by someone other than the bot. Metadata still costs API
 reads; a cache miss additionally reads bodies within the same existing pass
 bounds, reserving room for both reads and hold publication. This adds no
 option or mutation authority; it remains off unless `holds.needsYou` is set.
-Summaries enrich asks but are no source of them, so they do not make the list incomplete. A review
+Summaries add detail to asks but don't create them, so they do not make the list incomplete. A review
 wait asks its step's reason; a proposal its title, recommending the first
 line of its `why`; a digest entry what its group asks, recommending its
 reason, concern or drafted reply. Every text is its first line, cut to 500
@@ -535,8 +535,8 @@ failed, or no maintain day is known); or `off` (stage 3 without `epics`,
 stage 2 without `follow`, no `holds.proposals`, no `maintain`). Where a
 source is `unread`, the asks it published before are kept, and where it is
 `partial`, those of the repositories and issues it did not read; each has
-`"carried": true`, and is listed again only while well formed. Nothing of a
-published list is carried, nor its `waiting_since`, questions or
+`"carried": true`, and is listed again only while well formed. No part of a
+published list is carried, including its `waiting_since`, questions or
 `changed_at`, unless GitHub says the bot both wrote and last edited its
 comment (one GraphQL read): anyone with write access may edit it. Stage 4's
 holds are carried as above. `complete` is true only where each source is
@@ -1943,7 +1943,7 @@ to auto-merge) counts as moving only until the head has stood still for
 H hours (…)` and its items' holds stall as before. So do they where the
 step was not taken (`… stage 2's step did not run this pass (…)`: a cap,
 pacing, the poll's dispatch limit, a refused merge, another pass first).
-Any other wait is a person's. The pass starts and writes nothing of its own
+Any other wait needs a person. The pass doesn't start runs or make writes of its own
 here.
 
 Otherwise only a person moves it: stage 2 stopped it, left it to its author
@@ -2464,7 +2464,7 @@ pending checkpoint may override the forge evidence. A completed run gets five
 minutes for its answer to arrive; an unconfirmed dispatch gets six hours before
 being reported unresolved. An unresolved request is retried once, six hours
 after its run ended (or after the request, where GitHub named no run), since
-a run that answers nothing usually failed for a passing reason; the retry's
+a run that doesn't answer usually failed because of a temporary problem; the retry's
 plan comment names the request it retries, so the next pass reads it from the
 forge. A retry that is unresolved too is not retried again: the epic is
 labelled `needs-human` with a `Q:` in its Why, so that it reaches the
@@ -2590,7 +2590,7 @@ it expires. Admit reaps the one whose slot it takes; stage 3 or 4 of a pass
 with `leases` set reaps every one, each one write step (a preview frees none
 and prints `lease: reap NAME: why; a preview does not free it`), and counts
 the runs holding the rest toward `wip`, once each with the runs it lists. A
-commit there that is no lease holds nothing, and a ref that is no slot is
+commit there that isn't a lease holds nothing, and a ref that isn't a slot is
 ignored. More than 100 lease refs, or a lease that cannot be read, is an
 error: capacity read without them would be guessed.
 
