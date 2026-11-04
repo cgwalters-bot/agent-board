@@ -1214,12 +1214,12 @@ pub struct NeedsYou {
     /// How much of the bot's summaries of the held issues this pass read:
     /// they enrich asks, but are no source of them.
     pub summaries: Read,
-    /// Decisions omitted from the inventory (always zero).
+    /// Decisions omitted only when even the identity inventory cannot fit.
     pub omitted: usize,
     /// How many decisions, including identities whose detail did not fit.
     pub count: usize,
     pub items: Vec<Ask>,
-    /// Complete decision inventory; `items` is only the detailed projection.
+    /// Ranked decision inventory; incomplete when `omitted` is nonzero.
     pub identities: Vec<Identity>,
     pub epics: BTreeMap<String, EpicActivity>,
     pub details_omitted: usize,
@@ -1272,6 +1272,18 @@ impl NeedsYou {
             .filter(|i| !self.items.iter().any(|a| a.key == i.detail_key))
             .count();
         Some(ask)
+    }
+
+    /// What [`cap`] leaves of a list with no detail card left: no source
+    /// records or epic activity, and only the first `keep` identities, the
+    /// rest counted in `omitted`.
+    fn capped(&mut self, keep: usize) {
+        self.request_sources.clear();
+        self.requests.clear();
+        self.epics.clear();
+        self.omitted += self.identities.len().saturating_sub(keep);
+        self.identities.truncate(keep);
+        self.complete = false;
     }
 }
 
@@ -2089,12 +2101,18 @@ pub(super) fn preserve_changed_at(list: &mut NeedsYou, previous: Option<&Value>)
         list
     };
     // Where [`fit`] cut the published list's tail, the same list is this
-    // one cut as far.
+    // one cut as far; where [`cap`] went on past the last card, capped as far.
     let same = previous.filter(|p| {
         let mut cut = list.clone();
         let published = p["items"].as_array().map_or(0, Vec::len);
         while cut.items.len() > published && cut.cut().is_some() {}
-        serde_json::to_value(&cut).is_ok_and(|now| content(p) == content(&now))
+        let same =
+            |cut: &NeedsYou| serde_json::to_value(cut).is_ok_and(|now| content(p) == content(&now));
+        same(&cut)
+            || cut.items.is_empty() && {
+                cut.capped(p["identities"].as_array().map_or(0, Vec::len));
+                same(&cut)
+            }
     });
     if let Some(since) = same.and_then(|p| not_after(&p["changed_at"], &list.validated_at)) {
         list.changed_at = since;
@@ -2186,10 +2204,9 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// never keep the holds from being published, and a hold's stall clock,
 /// the `since` the next pass carries over ([`carry`]), outlasts the other
 /// holds: no alarm is kept without its hold. The operator's own holds and
-/// the holds of every new run are always kept; past them, the needs-you
-/// list's lowest ranked asks are left out, counted in its `omitted`, so
-/// that what it can show is shown, and with none left the list goes whole.
-/// If the holds alone do not fit, that is an error.
+/// the holds of every new run are kept ahead of needs-you detail cards.
+/// If even the inventory or protected holds cannot fit, [`cap`] publishes
+/// an honestly incomplete snapshot rather than freezing the inbox.
 pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let holds = &snapshot.holds;
     let on = |h: &Published| (h.item.clone(), h.epic);
@@ -2224,21 +2241,21 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let mut order = order.into_iter();
     let mut dropped = BTreeSet::new();
     let mut needs_you = snapshot.needs_you.clone();
-    loop {
-        let kept = (holds.iter().enumerate())
+    let without = |dropped: &BTreeSet<usize>, needs_you: &Option<NeedsYou>| Snapshot {
+        schema: snapshot.schema,
+        at: snapshot.at.clone(),
+        truncated: dropped.len(),
+        wip: snapshot.wip.clone(),
+        pass: snapshot.pass.clone(),
+        leases: snapshot.leases.clone(),
+        needs_you: needs_you.clone(),
+        holds: (holds.iter().enumerate())
             .filter(|(n, _)| !dropped.contains(n))
             .map(|(_, h)| h.clone())
-            .collect();
-        let fitted = Snapshot {
-            schema: snapshot.schema,
-            at: snapshot.at.clone(),
-            truncated: dropped.len(),
-            wip: snapshot.wip.clone(),
-            pass: snapshot.pass.clone(),
-            leases: snapshot.leases.clone(),
-            needs_you: needs_you.clone(),
-            holds: kept,
-        };
+            .collect(),
+    };
+    loop {
+        let fitted = without(&dropped, &needs_you);
         let body = render(&fitted)?;
         let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
         if over == 0 {
@@ -2254,11 +2271,11 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         // which the next round sees.
         while over > 0 {
             let Some(group) = order.next() else {
-                // With no ask left to cut, the list's own fields go too.
+                // Detail eviction normally preserves every identity. In the
+                // emergency case, keep publishing with explicit incompleteness,
+                // the holds this round left out included.
                 let Some(_) = needs_you.as_mut().and_then(NeedsYou::cut) else {
-                    anyhow::bail!(
-                        "the hold snapshot is over {MAX_COMMENT_CHARS} characters with the complete decision inventory; refusing to publish a capped inbox"
-                    );
+                    return cap(without(&dropped, &needs_you));
                 };
                 // A cut removes its descriptor too; re-render before cutting
                 // again so that the additional savings do not overcut asks.
@@ -2270,6 +2287,74 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
                 dropped.insert(n);
             }
         }
+    }
+}
+
+/// Last-resort single-comment fallback. Called only after all evictable holds
+/// and detail cards are gone. No extra writes or reader protocol are needed.
+fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
+    loop {
+        let body = render(&snapshot)?;
+        let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
+        if over == 0 {
+            return Ok((snapshot, body));
+        }
+        if let Some(list) = snapshot.needs_you.as_mut() {
+            // Source carry records and activity can outlive the last detail
+            // card. Missing activity is unknown, not proof of inactivity.
+            if !list.request_sources.is_empty()
+                || !list.requests.is_empty()
+                || !list.epics.is_empty()
+            {
+                list.capped(list.identities.len());
+                continue;
+            }
+            if !list.identities.is_empty() {
+                // Keep the highest ranked prefix. Batch the cut by encoded
+                // character size, then re-render to account for count digits.
+                let mut keep = list.identities.len();
+                while over > 0 && keep > 0 {
+                    keep -= 1;
+                    let size = serde_json::to_string(&list.identities[keep])?;
+                    over = over.saturating_sub(size.chars().count() + 1);
+                }
+                list.capped(keep);
+                continue;
+            }
+        }
+        if let Some(last) = snapshot.holds.last() {
+            // Even protected holds may overflow on their own. Keep an alarm
+            // and its base together, just as the normal fitting path does.
+            let on = (last.item.clone(), last.epic);
+            let before = snapshot.holds.len();
+            snapshot.holds.retain(|h| (h.item.clone(), h.epic) != on);
+            snapshot.truncated += before - snapshot.holds.len();
+            if let Some(list) = snapshot.needs_you.as_mut() {
+                list.complete = false;
+            }
+            continue;
+        }
+        // The remaining variable-size metadata is optional. Absence means
+        // unknown, never an empty lease inventory or complete accounting.
+        if snapshot.leases.is_some() || snapshot.pass.overhead.is_some() {
+            snapshot.leases = None;
+            snapshot.pass.overhead = None;
+            continue;
+        }
+        // Only carried timestamps can still have unbounded text here. Preserve
+        // their instants in canonical form rather than looping without progress.
+        let canonical = |text: &str| {
+            parse_time(text)
+                .and_then(|t| t.format(&Rfc3339).ok())
+                .unwrap_or_else(|| snapshot.at.clone())
+        };
+        snapshot.pass.progress_at = canonical(&snapshot.pass.progress_at);
+        if let Some(list) = snapshot.needs_you.as_mut() {
+            list.changed_at = canonical(&list.changed_at);
+            list.complete = false;
+        }
+        let body = render(&snapshot)?;
+        return Ok((snapshot, body));
     }
 }
 
@@ -2637,8 +2722,8 @@ mod tests {
         );
         let list = uncached.needs_you.unwrap();
         assert_eq!((list.items.len(), list.summary_cache.len()), (asks, 0));
-        // Never publish a list missing decision identities, even when the
-        // operator's holds alone leave no room for that inventory.
+        // Even when protected holds crowd out the inventory, publish an
+        // explicitly incomplete list rather than leaving the inbox frozen.
         let mut asked = bare(&board(0, 0));
         let pad = MAX_COMMENT_CHARS - chars(&render(&asked).unwrap()) - 10;
         asked
@@ -2648,12 +2733,10 @@ mod tests {
             .reason
             .push_str(&"p".repeat(pad));
         asked.needs_you = Some(listed(&waiting(), None, (true, true)));
-        assert!(
-            fit(asked)
-                .unwrap_err()
-                .to_string()
-                .contains("complete decision inventory")
-        );
+        let (asked, body) = fit(asked).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        assert!(!asked.needs_you.as_ref().unwrap().complete);
+        assert!(asked.needs_you.as_ref().unwrap().omitted > 0);
         let kept: BTreeSet<String> = fitted.holds.iter().filter_map(|h| h.item.clone()).collect();
         assert!(
             !kept.contains("o/work#55"),
@@ -2699,12 +2782,84 @@ mod tests {
         // One fewer left out would not fit.
         let back = serde_json::to_string(out[out.len() - 1]).unwrap();
         assert!(chars(&body) + chars(&back) + 2 > MAX_COMMENT_CHARS);
-        // The operator's questions alone past the limit are an error.
+        // Even the operator's questions alone past the limit are capped.
         let mut asked = board(0, 0);
         for hold in &mut asked[1..] {
             hold.why = Some(format!("Q: {}", "q".repeat(4000)));
         }
-        assert!(fit(bare(&asked)).is_err());
+        let full = bare(&asked);
+        let (fitted, body) = fit(bare(&asked)).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        assert!(fitted.truncated > 0);
+        assert_eq!(fitted.holds.len() + fitted.truncated, full.holds.len());
+    }
+
+    #[test]
+    fn inventory_over_sixty_thousand_characters_still_publishes() {
+        let mut snapshot = waiting();
+        let mut list = listed(&snapshot, None, (true, true));
+        let template = list.identities[0].clone();
+        list.identities = (0..400)
+            .map(|n| Identity {
+                key: format!("o/work#{n}"),
+                detail_key: format!("o/work#{n}"),
+                item: format!("o/work#{n}"),
+                ..template.clone()
+            })
+            .collect();
+        list.count = list.identities.len();
+        list.items.clear();
+        list.details_omitted = list.count;
+        assert!(chars(&serde_json::to_string(&list.identities).unwrap()) > MAX_COMMENT_CHARS);
+        let identities = list.identities.clone();
+        snapshot.needs_you = Some(list);
+        let protected =
+            |h: &Published| h.item.is_none() || h.operator && h.kind != HoldKind::Stalled;
+        let evictable = snapshot.holds.iter().filter(|h| !protected(h)).count();
+        let (fitted, body) = fit(snapshot).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        // Every hold that may be left out goes before any identity does.
+        assert!(evictable > 0);
+        assert_eq!(fitted.truncated, evictable);
+        assert!(fitted.holds.iter().all(protected));
+        let list = fitted.needs_you.as_ref().unwrap();
+        // One fewer omitted would not fit.
+        let back = serde_json::to_string(&identities[list.identities.len()]).unwrap();
+        assert!(chars(&body) + chars(&back) + 1 > MAX_COMMENT_CHARS);
+        assert!(!list.complete);
+        assert!(list.omitted > 0 && !list.identities.is_empty());
+        assert_eq!(list.count, 400);
+        assert_eq!(list.count, list.identities.len() + list.omitted);
+        assert_eq!(list.identities, identities[..list.identities.len()]);
+        assert_eq!(list.details_omitted, list.count);
+        let parsed = parse(&body).unwrap();
+        assert_eq!(parsed["needs_you"]["omitted"], list.omitted);
+        assert_eq!(parsed["needs_you"]["complete"], false);
+        assert_eq!(parsed["truncated"], fitted.truncated);
+        assert!(!changed(Some(&body), &fitted).unwrap());
+    }
+
+    #[test]
+    fn oversized_optional_metadata_still_publishes() {
+        let mut snapshot = waiting();
+        snapshot.holds.clear();
+        snapshot.leases = Some(vec![Held {
+            slot: 1,
+            lease: super::super::lease::Lease {
+                run: 1,
+                item: "o/r#1".into(),
+                pool: "p".repeat(MAX_COMMENT_CHARS),
+                taken_at: snapshot.at.clone(),
+                expires_at: snapshot.at.clone(),
+                overridden: false,
+            },
+        }]);
+        let (fitted, body) = fit(snapshot).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        assert!(
+            fitted.leases.is_none(),
+            "missing leases are unknown, not empty"
+        );
     }
 
     /// Only a change of the holds, the WIP count or the pass's summary
@@ -3643,7 +3798,24 @@ mod tests {
             assert_eq!(list.changed_at, at(30), "{holds} {first}");
             assert!(changed(Some(&body), &other).unwrap(), "{holds} {first}");
         }
+        // Likewise a list [`cap`] cut into its identities, over two passes.
+        let (first, body) = pass(CAPPED_HOLDS, "q", 0, None);
+        let list = first.needs_you.as_ref().unwrap();
+        assert!(list.omitted > 0 && !list.identities.is_empty(), "{list:?}");
+        let published = parse(&body);
+        for minutes in [30, 50] {
+            let (again, _) = pass(CAPPED_HOLDS, "q", minutes, published.as_ref());
+            assert_eq!(again.needs_you.as_ref().unwrap().changed_at, at(0));
+            assert!(!changed(Some(&body), &again).unwrap(), "{minutes}");
+        }
+        let (other, _) = pass(CAPPED_HOLDS + 1, "q", 30, published.as_ref());
+        assert_eq!(other.needs_you.as_ref().unwrap().changed_at, at(30));
+        assert!(changed(Some(&body), &other).unwrap());
     }
+
+    /// Enough operator holds in [`fit_cut_list_is_the_same_list_next_pass`]
+    /// that their identities do not all fit beside them.
+    const CAPPED_HOLDS: u64 = 200;
 
     const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

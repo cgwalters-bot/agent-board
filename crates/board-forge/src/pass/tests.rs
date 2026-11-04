@@ -3434,6 +3434,48 @@ fn apply_publishes_what_needs_you() {
     }
     assert_eq!(many_snapshot["needs_you"]["summaries"], "complete");
     let snapshot = holds::parse(&body).unwrap();
+    // A carried identity-only inventory can exceed a whole comment by itself.
+    // A full WIP pass must still edit the inbox successfully, not fail fitting.
+    let mut oversized = snapshot.clone();
+    let template = oversized["needs_you"]["identities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["source"] == "items")
+        .unwrap()
+        .clone();
+    let inventory: Vec<_> = (10000..10400)
+        .map(|n| {
+            let mut identity = template.clone();
+            let key = format!("cgwalters-forge/tracker#{n}");
+            for field in ["key", "detail_key", "item"] {
+                identity[field] = json!(key);
+            }
+            identity
+        })
+        .collect();
+    assert!(serde_json::to_string(&inventory).unwrap().chars().count() > holds::MAX_COMMENT_CHARS);
+    oversized["needs_you"]["identities"] = json!(inventory);
+    oversized["needs_you"]["count"] = json!(400);
+    for field in ["items", "requests", "request_sources"] {
+        oversized["needs_you"][field] = json!([]);
+    }
+    let oversized_body = format!("{}\n```json\n{oversized}\n```", holds::HOLDS_MARKER);
+    let forge = forge_with(Some(&oversized_body));
+    let report = apply(&forge, &with_wip(2));
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    let capped = forge
+        .writes
+        .borrow()
+        .iter()
+        .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
+        .map(|(_, _, body)| text(body, "/body").to_owned())
+        .unwrap_or_else(|| panic!("{:?}", report.lines));
+    assert!(capped.chars().count() <= holds::MAX_COMMENT_CHARS);
+    let capped = holds::parse(&capped).unwrap();
+    assert_eq!(capped["needs_you"]["complete"], false);
+    assert!(capped["needs_you"]["omitted"].as_u64().unwrap() > 0);
+    assert!(capped["needs_you"]["count"].as_u64().unwrap() >= 400);
     let list = &snapshot["needs_you"];
     assert_eq!(list["schema"], holds::NEEDS_YOU_SCHEMA);
     assert_eq!(
