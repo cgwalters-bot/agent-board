@@ -399,6 +399,7 @@ impl Accepted {
             kind: &self.plan.kind,
             brief: &self.plan.brief,
             pool: Some(&self.plan.pool),
+            effort: self.plan.effort,
             runner: Some(&self.plan.runner),
             base: None,
         }
@@ -456,6 +457,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.client,
             self.starts,
             target,
+            // Not `effort`: Forgejo drops undeclared inputs, so a heavy plan
+            // is refused until a caller can declare it, never run as default.
             ["task", "repo", "item", "kind", "pool"]
                 .map(String::from)
                 .into(),

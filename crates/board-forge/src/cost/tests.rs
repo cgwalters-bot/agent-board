@@ -221,6 +221,52 @@ fn reads_and_prices_a_recorded_day() {
 }
 
 #[test]
+fn actual_summary_model_sets_price_not_requested_effort() {
+    for effort in ["heavy", ""] {
+        for actual in ["praxis/gpt-6-astra", "praxis/gpt-6.1-sol", "unlisted"] {
+            let summary = json!({"model": actual, "effort": effort, "pool": "openai",
+                "tokens": {"input": 1_000_000}});
+            let run = counted(summary.to_string().as_bytes(), "o/r",
+                &json!({"id": 1, "path": ".github/workflows/dispatch.yml", "display_title": "implement o/r#1 (openai)"}),
+                &json!({"name": "dispatch-implement-agent-run"}), "u").unwrap();
+            let prices = BTreeMap::from([
+                (
+                    "praxis/gpt-6-astra".into(),
+                    Price {
+                        input: 10.0,
+                        cached_input: 1.0,
+                        output: 20.0,
+                    },
+                ),
+                (
+                    "praxis/gpt-6.1-sol".into(),
+                    Price {
+                        input: 2.0,
+                        cached_input: 0.2,
+                        output: 4.0,
+                    },
+                ),
+            ]);
+            let report = report(
+                day(),
+                Day {
+                    runs: vec![run],
+                    ..Day::default()
+                },
+                &prices,
+            );
+            let expected = prices.get(actual).map(|p| p.input);
+            assert_eq!(report["runs"][0]["model"], actual);
+            assert_eq!(report["runs"][0]["usd"], json!(expected));
+            assert_eq!(
+                report["totals"]["unpriced_runs"],
+                u64::from(expected.is_none())
+            );
+        }
+    }
+}
+
+#[test]
 fn a_cached_summary_is_not_downloaded_again() {
     let dir = std::env::temp_dir().join(format!("cost-cache-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

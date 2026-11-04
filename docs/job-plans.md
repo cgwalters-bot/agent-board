@@ -38,6 +38,7 @@ start of a line, holding one JSON object:
 | `kind` | yes | `implement`, `triage` or `research`: the profile the run gets |
 | `runner` | yes | `hosted`, the only runner the caller has |
 | `pool` | no | Inference pool named in the caller's `pools.json`: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 32 bytes (`gpt5`, `claude-opus`), and not a `tier-` name; absent leaves it to the caller's variables |
+| `effort` | no | Only `"heavy"`: request the selected pool's optional heavy model; omit for the existing default model. Null, empty, `"default"` and other values are refused |
 | `brief` | yes | The task, at most 16,000 characters; the run gets it after the kind's profile |
 | `stacks_on` | no | Another issue number in `repo` whose pull request this implement run builds on ([stacking](#stacking)) |
 
@@ -49,6 +50,22 @@ budget and allowed outputs have no caller input yet, and a plan that names
 them must not look honoured when it is not. A `devspace` runner is refused for the same reason; the caller has no
 devspace runner for upstream forks yet. Each is added to the schema when the
 caller can carry it. One plan per comment; a comment with two is refused.
+
+### Model effort (caller deployment required)
+
+Planners must omit `effort` for now: no caller accepts it yet, so GitHub
+refuses a heavy plan's dispatch and the native Forgejo pass holds it. Once the
+[caller contract](dispatch.md#heavy-model-caller-contract) is deployed and
+verified, `effort: "heavy"` is meant for architecture/design, large or
+cross-cutting changes, a second attempt after a failed or blocked run, and
+substantial research. It is one model variant within the same pool, not a
+second pool or a free-form model override. No effort input is sent when
+omitted, preserving existing callers' default behavior.
+
+agent-board carries the choice in manual and scheduled plan dispatch, including
+routed requests; it does not own the caller's pools file or resolve its model.
+A heavy request must fail before inference if the effective pool has no heavy
+model, including when the pool was inherited.
 
 ## Who may write one
 
@@ -158,7 +175,7 @@ conflicting with each other while they wait. The issue and every extra must be:
   "waiting on/for" in its body; batch members cannot depend on each other;
 - without a pull request that closes it, open, merged or closed;
 - for an extra, planned by its own accepted implement plan for that issue, with
-  the primary's runner and pool, and not recorded already.
+  the primary's runner, pool and effort (including omission), and not recorded already.
 
 Extras are taken oldest first, from at most ten candidates read, while the
 whole task stays within 32,000 characters. An epic or a sibling that cannot be

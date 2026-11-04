@@ -23,6 +23,8 @@ pub struct Start<'a> {
     pub brief: &'a str,
     /// `None` leaves the input out; an empty one is sent empty.
     pub pool: Option<&'a str>,
+    /// Optional model variant, resolved by the caller after pool inheritance.
+    pub effort: Option<crate::plan::Effort>,
     /// Not sent: the caller workflow has one runner and no such input.
     pub runner: Option<&'a str>,
     /// A stacked plan's base branch; only then is a `base` input sent.
@@ -335,6 +337,9 @@ impl GitHub<'_> {
         if let Some(pool) = start.pool {
             body["inputs"]["pool"] = pool.into();
         }
+        if let Some(effort) = start.effort {
+            body["inputs"]["effort"] = effort.as_str().into();
+        }
         if let Some(base) = start.base {
             body["inputs"]["base"] = base.into();
         }
@@ -506,6 +511,7 @@ mod tests {
                 kind,
                 brief: "Look.",
                 pool: Some(pool),
+                effort: None,
                 runner: None,
                 base,
             };
@@ -524,6 +530,13 @@ mod tests {
                             body["inputs"]["pool"],
                             if pool.is_empty() { "openai" } else { pool }
                         );
+                        let heavy = Start {
+                            effort: Some(crate::plan::Effort::Heavy),
+                            ..start
+                        };
+                        let mut expected = body;
+                        expected["inputs"]["effort"] = json!("heavy");
+                        assert_eq!(github.routed_body(&heavy, Some(&route)).unwrap(), expected);
                     }
                 }
                 (Err(error), Err(want)) => {
@@ -833,6 +846,7 @@ mod tests {
             kind: "fix",
             brief: "Fix it.",
             pool: None,
+            effort: None,
             runner: Some("hosted"),
             base: None,
         };
@@ -948,6 +962,7 @@ mod tests {
             kind: "triage",
             brief: "Look.",
             pool: Some("small"),
+            effort: None,
             runner: None,
             base: Some("stack/lower"),
         };

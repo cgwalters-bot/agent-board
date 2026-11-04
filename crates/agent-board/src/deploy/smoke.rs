@@ -343,6 +343,7 @@ impl<T: Transport + board_forge::github::GraphQl> Run<'_, T> {
                 kind: FAKE_KIND,
                 brief: FAKE_TASK,
                 pool: None,
+                effort: None,
                 runner: None,
                 base: None,
             };

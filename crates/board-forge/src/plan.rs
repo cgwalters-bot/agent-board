@@ -59,6 +59,7 @@ const FIELDS: &[&str] = &[
     "kind",
     "runner",
     "pool",
+    "effort",
     "brief",
     "stacks_on",
 ];
@@ -103,11 +104,26 @@ pub struct JobPlan {
     pub runner: String,
     /// Inference pool; empty leaves it to the caller's variables.
     pub pool: String,
+    /// Optional variant within the same pool; never a model supplied by a plan.
+    pub effort: Option<Effort>,
     /// The task, given to the run after the kind's profile.
     pub brief: String,
     /// An issue in `repo` whose open pull request this run builds on
     /// ([`crate::stack`]): an implement run only, and never the plan's own item.
     pub stacks_on: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effort {
+    Heavy,
+}
+
+impl Effort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Heavy => "heavy",
+        }
+    }
 }
 
 impl JobPlan {
@@ -175,6 +191,16 @@ impl JobPlan {
                 pool
             }
         };
+        let effort = match object.get("effort") {
+            None => None,
+            Some(_) => {
+                ensure!(
+                    text("effort")? == "heavy",
+                    "plan effort must be heavy or omitted"
+                );
+                Some(Effort::Heavy)
+            }
+        };
         let brief = text("brief")?;
         ensure!(!brief.trim().is_empty(), "plan brief is empty");
         ensure!(
@@ -201,6 +227,7 @@ impl JobPlan {
             kind: kind.into(),
             runner: runner.into(),
             pool: pool.into(),
+            effort,
             brief: brief.into(),
             stacks_on,
         })
@@ -271,6 +298,7 @@ impl JobPlan {
             kind: &self.kind,
             brief: &self.brief,
             pool: Some(&self.pool),
+            effort: self.effort,
             runner: Some(&self.runner),
             base,
         }
@@ -1286,6 +1314,25 @@ mod tests {
     fn plan_validation_table() {
         let valid = JobPlan::from_json(&plan()).unwrap();
         assert_eq!(valid.item, 3665);
+        assert_eq!(valid.effort, None);
+        for effort in [
+            Value::Null,
+            json!(false),
+            json!(7),
+            json!({}),
+            json!(""),
+            json!("default"),
+            json!("Heavy"),
+        ] {
+            let mut invalid = plan();
+            invalid["effort"] = effort;
+            assert!(
+                JobPlan::from_json(&invalid)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("effort")
+            );
+        }
         let mut no_pool = plan();
         no_pool.as_object_mut().unwrap().remove("pool");
         assert_eq!(JobPlan::from_json(&no_pool).unwrap().pool, "");
@@ -1370,6 +1417,25 @@ mod tests {
             assert_eq!(error, format!("plan has no {key}"));
         }
         assert!(JobPlan::from_json(&json!([plan()])).is_err());
+    }
+
+    #[test]
+    fn effort_is_carried_without_changing_the_pool() {
+        for pool in [Some("claude"), None] {
+            let mut value = plan();
+            if pool.is_none() {
+                value.as_object_mut().unwrap().remove("pool");
+            }
+            let default = JobPlan::from_json(&value).unwrap();
+            let request = default.dispatch_request(&target(), None).unwrap();
+            assert!(request["body"]["inputs"].get("effort").is_none());
+            value["effort"] = json!("heavy");
+            let heavy = JobPlan::from_json(&value).unwrap();
+            assert_eq!(heavy.effort, Some(Effort::Heavy));
+            let mut request = request;
+            request["body"]["inputs"]["effort"] = json!("heavy");
+            assert_eq!(heavy.dispatch_request(&target(), None).unwrap(), request);
+        }
     }
 
     #[test]
@@ -2465,6 +2531,7 @@ mod tests {
             ("off", 0, "", &["small"], Ok(&[])),
             ("three", 3, "", &["small"], Ok(&[541, 545, 546])),
             ("two", 2, "", &["small"], Ok(&[541, 545])),
+            ("effort mismatch", 3, "heavy extra", &["small"], Ok(&[545, 546])),
             ("primary not small", 3, "", &["P2"], Ok(&[])),
             ("primary opted out", 3, "", &["small", "no-batch"], Ok(&[])),
             // Another pass taking an extra first leaves only that one out.
@@ -2482,6 +2549,17 @@ mod tests {
         ];
         for (name, batch, twist, labels, expected) in cases {
             let mut others = siblings();
+            if *twist == "heavy extra" {
+                let mut p = JobPlan::from_comment(others[&541][0]["body"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap();
+                p.effort = Some(Effort::Heavy);
+                let mut value = plan();
+                value["repo"] = json!(p.repo);
+                value["item"] = json!(p.item);
+                value["effort"] = json!("heavy");
+                others.get_mut(&541).unwrap()[0]["body"] = json!(body(&value));
+            }
             if *twist == "long" {
                 // Each section is "\n\n## cgwalters-forge/tracker#N\n\n" and
                 // its brief; the primary's brief is "Do #540.".

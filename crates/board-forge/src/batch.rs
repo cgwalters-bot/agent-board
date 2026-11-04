@@ -277,8 +277,8 @@ pub fn select<T: Transport>(
                 "not an implement plan for this issue"
             );
             ensure!(
-                p.runner == plan.runner && p.pool == plan.pool,
-                "plan asks for another runner or pool"
+                p.runner == plan.runner && p.pool == plan.pool && p.effort == plan.effort,
+                "plan asks for another runner, pool or effort"
             );
             // Its run starts from another branch than the primary's.
             ensure!(p.stacks_on.is_none(), "plan stacks on another issue");

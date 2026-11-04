@@ -531,6 +531,9 @@ impl EpicPlan {
                         if !plan.pool.is_empty() {
                             fields["pool"] = json!(plan.pool);
                         }
+                        if let Some(effort) = plan.effort {
+                            fields["effort"] = json!(effort.as_str());
+                        }
                         // Apply puts the created issue's number in place of NEW-k.
                         match stacks_on {
                             Some(Target::Issue(lower)) => fields["stacks_on"] = lower.number.into(),
@@ -1286,6 +1289,20 @@ mod tests {
                 "body": "Schema and dry run only.", "reason": "Apply is its own slice."}),
             json!({"type": "set_priority", "issue": "cgwalters-forge/agent-board#63", "value": "P0"}),
         ]
+    }
+
+    #[test]
+    fn heavy_effort_survives_child_plan_creation() {
+        let mut child = create();
+        child["plan"]["effort"] = json!("heavy");
+        let checked = EpicPlan::validate(&plan(vec![child]), &bounds(), &epic()).unwrap();
+        let mutations = checked.mutations(&epic());
+        let body = mutations
+            .iter()
+            .filter_map(|m| m.pointer("/body/body").and_then(Value::as_str))
+            .find(|body| body.contains("effort"))
+            .unwrap();
+        assert!(body.contains("\"heavy\""));
     }
 
     #[test]

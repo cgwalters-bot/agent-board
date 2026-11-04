@@ -48,9 +48,10 @@ impl<'a, T: Transport> Forgejo<'a, T> {
             "dispatch bot must be a configured recorder id"
         );
         ensure!(
-            accepted_inputs
-                .iter()
-                .all(|s| ["task", "repo", "item", "kind", "pool", "base"].contains(&s.as_str()))
+            accepted_inputs.iter().all(|s| [
+                "task", "repo", "item", "kind", "pool", "base", "effort"
+            ]
+            .contains(&s.as_str()))
                 && ["task", "repo", "item", "kind"]
                     .iter()
                     .all(|s| accepted_inputs.contains(*s)),

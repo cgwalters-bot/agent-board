@@ -496,6 +496,7 @@ pub fn from_plan<T: Transport + Rest>(
                 kind: &plan.kind,
                 brief: &plan.brief,
                 pool: Some(&plan.pool),
+                effort: plan.effort,
                 runner: Some(&plan.runner),
                 base: None,
             })

@@ -379,6 +379,39 @@ fn applying(fake: &Applying, limits: Limits) -> Report {
     .unwrap()
 }
 
+#[test]
+fn heavy_plan_is_refused_not_run_on_the_default_model() {
+    for effort in [None, Some("heavy")] {
+        let fake = Applying::new();
+        let mut plan = json!({"schema": JOB_PLAN_SCHEMA, "repo":"example/work", "item":7,
+            "kind":"implement", "runner":"hosted", "brief":"Implement the task.", "pool":"claude"});
+        if let Some(effort) = effort {
+            plan["effort"] = effort.into();
+        }
+        fake.comments.borrow_mut().get_mut(&7).unwrap()[0]["body"] =
+            format!("```agent-board-plan\n{plan}\n```").into();
+        let report = applying(&fake, Limits::default());
+        if effort.is_some() {
+            assert_eq!(fake.posts("/dispatches"), 0, "{:#?}", report.lines);
+            assert!(
+                format!("{:?}", report.lines).contains("caller does not accept requested input"),
+                "{:#?}",
+                report.lines
+            );
+            continue;
+        }
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert_eq!(fake.posts("/dispatches"), 1, "{:#?}", report.lines);
+        let runs = fake.runs.borrow();
+        assert_eq!(runs.len(), 1);
+        let payload: Value =
+            serde_json::from_str(runs[0]["event_payload"].as_str().unwrap()).unwrap();
+        let inputs = &payload["inputs"];
+        assert_eq!(inputs["pool"], "claude");
+        assert!(inputs.get("effort").is_none());
+    }
+}
+
 fn revisit_file() -> Value {
     let mut value = file();
     value["board"]["url"] = URL.into();

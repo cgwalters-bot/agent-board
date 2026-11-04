@@ -10,6 +10,9 @@ from the caller's configuration, and only those bounds limit what it may change.
 `epic plan --dry-run` prints the GitHub mutations a plan would make.
 `epic apply ISSUE --config FILE` previews by default; `--apply` acts with the
 configured bot's token. Ordering is expressed only by sub-issue Priority.
+A child job plan's optional `effort` survives child-plan creation, but omit it
+for now: no caller accepts it yet ([model effort](job-plans.md#model-effort-caller-deployment-required)).
+
 Apply and its preview require positive evidence of the parent's `epic` label;
 apply checks it again after claiming. This prevents the planner from starting
 decompositions on ordinary issues or its own new children. Anyone with triage

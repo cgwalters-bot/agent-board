@@ -22,6 +22,7 @@
         "schema": {"const": "agent-board/job-plan/v1"},
         "kind": {"enum": ["implement", "triage", "research"]}, "runner": {"const": "hosted"},
         "pool": {"type": "string", "maxLength": 32, "pattern": "^(?!tier-)[a-z0-9][a-z0-9_-]*(?![\\s\\S])"},
+        "effort": {"const": "heavy"},
         "brief": {"type": "string", "minLength": 1, "maxLength": 16000, "pattern": "\\S"}
       }
     },
