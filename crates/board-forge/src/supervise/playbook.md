@@ -165,6 +165,29 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   failure.
 - **approved**: an approved pull request not merging. Find what blocks it
   (checks, conflicts, a draft) and report the blocker.
+- **queue-aged**: queue residence of at least 60 minutes. Read the entry's
+  state and latest matching merge-group run. Residence is not unchanged-state
+  age: do not claim a state was stuck without a transition timestamp or prior
+  observations. Check required checks and queue blockers. If CI has failed and
+  the queue has not advanced, report whether the operator should dequeue and
+  re-enqueue after fixing or confirming the failure; do not do it yourself.
+- **reviews**: an eligible non-draft PR has no active or successful dedicated
+  review run for its current head after 15 minutes since its last update. Check
+  force-push/undraft events, cancellations, workflow admission and permissions.
+  An old-head approval or a cancelled review does not repair the missing run.
+  Report the current head and whether the operator should restart its review;
+  do not retry automatically or treat a missing observation as healthy.
+- **apply-failures**: an agent succeeded but apply failed in the same dispatch
+  attempt. Inspect the grouped first error and linked runs for a common wrapper
+  regression, policy refusal or permission failure. File one bug per recurring
+  signature (the same signature may appear in **signatures**, not a second bug).
+  Recommend correcting the cause before the operator reruns affected attempts;
+  do not replan their items just because apply failed.
+- **stalls**: at least three distinct failures completed within two minutes.
+  Inspect run links and observed pools alongside broker/provider evidence.
+  Describe time correlation, not proven provider causation; absent pool/provider
+  data is unknown. Investigate the shared incident before individual items and
+  report operator recovery choices, without automatic retry, cancel or replan.
 - **infrastructure**: `needs-human` added during a probe failure. Confirm
   the run failed from the outage and not from the change, and report the
   evidence.
