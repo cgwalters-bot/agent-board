@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+mod diagnostics;
 mod signatures;
 
 /// Each check, in report order, with what to do when it fails.
@@ -46,6 +47,22 @@ pub const CHECKS: &[(&str, &str)] = &[
         "Inspect the dispatch target before cancelling duplicate work.",
     ),
     ("queue", "Inspect queue removal events and failed checks."),
+    (
+        "queue-aged",
+        "Inspect queue residence, state and the matching merge-group run; report recovery to the operator.",
+    ),
+    (
+        "reviews",
+        "Inspect the current head's missing review and its cancelled or failed runs.",
+    ),
+    (
+        "apply-failures",
+        "Inspect agent-success/apply-failure attempts grouped by their first apply error.",
+    ),
+    (
+        "stalls",
+        "Inspect time-correlated stall failures before blaming or replanning individual items.",
+    ),
     (
         "approved",
         "Inspect merge requirements for the approved head.",
@@ -445,7 +462,8 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 // A feature merged off stays off until its option is named
                 // (tracker#733): each one left unset is shown, and only warns.
                 "unset" => items.iter().collect(),
-                "signatures" | "stranded" | "main" | "needs-you" => {
+                "signatures" | "stranded" | "main" | "needs-you" | "queue-aged" | "reviews"
+                | "apply-failures" | "stalls" => {
                     items.iter().filter(|i| i["problem"] != false).collect()
                 }
                 _ => vec![],
@@ -496,7 +514,18 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
                 "evidence": evidence,
                 "suggested_action": if bad.is_empty() { "None." } else { action },
             });
-            if ["signatures", "stranded", "main", "needs-you"].contains(&id) {
+            if [
+                "signatures",
+                "stranded",
+                "main",
+                "needs-you",
+                "queue-aged",
+                "reviews",
+                "apply-failures",
+                "stalls",
+            ]
+            .contains(&id)
+            {
                 check["signatures"] = json!(items);
             }
             check
@@ -506,7 +535,8 @@ pub fn evaluate(snapshot: &Snapshot, now: i64, limits: &Limits) -> Vec<Value> {
 
 const OPEN_PULLS: &str = r#"query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {
   pullRequests(states: OPEN, first: 100) { pageInfo { hasNextPage } nodes {
-    url isInMergeQueue isDraft mergeStateStatus author { __typename login } baseRepository { nameWithOwner }
+    url number updatedAt headRefOid isInMergeQueue isDraft mergeStateStatus author { __typename login } baseRepository { nameWithOwner defaultBranchRef { name } }
+    mergeQueueEntry { enqueuedAt state headCommit { oid } }
     labels(first: 30) { nodes { name } }
     timelineItems(itemTypes: [LABELED_EVENT], last: 50) { nodes { ... on LabeledEvent { createdAt label { name } } } }
     comments(last: 10) { nodes { databaseId url body createdAt updatedAt author { login } } }
@@ -870,7 +900,7 @@ impl Collector<'_> {
                 let data = self.query(OPEN_PULLS, json!({"owner": owner, "name": name}))?;
                 let pulls = &data["repository"]["pullRequests"];
                 ensure!(
-                    pulls["pageInfo"]["hasNextPage"] != true,
+                    pulls["pageInfo"]["hasNextPage"] == false,
                     "open PRs truncated"
                 );
                 all.extend(
@@ -1900,6 +1930,10 @@ pub fn collect(
     capture("unclosed", &|_| c.unclosed());
     capture("scheduled", &|_| c.scheduled());
     capture("signatures", &|_| c.failure_signatures());
+    capture("queue-aged", &|_| c.aged_queue());
+    capture("reviews", &|_| c.lost_reviews());
+    capture("apply-failures", &|_| c.apply_failures());
+    capture("stalls", &|_| c.stall_groups());
     capture("stranded", &|_| c.hold_signatures(false));
     capture("needs-you", &|_| c.hold_signatures(true));
     capture("main", &|_| c.main_signatures());

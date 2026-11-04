@@ -6,6 +6,11 @@ const DAY: i64 = 24 * HOUR_MS;
 const TEXT_LIMIT: usize = 240;
 const EXAMPLES: usize = 3;
 const REPORT_BYTES: usize = 4 * 1024;
+/// Completion-time correlation, inclusive; not a claim of provider causation.
+const STALL_WINDOW_MS: i64 = 2 * 60_000;
+const STALL_MIN_COUNT: usize = 3;
+/// agentic-job's terminal stalled-turn failure message (session/driver.rs).
+const STALLED: &str = "the agent stalled";
 
 /// Strip volatile numbers and abbreviated/full SHAs before grouping. Keep
 /// punctuation and words so distinct failures do not collapse to a job name.
@@ -99,50 +104,159 @@ fn grouped(events: Vec<Value>, max: usize) -> Result<Vec<Value>> {
 
 impl Collector<'_> {
     pub(super) fn failure_signatures(&self) -> Result<Vec<Value>> {
-        let runs: Vec<Value> = self
-            .dispatch_runs()?
-            .into_iter()
-            .filter(|r| {
-                millis(&r["updated_at"]).is_some_and(|at| at >= self.now - DAY && at <= self.now)
-                    && FAILED.contains(&r["conclusion"].as_str().unwrap_or_default())
-            })
-            .collect();
-        let mut events = vec![];
-        for run in runs {
-            let id = run["id"].as_u64().context("run id")?;
-            let jobs = self.cached_get(&format!(
-                "{}/actions/runs/{id}/jobs?per_page=100",
-                self.root
-            ))?;
-            let nodes = jobs["jobs"].as_array().context("failed jobs")?;
-            ensure!(
-                jobs["total_count"].as_u64().is_some_and(|n| n <= 100),
-                "jobs truncated"
-            );
-            for job in nodes
-                .iter()
-                .filter(|j| FAILED.contains(&j["conclusion"].as_str().unwrap_or_default()))
-            {
-                let id = job["id"].as_u64().context("job id")?;
-                let log = self.api.download(
-                    &format!("{}/actions/jobs/{id}/logs", self.root),
-                    self.s.limits.max_download_bytes,
-                )?;
-                let text = strip_colours(&String::from_utf8_lossy(&log));
-                let error = text
-                    .lines()
-                    .filter_map(log_line)
-                    .find(|l| {
-                        let lower = l.to_ascii_lowercase();
-                        lower.contains("##[error]")
-                            || lower.starts_with("error:")
-                            || lower.starts_with("error[")
-                    })
-                    .context("failed job has no error line")?;
-                events.push(json!({"kind": "step", "text": error, "url": run["html_url"], "at": run["updated_at"]}));
+        grouped(
+            self.failure_events()?
+                .into_iter()
+                .filter(|e| e["kind"] != "stall")
+                .collect(),
+            self.s.limits.max_items,
+        )
+    }
+
+    /// Shared event collection: apply errors belong to one signature class,
+    /// not both a generic step and an apply failure. Reruns use only their
+    /// latest attempt's jobs; duplicate listing entries count once.
+    fn failure_events(&self) -> Result<Vec<Value>> {
+        let value = self.once("failure events", || {
+            let runs: Vec<Value> = self
+                .failed_dispatch_runs()?
+                .into_iter()
+                .filter(|r| FAILED.contains(&r["conclusion"].as_str().unwrap_or_default()))
+                .collect();
+            let mut events = vec![];
+            let mut seen = BTreeSet::new();
+            for run in runs {
+                let updated = millis(&run["updated_at"]).context("failed run time")?;
+                ensure!(updated <= self.now, "future failed run time");
+                if updated < self.now - DAY {
+                    continue;
+                }
+                let id = run["id"].as_u64().context("run id")?;
+                let attempt = run["run_attempt"].as_u64().unwrap_or(1);
+                let identity = format!("{id}/{attempt}");
+                if !seen.insert((id, attempt)) {
+                    continue;
+                }
+                let jobs = self.cached_get(&format!(
+                    "{}/actions/runs/{id}/attempts/{attempt}/jobs?per_page=100",
+                    self.root
+                ))?;
+                let nodes = jobs["jobs"].as_array().context("failed jobs")?;
+                ensure!(
+                    jobs["total_count"]
+                        .as_u64()
+                        .is_some_and(|n| n <= 100 && n as usize == nodes.len())
+                        && !nodes.is_empty(),
+                    "jobs truncated"
+                );
+                let role = |j: &Value, name: &str| {
+                    j["name"]
+                        .as_str()
+                        .is_some_and(|n| n == name || n.ends_with(&format!(" / {name}")))
+                };
+                let agent_success = nodes
+                    .iter()
+                    .any(|j| role(j, "agent") && j["conclusion"] == "success");
+                for job in nodes
+                    .iter()
+                    .filter(|j| FAILED.contains(&j["conclusion"].as_str().unwrap_or_default()))
+                {
+                    let id = job["id"].as_u64().context("job id")?;
+                    let log = self.api.download(
+                        &format!("{}/actions/jobs/{id}/logs", self.root),
+                        self.s.limits.max_download_bytes,
+                    )?;
+                    let text = strip_colours(&String::from_utf8_lossy(&log));
+                    let error = text
+                        .lines()
+                        .filter_map(log_line)
+                        .find(|l| {
+                            let lower = l.to_ascii_lowercase();
+                            lower.contains("##[error]")
+                                || lower.starts_with("error:")
+                                || lower.starts_with("error[")
+                        })
+                        .context("failed job has no error line")?;
+                    let apply = agent_success && role(job, "apply");
+                    let at = if apply {
+                        &job["completed_at"]
+                    } else {
+                        &run["updated_at"]
+                    };
+                    let completed = millis(at).context("failure completion time")?;
+                    ensure!(completed <= self.now, "future failure completion");
+                    if apply && completed < self.now - DAY {
+                        continue;
+                    }
+                    events.push(
+                        json!({"kind": if apply {"apply"} else {"step"}, "text": error,
+                    "url": run["html_url"], "at": at, "identity":identity}),
+                    );
+                    if role(job, "agent")
+                        && text.lines().filter_map(log_line).any(|line| {
+                            let outcome = line.strip_prefix("##[error]").unwrap_or(line).trim();
+                            let outcome = outcome
+                                .strip_prefix("Error: ")
+                                .or_else(|| outcome.strip_prefix("error: "))
+                                .unwrap_or(outcome);
+                            outcome.starts_with(STALLED)
+                        })
+                    {
+                        let at = millis(&job["completed_at"]).context("stall completion time")?;
+                        ensure!(at <= self.now, "future stall completion");
+                        if at < self.now - DAY {
+                            continue;
+                        }
+                        let pool = run["display_title"]
+                            .as_str()
+                            .and_then(|s| s.rsplit_once(" ("))
+                            .and_then(|(_, p)| p.strip_suffix(')'));
+                        events.push(
+                            json!({"kind":"stall", "text":"stall", "url":run["html_url"],
+                        "identity":identity, "at":iso(at), "pool":pool}),
+                        );
+                    }
+                }
+            }
+            Ok(json!(events))
+        })?;
+        Ok(value.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Creation-time filtering loses old runs rerun today. Read the bounded
+    /// failed-run census instead, then judge completion times. If history
+    /// exceeds maxPages, coverage is unavailable rather than falsely green.
+    fn failed_dispatch_runs(&self) -> Result<Vec<Value>> {
+        let mut all = vec![];
+        for page in 1..=self.s.limits.max_pages {
+            let runs = self.list(
+                &format!(
+                    "{}/actions/workflows/{}/runs?status=completed&page={page}",
+                    self.root, self.s.dispatch_workflow
+                ),
+                true,
+            )?;
+            let full = runs.len() as u64 >= self.s.limits.page_size;
+            all.extend(runs);
+            if !full {
+                return Ok(all);
             }
         }
-        grouped(events, self.s.limits.max_items)
+        bail!("failed dispatch history truncated")
+    }
+
+    pub(super) fn apply_failures(&self) -> Result<Vec<Value>> {
+        grouped(
+            self.failure_events()?
+                .into_iter()
+                .filter(|e| e["kind"] == "apply")
+                .collect(),
+            self.s.limits.max_items,
+        )
+    }
+
+    pub(super) fn stall_groups(&self) -> Result<Vec<Value>> {
+        stall_windows(self.failure_events()?, self.s.limits.max_items)
     }
 
     fn holds_snapshot(&self) -> Result<(Value, String)> {
@@ -274,11 +388,96 @@ impl Collector<'_> {
     }
 }
 
+fn stall_windows(events: Vec<Value>, max: usize) -> Result<Vec<Value>> {
+    let mut stalls: Vec<Value> = events
+        .into_iter()
+        .filter(|e| e["kind"] == "stall")
+        .collect();
+    stalls.sort_by_key(|e| {
+        (
+            millis(&e["at"]),
+            e["identity"].as_str().unwrap_or_default().to_owned(),
+        )
+    });
+    let mut seen = BTreeSet::new();
+    stalls.retain(|e| seen.insert(e["identity"].clone().to_string()));
+    let mut result = vec![];
+    let mut start = 0;
+    while start < stalls.len() {
+        let first = millis(&stalls[start]["at"]).context("stall time")?;
+        let end = stalls[start..]
+            .iter()
+            .position(|e| millis(&e["at"]).is_none_or(|at| at - first > STALL_WINDOW_MS))
+            .map_or(stalls.len(), |n| start + n);
+        ensure!(end > start, "missing stall time");
+        let window = &stalls[start..end];
+        if window.len() >= STALL_MIN_COUNT {
+            let pools: BTreeSet<&str> = window.iter().filter_map(|e| e["pool"].as_str()).collect();
+            let mut group = json!({"count":window.len(), "first_seen":iso(first), "last_seen":window.last().map(|e| &e["at"]),
+                "examples":window.iter().filter_map(|e| e["url"].as_str()).take(EXAMPLES).collect::<Vec<_>>(),
+                "text":"Time-correlated stall failures; provider causation not established", "problem":true});
+            if !pools.is_empty() {
+                group["observed_pools"] = json!(pools);
+            }
+            result.push(group);
+            start = end;
+        } else {
+            start += 1;
+        }
+    }
+    super::diagnostics::bounded(result, max)
+}
+
 const MAIN: &str = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){defaultBranchRef{target{... on Commit{url statusCheckRollup{state}}}}}}";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_completion_windows_boundaries_duplicates_and_no_chaining() {
+        let event = |n: i64, at: i64| json!({"kind":"stall","identity":format!("{n}/1"),"at":iso(at),"url":format!("https://example.com/runs/{n}")});
+        for (offset, count) in [
+            (STALL_WINDOW_MS - 1, 1),
+            (STALL_WINDOW_MS, 1),
+            (STALL_WINDOW_MS + 1, 0),
+        ] {
+            let groups =
+                stall_windows(vec![event(1, 0), event(2, 1), event(3, offset)], 25).unwrap();
+            assert_eq!(groups.len(), count);
+        }
+        assert!(
+            stall_windows(vec![event(1, 0), event(1, 0), event(2, 1)], 25)
+                .unwrap()
+                .is_empty()
+        );
+        let groups = stall_windows(
+            vec![
+                event(1, 0),
+                event(2, 119_000),
+                event(3, 121_000),
+                event(4, 122_000),
+            ],
+            25,
+        )
+        .unwrap();
+        assert_eq!(groups[0]["count"], 3);
+        assert_eq!(groups[0]["first_seen"], iso(119_000));
+        assert!(groups[0].get("observed_pools").is_none());
+        let mut events = vec![
+            event(1, 0),
+            event(2, 100_000),
+            event(3, 200_000),
+            event(4, 300_000),
+        ];
+        assert!(stall_windows(events.clone(), 25).unwrap().is_empty());
+        events[2]["at"] = json!(iso(120_000));
+        events[0]["pool"] = json!("observed-pool");
+        let groups = stall_windows(events.clone(), 25).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["observed_pools"], json!(["observed-pool"]));
+        assert!(stall_windows(events, 0).is_err());
+    }
 
     #[test]
     fn normalization_and_grouping() {

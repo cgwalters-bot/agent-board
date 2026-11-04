@@ -1,0 +1,26 @@
+{
+  "pull": {
+    "url": "https://github.com/example/project/pull/7", "number": 7,
+    "author": {"__typename":"User", "login":"worker"},
+    "baseRepository": {"nameWithOwner":"example/project", "defaultBranchRef":{"name":"main"}},
+    "headRefOid":"current-head", "updatedAt":"2026-11-03T00:00:00Z",
+    "isDraft":false, "isInMergeQueue":true,
+    "mergeQueueEntry":{"enqueuedAt":"2026-11-03T00:00:00Z", "state":"AWAITING_CHECKS", "headCommit":{"oid":"queue-head"}}
+  },
+  "review": {
+    "id":10, "path":".github/workflows/review.yml", "event":"pull_request_target",
+    "head_sha":"current-head", "repository":{"full_name":"example/project"},
+    "pull_requests":[{"number":7,"head":{"sha":"current-head"},"base":{"repo":{"full_name":"example/project"}}}],
+    "status":"completed", "conclusion":"cancelled", "html_url":"https://github.com/example/project/actions/runs/10"
+  },
+  "queue_runs":[
+    {"event":"merge_group", "head_sha":"old-queue-head", "created_at":"2026-11-03T00:50:00Z", "html_url":"https://github.com/example/project/actions/runs/12"},
+    {"event":"merge_group", "head_sha":"queue-head", "created_at":"2026-11-03T00:10:00Z", "status":"completed", "conclusion":"failure", "run_attempt":2, "html_url":"https://github.com/example/project/actions/runs/11"}
+  ],
+  "dispatch": {"id":20,"run_attempt":2,"status":"completed","conclusion":"failure","updated_at":"2026-11-03T00:30:00Z","html_url":"https://github.com/example/control/actions/runs/20"},
+  "jobs":{"total_count":2, "jobs":[
+    {"id":21,"name":"agent / agent","conclusion":"success","completed_at":"2026-11-03T00:20:00Z"},
+    {"id":22,"name":"agent / apply","conclusion":"failure","completed_at":"2026-11-03T00:30:00Z"}
+  ]},
+  "log":"2026-11-03T00:29:00Z ##[error]E008 refused item 123\n2026-11-03T00:30:00Z ##[error]Process completed with exit code 1"
+}

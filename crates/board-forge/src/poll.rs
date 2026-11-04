@@ -1607,7 +1607,7 @@ fn job_verdict(pull: &Value) -> Verdict<'_> {
 /// review's body, as agentic-job's apply writes it:
 /// `<!-- gh-aw-agentic-workflow: review, id: N, ..., run: https://github.com/OWNER/REPO/actions/runs/N -->`.
 /// More than one names no run: which is the job's own is not known.
-fn cited_run(body: &str) -> Option<(&str, u64)> {
+pub(crate) fn cited_run(body: &str) -> Option<(&str, u64)> {
     let mut markers = body.match_indices(RUN_MARKER).map(|(at, _)| {
         let rest = &body[at + RUN_MARKER.len()..];
         rest.find("-->").map(|end| &rest[..end])
@@ -1694,6 +1694,17 @@ fn reviews_head_for_workflow(
     config: &Config,
     workflow: Option<&str>,
 ) -> bool {
+    review_head_run(pull, run, workflow, !config.policy.review_pools.is_empty())
+}
+
+/// Shared run identity predicate. Write-authorizing callers pass dispatch
+/// admission; health only observes already existing dedicated review runs.
+pub(crate) fn review_head_run(
+    pull: &Value,
+    run: &Value,
+    workflow: Option<&str>,
+    dispatched: bool,
+) -> bool {
     let Some(workflow) = workflow else {
         return false;
     };
@@ -1704,7 +1715,7 @@ fn reviews_head_for_workflow(
         DISPATCH_EVENT => {
             let title = review_title(pull);
             let named = text(run, "/display_title");
-            !config.policy.review_pools.is_empty()
+            dispatched
                 && !default.is_empty()
                 && text(run, "/head_branch") == default
                 && named.strip_prefix(&title).is_some_and(|pool| {

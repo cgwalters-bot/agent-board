@@ -399,6 +399,8 @@ pub struct Settings {
     pub limits: Limits,
     pub poll_workflow: String,
     pub probe_workflow: String,
+    /// Existing poll review workflow; no new caller enablement switch.
+    pub review_workflow: Option<String>,
     pub supervisor_workflow: String,
     /// The poll workflow's scheduler job, whose log the idle and stuck checks
     /// read; absent, those checks are not configured.
@@ -516,6 +518,10 @@ impl Settings {
         }
         // Only a job name, matched against the poll run's jobs.
         let scheduler_job = optional_string(supervisor, "schedulerJob", what)?;
+        let review_workflow = optional_string(board, "reviewWorkflow", "agent-board config")?;
+        if let Some(workflow) = &review_workflow {
+            validate_workflow(workflow)?;
+        }
         // The release check needs all three; some without the others is a
         // mistake to report, not a check to switch off quietly.
         let release = match (
@@ -586,6 +592,7 @@ impl Settings {
             probe_workflow: names["probeWorkflow"].clone(),
             supervisor_workflow: names["supervisorWorkflow"].clone(),
             scheduler_job,
+            review_workflow,
             implement_branch_prefix: names["implementBranchPrefix"].clone(),
             release,
             release_train_workflow,

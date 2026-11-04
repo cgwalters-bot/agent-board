@@ -109,7 +109,76 @@ All reads use the existing request budget, deadline, page and download limits.
 The report permits at most `maxItems` distinct signatures and 4 KiB per check. Missing
 errors, stale snapshots, or truncated evidence make that check unavailable,
 not healthy; unavailable checks retain the existing escalation. No write is
-added to health collection. Existing queue/apply/stall checks remain unchanged.
+added to health collection.
+
+### Queue, review, apply and stall diagnostics
+
+These extend the existing health pass without a new enablement option or write
+authority. Recovery remains off: no diagnostic retries, dequeues, cancels or
+replans work. They address invisible blocked work and correlated infrastructure
+failures, not authorization of a recovery action.
+
+`queue-aged` reports queue residence at **60 minutes or more**
+(`QUEUE_RESIDENCE_MS`), with the current state, enqueue time, observation time
+and age basis. It deliberately does **not** claim that the state was unchanged:
+GitHub's enqueue timestamp is not a state transition timestamp. It reads runs
+for the queue entry's current merge-group head and selects the latest matching
+`merge_group` run by creation time and attempt, including status, conclusion and
+link. No matching run is explicitly null, not an inferred green check. A changed
+queue head cannot inherit the old head's run. Missing queue timestamps or heads
+make the observation unavailable.
+
+`reviews` covers open, non-draft PRs by the configured bot or `mergeAuthors` in
+`follow`, using the poll's existing `reviewWorkflow`. After **15 minutes**
+(`REVIEW_GRACE_MS`) since the last PR update it reports a head with neither an
+active nor successful review run. The update time is a conservative grace
+basis (comments can postpone the alarm), not a claim about when a commit was
+pushed. Only the configured workflow path, base repository, PR number and current
+head SHA all matching count. `pull_request_target` runs use the run's SHA and
+PR association. Fork runs commonly have an empty `pull_requests` array; then
+a current-head bot/operator review must cite that run, submitted within its
+latest attempt. An active/successful candidate without a readable PR association
+makes the check unavailable, not a missing-review assertion. Dedicated
+`workflow_dispatch` reviews use the poll's shared identity predicate: the default
+branch, exact `review OWNER/REPO#N HEAD` title and optional pool suffix. Their
+default-branch SHA is not mistaken for the reviewed head. Successful runs
+are not restricted to the recent dispatch lookback. Old-head approvals, cancelled
+runs, unrelated workflows and uncorrelated dispatch titles cannot satisfy it.
+This check does not infer ordinary contributor intake eligibility or prove a
+review was posted; it diagnoses missing runs for the existing dedicated reviewer.
+If eligible PRs exist without `reviewWorkflow`, the check is unavailable.
+
+`apply-failures` uses the same signatures as `signatures`, of kind `apply`, for
+dispatch attempts with a successful `agent` job and failed `apply` job. Reusable
+workflow job names ending in ` / agent` or ` / apply` are recognized too. Jobs
+are read from the explicit latest attempt endpoint, so a previous attempt's
+successful agent cannot satisfy this condition. The first apply error line is
+normalized and grouped by the existing signature machinery; each run/attempt
+counts once per signature, with at most three run links. It is not also counted
+as a generic step failure. Logs and failure events are collected once and shared
+between these checks. Missing errors or completion times are unavailable.
+
+`stalls` groups distinct run/attempt failures whose agent log contains the
+terminal `the agent stalled` outcome line (optionally error-prefixed), not
+arbitrary mentions of stalls in task prose, using job **completion** times,
+not start or run-update times. The
+default is **three** failures (`STALL_MIN_COUNT`) within an inclusive **two-minute**
+window (`STALL_WINDOW_MS`), with completions in the last day. Sorted windows
+start at the first completion that can meet the minimum, consume each member
+once, and do not chain failures beyond two minutes from the first. The report
+includes observed pools from run titles only when present; it never infers a
+provider from a pool name. This is temporal correlation, not proven provider
+causation. Missing stall completion times make the observation unavailable.
+
+These defaults are named constants rather than more caller controls. All four
+checks use the shared read-only request/time/page/download budgets, `maxItems`,
+`maxEvidence`, and a 4 KiB report bound. A full single-page run listing or open-PR
+connection with another page is incomplete, not healthy. Failure collection
+pages the completed dispatch history without a creation-time cutoff, so old run
+IDs rerun today are not silently lost; exceeding the existing `maxPages` makes
+coverage unavailable. This can require a larger existing page budget in busy
+repositories. Unavailable checks use the normal warning/escalation
+policy. Live behavior and the incident runs have not been verified here.
 
 The playbook requests `file_bug` for each problem signature with at least two
 occurrences and no open bug, including its examples, within the caller's daily
