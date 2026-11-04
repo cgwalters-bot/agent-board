@@ -16,6 +16,8 @@ use crate::action::{self, ACTION_FENCE, Proposal};
 use crate::plan::{Comment, comment_id, fenced_json};
 use sha2::{Digest, Sha256};
 
+pub(super) mod epics;
+
 /// The most issues labelled for proposals read a pass, oldest first; the
 /// rest are unread, and their published asks kept.
 const MAX_PROPOSAL_ISSUES: usize = 10;
@@ -171,6 +173,7 @@ pub(super) fn review_asks(
             action,
             carried: false,
             group: None,
+            chain: holds::EpicChain::default(),
         });
     }
     if !collected.unread.is_empty() {
@@ -232,6 +235,7 @@ pub(super) fn proposal_asks(
             action,
             carried: false,
             group: None,
+            chain: holds::EpicChain::default(),
         });
     }
     (asks, whole)
@@ -315,6 +319,7 @@ pub(super) fn digest_asks(
                 action,
                 carried: false,
                 group: None,
+                chain: holds::EpicChain::default(),
             });
         }
     }
@@ -381,7 +386,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         };
         let list = holds::needs_you(snapshot, previous, &reading);
         reading.summaries = self.summaries(&list);
-        holds::needs_you(snapshot, previous, &reading)
+        let mut list = holds::needs_you(snapshot, previous, &reading);
+        self.inbox_epics(&mut list);
+        holds::preserve_changed_at(&mut list, previous);
+        list
     }
 
     /// Whether the published hold `comment`, as the REST API lists it, is

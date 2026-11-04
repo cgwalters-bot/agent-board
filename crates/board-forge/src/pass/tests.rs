@@ -3243,6 +3243,69 @@ fn apply_publishes_what_needs_you() {
         }
         forge
     };
+    let with_context = |mut forge: Forge| {
+        // Inbox parentage crosses repositories, through an ordinary issue,
+        // then two live epics. Activity propagates to both live ancestors.
+        let tracker = "cgwalters-forge/tracker";
+        let work = "cgwalters-forge/agent-board";
+        let identity = |repo: &str, n| json!({"number": n, "repository": {"nameWithOwner": repo}});
+        for (repo, number, parent, children, live) in [
+            (tracker, 446, identity(work, 999), vec![], false),
+            (
+                work,
+                999,
+                identity(tracker, 596),
+                vec![identity(tracker, 446)],
+                false,
+            ),
+            (
+                tracker,
+                596,
+                identity(tracker, 766),
+                vec![identity(work, 999)],
+                true,
+            ),
+            (
+                tracker,
+                766,
+                Value::Null,
+                vec![identity(tracker, 596)],
+                true,
+            ),
+            (tracker, 527, Value::Null, vec![], false),
+            ("cgwalters-forge/bot-ops", 5, Value::Null, vec![], false),
+        ] {
+            let (owner, name) = repo.split_once('/').unwrap();
+            let comments = if number == 446 {
+                vec![
+                    json!({"author":{"login":"cgwalters"},"createdAt":"2026-10-23T12:00:00Z","body":"Please proceed."}),
+                    json!({"author":{"login":"cgwalters-bot"},"createdAt":"2026-10-23T12:00:00Z",
+                    "body":format!("<!-- {}: 1@x -->\nhttps://github.com/{tracker}/actions/runs/1234", plan::DISPATCH_MARKER)}),
+                ]
+            } else {
+                vec![]
+            };
+            let labels = if live {
+                vec![json!({"name":"epic"})]
+            } else {
+                vec![]
+            };
+            let node = json!({"state":"OPEN","parent":parent,
+                "labels":{"totalCount":labels.len(),"nodes":labels},
+                "subIssues":{"totalCount":children.len(),"nodes":children},
+                "closedByPullRequestsReferences":{"totalCount":if number == 446 {1} else {0}},
+                "comments":{"totalCount":comments.len(),"nodes":comments}});
+            forge
+                .replay
+                .requests
+                .push(json!({"request":graphql_key(needs::epics::CONTEXT_QUERY,
+                &json!({"owner":owner,"name":name,"number":number})),
+                "answer":{"data":{"repository":{"issueOrPullRequest":node}}}}));
+        }
+        forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/{tracker}/actions/runs/1234")},
+            "answer":{"status":200,"body":{"status":"completed","run_started_at":"2026-10-23T12:00:00Z","updated_at":"2026-10-23T13:00:00Z"}}}));
+        forge
+    };
     let published = |config: &Config| {
         let forge = forge_with(None);
         let report = apply(&forge, config);
@@ -3252,6 +3315,67 @@ fn apply_publishes_what_needs_you() {
             .unwrap_or_else(|| panic!("{:#?}", report.lines))
     };
     let body = published(&config);
+    let context_forge = with_context(forge_with(None));
+    let context_report = apply(&context_forge, &config);
+    let context_body = context_forge
+        .writes
+        .borrow()
+        .iter()
+        .find(|(m, url, _)| m == "POST" && url.starts_with(&bot_ops))
+        .map(|(_, _, body)| text(body, "/body").to_owned())
+        .unwrap_or_else(|| panic!("{:?}", context_report.lines));
+    let context_snapshot = holds::parse(&context_body).unwrap();
+    let context_list = &context_snapshot["needs_you"];
+    let context = context_list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["item"] == "cgwalters-forge/tracker#446")
+        .unwrap();
+    assert_eq!(context["epic"], "cgwalters-forge/tracker#596");
+    assert_eq!(context["topEpic"], "cgwalters-forge/tracker#766");
+    assert_eq!(
+        context_list["epics"]["cgwalters-forge/tracker#766"]["activeWhy"],
+        json!(["open-pr", "operator-comment", "recent-run"])
+    );
+    assert_eq!(
+        context_list["epics"]["cgwalters-forge/tracker#766"]["active"],
+        true
+    );
+    let mut missing_history = with_context(forge_with(None));
+    for entry in &mut missing_history.replay.requests {
+        if entry["request"]["get"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/actions/runs/1234"))
+        {
+            entry["answer"]["status"] = json!(404);
+        }
+    }
+    let report = apply(&missing_history, &config);
+    let body_with_missing_history = missing_history
+        .writes
+        .borrow()
+        .iter()
+        .find(|(m, url, _)| m == "POST" && url.starts_with(&bot_ops))
+        .map(|(_, _, body)| text(body, "/body").to_owned())
+        .unwrap_or_else(|| panic!("{:?}", report.lines));
+    let missing = holds::parse(&body_with_missing_history).unwrap();
+    let list = &missing["needs_you"];
+    let identity = list["identities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["item"] == "cgwalters-forge/tracker#446")
+        .unwrap();
+    assert_eq!(identity["epic"], "cgwalters-forge/tracker#596");
+    assert_eq!(
+        list["epics"]["cgwalters-forge/tracker#766"]["activeWhy"],
+        json!(["open-pr", "operator-comment"])
+    );
+    assert_eq!(
+        list["epics"]["cgwalters-forge/tracker#766"]["complete"],
+        false
+    );
     // Every listed hold, not only the first ten, gets its summary.
     let mut many = forge_with(None);
     for request in &mut many.replay.requests {

@@ -68,7 +68,8 @@ const PASS_LOG: &str = "; see the pass log ";
 /// v2 added the sources of [`Reading`], typed references and
 /// recommendations, and made `kind` and `source` open strings.
 pub const NEEDS_YOU_SCHEMA: &str = "agent-board/needs-you/v2";
-/// The most asks the list publishes; the rest are counted.
+/// Former item cap, retained as a regression-test boundary only.
+#[cfg(test)]
 pub const MAX_NEEDS_YOU: usize = 100;
 /// How a hold's reason names the pull request whose approval it waits on
 /// (`approve pull request OWNER/REPO#N to merge`, [`approval_of`]).
@@ -1168,6 +1169,25 @@ pub struct Ask {
     /// Optional v2 extension: stranded PRs represented by this card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<AskGroup>,
+    #[serde(default, flatten)]
+    pub chain: EpicChain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EpicChain {
+    pub epic: String,
+    #[serde(rename = "topEpic")]
+    pub top_epic: String,
+}
+
+impl Default for EpicChain {
+    fn default() -> Self {
+        Self {
+            epic: "unknown".into(),
+            top_epic: "unknown".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1194,12 +1214,15 @@ pub struct NeedsYou {
     /// How much of the bot's summaries of the held issues this pass read:
     /// they enrich asks, but are no source of them.
     pub summaries: Read,
-    /// The asks left out, the lowest ranked: past [`MAX_NEEDS_YOU`], and
-    /// those [`fit`] cut.
+    /// Decisions omitted from the inventory (always zero).
     pub omitted: usize,
-    /// How many `items`: always their number.
+    /// How many decisions, including identities whose detail did not fit.
     pub count: usize,
     pub items: Vec<Ask>,
+    /// Complete decision inventory; `items` is only the detailed projection.
+    pub identities: Vec<Identity>,
+    pub epics: BTreeMap<String, EpicActivity>,
+    pub details_omitted: usize,
     /// Optional list-level extension; strict v2 Ask records are unchanged.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requests: Vec<requests::Request>,
@@ -1211,17 +1234,43 @@ pub struct NeedsYou {
     pub summary_cache: BTreeMap<String, Summary>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub key: String,
+    /// Detailed card representing this identity, possibly a grouped card.
+    pub detail_key: String,
+    pub item: String,
+    pub kind: String,
+    pub source: String,
+    pub waiting_since: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub carried: bool,
+    pub priority: Option<String>,
+    pub epic: String,
+    #[serde(rename = "topEpic")]
+    pub top_epic: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpicActivity {
+    pub active: bool,
+    #[serde(rename = "activeWhy")]
+    pub active_why: Vec<String>,
+    pub complete: bool,
+}
+
 impl NeedsYou {
-    /// Leaves out its lowest ranked ask, counted in `omitted`, so that it
-    /// is not complete; none where it has none.
+    /// Evicts detail only; the complete identity inventory stays intact.
     fn cut(&mut self) -> Option<Ask> {
         let ask = self.items.pop()?;
         self.requests.retain(|r| r.key != ask.key);
         self.request_sources.retain(|r| r.key != ask.key);
         self.summary_cache.remove(&ask.key);
-        self.omitted += 1;
-        self.count = self.items.len();
-        self.complete = false;
+        self.details_omitted = self
+            .identities
+            .iter()
+            .filter(|i| !self.items.iter().any(|a| a.key == i.detail_key))
+            .count();
         Some(ask)
     }
 }
@@ -1494,8 +1543,7 @@ fn group_stranded(items: Vec<Ask>) -> Vec<Ask> {
 /// Priority in the board's order (an unknown one after, none last; without
 /// the board, in the published list's order), then the longest waiting,
 /// then key; a key listed twice (the holds issue's two alarms) is listed
-/// once, where it ranks first, its asks joined; past [`MAX_NEEDS_YOU`], the
-/// rest are counted in `omitted`. `changed_at` carries over from
+/// once, where it ranks first, its asks joined. `changed_at` carries over from
 /// `previous`, the published snapshot's JSON, where the list was the same
 /// but for `summaries`.
 pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Reading) -> NeedsYou {
@@ -1529,7 +1577,9 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     // Priorities in stands in for them, so that the order does not move.
     let mut options = reading.options.to_vec();
     if options.is_empty() {
-        let listed = (published_list(previous).and_then(|n| n["items"].as_array())).into_iter();
+        let listed = (published_list(previous)
+            .and_then(|n| n.get("identities").unwrap_or(&n["items"]).as_array()))
+        .into_iter();
         for priority in listed.flatten().filter_map(|a| a["priority"].as_str()) {
             if !options.iter().any(|o| o == priority) {
                 options.push(priority.to_owned());
@@ -1613,6 +1663,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             action,
             carried: false,
             group: None,
+            chain: EpicChain::default(),
         };
         let Some(pull) = approval_of(&h.reason).map(str::to_ascii_lowercase) else {
             items.push(ask);
@@ -1738,6 +1789,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         items.push(ask);
     }
     items.extend(approvals.into_values().map(|(ask, _)| ask));
+    let ungrouped = items.clone();
     items = group_stranded(items);
     items.sort_by_key(rank);
     let evidence = items.clone();
@@ -1790,8 +1842,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         ask.ask = one_line(&ask.ask, MAX_ASK).unwrap_or_default();
         ask.recommendation = (ask.recommendation.as_deref()).and_then(|r| one_line(r, MAX_ASK));
     }
-    let omitted = kept.len().saturating_sub(MAX_NEEDS_YOU);
-    kept.truncate(MAX_NEEDS_YOU);
+    let omitted = 0;
     let requests: Vec<_> = semantic
         .iter()
         .filter(|ask| kept.iter().any(|card| card.key == ask.key))
@@ -1837,6 +1888,140 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             }
         }
     }
+    let mut identities: Vec<_> = kept
+        .iter()
+        .flat_map(|card| {
+            let members = card
+                .group
+                .as_ref()
+                .map(|g| g.numbers.clone())
+                .unwrap_or_else(|| vec![card.action.number]);
+            members
+                .into_iter()
+                .map(|number| {
+                    let ask = if card.group.is_some() {
+                        ungrouped
+                            .iter()
+                            .find(|a| {
+                                a.source == card.source
+                                    && a.action.number == number
+                                    && a.action
+                                        .repository
+                                        .eq_ignore_ascii_case(&card.action.repository)
+                            })
+                            .unwrap_or(card)
+                    } else {
+                        card
+                    };
+                    let item = if card.group.is_some() {
+                        format!("{}#{number}", card.action.repository)
+                    } else {
+                        ask.item.clone()
+                    };
+                    let key = if card.group.is_some() {
+                        item.to_ascii_lowercase()
+                    } else {
+                        ask.key.clone()
+                    };
+                    Identity {
+                        key,
+                        detail_key: card.key.clone(),
+                        item,
+                        kind: ask.kind.clone(),
+                        source: ask.source.clone(),
+                        waiting_since: ask.waiting_since.clone(),
+                        carried: ask.carried,
+                        priority: ask.priority.clone(),
+                        epic: "unknown".into(),
+                        top_epic: "unknown".into(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    // Detail eviction must not erase a decision when its source cannot be
+    // refreshed next pass. Only a complete read can retire that identity.
+    if let Some(old) = published_list(previous).and_then(|n| n["identities"].as_array()) {
+        for value in old {
+            let Ok(mut identity) = serde_json::from_value::<Identity>(value.clone()) else {
+                continue;
+            };
+            if let Some(carried) = identities
+                .iter_mut()
+                .find(|i| i.key == identity.key && i.carried)
+            {
+                carried.waiting_since = identity.waiting_since.clone();
+                carried.priority = identity.priority.clone();
+            }
+            let repository = identity
+                .item
+                .rsplit_once('#')
+                .map(|(r, _)| r.to_ascii_lowercase())
+                .unwrap_or_default();
+            let item = identity.item.to_ascii_lowercase();
+            let unread = match identity.source.as_str() {
+                "epics" | "items" => {
+                    let read = if identity.source == "epics" {
+                        sources.epics
+                    } else {
+                        sources.items
+                    };
+                    matches!(read, Read::Partial | Read::Unread)
+                        && !snapshot.holds.iter().any(|h| {
+                            h.kind != HoldKind::Unreadable
+                                && h.item
+                                    .as_ref()
+                                    .is_some_and(|i| i.eq_ignore_ascii_case(&identity.item))
+                        })
+                }
+                REVIEWS | PROPOSALS | DIGEST => {
+                    let collected = match identity.source.as_str() {
+                        REVIEWS => &reading.reviews,
+                        PROPOSALS => &reading.proposals,
+                        _ => &reading.digest,
+                    };
+                    collected.read == Read::Unread
+                        || collected.read == Read::Partial
+                            && (collected.unread.contains(&repository)
+                                || collected.unread.contains(&item))
+                }
+                _ => continue,
+            };
+            if unread
+                && !identities.iter().any(|i| i.key == identity.key)
+                && !published_list(previous)
+                    .and_then(|p| p["items"].as_array())
+                    .is_some_and(|items| items.iter().any(|i| i["key"] == identity.key))
+                && identity
+                    .key
+                    .starts_with(&identity.item.to_ascii_lowercase())
+                && identity.item.rsplit_once('#').is_some_and(|(repo, n)| {
+                    validate_repository(repo).is_ok() && n.parse::<u64>().is_ok_and(|n| n > 0)
+                })
+            {
+                identity.carried = true;
+                identities.push(identity);
+            }
+        }
+    }
+    identities.sort_by_key(|i| {
+        let known = i
+            .priority
+            .as_ref()
+            .and_then(|p| options.iter().position(|o| o == p));
+        let since = parse_time(&i.waiting_since);
+        (
+            (
+                i.priority.is_none(),
+                known.is_none(),
+                known,
+                i.priority.clone(),
+            ),
+            since.is_none(),
+            since,
+            i.key.clone(),
+        )
+    });
     let items = kept;
     let cached = published_list(previous).map(|p| &p["summary_cache"]);
     let summary_cache = items
@@ -1864,6 +2049,10 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         sources.proposals,
         sources.digest,
     ];
+    let details_omitted = identities
+        .iter()
+        .filter(|i| !items.iter().any(|a| a.key == i.detail_key))
+        .count();
     let mut list = NeedsYou {
         schema: NEEDS_YOU_SCHEMA,
         complete: omitted == 0 && read.iter().all(|r| matches!(r, Read::Complete | Read::Off)),
@@ -1872,12 +2061,20 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         sources,
         summaries: reading.summaries.0,
         omitted,
-        count: items.len(),
+        count: identities.len(),
         items,
+        identities,
+        epics: BTreeMap::new(),
+        details_omitted,
         requests,
         request_sources,
         summary_cache,
     };
+    preserve_changed_at(&mut list, previous);
+    list
+}
+
+pub(super) fn preserve_changed_at(list: &mut NeedsYou, previous: Option<&Value>) {
     let previous = published_list(previous);
     // How much of the summaries was read is no change: what they said is
     // kept where they were not.
@@ -1899,10 +2096,9 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         while cut.items.len() > published && cut.cut().is_some() {}
         serde_json::to_value(&cut).is_ok_and(|now| content(p) == content(&now))
     });
-    if let Some(since) = same.and_then(|p| not_after(&p["changed_at"], at)) {
+    if let Some(since) = same.and_then(|p| not_after(&p["changed_at"], &list.validated_at)) {
         list.changed_at = since;
     }
-    list
 }
 
 /// Whether `snapshot` says something other than the published comment
@@ -2060,11 +2256,9 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
             let Some(group) = order.next() else {
                 // With no ask left to cut, the list's own fields go too.
                 let Some(_) = needs_you.as_mut().and_then(NeedsYou::cut) else {
-                    ensure!(
-                        needs_you.take().is_some(),
-                        "the hold snapshot is over {MAX_COMMENT_CHARS} characters with only the operator's holds and those of every new run left"
+                    anyhow::bail!(
+                        "the hold snapshot is over {MAX_COMMENT_CHARS} characters with the complete decision inventory; refusing to publish a capped inbox"
                     );
-                    break;
                 };
                 // A cut removes its descriptor too; re-render before cutting
                 // again so that the additional savings do not overcut asks.
@@ -2443,9 +2637,8 @@ mod tests {
         );
         let list = uncached.needs_you.unwrap();
         assert_eq!((list.items.len(), list.summary_cache.len()), (asks, 0));
-        // Operator holds just under the cap, but not beside a needs-you
-        // list's fields: every ask is cut, then the list, and the holds
-        // are published.
+        // Never publish a list missing decision identities, even when the
+        // operator's holds alone leave no room for that inventory.
         let mut asked = bare(&board(0, 0));
         let pad = MAX_COMMENT_CHARS - chars(&render(&asked).unwrap()) - 10;
         asked
@@ -2454,11 +2647,13 @@ mod tests {
             .unwrap()
             .reason
             .push_str(&"p".repeat(pad));
-        let holds = asked.holds.len();
         asked.needs_you = Some(listed(&waiting(), None, (true, true)));
-        let (listless, listless_body) = fit(asked).unwrap();
-        assert!(chars(&listless_body) <= MAX_COMMENT_CHARS);
-        assert_eq!((listless.holds.len(), listless.needs_you), (holds, None));
+        assert!(
+            fit(asked)
+                .unwrap_err()
+                .to_string()
+                .contains("complete decision inventory")
+        );
         let kept: BTreeSet<String> = fitted.holds.iter().filter_map(|h| h.item.clone()).collect();
         assert!(
             !kept.contains("o/work#55"),
@@ -3358,10 +3553,21 @@ mod tests {
         let operator = operators(&over);
         let list = over.needs_you.as_mut().unwrap();
         let long = |n: usize| Ask {
+            key: format!("o/work#{n}"),
+            item: format!("o/work#{n}"),
             ask: format!("{n} {}", "a".repeat(MAX_ASK - 4)),
             ..list.items[0].clone()
         };
         list.items = (0..200).map(long).collect();
+        list.identities = (0..200)
+            .map(|n| Identity {
+                key: format!("o/work#{n}"),
+                detail_key: format!("o/work#{n}"),
+                item: format!("o/work#{n}"),
+                ..list.identities[0].clone()
+            })
+            .collect();
+        list.count = 200;
         let items = list.items.clone();
         let (fitted, body) = fit(over).unwrap();
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
@@ -3370,11 +3576,15 @@ mod tests {
         let kept = list.items.len();
         assert!(kept > 0 && kept < 200);
         assert_eq!(list.items, items[..kept]);
+        assert_eq!((list.count, list.omitted, list.complete), (200, 0, true));
+        assert_eq!(list.details_omitted, 200 - kept);
         assert_eq!(
-            (list.count, list.omitted, list.complete),
-            (kept, 200 - kept, false)
+            parse(&body).unwrap()["needs_you"]["identities"]
+                .as_array()
+                .unwrap()
+                .len(),
+            200
         );
-        assert_eq!(parse(&body).unwrap()["needs_you"]["omitted"], 200 - kept);
         // One fewer omitted would not fit.
         let back = serde_json::to_string(&items[kept]).unwrap();
         assert!(chars(&body) + chars(&back) + 1 > MAX_COMMENT_CHARS);
@@ -3412,7 +3622,7 @@ mod tests {
         let (first, body) = pass_at(0, None);
         assert_eq!((first.truncated, first.holds.len()), (0, 80));
         let list = first.needs_you.as_ref().unwrap();
-        assert!(list.omitted > 0 && !list.items.is_empty());
+        assert!(list.details_omitted > 0 && !list.items.is_empty());
         let published = parse(&body);
         let (again, _) = pass_at(30, published.as_ref());
         let list = again.needs_you.as_ref().unwrap();
@@ -3471,6 +3681,7 @@ mod tests {
             action,
             carried: false,
             group: None,
+            chain: EpicChain::default(),
         }
     }
 
@@ -3762,7 +3973,9 @@ mod tests {
         assert!(
             list.items.is_empty() && list.requests.is_empty() && list.request_sources.is_empty()
         );
-        assert_eq!(list.omitted, 1);
+        assert_eq!(list.details_omitted, 1);
+        assert_eq!(list.identities.len(), 1);
+        assert_eq!(list.omitted, 0);
     }
 
     #[test]
@@ -3840,13 +4053,16 @@ mod tests {
             ask.kind = "review-promote".into();
             asks.push(ask);
         }
+        asks[0].waiting_since = "2026-10-20T09:00:00Z".into();
+        asks[0].priority = Some("P1".into());
         let listed = own_listed(
             &[],
             "2026-10-28T09:00:00Z",
             (collected(Read::Complete, asks, &[]), Collected::off()),
             None,
         );
-        assert_eq!(listed.count, 5);
+        assert_eq!(listed.count, 50);
+        assert_eq!(listed.items.len(), 5);
         let promote = listed.items.iter().find(|a| a.key == "o/bootc#49").unwrap();
         assert_eq!(promote.ask, "bootc: 2 drafts waiting for promotion");
         assert_eq!(promote.kind, "review-promote");
@@ -3874,7 +4090,17 @@ mod tests {
             (collected(Read::Unread, vec![], &[]), Collected::off()),
             Some(&previous),
         );
-        assert_eq!(carried.count, 5);
+        assert_eq!(carried.count, 50);
+        assert_eq!(carried.items.len(), 5);
+        for identity in &listed.identities {
+            let kept = carried
+                .identities
+                .iter()
+                .find(|i| i.key == identity.key)
+                .unwrap();
+            assert_eq!(kept.waiting_since, identity.waiting_since);
+            assert_eq!(kept.priority, identity.priority);
+        }
         assert!(carried.items.iter().all(|a| a.carried));
         assert_eq!(
             carried
@@ -4175,8 +4401,65 @@ mod tests {
         }
     }
 
-    /// Past [`MAX_NEEDS_YOU`] asks the rest are counted, not listed, and
-    /// the list is not complete; each ask and recommendation is one line
+    #[test]
+    fn evicted_details_do_not_erase_unread_decisions() {
+        let on = item("o/ops", 1);
+        let mut reading = reading(&on, &[]);
+        reading.proposals = collected(
+            Read::Complete,
+            (1..=150)
+                .map(|n| own(PROPOSALS, ("o/ops", n), RefKind::OperatorAction, None))
+                .collect(),
+            &[],
+        );
+        let mut board = snapshot(&[], "2026-10-28T09:00:00Z".into(), tally());
+        let first = needs_you(&board, None, &reading);
+        board.needs_you = Some(first);
+        let (fitted, body) = fit(board).unwrap();
+        let fitted = fitted.needs_you.unwrap();
+        assert_eq!(fitted.identities.len(), 150);
+        assert!(fitted.items.len() < 150);
+        let previous = parse(&body).unwrap();
+        let board = snapshot(&[], "2026-10-28T09:00:00Z".into(), tally());
+        reading.proposals = Collected::of(Read::Unread);
+        let unread = needs_you(&board, Some(&previous), &reading);
+        assert_eq!(unread.count, 150);
+        assert_eq!(unread.identities.len(), 150);
+        assert!(unread.identities.iter().all(|i| i.carried));
+        assert_eq!(unread.details_omitted, 150 - unread.items.len());
+        // A failure in a different repository must not retain decisions
+        // whose own repository was successfully refreshed and retired them.
+        reading.proposals = collected(Read::Partial, vec![], &["o/other"]);
+        assert_eq!(needs_you(&board, Some(&previous), &reading).count, 0);
+        reading.proposals = collected(Read::Partial, vec![], &["o/ops"]);
+        assert_eq!(needs_you(&board, Some(&previous), &reading).count, 150);
+        reading.proposals = Collected::of(Read::Complete);
+        assert_eq!(needs_you(&board, Some(&previous), &reading).count, 0);
+    }
+
+    #[test]
+    fn unreadable_item_keeps_its_evicted_decision() {
+        let on = item("o/ops", 1);
+        let reading = reading(&on, &[]);
+        let held = entry(Scope::Item(item("o/r", 9)), HoldKind::NeedsHuman, "help");
+        let board = snapshot(&[held], "2026-10-28T09:00:00Z".into(), tally());
+        let mut list = needs_you(&board, None, &reading);
+        assert_eq!(list.identities.len(), 1);
+        list.items.clear();
+        list.requests.clear();
+        let previous = json!({"schema": HOLDS_SCHEMA, "needs_you": list});
+        let unread = entry(
+            Scope::Item(item("o/r", 9)),
+            HoldKind::Unreadable,
+            "read failed",
+        );
+        let board = snapshot(&[unread], "2026-10-28T10:00:00Z".into(), tally());
+        let list = needs_you(&board, Some(&previous), &reading);
+        assert_eq!(list.identities.len(), 1);
+        assert!(list.identities[0].carried);
+    }
+
+    /// Past the old cap every identity and ask is still available; each ask and recommendation is one line
     /// of at most [`MAX_ASK`] characters.
     #[test]
     fn needs_you_is_bounded() {
@@ -4197,9 +4480,10 @@ mod tests {
         );
         assert_eq!(
             (list.count, list.items.len(), list.omitted),
-            (MAX_NEEDS_YOU, MAX_NEEDS_YOU, 7)
+            (MAX_NEEDS_YOU + 7, MAX_NEEDS_YOU + 7, 0)
         );
-        assert!(!list.complete);
+        assert!(list.complete);
+        assert_eq!(list.identities.len(), MAX_NEEDS_YOU + 7);
         let cut = format!("{}…", "a".repeat(MAX_ASK));
         assert!(
             list.items

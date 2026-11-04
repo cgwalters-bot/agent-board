@@ -3652,6 +3652,20 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
     }
 }
 
+fn approval_only(pull: &Value, checks: &Checks, run: Option<&Value>, config: &Config) -> bool {
+    truncated(pull).is_empty()
+        && pull["state"] == "OPEN"
+        && pull["isDraft"] == false
+        && pull["mergeable"] == "MERGEABLE"
+        && !is_held(pull)
+        && checks.failed.is_empty()
+        && checks.pending.is_empty()
+        && matches!(job_verdict(pull), Some((Review::Approved, _)))
+        && reviews_at_head(pull).iter().any(|review| {
+            review["state"] == "APPROVED" && review_run_matches(pull, review, run, config)
+        })
+}
+
 /// Whether `pull`'s base repository is in `pr.noMerge`.
 fn no_merge(config: &Config, pull: &Value) -> bool {
     let repository = text(pull, "/baseRepository/nameWithOwner");
@@ -6665,13 +6679,52 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         } else {
             format!("{repo}#{number} {} {action}: {reason}{done}", short(head))
         };
-        let wait = operator_wait(&pull, &decision).map(|kind| Wait {
-            repository: repo.to_owned(),
-            number,
-            head: head.to_owned(),
-            kind,
-            reason: needs_you_reason(&pull, &decision.reason),
-        });
+        // Publication only: a controller PR still cannot merge on a job's
+        // approval. Its operator decision must not disappear behind a skip.
+        // Read display provenance only after deciding that this PR otherwise
+        // takes no step. A missing historical job cannot block an operator-
+        // authorized merge or another independently authorized operation.
+        let display_run_id = (decision.action == "skip"
+            && decision.reason.starts_with(NO_REVIEW)
+            && self.config.review_workflow.is_some())
+        .then(|| job_verdict(&pull))
+        .flatten()
+        .filter(|(verdict, _)| *verdict == Review::Approved)
+        .and_then(|(_, review)| cited_run(text(review, "/body")))
+        .filter(|(base, _)| *base == repo)
+        .map(|(_, run)| run);
+        let display_run = match display_run_id {
+            Some(run) => Some(
+                self.get_url(
+                    &format!("{API_ROOT}repos/{repo}/actions/runs/{run}"),
+                    slim_run,
+                    false,
+                )?
+                .0,
+            ),
+            None => None,
+        };
+        let approval_only = decision.action == "skip"
+            && decision.reason.starts_with(NO_REVIEW)
+            && approval_only(
+                &pull,
+                &classify_all_checks(&pull, base_required),
+                review_run.as_ref().or(display_run.as_ref()),
+                self.config,
+            );
+        let wait = operator_wait(&pull, &decision)
+            .or_else(|| approval_only.then_some("approve"))
+            .map(|kind| Wait {
+                repository: repo.to_owned(),
+                number,
+                head: head.to_owned(),
+                kind,
+                reason: if approval_only {
+                    "The review agent approved and checks are green; approve this head?".into()
+                } else {
+                    needs_you_reason(&pull, &decision.reason)
+                },
+            });
         let stepped = (text(&pull, "/author/login") == self.config.bot).then(|| Stepped {
             repository: repo.to_owned(),
             number,
@@ -10528,6 +10581,21 @@ mod tests {
         let cases = [
             ("approved and green", json!({}), None),
             (
+                "controller approved and green",
+                json!({"isCrossRepository": false}),
+                Some("approve"),
+            ),
+            (
+                "controller without approval",
+                json!({"isCrossRepository": false, "reviews": {"nodes": []}}),
+                None,
+            ),
+            (
+                "controller with failing checks",
+                json!({"isCrossRepository": false, "contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                None,
+            ),
+            (
                 "for the operator's approval",
                 labels(OPERATOR_APPROVAL_LABEL),
                 Some("approve"),
@@ -10555,6 +10623,32 @@ mod tests {
         let outcome = pass(&github(), State::default(), &[], &["o/missing"]);
         assert_eq!(outcome.undecided, ["o/missing".to_owned()].into());
         assert!(outcome.waits.is_empty());
+        // The operator's governing verdict needs no agent run. An irrelevant
+        // job lookup must not turn its unavailable history into a merge hold.
+        let mut fake = github();
+        fake.pulls.insert(
+            470,
+            pull(
+                "pull-470",
+                json!({"reviews":{"nodes":[
+                    review("APPROVED", job(), HEAD, "approved"),
+                    later(review("APPROVED", user("cgwalters"), HEAD, "approved"))
+                ]}}),
+            ),
+        );
+        fake.rest
+            .remove(&format!("{API_ROOT}repos/{REPO}/actions/runs/{REVIEW_RUN}"));
+        let outcome = pass(&fake, State::default(), &[], &[REPO]);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(outcome.waits.is_empty());
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|line| line.contains(" merge:") || line.starts_with("merge ")),
+            "{:?}",
+            outcome.lines
+        );
     }
 
     #[test]
