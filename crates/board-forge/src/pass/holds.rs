@@ -1261,6 +1261,9 @@ pub struct Identity {
     pub source: String,
     pub waiting_since: String,
     pub carried: bool,
+    /// A review wait backed by needs-human, not an unlabelled poll refusal.
+    /// Older publications lack this evidence and require a full source read.
+    pub label_backed: bool,
     pub priority: Option<String>,
     pub epic: String,
     pub top_epic: String,
@@ -1283,6 +1286,8 @@ struct CompactIdentity {
     waiting_since: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     carried: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    label_backed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     priority: Option<String>,
     epic: String,
@@ -1302,6 +1307,7 @@ impl From<CompactIdentity> for Identity {
             source: c.source,
             waiting_since: c.waiting_since,
             carried: c.carried,
+            label_backed: c.label_backed,
             priority: c.priority,
             epic: c.epic,
         }
@@ -1319,6 +1325,7 @@ impl From<Identity> for CompactIdentity {
             source: i.source,
             waiting_since: i.waiting_since,
             carried: i.carried,
+            label_backed: i.label_backed,
             priority: i.priority,
             epic: i.epic,
         }
@@ -1918,7 +1925,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             head: None,
             source_ref: Reference::new(RefKind::Hold, &repository, number),
             action,
-            carried: false,
+            carried: h.carried,
             group: None,
             chain: EpicChain::default(),
         };
@@ -2205,6 +2212,9 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
                         source: ask.source.clone(),
                         waiting_since: ask.waiting_since.clone(),
                         carried: ask.carried,
+                        label_backed: !ask.carried
+                            && ask.kind == "review-needs-human"
+                            && !ask.ask.starts_with(crate::poll::LEFT_TO_OPERATOR),
                         priority: ask.priority.clone(),
                         epic: "unknown".into(),
                         top_epic: "unknown".into(),
@@ -2226,6 +2236,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             {
                 carried.waiting_since = identity.waiting_since.clone();
                 carried.priority = identity.priority.clone();
+                carried.label_backed = identity.label_backed;
             }
             let repository = identity
                 .item
@@ -4393,17 +4404,21 @@ mod tests {
             Some(HEAD_A),
         );
         digest.ask = "Approve at the assessed head?".into();
+        digest.key = "o/r#9/digest".into();
         digest.source_ref.comment = Some(17);
         digest.waiting_since = "2026-10-27T08:00:00Z".into();
         reading.proposals = Collected::off();
         reading.reviews = collected(Read::Complete, vec![live], &[]);
         reading.digest = collected(Read::Complete, vec![digest], &[]);
-        let first = needs_you(&board, None, &reading);
+        let mut first = needs_you(&board, None, &reading);
+        super::super::needs::inventory::revalidate(&mut first, &BTreeMap::new(), None);
+        assert_eq!(first.request_sources.len(), 2);
         assert_eq!(first.items[0].waiting_since, "2026-10-27T08:00:00Z");
         reading.digest = Collected::of(Read::Unread);
         let mut later = board;
         later.at = "2026-10-28T10:00:00Z".into();
-        let middle = needs_you(&later, Some(&as_published(&first)), &reading);
+        let mut middle = needs_you(&later, Some(&as_published(&first)), &reading);
+        super::super::needs::inventory::revalidate(&mut middle, &BTreeMap::new(), None);
         assert_ne!(
             middle.requests[0].observed_at,
             first.requests[0].observed_at
@@ -4493,6 +4508,34 @@ mod tests {
         assert_eq!(list.requests.len(), 2);
         assert_ne!(list.requests[0].identity, list.requests[1].identity);
         assert!(list.requests.iter().all(|r| r.key == list.items[0].key));
+        let mut stale = board.clone();
+        stale.holds[0].kind = HoldKind::NeedsHuman;
+        stale.holds[0].carried = true;
+        stale.holds[0].priority = Some("P0".into());
+        let mut shared = needs_you(&stale, None, &reading);
+        assert_eq!(shared.identities[0].kind, "needs-human");
+        super::super::needs::inventory::revalidate(
+            &mut shared,
+            &BTreeMap::from([(
+                "o/r#9".into(),
+                json!({"state":"OPEN","labels":{"nodes":[],"totalCount":0}}),
+            )]),
+            None,
+        );
+        assert_eq!(shared.items.len(), 1);
+        assert_eq!(shared.requests.len(), 1);
+        assert_eq!(shared.requests[0].target.kind, RefKind::ApprovePullRequest);
+        assert_eq!(shared.identities[0].source, REVIEWS);
+        assert_eq!(shared.counts.decisions, 1);
+        assert_eq!(shared.counts.members, 1);
+        reading.reviews = Collected::of(Read::Unread);
+        let carried_review = needs_you(&stale, Some(&as_published(&shared)), &reading);
+        assert!(
+            carried_review
+                .requests
+                .iter()
+                .any(|r| r.target.kind == RefKind::ApprovePullRequest)
+        );
         reading.reviews = Collected::of(Read::Unread);
         let unread = needs_you(&board, Some(&as_published(&list)), &reading);
         assert_eq!(unread.items.len(), 1);

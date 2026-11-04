@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 
 pub(super) mod epics;
 pub(super) mod inbox;
+pub(super) mod inventory;
 
 /// The most issues labelled for proposals read a pass, oldest first; the
 /// rest are unread, and their published asks kept.
@@ -497,8 +498,43 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             summaries: (Read::Complete, BTreeMap::new()),
         };
         let list = holds::needs_you(snapshot, previous, &reading);
+        let inventory = self.inbox_inventory(&list);
+        let proposal_label = config
+            .holds
+            .as_ref()
+            .and_then(|h| h.proposals.as_ref())
+            .map(|p| p.label.as_str());
+        let mut list = list;
+        inventory::revalidate(&mut list, &inventory, proposal_label);
+        self.inventory_chains(&mut list, &inventory);
+        let chains: BTreeMap<_, _> = list
+            .identities
+            .iter()
+            .map(|i| {
+                (
+                    i.item.to_ascii_lowercase(),
+                    holds::EpicChain {
+                        epic: i.epic.clone(),
+                        top_epic: i.top_epic.clone(),
+                    },
+                )
+            })
+            .collect();
+        // Parent chains and carry checks take precedence over optional prose.
         reading.summaries = self.summaries(&list);
         let mut list = holds::needs_you(snapshot, previous, &reading);
+        inventory::revalidate(&mut list, &inventory, proposal_label);
+        for identity in &mut list.identities {
+            if let Some(chain) = chains.get(&identity.item.to_ascii_lowercase()) {
+                identity.epic = chain.epic.clone();
+                identity.top_epic = chain.top_epic.clone();
+            }
+        }
+        for ask in &mut list.items {
+            if let Some(chain) = chains.get(&ask.item.to_ascii_lowercase()) {
+                ask.chain = chain.clone();
+            }
+        }
         self.inbox_epics(&mut list);
         holds::preserve_changed_at(&mut list, previous);
         list

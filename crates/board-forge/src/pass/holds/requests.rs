@@ -68,6 +68,27 @@ pub struct SourceAsk {
     pub source_time: Option<String>,
 }
 
+/// Keep the semantic projection when inventory pruning changes a group's
+/// representative. No facts read at the old PR's head apply to the new one.
+pub(crate) fn refresh_group(request: &mut Request, ask: &Ask) {
+    request.question = ask.ask.clone();
+    if request.target.number == ask.action.number {
+        return;
+    }
+    request.identity = identity(ask, &request.forge);
+    request.target = ask.action.clone();
+    request.revision = None;
+    request.recommendation = None;
+    request.sources = vec![ask.source_ref.clone()];
+    request.observed_at = None;
+    request.source_time = None;
+    request.facts = ask.ask.clone();
+    request.quality = "unverified-carried".into();
+    for action in &mut request.actions {
+        action.supported = false;
+    }
+}
+
 pub(super) fn previous_source(ask: &Ask, previous: Option<&Value>) -> Option<SourceAsk> {
     published_list(previous)
         .and_then(|p| p["request_sources"].as_array())
@@ -86,7 +107,7 @@ pub(super) fn previous_source(ask: &Ask, previous: Option<&Value>) -> Option<Sou
 
 /// Identity excludes source and revision. A proposal comment is deliberately
 /// independent even when its title or target is identical to another's.
-pub(super) fn identity(ask: &Ask, host: &str) -> String {
+pub(crate) fn identity(ask: &Ask, host: &str) -> String {
     let action = &ask.action;
     let semantic = match action.kind {
         RefKind::ApprovePullRequest => "approve".to_owned(),

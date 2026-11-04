@@ -23,15 +23,15 @@ pub(in crate::pass) const CONTEXT_QUERY: &str = r#"query($owner: String!, $name:
 }"#;
 
 #[derive(Default)]
-struct Node {
-    parent: Option<String>,
-    live: bool,
+pub(super) struct Node {
+    pub(super) parent: Option<String>,
+    pub(super) live: bool,
     children: Vec<String>,
     why: BTreeSet<String>,
     complete: bool,
 }
 
-fn reference(node: &Value) -> Option<ItemRef> {
+pub(super) fn reference(node: &Value) -> Option<ItemRef> {
     let repository = node["repository"]["nameWithOwner"].as_str()?;
     validate_repository(repository).ok()?;
     let number = node["number"].as_u64().filter(|n| *n > 0)?;
@@ -98,7 +98,7 @@ fn activity(at: &str, nodes: &BTreeMap<String, Node>) -> EpicActivity {
     }
 }
 
-fn decorate(list: &mut NeedsYou, nodes: &BTreeMap<String, Node>) {
+pub(super) fn decorate(list: &mut NeedsYou, nodes: &BTreeMap<String, Node>) {
     for identity in &mut list.identities {
         let resolved = chain(&identity.item.to_ascii_lowercase(), nodes);
         identity.epic = resolved.epic.clone();
@@ -158,7 +158,13 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 )),
             }
         }
-        decorate(list, &nodes);
+        // Inventory/ancestor reads already resolved every identity, before
+        // optional descendant activity could spend the remaining budget.
+        list.epics = nodes
+            .iter()
+            .filter(|(_, n)| n.live)
+            .map(|(key, _)| (key.clone(), activity(key, &nodes)))
+            .collect();
         for (at, live) in &self.epics {
             if *live == Ok(true) {
                 list.epics

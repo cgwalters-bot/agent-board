@@ -2376,6 +2376,31 @@ impl Transport for Forge {
             self.late(&variables.to_string(), &mut data);
             return Ok(data);
         }
+        if query.starts_with("query InboxInventory(") {
+            let mut data = serde_json::Map::new();
+            for n in 0..variables.as_object().unwrap().len() / 3 {
+                let vars = json!({"owner": variables[format!("o{n}")], "name": variables[format!("r{n}")], "number": variables[format!("n{n}")]});
+                let mut node = self
+                    .replay
+                    .graphql(needs::epics::CONTEXT_QUERY, vars.clone())
+                    .or_else(|_| self.replay.graphql("inbox inventory fixture", vars))
+                    .ok()
+                    .map(|v| v["repository"]["issueOrPullRequest"].clone())
+                    .unwrap_or(Value::Null);
+                if let Some(fields) = node.as_object_mut()
+                    && let Some(state) = fields.remove("state")
+                {
+                    let field = if fields.contains_key("closingIssuesReferences") {
+                        "pullRequestState"
+                    } else {
+                        "issueState"
+                    };
+                    fields.insert(field.into(), state);
+                }
+                data.insert(format!("i{n}"), json!({"issueOrPullRequest": node}));
+            }
+            return Ok(Value::Object(data));
+        }
         let mut data = match self.replay.graphql(query, variables.clone()) {
             // An issue whose body was not recorded: the operator's, unedited.
             Err(_) if query == BODY_QUERY => {
@@ -2425,6 +2450,17 @@ impl Transport for Forge {
         }
         Ok(data)
     }
+}
+
+fn inventory_on(replay: &mut Replay, repository: &str, number: u64, label: &str) {
+    let (owner, name) = repository.split_once('/').unwrap();
+    let vars = json!({"owner": owner, "name": name, "number": number});
+    replay.requests.push(
+        json!({"request": graphql_key("inbox inventory fixture", &vars),
+        "answer": {"data": {"repository": {"issueOrPullRequest": {
+            "state": "OPEN", "labels": {"nodes": [{"name": label}], "totalCount": 1}, "parent": null
+        }}}}}),
+    );
 }
 
 fn apply(forge: &Forge, config: &Config) -> Report {
@@ -3351,6 +3387,13 @@ fn apply_publishes_what_needs_you() {
             let request = json!({"request": {"get": url}, "answer": reply(body)});
             forge.replay.requests.push(request);
         }
+        for (repo, n, label) in [
+            ("cgwalters-forge/tracker", 446, NEEDS_HUMAN),
+            ("cgwalters-forge/tracker", 527, NEEDS_HUMAN),
+            ("cgwalters-forge/bot-ops", 5, "operator-action"),
+        ] {
+            inventory_on(&mut forge.replay, repo, n, label);
+        }
         forge
     };
     let with_context = |mut forge: Forge| {
@@ -3544,6 +3587,118 @@ fn apply_publishes_what_needs_you() {
     }
     assert_eq!(many_snapshot["needs_you"]["summaries"], "complete");
     let snapshot = holds::parse(&body).unwrap();
+    // #668: real public state/parent facts through the complete publication
+    // path. Full WIP carries the underlying holds, not just identity records.
+    // Previous membership is reconstructed; the private inbox is unavailable.
+    {
+        let replay: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/pass/inbox-public-2026-11-04.json"
+        ))
+        .unwrap();
+        let template = snapshot["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["kind"] == "needs-human" && h["operator"] == true)
+            .unwrap();
+        let mut old = snapshot.clone();
+        old["holds"] = Value::Array(
+            replay["carried"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    let mut hold = template.clone();
+                    let item = item.as_str().unwrap();
+                    let (repo, number) = item.rsplit_once('#').unwrap();
+                    hold["item"] = json!(item);
+                    hold["url"] = json!(format!("https://github.com/{repo}/issues/{number}"));
+                    hold["epic"] = json!(false);
+                    hold
+                })
+                .collect(),
+        );
+        for field in ["items", "identities", "requests", "request_sources"] {
+            old["needs_you"][field] = json!([]);
+        }
+        let previous = format!("{}\n```json\n{old}\n```", holds::HOLDS_MARKER);
+        let mut forge = forge_with(Some(&previous));
+        for (item, node) in replay["nodes"].as_object().unwrap() {
+            let (repo, number) = item.rsplit_once('#').unwrap();
+            let (owner, name) = repo.split_once('/').unwrap();
+            let vars = json!({"owner":owner,"name":name,"number":number.parse::<u64>().unwrap()});
+            forge.replay.requests.push(
+                json!({"request":graphql_key("inbox inventory fixture", &vars),
+                "answer":{"data":{"repository":{"issueOrPullRequest":node}}}}),
+            );
+        }
+        // Use the existing recorded authenticated epic-label timeline, with
+        // fixture identity substitutions for the newly observed ancestors.
+        let labelled = forge
+            .replay
+            .requests
+            .iter()
+            .find(|e| {
+                e["request"]["variables"]
+                    == json!({"owner":"cgwalters-forge","name":"tracker","number":160})
+                    && e["answer"]
+                        .pointer("/data/repository/issue/timelineItems")
+                        .is_some()
+            })
+            .unwrap()
+            .clone();
+        for number in [15, 333, 680, 1215] {
+            let mut entry = labelled.clone();
+            entry["request"]["variables"]["number"] = json!(number);
+            forge.replay.requests.push(entry);
+        }
+        let report = apply(&forge, &with_wip(2));
+        assert_eq!(report.failures, 0, "{:?}", report.lines);
+        let body = forge
+            .writes
+            .borrow()
+            .iter()
+            .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
+            .map(|(_, _, b)| text(b, "/body").to_owned())
+            .unwrap();
+        let publication = holds::parse(&body).unwrap();
+        let list = &publication["needs_you"];
+        let identities: Vec<_> = list["identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["source"] == "items")
+            .collect();
+        assert_eq!(identities.len(), 4, "{list}");
+        assert!(identities.iter().all(|i| i["carried"] == true));
+        assert!(
+            identities.iter().filter(|i| i["epic"] == "unknown").count() * 100
+                < identities.len() * 5
+        );
+        for dropped in replay["dropped"].as_array().unwrap() {
+            assert!(
+                !identities.iter().any(|i| i["item"] == *dropped),
+                "{dropped}"
+            );
+            assert!(
+                !list["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["item"] == *dropped)
+            );
+        }
+        for identity in identities {
+            assert_eq!(
+                identity["epic"],
+                if identity["item"] == "cgwalters-forge/composefs-rs#33" {
+                    "cgwalters-forge/tracker#160"
+                } else {
+                    "cgwalters-forge/tracker#1215"
+                }
+            );
+        }
+    }
     // A carried identity-only inventory can exceed a whole comment by itself.
     // A full WIP pass must still edit the inbox successfully, not fail fitting.
     let mut oversized = snapshot.clone();
@@ -3571,7 +3726,10 @@ fn apply_publishes_what_needs_you() {
         oversized["needs_you"][field] = json!([]);
     }
     let oversized_body = format!("{}\n```json\n{oversized}\n```", holds::HOLDS_MARKER);
-    let forge = forge_with(Some(&oversized_body));
+    let mut forge = forge_with(Some(&oversized_body));
+    for n in 10000..10400 {
+        inventory_on(&mut forge.replay, "cgwalters-forge/tracker", n, NEEDS_HUMAN);
+    }
     let report = apply(&forge, &with_wip(2));
     assert_eq!(report.failures, 0, "{:?}", report.lines);
     let capped = forge
@@ -3778,9 +3936,9 @@ fn apply_publishes_what_needs_you() {
             );
         }
     }
-    // Too few requests left for the proposals' listing: it is not sent, and
-    // the proposals, read in part, keep what they published. Nor are the
-    // summaries read, and the holds keep their published questions. Every
+    // Too few requests left for the proposals' comments or the carry check:
+    // unchecked proposals remain unverified carry records for the next pass,
+    // rather than disappearing permanently during a transient outage. Every
     // slot taken, stage 4 starts nothing, so spends as much on less.
     let full = with_wip(2);
     let within = |forge: &Forge, limit| {
@@ -3802,15 +3960,20 @@ fn apply_publishes_what_needs_you() {
         list["complete"]
     ]);
     assert_eq!(read, json!(["partial", "partial", false]));
-    assert_eq!(carried(&list), [proposal(21), proposal(22), proposal(23)]);
-    let asks: Vec<&Value> = (list["items"].as_array().unwrap().iter())
-        .map(|a| &a["ask"])
-        .collect();
-    let original: Vec<&Value> = (items.iter()).map(|a| &a["ask"]).collect();
-    assert_eq!(asks, original);
+    for key in [proposal(22), proposal(23)] {
+        assert!(carried(&list).contains(&key));
+    }
+    assert!(list["count"].as_u64().unwrap() > 0);
+    assert!(
+        list["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| { r["quality"] == "unverified-carried" || r["target"]["type"] == "hold" })
+    );
     said(
         &report,
-        "needs-you proposals error: the pass's request budget",
+        "needs-you inventory error: the pass's request budget",
     );
     // A later pass that reads the same list keeps its `changed_at`, and
     // so does one that cannot read #446's summary: it keeps the question

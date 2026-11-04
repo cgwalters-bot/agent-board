@@ -1,0 +1,20 @@
+{
+  "provenance": "Public GitHub GraphQL reads on 2026-11-04 for #668. Minimal state/labels/parent facts only, not the private inbox snapshot (unavailable: bot-ops HTTP 404). Prior carried needs-human identities are a reconstruction from the issue report, not a captured publication.",
+  "nodes": {
+    "cgwalters-forge/tracker#1257": {"state":"CLOSED","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},"parent":{"number":680,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/tracker#94": {"state":"CLOSED","labels":{"nodes":[{"name":"target:bootc-dev"},{"name":"P2"}],"totalCount":2},"parent":{"number":333,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/tracker#99": {"state":"OPEN","labels":{"nodes":[{"name":"target:osbuild"},{"name":"P2"}],"totalCount":2},"parent":{"number":15,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/composefs-rs#33": {"state":"OPEN","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},"parent":{"number":160,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/agentic-job#2890": {"state":"CLOSED","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},"parent":{"number":939,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/agentic-job#2891": {"state":"OPEN","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},"parent":{"number":1215,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/tracker#1239": {"state":"OPEN","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},"parent":{"number":1215,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/bootc#90": {"state":"OPEN","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},"parent":{"number":1215,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}}},
+    "cgwalters-forge/tracker#160": {"state":"OPEN","labels":{"nodes":[{"name":"target:bootc-dev"},{"name":"P1"},{"name":"epic"}],"totalCount":3},"parent":null},
+    "cgwalters-forge/tracker#1215": {"state":"OPEN","labels":{"nodes":[{"name":"epic"}],"totalCount":1},"parent":null},
+    "cgwalters-forge/tracker#680": {"state":"OPEN","labels":{"nodes":[{"name":"target:other"},{"name":"epic"}],"totalCount":2},"parent":null},
+    "cgwalters-forge/tracker#333": {"state":"OPEN","labels":{"nodes":[{"name":"target:bootc-dev"},{"name":"P2"},{"name":"epic"}],"totalCount":3},"parent":null},
+    "cgwalters-forge/tracker#15": {"state":"OPEN","labels":{"nodes":[{"name":"target:osbuild"},{"name":"P1"},{"name":"epic"}],"totalCount":3},"parent":null}
+  },
+  "carried": ["cgwalters-forge/tracker#1257", "cgwalters-forge/tracker#94", "cgwalters-forge/tracker#99", "cgwalters-forge/composefs-rs#33", "cgwalters-forge/agentic-job#2890", "cgwalters-forge/agentic-job#2891", "cgwalters-forge/tracker#1239", "cgwalters-forge/bootc#90"],
+  "dropped": ["cgwalters-forge/tracker#1257", "cgwalters-forge/tracker#94", "cgwalters-forge/tracker#99", "cgwalters-forge/agentic-job#2890"]
+}

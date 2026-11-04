@@ -255,7 +255,7 @@ const WITHHELD_WAIT: &str =
 const PROMOTE_WAIT: &str = "a midstream draft, waiting for promotion";
 /// How a round outside the caller's fix bounds is skipped: the operator
 /// takes it, labelled or not.
-const LEFT_TO_OPERATOR: &str = "left to the operator: ";
+pub(crate) const LEFT_TO_OPERATOR: &str = "left to the operator: ";
 
 /// agentic-job's apply pushes a round's commit to a head repository other
 /// than the bot's own fork only where that repository's default branch has
