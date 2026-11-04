@@ -103,6 +103,8 @@ jobs:
     secrets:
       SAFE_OUTPUTS_PAT: ${{ secrets.SAFE_OUTPUTS_PAT }}
     with:
+      # JSON label for policy/check/apply; keep the provider's agent runner.
+      runner: '"ubuntu-26.04"'
       id: reconcile
       repo: ${{ vars.RECONCILE_REPO }}
       allow: .github/agentic-job/reconcile.toml

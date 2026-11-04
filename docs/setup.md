@@ -138,6 +138,69 @@ in CI and checks the pass's decisions and summary. Nothing here proves live
 token access, dispatch, inference, review, container isolation or a scheduled
 loop. Every flag is in the [CLI reference](cli.md).
 
+## This repository's runner maintenance
+
+`.github/renovate.json` adopts the published
+[runner-only preset](https://github.com/cgwalters-forge/actions/blob/main/renovate/README.md).
+It follows the provider's **main branch**, not a pinned revision: future preset
+changes reach this repository too. The preset disables other dependency updates
+and vulnerability-alert PRs, enables only Ubuntu `github-runners` updates, and
+does not automerge. Dependabot still owns action pins; its configuration is
+unchanged. Adoption grants no workflow permission or credential. The Renovate
+App must already be installed with access to this repository; a configuration
+file alone does not prove that access or a live update.
+
+The credential-free `.github/agentic-job/test_review.py` suite checks adoption
+and each directly owned workflow job, including build/release workflows and
+staging templates when present. CI migrated to `ubuntu-26.04` in #535; the
+staging templates now use it too. Reusable workflows retain ownership of their
+runners; do not copy their jobs or move privileged pins just to change labels.
+Intentional special runners (for example the provider's detector and agent
+runner, which needs systemd 257) must retain their separate requirements.
+
+Runner ownership audit of this branch's pinned providers (2026-11-04):
+
+- Review calls `cgwalters-forge/actions/.github/workflows/cgwalters-review.yml`
+  at `d8e22f71b2abbe5f41306a0c7ef1b6c3d2829cac`. Its refusal, submit and status
+  jobs use 26.04. Its agent uses `AGENT_RUNNER`, defaulting to 26.04. Its
+  transitive `policy.yml`, `check.yml` and `apply.yml` calls belong to
+  `cgwalters-forge/agentic-job@v0.6.2`
+  (`258dc11ca7fe1798836976c0424274d1498e22cb`): policy defaults to 24.04,
+  passed through policy outputs to check/apply; the detector explicitly uses
+  26.04. The wrapper does not expose an ordinary-runner override. Migration
+  needs a provider change and review of the privileged wrapper pin and identity
+  admission; this adoption does not change them.
+- Reconciliation calls `cgwalters-forge/agentic-job/.github/workflows/agentic-job.yml`
+  at `db6f8e67b0855ba342c3f32a7083b4243a8ae995` (v0.6.3). Its local policy,
+  check and apply workflows run at that same revision: ordinary `runner`
+  defaults to 24.04, while `agent-runner` and the detector use 26.04. The
+  proposals-only caller skips agent/registration. The caller now passes
+  `with.runner: '"ubuntu-26.04"'` to migrate policy/check/apply without moving
+  the provider pin or changing permissions, credentials or identity admission.
+  The provider default remains older; its JSON input is manually maintained.
+
+The merge target, main at `1984af5822eac67f1dfc67c374bf9554e7466fca`, has
+already reviewed newer provider pins independently of this patch: review uses
+the actions wrapper `1b4539dd00edff3f89cb130e72e535e8d9c6a67a`, calling
+agentic-job v0.6.9 (`57119eeffa17ea41b383cfdaf8370b8abeba8868`). Its ordinary
+policy default is 26.04, passed to check/apply; wrapper jobs and the detector
+also use 26.04. Thus the old review-provider blocker above does not remain
+after merging main. Main's reconcile pin is v0.6.4
+(`732db8c24295ee8d4a79de19f588e6f871d35fe0`), which still defaults to 24.04
+and accepts the same JSON override. This patch preserves both branches' pins
+and lets their existing updates merge normally; it changes no identity admission.
+
+The preset extracts literal `runs-on` strings/lists only. There are no owned
+matrix/variable runner labels today. Provider `inputs.runner`, policy outputs,
+`inputs.agent-runner` and review's `vars.AGENT_RUNNER` need manual maintenance;
+the preset cannot follow them. Never mechanically rewrite self-hosted label
+lists or specialized runners. The preset does not scan `live/`; staging templates
+are manually maintained until copied into a staging repository's workflows.
+The installation API returned 401 on 2026-11-04:
+App access is unknown, not absent. Live app access and a Renovate-authored update
+remain separate evidence under tracker#1205, not a prerequisite for merging this
+configuration patch. See the adoption PR for the dated checks and hosted CI links.
+
 ## Connect one lane
 
 A deployment is configuration on a caller repository's protected default

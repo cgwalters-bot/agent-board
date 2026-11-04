@@ -13,6 +13,42 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReviewContracts(unittest.TestCase):
+    def test_runner_maintenance_uses_only_the_published_preset(self):
+        config = json.loads((ROOT / ".github/renovate.json").read_text())
+        # No local rules, second preset, action-pin updates or automerge.
+        self.assertEqual(config, {
+            "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+            "extends": ["github>cgwalters-forge/actions//renovate/runners"],
+        })
+
+    def test_owned_workflows_use_the_current_ubuntu_vm_runner(self):
+        # Include reusable build/release workflows and staging templates, not
+        # just PR CI. Providers own their jobs; expressions and special runners
+        # need explicit review rather than a mechanical label replacement.
+        workflows = sorted((ROOT / ".github/workflows").glob("*.yml")) + sorted((ROOT / "live").glob("*.yml"))
+        self.assertTrue(workflows)
+        for path in workflows:
+            content = path.read_text().split("\njobs:\n", 1)[1]
+            jobs = re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)", content, re.MULTILINE | re.DOTALL)
+            self.assertTrue(jobs, path)
+            for name, job in jobs:
+                with self.subTest(workflow=path.name, job=name):
+                    runners = re.findall(r"^    runs-on: (.+)$", job, re.MULTILINE)
+                    if re.search(r"^    uses: ", job, re.MULTILINE):
+                        self.assertEqual(runners, [])
+                    else:
+                        self.assertEqual(runners, ["ubuntu-26.04"])
+
+    def test_reconcile_overrides_only_the_ordinary_provider_runner(self):
+        caller = (ROOT / ".github/workflows/reconcile.yml").read_text()
+        apply = caller.split("\n  apply:\n", 1)[1]
+        # The provider consumes JSON, not a bare runner label. Leave its
+        # specialized agent runner, grants and source pin independently owned.
+        runner = re.findall(r"^      runner: '(.+)'$", apply, re.MULTILINE)
+        self.assertEqual(len(runner), 1)
+        self.assertEqual(json.loads(runner[0]), "ubuntu-26.04")
+        self.assertNotIn("agent-runner:", apply)
+
     def test_caller_uses_a_pinned_wrapper_and_never_checks_out_the_head(self):
         caller = (ROOT / ".github/workflows/review.yml").read_text()
         self.assertRegex(
