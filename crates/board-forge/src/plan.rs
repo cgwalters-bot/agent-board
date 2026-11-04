@@ -512,6 +512,15 @@ pub fn issue_comments<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Ve
     comments(transport, issue, COMMENTS_QUERY, "issue", "an issue", false)
 }
 
+/// Plans used as promotion evidence must distinguish absent edit facts from
+/// GitHub's explicit null (an unedited comment).
+pub(crate) fn issue_comments_with_edit_evidence<T: Transport>(
+    transport: &T,
+    issue: &ItemRef,
+) -> Result<Vec<Comment>> {
+    comments(transport, issue, COMMENTS_QUERY, "issue", "an issue", true)
+}
+
 /// Every comment on a pull request, in order, with the same bounds and
 /// refusals as [`issue_comments`]; an issue is refused.
 pub fn pull_request_comments<T: Transport>(transport: &T, pull: &ItemRef) -> Result<Vec<Comment>> {

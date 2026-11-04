@@ -40,7 +40,28 @@ parser accepts only a complete plain `/promote` or `/promote --human-text`
 comment, with optional surrounding newlines: prose, Markdown link titles,
 quotes, fences and HTML examples are not permission.
 
+`gates-public-2026-11-04.json` adds public REST observations read with `gh api`
+on 4 November 2026, not a live candidate or authorization. Its request keys
+name the exact endpoints: upstream `pulls?state=all&head=...` (empty),
+`compare/main...cgwalters-bot:dispatch/implement/agent-run-39714560993`
+(one ahead, 23 behind), `rules/branches/main`, `branches/main`, and check runs
+at base head `b41cec22319f8d76dcb0a8f82f259d23ad904157`. Listings used
+`per_page=100&page=1`; all fit on one page. The check-runs read with GitHub's
+default page size returned only 30 of 33 checks; the explicit 100-row read
+captured all 33, including DCO. None of these endpoint reads was unavailable.
+Only fields used by these gates are retained. The long comparison commit
+message is omitted (not replaced with invented recorded text); a DCO candidate
+using that projection without a scenario edit would hold on the missing message.
+The original recording remains unchanged so existing draft previews replay.
+
+Gate scenarios combine both public recordings and explicitly edit behind
+distance, authors/messages, PR text/state, required checks and check runs.
+Issue-plan comment responses and parent PRs in these tests are hypothetical
+scenario data, not claims of additional recorded public observations.
+They cover no plan, explicit stacks, all parent states and the DCO/text holds.
+The CLI's would-promote example is likewise an edited offline scenario.
+
 No caller setting, schedule, forge write, live promotion or staging test was
-enabled. Policy/stack/human-text provenance/distance/DCO/publication checks,
+enabled. Policy/human-text provenance/publication checks,
 bounded writes and recovery, sign-off, and Status/scheduling handoff remain
 separate slices of #308.

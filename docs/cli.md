@@ -37,7 +37,7 @@ Commands:
 - [`cost`](#agent-board-cost): What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md)
 - [`ci-health`](#agent-board-ci-health): Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md)
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
-- [`promote`](#agent-board-promote): Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Prints candidate/hold evidence only: policy freshness/loosening, stack, human-text provenance, distance, DCO and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote)
+- [`promote`](#agent-board-promote): Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Candidates get upstream-PR, distance, accepted-plan stack, GitHub DCO and text gates; prints hold, already promoted or would promote. Policy, human-text provenance and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -792,7 +792,7 @@ Options:
 
 ## agent-board promote
 
-Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Prints candidate/hold evidence only: policy freshness/loosening, stack, human-text provenance, distance, DCO and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote)
+Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Candidates get upstream-PR, distance, accepted-plan stack, GitHub DCO and text gates; prints hold, already promoted or would promote. Policy, human-text provenance and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote)
 
 ```text
 agent-board promote [OPTIONS] --config <FILE>

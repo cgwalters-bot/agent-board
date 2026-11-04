@@ -14,7 +14,7 @@ use crate::{
 const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
-pub const REMAINING: &str = "promote: candidate only; remaining gates: policy freshness/loosening, stack, human-text provenance, distance, DCO, publication; no writes implemented; bot-fork heads require recorded staging verification";
+pub const REMAINING: &str = "promote: remaining gates: policy, human-text provenance, publication; no writes implemented; bot-fork heads require recorded staging verification";
 
 pub fn enabled(config: &Config) -> bool {
     config.promote.as_ref().is_some_and(|p| !p.forks.is_empty())
@@ -41,6 +41,9 @@ pub fn preview<C: Rest + Transport>(
         let mut lines = Vec::new();
         let promote = config.promote.as_ref().context("promote configuration")?;
         for (repo, target) in &promote.forks {
+            validate_repository(repo)?;
+            validate_repository(&target.upstream)?;
+            validate_branch(&target.base)?;
             let metadata = get(client, &format!("repos/{repo}"))?;
             repository(&metadata, repo)?;
             let network = in_network(&metadata, &target.upstream);
@@ -70,8 +73,19 @@ pub fn preview<C: Rest + Transport>(
                     now,
                 );
                 match evidence {
-                    Ok(command) => lines.push(format!("candidate promote {repo}#{number} head={head} {command}; staging verification required for bot-fork head")),
-                    Err(error) => lines.push(format!("hold promote {repo}#{number} head={head} command=unverified: {error:#}")),
+                    Ok(command) => {
+                        match gates(client, config, repo, &pull, &target.upstream, &target.base) {
+                            Ok(result) => {
+                                lines.push(format!("{result}; head={head} {command}; staging verification required for bot-fork head"));
+                            }
+                            Err(error) => lines.push(format!(
+                                "hold promote {repo}#{number} head={head} {command}: {error:#}"
+                            )),
+                        }
+                    }
+                    Err(error) => lines.push(format!(
+                        "hold promote {repo}#{number} head={head} command=unverified: {error:#}"
+                    )),
                 }
             }
         }
@@ -93,6 +107,10 @@ fn get(client: &impl Rest, path: &str) -> Result<Value> {
 /// Construct page paths locally: a forged Link cannot redirect credentials.
 /// A full last page without a next link is ambiguous and fails closed.
 fn pages(client: &impl Rest, path: &str) -> Result<Vec<Value>> {
+    object_pages(client, path, None)
+}
+
+fn object_pages(client: &impl Rest, path: &str, field: Option<&str>) -> Result<Vec<Value>> {
     let mut values = Vec::new();
     for page in 1..=MAX_PAGES {
         let separator = if path.contains('?') { '&' } else { '?' };
@@ -103,8 +121,8 @@ fn pages(client: &impl Rest, path: &str) -> Result<Vec<Value>> {
             "GET {path}: HTTP {}",
             response.status
         );
-        let rows = response
-            .body
+        let rows = field
+            .map_or(&response.body, |key| &response.body[key])
             .as_array()
             .context("listing is not an array")?;
         ensure!(rows.len() <= PAGE_SIZE, "oversized listing");
@@ -113,10 +131,463 @@ fn pages(client: &impl Rest, path: &str) -> Result<Vec<Value>> {
         values.extend(rows.iter().cloned());
         if !more {
             ensure!(rows.len() < PAGE_SIZE, "listing may be truncated");
+            if field == Some("check_runs") {
+                ensure!(
+                    response.body["total_count"].as_u64() == Some(values.len() as u64),
+                    "incomplete check runs"
+                );
+            }
             return Ok(values);
         }
     }
     anyhow::bail!("listing exceeds {MAX_PAGES} pages")
+}
+
+fn encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+/// These gates prevent duplicate publication, stale bases, unmerged dependencies,
+/// unsafe sign-off rewrites and repository-relative text changing meaning.
+fn gates(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    repo: &str,
+    pull: &Value,
+    upstream: &str,
+    base: &str,
+) -> Result<String> {
+    validate_repository(repo)?;
+    validate_repository(upstream)?;
+    validate_branch(base)?;
+    let number = pull["number"].as_u64().context("invalid pull number")?;
+    let owner = pull["head"]["repo"]["owner"]["login"]
+        .as_str()
+        .context("missing head owner")?;
+    let branch = pull["head"]["ref"]
+        .as_str()
+        .context("missing head branch")?;
+    validate_branch(branch)?;
+    let head = pull["head"]["sha"]
+        .as_str()
+        .filter(|s| oid(s))
+        .context("invalid head sha")?;
+    let existing = upstream_pulls(client, upstream, owner, branch)?;
+    if !existing.is_empty() {
+        ensure!(
+            existing.len() == 1,
+            "multiple upstream PRs for head {owner}:{branch}"
+        );
+        let p = &existing[0];
+        let n = p["number"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .context("invalid upstream pull number")?;
+        ensure!(
+            p["state"] == "open",
+            "upstream {upstream}#{n} is closed/merged"
+        );
+        ensure!(
+            p["head"]["sha"] == head,
+            "upstream {upstream}#{n} has a different head"
+        );
+        return Ok(format!(
+            "already promoted {repo}#{number} -> {upstream}#{n}"
+        ));
+    }
+    let path = format!(
+        "repos/{upstream}/compare/{}...{}",
+        encode(base),
+        encode(&format!("{owner}:{branch}"))
+    );
+    let compare = comparison(client, &path, head)?;
+    let ahead = compare["ahead_by"].as_u64().context("missing ahead_by")?;
+    let behind = compare["behind_by"].as_u64().context("missing behind_by")?;
+    ensure!(ahead > 0, "already upstream (zero ahead)");
+    ensure!(
+        behind == 0,
+        "needs rebase and a fresh /promote (behind_by={behind})"
+    );
+    let stack = stack_gate(client, config, repo, pull, upstream, base)?;
+    let dco = dco_gate(client, config, upstream, base, &compare, head)?;
+    let text = pull["body"].as_str().context("missing pull body")?;
+    ensure!(!text.trim().is_empty(), "empty body");
+    let title = pull["title"].as_str().context("missing pull title")?;
+    for text in [title, text] {
+        // A qualified reference keeps its meaning; any bare reference changes
+        // repository. Be conservative even in Markdown examples: never rewrite.
+        for (i, _) in text.match_indices('#') {
+            if text.as_bytes().get(i + 1).is_some_and(u8::is_ascii_digit) {
+                let prefix = &text[..i];
+                let qualifier = prefix
+                    .rsplit(|c: char| !(c.is_ascii_alphanumeric() || "-._/".contains(c)))
+                    .next()
+                    .unwrap_or_default();
+                let qualified = validate_repository(qualifier).is_ok();
+                ensure!(
+                    qualified,
+                    "text has a bare #N reference that changes repository upstream"
+                );
+            }
+        }
+        for n in referenced_numbers(text) {
+            ensure!(
+                !crate::stack::closes(text, repo, n),
+                "text has a closing reference to {repo}#{n}"
+            );
+        }
+    }
+    Ok(format!(
+        "would promote {repo}#{number} -> {upstream} ({}); remaining gates: policy, human-text provenance, publication; no writes implemented; {stack}; {}",
+        dco.1, dco.0
+    ))
+}
+
+fn comparison(client: &impl Rest, path: &str, head: &str) -> Result<Value> {
+    let mut first: Option<Value> = None;
+    let mut commits = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let response = client.get(
+            &format!("{API}{path}?per_page={PAGE_SIZE}&page={page}"),
+            None,
+        )?;
+        ensure!(
+            response.status == 200,
+            "GET {path}: HTTP {}",
+            response.status
+        );
+        let body = response.body;
+        if let Some(first) = &first {
+            for key in [
+                "ahead_by",
+                "behind_by",
+                "total_commits",
+                "merge_base_commit",
+            ] {
+                ensure!(body[key] == first[key], "compare changed during pagination");
+            }
+        } else {
+            first = Some(body.clone());
+        }
+        let rows = body["commits"]
+            .as_array()
+            .context("missing compare commits")?;
+        ensure!(rows.len() <= PAGE_SIZE, "oversized compare page");
+        let more = pagination(response.link.as_deref())?;
+        ensure!(!more || !rows.is_empty(), "empty intermediate compare page");
+        commits.extend(rows.iter().cloned());
+        if !more {
+            let mut result = first.context("missing compare")?;
+            ensure!(
+                result["total_commits"].as_u64() == Some(commits.len() as u64)
+                    && result["ahead_by"] == result["total_commits"],
+                "incomplete compare commits"
+            );
+            ensure!(
+                result["merge_base_commit"]["sha"].as_str().is_some_and(oid),
+                "invalid merge base sha"
+            );
+            let mut seen = BTreeSet::new();
+            for c in &commits {
+                let sha = c["sha"]
+                    .as_str()
+                    .filter(|s| oid(s))
+                    .context("invalid compare commit sha")?;
+                ensure!(seen.insert(sha), "duplicate compare commit");
+            }
+            ensure!(
+                commits.is_empty() || commits.last().is_some_and(|c| c["sha"] == head),
+                "compare head mismatch"
+            );
+            result["commits"] = Value::Array(commits);
+            return Ok(result);
+        }
+    }
+    anyhow::bail!("compare exceeds {MAX_PAGES} pages")
+}
+
+fn upstream_pulls(
+    client: &impl Rest,
+    upstream: &str,
+    owner: &str,
+    branch: &str,
+) -> Result<Vec<Value>> {
+    validate_repository(upstream)?;
+    validate_repository(&format!("{owner}/head"))?;
+    validate_branch(branch)?;
+    let rows = pages(
+        client,
+        &format!(
+            "repos/{upstream}/pulls?state=all&head={}",
+            encode(&format!("{owner}:{branch}"))
+        ),
+    )?;
+    for p in &rows {
+        ensure!(
+            p["head"]["ref"] == branch
+                && p["head"]["repo"]["owner"]["login"]
+                    .as_str()
+                    .is_some_and(|o| o.eq_ignore_ascii_case(owner)),
+            "upstream head identity mismatch"
+        );
+        ensure!(
+            p["head"]["sha"].as_str().is_some_and(oid),
+            "invalid upstream head sha"
+        );
+    }
+    Ok(rows)
+}
+
+fn referenced_numbers(text: &str) -> BTreeSet<u64> {
+    text.split(['#'])
+        .skip(1)
+        .chain(text.split("/issues/").skip(1))
+        .filter_map(|s| {
+            s.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .filter(|n| *n > 0)
+        .collect()
+}
+
+fn stack_gate(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    repo: &str,
+    pull: &Value,
+    upstream: &str,
+    base: &str,
+) -> Result<String> {
+    let text = pull["body"]
+        .as_str()
+        .context("cannot tie fork PR to issue: missing body")?;
+    let issues: Vec<_> = referenced_numbers(text)
+        .into_iter()
+        .filter(|n| crate::stack::closes(text, repo, *n) || crate::stack::part_of(text, repo, *n))
+        .collect();
+    ensure!(
+        issues.len() == 1,
+        "cannot tie fork PR to one issue deterministically{}",
+        if text.trim().is_empty() {
+            ": empty body"
+        } else {
+            ""
+        }
+    );
+    let issue = crate::parse_github_item(
+        &format!("{repo}#{}", issues[0]),
+        None,
+        crate::github::DEFAULT_HOST,
+    )?;
+    let comments = crate::plan::issue_comments_with_edit_evidence(client, &issue)?;
+    let writers = [&*config.operator, &*config.bot];
+    if crate::plan::no_plan(&comments, &writers) {
+        return Ok("stack=none (no plan)".into());
+    }
+    let (plan, _) = crate::plan::newest_plan(&comments, &writers)?;
+    ensure!(
+        plan.repo.eq_ignore_ascii_case(repo) && plan.item == issue.number,
+        "accepted plan issue mismatch"
+    );
+    let Some(lower) = plan.stacks_on else {
+        return Ok("stack=none".into());
+    };
+    let parents = pages(
+        client,
+        &format!("repos/{repo}/pulls?state=all&sort=created&direction=asc"),
+    )?;
+    let parents: Vec<_> = parents
+        .iter()
+        .filter(|p| {
+            let body = p["body"].as_str().unwrap_or_default();
+            p["user"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot))
+                && (crate::stack::closes(body, repo, lower)
+                    || crate::stack::part_of(body, repo, lower))
+        })
+        .collect();
+    ensure!(
+        parents.len() == 1,
+        "stack parent {repo}#{lower} has no unique fork PR"
+    );
+    let parent = parents[0];
+    let parent_head = parent["head"]["sha"]
+        .as_str()
+        .filter(|s| oid(s))
+        .context("invalid parent head sha")?;
+    let n = parent["number"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .context("invalid parent PR number")?;
+    let owner = parent["head"]["repo"]["owner"]["login"]
+        .as_str()
+        .context("missing parent head owner")?;
+    let branch = parent["head"]["ref"]
+        .as_str()
+        .context("missing parent head branch")?;
+    let prs = upstream_pulls(client, upstream, owner, branch)?;
+    ensure!(
+        prs.len() <= 1,
+        "stack parent {repo}#{n} has multiple upstream PRs"
+    );
+    if let Some(p) = prs.first() {
+        let pn = p["number"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .context("invalid parent upstream PR number")?;
+        if p["state"] == "closed" && p["merged_at"].is_string() {
+            ensure!(
+                p["base"]["ref"] == base,
+                "stack parent {upstream}#{pn}: merged into a different base, not {base}"
+            );
+            ensure!(
+                p["head"]["sha"] == parent_head,
+                "stack parent {upstream}#{pn}: merged head differs from fork parent {repo}#{n}"
+            );
+            return Ok(format!("stack={repo}#{n} -> {upstream}#{pn} merged"));
+        }
+        ensure!(
+            p["state"] != "open",
+            "stack parent {upstream}#{pn}: open upstream PR"
+        );
+        anyhow::bail!("stack parent {upstream}#{pn}: closed unmerged; rebase by hand");
+    }
+    ensure!(
+        parent["state"] != "open",
+        "stack parent {repo}#{n}: open fork PR"
+    );
+    anyhow::bail!("stack parent {repo}#{n}: closed unmerged; rebase by hand")
+}
+
+fn dco_gate(
+    client: &impl Rest,
+    config: &Config,
+    upstream: &str,
+    base: &str,
+    compare: &Value,
+    head: &str,
+) -> Result<(String, String)> {
+    let rules = pages(
+        client,
+        &format!("repos/{upstream}/rules/branches/{}", encode(base)),
+    )?;
+    for rule in &rules {
+        let kind = rule["type"].as_str().context("missing branch rule type")?;
+        if kind == "required_status_checks" {
+            ensure!(
+                rule["parameters"]["required_status_checks"].is_array(),
+                "unreadable required status checks"
+            );
+        }
+    }
+    let branch = get(
+        client,
+        &format!("repos/{upstream}/branches/{}", encode(base)),
+    )?;
+    let sha = branch["commit"]["sha"]
+        .as_str()
+        .filter(|s| oid(s))
+        .context("invalid base head sha")?;
+    let required = crate::poll::required_checks(&Value::Array(rules), &branch)?;
+    let checks = object_pages(
+        client,
+        &format!("repos/{upstream}/commits/{sha}/check-runs"),
+        Some("check_runs"),
+    )?;
+    let dco_name = |name: &str| {
+        name.to_ascii_lowercase()
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|s| s == "dco")
+    };
+    let mut dco = false;
+    for (rows, key) in [(&required, "context"), (&checks, "name")] {
+        for row in rows {
+            dco |= dco_name(row[key].as_str().context("missing check name")?);
+        }
+    }
+    if !dco {
+        return Ok(("dco=not-required".into(), "no DCO".into()));
+    }
+    (|| {
+        let commits = compare["commits"]
+            .as_array()
+            .context("missing compare commits")?;
+        ensure!(
+            compare["total_commits"].as_u64() == Some(commits.len() as u64)
+                && compare["ahead_by"] == compare["total_commits"],
+            "incomplete compare commits for DCO"
+        );
+        let merge_base = compare["merge_base_commit"]["sha"]
+            .as_str()
+            .filter(|s| oid(s))
+            .context("invalid merge base sha")?;
+        let mut known = BTreeSet::from([merge_base]);
+        let signoff = config
+            .promote
+            .as_ref()
+            .and_then(|p| p.signoff.as_ref())
+            .context("missing sign-off identity")?;
+        let trailer = format!("Signed-off-by: {} <{}>", signoff.name, signoff.email);
+        let mut missing = 0;
+        let mut problems = Vec::new();
+        for c in commits {
+            let sha = c["sha"]
+                .as_str()
+                .filter(|s| oid(s))
+                .context("invalid commit sha")?;
+            let message = c["commit"]["message"]
+                .as_str()
+                .context("missing commit message")?;
+            let parents = c["parents"].as_array().context("missing commit parents")?;
+            ensure!(
+                parents.iter().all(|p| p["sha"].as_str().is_some_and(oid)),
+                "invalid parent sha"
+            );
+            if !message
+                .trim_end()
+                .lines()
+                .rev()
+                .take_while(|l| !l.trim().is_empty())
+                .any(|l| l.eq_ignore_ascii_case(&trailer))
+            {
+                missing += 1;
+                if parents.len() != 1 {
+                    problems.push(format!("{sha} is a merge commit"));
+                }
+                if !c["author"]["login"].as_str().is_some_and(|s| {
+                    s.eq_ignore_ascii_case(&config.bot) || s.eq_ignore_ascii_case(&config.operator)
+                }) {
+                    problems.push(format!("{sha} is by neither bot nor operator"));
+                }
+            }
+            ensure!(
+                parents
+                    .iter()
+                    .all(|p| p["sha"].as_str().is_some_and(|s| known.contains(s))),
+                "incomplete compare commit DAG"
+            );
+            known.insert(sha);
+        }
+        ensure!(
+            commits.last().is_some_and(|c| c["sha"] == head),
+            "compare head mismatch"
+        );
+        ensure!(
+            problems.is_empty(),
+            "missing sign-off on {missing} of {} commits: {}",
+            commits.len(),
+            problems.join(", ")
+        );
+        Ok((
+            "dco=required".into(),
+            format!("sign-off on {missing} of {} commits", commits.len()),
+        ))
+    })()
+    .context("dco=required")
 }
 
 /// Interpret and validate the same grammar, so malformed `next` cannot be
