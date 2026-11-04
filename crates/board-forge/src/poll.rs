@@ -4338,6 +4338,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind: "fix",
             brief: &task,
             pool: pool.as_deref(),
+            effort: None,
             runner: None,
             base: None,
         };

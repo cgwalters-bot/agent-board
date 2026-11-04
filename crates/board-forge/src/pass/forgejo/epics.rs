@@ -1004,6 +1004,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                         if !job.pool.is_empty() {
                             fields["pool"] = json!(job.pool);
                         }
+                        if let Some(effort) = job.effort {
+                            fields["effort"] = json!(effort.as_str());
+                        }
                         let body = format!("```{PLAN_FENCE}\n{fields:#}\n```\n");
                         self.write_on(&forge, &item, &names, BoardOperation::Comment { body })?;
                         record(detail, "comment", &child);

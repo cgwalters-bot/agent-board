@@ -912,6 +912,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind: "fix",
             brief,
             pool: pool.as_deref(),
+            effort: None,
             runner: None,
             base: None,
         };
@@ -1378,6 +1379,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind: "fix",
             brief: &brief,
             pool: pool.as_deref(),
+            effort: None,
             runner: None,
             base: None,
         };
@@ -1578,6 +1580,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind,
             brief: &task,
             pool: pool.as_deref(),
+            effort: None,
             runner: None,
             base: None,
         };

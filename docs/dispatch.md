@@ -167,10 +167,72 @@ with a `ref` and these string inputs, which the caller workflow must accept:
 | `item` | Issue or pull request number in `repo` |
 | `kind` | `implement`, `triage`, `research` or `fix`: the profile the run gets |
 | `pool` | Inference pool, or empty to leave it to the caller |
+| `effort` | Optional: exactly `heavy`; omitted for the existing default. Carried unchanged even when routing supplies a default pool |
 | `base` | Only for a [stacked](job-plans.md#stacking) plan: the branch to start from |
 
 A plan's `runner` is checked (only `hosted` is accepted) but not sent: the
 caller workflow has one runner. Batched plans add their briefs to `task`.
+
+### Heavy model caller contract
+
+The concrete threat is a plan choosing an arbitrary model, escaping a pool's
+budget/holds, or silently running a weaker model than requested. The only new
+control is an optional, bounded enum input, `effort=heavy`; omission is off and
+sends no new input. Plans cannot supply a model or a pools file. No new usage
+reading, target, slot, hold bypass, price fallback or admission mechanism is
+introduced.
+
+The external caller must implement this contract before activation:
+
+1. Accept string workflow input `effort`, default empty, on every receiving
+   workflow (including routed backends). Reject values other than empty or
+   `heavy` before inference. Pass the input to the pool resolver, not merely
+   into the task brief. The native Forgejo pass refuses heavy plans for now:
+   Forgejo drops inputs a workflow does not declare, and its caller's inputs
+   are not yet configurable.
+2. Resolve the effective pool first, using the existing explicit pool or
+   inherited caller variable/default (including a route's `openai` default).
+   Load only the deployment-owned `.github/agentic-job/pools.json`, never
+   target-checkout or agent-provided configuration.
+3. With empty effort, use the existing pool model unchanged. With `heavy`,
+   require that exact pool's `heavy` object with a nonempty valid `model`
+   string, and replace **only** the resolved model. Fail clearly, e.g.
+   `pool openai has no configured heavy.model`, before launching inference
+   when absent or invalid. Never fall back to the default model or another
+   pool. Test both explicit and inherited pool selection.
+4. Retain the pool's name, agent, budget, usage reading, target, holds and slot
+   accounting. Pace and enforce weekly spend on the original pool. Batch
+   members must have identical effort as well as runner and pool.
+5. Record the actual model used in the run's summary. Existing cost accounting
+   prices the summary model, not requested effort or a pool's default model;
+   a missing price stays unpriced, not zero or a default-model estimate.
+   Verify broker weekly spend also prices the actual model and still holds
+   new runs at the weekly budget.
+
+agent-board does not own tracker's pool-to-model resolver. It sends `pool`
+and optional `effort`; the resolver passes its selected `model` through the
+same inference input used for the default model. Release this wire contract
+before activating heavy plans. The following is the required tracker
+follow-up, not evidence of deployment:
+
+- In `cgwalters-forge/tracker`, add the `effort` workflow input to
+  `.github/workflows/dispatch.yml` and thread it into that workflow's existing
+  pool-to-agent/model/budget resolver; identify and update its resolver source
+  and all routed receiving workflows as part of the change.
+- Inventory **all deployed and pinned** parsers of
+  `.github/agentic-job/pools.json`, including dispatch, review, usage and
+  supervisor consumers and their transitive action/tool pins. Test each with
+  the additional `heavy: {model: ...}` object, not just the latest parser.
+  Update incompatible pins first, before adding the key to a shared file.
+- Add resolver tests for default omission, explicit/inherited heavy pool,
+  unchanged agent/budget/name, missing/invalid heavy failure before inference,
+  and no downgrade. Smoke the caller input contract and actual-model summary
+  reporting; verify actual-model prices in broker weekly accounting and
+  weekly-limit refusal, pacing, holds and single-slot accounting.
+- Only after release, compatible pins and verified caller deployment, set
+  `.github/agentic-job/pools.json` key `openai.heavy.model` to
+  `praxis/gpt-6-astra`. Keep the default model unchanged. Do not claim
+  end-to-end activation before these checks pass.
 
 ## What comes back
 

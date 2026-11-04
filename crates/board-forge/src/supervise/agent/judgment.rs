@@ -603,6 +603,7 @@ impl Checked {
                     kind: &r.kind,
                     brief: &r.task(&ctx.run_url),
                     pool: Some(&r.pool),
+                    effort: None,
                     runner: None,
                     base: None,
                 };

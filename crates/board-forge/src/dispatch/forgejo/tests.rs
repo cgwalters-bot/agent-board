@@ -70,6 +70,7 @@ fn start() -> Start<'static> {
         kind: "research",
         brief: "Look.",
         pool: Some("small"),
+        effort: None,
         runner: None,
         base: None,
     }
