@@ -73,7 +73,7 @@ const REVIEW_CONTEXT: &str = "review";
 /// The user id of `github-actions[bot]`, which submits agentic-job's reviews
 /// with the workflow token. Fixed by GitHub, unlike a login, which an app or
 /// user may share in part (`github-actions` is a free user name).
-const ACTIONS_BOT_ID: u64 = 41898282;
+pub(crate) const ACTIONS_BOT_ID: u64 = 41898282;
 /// Where the review job's marker comment opens in its review (gh-aw's safe
 /// outputs footer), naming the run that wrote it.
 const RUN_MARKER: &str = "<!-- gh-aw-agentic-workflow: ";

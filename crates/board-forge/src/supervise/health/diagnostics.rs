@@ -6,6 +6,8 @@ const QUEUE_RESIDENCE_MS: i64 = HOUR_MS;
 /// Conservative grace from the last PR update, including head/draft changes.
 const REVIEW_GRACE_MS: i64 = 15 * 60_000;
 const REPORT_BYTES: usize = 4 * 1024;
+/// Runs read for current-head reviews that cite them, newest first.
+const CITED_RUN_READS: usize = 3;
 
 impl Collector<'_> {
     pub(super) fn aged_queue(&self) -> Result<Vec<Value>> {
@@ -44,9 +46,9 @@ impl Collector<'_> {
                 "age_basis":"queue residence (not unchanged state)", "since":iso(at),
                 "age_minutes":(self.now-at)/60_000, "observed_at":iso(self.now),
                 "merge_group_head":head, "latest_merge_group_run":run,
-                "run_url":run.as_ref().map(|r| &r["html_url"]), "problem":self.now-at >= QUEUE_RESIDENCE_MS}));
+                "problem":self.now-at >= QUEUE_RESIDENCE_MS}));
         }
-        bounded(result, self.s.limits.max_items)
+        problems(result, self.s.limits.max_items)
     }
 
     pub(super) fn lost_reviews(&self) -> Result<Vec<Value>> {
@@ -76,11 +78,16 @@ impl Collector<'_> {
                 .context("review repository")?;
             let updated = millis(&p["updatedAt"]).context("review grace time")?;
             ensure!(updated <= self.now, "future PR update");
-            // No lookback: an old, successful review of this head still counts.
-            // A full single page is unavailable, never a claim of no review.
-            // A dispatch runs on the default branch SHA, not the PR SHA.
-            let runs =
-                self.cached_list(&format!("/repos/{repo}/actions/workflows/{workflow}/runs"))?;
+            // The head's own runs, and dispatches since the lookback, which
+            // run on the default branch SHA and name the head in their title.
+            // A full head page or more dispatches than maxPages is unavailable,
+            // never a claim of no review.
+            let path = format!("/repos/{repo}/actions/workflows/{workflow}/runs");
+            let mut runs = self.cached_list(&format!(
+                "{path}?head_sha={}&event=pull_request_target",
+                encode(head)
+            ))?;
+            runs.extend(self.review_dispatches(&path)?);
             let matching: Vec<&Value> = runs
                 .iter()
                 .filter(|r| crate::poll::review_head_run(&p, r, Some(workflow), true))
@@ -96,39 +103,12 @@ impl Collector<'_> {
                         })
                 })
                 .collect();
-            let mut satisfied = false;
-            let mut unknown = false;
-            for run in &matching {
-                if !(RUNNING.contains(&run["status"].as_str().unwrap_or_default())
-                    || (run["status"] == "completed" && run["conclusion"] == "success"))
-                {
-                    continue;
-                }
-                if run["event"] == "workflow_dispatch"
-                    || run["pull_requests"]
-                        .as_array()
-                        .is_some_and(|prs| !prs.is_empty())
-                {
-                    satisfied = true;
-                    continue;
-                }
-                // Fork runs often have pull_requests: []. A current-head bot
-                // review citing this attempt establishes the PR association.
-                let reviews = self.cached_list(&format!("/repos/{repo}/pulls/{number}/reviews"))?;
-                let posted = reviews.iter().any(|review| {
-                    let who = review["user"]["login"].as_str().unwrap_or_default();
-                    let cited = crate::poll::cited_run(review["body"].as_str().unwrap_or_default());
-                    review["commit_id"] == head
-                        && [self.s.bot.as_str(), self.s.operator.as_str()].contains(&who)
-                        && cited.is_some_and(|(r, id)| r == repo && run["id"] == id)
-                        && millis(&review["submitted_at"])
-                            .zip(millis(&run["run_started_at"]).zip(millis(&run["updated_at"])))
-                            .is_some_and(|(at, (start, end))| start <= at && at <= end)
-                });
-                satisfied |= posted;
-                unknown |= !posted;
-            }
-            ensure!(satisfied || !unknown, "review PR association unavailable");
+            // Fork runs often have pull_requests: []; the head SHA they were
+            // listed and matched by is their association then.
+            let satisfied = matching.iter().any(|run| {
+                RUNNING.contains(&run["status"].as_str().unwrap_or_default())
+                    || (run["status"] == "completed" && run["conclusion"] == "success")
+            }) || self.cited_review(&p, &runs, workflow)?;
             let examples: Vec<&Value> = matching
                 .iter()
                 .filter_map(|r| r.get("html_url"))
@@ -140,8 +120,82 @@ impl Collector<'_> {
                 "problem":!satisfied && self.now-updated >= REVIEW_GRACE_MS}),
             );
         }
-        bounded(result, self.s.limits.max_items)
+        problems(result, self.s.limits.max_items)
     }
+
+    /// The review workflow's dispatched runs in the lookback, once a repository.
+    fn review_dispatches(&self, path: &str) -> Result<Vec<Value>> {
+        let value = self.once(&format!("review dispatches {path}"), || {
+            let since = encode(&format!(">={}", iso(self.lookback())));
+            Ok(Value::Array(self.run_pages(
+                &format!("{path}?event=workflow_dispatch&created={since}"),
+                "review dispatches",
+            )?))
+        })?;
+        Ok(value.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Whether a current-head review by the Actions bot (as agentic-job's
+    /// apply posts them), the bot or the operator cites a review run for that
+    /// head, run to success and submitted during its latest attempt, as the
+    /// poll counts a review: a run older than the reads. The newest
+    /// [`CITED_RUN_READS`] citing reviews are checked.
+    fn cited_review(&self, pull: &Value, runs: &[Value], workflow: &str) -> Result<bool> {
+        let repo = pull["baseRepository"]["nameWithOwner"]
+            .as_str()
+            .context("review repository")?;
+        let number = pull["number"].as_u64().context("review PR number")?;
+        let reviews = self.once(&format!("reviews {repo}#{number}"), || {
+            Ok(Value::Array(self.paged(
+                &format!("/repos/{repo}/pulls/{number}/reviews"),
+                self.s.limits.max_pages,
+            )?))
+        })?;
+        let cited = reviews
+            .as_array()
+            .context("reviews")?
+            .iter()
+            .rev()
+            .filter(|review| {
+                let user = &review["user"];
+                let who = user["login"].as_str().unwrap_or_default();
+                let actions = user["type"] == "Bot"
+                    && user["id"].as_u64() == Some(crate::poll::ACTIONS_BOT_ID);
+                review["commit_id"] == pull["headRefOid"]
+                    && (actions || [self.s.bot.as_str(), self.s.operator.as_str()].contains(&who))
+            })
+            .filter_map(|review| {
+                let (r, id) = crate::poll::cited_run(review["body"].as_str()?)?;
+                (r == repo).then(|| (millis(&review["submitted_at"]), id))
+            })
+            .take(CITED_RUN_READS);
+        for (submitted, id) in cited {
+            let run = match runs.iter().find(|r| r["id"] == id) {
+                Some(run) => run.clone(),
+                None => self.cached_get(&format!("/repos/{repo}/actions/runs/{id}"))?,
+            };
+            let attempt = millis(&run["run_started_at"]).zip(millis(&run["updated_at"]));
+            if run["status"] == "completed"
+                && run["conclusion"] == "success"
+                && submitted
+                    .zip(attempt)
+                    .is_some_and(|(at, (start, end))| start <= at && at <= end)
+                && crate::poll::review_head_run(pull, &run, Some(workflow), true)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// Only problems are reported, so healthy items on a busy repository do not
+/// exhaust the bounds.
+fn problems(items: Vec<Value>, max: usize) -> Result<Vec<Value>> {
+    bounded(
+        items.into_iter().filter(|i| i["problem"] == true).collect(),
+        max,
+    )
 }
 
 /// Reports must be whole, not silently trimmed into a healthy subset.
@@ -184,19 +238,28 @@ mod tests {
             if path.contains("event=merge_group") {
                 return Ok(json!({"workflow_runs":self.data["queue_runs"]}));
             }
+            let history = |key: &str| self.data[key].as_array().cloned().unwrap_or_default();
+            let mut reviews = vec![self.data["review"].clone()];
+            reviews.extend(history("review_history"));
             if path.contains("/workflows/review.yml/runs?") {
-                return Ok(json!({"workflow_runs":[self.data["review"].clone()]}));
+                return Ok(listed(reviews, path));
+            }
+            if let Some(id) = path.strip_prefix("/repos/example/project/actions/runs/") {
+                return reviews
+                    .into_iter()
+                    .find(|r| r["id"].as_u64() == id.parse().ok())
+                    .context("unrecorded run");
             }
             if path.contains("/pulls/7/reviews?") {
                 return Ok(self.data.get("reviews").cloned().unwrap_or(json!([])));
             }
             if path.contains("/workflows/dispatch.yml/runs?") {
-                if self.data["dispatches"].is_array() {
-                    return Ok(json!({"workflow_runs": self.data["dispatches"]}));
+                let mut runs = history("dispatches");
+                if runs.is_empty() {
+                    runs = vec![self.data["dispatch"].clone(), self.data["dispatch"].clone()];
                 }
-                return Ok(
-                    json!({"workflow_runs":[self.data["dispatch"].clone(),self.data["dispatch"].clone()]}),
-                );
+                runs.extend(history("dispatch_history"));
+                return Ok(listed(runs, path));
             }
             if [20, 21, 22]
                 .iter()
@@ -209,8 +272,15 @@ mod tests {
 
         fn graphql(&self, query: &str, _: Value) -> Result<Value> {
             ensure!(query == OPEN_PULLS, "unrecorded query");
+            let mut pulls = vec![self.data["pull"].clone()];
+            pulls.extend(
+                self.data["other_pulls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+            );
             Ok(
-                json!({"repository":{"pullRequests":{"nodes":[self.data["pull"].clone()],"pageInfo":{"hasNextPage":self.next_page}}}}),
+                json!({"repository":{"pullRequests":{"nodes":pulls,"pageInfo":{"hasNextPage":self.next_page}}}}),
             )
         }
 
@@ -230,6 +300,37 @@ mod tests {
         }
     }
 
+    /// A run listing as GitHub filters and pages it; a run without a
+    /// recorded creation time passes the `created` filter.
+    fn listed(runs: Vec<Value>, path: &str) -> Value {
+        let query: HashMap<String, String> =
+            url::form_urlencoded::parse(path.split_once('?').unwrap().1.as_bytes())
+                .into_owned()
+                .collect();
+        let field = |r: &Value, key: &str, field: &str| {
+            query.get(key).is_none_or(|want| r[field] == want.as_str())
+        };
+        let since = query
+            .get("created")
+            .map(|c| millis(&json!(c.strip_prefix(">=").unwrap())).unwrap());
+        let per: usize = query["per_page"].parse().unwrap();
+        let page: usize = query.get("page").map_or(1, |p| p.parse().unwrap());
+        let runs: Vec<Value> = runs
+            .into_iter()
+            .filter(|r| {
+                field(r, "event", "event")
+                    && field(r, "head_sha", "head_sha")
+                    && (field(r, "status", "status") || field(r, "status", "conclusion"))
+                    && since
+                        .zip(millis(&r["created_at"]))
+                        .is_none_or(|(since, at)| at >= since)
+            })
+            .skip((page - 1) * per)
+            .take(per)
+            .collect();
+        json!({"workflow_runs": runs})
+    }
+
     fn collector<'a>(api: &'a dyn Api, s: &'a Settings, now: i64) -> Collector<'a> {
         Collector {
             api,
@@ -239,6 +340,11 @@ mod tests {
             root: "/repos/example/control".into(),
             cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// How many current heads are reported without a review.
+    fn lost(api: &dyn Api, s: &Settings, now: i64) -> usize {
+        collector(api, s, now).lost_reviews().unwrap().len()
     }
 
     fn configured() -> Settings {
@@ -264,7 +370,10 @@ mod tests {
             (QUEUE_RESIDENCE_MS + 1, true),
         ] {
             let got = collector(&api, &s, epoch() + age).aged_queue().unwrap();
-            assert_eq!(got[0]["problem"], problem);
+            assert_eq!(got.len() == 1, problem);
+            if !problem {
+                continue;
+            }
             assert_eq!(got[0]["latest_merge_group_run"]["run_attempt"], 2);
             assert_eq!(got[0]["latest_merge_group_run"]["conclusion"], "failure");
             assert_eq!(got[0]["age_basis"], "queue residence (not unchanged state)");
@@ -300,7 +409,11 @@ mod tests {
             (REVIEW_GRACE_MS + 1, true),
         ] {
             assert_eq!(
-                collector(&api, &s, epoch() + age).lost_reviews().unwrap()[0]["problem"],
+                collector(&api, &s, epoch() + age)
+                    .lost_reviews()
+                    .unwrap()
+                    .len()
+                    == 1,
                 problem
             );
         }
@@ -316,7 +429,9 @@ mod tests {
             assert_eq!(
                 collector(&api, &s, epoch() + HOUR_MS)
                     .lost_reviews()
-                    .unwrap()[0]["problem"],
+                    .unwrap()
+                    .len()
+                    == 1,
                 problem
             );
         }
@@ -331,22 +446,11 @@ mod tests {
             ("/repository/full_name", json!("other/repo")),
         ] {
             *api.data["review"].pointer_mut(path).unwrap() = value;
-            assert_eq!(
-                collector(&api, &s, epoch() + HOUR_MS)
-                    .lost_reviews()
-                    .unwrap()[0]["problem"],
-                true,
-                "{path}"
-            );
+            assert_eq!(lost(&api, &s, epoch() + HOUR_MS), 1, "{path}");
             api.data["review"] = original.clone();
         }
         api.data["pull"]["headRefOid"] = json!("new-head");
-        assert_eq!(
-            collector(&api, &s, epoch() + HOUR_MS)
-                .lost_reviews()
-                .unwrap()[0]["problem"],
-            true
-        );
+        assert_eq!(lost(&api, &s, epoch() + HOUR_MS), 1);
         api.data["pull"]["isDraft"] = json!(true);
         assert!(
             collector(&api, &s, epoch() + HOUR_MS)
@@ -366,9 +470,26 @@ mod tests {
     #[test]
     fn recorded_apply_attempt_deduplicated_and_reuses_error_signature() {
         let mut api = Recorded::new();
-        // An old run rerun today must not be lost to a created-time filter.
-        api.data["dispatch"]["created_at"] = json!("2026-10-01T00:00:00Z");
+        // A run from days ago rerun today must not be lost to the lookback,
+        // nor to a lifetime of successful runs; a rerun of a month-old run
+        // is outside the read failed-run window.
         let s = configured();
+        api.data["dispatch"]["created_at"] = json!("2026-10-01T00:00:00Z");
+        assert!(
+            collector(&api, &s, epoch() + HOUR_MS)
+                .apply_failures()
+                .unwrap()
+                .is_empty()
+        );
+        api.data["dispatch"]["created_at"] = json!("2026-10-30T00:00:00Z");
+        api.data["dispatch_history"] = json!(
+            (0..2 * s.limits.max_pages as u64 * s.limits.page_size)
+                .map(
+                    |n| json!({"id": 1000 + n, "status": "completed", "conclusion": "success",
+                    "created_at": "2026-10-31T00:00:00Z"})
+                )
+                .collect::<Vec<_>>()
+        );
         let c = collector(&api, &s, epoch() + HOUR_MS);
         let apply = c.apply_failures().unwrap();
         assert_eq!(apply.len(), 1);
@@ -411,37 +532,21 @@ mod tests {
         let mut api = Recorded::new();
         let s = configured();
         // Real GitHub fork pull_request_target runs have this shape: the run
-        // listing has no PR association, even for a successful review.
+        // listing has no PR association, even for a successful review; the
+        // head SHA it was listed by associates it, active or successful.
         api.data["review"]["pull_requests"] = json!([]);
-        api.data["review"]["conclusion"] = json!("success");
+        for (status, conclusion) in [("in_progress", ""), ("completed", "success")] {
+            api.data["review"]["status"] = json!(status);
+            api.data["review"]["conclusion"] = json!(conclusion);
+            assert_eq!(lost(&api, &s, epoch() + HOUR_MS), 0);
+        }
+        // A review citing it cannot make a cancelled latest attempt count.
+        api.data["review"]["conclusion"] = json!("cancelled");
         api.data["review"]["run_started_at"] = json!("2026-11-03T00:00:00Z");
         api.data["review"]["updated_at"] = json!("2026-11-03T00:30:00Z");
-        assert!(
-            collector(&api, &s, epoch() + HOUR_MS)
-                .lost_reviews()
-                .is_err()
-        );
         api.data["reviews"] = json!([{"user":{"login":"worker"},"commit_id":"current-head", "submitted_at":"2026-11-03T00:20:00Z",
             "body":"<!-- gh-aw-agentic-workflow: review, id: 10, run: https://github.com/example/project/actions/runs/10 -->"}]);
-        assert_eq!(
-            collector(&api, &s, epoch() + HOUR_MS)
-                .lost_reviews()
-                .unwrap()[0]["problem"],
-            false
-        );
-        api.data["reviews"][0]["commit_id"] = json!("old-head");
-        assert!(
-            collector(&api, &s, epoch() + HOUR_MS)
-                .lost_reviews()
-                .is_err()
-        );
-        api.data["review"]["conclusion"] = json!("cancelled");
-        assert_eq!(
-            collector(&api, &s, epoch() + HOUR_MS)
-                .lost_reviews()
-                .unwrap()[0]["problem"],
-            true
-        );
+        assert_eq!(lost(&api, &s, epoch() + HOUR_MS), 1);
         api.data["review"]["event"] = json!("workflow_dispatch");
         api.data["review"]["head_sha"] = json!("default-branch-sha");
         api.data["review"]["head_branch"] = json!("main");
@@ -449,12 +554,7 @@ mod tests {
         for (status, conclusion) in [("in_progress", ""), ("completed", "success")] {
             api.data["review"]["status"] = json!(status);
             api.data["review"]["conclusion"] = json!(conclusion);
-            assert_eq!(
-                collector(&api, &s, epoch() + HOUR_MS)
-                    .lost_reviews()
-                    .unwrap()[0]["problem"],
-                false
-            );
+            assert_eq!(lost(&api, &s, epoch() + HOUR_MS), 0);
         }
         for (key, value) in [
             ("display_title", "review example/project#7 old-head (pool)"),
@@ -466,14 +566,100 @@ mod tests {
         ] {
             let original = api.data["review"][key].clone();
             api.data["review"][key] = json!(value);
-            assert_eq!(
-                collector(&api, &s, epoch() + HOUR_MS)
-                    .lost_reviews()
-                    .unwrap()[0]["problem"],
-                true
-            );
+            assert_eq!(lost(&api, &s, epoch() + HOUR_MS), 1);
             api.data["review"][key] = original;
         }
+    }
+
+    #[test]
+    fn recorded_review_history_volume_and_old_cited_dispatch() {
+        let mut api = Recorded::new();
+        let s = configured();
+        let now = epoch() + HOUR_MS;
+        let run = |n: u64, event: &str, head: &str, created: &str| {
+            json!({"id": 100 + n, "event": event, "head_sha": head, "created_at": created,
+                "path": ".github/workflows/review.yml", "repository": {"full_name": "example/project"},
+                "head_branch": "main", "display_title": format!("review example/project#{} other (pool)", 100 + n),
+                "status": "completed", "conclusion": "success"})
+        };
+        // Pages of other heads' runs and recent dispatches for other PRs.
+        let page = s.limits.page_size;
+        let mut history: Vec<Value> = (0..3 * page)
+            .map(|n| {
+                run(
+                    n,
+                    "pull_request_target",
+                    "other-head",
+                    "2026-11-02T12:00:00Z",
+                )
+            })
+            .collect();
+        history.extend((0..2 * page).map(|n| {
+            run(
+                1000 + n,
+                "workflow_dispatch",
+                "main-sha",
+                "2026-11-02T12:00:00Z",
+            )
+        }));
+        api.data["review_history"] = json!(history);
+        let got = collector(&api, &s, now).lost_reviews().unwrap();
+        assert_eq!(got[0]["examples"], json!([api.data["review"]["html_url"]]));
+        // A successful dispatch older than the lookback counts only through a
+        // current-head review citing it.
+        let dispatched = &mut api.data["review"];
+        dispatched["event"] = json!("workflow_dispatch");
+        dispatched["head_sha"] = json!("main-sha");
+        dispatched["head_branch"] = json!("main");
+        dispatched["created_at"] = json!("2026-10-31T00:00:00Z");
+        dispatched["conclusion"] = json!("success");
+        dispatched["display_title"] = json!("review example/project#7 current-head");
+        dispatched["run_started_at"] = json!("2026-10-31T00:00:00Z");
+        dispatched["updated_at"] = json!("2026-10-31T00:30:00Z");
+        assert_eq!(lost(&api, &s, now), 1);
+        let body = "<!-- gh-aw-agentic-workflow: review, id: 10, run: https://github.com/example/project/actions/runs/10 -->";
+        api.data["reviews"] = json!([{"user": {"login": "github-actions[bot]", "type": "Bot", "id": 41898282},
+                "commit_id": "current-head", "submitted_at": "2026-10-31T00:20:00Z", "body": body}]);
+        assert_eq!(lost(&api, &s, now), 0);
+        assert!(
+            api.reads
+                .borrow()
+                .iter()
+                .any(|p| p == "/repos/example/project/actions/runs/10")
+        );
+        for (key, value) in [
+            ("/reviews/0/commit_id", json!("old-head")),
+            ("/reviews/0/user/id", json!(1)),
+            ("/reviews/0/user/type", json!("User")),
+            // A later attempt, rerun after the review was posted.
+            ("/review/run_started_at", json!("2026-11-01T00:00:00Z")),
+            ("/review/conclusion", json!("cancelled")),
+            (
+                "/review/display_title",
+                json!("review example/project#8 current-head"),
+            ),
+        ] {
+            let original = api.data.pointer(key).unwrap().clone();
+            *api.data.pointer_mut(key).unwrap() = value;
+            assert_eq!(lost(&api, &s, now), 1, "{key}");
+            *api.data.pointer_mut(key).unwrap() = original;
+        }
+        // Many healthy queued and reviewed PRs stay within the report bounds.
+        let mut healthy = api.data["pull"].clone();
+        healthy["mergeQueueEntry"]["enqueuedAt"] = json!(iso(now - 1));
+        api.data["other_pulls"] = json!(vec![healthy; 2 * s.limits.max_items]);
+        let c = collector(&api, &s, now);
+        assert!(c.lost_reviews().unwrap().is_empty());
+        assert_eq!(c.aged_queue().unwrap().len(), 1);
+        api.data["other_pulls"] = json!([]);
+        // More dispatches in the lookback than maxPages hold is unavailable.
+        api.data["review_history"] = json!(
+            (0..s.limits.max_pages as u64 * page)
+                .map(|n| run(n, "workflow_dispatch", "main-sha", "2026-11-02T12:00:00Z"))
+                .collect::<Vec<_>>()
+        );
+        api.data["reviews"] = json!([]);
+        assert!(collector(&api, &s, now).lost_reviews().is_err());
     }
 
     #[test]

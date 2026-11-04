@@ -134,16 +134,20 @@ make the observation unavailable.
 active nor successful review run. The update time is a conservative grace
 basis (comments can postpone the alarm), not a claim about when a commit was
 pushed. Only the configured workflow path, base repository, PR number and current
-head SHA all matching count. `pull_request_target` runs use the run's SHA and
-PR association. Fork runs commonly have an empty `pull_requests` array; then
-a current-head bot/operator review must cite that run, submitted within its
-latest attempt. An active/successful candidate without a readable PR association
-makes the check unavailable, not a missing-review assertion. Dedicated
-`workflow_dispatch` reviews use the poll's shared identity predicate: the default
+head SHA all matching count. `pull_request_target` runs are read for the
+current head SHA only and use the run's PR association; fork runs commonly have
+an empty `pull_requests` array, and then that head SHA is their association.
+Dedicated
+`workflow_dispatch` reviews are read from the event lookback
+(`eventLookbackHours`) and use the poll's shared identity predicate: the default
 branch, exact `review OWNER/REPO#N HEAD` title and optional pool suffix. Their
-default-branch SHA is not mistaken for the reviewed head. Successful runs
-are not restricted to the recent dispatch lookback. Old-head approvals, cancelled
-runs, unrelated workflows and uncorrelated dispatch titles cannot satisfy it.
+default-branch SHA is not mistaken for the reviewed head. Without such a run, a
+current-head review by the Actions bot (as agentic-job's apply posts it), the
+bot or the operator citing a run (the newest three are read) satisfies the
+check where that run passes the same predicate, succeeded, and the review was
+submitted during its latest attempt: this covers reviews older than the
+lookback. Old-head approvals, cancelled runs, unrelated workflows and
+uncorrelated dispatch titles cannot satisfy it.
 This check does not infer ordinary contributor intake eligibility or prove a
 review was posted; it diagnoses missing runs for the existing dedicated reviewer.
 If eligible PRs exist without `reviewWorkflow`, the check is unavailable.
@@ -172,12 +176,14 @@ causation. Missing stall completion times make the observation unavailable.
 
 These defaults are named constants rather than more caller controls. All four
 checks use the shared read-only request/time/page/download budgets, `maxItems`,
-`maxEvidence`, and a 4 KiB report bound. A full single-page run listing or open-PR
-connection with another page is incomplete, not healthy. Failure collection
-pages the completed dispatch history without a creation-time cutoff, so old run
-IDs rerun today are not silently lost; exceeding the existing `maxPages` makes
-coverage unavailable. This can require a larger existing page budget in busy
-repositories. Unavailable checks use the normal warning/escalation
+`maxEvidence`, and a 4 KiB report bound; `queue-aged` and `reviews` report
+only problem PRs, so healthy ones do not count against it. A full single-page run listing or open-PR
+connection with another page is incomplete, not healthy. GitHub filters run
+listings by creation, so failure collection reads the lookback's dispatch runs
+and, for reruns, the failed dispatch runs created in the last seven days
+(`RERUN_DAYS`); a rerun of an older run is not seen. Either listing exceeding
+the existing `maxPages` makes coverage unavailable; successful history is never
+paged. Unavailable checks use the normal warning/escalation
 policy. Live behavior and the incident runs have not been verified here.
 
 The playbook requests `file_bug` for each problem signature with at least two
