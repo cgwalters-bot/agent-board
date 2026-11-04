@@ -340,7 +340,12 @@ The asks come from five sources, each named by an item's `source`:
    `src/github/holds.ts`, ignore the optional field and still open the
    representative PR via `action`; group-aware readers can show the full list.
   What the poll goes on with by itself is not listed: a run, check, review,
-  queue or rerun it waits for, or an answer it already acts on.
+   queue or rerun it waits for, or an answer it already acts on.
+   A controller PR in a followed repository also produces `review-approve`
+   when its current head has the review workflow's authenticated approval,
+   green checks and known mergeability, and only the operator's review counts
+   for merging it. This is read-only inbox metadata: the poll's merge gate
+   still refuses to use that branch's own job approval as authorization.
 - `proposals` (with `holds.proposals`): each
   [operator-action](cli.md#agent-board-action-check) proposal, `operator-action`, on the open issues of
   `holds.proposals.repository` labelled `holds.proposals.label`, oldest
@@ -410,8 +415,36 @@ list first had it at that head (a new head starts it again); for a proposal
 or a digest entry, its comment's time. Items are sorted by Priority in the
 board's option order (one the board does not list after, none last; where
 the pass did not read the board, the order the published list had), then
-the longest waiting, then `key`; past 100, the rest are counted in `omitted`
-and left out. `count` is the number of items listed.
+the longest waiting, then `key`. There is no 100-decision cap. `identities` is
+the complete ranked lightweight inventory, each entry containing `key`, `item`,
+`detail_key`, `source`, `kind`, `priority`, `waiting_since`, `carried`, `epic` and
+`topEpic`. `count` is its length; `items` is the detailed projection joined by
+identity `detail_key` to item `key`, and may be shorter. Grouped PR cards retain
+an identity and independent epic context for every member.
+Consumers must render identities even when no detail record fits. `omitted`
+is zero; `details_omitted` counts identities whose detail card was evicted for
+the size bound.
+
+Each identity and detailed item has `epic` (nearest live epic, including the
+item itself if live) and `topEpic` (highest live ancestor), resolved through
+native sub-issue parents across repositories. `none` means no live epic;
+`unknown` means the chain could not be read whole, was cyclic, or a PR had
+multiple closing issues with no unique parent. A PR uses its closing issue's
+chain. `epics` maps live epic identities to `active`, `activeWhy` and
+`complete`. Activity reasons are `focus` (this epic is `epics.focus`),
+`recent-run` (a descendant's dispatched run started or completed within 48
+hours), `open-pr` (a descendant has an open closing PR), and
+`operator-comment` (the operator commented on this epic or a descendant in
+the last seven days). Windows include their boundary and exclude future
+timestamps. Completed runs use GitHub's `updated_at` completion clock.
+
+Context reads share the existing pass request/time budget, reserving publication
+requests. Each issue context reads at most 100 children and the latest 100
+comments; incomplete connections and unread descendants make epic activity
+`complete: false`, not proof of inactivity. All live epics already found by the
+pass remain listed even when their context is unread. This adds no option or
+mutation authority and remains off behind existing `holds.needsYou`; callers
+already publishing the inbox need no setting change.
 
 #### Semantic operator requests (optional v2 extension)
 
@@ -423,7 +456,7 @@ descriptor includes its own clipped question and recommendation. It adds no fiel
 including review's `src/github/holds.ts`, can keep reading `items`, `action` and
 `source_ref`. Existing grouping, summary parsing, cache validation and request/time
 caps remain in force. Descriptors derive only from existing reads; the publication
-size cap cuts all descriptors with their card and counts omitted cards as incomplete.
+size cap cuts descriptors with their detail card, never its inventory identity.
 Optional `request_sources` retains validated source-specific asks (including digest
 aliases hidden by deduplication), observation clocks and source edit times, so an
 unread source can still carry its own wait. Source records take precedence over
@@ -520,11 +553,13 @@ out until it fits, those without a Priority first, then the lowest Priority
 counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
 are left out only after the rest, then the alarms, each together with its
 hold, and the alarms on the holds issue last. The operator's holds and the holds of every new
-run are always kept. Past them, the needs-you list's lowest ranked asks are
-left out and counted in its `omitted`, which leaves it not `complete`; as
-they are not published, a later pass that does not read their source
-whole cannot carry them.
-Should the holds alone not fit, nothing is published and the line is
+run are always kept. Past them, the needs-you list's lowest ranked detail
+records are left out and counted in `details_omitted`. Their identities,
+kinds, priorities and epic context remain published and can be carried when
+their source is unread on a later pass. Detail eviction alone does not make
+the inventory incomplete. Should the complete inventory and protected holds
+not fit, nothing is published rather than silently publishing a capped inbox,
+and the line is
 `holds error: …`.
 
 With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
