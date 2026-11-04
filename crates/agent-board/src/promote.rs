@@ -106,6 +106,7 @@ fn recording(fixture: &str) -> Result<String> {
                         "before",
                         "after",
                         "activity_type",
+                        "actor",
                         "title",
                         "body",
                         "merged_at",

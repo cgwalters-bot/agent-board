@@ -15,7 +15,32 @@ use crate::{
 const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
-pub const REMAINING: &str = "promote: remaining gates: human-text provenance, publication; no writes implemented; bot-fork heads require recorded staging verification";
+pub const REMAINING: &str = "promote: remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; bot-fork heads require recorded staging verification";
+
+/// Authenticated command selection and its observed branch binding, not output
+/// parsed back into authority. The pusher is from the newest activity event.
+struct Command {
+    url: String,
+    author: String,
+    created: OffsetDateTime,
+    head: String,
+    pushed: OffsetDateTime,
+    pusher: Option<String>,
+    human_text: bool,
+}
+
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "command={} at={} human-text={} push={}",
+            self.url,
+            self.created.format(&Rfc3339).map_err(|_| std::fmt::Error)?,
+            self.human_text,
+            self.pushed.format(&Rfc3339).map_err(|_| std::fmt::Error)?
+        )
+    }
+}
 
 /// What the candidate read gates found, before the policy gate.
 enum Gates {
@@ -96,9 +121,18 @@ pub fn preview<C: Rest + Transport>(
                                         policy::gate(client, config, &target.upstream)
                                             .map_err(|e| format!("{e:#}"))
                                     });
-                                lines.push(match policy {
-                                    Ok(()) => format!(
-                                        "would promote {repo}#{number} -> {} ({summary}) (policy bot-ok); remaining gates: human-text provenance, publication; no writes implemented; {detail}; head={head} {command}; staging verification required for bot-fork head",
+                                let permission = match policy {
+                                    Ok(policy::Permitted::BotOk) => Ok("bot-ok"),
+                                    Ok(policy::Permitted::HumanText) => {
+                                        provenance::verify(client, config, repo, &pull, &command)
+                                            .map(|()| "human-text; provenance verified")
+                                            .map_err(|e| format!("needs-text: {e:#}"))
+                                    }
+                                    Err(why) => Err(why.clone()),
+                                };
+                                lines.push(match permission {
+                                    Ok(verdict) => format!(
+                                        "would promote {repo}#{number} -> {} ({summary}) (policy {verdict}); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; {detail}; head={head} {command}; staging verification required for bot-fork head",
                                         target.upstream
                                     ),
                                     Err(why) => {
@@ -686,7 +720,7 @@ fn evaluate(
     pull: &Value,
     (network, upstream): (bool, &str),
     now: OffsetDateTime,
-) -> Result<String> {
+) -> Result<Command> {
     ensure!(network, "fork-network mismatch");
     ensure!(pull["state"] == "open", "pull is not open");
     repository(&pull["base"]["repo"], repo)?;
@@ -859,7 +893,15 @@ fn evaluate(
                 "unknown operator review state"
             );
         }
-        Ok(evidence.clone())
+        Ok(Command {
+            url: format!("https://github.com/{repo}/pull/{number}#issuecomment-{id}"),
+            author: config.operator.clone(),
+            created,
+            head: head.into(),
+            pushed,
+            pusher: activity[0]["actor"]["login"].as_str().map(str::to_owned),
+            human_text,
+        })
     })()
     .with_context(|| evidence)
 }
@@ -927,6 +969,8 @@ fn command_line(body: &str) -> Result<Option<bool>> {
 }
 
 mod policy;
+
+mod provenance;
 
 #[cfg(test)]
 mod tests;

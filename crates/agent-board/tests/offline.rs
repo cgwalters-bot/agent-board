@@ -2854,7 +2854,101 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
         .success()
         .get_output()
         .clone();
-    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: human-text provenance, publication; no writes implemented"));
+    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented"));
+    // Hypothetical human-text scenarios, not recorded operator authorization.
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    for e in &mut replay.requests {
+        let url = e["request"]["get"].as_str().unwrap_or_default().to_owned();
+        if url.contains("/contents/upstream-policy/") {
+            let file = &mut e["answer"]["body"];
+            let text = String::from_utf8(
+                STANDARD
+                    .decode(file["content"].as_str().unwrap().replace('\n', ""))
+                    .unwrap(),
+            )
+            .unwrap()
+            .replace("verdict: bot-ok", "verdict: human-text");
+            file["size"] = text.len().into();
+            file["content"] = STANDARD.encode(text).into();
+        } else if url.contains("/activity?") {
+            e["answer"]["body"][0]["actor"] = serde_json::json!({"login":"cgwalters"});
+        } else if url.contains("/issues/34/comments?") {
+            e["answer"]["body"][0]["body"] = "/promote --human-text".into();
+        }
+    }
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/promote/provenance-public-2026-11-04.json"
+    ))
+    .unwrap();
+    let mut answer = fixture["answer"].clone();
+    let p = &mut answer["repository"]["pullRequest"];
+    p["number"] = 34.into();
+    p["url"] = "https://github.com/cgwalters-forge/composefs-rs/pull/34".into();
+    p["headRefOid"] = "866b6ce9050782c50eb0fec1c08b37cebec93dc6".into();
+    p["title"] = "Implement slice".into();
+    p["body"] = "Part of cgwalters-forge/composefs-rs#31".into();
+    p["editor"] = serde_json::json!({"login":"cgwalters"});
+    p["lastEditedAt"] = "2026-10-22T12:00:00Z".into();
+    p["userContentEdits"] = serde_json::json!({"totalCount":1,"nodes":[{"editedAt":"2026-10-22T12:00:00Z","deletedAt":null,"editor":{"login":"cgwalters"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+    p["timelineItems"] = serde_json::json!({"totalCount":14,"nodes":[{"id":"rename-1","createdAt":"2026-10-22T12:00:00Z","previousTitle":"Bot title","currentTitle":"Implement slice","actor":{"login":"cgwalters"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}});
+    struct Evidence(Value);
+    impl Transport for Evidence {
+        fn graphql(&self, _: &str, _: Value) -> anyhow::Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+    let evidence = Evidence(answer);
+    let recorder = Recorder::new(&evidence);
+    recorder
+        .graphql(
+            fixture["query"].as_str().unwrap(),
+            serde_json::json!({"owner":"cgwalters-forge","name":"composefs-rs","number":34}),
+        )
+        .unwrap();
+    replay.requests.extend(
+        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
+            .unwrap()
+            .requests,
+    );
+    for hold in [false, true] {
+        if hold {
+            let e = replay
+                .requests
+                .iter_mut()
+                .find(|e| {
+                    e["answer"]["data"]["repository"]["pullRequest"]["userContentEdits"].is_object()
+                })
+                .unwrap();
+            e["answer"]["data"]["repository"]["pullRequest"]["editor"] = Value::Null;
+        }
+        std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema":"agent-board/pass-replay/v1","now":replay.now.format(&time::format_description::well_known::Rfc3339).unwrap(),"requests":replay.requests})).unwrap()).unwrap();
+        let output = command()
+            .args([
+                "promote",
+                "--config",
+                "fixtures/promote/config.json",
+                "--replay",
+            ])
+            .arg(&path)
+            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("DISPATCH_TOKEN")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let expected = if hold {
+            "hold promote cgwalters-forge/composefs-rs#34 head=866b6ce9050782c50eb0fec1c08b37cebec93dc6: needs-text: last body editor is not the operator or is missing".to_owned()
+        } else {
+            "would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy human-text; provenance verified); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; stack=none (no plan); dco=required; head=866b6ce9050782c50eb0fec1c08b37cebec93dc6 command=https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-1 at=2026-10-23T00:00:00Z human-text=true push=2026-10-22T03:25:48Z; staging verification required for bot-fork head".to_owned()
+        };
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{expected}\n{}\n", board_forge::promote::REMAINING)
+        );
+        assert!(output.stderr.is_empty());
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 

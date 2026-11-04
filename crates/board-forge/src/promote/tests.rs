@@ -130,12 +130,270 @@ fn plan_comments(replay: &mut Replay, nodes: Value) {
 
 fn candidate(human: bool) -> String {
     format!(
-        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: human-text provenance, publication; no writes implemented; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
+        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
     )
 }
 
 fn policy_hold(reason: &str) -> String {
     format!("hold promote {REPO}#34 head={HEAD}: {reason}")
+}
+
+fn text_evidence(replay: &mut Replay) -> &mut Value {
+    &mut replay
+        .requests
+        .iter_mut()
+        .find(|e| {
+            e["request"]["graphql"].as_str().is_some()
+                && e["answer"]["data"]["repository"]["pullRequest"]["userContentEdits"].is_object()
+        })
+        .unwrap()["answer"]["data"]["repository"]["pullRequest"]
+}
+
+/// Public endpoint shape, with explicitly hypothetical operator edits/rename.
+fn human_scenario() -> Replay {
+    let mut replay = scenario();
+    set_current(&mut replay, "human-text");
+    set_verdict(&mut replay, Some(OLDER), "human-text");
+    comments(&mut replay)[0]["body"] = json!("/promote --human-text");
+    activity(&mut replay)[0]["actor"] = json!({"login":"cgwalters"});
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/promote/provenance-public-2026-11-04.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture["query"], provenance::QUERY);
+    let mut answer = fixture["answer"].clone();
+    let p = &mut answer["repository"]["pullRequest"];
+    p["number"] = json!(34);
+    p["url"] = json!(format!("https://github.com/{REPO}/pull/34"));
+    p["headRefOid"] = json!(HEAD);
+    p["title"] = pull(&mut replay)["title"].clone();
+    p["body"] = pull(&mut replay)["body"].clone();
+    p["lastEditedAt"] = json!(PUSH);
+    p["editor"] = json!({"login":"cgwalters"});
+    p["userContentEdits"] = json!({"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"editedAt":PUSH,"deletedAt":null,"editor":{"login":"cgwalters"}}]});
+    p["timelineItems"] = json!({"totalCount":14,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"rename-1","createdAt":PUSH,"previousTitle":"Bot title","currentTitle":p["title"],"actor":{"login":"cgwalters"}}]});
+    struct Answer(Value);
+    impl Transport for Answer {
+        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+    let answer = Answer(answer);
+    let recorder = crate::pass::Recorder::new(&answer);
+    recorder
+        .graphql(
+            provenance::QUERY,
+            json!({"owner":"cgwalters-forge","name":"composefs-rs","number":34}),
+        )
+        .unwrap();
+    replay.requests.extend(
+        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
+            .unwrap()
+            .requests,
+    );
+    replay
+}
+
+fn human_candidate() -> String {
+    candidate(true).replace("policy bot-ok", "policy human-text; provenance verified")
+}
+
+#[test]
+fn human_text_provenance() {
+    type Case = (&'static str, fn(&mut Replay), &'static str);
+    let cases: &[Case] = &[
+        ("valid", |_| {}, ""),
+        (
+            "marker",
+            |r| comments(r)[0]["body"] = json!("/promote"),
+            "selected command lacks --human-text",
+        ),
+        (
+            "pusher",
+            |r| activity(r)[0]["actor"]["login"] = json!("cgwalters-bot"),
+            "current-head pusher is not the operator or is missing",
+        ),
+        (
+            "missing pusher",
+            |r| activity(r)[0]["actor"] = Value::Null,
+            "current-head pusher is not the operator or is missing",
+        ),
+        (
+            "body editor",
+            |r| text_evidence(r)["editor"]["login"] = json!("cgwalters-bot"),
+            "last body editor is not the operator or is missing",
+        ),
+        (
+            "history editor",
+            |r| {
+                text_evidence(r)["userContentEdits"]["nodes"][0]["editor"]["login"] =
+                    json!("visitor")
+            },
+            "last body editor is not the operator or is missing",
+        ),
+        (
+            "missing editor",
+            |r| text_evidence(r)["editor"] = Value::Null,
+            "last body editor is not the operator or is missing",
+        ),
+        (
+            "missing history editor",
+            |r| text_evidence(r)["userContentEdits"]["nodes"][0]["editor"] = Value::Null,
+            "deleted, ambiguous or unverifiable body edit history",
+        ),
+        (
+            "deleted edit",
+            |r| text_evidence(r)["userContentEdits"]["nodes"][0]["deletedAt"] = json!(COMMAND),
+            "deleted, ambiguous or unverifiable body edit history",
+        ),
+        (
+            "title renamer",
+            |r| text_evidence(r)["timelineItems"]["nodes"][0]["actor"]["login"] = json!("visitor"),
+            "last title renamer is not the operator or is missing",
+        ),
+        (
+            "missing renamer",
+            |r| text_evidence(r)["timelineItems"]["nodes"][0]["actor"] = Value::Null,
+            "last title renamer is not the operator or is missing",
+        ),
+        (
+            "later body",
+            |r| {
+                let p = text_evidence(r);
+                p["lastEditedAt"] = json!(COMMAND);
+                p["userContentEdits"]["nodes"][0]["editedAt"] = json!(COMMAND);
+            },
+            "body edit does not predate command; fresh command required",
+        ),
+        (
+            "later title",
+            |r| {
+                text_evidence(r)["timelineItems"]["nodes"][0]["createdAt"] =
+                    json!("2026-10-24T00:00:00Z")
+            },
+            "title rename does not predate command; fresh command required",
+        ),
+        (
+            "missing edits",
+            |r| text_evidence(r)["userContentEdits"] = Value::Null,
+            "missing body edit history",
+        ),
+        (
+            "no edit",
+            |r| {
+                let e = &mut text_evidence(r)["userContentEdits"];
+                e["nodes"] = json!([]);
+                e["totalCount"] = json!(0);
+            },
+            "missing body edit proof",
+        ),
+        (
+            "truncated edits",
+            |r| text_evidence(r)["userContentEdits"]["pageInfo"]["hasNextPage"] = json!(true),
+            "incomplete body edit history",
+        ),
+        (
+            "full edit page",
+            |r| {
+                let row = text_evidence(r)["userContentEdits"]["nodes"][0].clone();
+                text_evidence(r)["userContentEdits"]["nodes"] = json!(vec![row; PAGE_SIZE]);
+            },
+            "incomplete body edit history",
+        ),
+        (
+            "ambiguous edits",
+            |r| {
+                let row = text_evidence(r)["userContentEdits"]["nodes"][0].clone();
+                let e = &mut text_evidence(r)["userContentEdits"];
+                e["nodes"] = json!([row, row]);
+                e["totalCount"] = json!(2);
+            },
+            "deleted, ambiguous or unverifiable body edit history",
+        ),
+        (
+            "edit count",
+            |r| text_evidence(r)["userContentEdits"]["totalCount"] = json!(2),
+            "incomplete body edit history",
+        ),
+        (
+            "missing timeline",
+            |r| text_evidence(r)["timelineItems"] = Value::Null,
+            "missing title rename timeline",
+        ),
+        (
+            "no rename",
+            |r| text_evidence(r)["timelineItems"]["nodes"] = json!([]),
+            "missing title rename proof",
+        ),
+        (
+            "truncated timeline",
+            |r| text_evidence(r)["timelineItems"]["pageInfo"]["hasNextPage"] = json!(true),
+            "incomplete title rename timeline",
+        ),
+        (
+            "full timeline",
+            |r| {
+                let row = text_evidence(r)["timelineItems"]["nodes"][0].clone();
+                text_evidence(r)["timelineItems"]["nodes"] = json!(vec![row; PAGE_SIZE]);
+            },
+            "incomplete title rename timeline",
+        ),
+        (
+            "ambiguous renames",
+            |r| {
+                let row = text_evidence(r)["timelineItems"]["nodes"][0].clone();
+                text_evidence(r)["timelineItems"]["nodes"] = json!([row, row]);
+            },
+            "ambiguous title rename timeline",
+        ),
+        (
+            "attribution",
+            |r| {
+                pull(r)["body"] = json!(format!(
+                    "Part of {REPO}#31\nGenerated-by: https://github.com/cgwalters/#llms"
+                ))
+            },
+            "body still has Generated-by attribution",
+        ),
+        (
+            "head disagreement",
+            |r| text_evidence(r)["headRefOid"] = json!("a".repeat(40)),
+            "REST/GraphQL PR/head/text disagreement",
+        ),
+        (
+            "title disagreement",
+            |r| text_evidence(r)["title"] = json!("Different"),
+            "REST/GraphQL PR/head/text disagreement",
+        ),
+        (
+            "body disagreement",
+            |r| text_evidence(r)["body"] = json!("Different"),
+            "REST/GraphQL PR/head/text disagreement",
+        ),
+        (
+            "rename disagreement",
+            |r| text_evidence(r)["timelineItems"]["nodes"][0]["currentTitle"] = json!("Different"),
+            "title rename/current title disagreement",
+        ),
+        (
+            "edit disagreement",
+            |r| text_evidence(r)["lastEditedAt"] = Value::Null,
+            "missing evidence time",
+        ),
+    ];
+    let config = Config::parse(CONFIG).unwrap();
+    for (name, edit, why) in cases {
+        let mut replay = human_scenario();
+        edit(&mut replay);
+        let (lines, forge) = run(replay, &config);
+        let expected = if why.is_empty() {
+            human_candidate()
+        } else {
+            policy_hold(&format!("needs-text: {why}"))
+        };
+        assert_eq!(lines.unwrap(), [expected, REMAINING.into()], "{name}");
+        assert_eq!(forge.writes.get(), 0, "{name}");
+    }
 }
 
 fn exact<'a>(replay: &'a mut Replay, path: &str) -> &'a mut Value {
@@ -245,8 +503,10 @@ fn root_listing(replay: &mut Replay) -> &mut Vec<Value> {
 #[test]
 fn policy_is_read_once_per_upstream() {
     let config = Config::parse(CONFIG).unwrap();
-    for missing in [false, true] {
-        let mut replay = scenario();
+    for kind in ["bot-ok", "missing", "human-text"] {
+        let missing = kind == "missing";
+        let human = kind == "human-text";
+        let mut replay = if human { human_scenario() } else { scenario() };
         // Scenario: #35 is a copy of #34 with its own comments and reviews.
         let mut second = pull(&mut replay).clone();
         second["number"] = json!(35);
@@ -274,6 +534,23 @@ fn policy_is_read_once_per_upstream() {
             &mut metadata["answer"]["data"]["repository"]["pullRequest"]["comments"]["nodes"];
         nodes[0]["url"] = json!(format!("https://github.com/{REPO}/pull/35#issuecomment-1"));
         replay.requests.push(metadata);
+        if human {
+            // One upstream policy, but #35's last body editor is not operator.
+            let mut evidence = replay
+                .requests
+                .iter()
+                .find(|e| {
+                    e["answer"]["data"]["repository"]["pullRequest"]["userContentEdits"].is_object()
+                })
+                .unwrap()
+                .clone();
+            evidence["request"]["variables"]["number"] = json!(35);
+            let p = &mut evidence["answer"]["data"]["repository"]["pullRequest"];
+            p["number"] = json!(35);
+            p["url"] = json!(format!("https://github.com/{REPO}/pull/35"));
+            p["editor"] = json!({"login":"visitor"});
+            replay.requests.push(evidence);
+        }
         if missing {
             exact(&mut replay, RECORD)["answer"] = json!({"status":404,"link":null,"body":null});
         }
@@ -282,10 +559,17 @@ fn policy_is_read_once_per_upstream() {
             policy_hold(
                 "policy missing: no record at cgwalters-forge/tracker:upstream-policy/composefs/composefs-rs.md",
             )
+        } else if human {
+            human_candidate()
         } else {
             candidate(false)
         };
-        let second = first.replace("#34", "#35").replace("pull/34#", "pull/35#");
+        let second = if human {
+            policy_hold("needs-text: last body editor is not the operator or is missing")
+                .replace("#34", "#35")
+        } else {
+            first.replace("#34", "#35").replace("pull/34#", "pull/35#")
+        };
         assert_eq!(lines.unwrap(), [first, second, REMAINING.into()]);
         let url = format!("{API}{RECORD}");
         assert_eq!(
@@ -545,7 +829,7 @@ fn policy_gate() {
         (
             "human-text",
             |r| set_current(r, "human-text"),
-            policy_hold("policy human-text: the human-text provenance gate is not built"),
+            policy_hold("needs-text: selected command lacks --human-text"),
         ),
         (
             "no-go",
@@ -1201,6 +1485,36 @@ fn force_push_back_to_old_oid_needs_a_new_command() {
         back["before"] = json!("a".repeat(40));
         back["after"] = json!(HEAD);
         *activity(&mut replay) = json!([back, away, original]);
+        assert_eq!(
+            run(replay, &config).0.unwrap(),
+            [expected, REMAINING.into()]
+        );
+    }
+}
+
+#[test]
+fn human_text_uses_the_pusher_returning_to_an_old_oid() {
+    let config = Config::parse(CONFIG).unwrap();
+    let pushed = "2026-10-22T12:00:00Z";
+    for pusher in [Some("cgwalters"), Some("cgwalters-bot"), None] {
+        let mut replay = human_scenario();
+        let original = activity(&mut replay)[0].clone();
+        let mut away = original.clone();
+        away["activity_type"] = json!("force_push");
+        away["timestamp"] = json!("2026-10-22T06:00:00Z");
+        away["before"] = json!(HEAD);
+        away["after"] = json!("a".repeat(40));
+        let mut back = away.clone();
+        back["timestamp"] = json!(pushed);
+        back["before"] = json!("a".repeat(40));
+        back["after"] = json!(HEAD);
+        back["actor"] = pusher.map_or(Value::Null, |login| json!({"login":login}));
+        *activity(&mut replay) = json!([back, away, original]);
+        let expected = if pusher == Some("cgwalters") {
+            human_candidate().replace(PUSH, pushed)
+        } else {
+            policy_hold("needs-text: current-head pusher is not the operator or is missing")
+        };
         assert_eq!(
             run(replay, &config).0.unwrap(),
             [expected, REMAINING.into()]
