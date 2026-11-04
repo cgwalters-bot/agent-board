@@ -2787,6 +2787,14 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
     )
     .unwrap();
     replay.requests.extend(extra.requests);
+    let policy = Replay::from_json(
+        &serde_json::from_str(include_str!(
+            "../../../fixtures/promote/policy-public-2026-11-04.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    replay.requests.extend(policy.requests);
     for e in &mut replay.requests {
         let url = e["request"]["get"].as_str().unwrap_or_default().to_owned();
         if url.contains("pulls?state=open") {
@@ -2846,7 +2854,7 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
         .success()
         .get_output()
         .clone();
-    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits); remaining gates: policy, human-text provenance, publication; no writes implemented"));
+    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: human-text provenance, publication; no writes implemented"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

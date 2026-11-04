@@ -61,7 +61,31 @@ scenario data, not claims of additional recorded public observations.
 They cover no plan, explicit stacks, all parent states and the DCO/text holds.
 The CLI's would-promote example is likewise an edited offline scenario.
 
+`policy-public-2026-11-04.json` holds the policy gate's public reads, made
+with `gh api` on 4 November 2026 and projected to the fields the gate reads.
+`--record` cannot reach them, as no live candidate passes the earlier gates.
+These responses are recorded unchanged: composefs/composefs-rs's contents
+listings of its top level, `.github`, `doc` and `.claude`; bootc-dev/infra's
+`common`; the 404s of composefs-rs's `docs` and of the composefs/.github
+repository; and cgwalters-forge/tracker's repository (`default_branch`).
+These are edited: homegit's public record
+`upstream-policy/composefs/composefs-rs.md` at c027d9f4
+(`repos/cgwalters/homegit/contents/...?ref=c027d9f4`), its two commits from
+`commits?path=...&sha=c027d9f4`, its content at each of them, each commit and
+its (empty) associated pull requests are served at the fixture config's
+policy location in cgwalters-forge/tracker, which has no `upstream-policy/`;
+only the request URLs changed. The `git/trees` responses at each of the two
+commits are invented: a path of trees with ids of one repeated digit down
+to the record as a regular file whose blob is that version's recorded
+`sha`. As recorded, the record is fresh against the
+listings and was never loosened, so the unedited scenario prints `(policy
+bot-ok)`. Tests in `promote/tests.rs` edit these responses for each hold:
+the record's text and verdicts, tree modes, listing ids, types and extra
+files, error statuses,
+truncation, commit authors and verification. The merged policy pull request,
+its reviews and its commits' trees are invented scenario data.
+
 No caller setting, schedule, forge write, live promotion or staging test was
-enabled. Policy/human-text provenance/publication checks,
-bounded writes and recovery, sign-off, and Status/scheduling handoff remain
-separate slices of #308.
+enabled. Human-text provenance/publication checks, bounded writes and
+recovery, sign-off, and Status/scheduling handoff remain separate slices of
+#308.

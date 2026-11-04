@@ -132,6 +132,18 @@ fn recording(fixture: &str) -> Result<String> {
                         "parameters",
                         "check_runs",
                         "total_count",
+                        // The policy gate: record files, listings and history.
+                        "path",
+                        "size",
+                        "encoding",
+                        "content",
+                        "committer",
+                        "verification",
+                        "verified",
+                        "default_branch",
+                        "merge_commit_sha",
+                        "commit_id",
+                        "tree",
                     ]
                     .contains(&key.as_str())
                         || (comments && key == "body")

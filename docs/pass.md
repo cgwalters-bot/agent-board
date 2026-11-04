@@ -960,9 +960,9 @@ A pass captures one clock and performs these stages in order:
    not scheduled by this stage. Status stays stage 5. Do not use pass `--apply`
     to promote. The standalone preview checks operator command/head evidence,
     then candidate upstream PRs, distance, accepted-plan stacks, GitHub DCO
-    facts and title/body references. Passing says `would promote`, not that
-    publication is permitted: policy, human-text provenance and publication
-    remain gates. The contract and minimal-noise requirements remain in the
+    facts and title/body references, then the upstream's contribution-policy
+    record. Passing says `would promote`, not that publication is permitted:
+    human-text provenance and publication remain gates. The contract and minimal-noise requirements remain in the
    [architecture](architecture.md#promote); write/recovery, sign-off and
    Status/scheduling handoff tests come before a future write slice. A
    separate tracker schedule and recorded bot-fork staging verification are

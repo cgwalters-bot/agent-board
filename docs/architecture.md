@@ -143,9 +143,40 @@ promotion reads or writes.
   that are merges or by neither bot nor operator hold. Empty bodies, bare
   `#N` references and closing references to the fork hold, never get rewritten.
   All reads use the existing budget and complete bounded pagination (ten
-  100-row pages); unreadable/incomplete evidence holds. Passing prints
-  `would promote`, not publication permission: policy, human-text provenance
-  and publication still remain. No bot-fork staging success is implied.
+  100-row pages); unreadable/incomplete evidence holds.
+* **Policy gate.** Only a candidate that passed every read gate above reads
+  its upstream's record, once per run, from
+  `policyRepository/policyPath/OWNER/REPO.md` on that repository's default
+  branch; promote never writes one. The record is homegit's format: `---`
+  front matter with `verdict`, `ai-trailer`, `dco`, `sources` (`repo`, `path`,
+  `sha`), `checked` and optional `rebase`, then a non-empty body. A 404 holds
+  as `policy missing`; a version that is not a regular file in its commit's
+  Git tree (the contents API serves a symlink's target as a file at the
+  link's path, and the target's edits are outside the record's history),
+  unknown key or malformed record as `policy invalid`. It
+  holds as `policy stale` unless every source is still a file or directory
+  (a symlink's id names its target, not its text) with its recorded blob or
+  tree id on its repository's default branch and the top level, `.github`,
+  `docs` and `doc` of the upstream and its owner's `.github` repository hold
+  no unrecorded file named like homegit's set (contribution guides, agent
+  instructions, PR templates, DCO texts, AI/LLM as a word); a 404 directory
+  is absent, any other unreadable or truncated listing holds. Homegit's
+  loosening rule is ported over the record's default-branch commit list
+  (complete, bounded; per version, one tree read per path segment and its
+  content, which must be its tree's blob): a looser verdict counts only
+  from a GitHub-verified commit the operator both authored and committed
+  (GitHub verifies the committer; anyone can set an author), or a merged
+  pull request whose merged head the operator last approved and whose merged
+  tree is that head's; otherwise `policy loosened by LOGIN at SHA`. As in
+  homegit, a record's first version sets the baseline unvouched, since the
+  policy-check agent creates records. GitHub's path history does not follow
+  renames, unlike homegit's. `bot-ok` passes; `human-text` holds until its provenance
+  gate is built; `human-only` and `no-go` hold naming the record's sources.
+  The threat is the bot publishing where maintainers refuse it, on a record
+  that no longer describes the upstream, or one someone else loosened.
+  Passing prints `would promote ... (policy bot-ok)`, not publication
+  permission: human-text provenance and publication still remain. No
+  bot-fork staging success is implied.
 * **Kept.** The upstream contribution-policy gate; the operator's sign-off
   added at promote where the upstream wants DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason
@@ -208,9 +239,8 @@ Three rules learned from reviewing the first attempt (agent-board#312):
   response against the command-bound one; on a mismatch it refuses, records no
   success and closes nothing.
 
-The preview reports candidates only: policy freshness and loosening history,
-stack, human-text provenance, distance, DCO and publication are not evaluated.
-Sign-off semantics/proof, capped writes/recovery, the Status/scheduling handoff
+The preview reports candidates only: human-text provenance and publication are
+not evaluated. Sign-off semantics/proof, capped writes/recovery, the Status/scheduling handoff
 and the caller's independent 10–15 minute tracker schedule remain follow-up
 slices. Bot-fork acceptance and `maintainer_can_modify` still require the
 recorded staging call before live publication; no staging or live promotion

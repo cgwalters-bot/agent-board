@@ -1,7 +1,8 @@
-//! Standalone promotion evidence preview. No mutation or publication evaluation.
+//! Standalone promotion evidence preview, including the upstream
+//! contribution-policy gate. No mutation or publication evaluation.
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
@@ -14,7 +15,15 @@ use crate::{
 const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
-pub const REMAINING: &str = "promote: remaining gates: policy, human-text provenance, publication; no writes implemented; bot-fork heads require recorded staging verification";
+pub const REMAINING: &str = "promote: remaining gates: human-text provenance, publication; no writes implemented; bot-fork heads require recorded staging verification";
+
+/// What the candidate read gates found, before the policy gate.
+enum Gates {
+    /// The full line: an open upstream PR already has this head.
+    Promoted(String),
+    /// Every read gate passed: the commit summary and the gate details.
+    Ready { summary: String, detail: String },
+}
 
 pub fn enabled(config: &Config) -> bool {
     config.promote.as_ref().is_some_and(|p| !p.forks.is_empty())
@@ -39,6 +48,8 @@ pub fn preview<C: Rest + Transport>(
     );
     pass::preview_reads(client, |client| {
         let mut lines = Vec::new();
+        // Each upstream's policy is read at most once per run.
+        let mut policies = BTreeMap::new();
         let promote = config.promote.as_ref().context("promote configuration")?;
         for (repo, target) in &promote.forks {
             validate_repository(repo)?;
@@ -75,8 +86,25 @@ pub fn preview<C: Rest + Transport>(
                 match evidence {
                     Ok(command) => {
                         match gates(client, config, repo, &pull, &target.upstream, &target.base) {
-                            Ok(result) => {
+                            Ok(Gates::Promoted(result)) => {
                                 lines.push(format!("{result}; head={head} {command}; staging verification required for bot-fork head"));
+                            }
+                            Ok(Gates::Ready { summary, detail }) => {
+                                let policy = policies
+                                    .entry(target.upstream.to_ascii_lowercase())
+                                    .or_insert_with(|| {
+                                        policy::gate(client, config, &target.upstream)
+                                            .map_err(|e| format!("{e:#}"))
+                                    });
+                                lines.push(match policy {
+                                    Ok(()) => format!(
+                                        "would promote {repo}#{number} -> {} ({summary}) (policy bot-ok); remaining gates: human-text provenance, publication; no writes implemented; {detail}; head={head} {command}; staging verification required for bot-fork head",
+                                        target.upstream
+                                    ),
+                                    Err(why) => {
+                                        format!("hold promote {repo}#{number} head={head}: {why}")
+                                    }
+                                });
                             }
                             Err(error) => lines.push(format!(
                                 "hold promote {repo}#{number} head={head} {command}: {error:#}"
@@ -156,7 +184,7 @@ fn gates(
     pull: &Value,
     upstream: &str,
     base: &str,
-) -> Result<String> {
+) -> Result<Gates> {
     validate_repository(repo)?;
     validate_repository(upstream)?;
     validate_branch(base)?;
@@ -191,9 +219,9 @@ fn gates(
             p["head"]["sha"] == head,
             "upstream {upstream}#{n} has a different head"
         );
-        return Ok(format!(
+        return Ok(Gates::Promoted(format!(
             "already promoted {repo}#{number} -> {upstream}#{n}"
-        ));
+        )));
     }
     let path = format!(
         "repos/{upstream}/compare/{}...{}",
@@ -237,10 +265,10 @@ fn gates(
             );
         }
     }
-    Ok(format!(
-        "would promote {repo}#{number} -> {upstream} ({}); remaining gates: policy, human-text provenance, publication; no writes implemented; {stack}; {}",
-        dco.1, dco.0
-    ))
+    Ok(Gates::Ready {
+        summary: dco.1,
+        detail: format!("{stack}; {}", dco.0),
+    })
 }
 
 fn comparison(client: &impl Rest, path: &str, head: &str) -> Result<Value> {
@@ -897,6 +925,8 @@ fn command_line(body: &str) -> Result<Option<bool>> {
         _ => None,
     })
 }
+
+mod policy;
 
 #[cfg(test)]
 mod tests;

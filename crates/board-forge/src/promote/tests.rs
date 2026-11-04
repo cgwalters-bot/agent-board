@@ -10,6 +10,14 @@ const REPO: &str = "cgwalters-forge/composefs-rs";
 const HEAD: &str = "866b6ce9050782c50eb0fec1c08b37cebec93dc6";
 const PUSH: &str = "2026-10-22T03:25:48Z";
 const COMMAND: &str = "2026-10-23T00:00:00Z";
+const POLICY_FIXTURE: &str =
+    include_str!("../../../../fixtures/promote/policy-public-2026-11-04.json");
+const TRACKER: &str = "repos/cgwalters-forge/tracker";
+const RECORD: &str =
+    "repos/cgwalters-forge/tracker/contents/upstream-policy/composefs/composefs-rs.md";
+/// The record's two recorded commits, oldest first.
+const OLDER: &str = "220fbc83e8e46c5ea6614a285c3848ab253bd6db";
+const NEWER: &str = "07834ad32644607d1cd79add4af025659c988104";
 
 fn entry<'a>(replay: &'a mut Replay, needle: &str) -> &'a mut Value {
     replay
@@ -84,6 +92,8 @@ fn scenario() -> Replay {
     )
     .unwrap();
     replay.requests.extend(gates.requests);
+    let policy = Replay::from_json(&serde_json::from_str(POLICY_FIXTURE).unwrap()).unwrap();
+    replay.requests.extend(policy.requests);
     // Hypothetical fresh base, bot-authored unsigned commit and safe text.
     body(&mut replay, "/compare/")["behind_by"] = json!(0);
     body(&mut replay, "/compare/")["commits"][0]["commit"] =
@@ -120,8 +130,454 @@ fn plan_comments(replay: &mut Replay, nodes: Value) {
 
 fn candidate(human: bool) -> String {
     format!(
-        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits); remaining gates: policy, human-text provenance, publication; no writes implemented; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
+        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: human-text provenance, publication; no writes implemented; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
     )
+}
+
+fn policy_hold(reason: &str) -> String {
+    format!("hold promote {REPO}#34 head={HEAD}: {reason}")
+}
+
+fn exact<'a>(replay: &'a mut Replay, path: &str) -> &'a mut Value {
+    let url = format!("{API}{path}");
+    replay
+        .requests
+        .iter_mut()
+        .find(|e| e["request"]["get"] == url)
+        .unwrap()
+}
+
+/// The record as served now (None) or at a commit of its history.
+fn record_path(at: Option<&str>) -> String {
+    at.map_or(RECORD.into(), |sha| format!("{RECORD}?ref={sha}"))
+}
+
+fn edit_record(replay: &mut Replay, at: Option<&str>, edit: impl Fn(String) -> String) {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let file = &mut exact(replay, &record_path(at))["answer"]["body"];
+    let text = String::from_utf8(
+        STANDARD
+            .decode(file["content"].as_str().unwrap().replace('\n', ""))
+            .unwrap(),
+    )
+    .unwrap();
+    let text = edit(text);
+    file["size"] = json!(text.len());
+    file["content"] = json!(STANDARD.encode(text));
+}
+
+fn set_verdict(replay: &mut Replay, at: Option<&str>, verdict: &'static str) {
+    edit_record(replay, at, |t| {
+        t.replacen("verdict: bot-ok", &format!("verdict: {verdict}"), 1)
+    });
+}
+
+/// The newest version is the record served now; both change together.
+fn set_current(replay: &mut Replay, verdict: &'static str) {
+    set_verdict(replay, None, verdict);
+    set_verdict(replay, Some(NEWER), verdict);
+}
+
+/// Scenario: the older version was stricter, so the newer one loosened it.
+fn loosen(replay: &mut Replay) {
+    set_verdict(replay, Some(OLDER), "human-only");
+}
+
+/// Scenario: NEWER authored by the operator, committed by `committer`.
+fn operator_commit(replay: &mut Replay, verified: bool, committer: &str) {
+    let commit = &mut exact(replay, &format!("{TRACKER}/commits/{NEWER}"))["answer"]["body"];
+    commit["author"]["login"] = json!("cgwalters");
+    commit["committer"]["login"] = json!(committer);
+    commit["commit"]["verification"]["verified"] = json!(verified);
+}
+
+/// Scenario reads for a merged policy-repository PR whose head the operator
+/// approved, merged as NEWER with `tree` (the approved head's tree is 'd's).
+fn approved_pull(replay: &mut Replay, tree: char, review: &str) {
+    let head = "c".repeat(40);
+    let answer = |path: String, body: Value| json!({"request":{"get":format!("{API}{path}")},"answer":{"status":200,"link":null,"body":body}});
+    *exact(
+        replay,
+        &format!("{TRACKER}/commits/{NEWER}/pulls?per_page=100&page=1"),
+    )["answer"]["body"]
+        .as_array_mut()
+        .unwrap() = vec![
+        json!({"number":7,"merged_at":COMMAND,"merge_commit_sha":NEWER,"base":{"ref":"main","repo":{"full_name":"cgwalters-forge/tracker"}},"head":{"sha":head}}),
+    ];
+    replay.requests.extend([
+        answer(
+            format!("{TRACKER}/pulls/7/reviews?per_page=100&page=1"),
+            json!([
+                {"user":{"login":"cgwalters"},"state":"APPROVED","commit_id":head},
+                {"user":{"login":"cgwalters"},"state":review,"commit_id":head}
+            ]),
+        ),
+        answer(
+            format!("{TRACKER}/git/commits/{head}"),
+            json!({"tree":{"sha":"d".repeat(40)}}),
+        ),
+        answer(
+            format!("{TRACKER}/git/commits/{NEWER}"),
+            json!({"tree":{"sha":tree.to_string().repeat(40)}}),
+        ),
+    ]);
+}
+
+/// The fixture's tree row for `tree`'s only entry: the record in the
+/// invented leaf trees '2's (NEWER) and '4's (OLDER), a parent in the others.
+fn tree_row<'a>(replay: &'a mut Replay, tree: &str) -> &'a mut Value {
+    &mut exact(replay, &format!("{TRACKER}/git/trees/{tree}"))["answer"]["body"]["tree"][0]
+}
+
+/// Scenario: the record is a symlink in the leaf tree of '2's or '4's; the
+/// contents API still serves its target's text as a file at the link's path.
+fn symlink_at(replay: &mut Replay, leaf: char) {
+    tree_row(replay, &leaf.to_string().repeat(40))["mode"] = json!("120000");
+}
+
+fn root_listing(replay: &mut Replay) -> &mut Vec<Value> {
+    exact(replay, "repos/composefs/composefs-rs/contents")["answer"]["body"]
+        .as_array_mut()
+        .unwrap()
+}
+
+/// Two candidates for one upstream share one policy evaluation, pass or hold.
+#[test]
+fn policy_is_read_once_per_upstream() {
+    let config = Config::parse(CONFIG).unwrap();
+    for missing in [false, true] {
+        let mut replay = scenario();
+        // Scenario: #35 is a copy of #34 with its own comments and reviews.
+        let mut second = pull(&mut replay).clone();
+        second["number"] = json!(35);
+        body(&mut replay, "pulls?state=open")
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        for needle in ["/issues/34/comments?", "/pulls/34/reviews?"] {
+            let mut copy = entry(&mut replay, needle).clone();
+            let url = copy["request"]["get"]
+                .as_str()
+                .unwrap()
+                .replace("/34/", "/35/");
+            copy["request"]["get"] = json!(url);
+            replay.requests.push(copy);
+        }
+        let mut metadata = replay
+            .requests
+            .iter()
+            .find(|e| e["request"]["variables"]["number"] == 34)
+            .unwrap()
+            .clone();
+        metadata["request"]["variables"]["number"] = json!(35);
+        let nodes =
+            &mut metadata["answer"]["data"]["repository"]["pullRequest"]["comments"]["nodes"];
+        nodes[0]["url"] = json!(format!("https://github.com/{REPO}/pull/35#issuecomment-1"));
+        replay.requests.push(metadata);
+        if missing {
+            exact(&mut replay, RECORD)["answer"] = json!({"status":404,"link":null,"body":null});
+        }
+        let (lines, forge) = run(replay, &config);
+        let first = if missing {
+            policy_hold(
+                "policy missing: no record at cgwalters-forge/tracker:upstream-policy/composefs/composefs-rs.md",
+            )
+        } else {
+            candidate(false)
+        };
+        let second = first.replace("#34", "#35").replace("pull/34#", "pull/35#");
+        assert_eq!(lines.unwrap(), [first, second, REMAINING.into()]);
+        let url = format!("{API}{RECORD}");
+        assert_eq!(
+            forge.reads.borrow().iter().filter(|u| **u == url).count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn policy_gate() {
+    type Case = (&'static str, fn(&mut Replay), String);
+    let record = "cgwalters-forge/tracker:upstream-policy/composefs/composefs-rs.md";
+    let sources = "composefs/composefs-rs:.claude, composefs/composefs-rs:.claude/CLAUDE.md, composefs/composefs-rs:.cursorrules, composefs/composefs-rs:.gemini, composefs/composefs-rs:AGENTS.md, composefs/composefs-rs:GOVERNANCE.md, composefs/composefs-rs:MAINTAINERS.md, composefs/composefs-rs:REVIEW.md, composefs/composefs-rs:SECURITY.md, bootc-dev/infra:common/AGENTS.md, bootc-dev/infra:common/REVIEW.md";
+    let cases: Vec<Case> = vec![
+        ("recorded bot-ok", |_| {}, candidate(false)),
+        (
+            "missing",
+            |r| exact(r, RECORD)["answer"] = json!({"status":404,"link":null,"body":null}),
+            policy_hold(&format!("policy missing: no record at {record}")),
+        ),
+        (
+            "symlink",
+            |r| symlink_at(r, '2'),
+            policy_hold(&format!(
+                "policy invalid: upstream-policy/composefs/composefs-rs.md has mode 120000 at {NEWER}, not a regular file"
+            )),
+        ),
+        (
+            // Its target's later edits, a tightening and loosening back
+            // included, are outside the record's path history.
+            "symlink in an earlier version",
+            |r| symlink_at(r, '4'),
+            policy_hold(&format!(
+                "policy invalid: upstream-policy/composefs/composefs-rs.md has mode 120000 at {OLDER}, not a regular file"
+            )),
+        ),
+        (
+            "symlinked parent directory",
+            |r| tree_row(r, &"1".repeat(40))["mode"] = json!("120000"),
+            policy_hold(&format!(
+                "policy history unreadable: upstream-policy/composefs/composefs-rs.md has a parent of mode 120000 at {NEWER}"
+            )),
+        ),
+        (
+            "version is not its tree's blob",
+            |r| tree_row(r, &"2".repeat(40))["sha"] = json!("f".repeat(40)),
+            policy_hold(&format!(
+                "policy history unreadable: upstream-policy/composefs/composefs-rs.md at {NEWER} is not its tree's blob"
+            )),
+        ),
+        (
+            "directory",
+            |r| exact(r, RECORD)["answer"]["body"] = json!([]),
+            policy_hold(
+                "policy invalid: upstream-policy/composefs/composefs-rs.md is not a regular file",
+            ),
+        ),
+        (
+            "unknown key",
+            |r| {
+                edit_record(r, None, |t| {
+                    t.replacen("rebase: any", "rebase: any\nlicense: MIT", 1)
+                })
+            },
+            policy_hold("policy invalid: unknown key \"license\""),
+        ),
+        (
+            "unknown source key",
+            |r| {
+                edit_record(r, None, |t| {
+                    t.replacen(
+                        "    path: .claude\n",
+                        "    path: .claude\n    ref: main\n",
+                        1,
+                    )
+                })
+            },
+            policy_hold("policy invalid: unknown source key \"ref\""),
+        ),
+        (
+            "no body",
+            |r| edit_record(r, None, |t| t[..t.find("\n---\n").unwrap() + 5].into()),
+            policy_hold("policy invalid: no body"),
+        ),
+        (
+            "unknown verdict",
+            |r| set_verdict(r, None, "bot-maybe"),
+            policy_hold("policy invalid: unknown verdict \"bot-maybe\""),
+        ),
+        (
+            "no front matter",
+            |r| edit_record(r, None, |t| t.replacen("---\n", "", 1)),
+            policy_hold("policy invalid: no front matter"),
+        ),
+        (
+            "stale source sha",
+            |r| {
+                let agents = root_listing(r)
+                    .iter_mut()
+                    .find(|e| e["name"] == "AGENTS.md")
+                    .unwrap();
+                agents["sha"] = json!("0123456789abcdef0123456789abcdef01234567");
+            },
+            policy_hold(
+                "policy stale: composefs/composefs-rs:AGENTS.md changed (61261301421a -> 0123456789ab)",
+            ),
+        ),
+        (
+            // Same id: a symlink's id is its target's name, not its text.
+            "source became a symlink",
+            |r| {
+                root_listing(r)
+                    .iter_mut()
+                    .find(|e| e["name"] == "AGENTS.md")
+                    .unwrap()["type"] = json!("symlink")
+            },
+            policy_hold(
+                "policy stale: composefs/composefs-rs:AGENTS.md is a symlink, not a file or directory",
+            ),
+        ),
+        (
+            "source gone",
+            |r| {
+                *exact(r, "repos/bootc-dev/infra/contents/common")["answer"]["body"]
+                    .as_array_mut()
+                    .unwrap() = vec![]
+            },
+            policy_hold(
+                "policy stale: bootc-dev/infra:common/AGENTS.md is gone, bootc-dev/infra:common/REVIEW.md is gone",
+            ),
+        ),
+        (
+            "unlisted new file",
+            |r| {
+                root_listing(r).push(json!({"name":"CONTRIBUTING.md","path":"CONTRIBUTING.md","sha":"a".repeat(40),"type":"file"}))
+            },
+            policy_hold(
+                "policy stale: composefs/composefs-rs:CONTRIBUTING.md is not in the record",
+            ),
+        ),
+        (
+            "unlisted symlink",
+            |r| {
+                root_listing(r).push(json!({"name":"copilot-instructions.md","path":"copilot-instructions.md","sha":"a".repeat(40),"type":"symlink"}))
+            },
+            policy_hold(
+                "policy stale: composefs/composefs-rs:copilot-instructions.md is not in the record",
+            ),
+        ),
+        (
+            "unlisted AI file in the owner's .github",
+            |r| {
+                exact(r, "repos/composefs/.github/contents")["answer"] = json!({"status":200,"link":null,"body":[{"name":"docs","path":"docs","sha":"b".repeat(40),"type":"dir"}]});
+                r.requests.extend([".github", "doc"].map(|d| json!({"request":{"get":format!("{API}repos/composefs/.github/contents/{d}")},"answer":{"status":404,"link":null,"body":null}})));
+                r.requests.push(json!({"request":{"get":format!("{API}repos/composefs/.github/contents/docs")},"answer":{"status":200,"link":null,"body":[{"name":"using-AI.md","path":"docs/using-AI.md","sha":"a".repeat(40),"type":"file"}]}}));
+            },
+            policy_hold("policy stale: composefs/.github:docs/using-AI.md is not in the record"),
+        ),
+        (
+            "unreadable listing",
+            |r| {
+                exact(r, "repos/composefs/composefs-rs/contents/.github")["answer"]["status"] =
+                    json!(403)
+            },
+            policy_hold(
+                "policy unreadable: listing composefs/composefs-rs:.github: GET repos/composefs/composefs-rs/contents/.github: HTTP 403",
+            ),
+        ),
+        (
+            "truncated listing",
+            |r| {
+                let row = root_listing(r)[0].clone();
+                *root_listing(r) = vec![row; 1000];
+            },
+            policy_hold(
+                "policy unreadable: listing composefs/composefs-rs:: listing may be truncated",
+            ),
+        ),
+        (
+            "truncated commit list",
+            |r| {
+                let commits = exact(
+                    r,
+                    &format!(
+                        "{TRACKER}/commits?path=upstream-policy%2Fcomposefs%2Fcomposefs-rs.md&per_page=100&page=1"
+                    ),
+                );
+                let row = commits["answer"]["body"][0].clone();
+                commits["answer"]["body"] = json!(vec![row; PAGE_SIZE]);
+            },
+            policy_hold("policy history unreadable: listing may be truncated"),
+        ),
+        (
+            "loosened by a non-operator",
+            loosen,
+            policy_hold(&format!("policy loosened by cgwalters-bot at {NEWER}")),
+        ),
+        (
+            "loosened by an unverified operator commit",
+            |r| {
+                loosen(r);
+                operator_commit(r, false, "cgwalters");
+            },
+            policy_hold(&format!("policy loosened by cgwalters at {NEWER}")),
+        ),
+        (
+            // The bot signs with its own key and sets the operator as author.
+            "loosened by a verified commit with an operator author only",
+            |r| {
+                loosen(r);
+                operator_commit(r, true, "cgwalters-bot");
+            },
+            policy_hold(&format!(
+                "policy loosened by cgwalters-bot (author cgwalters) at {NEWER}"
+            )),
+        ),
+        (
+            "loosened by a verified operator commit",
+            |r| {
+                loosen(r);
+                operator_commit(r, true, "cgwalters");
+            },
+            candidate(false),
+        ),
+        (
+            "loosened through an operator-approved PR",
+            |r| {
+                loosen(r);
+                approved_pull(r, 'd', "COMMENTED");
+            },
+            candidate(false),
+        ),
+        (
+            "loosened through a PR merged with more than approved",
+            |r| {
+                loosen(r);
+                approved_pull(r, 'e', "COMMENTED");
+            },
+            policy_hold(&format!("policy loosened by cgwalters-bot at {NEWER}")),
+        ),
+        (
+            "loosened through a PR whose approval was withdrawn",
+            |r| {
+                loosen(r);
+                approved_pull(r, 'd', "DISMISSED");
+            },
+            policy_hold(&format!("policy loosened by cgwalters-bot at {NEWER}")),
+        ),
+        (
+            "human-only",
+            |r| set_current(r, "human-only"),
+            policy_hold(&format!(
+                "policy human-only: the bot may not post there; sources: {sources}"
+            )),
+        ),
+        (
+            "human-text",
+            |r| set_current(r, "human-text"),
+            policy_hold("policy human-text: the human-text provenance gate is not built"),
+        ),
+        (
+            "no-go",
+            |r| set_current(r, "no-go"),
+            policy_hold(&format!(
+                "policy no-go: the bot may not post there; sources: {sources}"
+            )),
+        ),
+        (
+            "changed during the read",
+            |r| set_verdict(r, None, "no-go"),
+            policy_hold("policy history unreadable: the record changed during the read"),
+        ),
+    ];
+    let config = Config::parse(CONFIG).unwrap();
+    for (name, edit, expected) in cases {
+        let mut replay = scenario();
+        edit(&mut replay);
+        let (lines, forge) = run(replay, &config);
+        assert_eq!(lines.unwrap(), [expected, REMAINING.into()], "{name}");
+        // Each policy read happens at most once in a run.
+        let reads = forge.reads.borrow();
+        let policy: Vec<_> = reads
+            .iter()
+            .filter(|u| u.contains("/contents") || u.contains("cgwalters-forge/tracker"))
+            .collect();
+        assert_eq!(
+            policy.len(),
+            policy.iter().collect::<BTreeSet<_>>().len(),
+            "{name}: {policy:?}"
+        );
+    }
 }
 
 fn hold(reason: &str) -> String {
@@ -370,7 +826,13 @@ fn candidate_read_gates() {
     for (name, edit, expected) in cases {
         let mut replay = scenario();
         edit(&mut replay);
-        let (lines, _) = run(replay, &config);
+        let (lines, forge) = run(replay, &config);
+        // The policy is read only for a candidate that passed every other gate.
+        assert_eq!(
+            forge.reads.borrow().iter().any(|u| u.contains(TRACKER)),
+            expected.starts_with("would promote"),
+            "{name}"
+        );
         assert_eq!(lines.unwrap(), [expected, REMAINING.into()], "{name}");
     }
     for needle in [
