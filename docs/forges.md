@@ -242,8 +242,8 @@ scope is fixed by that file alone:
   label resolution's `GET /orgs/{owner}`, which answers 403 without it even
   for a personal owner ([Live CI](#live-ci)). At the start of every preview or applying pass,
   `GET /user` must name `bot` with an id in `recorders`; otherwise nothing is
-  written. Not the Actions automatic token: its user's id is negative, so it
-  can be no recorder, and the comments it writes wake no workflow
+  written. Not the Actions automatic token: its user's id is negative, so
+  it cannot be a recorder, and its comments don't wake workflows
   ([notifier_helper.go#L137-L150][fj-actions-user]).
 * **Identities.** `operator` and `bot` stay logins, each resolved to its user
   id once a pass (bot through `GET /user`, operator through `GET /users/{login}`), and each id must be in `recorders`, or
@@ -251,8 +251,8 @@ scope is fixed by that file alone:
   registered again, an id cannot. Every trust decision compares ids.
 
 Two instances are two configurations, crons, callers and tokens. A Forgejo
-pass reads nothing of a GitHub board and publishes nothing there, and the
-other way round. Its usage and hold snapshots, where set, go only to an issue
+pass doesn't read a GitHub board or publish anything there, and vice versa.
+Its usage and hold snapshots, where set, go only to an issue
 of a private repository on its own instance.
 
 ### Capabilities by stage
@@ -276,9 +276,10 @@ GitHub pass's snapshot, grants, pacing and `usage:` rendering, but never its
 snapshot fallback. With `usage.repository` and `usage.issue` (both or
 neither), and with `holds`, the snapshots are published as the
 [comments section](#comments-recorders-and-editors) says. Missing readings hold pools; failed reads
-report failures, with grants still deciding when available. No broker is no
-reading, never a reason to access GitHub. The Forgejo transport and separate
-credential-free broker share the 500-request/15-minute pass bound. The preview
+report failures, with grants still deciding when available. Without a broker,
+there is no reading; that is never a reason to access GitHub. The Forgejo
+transport and separate credential-free broker share the 500-request/15-minute
+pass bound. The preview
 is opt-in through a trusted config file, with no caller or adapter activation.
 
 | Stage | Forgejo | Refused |

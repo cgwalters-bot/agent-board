@@ -17,9 +17,9 @@ GitHub's documentation on 2026-10-19.
 
 ## Roles and permissions
 
-Each role's writes are the ones its steps make today; its permissions are the
-smallest [GitHub App permissions](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps)
-that cover them. Every app also gets Metadata: read, which GitHub always grants.
+Each role makes the same writes its steps make today, with the minimum
+[GitHub App permissions](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps)
+needed for those writes. Every app also gets Metadata: read, which GitHub always grants.
 No role's token reaches an agent: agents keep the read-only job token
 (operator decision of 2026-10-09), as the wrappers already arrange.
 [`policy/apps.json`](../policy/apps.json) holds this table as the default roles
@@ -58,7 +58,7 @@ Notes on the table:
   ([public or private](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private)),
   so the apps are owned by cgwalters-forge and made public where they install
   elsewhere or cgwalters-bot is not a member. Public only lets other accounts
-  install the app on their own resources; it grants nothing of ours, and the
+  install the app on their own resources; it doesn't grant access to ours, and the
   keys stay with the operator.
   Organization Projects permission covers every project of the organization;
   agent-board's project identity checks still bound which one is written.
@@ -104,9 +104,9 @@ coordinator and executor find their own markers and logs by the bot's login. So
 those two use user access tokens on behalf of cgwalters-bot, which keep every one
 of those checks working and add the app's badge.
 
-For the user tokens, the single-use refresh token is the cost. A workflow that
-refreshes must write the new refresh token back to a secret before the next run,
-which needs a Secrets: write credential in that job, and two concurrent runs
+User tokens have a drawback: their refresh tokens are single-use. A workflow that
+refreshes must write the new refresh token back to a secret before the next run.
+That job needs a Secrets: write credential, and two concurrent runs
 refreshing at once lock one of them out. That fails the gut check, so implement
 and executor apps **opt out of user-token expiry**: cgwalters-bot authorizes each
 once (device flow), and the operator stores the token as that role's secret
@@ -132,9 +132,9 @@ GraphQL `IssueComment` has no app field, only `author`
 ([schema](https://docs.github.com/en/graphql/reference/objects#issuecomment)),
 so in GraphQL a user-token comment is indistinguishable from the PAT's.
 
-So: an installation token's provenance is readable everywhere, by author;
-a user token's only through REST. agent-board's input rule reads authors
-through GraphQL and refuses any non-`User` author (`board-forge/src/input.rs`)
+An installation token's provenance can be read everywhere from its author;
+a user token's provenance can only be read through REST. agent-board's input
+rule reads authors through GraphQL and refuses any non-`User` author (`board-forge/src/input.rs`)
 unless the caller passes the status app's id (`dispatch --collaborators-only
 --status-app-id ID`, the input-rule step of tracker#766): then an issue
 comment by a `Bot` author is admitted when REST's `performed_via_github_app.id`
@@ -232,7 +232,7 @@ write-scoped job token now. Installation tokens are minted in the step that uses
 
 No renewal sidecar is needed. A sidecar would have to place a new token into the
 environment of a process that is already running, and only a long-lived process
-holding a token needs that. Here no such process exists: agents never hold a
+holding a token needs that. There is no such process here: agents never have a
 write token, and every writing step is short (the longest, poll's board job, is
 bounded at 40 minutes; agentic-job's apply at 15 and conclude at 5; the executor
 step at 8), so a token minted at the step's start outlives it. A status comment

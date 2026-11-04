@@ -7,7 +7,7 @@ agent runs used and cost, by kind, model, repository and item, as
 `agent-board/cost-day/v1` JSON ([schema](cost-day.schema.json)); `--human`
 prints a short table instead (agent-board#441). It is read-only. Unlike the
 [budget tree](pass.md#budget-tree), it counts every run with an agentic-job
-artifact, reviews included, which are no board items: a review's is named
+artifact, including reviews, which aren't board items: a review's is named
 `agent-run`, a dispatched run's `dispatch-KIND-agent-run`, for each kind
 the shared agentic-job workflow (`cgwalters-agentic-job.yml` in
 cgwalters-forge/actions, which tracker's dispatch and supervisor workflows
@@ -40,7 +40,7 @@ missing count is 0), `model`, `repo`, `item`, `outcome`, `duration_s` and
 `workflow`, the last only where nothing else names the run's kind. A run
 whose artifact expired, is too large or has no readable summary is listed under `unread` with the reason, not counted; a request that
 fails, the bounds below or the cache fail the whole day instead, so that a
-report never leaves out a run for a passing reason. GitHub's server errors
+report never leaves out a run because of a temporary problem. GitHub's server errors
 (5xx) on a read are retried first, as every GET of the client is: at most 3
 times, 2, 4 and 8 seconds apart, the retries not counted in the bounds
 below. A read sends at most 1000
@@ -58,8 +58,8 @@ workflow file name, each split at `-`, `_` and `.`, so a review's plain
 `agent-run` from `review.yml` is `review`; otherwise the one the first word of
 its title starts with, as in the pass's `implement OWNER/REPO#N (pool)`;
 otherwise, from the summary's `workflow`, `implement` for `branch` and
-`triage` for `analysis` (each of which also serves the other of its pair, fix
-and planning, which only the name or title tells apart); otherwise `other`.
+`triage` for `analysis` (`branch` also serves fix runs, and `analysis` also
+serves planning runs; only the name or title tells each pair apart); otherwise `other`.
 Its repository
 is the summary's `repo` where that is a repository name, else the one it ran
 in; its item is `REPO#N` for a numeric `item`, else the summary's text.

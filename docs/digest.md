@@ -4,7 +4,7 @@
 
 `agent-board digest --config digest.json` gathers public board changes, public
 releases of followed repositories, and project status updates into a weekly issue.
-The generic name leaves the publication format to the caller's templates: a blog
+The generic name lets callers choose the publication format in their templates: a blog
 post is one use, not a built-in destination or writing policy. This ports the
 material, issue and start steps of tracker's `weekly-blog.yml` at `3d010f1`.
 

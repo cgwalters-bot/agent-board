@@ -8,13 +8,13 @@ token; none is delegated to an agent.
 
 ## Asking the operator
 
-The `needs-human` label is the one marker that the operator must act
+The `needs-human` label is the only marker that the operator must act
 ([architecture](architecture.md#one-marker-for-the-operator)): the operator
 answers on the labelled item and takes the label off, or on the `question`
 issue `ask create` opens, which `ask resolve` closes and unlabels. The
 [pass](pass.md#order-and-effects) derives the Needs human status from the
-label, never set by hand, and holds labelled work. The decisions document of
-`ask add` and `ask read` is superseded by it.
+label, never set by hand, and holds labelled work. This replaces the decisions
+document used by `ask add` and `ask read`.
 
 The [pass](pass.md)'s hold snapshot marks `needs-human`,
 `needs-operator` and unplanned-epic holds as the operator's. A `needs-design`
@@ -126,7 +126,7 @@ The repository-owned file, read from a protected default-branch checkout, has
 `writers` (operator and bot logins) and `repositories` (explicit allowed
 repositories), both nonempty arrays of at most 100 strings, and optionally `org`:
 the one organisation the organisation kinds may change, compared without case.
-Absent or empty, they are refused. There is no implicit organisation repository
+Missing or empty values are refused. There is no implicit organisation repository
 allowlist, no default configuration and no execution switch. Do not
 source this file or its path from proposal content or dispatcher workflow inputs.
 To widen repository scope, the operator changes that file through normal review.
@@ -183,8 +183,8 @@ left out; with no changes the body says `No changes since TIME`.
 For a list that is published somewhere other than the project, such as the
 weekly notes on the organization site, `changes --public-only` leaves out the
 issues and pull requests of private repositories, does not search those
-repositories, and drops a private issue from a landing's `closes`. It needs no
-extra request: the reads already carry each repository's `isPrivate`, and one
+repositories, and drops a private issue from a landing's `closes`. It doesn't need
+an extra request: the reads already carry each repository's `isPrivate`, and one
 that was not read counts as private. `--max-chars N` trims the Markdown to at
 most N characters as a generated status update is trimmed (the sections with
 the most lines lose their last lines first, ending with `+K more`). Status

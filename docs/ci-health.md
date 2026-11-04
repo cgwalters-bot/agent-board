@@ -80,8 +80,8 @@ never passes or denominator entries. Rates are observed rates, not health verdic
 
 JSON is the default stable interface: `schema: agent-board/ci-health/v1`, UTC
 `since`/`until`, `complete`, `targets`, `groups`, `bounds`, and `decoded_bytes`.
-Consumers must check both report and target `complete` and display `warnings`
-before using rates. Each target contains its configured `target`,
+Before using rates, consumers must check `complete` at both the report and
+target levels and display `warnings`. Each target contains its configured `target`,
 `listing_complete`, `populations`, `complete`, and `warnings`. A failed history
 listing is discarded, not represented as a successful empty census. No eligible
 history is explicitly warned and incomplete. Unavailable repositories, changing
@@ -121,8 +121,8 @@ at its standard limit; an in-flight operation can overrun the collection deadlin
 Log downloads may require an additional unauthenticated redirect request.
 The command disables transport backoff retries. Byte accounting is after decoding,
 not a wire-byte meter; the last bounded response may exceed the aggregate limit
-and is then refused. These limits can make a busy 30-day window incomplete;
-do not substitute a live sample or a shorter history while claiming full coverage.
+and is then refused. These limits can leave a busy 30-day window incomplete.
+Do not claim full coverage based on a live sample or a shorter history.
 
 ## Tracker daily reporting integration
 

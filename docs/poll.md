@@ -255,7 +255,7 @@ chosen, never the tier. A tier the file does not give, a tier with no automatic
 pool, a tier named without `--pools`, or a tier in `toilFixPool`,
 `conflictFixPool`, `diagnosticPool` or `continuation.pools` (which name the
 one pool a round must take) refuses the configuration. A configuration that
-names no tier needs no pools file and behaves as before. The supervisor's
+names no tier doesn't need a pools file and behaves as before. The supervisor's
 executor reads its kind's tier from the pools file it already takes, and admits
 a request for any automatic pool of it.
 

@@ -5,8 +5,8 @@
 `agent-board prune --config FILE` lists the open issues of the pass
 configuration's `workRepositories` that are candidates to close, each with its
 reasons and the links that show them (agent-board#280). It is read-only: it
-comments on, labels and closes nothing. Closing, a cap for it and a schedule
-are a later change; this list is what the operator looks at first.
+doesn't comment on, label or close issues. Closing issues, capping those writes
+and adding a schedule are future work; this list is for the operator to review first.
 
 The configuration is the [pass's](pass.md#one-configuration-file), from a
 trusted default-branch checkout. Prune reads its `workRepositories`, its
@@ -40,8 +40,8 @@ that applies:
   bot), or at a cross-reference from a pull request, whoever opened it, as
   that is run activity. The bot's own comments and labels, and those of apps, never count,
   so board passes and status comments do not make an issue look active. An
-  issue whose sub-issue or dependency summary GitHub did not return is never
-  called stale. The evidence is the newest activity that counted.
+  issue is never called stale if GitHub did not return its sub-issue or
+  dependency summary. The evidence is the newest activity that counted.
 - **triage-done**: the newest triage verdict the bot posted on the issue (a
   `schedule-triage` block, as in the [supervisor's
   close](supervisor-requests.md)) is `done`, and no person commented after it.

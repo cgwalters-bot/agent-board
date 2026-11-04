@@ -17,7 +17,7 @@ This page is the checklist the release waits on, and the
 [changelog](../CHANGELOG.md) is where its notes collect.
 
 A merged implementation, a successful live run and a satisfied criterion are
-different evidence, and a closed issue is none of them. A gate is `met` only
+different kinds of evidence. A closed issue proves none of them. A gate is `met` only
 when its row links the merged implementation and the live evidence (or
 says `n/a` where there is nothing live to show); otherwise it is `blocked`,
 with what is missing. The test below only sees that a link is there;
@@ -61,7 +61,7 @@ report is the measure [beyond the release](#beyond-the-release).
 
 ## Waiting on the operator
 
-These stay blocked until the operator decides them; no change here can.
+These stay blocked until the operator decides them; changes here cannot resolve them.
 
 - **Stage credential and triggers** ([#282](https://github.com/cgwalters-forge/agent-board/issues/282)):
   where the stage-only administrative token and protected environment live,

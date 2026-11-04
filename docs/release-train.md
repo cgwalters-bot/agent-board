@@ -52,7 +52,7 @@ The steps of a train, each a pass:
    moving its commit pin of the wrappers to that merge commit.
 6. **done**: close the tracking issue.
 
-A pass keeps no state: it reads the stage from the one open tracking issue (an
+A pass doesn't keep state: it reads the stage from the only open tracking issue (an
 issue by the bot titled `NAME vX.Y.Z release train`, carrying the tracking
 label) and the PRs on `release-train/vX.Y.Z` from the bot's forks. With no open
 train, it follows a release cut outside the train whose version the wrappers
