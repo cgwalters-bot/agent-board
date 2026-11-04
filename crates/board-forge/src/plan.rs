@@ -509,7 +509,7 @@ pub(crate) fn comment(node: &Value) -> Result<Comment> {
 /// Every comment on an issue, in order. A pull request is refused: plans
 /// live on issues.
 pub fn issue_comments<T: Transport>(transport: &T, issue: &ItemRef) -> Result<Vec<Comment>> {
-    comments(transport, issue, COMMENTS_QUERY, "issue", "an issue")
+    comments(transport, issue, COMMENTS_QUERY, "issue", "an issue", false)
 }
 
 /// Every comment on a pull request, in order, with the same bounds and
@@ -521,6 +521,7 @@ pub fn pull_request_comments<T: Transport>(transport: &T, pull: &ItemRef) -> Res
         PULL_REQUEST_COMMENTS_QUERY,
         "pullRequest",
         "a pull request",
+        false,
     )
 }
 
@@ -536,7 +537,14 @@ pub(crate) fn comment_metadata<T: Transport>(
     } else {
         (COMMENTS_QUERY, "issue", "an issue")
     };
-    comments(transport, item, &query.replace(" body ", " "), field, what)
+    comments(
+        transport,
+        item,
+        &query.replace(" body ", " "),
+        field,
+        what,
+        true,
+    )
 }
 
 /// Every comment on `issue`'s `field` (`issue` or `pullRequest`), read by `query`.
@@ -546,6 +554,7 @@ fn comments<T: Transport>(
     query: &str,
     field: &str,
     what: &str,
+    require_edit_evidence: bool,
 ) -> Result<Vec<Comment>> {
     ensure!(
         issue.host == crate::github::DEFAULT_HOST,
@@ -567,6 +576,12 @@ fn comments<T: Transport>(
             .as_array()
             .context("comments have no nodes")?
         {
+            if require_edit_evidence {
+                ensure!(
+                    node.get("lastEditedAt").is_some() && node.get("editor").is_some(),
+                    "comment has incomplete edit evidence"
+                );
+            }
             let mut node = node.clone();
             if !query.contains(" body ") {
                 node["body"] = Value::String(String::new());

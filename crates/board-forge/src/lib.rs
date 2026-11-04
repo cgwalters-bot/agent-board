@@ -25,6 +25,7 @@ pub mod pass;
 pub mod plan;
 pub mod poll;
 mod pool_choice;
+pub mod promote;
 pub mod prune;
 pub mod release_train;
 pub mod review;

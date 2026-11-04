@@ -2737,8 +2737,102 @@ fn pass_replay_with_promote_reads_and_writes_nothing() {
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.contains(error), "{case}: {stderr}");
         assert!(output.stdout.is_empty(), "{case}: {:?}", output.stdout);
+        let path = dir.join(format!("{case}.json"));
+        let output = command()
+            .args(["promote", "--config"])
+            .arg(path)
+            .args(["--replay", "fixtures/promote/public-2026-11-04.json"])
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(1)
+            .get_output()
+            .clone();
+        assert!(
+            String::from_utf8(output.stderr).unwrap().contains(error),
+            "{case}"
+        );
+        assert!(output.stdout.is_empty());
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn promote_offline_preview_and_cli_refusals() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let config = "fixtures/promote/config.json";
+    let fixture = "fixtures/promote/public-2026-11-04.json";
+    let output = command()
+        .args(["promote", "--config", config, "--replay", fixture])
+        .current_dir(root)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("DISPATCH_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let recorded: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/promote/public-2026-11-04.json"
+    ))
+    .unwrap();
+    let mut pulls = recorded["requests"][1]["answer"]["body"]
+        .as_array()
+        .unwrap()
+        .clone();
+    pulls.sort_by_key(|p| p["number"].as_u64());
+    let mut expected = String::new();
+    for pull in pulls {
+        expected.push_str(&format!(
+            "hold promote cgwalters-forge/composefs-rs#{} head={} command=unverified: draft\n",
+            pull["number"],
+            pull["head"]["sha"].as_str().unwrap()
+        ));
+    }
+    expected.push_str(board_forge::promote::REMAINING);
+    expected.push('\n');
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(output.stderr.is_empty());
+    for (extra, code, reason) in [
+        (vec!["--apply"], 1, "unexpected argument '--apply'"),
+        (
+            vec!["--record", "unused.json", "--replay", fixture],
+            1,
+            "cannot be used with",
+        ),
+        (vec!["--owner", "example"], 1, "--config only"),
+        (
+            vec!["--replay", "fixtures/board.json"],
+            1,
+            "not a pass replay",
+        ),
+        (vec![], 4, "GH_TOKEN"),
+    ] {
+        let output = command()
+            .args(["promote", "--config", config])
+            .args(&extra)
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        assert!(
+            String::from_utf8(output.stderr).unwrap().contains(reason),
+            "{extra:?}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+    command()
+        .args(["promote", "--config", "fixtures/pass/config.json"])
+        .current_dir(root)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .stdout("promote: off\n");
 }
 
 /// `prune` checks its configuration, options and cache before any token is

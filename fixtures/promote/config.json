@@ -1,0 +1,17 @@
+{
+  "operator": "cgwalters",
+  "bot": "cgwalters-bot",
+  "dispatchRepo": "cgwalters-forge/tracker",
+  "dispatchWorkflow": "dispatch.yml",
+  "dispatchRef": "main",
+  "workRepositories": [],
+  "wip": 1,
+  "pools": {"openai": {"target": 0.95, "burst": 3}},
+  "usage": {"repository": "cgwalters-forge/tracker", "issue": 1},
+  "promote": {
+    "forks": {"cgwalters-forge/composefs-rs": {"upstream": "composefs/composefs-rs", "base": "main"}},
+    "signoff": {"name": "Preview fixture", "email": "preview@example.invalid"},
+    "policyRepository": "cgwalters-forge/tracker",
+    "policyPath": "upstream-policy"
+  }
+}

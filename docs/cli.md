@@ -37,6 +37,7 @@ Commands:
 - [`cost`](#agent-board-cost): What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md)
 - [`ci-health`](#agent-board-ci-health): Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md)
 - [`prune`](#agent-board-prune): Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md)
+- [`promote`](#agent-board-promote): Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Prints candidate/hold evidence only: policy freshness/loosening, stack, human-text provenance, distance, DCO and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote)
 - [`supervise`](#agent-board-supervise): The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests
 - [`status`](#agent-board-status): How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads)
 - [`release-train`](#agent-board-release-train): One pass of the release train: cut a release and move its callers' pins, a step a pass (prints unless --apply)
@@ -788,6 +789,20 @@ Options:
 - `--stale-days <DAYS>`: Days without activity by a person or a pull request after which an issue at neither P0 nor P1 is stale (1 to 365) (default: `21`)
 - `--cache <FILE>`: The response cache: read if it exists, so unchanged pages are revalidated and cost no rate budget, then replaced by the responses this read used
 - `--format <FORMAT>`: Output format (possible values: `text`, `json`) (default: `text`)
+
+## agent-board promote
+
+Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Prints candidate/hold evidence only: policy freshness/loosening, stack, human-text provenance, distance, DCO and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote)
+
+```text
+agent-board promote [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: Trusted shared pass configuration; promote.forks absent or empty means off, with no forge reads or token lookup. The pass remains inert. With forks, GH_TOKEN reads within the pass's request/time bounds and ten 100-row pages per listing
+- `--record <FILE>`: Save live read responses projected to the evidence fields used here for offline replay. No forge writes. Record public repositories only before publishing the file; comment bodies remain in it
+- `--replay <FILE>`: Preview recorded reads at their recorded clock, without credentials
 
 ## agent-board supervise
 

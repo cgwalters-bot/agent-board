@@ -1,14 +1,11 @@
-//! Stage 4b, promotion (agent-board#308, docs/pass.md#order-and-effects,
-//! docs/architecture.md#promote): a fork pull request the operator approved
-//! on its current head is opened in the upstream project its fork tracks.
-//!
-//! Built so far: the configuration and the stage's one line. Nothing is
-//! evaluated, read or written yet; the read-only evaluation comes next, then
-//! each write behind `--apply` and `--max-writes`.
+//! Shared promotion configuration and inert pass compatibility scaffolding.
+//! Standalone comment-triggered evaluation lives in `crate::promote`, not in
+//! the Scheduler. The old pass line is retained for existing replay compatibility;
+//! it performs no promotion reads or writes.
 use super::*;
 
 /// `promote` in the configuration ([`Config::promote`]): which of our forks
-/// send approved pull requests to which upstream, and as whom. Configuration,
+/// send command-authorized pull requests to which upstream, and as whom. Configuration,
 /// never a pull request's body, which anyone can edit, says where one goes.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
