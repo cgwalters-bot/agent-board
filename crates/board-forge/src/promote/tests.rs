@@ -76,17 +76,394 @@ fn scenario() -> Replay {
     pull(&mut replay)["labels"] = json!([]);
     *comments(&mut replay) = json!([{"id": 1, "user": {"login": "cgwalters"}, "created_at": COMMAND, "updated_at": COMMAND, "body": "/promote"}]);
     sync_metadata(&mut replay);
+    let gates = Replay::from_json(
+        &serde_json::from_str(include_str!(
+            "../../../../fixtures/promote/gates-public-2026-11-04.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    replay.requests.extend(gates.requests);
+    // Hypothetical fresh base, bot-authored unsigned commit and safe text.
+    body(&mut replay, "/compare/")["behind_by"] = json!(0);
+    body(&mut replay, "/compare/")["commits"][0]["commit"] =
+        json!({"message":"Implement the slice"});
+    body(&mut replay, "/compare/")["commits"][0]["author"]["login"] = json!("cgwalters-bot");
+    pull(&mut replay)["body"] = json!(format!("Part of {REPO}#31"));
+    pull(&mut replay)["title"] = json!("Implement the slice");
+    plan_comments(&mut replay, json!([]));
     replay
+}
+
+fn plan_comments(replay: &mut Replay, nodes: Value) {
+    struct Answer(Value);
+    impl Transport for Answer {
+        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+    replay
+        .requests
+        .retain(|e| e["request"]["variables"]["number"] != 31);
+    let answer = Answer(
+        json!({"repository":{"issue":{"comments":{"nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
+    );
+    let recorder = crate::pass::Recorder::new(&answer);
+    let issue =
+        crate::parse_github_item(&format!("{REPO}#31"), None, crate::github::DEFAULT_HOST).unwrap();
+    crate::plan::issue_comments(&recorder, &issue).unwrap();
+    let recorded =
+        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
+            .unwrap();
+    replay.requests.extend(recorded.requests);
 }
 
 fn candidate(human: bool) -> String {
     format!(
-        "candidate promote {REPO}#34 head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
+        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits); remaining gates: policy, human-text provenance, publication; no writes implemented; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
     )
 }
 
 fn hold(reason: &str) -> String {
     format!("hold promote {REPO}#34 head={HEAD} command=unverified: {reason}")
+}
+
+fn gate_hold(reason: &str) -> String {
+    format!(
+        "hold promote {REPO}#34 head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text=false push={PUSH}: {reason}"
+    )
+}
+
+fn upstream(replay: &mut Replay) -> &mut Value {
+    body(replay, "composefs/composefs-rs/pulls?state=all")
+}
+
+fn upstream_pr() -> Value {
+    json!({"number":70,"state":"open","merged_at":null,"base":{"ref":"main"},"head":{"sha":HEAD,"ref":"dispatch/implement/agent-run-39714560993","repo":{"owner":{"login":"cgwalters-bot"}}}})
+}
+
+fn signed_dag(replay: &mut Replay) {
+    let c = body(replay, "/compare/");
+    let base = c["merge_base_commit"]["sha"].clone();
+    let commit = |sha: String, parents: Vec<Value>| json!({"sha":sha,"parents":parents,"author":{"login":"cgwalters-bot"},"commit":{"message":"Implement\n\nSigned-off-by: Preview fixture <preview@example.invalid>"}});
+    c["ahead_by"] = json!(3);
+    c["total_commits"] = json!(3);
+    c["commits"] = json!([
+        commit("a".repeat(40), vec![json!({"sha":base})]),
+        commit("b".repeat(40), vec![json!({"sha":base})]),
+        commit(
+            HEAD.into(),
+            vec![json!({"sha":"a".repeat(40)}), json!({"sha":"b".repeat(40)})]
+        )
+    ]);
+}
+
+fn plan_node(lower: Option<u64>) -> Value {
+    let mut plan = json!({"schema":"agent-board/job-plan/v1","repo":REPO,"item":31,"kind":"implement","runner":"hosted","pool":"openai","brief":"Implement slice"});
+    if let Some(lower) = lower {
+        plan["stacks_on"] = json!(lower);
+    }
+    json!({"url":format!("https://github.com/{REPO}/issues/31#issuecomment-2"),"author":{"login":"cgwalters-bot"},"editor":null,"lastEditedAt":null,"createdAt":COMMAND,"body":format!("```agent-board-plan\n{plan}\n```")})
+}
+
+#[test]
+fn plan_absence_is_distinct_from_unreadable_or_invalid_plan() {
+    let config = Config::parse(CONFIG).unwrap();
+    for case in [
+        "no stacks_on",
+        "missing edit time",
+        "missing editor",
+        "foreign edit",
+        "invalid plan",
+        "missing pageInfo",
+    ] {
+        let mut replay = scenario();
+        let mut node = plan_node(None);
+        match case {
+            "missing edit time" => {
+                node.as_object_mut().unwrap().remove("lastEditedAt");
+            }
+            "missing editor" => {
+                node.as_object_mut().unwrap().remove("editor");
+            }
+            "foreign edit" => {
+                node["lastEditedAt"] = json!(COMMAND);
+                node["editor"] = json!({"login":"visitor"});
+            }
+            "invalid plan" => {
+                node["body"] = json!("```agent-board-plan\n{}\n```");
+            }
+            _ => {}
+        }
+        plan_comments(&mut replay, json!([node]));
+        if case == "missing pageInfo" {
+            replay
+                .requests
+                .iter_mut()
+                .find(|e| e["request"]["variables"]["number"] == 31)
+                .unwrap()["answer"]["data"]["repository"]["issue"]["comments"]["pageInfo"] =
+                Value::Null;
+        }
+        let lines = run(replay, &config).0.unwrap();
+        if case == "no stacks_on" {
+            assert_eq!(
+                lines,
+                [
+                    candidate(false).replace("stack=none (no plan)", "stack=none"),
+                    REMAINING.into()
+                ]
+            );
+        } else {
+            assert!(lines[0].starts_with("hold promote"), "{case}: {lines:?}");
+        }
+    }
+}
+
+#[test]
+fn candidate_read_gates() {
+    type Case = (&'static str, fn(&mut Replay), String);
+    let cases: Vec<Case> = vec![
+        ("pass", |_| {}, candidate(false)),
+        (
+            "already promoted",
+            |r| *upstream(r) = json!([upstream_pr()]),
+            format!(
+                "already promoted {REPO}#34 -> composefs/composefs-rs#70; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text=false push={PUSH}; staging verification required for bot-fork head"
+            ),
+        ),
+        (
+            "different head",
+            |r| {
+                let mut p = upstream_pr();
+                p["head"]["sha"] = json!("a".repeat(40));
+                *upstream(r) = json!([p]);
+            },
+            gate_hold("upstream composefs/composefs-rs#70 has a different head"),
+        ),
+        (
+            "closed",
+            |r| {
+                let mut p = upstream_pr();
+                p["state"] = json!("closed");
+                *upstream(r) = json!([p]);
+            },
+            gate_hold("upstream composefs/composefs-rs#70 is closed/merged"),
+        ),
+        (
+            "merged",
+            |r| {
+                let mut p = upstream_pr();
+                p["state"] = json!("closed");
+                p["merged_at"] = json!(COMMAND);
+                *upstream(r) = json!([p]);
+            },
+            gate_hold("upstream composefs/composefs-rs#70 is closed/merged"),
+        ),
+        (
+            "truncated upstream",
+            |r| *upstream(r) = json!(vec![upstream_pr(); PAGE_SIZE]),
+            gate_hold("listing may be truncated"),
+        ),
+        (
+            "behind",
+            |r| body(r, "/compare/")["behind_by"] = json!(1),
+            gate_hold("needs rebase and a fresh /promote (behind_by=1)"),
+        ),
+        (
+            "zero ahead",
+            |r| {
+                let c = body(r, "/compare/");
+                c["ahead_by"] = json!(0);
+                c["total_commits"] = json!(0);
+                c["commits"] = json!([]);
+            },
+            gate_hold("already upstream (zero ahead)"),
+        ),
+        (
+            "empty body",
+            |r| pull(r)["body"] = json!(""),
+            gate_hold("cannot tie fork PR to one issue deterministically: empty body"),
+        ),
+        (
+            "ambiguous issue",
+            |r| pull(r)["body"] = json!(format!("Part of {REPO}#31\nPart of {REPO}#32")),
+            gate_hold("cannot tie fork PR to one issue deterministically"),
+        ),
+        (
+            "bare title",
+            |r| pull(r)["title"] = json!("Implement #31"),
+            gate_hold("text has a bare #N reference that changes repository upstream"),
+        ),
+        (
+            "bare body",
+            |r| pull(r)["body"] = json!("Part of #31"),
+            gate_hold("text has a bare #N reference that changes repository upstream"),
+        ),
+        (
+            "closing title",
+            |r| pull(r)["title"] = json!(format!("Fixes {REPO}#31")),
+            gate_hold(&format!("text has a closing reference to {REPO}#31")),
+        ),
+        (
+            "closing body",
+            |r| pull(r)["body"] = json!(format!("Closes https://github.com/{REPO}/issues/31")),
+            gate_hold(&format!("text has a closing reference to {REPO}#31")),
+        ),
+        (
+            "third party",
+            |r| body(r, "/compare/")["commits"][0]["author"]["login"] = json!("visitor"),
+            gate_hold(&format!(
+                "dco=required: missing sign-off on 1 of 1 commits: {HEAD} is by neither bot nor operator"
+            )),
+        ),
+        (
+            "merge commit",
+            |r| {
+                signed_dag(r);
+                body(r, "/compare/")["commits"][2]["commit"]["message"] = json!("Unsigned merge");
+            },
+            gate_hold(&format!(
+                "dco=required: missing sign-off on 1 of 3 commits: {HEAD} is a merge commit"
+            )),
+        ),
+        (
+            "fully signed merge DAG",
+            signed_dag,
+            candidate(false).replace("sign-off on 1 of 1", "sign-off on 0 of 3"),
+        ),
+        (
+            "signed",
+            |r| {
+                body(r, "/compare/")["commits"][0]["commit"]["message"] =
+                    json!("Implement\n\nSigned-off-by: Preview fixture <preview@example.invalid>")
+            },
+            candidate(false).replace("sign-off on 1 of 1", "sign-off on 0 of 1"),
+        ),
+        (
+            "no DCO",
+            |r| {
+                body(r, "/check-runs?")["check_runs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap()["name"] = json!("Other check");
+            },
+            candidate(false)
+                .replace("sign-off on 1 of 1 commits", "no DCO")
+                .replace("dco=required", "dco=not-required"),
+        ),
+        (
+            "rule DCO",
+            |r| {
+                body(r, "/check-runs?")["check_runs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap()["name"] = json!("Other check");
+                body(r, "/rules/branches/")[2]["parameters"]["required_status_checks"][0]["context"] =
+                    json!("DCO");
+            },
+            candidate(false),
+        ),
+    ];
+    let config = Config::parse(CONFIG).unwrap();
+    for (name, edit, expected) in cases {
+        let mut replay = scenario();
+        edit(&mut replay);
+        let (lines, _) = run(replay, &config);
+        assert_eq!(lines.unwrap(), [expected, REMAINING.into()], "{name}");
+    }
+    for needle in [
+        "composefs/composefs-rs/pulls?state=all",
+        "/compare/",
+        "/rules/branches/",
+        "/branches/main",
+        "/check-runs?",
+    ] {
+        let mut replay = scenario();
+        entry(&mut replay, needle)["answer"]["status"] = json!(403);
+        let lines = run(replay, &config).0.unwrap();
+        assert!(
+            lines[0].starts_with("hold promote") && lines[0].contains("HTTP 403"),
+            "{needle}: {lines:?}"
+        );
+    }
+    let mut replay = scenario();
+    comments(&mut replay)[0]["body"] = json!("No command");
+    sync_metadata(&mut replay);
+    let (_, forge) = run(replay, &config);
+    assert!(
+        !forge
+            .reads
+            .borrow()
+            .iter()
+            .any(|s| s.contains("/compare/") || s.contains("state=all"))
+    );
+}
+
+#[test]
+fn accepted_plan_is_the_only_stack_source() {
+    let config = Config::parse(CONFIG).unwrap();
+    for state in [
+        "open fork PR",
+        "open upstream PR",
+        "closed unmerged",
+        "merged",
+        "merged different base",
+        "merged different head",
+    ] {
+        let mut replay = scenario();
+        plan_comments(&mut replay, json!([plan_node(Some(30))]));
+        let mut parent = pull(&mut replay).clone();
+        parent["number"] = json!(33);
+        parent["body"] = json!("Part of #30");
+        parent["head"]["ref"] = json!("dispatch/parent");
+        parent["state"] = json!(if state == "closed unmerged" {
+            "closed"
+        } else {
+            "open"
+        });
+        replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/pulls?state=all&sort=created&direction=asc&per_page=100&page=1")},"answer":{"status":200,"link":null,"body":[parent]}}));
+        let prs = if state.starts_with("merged") || state == "open upstream PR" {
+            let mut p = upstream_pr();
+            p["head"]["ref"] = json!("dispatch/parent");
+            if state.starts_with("merged") {
+                p["state"] = json!("closed");
+                p["merged_at"] = json!(COMMAND);
+            }
+            if state == "merged different base" {
+                p["base"]["ref"] = json!("release");
+            }
+            if state == "merged different head" {
+                p["head"]["sha"] = json!("a".repeat(40));
+            }
+            json!([p])
+        } else {
+            json!([])
+        };
+        replay.requests.push(json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/pulls?state=all&head=cgwalters-bot%3Adispatch%2Fparent&per_page=100&page=1")},"answer":{"status":200,"link":null,"body":prs}}));
+        let lines = run(replay, &config).0.unwrap();
+        let expected = match state {
+            "merged different base" => gate_hold(
+                "stack parent composefs/composefs-rs#70: merged into a different base, not main",
+            ),
+            "merged different head" => gate_hold(&format!(
+                "stack parent composefs/composefs-rs#70: merged head differs from fork parent {REPO}#33"
+            )),
+            "merged" => candidate(false).replace(
+                "stack=none (no plan)",
+                &format!("stack={REPO}#33 -> composefs/composefs-rs#70 merged"),
+            ),
+            "open upstream PR" => {
+                gate_hold("stack parent composefs/composefs-rs#70: open upstream PR")
+            }
+            "closed unmerged" => gate_hold(&format!(
+                "stack parent {REPO}#33: closed unmerged; rebase by hand"
+            )),
+            _ => gate_hold(&format!("stack parent {REPO}#33: open fork PR")),
+        };
+        assert_eq!(lines, [expected, REMAINING.into()], "{state}");
+    }
 }
 
 struct Forge {

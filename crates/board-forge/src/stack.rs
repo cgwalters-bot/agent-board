@@ -161,7 +161,7 @@ pub(crate) fn after_part_of(line: &str) -> Option<&str> {
 /// Whether a line of a pull request's description begins `Part of` and then
 /// `#N`, `OWNER/REPO#N` or the issue's URL, as an implement run writes for a
 /// slice that does not finish the issue (and so does not close it on merge).
-fn part_of(body: &str, repo: &str, number: u64) -> bool {
+pub(crate) fn part_of(body: &str, repo: &str, number: u64) -> bool {
     let references = references(GITHUB_WEB, repo, number);
     body.lines().any(|line| {
         after_part_of(line)

@@ -2759,6 +2759,98 @@ fn pass_replay_with_promote_reads_and_writes_nothing() {
 }
 
 #[test]
+fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
+    use board_forge::{
+        github::Transport,
+        pass::{Recorder, Replay},
+    };
+    struct NoPlan;
+    impl Transport for NoPlan {
+        fn graphql(&self, _: &str, _: Value) -> anyhow::Result<Value> {
+            Ok(
+                serde_json::json!({"repository":{"issue":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}),
+            )
+        }
+    }
+    let mut replay = Replay::from_json(
+        &serde_json::from_str(include_str!(
+            "../../../fixtures/promote/public-2026-11-04.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let extra = Replay::from_json(
+        &serde_json::from_str(include_str!(
+            "../../../fixtures/promote/gates-public-2026-11-04.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    replay.requests.extend(extra.requests);
+    for e in &mut replay.requests {
+        let url = e["request"]["get"].as_str().unwrap_or_default().to_owned();
+        if url.contains("pulls?state=open") {
+            let mut p = e["answer"]["body"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["number"] == 34)
+                .unwrap()
+                .clone();
+            p["draft"] = false.into();
+            p["labels"] = serde_json::json!([]);
+            p["title"] = "Implement slice".into();
+            p["body"] = "Part of cgwalters-forge/composefs-rs#31".into();
+            e["answer"]["body"] = serde_json::json!([p]);
+        } else if url.contains("/issues/34/comments?") {
+            e["answer"]["body"] = serde_json::json!([{"id":1,"user":{"login":"cgwalters"},"body":"/promote","created_at":"2026-10-23T00:00:00Z","updated_at":"2026-10-23T00:00:00Z"}]);
+        } else if url.contains("/compare/") {
+            e["answer"]["body"]["behind_by"] = 0.into();
+            e["answer"]["body"]["commits"][0]["author"]["login"] = "cgwalters-bot".into();
+            e["answer"]["body"]["commits"][0]["commit"] =
+                serde_json::json!({"message":"Implement slice"});
+        }
+        if e["request"]["variables"]["number"] == 34 {
+            e["answer"]["data"]["repository"]["pullRequest"]["comments"]["nodes"] = serde_json::json!([{"url":"https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-1","author":{"login":"cgwalters"},"createdAt":"2026-10-23T00:00:00Z","lastEditedAt":null,"editor":null}]);
+        }
+    }
+    let recorder = Recorder::new(&NoPlan);
+    let issue =
+        board_forge::parse_github_item("cgwalters-forge/composefs-rs#31", None, "github.com")
+            .unwrap();
+    board_forge::plan::issue_comments(&recorder, &issue).unwrap();
+    replay.requests.extend(
+        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
+            .unwrap()
+            .requests,
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "agent-board-promote-scenario-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scenario.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"schema":"agent-board/pass-replay/v1","now":replay.now.format(&time::format_description::well_known::Rfc3339).unwrap(),"requests":replay.requests})).unwrap()).unwrap();
+    let output = command()
+        .args([
+            "promote",
+            "--config",
+            "fixtures/promote/config.json",
+            "--replay",
+        ])
+        .arg(&path)
+        .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits); remaining gates: policy, human-text provenance, publication; no writes implemented"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn promote_offline_preview_and_cli_refusals() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let config = "fixtures/promote/config.json";

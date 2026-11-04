@@ -103,8 +103,8 @@ and a person should be able to read what the machine read.
 A fork pull request the operator requests be promoted is evaluated by standalone
 `agent-board promote --config FILE`, not by the pass or poll (#308). The newer
 [decision context](https://github.com/cgwalters-forge/agent-board/issues/308#issuecomment-6606946679)
-supersedes the old pass-stage and review-only plan. The command currently only
-previews command/head evidence; it implements no writes and takes no inference
+supersedes the old pass-stage and review-only plan. The command previews
+command/head evidence and candidate read gates; it implements no writes and takes no inference
 pool or dispatch slot. The pass retains an inert compatibility line, with no
 promotion reads or writes.
 
@@ -126,6 +126,26 @@ promotion reads or writes.
   request's body, which anyone can edit. At run time the fork's GitHub parent
   or network root must be the configured upstream. A fork is never in
   `follow`: its main moves only by sync.
+* **Candidate read gates.** Only after command/head evidence passes, read in
+  order: all upstream PRs for the head repository owner's branch (same open
+  head is already promoted; different, closed or merged holds); upstream-base
+  comparison (zero ahead or any behind holds, needing a rebase and fresh
+  `/promote`); the issue's accepted plan's `stacks_on`; DCO facts from required
+  base-branch checks or base-head check runs; and unchanged title/body text.
+  This prevents duplicate publication, stale bases, unmerged dependencies,
+  unsafe sign-off rewrites and references changing meaning upstream. Only a
+  unique closing or `Part of` reference to an issue in the fork ties a PR to
+  its plan; ambiguous/missing linkage holds. No plan or no `stacks_on` means
+  unstacked. A parent's open fork PR, open upstream PR or closed-unmerged PR
+  holds; only its matching-head upstream PR merged into the configured base
+  passes. Accepted-plan comments require complete edit metadata. DCO never comes from CONTRIBUTING.
+  When required, report missing operator sign-offs; commits needing a sign-off
+  that are merges or by neither bot nor operator hold. Empty bodies, bare
+  `#N` references and closing references to the fork hold, never get rewritten.
+  All reads use the existing budget and complete bounded pagination (ten
+  100-row pages); unreadable/incomplete evidence holds. Passing prints
+  `would promote`, not publication permission: policy, human-text provenance
+  and publication still remain. No bot-fork staging success is implied.
 * **Kept.** The upstream contribution-policy gate; the operator's sign-off
   added at promote where the upstream wants DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason
