@@ -2103,9 +2103,25 @@ impl std::fmt::Display for Spent {
 /// note, and what is left is for the next pass to observe. Once a request is refused under a
 /// rate limit past the client's retries ([`RateLimited`]), it sends nothing
 /// more: more requests would only prolong the limit.
-struct Budget<'a, C> {
+pub(crate) struct Budget<'a, C> {
     inner: &'a C,
     bounds: &'a Bounds,
+}
+
+/// Standalone read-only previews share the pass's request and time envelope.
+/// The wrapper still refuses reads after exhaustion and never grants write authority.
+pub(crate) fn preview_reads<C, R>(
+    client: &C,
+    read: impl FnOnce(&Budget<'_, C>) -> Result<R>,
+) -> Result<R> {
+    let bounds = Bounds::new(
+        PASS_REQUEST_LIMIT,
+        Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT),
+    );
+    read(&Budget {
+        inner: client,
+        bounds: &bounds,
+    })
 }
 
 impl<C> Budget<'_, C> {

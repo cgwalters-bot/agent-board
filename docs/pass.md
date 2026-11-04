@@ -16,9 +16,12 @@ The GitHub pass implements the configuration below and stages 1 to 5, except
 that the one rerun is the plain [`reruns`](#reruns) rather than one only of
 infrastructure failures, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included.
-Of stage 4b, [promote](#order-and-effects), only the `promote` configuration
-and its line are built: it evaluates no fork pull request, reads nothing and
-writes nothing.
+The old stage 4b promote line is compatibility scaffolding only: it evaluates
+no fork pull request, reads nothing and writes nothing. The shared `promote`
+configuration now serves the separate read-only
+[`agent-board promote`](cli.md#agent-board-promote); it does not enable a pass
+stage. The newer [comment-trigger contract](architecture.md#promote) replaces
+the obsolete review-only/pass-stage plan.
 The [maintain](#maintain) digest is dispatched only where its repository is
 public; elsewhere it is planned and recorded but not dispatched.
 
@@ -951,17 +954,17 @@ A pass captures one clock and performs these stages in order:
    plan claim and run link, and the existing board Run update where supported;
    it does not close issues from guessed outcomes.
 
-   4b. Promote (planned; [decisions](architecture.md#promote)): open the
-   upstream pull request for a fork pull request in `promote.forks` that the
-   operator approved on its current head, after its policy, stack, base and
-   DCO checks; close the fork pull request with a link to it; at most one a
-   pass, its writes one step within `--max-writes`. It comes after stage 2,
-   which may move a head and so unmake an approval, takes no pool or slot
-   from stage 4, and comes before Status, which then sees its effects in the
-   same pass. It is called 4b so that Status stays stage 5. Nothing of it is
-   built but the configuration and its one line: `promote: off`, or
-   `promote: N fork(s) configured; evaluation is not built`. It reads and
-   writes nothing yet.
+   4b. Inert promote compatibility scaffolding. It keeps the existing replay
+   line `promote: off`, or `promote: N fork(s) configured; evaluation is not
+   built`, with no promotion reads or writes. Evaluation is now standalone,
+   not scheduled by this stage. Status stays stage 5. Do not use pass `--apply`
+   to promote. The standalone preview finds only operator command/head
+   candidates, not publishable pull requests. Policy, stack, draft,
+   behind-upstream and minimal-noise requirements remain in the
+   [architecture](architecture.md#promote); write/recovery, sign-off and
+   Status/scheduling handoff tests come before a future write slice. A
+   separate tracker schedule and recorded bot-fork staging verification are
+   still required; neither is enabled or claimed here.
 5. Derive Status for every board item, closed issues and merged pull
    requests included (this stage reads those, which earlier stages skip),
    from this pass's facts and its own starts, and write each one that differs:
@@ -2869,9 +2872,9 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
-| `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, where stage 4b will promote its approved pull requests; the destination comes from here, never a pull request's body; a fork is named once ignoring case, is not its own upstream, nor in `follow` (its main moves only by sync); `base` non-empty; absent or `{}` (off) |
-| `promote.signoff.name`, `promote.signoff.email` | The operator's `Signed-off-by` and committer identity, added at promote where the upstream wants DCO; both non-empty; required with `promote.forks`, no default |
-| `promote.policyRepository` | Repository whose default branch holds the upstream contribution-policy records, read and never written; required with `promote.forks` |
+| `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, read by standalone `promote`, never the pass; the destination comes from here, never a pull request's body; a fork is named once ignoring case, is not its own upstream, nor in `follow` (its main moves only by sync); `base` non-empty; absent or `{}` means off with no forge reads |
+| `promote.signoff.name`, `promote.signoff.email` | Reserved operator sign-off identity; both non-empty; required with `promote.forks`, no default; no sign-off is performed in the preview |
+| `promote.policyRepository` | Repository whose default branch will supply upstream policy records, never written; required with `promote.forks`, but policy is not read by this preview |
 | `promote.policyPath` | Directory of the records in it, one `OWNER/REPO.md` per upstream; absent, its top level |
 
 The PR stage otherwise uses today's default poll policy, including two fix

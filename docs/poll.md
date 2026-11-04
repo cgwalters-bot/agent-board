@@ -50,9 +50,13 @@ A stop is added after its label, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
 repositories only, besides the runs `operatorComments` starts (below); the board widens what is read, not what is changed. The
-workflow, its bounds and the tokens stay in the caller's repository. Promoting operator-approved fork pull requests upstream is
-planned as the pass's [stage 4b](pass.md#order-and-effects), not the poll's,
-and is not yet built. Every workflow of a repository reviews as the Actions bot, and a
+workflow, its bounds and the tokens stay in the caller's repository. Promotion
+is now the standalone [`agent-board promote`](cli.md#agent-board-promote)
+preview, not a poll or pass stage: only the operator's `/promote` command after
+the observed current-head push is a trigger, never an approving review.
+It evaluates command/head candidates only and implements no writes; policy,
+stack, human-text provenance, distance, DCO, publication and bot-fork staging
+verification remain [gates](architecture.md#promote). Every workflow of a repository reviews as the Actions bot, and a
 branch of the repository could add one that approves its own pull request, so
 the bot's review counts only where the pull request's own workflows cannot
 review (the bot's pull request from its fork into a public repository, on

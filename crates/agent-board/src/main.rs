@@ -19,6 +19,7 @@ mod org_status;
 mod overlap;
 mod pass;
 mod poll;
+mod promote;
 mod prune;
 mod release_train;
 mod review;
@@ -181,6 +182,8 @@ enum Command {
     CiHealth(ci_health::CiHealth),
     /// Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md).
     Prune(prune::Prune),
+    /// Preview operator /promote command evidence on configured forks; standalone, not a pass stage. Only a complete plain operator-authored /promote or /promote --human-text conversation comment after the observed current-head push is a trigger, never an APPROVED review. Prints candidate/hold evidence only: policy freshness/loosening, stack, human-text provenance, distance, DCO and publication remain unevaluated. Bot-fork heads require recorded staging verification. No writes or --apply implemented (docs/architecture.md#promote).
+    Promote(promote::Promote),
     /// The controller's supervisor: a read-only health pass, whether its agent runs, and the executor of its dispatch requests.
     Supervise(supervise::Supervise),
     /// How loaded the --owner organization is: runner jobs, agent runs, pools, merge queues and, with --project, the board (read-only; GH_TOKEN reads).
@@ -1248,6 +1251,22 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 time::OffsetDateTime::now_utc().date(),
                 &mut io::stdout().lock(),
             )
+        }
+        Command::Promote(args) => {
+            ensure!(
+                cli.json.is_none()
+                    && cli.repo.is_none()
+                    && cli.snapshot.is_none()
+                    && cli.owner.is_none()
+                    && cli.project.is_none()
+                    && cli.board_config.is_none(),
+                "promote reads its settings from --config only"
+            );
+            ensure!(
+                cli.hostname == board_forge::github::DEFAULT_HOST,
+                "unsupported GitHub host"
+            );
+            promote::run(args, &mut io::stdout().lock())
         }
         Command::Prune(args) => {
             ensure!(

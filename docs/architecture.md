@@ -100,17 +100,28 @@ and a person should be able to read what the machine read.
 
 ## Promote
 
-A fork pull request the operator approved is opened in the upstream project
-its fork tracks by the pass's [stage 4b](pass.md#order-and-effects), not a
-separate job; it replaces homegit's `bot-promote-due` and `bot-pr promote`
-(agent-board#308). Only its configuration is built so far.
+A fork pull request the operator requests be promoted is evaluated by standalone
+`agent-board promote --config FILE`, not by the pass or poll (#308). The newer
+[decision context](https://github.com/cgwalters-forge/agent-board/issues/308#issuecomment-6606946679)
+supersedes the old pass-stage and review-only plan. The command currently only
+previews command/head evidence; it implements no writes and takes no inference
+pool or dispatch slot. The pass retains an inert compatibility line, with no
+promotion reads or writes.
 
-* **Approval.** Only the operator's approving review of the fork pull
-  request's current head counts; an approval of an older head does not, and
-  the stage says so once per approval. A later change request or dismissal
-  cancels it; a later comment-only review leaves it. The `/promote`,
-  `/draft` and `/ready` comment commands are gone: the approving review is
-  the whole signal.
+* **Permission.** Only an exact operator-authored `/promote` or
+  `/promote --human-text` conversation command after the observed push
+  establishing the current head is a trigger. This preview accepts only a
+  complete plain command comment, with optional surrounding newlines, not prose
+  containing a command. REST comment identity/creation must agree with GraphQL
+  metadata; missing edit metadata or any operator-comment edit holds, even when
+  REST creation/update timestamps match to the second. An APPROVED review never is.
+  Quoted examples, another author's command and a command before the latest
+  push grant nothing. Later operator change requests or dismissals cancel the
+  command; approvals and comment-only reviews cannot restore it. The concrete
+  threat is publishing a changed head using stale permission, including after a
+  force-push back to an old oid. Complete authenticated branch activity, not
+  commit author/committer dates, proves the push. Missing, truncated, edited
+  with unverifiable authorship, ambiguous or out-of-order evidence holds.
 * **Where it goes.** `promote.forks` in the configuration, never the pull
   request's body, which anyone can edit. At run time the fork's GitHub parent
   or network root must be the configured upstream. A fork is never in
@@ -119,7 +130,8 @@ separate job; it replaces homegit's `bot-promote-due` and `bot-pr promote`
   added at promote where the upstream wants DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason
   on the fork pull request; and `--human-text`, the one marker that the
-  operator wrote the text, in the approving review's body.
+  operator wrote the text, in the `/promote --human-text` command. That marker
+  alone is not proof of text provenance.
 * **Dropped.** The advisory comment quoting the upstream's rules, unless the
   policy blocks the promotion: then the blocking notice says the verdict and
   what it rests on, once. Also homegit's `--include-others` and
@@ -132,10 +144,10 @@ separate job; it replaces homegit's `bot-promote-due` and `bot-pr promote`
 * **Noise.** The upstream repository gets the pull request and nothing else.
   The fork pull request, first-party, gets readable state with its machine
   detail alongside ([bookkeeping](#bookkeeping)).
-* **Writes.** `pass --apply` makes them directly within `--max-writes`
-  ([writes](#writes)), one promotion a pass taken whole or held whole, over
-  the forge API through the pass's budget and replay, never a `git` or `gh`
-  subprocess.
+* **Writes (future).** A separately bounded standalone job will make them
+  directly, with whole-step caps and recoverable receipts, over the existing
+  forge transport and budget/replay machinery, never a `git` or `gh` subprocess.
+  There is no working `promote --apply` in this slice.
 
 The answers to the brief's open questions:
 
@@ -143,8 +155,10 @@ The answers to the brief's open questions:
    the upstream one, as homegit did. The item's first-party state (its
    hidden state comment) records the upstream pull request, and Status counts
    an open one recorded there as In Progress and its merge as Done. A replay
-   scenario shows that before anything closes a fork pull request.
-2. **`--human-text`.** The marker in the approving review's body is enough.
+   scenario must show that before anything closes a fork pull request. This
+   Status/scheduling handoff is not built by the preview.
+2. **`--human-text`.** Only the operator's command carries the marker. Checking
+   the pusher and the title/body editors is a later gate, not implemented here.
 3. **Policy records.** Read from the configured repository's default
    branch, with homegit's rule that a verdict is loosened only by the
    operator, ported; never written.
@@ -152,7 +166,7 @@ The answers to the brief's open questions:
    is not stacked.
 5. **Drafts.** A draft fork pull request is never promoted.
 6. **Behind upstream.** Refused, with one notice, even where it would merge
-   cleanly: the approved head would go upstream untested against the new
+   cleanly: the command-bound head would go upstream untested against the new
    base, and rebasing needs `git`.
 7. **A head in the bot's fork.** Whether an upstream takes a pull request
    whose head is in the bot's fork is verified with one recorded call in a
@@ -161,22 +175,31 @@ The answers to the brief's open questions:
 
 Three rules learned from reviewing the first attempt (agent-board#312):
 
-* **Re-read the decision.** The operator's latest decision is read again
-  immediately before the first write; the promotion holds unless it is still
-  the approval acted on and no `needs-human` label was added since.
+* **Re-read the decision.** Immediately before any future first mutation,
+  re-read the command, its authorship/edit evidence, cancellations, PR head,
+  branch push evidence and readiness/labels; hold unless it is still the same
+  command bound to the same observed head and no `needs-human` was added.
 * **Move a ref only by compare-and-swap.** The branch ref is moved only by
   an update that names the expected old object id (GraphQL `updateRefs`),
   never by a read, a REST `PATCH` and a second read, which lose a push that
   lands between them.
 * **Check the head published.** The upstream pull request is created from a
-  mutable `OWNER:BRANCH` head, so the stage checks the head sha in the
-  response against the approved one; on a mismatch it refuses, records no
+  mutable `OWNER:BRANCH` head, so the job checks the head sha in the
+  response against the command-bound one; on a mismatch it refuses, records no
   success and closes nothing.
 
-Why: the approving review is one authenticated act on an exact head, and
-everything else the stage trusts is configuration or a fact it read itself;
-a pull request body, a comment or a local cache can say anything. An
-upstream sees only the pull request, as a person would have opened it.
+The preview reports candidates only: policy freshness and loosening history,
+stack, human-text provenance, distance, DCO and publication are not evaluated.
+Sign-off semantics/proof, capped writes/recovery, the Status/scheduling handoff
+and the caller's independent 10–15 minute tracker schedule remain follow-up
+slices. Bot-fork acceptance and `maintainer_can_modify` still require the
+recorded staging call before live publication; no staging or live promotion
+is claimed here.
+
+Why: the authenticated operator command is bound to a head by observed forge
+push evidence, not by the content's claim about itself. Configuration and read
+facts determine where it may go. An upstream sees only the pull request, as a
+person would have opened it.
 
 ## Async forge I/O
 

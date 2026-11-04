@@ -1,0 +1,3806 @@
+{
+  "schema": "agent-board/pass-replay/v1",
+  "now": "2026-11-04T05:02:25.42257594Z",
+  "requests": [
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": {
+          "id": 1384431030,
+          "name": "composefs-rs",
+          "full_name": "cgwalters-forge/composefs-rs",
+          "owner": {
+            "login": "cgwalters-forge",
+            "id": 333055778
+          },
+          "fork": true,
+          "created_at": "2026-09-24T01:43:21Z",
+          "updated_at": "2026-10-17T12:19:41Z",
+          "parent": {
+            "id": 867189480,
+            "name": "composefs-rs",
+            "full_name": "composefs/composefs-rs",
+            "owner": {
+              "login": "composefs",
+              "id": 186193418
+            },
+            "fork": false,
+            "created_at": "2024-10-03T15:50:48Z",
+            "updated_at": "2026-11-01T22:11:32Z"
+          },
+          "source": {
+            "id": 867189480,
+            "name": "composefs-rs",
+            "full_name": "composefs/composefs-rs",
+            "owner": {
+              "login": "composefs",
+              "id": 186193418
+            },
+            "fork": false,
+            "created_at": "2024-10-03T15:50:48Z",
+            "updated_at": "2026-11-01T22:11:32Z"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls?state=open&sort=created&direction=asc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 4719522917,
+            "number": 9,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-02T17:39:25Z",
+            "updated_at": "2026-11-03T21:55:26Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/varlink-oci-transfer",
+              "sha": "821891d51ce3f1130fd8a3cbfe440e644389c50c",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4728765376,
+            "number": 11,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-03T18:31:08Z",
+            "updated_at": "2026-11-03T21:55:24Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/cfs-320",
+              "sha": "f71f78c773be1900bbc295993d377858abc1c8ac",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "bot/varlink-oci-transfer",
+              "sha": "821891d51ce3f1130fd8a3cbfe440e644389c50c",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4728773484,
+            "number": 13,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-03T18:32:22Z",
+            "updated_at": "2026-11-03T21:55:22Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/oci-whiteout-spec",
+              "sha": "cb7562e2d44408e393126788877a3393008af4d5",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4729420094,
+            "number": 18,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-03T20:20:09Z",
+            "updated_at": "2026-11-03T21:55:20Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/http-parallel-fetch",
+              "sha": "2535786f13f3ffcfd0c407e68ca51c9763661d09",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4737976776,
+            "number": 22,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-04T22:06:17Z",
+            "updated_at": "2026-11-03T21:55:18Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/varlink-error-tests",
+              "sha": "45dfa3557114776dd9cdc9ac0bc5b8acca0e556b",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "bot/cfs-320",
+              "sha": "f71f78c773be1900bbc295993d377858abc1c8ac",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4762867707,
+            "number": 27,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-06T18:15:35Z",
+            "updated_at": "2026-11-03T21:55:17Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443311,
+                "name": "review:quick"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/cfsctl-unwrap-errors",
+              "sha": "682639c44807306dc1ce7430553e26a3b81821a9",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4807012032,
+            "number": 30,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-09T23:37:26Z",
+            "updated_at": "2026-11-03T21:55:15Z",
+            "labels": [
+              {
+                "id": 12906887919,
+                "name": "needs-human"
+              },
+              {
+                "id": 12948443435,
+                "name": "review:problem"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/capi-408-review",
+              "sha": "5302b327af23f5d142b4e7ac148f0a130baa0788",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "bot/capi-ostree-revdep",
+              "sha": "ffb38b15501d464d7ee6833d8f609edb18160a3c",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 4961623453,
+            "number": 34,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-22T03:25:49Z",
+            "updated_at": "2026-11-03T21:55:13Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-39714560993",
+              "sha": "866b6ce9050782c50eb0fec1c08b37cebec93dc6",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5067451560,
+            "number": 40,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-29T11:50:14Z",
+            "updated_at": "2026-11-03T21:55:12Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-40864420780",
+              "sha": "29d8e9e4e2ce0204b56d7a8e0ab47eb298e3291a",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5097267533,
+            "number": 45,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T11:54:37Z",
+            "updated_at": "2026-11-03T21:55:10Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41197696453",
+              "sha": "e0314c43b9f94a887bbfa7d952c5e05187bc7e72",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5107402854,
+            "number": 47,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T12:38:18Z",
+            "updated_at": "2026-11-03T21:55:07Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41306218097",
+              "sha": "d6ee3e0efbb50460b757bb3b660b4786efed4235",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5107428732,
+            "number": 49,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T12:41:37Z",
+            "updated_at": "2026-11-03T21:55:05Z",
+            "labels": [
+              {
+                "id": 12948443435,
+                "name": "review:problem"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41306317833",
+              "sha": "a9beb73a17883dea8f164ada4459712d33c7057e",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5107583748,
+            "number": 50,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T13:01:51Z",
+            "updated_at": "2026-11-03T21:55:04Z",
+            "labels": [
+              {
+                "id": 12948443311,
+                "name": "review:quick"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41306341706",
+              "sha": "35b173f0efe45f717e84612e7248542010d2e4da",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5108584821,
+            "number": 51,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T15:04:51Z",
+            "updated_at": "2026-11-03T21:55:02Z",
+            "labels": [
+              {
+                "id": 12948443311,
+                "name": "review:quick"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41318083569",
+              "sha": "cad725d42b9d65398c212d67c5ceea56217cc366",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5108598606,
+            "number": 52,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T15:06:37Z",
+            "updated_at": "2026-11-03T21:55:00Z",
+            "labels": [
+              {
+                "id": 12948443435,
+                "name": "review:problem"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41318101635",
+              "sha": "9040842f626e190349279e1518e48f5ad83ba6ce",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5111046655,
+            "number": 54,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T20:04:21Z",
+            "updated_at": "2026-11-03T21:54:58Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41340202437",
+              "sha": "31454aea976c3b183aaedcff06ac31b3cfc3eb85",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5129587439,
+            "number": 58,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T00:18:39Z",
+            "updated_at": "2026-11-03T21:54:57Z",
+            "labels": [
+              {
+                "id": 12948443311,
+                "name": "review:quick"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41550977693",
+              "sha": "2174176f75c745e910f30d79ec70cb29a79b74e7",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5144606733,
+            "number": 59,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T21:13:39Z",
+            "updated_at": "2026-11-03T21:54:55Z",
+            "labels": [
+              {
+                "id": 12948443311,
+                "name": "review:quick"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41717352301",
+              "sha": "897100d8251b04bb1ca44f4a76e8a3b20c97e812",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5144740986,
+            "number": 60,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T21:24:55Z",
+            "updated_at": "2026-11-03T21:54:53Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41717327387",
+              "sha": "5821876da5e2f80f39083b9bca80b66a76fc164e",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5146545911,
+            "number": 64,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-04T00:12:08Z",
+            "updated_at": "2026-11-04T04:28:28Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41742687911",
+              "sha": "9fb7f2888d9f00fd8e58cfaffcf94d4545282d50",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5146574357,
+            "number": 65,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-04T00:15:15Z",
+            "updated_at": "2026-11-04T04:28:30Z",
+            "labels": [
+              {
+                "id": 12948443372,
+                "name": "review:deep"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "dispatch/implement/agent-run-41742670223",
+              "sha": "36ffaab2195159438d3ee1918116e8034cfb7b26",
+              "user": {
+                "login": "cgwalters-bot",
+                "id": 17814078
+              },
+              "repo": {
+                "id": 1382158656,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-bot/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-bot",
+                  "id": 17814078
+                },
+                "fork": true,
+                "created_at": "2026-09-22T18:40:07Z",
+                "updated_at": "2026-09-22T18:40:08Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          },
+          {
+            "id": 5146781258,
+            "number": 66,
+            "state": "open",
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-04T00:36:05Z",
+            "updated_at": "2026-11-04T00:36:20Z",
+            "labels": [
+              {
+                "id": 12948443311,
+                "name": "review:quick"
+              }
+            ],
+            "draft": true,
+            "head": {
+              "ref": "bot/revdep-never",
+              "sha": "b450d57e84735d491896630b8ac7ba74ce8e925c",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            },
+            "base": {
+              "ref": "main",
+              "sha": "f5aa0a21c2c22d1b83b81fae7ffb932d2cd2615a",
+              "user": {
+                "login": "cgwalters-forge",
+                "id": 333055778
+              },
+              "repo": {
+                "id": 1384431030,
+                "name": "composefs-rs",
+                "full_name": "cgwalters-forge/composefs-rs",
+                "owner": {
+                  "login": "cgwalters-forge",
+                  "id": 333055778
+                },
+                "fork": true,
+                "created_at": "2026-09-24T01:43:21Z",
+                "updated_at": "2026-10-17T12:19:41Z"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Fvarlink-oci-transfer&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 46823267631,
+            "before": "bd4cfceb8460f42c98e8e9d3bbe1fe2d66d0704e",
+            "after": "821891d51ce3f1130fd8a3cbfe440e644389c50c",
+            "ref": "refs/heads/bot/varlink-oci-transfer",
+            "timestamp": "2026-10-17T14:19:41Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45277089137,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "bd4cfceb8460f42c98e8e9d3bbe1fe2d66d0704e",
+            "ref": "refs/heads/bot/varlink-oci-transfer",
+            "timestamp": "2026-10-02T17:39:20Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/9/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6234223859,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T13:05:18Z",
+            "updated_at": "2026-10-17T14:19:55Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/39039214004) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/9\n\n<!-- agentic-job-run: 39039214004 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6559439845,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:41:37Z",
+            "updated_at": "2026-11-01T14:41:57Z",
+            "body": "Moved to draft. Pull requests on this midstream stay drafts (tracker#336), and the pass now follows this repository, so an approval of a ready one could land it on main ahead of upstream. Approving a draft is still fine, and the promote flow is unchanged. The lasting fix is https://github.com/cgwalters-forge/agent-board/issues/570.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559513040,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:48:14Z",
+            "updated_at": "2026-11-01T14:48:14Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"821891d51ce3f1130fd8a3cbfe440e644389c50c\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 9,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/9#issuecomment-6234223859",
+                    "createdAt": "2026-10-17T13:05:18Z",
+                    "lastEditedAt": "2026-10-17T14:19:55Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/9#issuecomment-6559439845",
+                    "createdAt": "2026-11-01T14:41:37Z",
+                    "lastEditedAt": "2026-11-01T14:41:57Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/9#issuecomment-6559513040",
+                    "createdAt": "2026-11-01T14:48:14Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYb6OdA="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/9/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Fcfs-320&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 46825390884,
+            "before": "8c04cfbe453e0bfe4668e2140d6813a5b7783212",
+            "after": "f71f78c773be1900bbc295993d377858abc1c8ac",
+            "ref": "refs/heads/bot/cfs-320",
+            "timestamp": "2026-10-17T14:50:52Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 46824327065,
+            "before": "592e5499e04d446adb899bca8ce8220815610eec",
+            "after": "8c04cfbe453e0bfe4668e2140d6813a5b7783212",
+            "ref": "refs/heads/bot/cfs-320",
+            "timestamp": "2026-10-17T14:35:20Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 46822133197,
+            "before": "733d10ecb127da329156a0b17c312279f32997c3",
+            "after": "592e5499e04d446adb899bca8ce8220815610eec",
+            "ref": "refs/heads/bot/cfs-320",
+            "timestamp": "2026-10-17T14:02:42Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45361336897,
+            "before": "e61cd8e6cdb8ef37ab3a89139d1aa66fa7688af0",
+            "after": "733d10ecb127da329156a0b17c312279f32997c3",
+            "ref": "refs/heads/bot/cfs-320",
+            "timestamp": "2026-10-03T18:39:47Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45360838962,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "e61cd8e6cdb8ef37ab3a89139d1aa66fa7688af0",
+            "ref": "refs/heads/bot/cfs-320",
+            "timestamp": "2026-10-03T18:31:05Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/11/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6234224365,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T13:05:21Z",
+            "updated_at": "2026-10-17T14:51:09Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/39041399879) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/11\n\n<!-- agentic-job-run: 39041399879 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6559440155,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:41:39Z",
+            "updated_at": "2026-11-01T14:41:58Z",
+            "body": "Moved to draft. Pull requests on this midstream stay drafts (tracker#336), and the pass now follows this repository, so an approval of a ready one could land it on main ahead of upstream. Approving a draft is still fine, and the promote flow is unchanged. The lasting fix is https://github.com/cgwalters-forge/agent-board/issues/570.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559513511,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:48:16Z",
+            "updated_at": "2026-11-01T14:48:16Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"f71f78c773be1900bbc295993d377858abc1c8ac\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 11,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/11#issuecomment-6234224365",
+                    "createdAt": "2026-10-17T13:05:21Z",
+                    "lastEditedAt": "2026-10-17T14:51:09Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/11#issuecomment-6559440155",
+                    "createdAt": "2026-11-01T14:41:39Z",
+                    "lastEditedAt": "2026-11-01T14:41:58Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/11#issuecomment-6559513511",
+                    "createdAt": "2026-11-01T14:48:16Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYb6O6c="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/11/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 5402149497,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "state": "COMMENTED",
+            "submitted_at": "2026-10-03T18:38:28Z"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Foci-whiteout-spec&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 46822030501,
+            "before": "946c3d7c007e0a0156e0987b13ddbed58eb0ce09",
+            "after": "cb7562e2d44408e393126788877a3393008af4d5",
+            "ref": "refs/heads/bot/oci-whiteout-spec",
+            "timestamp": "2026-10-17T14:01:14Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45360910056,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "946c3d7c007e0a0156e0987b13ddbed58eb0ce09",
+            "ref": "refs/heads/bot/oci-whiteout-spec",
+            "timestamp": "2026-10-03T18:32:19Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/13/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6233580556,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T11:54:51Z",
+            "updated_at": "2026-10-17T11:54:51Z",
+            "body": "Ready for review since 2026-10-04 (draft, mergeable, no open findings). @cgwalters: please review, or say if it should be dropped or reworked. Asked 2026-10-17.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6234226370,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T13:05:34Z",
+            "updated_at": "2026-10-17T14:01:27Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/39038145422) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/13\n\n<!-- agentic-job-run: 39038145422 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6546713551,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T17:24:53Z",
+            "updated_at": "2026-10-31T17:24:53Z",
+            "body": "<!-- tracker-poll: {\"queue\":{\"failed\":null,\"group\":null,\"head\":\"\",\"jobs\":[],\"queued\":null,\"reasons\":[],\"seen\":\"\",\"since\":null,\"tries\":0},\"rounds\":0,\"sha\":\"cb7562e2d44408e393126788877a3393008af4d5\",\"stopped\":true} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6594532127,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T03:16:06Z",
+            "updated_at": "2026-11-03T03:16:06Z",
+            "body": "/review"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 13,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/13#issuecomment-6233580556",
+                    "createdAt": "2026-10-17T11:54:51Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/13#issuecomment-6234226370",
+                    "createdAt": "2026-10-17T13:05:34Z",
+                    "lastEditedAt": "2026-10-17T14:01:27Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/13#issuecomment-6546713551",
+                    "createdAt": "2026-10-31T17:24:53Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/13#issuecomment-6594532127",
+                    "createdAt": "2026-11-03T03:16:06Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkQkx8="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/13/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Fhttp-parallel-fetch&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 46823877161,
+            "before": "1d1dd4ba4d027732722dd13c075c887e8601b2f3",
+            "after": "2535786f13f3ffcfd0c407e68ca51c9763661d09",
+            "ref": "refs/heads/bot/http-parallel-fetch",
+            "timestamp": "2026-10-17T14:28:51Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45366971729,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "1d1dd4ba4d027732722dd13c075c887e8601b2f3",
+            "ref": "refs/heads/bot/http-parallel-fetch",
+            "timestamp": "2026-10-03T20:20:05Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/18/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6235006614,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T14:20:28Z",
+            "updated_at": "2026-10-17T14:29:09Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/39040260905) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/18\n\n<!-- agentic-job-run: 39040260905 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6559440476,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:41:40Z",
+            "updated_at": "2026-11-01T14:41:59Z",
+            "body": "Moved to draft. Pull requests on this midstream stay drafts (tracker#336), and the pass now follows this repository, so an approval of a ready one could land it on main ahead of upstream. Approving a draft is still fine, and the promote flow is unchanged. The lasting fix is https://github.com/cgwalters-forge/agent-board/issues/570.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559513840,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:48:18Z",
+            "updated_at": "2026-11-01T14:48:18Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"2535786f13f3ffcfd0c407e68ca51c9763661d09\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6594532819,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T03:16:09Z",
+            "updated_at": "2026-11-03T03:16:09Z",
+            "body": "/review"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 18,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/18#issuecomment-6235006614",
+                    "createdAt": "2026-10-17T14:20:28Z",
+                    "lastEditedAt": "2026-10-17T14:29:09Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/18#issuecomment-6559440476",
+                    "createdAt": "2026-11-01T14:41:40Z",
+                    "lastEditedAt": "2026-11-01T14:41:59Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/18#issuecomment-6559513840",
+                    "createdAt": "2026-11-01T14:48:18Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/18#issuecomment-6594532819",
+                    "createdAt": "2026-11-03T03:16:09Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkQldM="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/18/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 5402583759,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "state": "COMMENTED",
+            "submitted_at": "2026-10-03T20:22:13Z"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Fvarlink-error-tests&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 46826376715,
+            "before": "e7171824a3b7070109ae194e11f382cc01279dc3",
+            "after": "45dfa3557114776dd9cdc9ac0bc5b8acca0e556b",
+            "ref": "refs/heads/bot/varlink-error-tests",
+            "timestamp": "2026-10-17T15:04:51Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 46825199574,
+            "before": "60bf3452ad07153d228e20a67fa79e3653da37e5",
+            "after": "e7171824a3b7070109ae194e11f382cc01279dc3",
+            "ref": "refs/heads/bot/varlink-error-tests",
+            "timestamp": "2026-10-17T14:48:05Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 46824327315,
+            "before": "e896a7a17d75ff29b4f2153673df5e3d4aeebb34",
+            "after": "60bf3452ad07153d228e20a67fa79e3653da37e5",
+            "ref": "refs/heads/bot/varlink-error-tests",
+            "timestamp": "2026-10-17T14:35:20Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 46822169074,
+            "before": "6150a0e78ccc6f4e84a025f8600d314e6a86ae9e",
+            "after": "e896a7a17d75ff29b4f2153673df5e3d4aeebb34",
+            "ref": "refs/heads/bot/varlink-error-tests",
+            "timestamp": "2026-10-17T14:03:14Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45447358841,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "6150a0e78ccc6f4e84a025f8600d314e6a86ae9e",
+            "ref": "refs/heads/bot/varlink-error-tests",
+            "timestamp": "2026-10-04T22:06:13Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/22/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6234225495,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T13:05:29Z",
+            "updated_at": "2026-10-17T14:48:17Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/39041402403) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/22\n\n<!-- agentic-job-run: 39041402403 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6235467556,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T15:04:52Z",
+            "updated_at": "2026-10-17T15:04:52Z",
+            "body": "Restacked by the controller onto #11's new head (`f71f78c`), so the series is #9 → #11 → #22. The rebase was clean. `cargo test -p composefs-ctl` passes (18 passed, 0 failed) and `cargo fmt --check` is clean. Promote upstream in that order.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559440827,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:41:42Z",
+            "updated_at": "2026-11-01T14:42:01Z",
+            "body": "Moved to draft. Pull requests on this midstream stay drafts (tracker#336), and the pass now follows this repository, so an approval of a ready one could land it on main ahead of upstream. Approving a draft is still fine, and the promote flow is unchanged. The lasting fix is https://github.com/cgwalters-forge/agent-board/issues/570.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559514303,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:48:21Z",
+            "updated_at": "2026-11-01T14:48:21Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"45dfa3557114776dd9cdc9ac0bc5b8acca0e556b\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 22,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/22#issuecomment-6234225495",
+                    "createdAt": "2026-10-17T13:05:29Z",
+                    "lastEditedAt": "2026-10-17T14:48:17Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/22#issuecomment-6235467556",
+                    "createdAt": "2026-10-17T15:04:52Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/22#issuecomment-6559440827",
+                    "createdAt": "2026-11-01T14:41:42Z",
+                    "lastEditedAt": "2026-11-01T14:42:01Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/22#issuecomment-6559514303",
+                    "createdAt": "2026-11-01T14:48:21Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYb6Pr8="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/22/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Fcfsctl-unwrap-errors&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 46828296367,
+            "before": "0ddb5fdb486205f7eedce0771a202ae93473f01f",
+            "after": "682639c44807306dc1ce7430553e26a3b81821a9",
+            "ref": "refs/heads/bot/cfsctl-unwrap-errors",
+            "timestamp": "2026-10-17T15:32:32Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 45649170168,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "0ddb5fdb486205f7eedce0771a202ae93473f01f",
+            "ref": "refs/heads/bot/cfsctl-unwrap-errors",
+            "timestamp": "2026-10-06T18:15:31Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/27/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6235648504,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-17T15:20:39Z",
+            "updated_at": "2026-10-17T15:32:46Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/39044547160) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/27\n\n<!-- agentic-job-run: 39044547160 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6559441182,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:41:44Z",
+            "updated_at": "2026-11-01T14:42:02Z",
+            "body": "Moved to draft. Pull requests on this midstream stay drafts (tracker#336), and the pass now follows this repository, so an approval of a ready one could land it on main ahead of upstream. Approving a draft is still fine, and the promote flow is unchanged. The lasting fix is https://github.com/cgwalters-forge/agent-board/issues/570.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559514649,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:48:23Z",
+            "updated_at": "2026-11-01T14:48:23Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"682639c44807306dc1ce7430553e26a3b81821a9\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6594533044,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T03:16:10Z",
+            "updated_at": "2026-11-03T03:16:10Z",
+            "body": "/review"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 27,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/27#issuecomment-6235648504",
+                    "createdAt": "2026-10-17T15:20:39Z",
+                    "lastEditedAt": "2026-10-17T15:32:46Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/27#issuecomment-6559441182",
+                    "createdAt": "2026-11-01T14:41:44Z",
+                    "lastEditedAt": "2026-11-01T14:42:02Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/27#issuecomment-6559514649",
+                    "createdAt": "2026-11-01T14:48:23Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/27#issuecomment-6594533044",
+                    "createdAt": "2026-11-03T03:16:10Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkQlrQ="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/27/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Fcapi-408-review&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48506665753,
+            "before": "a4e504241c2c73a87c6df0c4f8f43f630e3fc805",
+            "after": "5302b327af23f5d142b4e7ac148f0a130baa0788",
+            "ref": "refs/heads/bot/capi-408-review",
+            "timestamp": "2026-10-31T19:22:51Z",
+            "activity_type": "force_push"
+          },
+          {
+            "id": 46014860036,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "a4e504241c2c73a87c6df0c4f8f43f630e3fc805",
+            "ref": "refs/heads/bot/capi-408-review",
+            "timestamp": "2026-10-09T23:37:24Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/30/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6547891865,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T19:09:22Z",
+            "updated_at": "2026-10-31T19:09:25Z",
+            "body": "<!-- tracker-poll: {\"at\":\"2026-10-31T19:08:28Z\",\"pool\":\"openai\",\"queue\":{\"failed\":null,\"group\":null,\"head\":\"a4e504241c2c73a87c6df0c4f8f43f630e3fc805\",\"jobs\":[],\"queued\":null,\"reasons\":[],\"seen\":\"\",\"since\":null,\"tries\":0},\"rounds\":1,\"run\":41232863999,\"sha\":\"a4e504241c2c73a87c6df0c4f8f43f630e3fc805\"} -->\nFix round 1 of 2 for `a4e504241c2c`: [run](https://github.com/cgwalters-forge/tracker/actions/runs/41232863999).\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6547902574,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T19:10:20Z",
+            "updated_at": "2026-10-31T19:23:02Z",
+            "body": "✅ [dispatch](https://github.com/cgwalters-forge/tracker/actions/runs/41232863999) ended well. Result: https://github.com/cgwalters-forge/composefs-rs/pull/30\n\n<!-- agentic-job-run: 41232863999 -->\n\n<!-- agentic-job-status -->"
+          },
+          {
+            "id": 6548103570,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T19:29:04Z",
+            "updated_at": "2026-10-31T19:29:04Z",
+            "body": "<!-- tracker-poll: {\"queue\":{\"failed\":null,\"group\":null,\"head\":\"\",\"jobs\":[],\"queued\":null,\"reasons\":[],\"seen\":\"\",\"since\":null,\"tries\":0},\"rounds\":1,\"sha\":\"5302b327af23f5d142b4e7ac148f0a130baa0788\",\"stopped\":true} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 30,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/30#issuecomment-6547891865",
+                    "createdAt": "2026-10-31T19:09:22Z",
+                    "lastEditedAt": "2026-10-31T19:09:25Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/30#issuecomment-6547902574",
+                    "createdAt": "2026-10-31T19:10:20Z",
+                    "lastEditedAt": "2026-10-31T19:23:02Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/30#issuecomment-6548103570",
+                    "createdAt": "2026-10-31T19:29:04Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYZMIZI="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/30/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": {
+          "id": 1382158656,
+          "name": "composefs-rs",
+          "full_name": "cgwalters-bot/composefs-rs",
+          "owner": {
+            "login": "cgwalters-bot",
+            "id": 17814078
+          },
+          "fork": true,
+          "created_at": "2026-09-22T18:40:07Z",
+          "updated_at": "2026-09-22T18:40:08Z",
+          "parent": {
+            "id": 867189480,
+            "name": "composefs-rs",
+            "full_name": "composefs/composefs-rs",
+            "owner": {
+              "login": "composefs",
+              "id": 186193418
+            },
+            "fork": false,
+            "created_at": "2024-10-03T15:50:48Z",
+            "updated_at": "2026-11-01T22:11:32Z"
+          },
+          "source": {
+            "id": 867189480,
+            "name": "composefs-rs",
+            "full_name": "composefs/composefs-rs",
+            "owner": {
+              "login": "composefs",
+              "id": 186193418
+            },
+            "fork": false,
+            "created_at": "2024-10-03T15:50:48Z",
+            "updated_at": "2026-11-01T22:11:32Z"
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-39714560993&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 47340206064,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "866b6ce9050782c50eb0fec1c08b37cebec93dc6",
+            "ref": "refs/heads/dispatch/implement/agent-run-39714560993",
+            "timestamp": "2026-10-22T03:25:48Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/34/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6559441520,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:41:46Z",
+            "updated_at": "2026-11-01T14:42:03Z",
+            "body": "Moved to draft. Pull requests on this midstream stay drafts (tracker#336), and the pass now follows this repository, so an approval of a ready one could land it on main ahead of upstream. Approving a draft is still fine, and the promote flow is unchanged. The lasting fix is https://github.com/cgwalters-forge/agent-board/issues/570.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6559515029,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T14:48:25Z",
+            "updated_at": "2026-11-01T14:48:25Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"866b6ce9050782c50eb0fec1c08b37cebec93dc6\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 34,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-6559441520",
+                    "createdAt": "2026-11-01T14:41:46Z",
+                    "lastEditedAt": "2026-11-01T14:42:03Z",
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": {
+                      "login": "cgwalters-bot"
+                    }
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-6559515029",
+                    "createdAt": "2026-11-01T14:48:25Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYb6QZU="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/34/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-40864420780&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48224452231,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "29d8e9e4e2ce0204b56d7a8e0ab47eb298e3291a",
+            "ref": "refs/heads/dispatch/implement/agent-run-40864420780",
+            "timestamp": "2026-10-29T11:50:13Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/40/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6546715352,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T17:25:02Z",
+            "updated_at": "2026-10-31T17:25:02Z",
+            "body": "<!-- tracker-poll: {\"queue\":{\"failed\":null,\"group\":null,\"head\":\"\",\"jobs\":[],\"queued\":null,\"reasons\":[],\"seen\":\"\",\"since\":null,\"tries\":0},\"rounds\":0,\"sha\":\"29d8e9e4e2ce0204b56d7a8e0ab47eb298e3291a\",\"stopped\":true} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 40,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/40#issuecomment-6546715352",
+                    "createdAt": "2026-10-31T17:25:02Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYY28tg="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/40/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41197696453&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48473724331,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "e0314c43b9f94a887bbfa7d952c5e05187bc7e72",
+            "ref": "refs/heads/dispatch/implement/agent-run-41197696453",
+            "timestamp": "2026-10-31T11:54:37Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/45/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6546715794,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-10-31T17:25:05Z",
+            "updated_at": "2026-10-31T17:25:05Z",
+            "body": "<!-- tracker-poll: {\"queue\":{\"failed\":null,\"group\":null,\"head\":\"\",\"jobs\":[],\"queued\":null,\"reasons\":[],\"seen\":\"\",\"since\":null,\"tries\":0},\"rounds\":0,\"sha\":\"e0314c43b9f94a887bbfa7d952c5e05187bc7e72\",\"stopped\":true} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 45,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/45#issuecomment-6546715794",
+                    "createdAt": "2026-10-31T17:25:05Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYY29JI="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/45/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41306218097&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48571209044,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "d6ee3e0efbb50460b757bb3b660b4786efed4235",
+            "ref": "refs/heads/dispatch/implement/agent-run-41306218097",
+            "timestamp": "2026-11-01T12:38:18Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/47/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6558081826,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T12:41:33Z",
+            "updated_at": "2026-11-01T12:41:33Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"d6ee3e0efbb50460b757bb3b660b4786efed4235\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6558949103,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T13:59:50Z",
+            "updated_at": "2026-11-01T13:59:50Z",
+            "body": "Back to draft. I marked this ready by mistake: pull requests on this midstream stay drafts so nothing lands on its main ahead of upstream (tracker#336), and the operator promotes the work from here.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 47,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/47#issuecomment-6558081826",
+                    "createdAt": "2026-11-01T12:41:33Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/47#issuecomment-6558949103",
+                    "createdAt": "2026-11-01T13:59:50Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYbxnu8="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/47/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41306317833&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48571444372,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "a9beb73a17883dea8f164ada4459712d33c7057e",
+            "ref": "refs/heads/dispatch/implement/agent-run-41306317833",
+            "timestamp": "2026-11-01T12:41:36Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/49/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6558195404,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T12:52:15Z",
+            "updated_at": "2026-11-01T12:52:15Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"a9beb73a17883dea8f164ada4459712d33c7057e\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6558949765,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T13:59:54Z",
+            "updated_at": "2026-11-01T13:59:54Z",
+            "body": "Back to draft. I marked this ready by mistake: pull requests on this midstream stay drafts so nothing lands on its main ahead of upstream (tracker#336), and the operator promotes the work from here.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 49,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/49#issuecomment-6558195404",
+                    "createdAt": "2026-11-01T12:52:15Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/49#issuecomment-6558949765",
+                    "createdAt": "2026-11-01T13:59:54Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYbxoYU="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/49/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41306341706&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48572889286,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "35b173f0efe45f717e84612e7248542010d2e4da",
+            "ref": "refs/heads/dispatch/implement/agent-run-41306341706",
+            "timestamp": "2026-11-01T13:01:50Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/50/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6558426666,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T13:13:07Z",
+            "updated_at": "2026-11-01T13:13:07Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"35b173f0efe45f717e84612e7248542010d2e4da\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6558950583,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T13:59:58Z",
+            "updated_at": "2026-11-01T13:59:58Z",
+            "body": "Back to draft. I marked this ready by mistake: pull requests on this midstream stay drafts so nothing lands on its main ahead of upstream (tracker#336), and the operator promotes the work from here.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6594532578,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T03:16:08Z",
+            "updated_at": "2026-11-03T03:16:08Z",
+            "body": "/review"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 50,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/50#issuecomment-6558426666",
+                    "createdAt": "2026-11-01T13:13:07Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/50#issuecomment-6558950583",
+                    "createdAt": "2026-11-01T13:59:58Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/50#issuecomment-6594532578",
+                    "createdAt": "2026-11-03T03:16:08Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkQlOI="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/50/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41318083569&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48582145367,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "cad725d42b9d65398c212d67c5ceea56217cc366",
+            "ref": "refs/heads/dispatch/implement/agent-run-41318083569",
+            "timestamp": "2026-11-01T15:04:51Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/51/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6559763335,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T15:09:50Z",
+            "updated_at": "2026-11-01T15:09:50Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"cad725d42b9d65398c212d67c5ceea56217cc366\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          },
+          {
+            "id": 6594532321,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T03:16:07Z",
+            "updated_at": "2026-11-03T03:16:07Z",
+            "body": "/review"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 51,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/51#issuecomment-6559763335",
+                    "createdAt": "2026-11-01T15:09:50Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  },
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/51#issuecomment-6594532321",
+                    "createdAt": "2026-11-03T03:16:07Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYkQk-E="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/51/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41318101635&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48582286398,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "9040842f626e190349279e1518e48f5ad83ba6ce",
+            "ref": "refs/heads/dispatch/implement/agent-run-41318101635",
+            "timestamp": "2026-11-01T15:06:36Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/52/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6559763720,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T15:09:52Z",
+            "updated_at": "2026-11-01T15:09:52Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"9040842f626e190349279e1518e48f5ad83ba6ce\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 52,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/52#issuecomment-6559763720",
+                    "createdAt": "2026-11-01T15:09:52Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYb-DQg="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/52/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41340202437&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48605346103,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "31454aea976c3b183aaedcff06ac31b3cfc3eb85",
+            "ref": "refs/heads/dispatch/implement/agent-run-41340202437",
+            "timestamp": "2026-11-01T20:04:21Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/54/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6563211153,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-01T20:07:29Z",
+            "updated_at": "2026-11-01T20:07:29Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"31454aea976c3b183aaedcff06ac31b3cfc3eb85\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 54,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/54#issuecomment-6563211153",
+                    "createdAt": "2026-11-01T20:07:29Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYcyp5E="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/54/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41550977693&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48760433692,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "2174176f75c745e910f30d79ec70cb29a79b74e7",
+            "ref": "refs/heads/dispatch/implement/agent-run-41550977693",
+            "timestamp": "2026-11-03T00:18:39Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/58/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 6591944647,
+            "user": {
+              "login": "cgwalters-bot",
+              "id": 17814078
+            },
+            "created_at": "2026-11-03T00:19:24Z",
+            "updated_at": "2026-11-03T00:19:24Z",
+            "body": "<!-- tracker-poll: {\"rounds\":0,\"sha\":\"2174176f75c745e910f30d79ec70cb29a79b74e7\",\"stopped\":true,\"queue\":{\"head\":\"\",\"seen\":\"\",\"tries\":0,\"jobs\":[],\"failed\":null,\"reasons\":[],\"group\":null,\"since\":null,\"queued\":null}} -->\nThe poll stopped following this pull request: a draft with no checkpoint; mark it ready if the work is complete. It is labelled `needs-human`; remove the label to have the poll start again on it, with fresh fix rounds.\n\nGenerated-by: https://github.com/cgwalters/#llms"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 58,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [
+                  {
+                    "url": "https://github.com/cgwalters-forge/composefs-rs/pull/58#issuecomment-6591944647",
+                    "createdAt": "2026-11-03T00:19:24Z",
+                    "lastEditedAt": null,
+                    "author": {
+                      "login": "cgwalters-bot"
+                    },
+                    "editor": null
+                  }
+                ],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpHPAAAAAYjpF8c="
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/58/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41717352301&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48884431694,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "897100d8251b04bb1ca44f4a76e8a3b20c97e812",
+            "ref": "refs/heads/dispatch/implement/agent-run-41717352301",
+            "timestamp": "2026-11-03T21:13:38Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/59/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 59,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/59/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41717327387&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48885546053,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "5821876da5e2f80f39083b9bca80b66a76fc164e",
+            "ref": "refs/heads/dispatch/implement/agent-run-41717327387",
+            "timestamp": "2026-11-03T21:24:54Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/60/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 60,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/60/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41742687911&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48900945447,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "9fb7f2888d9f00fd8e58cfaffcf94d4545282d50",
+            "ref": "refs/heads/dispatch/implement/agent-run-41742687911",
+            "timestamp": "2026-11-04T00:12:08Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/64/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 64,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/64/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-bot/composefs-rs/activity?ref=refs%2Fheads%2Fdispatch%2Fimplement%2Fagent-run-41742670223&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48901201630,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "36ffaab2195159438d3ee1918116e8034cfb7b26",
+            "ref": "refs/heads/dispatch/implement/agent-run-41742670223",
+            "timestamp": "2026-11-04T00:15:14Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/65/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 65,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/65/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/activity?ref=refs%2Fheads%2Fbot%2Frevdep-never&direction=desc&per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": [
+          {
+            "id": 48902935665,
+            "before": "0000000000000000000000000000000000000000",
+            "after": "b450d57e84735d491896630b8ac7ba74ce8e925c",
+            "ref": "refs/heads/bot/revdep-never",
+            "timestamp": "2026-11-04T00:36:03Z",
+            "activity_type": "branch_creation"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/issues/66/comments?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    },
+    {
+      "request": {
+        "graphql": "f6b506f15a9c1a11",
+        "variables": {
+          "owner": "cgwalters-forge",
+          "name": "composefs-rs",
+          "number": 66,
+          "after": null
+        }
+      },
+      "answer": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "comments": {
+                "nodes": [],
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "request": {
+        "get": "https://api.github.com/repos/cgwalters-forge/composefs-rs/pulls/66/reviews?per_page=100&page=1"
+      },
+      "answer": {
+        "status": 200,
+        "link": null,
+        "body": []
+      }
+    }
+  ]
+}
