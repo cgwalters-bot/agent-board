@@ -1022,25 +1022,29 @@ impl Collector<'_> {
     fn dispatch_runs(&self) -> Result<Vec<Value>> {
         let value = self.once("dispatch runs", || {
             let since = encode(&format!(">={}", iso(self.lookback())));
-            let mut all = vec![];
-            for page in 1.. {
-                ensure!(page <= self.s.limits.max_pages, "dispatch runs truncated");
-                let runs = self.list(
-                    &format!(
-                        "{}/actions/workflows/{}/runs?created={since}&page={page}",
-                        self.root, self.s.dispatch_workflow
-                    ),
-                    true,
-                )?;
-                let full = runs.len() as u64 >= self.s.limits.page_size;
-                all.extend(runs);
-                if !full {
-                    break;
-                }
-            }
-            Ok(Value::Array(all))
+            Ok(Value::Array(self.run_pages(
+                &format!(
+                    "{}/actions/workflows/{}/runs?created={since}",
+                    self.root, self.s.dispatch_workflow
+                ),
+                "dispatch runs",
+            )?))
         })?;
         Ok(value.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Every page of a run listing, up to maxPages; more is truncated.
+    fn run_pages(&self, path: &str, what: &str) -> Result<Vec<Value>> {
+        let mut all = vec![];
+        for page in 1..=self.s.limits.max_pages {
+            let runs = self.list(&format!("{path}&page={page}"), true)?;
+            let full = runs.len() as u64 >= self.s.limits.page_size;
+            all.extend(runs);
+            if !full {
+                return Ok(all);
+            }
+        }
+        bail!("{what} truncated")
     }
 
     fn removals(pulls: &[Value]) -> Vec<Value> {

@@ -9,6 +9,8 @@ const REPORT_BYTES: usize = 4 * 1024;
 /// Completion-time correlation, inclusive; not a claim of provider causation.
 const STALL_WINDOW_MS: i64 = 2 * 60_000;
 const STALL_MIN_COUNT: usize = 3;
+/// How far back a failed run's creation may lie for its rerun to be seen.
+const RERUN_DAYS: i64 = 7;
 /// agentic-job's terminal stalled-turn failure message (session/driver.rs).
 const STALLED: &str = "the agent stalled";
 
@@ -223,26 +225,21 @@ impl Collector<'_> {
         Ok(value.as_array().cloned().unwrap_or_default())
     }
 
-    /// Creation-time filtering loses old runs rerun today. Read the bounded
-    /// failed-run census instead, then judge completion times. If history
-    /// exceeds maxPages, coverage is unavailable rather than falsely green.
+    /// The lookback's runs, shared with other checks, and failed runs created
+    /// in the last [`RERUN_DAYS`]: listings filter by creation, so an older
+    /// run rerun today is only found among those. Completion times are judged
+    /// afterwards. Past maxPages coverage is unavailable, not green.
     fn failed_dispatch_runs(&self) -> Result<Vec<Value>> {
-        let mut all = vec![];
-        for page in 1..=self.s.limits.max_pages {
-            let runs = self.list(
-                &format!(
-                    "{}/actions/workflows/{}/runs?status=completed&page={page}",
-                    self.root, self.s.dispatch_workflow
-                ),
-                true,
-            )?;
-            let full = runs.len() as u64 >= self.s.limits.page_size;
-            all.extend(runs);
-            if !full {
-                return Ok(all);
-            }
-        }
-        bail!("failed dispatch history truncated")
+        let since = encode(&format!(">={}", iso(self.now - RERUN_DAYS * DAY)));
+        let mut runs = self.dispatch_runs()?;
+        runs.extend(self.run_pages(
+            &format!(
+                "{}/actions/workflows/{}/runs?status=failure&created={since}",
+                self.root, self.s.dispatch_workflow
+            ),
+            "failed dispatch runs",
+        )?);
+        Ok(runs)
     }
 
     pub(super) fn apply_failures(&self) -> Result<Vec<Value>> {
