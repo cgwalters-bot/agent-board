@@ -1817,6 +1817,51 @@ main; …`, one write step, one pull request a base each pass), whose push asks
 the review job for a review against the new base. A conflict is a rebase or
 fix round as before; a head not behind still goes to `needs-human`.
 
+### Unstall
+
+misctool's review job failed on every run for weeks, for want of the
+repository variables its wrapper needs, and five pull requests waited
+for a review that could not post; misctool was not in `follow`, so the
+pass never saw them. Approved pull requests sat unmerged, and drafts were
+held for the operator after one failed continuation (agent-board#666).
+`pr.unstall: true` (off unless set) closes those gaps, each where a pull
+request would otherwise wait with nothing to say so:
+
+- The configuration is refused unless every `workRepositories` entry is in
+  `follow` (case-insensitively), so a repository runs open pull requests
+  in is never one whose pull requests nobody merges, fixes or surfaces.
+- The review job's failed run is re-run once as with `reruns` (the review
+  job bullet [above](#reruns), and with `pr.reviewPools` its runs the pass
+  started), without the rest of `reruns`. A failed run too old to re-run,
+  which `reruns` leaves to wait, is a stop instead: `needs-human: the
+  review job's run URL ended (failure) with no review of SHA, too long ago
+  to re-run; re-run or review it`. A second failure is a stop as before, so
+  the label puts it on the needs-you list.
+- A `mergeAuthors` pull request from a branch of its base repository
+  (not a fork, which the bot cannot push to) that is approved, green and
+  behind a base that requires it up to date is rebased onto it as the
+  bot's own is ([the poll](poll.md#configuration)), rather than left to its
+  author. The rebase rewrites the author's commits, and Dependabot stops
+  rebasing a pull request someone else pushed to. The new head needs the
+  operator's approval again before it merges. An
+  approved, clean pull request is merged or queued in the same pass as
+  before.
+- A draft whose continuation rounds are used up, or whose continuation
+  ended without moving its head, gets one fresh continuation round on a
+  fix pool other than the last round's (any fix pool where there is only
+  one, paced as a fix round is), before `needs-human`: `continue: … , so
+  a fresh continuation round on another pool`. It counts as the round
+  after the last, so it is given once until a person resets the rounds; a
+  `continuation.rounds` of 0 gets none, and a draft with no checkpoint, or
+  an unreadable one, still goes to `needs-human`. A continuation run that
+  failed early also takes this round, numbered after the last, so the
+  rounds it skipped are not given afterwards; its pool is a fix pool, not
+  the checkpoint reason's `continuation.pools` entry.
+
+It adds no new kind of write: re-runs, branch updates and continuation
+rounds keep their claims, `--max-dispatch`, `--max-writes`, the fix
+bounds and pacing. Forgejo refuses it, as the other stage 2 options.
+
 ## Start failures
 
 On 29 October every agent run failed for four and a half hours at the same
@@ -3007,6 +3052,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
+| `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
 | `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, read by standalone `promote`, never the pass; the destination comes from here, never a pull request's body; a fork is named once ignoring case, is not its own upstream, nor in `follow` (its main moves only by sync); `base` non-empty; absent or `{}` means off with no forge reads |

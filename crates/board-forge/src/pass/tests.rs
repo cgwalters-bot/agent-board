@@ -9928,6 +9928,43 @@ fn config_table() {
             (checks, checks, reruns)
         );
     }
+    // `pr.unstall` is off by default and, set, needs every work repository
+    // followed (#666).
+    assert!(!parsed.pr.unstall && !parsed.poll(None).policy.unstall);
+    for (follow, work, unfollowed) in [
+        (json!([]), json!([]), None),
+        (
+            json!(["o/r", "o/misctool"]),
+            json!(["o/R", "O/misctool"]),
+            None,
+        ),
+        (
+            json!(["o/r"]),
+            json!(["o/r", "o/misctool"]),
+            Some("o/misctool"),
+        ),
+        (json!([]), json!(["o/r"]), Some("o/r")),
+    ] {
+        let mut settings = minimal.clone();
+        settings["follow"] = follow.clone();
+        settings["workRepositories"] = work.clone();
+        settings["pr"] = json!({"unstall": true});
+        match (Config::parse(&settings.to_string()), unfollowed) {
+            (Ok(parsed), None) => {
+                assert!(parsed.pr.unstall && parsed.poll(None).policy.unstall);
+            }
+            (Err(error), Some(repo)) => assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "pr unstall needs every work repository followed, and {repo} is not in follow"
+                )
+            ),
+            (got, _) => panic!("{follow} {work}: {got:?}"),
+        }
+        // Without it, an unfollowed work repository is allowed, as before.
+        settings["pr"] = json!({});
+        assert!(Config::parse(&settings.to_string()).is_ok(), "{work}");
+    }
     assert!(parsed.poll(None).policy.no_merge.is_empty());
     for repositories in [
         json!([]),
