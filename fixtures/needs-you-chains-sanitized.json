@@ -1,0 +1,17 @@
+{
+  "provenance": "Representative sanitized model, not an API recording. The composefs-rs#33 -> tracker#160 edge is reported in #668; other identities are deliberately synthetic. No 4 November authenticated snapshot or parent responses were accessible (bot-ops comments returned HTTP 404).",
+  "identities": ["cgwalters-forge/composefs-rs#33", "example/work#1", "example/work#2"],
+  "nodes": {
+    "cgwalters-forge/composefs-rs#33": {"parent": "cgwalters-forge/tracker#160", "live": false},
+    "cgwalters-forge/tracker#160": {"parent": null, "live": true},
+    "example/work#1": {"parent": "example/plans#10", "live": false},
+    "example/plans#10": {"parent": "example/top#20", "live": true},
+    "example/top#20": {"parent": null, "live": true},
+    "example/work#2": {"parent": null, "live": false}
+  },
+  "expected": {
+    "cgwalters-forge/composefs-rs#33": ["cgwalters-forge/tracker#160", "cgwalters-forge/tracker#160"],
+    "example/work#1": ["example/plans#10", "example/top#20"],
+    "example/work#2": ["none", "none"]
+  }
+}

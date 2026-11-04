@@ -16,6 +16,7 @@ use crate::action::{self, ACTION_FENCE, Proposal};
 use crate::plan::{Comment, comment_id, fenced_json};
 use sha2::{Digest, Sha256};
 
+mod carry;
 pub(super) mod epics;
 pub(super) mod inbox;
 pub(super) mod inventory;
@@ -462,10 +463,33 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// is one `needs-you …` line, and the list says what was not read.
     pub(super) fn needs_you(
         &mut self,
-        snapshot: &holds::Snapshot,
+        snapshot: &mut holds::Snapshot,
         previous: Option<&Value>,
         on: &ItemRef,
     ) -> NeedsYou {
+        // Reserve cheap identity validation before any optional source body,
+        // summary or descendant activity reads can exhaust the pass.
+        let mut starts: Vec<_> = snapshot
+            .holds
+            .iter()
+            .filter_map(|h| h.item.as_deref())
+            .filter_map(|i| pull_ref(i).map(|(r, n)| on_github(&r, n)))
+            .collect();
+        if let Some(old) = previous.and_then(|p| {
+            let list = &p["needs_you"];
+            list.get("identities").unwrap_or(&list["items"]).as_array()
+        }) {
+            starts.extend(
+                old.iter()
+                    .filter_map(|i| i["item"].as_str())
+                    .filter_map(|i| pull_ref(i).map(|(r, n)| on_github(&r, n))),
+            );
+        }
+        let mut attempted = BTreeSet::new();
+        let mut nodes = BTreeMap::new();
+        self.inbox_chains(starts, &mut nodes, &mut attempted);
+        let filtered = carry::retire(snapshot, previous, &nodes);
+        let previous = filtered.as_ref();
         let options = match &self.board {
             Some(Some(board)) => board.options.clone(),
             _ => Vec::new(),
@@ -498,44 +522,32 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             summaries: (Read::Complete, BTreeMap::new()),
         };
         let list = holds::needs_you(snapshot, previous, &reading);
-        let inventory = self.inbox_inventory(&list);
         let proposal_label = config
             .holds
             .as_ref()
             .and_then(|h| h.proposals.as_ref())
             .map(|p| p.label.as_str());
-        let mut list = list;
-        inventory::revalidate(&mut list, &inventory, proposal_label);
-        self.inventory_chains(&mut list, &inventory);
-        let chains: BTreeMap<_, _> = list
+        let starts = list
             .identities
             .iter()
-            .map(|i| {
-                (
-                    i.item.to_ascii_lowercase(),
-                    holds::EpicChain {
-                        epic: i.epic.clone(),
-                        top_epic: i.top_epic.clone(),
-                    },
-                )
+            .filter(|i| {
+                !nodes.contains_key(&i.item.to_ascii_lowercase())
+                    && !attempted.contains(&i.item.to_ascii_lowercase())
             })
+            .filter_map(|i| pull_ref(&i.item).map(|(r, n)| on_github(&r, n)))
             .collect();
-        // Parent chains and carry checks take precedence over optional prose.
+        self.inbox_chains(starts, &mut nodes, &mut attempted);
+        carry::sources(&mut reading, &nodes);
+        let filtered = carry::retire(snapshot, previous, &nodes);
+        let previous = filtered.as_ref();
+        let mut list = holds::needs_you(snapshot, previous, &reading);
+        inventory::revalidate(&mut list, &nodes, proposal_label);
+        self.inbox_epics(&mut list, &nodes, false);
         reading.summaries = self.summaries(&list);
         let mut list = holds::needs_you(snapshot, previous, &reading);
-        inventory::revalidate(&mut list, &inventory, proposal_label);
-        for identity in &mut list.identities {
-            if let Some(chain) = chains.get(&identity.item.to_ascii_lowercase()) {
-                identity.epic = chain.epic.clone();
-                identity.top_epic = chain.top_epic.clone();
-            }
-        }
-        for ask in &mut list.items {
-            if let Some(chain) = chains.get(&ask.item.to_ascii_lowercase()) {
-                ask.chain = chain.clone();
-            }
-        }
-        self.inbox_epics(&mut list);
+        inventory::revalidate(&mut list, &nodes, proposal_label);
+        self.inbox_epics(&mut list, &nodes, true);
+        carry::evidence(&mut list, previous, &nodes);
         holds::preserve_changed_at(&mut list, previous);
         list
     }

@@ -2,7 +2,9 @@
 use super::*;
 
 /// Bound aliases and label/closing-issue connections in each request.
+#[cfg(test)]
 pub(super) const BATCH_SIZE: usize = 100;
+#[cfg(test)]
 const FIELDS: &str = r#"
   ... on Issue {
     issueState: state labels(first: 100) { nodes { name } totalCount }
@@ -14,6 +16,7 @@ const FIELDS: &str = r#"
   }
 "#;
 
+#[cfg(test)]
 pub(super) fn batch_query(items: &[ItemRef]) -> (String, Value) {
     let mut declarations = Vec::new();
     let mut selections = Vec::new();
@@ -250,6 +253,7 @@ pub(in crate::pass) fn revalidate(
             .count();
 }
 
+#[cfg(test)]
 fn read_inventory(
     list: &NeedsYou,
     mut fetch: impl FnMut(&[ItemRef]) -> Result<Value>,
@@ -306,6 +310,7 @@ fn read_inventory(
     (nodes, errors)
 }
 
+#[cfg(test)]
 fn resolve_chains(
     list: &mut NeedsYou,
     inventory: &BTreeMap<String, Value>,
@@ -357,46 +362,6 @@ fn resolve_chains(
     }
     epics::decorate(list, &nodes);
     errors
-}
-
-impl<C: Rest + Transport> Scheduler<'_, C> {
-    pub(super) fn inbox_inventory(&mut self, list: &NeedsYou) -> BTreeMap<String, Value> {
-        let (nodes, errors) = read_inventory(list, |batch| {
-            ensure!(self.room(), "the pass's request budget or time is spent");
-            let (query, variables) = batch_query(batch);
-            self.client.graphql(&query, variables)
-        });
-        for error in errors {
-            self.line(error);
-        }
-        nodes
-    }
-
-    pub(super) fn inventory_chains(
-        &mut self,
-        list: &mut NeedsYou,
-        inventory: &BTreeMap<String, Value>,
-    ) {
-        if self.config.epics.is_none() {
-            return;
-        }
-        let errors = resolve_chains(list, inventory, |parent| {
-            if parent.open
-                && self.config.epic_repository(&parent.issue.repository)
-                && parent
-                    .labels
-                    .iter()
-                    .any(|l| l.eq_ignore_ascii_case(EPIC_LABEL))
-                && !self.epics.contains_key(&key(&parent.issue))
-            {
-                ensure!(self.room(), "the pass's request budget or time is spent");
-            }
-            self.live(parent).map_err(anyhow::Error::msg)
-        });
-        for error in errors {
-            self.line(error);
-        }
-    }
 }
 
 #[cfg(test)]

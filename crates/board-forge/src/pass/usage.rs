@@ -869,7 +869,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let listed = previous.is_some_and(|p| p.get("needs_you").is_some());
             let own = listed && comment.is_some_and(|c| self.bot_edited(c));
             let previous = previous.filter(|_| own);
-            snapshot.needs_you = Some(self.needs_you(&snapshot, previous, &on));
+            snapshot.needs_you = Some(self.needs_you(&mut snapshot, previous, &on));
         }
         snapshot
     }

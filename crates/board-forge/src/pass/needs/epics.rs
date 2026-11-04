@@ -4,6 +4,20 @@ use holds::{EpicActivity, EpicChain};
 
 const RUN_HOURS: i64 = 48;
 const COMMENT_DAYS: i64 = 7;
+/// GitHub permits up to 100 identities in one cheap validation read.
+const BATCH_SIZE: usize = 100;
+
+pub(in crate::pass) const CHAIN_FIELDS: &str = r#"
+  __typename
+  ... on Issue {
+    issueState: state labels(first: 100) { nodes { name } totalCount }
+    parent { number repository { nameWithOwner } }
+  }
+  ... on PullRequest {
+    pullRequestState: state labels(first: 100) { nodes { name } totalCount }
+    closingIssuesReferences(first: 2) { nodes { number repository { nameWithOwner } } totalCount }
+  }
+"#;
 pub(in crate::pass) const CONTEXT_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     issueOrPullRequest(number: $number) {
@@ -115,7 +129,135 @@ pub(super) fn decorate(list: &mut NeedsYou, nodes: &BTreeMap<String, Node>) {
 }
 
 impl<C: Rest + Transport> Scheduler<'_, C> {
-    pub(super) fn inbox_epics(&mut self, list: &mut NeedsYou) {
+    /// Breadth-first, deduplicated upward reads. Activity never takes the
+    /// requests needed to establish another identity's parentage.
+    pub(super) fn inbox_chains(
+        &mut self,
+        starts: Vec<ItemRef>,
+        found: &mut BTreeMap<String, Value>,
+        attempted: &mut BTreeSet<String>,
+    ) {
+        let mut pending: BTreeMap<_, _> = starts.into_iter().map(|i| (key(&i), i)).collect();
+        pending.retain(|at, _| !attempted.contains(at));
+        let mut next = BTreeMap::new();
+        while !pending.is_empty() && self.room() {
+            let batch: Vec<_> = pending.values().take(BATCH_SIZE).cloned().collect();
+            let mut query = String::from("query { ");
+            for (n, issue) in batch.iter().enumerate() {
+                pending.remove(&key(issue));
+                attempted.insert(key(issue));
+                let Some((owner, name)) = issue.repository.split_once('/') else {
+                    continue;
+                };
+                // ItemRef admission above restricts repository names; JSON
+                // quoting also keeps all interpolated strings as data.
+                query.push_str(&format!(
+                    "r{n}: repository(owner: {}, name: {}) {{ issueOrPullRequest(number: {}) {{ {} }} }} ",
+                    json!(owner), json!(name), issue.number, CHAIN_FIELDS
+                ));
+            }
+            query.push('}');
+            match self.client.graphql(&query, json!({})) {
+                Ok(data) => {
+                    for (n, issue) in batch.iter().enumerate() {
+                        let value = &data[format!("r{n}")]["issueOrPullRequest"];
+                        if !value.is_object() {
+                            continue;
+                        }
+                        let parent = if value.get("closingIssuesReferences").is_some() {
+                            let closing = &value["closingIssuesReferences"];
+                            (closing["totalCount"] == 1)
+                                .then(|| reference(&closing["nodes"][0]))
+                                .flatten()
+                        } else {
+                            reference(&value["parent"])
+                        };
+                        if let Some(parent) = parent
+                            .filter(|p| self.config.epics.is_some() && !attempted.contains(&key(p)))
+                        {
+                            next.insert(key(&parent), parent);
+                        }
+                        let mut value = value.clone();
+                        value["state"] = value
+                            .get("issueState")
+                            .or_else(|| value.get("pullRequestState"))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        found.insert(key(issue), value);
+                    }
+                }
+                Err(error) => self.line(format!("needs-you validation error: {error:#}")),
+            }
+            if pending.is_empty() {
+                pending = std::mem::take(&mut next);
+                pending.retain(|at, _| !attempted.contains(at));
+            }
+        }
+    }
+
+    fn chain_node(&mut self, issue: &ItemRef, node: &Value) -> Result<Node> {
+        if let Some(closing) = node.get("closingIssuesReferences") {
+            let count = closing["totalCount"]
+                .as_u64()
+                .context("missing closing issue count")?;
+            ensure!(
+                closing["nodes"]
+                    .as_array()
+                    .is_some_and(|n| n.len() as u64 == count),
+                "incomplete closing issues"
+            );
+            ensure!(count <= 1, "PR has no unique closing issue");
+            let parent = if count == 1 {
+                Some(key(
+                    &reference(&closing["nodes"][0]).context("missing closing issue")?
+                ))
+            } else {
+                None
+            };
+            return Ok(Node {
+                parent,
+                ..Node::default()
+            });
+        }
+        let labels = labels(node).context("incomplete labels")?;
+        ensure!(
+            matches!(node["state"].as_str(), Some("OPEN" | "CLOSED")),
+            "missing state"
+        );
+        let parent = node.get("parent").context("missing parent")?;
+        let parent = if parent.is_null() {
+            None
+        } else {
+            Some(key(&reference(parent).context("invalid parent")?))
+        };
+        let live = if node["state"] != "OPEN" || !labels.iter().any(|l| l == EPIC_LABEL) {
+            false
+        } else {
+            ensure!(
+                self.epics.contains_key(&key(issue)) || self.room(),
+                "no budget for epic provenance"
+            );
+            self.live(&Parent {
+                issue: issue.clone(),
+                open: node["state"] == "OPEN",
+                labels_complete: true,
+                labels,
+            })
+            .map_err(anyhow::Error::msg)?
+        };
+        Ok(Node {
+            live,
+            parent,
+            ..Node::default()
+        })
+    }
+
+    pub(super) fn inbox_epics(
+        &mut self,
+        list: &mut NeedsYou,
+        raw: &BTreeMap<String, Value>,
+        expand: bool,
+    ) {
         if self.config.epics.is_none() {
             for identity in &mut list.identities {
                 identity.epic = "none".into();
@@ -129,18 +271,26 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             return;
         }
-        let mut nodes = BTreeMap::new();
-        let mut pending: Vec<ItemRef> = list
-            .identities
+        let mut nodes: BTreeMap<_, _> = raw
             .iter()
-            .filter_map(|i| pull_ref(&i.item).map(|(r, n)| on_github(&r, n)))
+            .filter_map(|(at, value)| {
+                let (r, n) = pull_ref(at)?;
+                self.chain_node(&on_github(&r, n), value)
+                    .ok()
+                    .map(|node| (at.clone(), node))
+            })
             .collect();
-        pending.extend(
-            self.epics
-                .iter()
-                .filter(|(_, live)| **live == Ok(true))
-                .filter_map(|(k, _)| pull_ref(k).map(|(r, n)| on_github(&r, n))),
-        );
+        // Resolve membership from the cheap upward reads, not optional activity.
+        decorate(list, &nodes);
+        let mut pending: Vec<ItemRef> = Vec::new();
+        if expand {
+            pending.extend(
+                self.epics
+                    .iter()
+                    .filter(|(_, live)| **live == Ok(true))
+                    .filter_map(|(k, _)| pull_ref(k).map(|(r, n)| on_github(&r, n))),
+            );
+        }
         let mut attempted = BTreeSet::new();
         while let Some(issue) = pending.pop() {
             let at = key(&issue);
@@ -149,7 +299,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             match self.inbox_node(&issue) {
                 Ok((node, refs)) => {
-                    pending.extend(refs);
+                    // Only downward activity expansion remains. Upward
+                    // membership is resolved independently above.
+                    pending.extend(refs.into_iter().filter(|r| node.children.contains(&key(r))));
                     nodes.insert(at, node);
                 }
                 Err(error) => self.line(format!(
@@ -316,9 +468,67 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     }
 }
 
+pub(super) fn labels(node: &Value) -> Option<Vec<String>> {
+    let nodes = node["labels"]["nodes"].as_array()?;
+    if node["labels"]["totalCount"].as_u64()? != nodes.len() as u64 {
+        return None;
+    }
+    nodes
+        .iter()
+        .map(|n| n["name"].as_str().map(str::to_ascii_lowercase))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn representative_sanitized_replay_requires_complete_parent_evidence() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../../fixtures/needs-you-chains-sanitized.json"
+        ))
+        .unwrap();
+        let nodes: BTreeMap<_, _> = fixture["nodes"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(at, value)| {
+                assert!(value.get("parent").is_some());
+                (
+                    at.clone(),
+                    Node {
+                        parent: value["parent"].as_str().map(str::to_owned),
+                        live: value["live"].as_bool().unwrap(),
+                        ..Node::default()
+                    },
+                )
+            })
+            .collect();
+        let identities = fixture["identities"].as_array().unwrap();
+        let mut unknown = 0;
+        for identity in identities {
+            let at = identity.as_str().unwrap();
+            let resolved = chain(at, &nodes);
+            unknown += usize::from(resolved.epic == "unknown");
+            assert_eq!(
+                json!([resolved.epic, resolved.top_epic]),
+                fixture["expected"][at]
+            );
+        }
+        assert!(unknown * 100 < identities.len() * 5);
+        assert_eq!(
+            chain("cgwalters-forge/composefs-rs#33", &nodes).epic,
+            "cgwalters-forge/tracker#160"
+        );
+        // Missing evidence cannot be filled in to satisfy a percentage.
+        let mut partial = nodes;
+        partial.remove("cgwalters-forge/tracker#160");
+        assert_eq!(
+            chain("cgwalters-forge/composefs-rs#33", &partial),
+            EpicChain::default()
+        );
+    }
 
     #[test]
     fn grouped_members_keep_individual_epics_when_detail_is_evicted() {

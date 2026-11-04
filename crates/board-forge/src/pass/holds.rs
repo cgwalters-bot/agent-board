@@ -1246,6 +1246,9 @@ pub struct NeedsYou {
     /// Optional v2 extension; bodies are reused only after metadata validation.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub summary_cache: BTreeMap<String, Summary>,
+    /// Per-target cheap carry check; unknown retains the last check clock.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub carry_validation: BTreeMap<String, Value>,
 }
 
 /// One decision of the inventory, published in its compact form
@@ -2369,6 +2372,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         requests,
         request_sources,
         summary_cache,
+        carry_validation: BTreeMap::new(),
     };
     preserve_changed_at(&mut list, previous);
     list
@@ -2624,6 +2628,14 @@ fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
                     let Some(identity) = list.identities.pop() else {
                         break;
                     };
+                    if !list
+                        .identities
+                        .iter()
+                        .any(|i| i.item.eq_ignore_ascii_case(&identity.item))
+                    {
+                        list.carry_validation
+                            .remove(&identity.item.to_ascii_lowercase());
+                    }
                     over =
                         over.saturating_sub(serde_json::to_string(&identity)?.chars().count() + 1);
                     list.omitted += 1;
