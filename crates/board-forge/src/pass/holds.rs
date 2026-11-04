@@ -1214,7 +1214,9 @@ pub struct NeedsYou {
     /// How much of the bot's summaries of the held issues this pass read:
     /// they enrich asks, but are no source of them.
     pub summaries: Read,
-    /// Decisions omitted only when even the identity inventory cannot fit.
+    /// The lowest ranked decisions whose identities were left out because
+    /// even the compact inventory, with no detail card left, did not fit
+    /// ([`fit`]); `complete` is then false. Otherwise zero.
     pub omitted: usize,
     /// How many decisions, including identities whose detail did not fit.
     pub count: usize,
@@ -1234,7 +1236,10 @@ pub struct NeedsYou {
     pub summary_cache: BTreeMap<String, Summary>,
 }
 
+/// One decision of the inventory, published in its compact form
+/// ([`CompactIdentity`]) and read back in either form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "CompactIdentity", into = "CompactIdentity")]
 pub struct Identity {
     pub key: String,
     /// Detailed card representing this identity, possibly a grouped card.
@@ -1243,12 +1248,69 @@ pub struct Identity {
     pub kind: String,
     pub source: String,
     pub waiting_since: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub carried: bool,
     pub priority: Option<String>,
     pub epic: String,
-    #[serde(rename = "topEpic")]
     pub top_epic: String,
+}
+
+/// [`Identity`] as published: `key` is left out where it is `item` in lower
+/// case, `detail_key` where it is `key`, `topEpic` where it is `epic`,
+/// `priority` where there is none and `carried` where false, so that far
+/// more decisions fit in one comment. The full form, as published before,
+/// reads the same.
+#[derive(Serialize, Deserialize)]
+struct CompactIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail_key: Option<String>,
+    item: String,
+    kind: String,
+    source: String,
+    waiting_since: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    carried: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    priority: Option<String>,
+    epic: String,
+    #[serde(rename = "topEpic", default, skip_serializing_if = "Option::is_none")]
+    top_epic: Option<String>,
+}
+
+impl From<CompactIdentity> for Identity {
+    fn from(c: CompactIdentity) -> Self {
+        let key = c.key.unwrap_or_else(|| c.item.to_ascii_lowercase());
+        Self {
+            detail_key: c.detail_key.unwrap_or_else(|| key.clone()),
+            key,
+            top_epic: c.top_epic.unwrap_or_else(|| c.epic.clone()),
+            item: c.item,
+            kind: c.kind,
+            source: c.source,
+            waiting_since: c.waiting_since,
+            carried: c.carried,
+            priority: c.priority,
+            epic: c.epic,
+        }
+    }
+}
+
+impl From<Identity> for CompactIdentity {
+    fn from(i: Identity) -> Self {
+        Self {
+            detail_key: (i.detail_key != i.key).then_some(i.detail_key),
+            key: (i.key != i.item.to_ascii_lowercase()).then_some(i.key),
+            top_epic: (i.top_epic != i.epic).then_some(i.top_epic),
+            item: i.item,
+            kind: i.kind,
+            source: i.source,
+            waiting_since: i.waiting_since,
+            carried: i.carried,
+            priority: i.priority,
+            epic: i.epic,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2186,9 +2248,11 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// never keep the holds from being published, and a hold's stall clock,
 /// the `since` the next pass carries over ([`carry`]), outlasts the other
 /// holds: no alarm is kept without its hold. The operator's own holds and
-/// the holds of every new run are kept ahead of needs-you detail cards.
-/// If even the inventory or protected holds cannot fit, [`cap`] publishes
-/// an honestly incomplete snapshot rather than freezing the inbox.
+/// the holds of every new run are kept ahead of needs-you detail cards,
+/// which go lowest ranked first. Should the inventory and protected holds
+/// still not fit, [`cap`] leaves out more, honestly counted, so that size
+/// never keeps the inbox from being published: the body is always at most
+/// [`MAX_COMMENT_CHARS`].
 pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let holds = &snapshot.holds;
     let on = |h: &Published| (h.item.clone(), h.epic);
@@ -2223,21 +2287,21 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let mut order = order.into_iter();
     let mut dropped = BTreeSet::new();
     let mut needs_you = snapshot.needs_you.clone();
-    loop {
-        let kept = (holds.iter().enumerate())
+    let without = |dropped: &BTreeSet<usize>, needs_you: &Option<NeedsYou>| Snapshot {
+        schema: snapshot.schema,
+        at: snapshot.at.clone(),
+        truncated: dropped.len(),
+        wip: snapshot.wip.clone(),
+        pass: snapshot.pass.clone(),
+        leases: snapshot.leases.clone(),
+        needs_you: needs_you.clone(),
+        holds: (holds.iter().enumerate())
             .filter(|(n, _)| !dropped.contains(n))
             .map(|(_, h)| h.clone())
-            .collect();
-        let fitted = Snapshot {
-            schema: snapshot.schema,
-            at: snapshot.at.clone(),
-            truncated: dropped.len(),
-            wip: snapshot.wip.clone(),
-            pass: snapshot.pass.clone(),
-            leases: snapshot.leases.clone(),
-            needs_you: needs_you.clone(),
-            holds: kept,
-        };
+            .collect(),
+    };
+    loop {
+        let fitted = without(&dropped, &needs_you);
         let body = render(&fitted)?;
         let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
         if over == 0 {
@@ -2253,10 +2317,11 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         // which the next round sees.
         while over > 0 {
             let Some(group) = order.next() else {
-                // Detail eviction normally preserves every identity. In the
-                // emergency case, keep publishing with explicit incompleteness.
+                // Detail eviction preserves every identity; past the last
+                // card, the cap leaves out what it must and says so. The
+                // holds this round dropped are not in `fitted`.
                 let Some(_) = needs_you.as_mut().and_then(NeedsYou::cut) else {
-                    return cap(fitted);
+                    return cap(without(&dropped, &needs_you));
                 };
                 // A cut removes its descriptor too; re-render before cutting
                 // again so that the additional savings do not overcut asks.
@@ -2271,8 +2336,12 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     }
 }
 
-/// Last-resort single-comment fallback. Called only after all evictable holds
-/// and detail cards are gone. No extra writes or reader protocol are needed.
+/// The last resort of [`fit`], once every evictable hold and detail card is
+/// gone, in this order: the source carry records no card is left for, then
+/// the lowest ranked identities, counted in `omitted` (`count` stays the
+/// number of decisions), after each batch of them the epic activity no kept
+/// identity names, then the protected holds in [`left_out_first`] order, counted in
+/// `truncated`, until it fits.
 fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
     loop {
         let body = render(&snapshot)?;
@@ -2281,17 +2350,28 @@ fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
             return Ok((snapshot, body));
         }
         if let Some(list) = snapshot.needs_you.as_mut() {
-            // Source carry records and activity can outlive the last detail
-            // card. Missing activity is unknown, not proof of inactivity.
-            if !list.request_sources.is_empty()
-                || !list.requests.is_empty()
-                || !list.epics.is_empty()
-            {
+            // Aliases hidden by deduplication can outlive the last card.
+            if !list.request_sources.is_empty() || !list.requests.is_empty() {
                 list.request_sources.clear();
                 list.requests.clear();
-                list.epics.clear();
                 list.complete = false;
                 continue;
+            }
+            // Once identities have gone, the activity of epics no kept one
+            // names goes before more of them do. Missing activity is
+            // unknown, not proof of inactivity.
+            if list.omitted > 0 || list.identities.is_empty() {
+                let identities = &list.identities;
+                let before = list.epics.len();
+                list.epics.retain(|epic, _| {
+                    identities
+                        .iter()
+                        .any(|i| &i.epic == epic || &i.top_epic == epic)
+                });
+                if list.epics.len() < before {
+                    list.complete = false;
+                    continue;
+                }
             }
             if !list.identities.is_empty() {
                 // Keep the highest ranked prefix. Batch the cut by encoded
@@ -2308,10 +2388,10 @@ fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
                 continue;
             }
         }
-        if let Some(last) = snapshot.holds.last() {
+        if let Some(first) = snapshot.holds.iter().min_by_key(|h| left_out_first(h)) {
             // Even protected holds may overflow on their own. Keep an alarm
             // and its base together, just as the normal fitting path does.
-            let on = (last.item.clone(), last.epic);
+            let on = (first.item.clone(), first.epic);
             let before = snapshot.holds.len();
             snapshot.holds.retain(|h| (h.item.clone(), h.epic) != on);
             snapshot.truncated += before - snapshot.holds.len();
@@ -2708,21 +2788,45 @@ mod tests {
         );
         let list = uncached.needs_you.unwrap();
         assert_eq!((list.items.len(), list.summary_cache.len()), (asks, 0));
-        // Even when protected holds crowd out the inventory, publish an
-        // explicitly incomplete list rather than leaving the inbox frozen.
+        // Protected holds that leave room for the list's own fields but
+        // none of its inventory still publish, with every decision counted
+        // in `omitted` and no hold left out.
+        let full = listed(&waiting(), None, (true, true));
+        let count = full.count;
         let mut asked = bare(&board(0, 0));
-        let pad = MAX_COMMENT_CHARS - chars(&render(&asked).unwrap()) - 10;
+        asked.needs_you = Some(NeedsYou {
+            complete: false,
+            omitted: count,
+            details_omitted: count,
+            items: Vec::new(),
+            identities: Vec::new(),
+            epics: BTreeMap::new(),
+            requests: Vec::new(),
+            request_sources: Vec::new(),
+            summary_cache: BTreeMap::new(),
+            ..full.clone()
+        });
+        let pad = MAX_COMMENT_CHARS - chars(&render(&asked).unwrap());
         asked
             .holds
             .last_mut()
             .unwrap()
             .reason
             .push_str(&"p".repeat(pad));
-        asked.needs_you = Some(listed(&waiting(), None, (true, true)));
+        asked.needs_you = Some(full);
         let (asked, body) = fit(asked).unwrap();
-        assert!(chars(&body) <= MAX_COMMENT_CHARS);
-        assert!(!asked.needs_you.as_ref().unwrap().complete);
-        assert!(asked.needs_you.as_ref().unwrap().omitted > 0);
+        assert_eq!((asked.truncated, chars(&body)), (0, MAX_COMMENT_CHARS));
+        let list = asked.needs_you.as_ref().unwrap();
+        assert_eq!(
+            (
+                list.count,
+                list.omitted,
+                list.identities.len(),
+                list.complete
+            ),
+            (count, count, 0, false)
+        );
+        assert_eq!(parse(&body).unwrap()["needs_you"]["omitted"], list.omitted);
         let kept: BTreeSet<String> = fitted.holds.iter().filter_map(|h| h.item.clone()).collect();
         assert!(
             !kept.contains("o/work#55"),
@@ -2768,51 +2872,117 @@ mod tests {
         // One fewer left out would not fit.
         let back = serde_json::to_string(out[out.len() - 1]).unwrap();
         assert!(chars(&body) + chars(&back) + 2 > MAX_COMMENT_CHARS);
-        // Even the operator's questions alone past the limit are capped.
+        // The operator's questions alone past the limit still publish: the
+        // whole inventory and epic activity go, then the holds in
+        // [`left_out_first`] order, each counted.
         let mut asked = board(0, 0);
         for hold in &mut asked[1..] {
             hold.why = Some(format!("Q: {}", "q".repeat(4000)));
         }
         let full = bare(&asked);
-        let (fitted, body) = fit(bare(&asked)).unwrap();
+        let mut crowded = bare(&asked);
+        let list = listed(&waiting(), None, (true, true));
+        let count = list.count;
+        crowded.needs_you = Some(list);
+        let (fitted, body) = fit(crowded).unwrap();
         assert!(chars(&body) <= MAX_COMMENT_CHARS);
         assert!(fitted.truncated > 0);
         assert_eq!(fitted.holds.len() + fitted.truncated, full.holds.len());
+        let mut order: Vec<&Published> = full.holds.iter().collect();
+        order.sort_by_key(|h| left_out_first(h));
+        let (out, kept) = order.split_at(fitted.truncated);
+        assert!(out.iter().all(|h| !fitted.holds.contains(h)));
+        assert!(kept.iter().all(|h| fitted.holds.contains(h)));
+        let list = fitted.needs_you.as_ref().unwrap();
+        assert_eq!(
+            (list.count, list.omitted, list.complete),
+            (count, count, false)
+        );
+        assert!(list.identities.is_empty() && list.epics.is_empty());
+        let parsed = parse(&body).unwrap();
+        assert_eq!(parsed["truncated"], fitted.truncated);
+        assert_eq!(parsed["needs_you"]["omitted"], count);
     }
 
+    /// The full form of `identity`, as published before the compact one.
+    fn full_form(identity: &Identity) -> Value {
+        json!({
+            "key": identity.key, "detail_key": identity.detail_key,
+            "item": identity.item, "kind": identity.kind, "source": identity.source,
+            "waiting_since": identity.waiting_since, "priority": identity.priority,
+            "epic": identity.epic, "topEpic": identity.top_epic,
+        })
+    }
+
+    /// An inventory of `n` identity-only decisions whose full form is past
+    /// the limit: compact, `whole` fits with none left out; past that, the
+    /// lowest ranked identities are left out, counted in `omitted`, with
+    /// `count` still every decision and `complete` false.
     #[test]
     fn inventory_over_sixty_thousand_characters_still_publishes() {
-        let mut snapshot = waiting();
-        let mut list = listed(&snapshot, None, (true, true));
-        let template = list.identities[0].clone();
-        list.identities = (0..400)
-            .map(|n| Identity {
-                key: format!("o/work#{n}"),
-                detail_key: format!("o/work#{n}"),
-                item: format!("o/work#{n}"),
-                ..template.clone()
-            })
-            .collect();
-        list.count = list.identities.len();
-        list.items.clear();
-        list.details_omitted = list.count;
-        assert!(chars(&serde_json::to_string(&list.identities).unwrap()) > MAX_COMMENT_CHARS);
-        let identities = list.identities.clone();
-        snapshot.needs_you = Some(list);
-        let (fitted, body) = fit(snapshot).unwrap();
-        assert!(chars(&body) <= MAX_COMMENT_CHARS);
-        let list = fitted.needs_you.as_ref().unwrap();
-        assert!(!list.complete);
-        assert!(list.omitted > 0 && !list.identities.is_empty());
-        assert_eq!(list.count, 400);
-        assert_eq!(list.count, list.identities.len() + list.omitted);
-        assert_eq!(list.identities, identities[..list.identities.len()]);
-        assert_eq!(list.details_omitted, list.count);
-        let parsed = parse(&body).unwrap();
-        assert_eq!(parsed["needs_you"]["omitted"], list.omitted);
-        assert_eq!(parsed["needs_you"]["complete"], false);
-        assert_eq!(parsed["truncated"], fitted.truncated);
-        assert!(!changed(Some(&body), &fitted).unwrap());
+        for (n, whole) in [(250, true), (800, false)] {
+            let mut snapshot = waiting();
+            let mut list = listed(&snapshot, None, (true, true));
+            let template = Identity {
+                priority: Some("P2".into()),
+                epic: "cgwalters-forge/tracker#596".into(),
+                top_epic: "cgwalters-forge/tracker#766".into(),
+                ..list.identities[0].clone()
+            };
+            list.identities = (10000..10000 + n)
+                .map(|n| Identity {
+                    key: format!("cgwalters-forge/tracker#{n}"),
+                    detail_key: format!("cgwalters-forge/tracker#{n}"),
+                    item: format!("cgwalters-forge/tracker#{n}"),
+                    epic: if n % 2 == 0 {
+                        template.top_epic.clone()
+                    } else {
+                        template.epic.clone()
+                    },
+                    ..template.clone()
+                })
+                .collect();
+            list.count = list.identities.len();
+            list.items.clear();
+            list.requests.clear();
+            list.request_sources.clear();
+            list.details_omitted = list.count;
+            let full: Vec<_> = list.identities.iter().map(full_form).collect();
+            assert!(chars(&serde_json::to_string(&full).unwrap()) > MAX_COMMENT_CHARS);
+            // The pass reads back either form as the same identity.
+            for (identity, full) in list.identities.iter().zip(&full) {
+                let compact = serde_json::to_value(identity).unwrap();
+                assert!(compact.get("detail_key").is_none() && compact.get("key").is_none());
+                for form in [compact, full.clone()] {
+                    assert_eq!(&serde_json::from_value::<Identity>(form).unwrap(), identity);
+                }
+            }
+            let identities = list.identities.clone();
+            let complete = list.complete;
+            snapshot.needs_you = Some(list);
+            let (fitted, body) = fit(snapshot).unwrap();
+            assert!(chars(&body) <= MAX_COMMENT_CHARS);
+            let list = fitted.needs_you.as_ref().unwrap();
+            assert_eq!(list.count, n);
+            assert_eq!(list.count, list.identities.len() + list.omitted);
+            assert_eq!(list.identities, identities[..list.identities.len()]);
+            assert_eq!(list.details_omitted, list.count);
+            match whole {
+                true => assert_eq!((list.omitted, list.complete), (0, complete), "{n}"),
+                false => {
+                    assert!(list.omitted > 0 && !list.identities.is_empty(), "{n}");
+                    assert!(!list.complete);
+                    // One fewer left out would not fit.
+                    let back = serde_json::to_string(&identities[list.identities.len()]);
+                    assert!(chars(&body) + chars(&back.unwrap()) + 1 > MAX_COMMENT_CHARS);
+                }
+            }
+            let parsed = parse(&body).unwrap();
+            assert_eq!(parsed["needs_you"]["omitted"], list.omitted);
+            assert_eq!(parsed["needs_you"]["complete"], list.complete);
+            assert_eq!(parsed["truncated"], fitted.truncated);
+            assert!(!changed(Some(&body), &fitted).unwrap());
+        }
     }
 
     #[test]

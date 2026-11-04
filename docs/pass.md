@@ -416,17 +416,22 @@ or a digest entry, its comment's time. Items are sorted by Priority in the
 board's option order (one the board does not list after, none last; where
 the pass did not read the board, the order the published list had), then
 the longest waiting, then `key`. There is no 100-decision cap. `identities` is
-the ranked lightweight inventory, each entry containing `key`, `item`,
+the ranked lightweight inventory, each entry with `key`, `item`,
 `detail_key`, `source`, `kind`, `priority`, `waiting_since`, `carried`, `epic` and
-`topEpic`. `count` is the total decision count before emergency size capping;
-normally it is the inventory's length. `items` is the detailed projection joined by
+`topEpic`. It is published compact, leaving out what is derivable or default:
+`key` where it is `item` in lower case, `detail_key` where it is `key`, `topEpic`
+where it is `epic`, `priority` where there is none (null) and `carried` where false.
+The pass reads back the compact and the earlier full form alike. Review's
+`src/github/holds.ts` does not read `identities` yet.
+`count` is the number of decisions; normally it is the inventory's length.
+`items` is the detailed projection joined by
 identity `detail_key` to item `key`, and may be shorter. Grouped PR cards retain
 an identity and independent epic context for every member.
 Consumers must render identities even when no detail record fits. `omitted`
-is normally zero; if the inventory itself cannot fit, it counts identities left
-out of publication and `complete` is false. `count` remains the total, so
-`count = identities.length + omitted`. `details_omitted` counts decisions without
-a detail card, including any omitted identities.
+is normally zero; where even the compact inventory cannot fit, it counts the
+lowest ranked identities left out of publication and `complete` is false. `count`
+remains every decision, so `count = identities.length + omitted`. `details_omitted`
+counts decisions without a detail card, including any omitted identities.
 
 Each identity and detailed item has `epic` (nearest live epic, including the
 item itself if live) and `topEpic` (highest live ancestor), resolved through
@@ -460,7 +465,7 @@ including review's `src/github/holds.ts`, can keep reading `items`, `action` and
 `source_ref`. Existing grouping, summary parsing, cache validation and request/time
 caps remain in force. Descriptors derive only from existing reads; the publication
 size cap cuts descriptors with their detail card, preserving inventory identities
-unless the emergency cap below is needed.
+unless the last resort below is needed.
 Optional `request_sources` retains validated source-specific asks (including digest
 aliases hidden by deduplication), observation clocks and source edit times, so an
 unread source can still carry its own wait. Source records take precedence over
@@ -561,19 +566,15 @@ run are kept ahead of the needs-you list's detail cards. The lowest ranked detai
 records are then left out and counted in `details_omitted`. Their identities,
 kinds, priorities and epic context remain published and can be carried when
 their source is unread on a later pass. Detail eviction alone does not make
-the inventory incomplete. Should the inventory and protected holds still not
-fit, an emergency cap keeps publication live: residual source carry records and
-epic activity are removed first (`complete: false`), then the lowest ranked
-identities are removed and counted in `needs_you.omitted`. If necessary, even
-protected holds are removed, with their alarms, and counted in `truncated`.
-Finally, oversized optional lease/accounting metadata is absent (unknown).
-Size alone never refuses publication; the published list cannot claim completeness
-after emergency eviction. This is interim relief for #663, not complete overflow
-delivery: continuation comments or a compact inventory with a matching reader in
-`cgwalters-forge/review`, `src/github/holds.ts`, remain follow-up work. No new reader
-protocol, setting, credential or write authority is added; existing
-`holds.needsYou` callers need no configuration change. Live reader rendering of
-the capped snapshot remains unverified.
+the inventory incomplete, and the compact inventory keeps a few hundred
+decisions within the cap. Should the inventory and protected holds still not
+fit once every detail card is gone, a last resort leaves out, in order, the
+source carry records no card is left for, then the lowest ranked identities,
+counted in `needs_you.omitted` (`count` stays every decision), each batch
+followed by the `epics` entries no kept identity names, then the protected holds in the order
+above, each with its alarms, counted in `truncated`; `complete` is then false.
+Last, oversized optional lease and accounting metadata is left out (unknown).
+Size never keeps the snapshot from being published, and never fails the pass.
 
 With `budget.weeklyUsd` set (agent-board#281), stage 1 also records the
 broker's `spend.runs`, the trailing week's cost of runs' requests at API list
