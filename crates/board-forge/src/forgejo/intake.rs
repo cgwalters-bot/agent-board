@@ -1,4 +1,4 @@
-//! Standalone metadata intake. No scheduling, routing or forge mutation.
+//! Bounded intake facts; standalone serialization exposes metadata only.
 use super::{Config as BoardConfig, Transport, listing, validate_repository};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,20 @@ pub struct Item {
     pub author_login: String,
     pub is_operator: bool,
     pub generated_by: bool,
+    #[serde(skip)]
+    pub source: Source,
+}
+
+/// Controller-only source facts. Never included in standalone intake output.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    pub id: u64,
+    pub author: i64,
+    pub created: String,
+    pub updated: Option<String>,
+    pub body: String,
+    pub pull_request: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +218,7 @@ fn read_repository(
         let mut ids = BTreeSet::new();
         for value in complete(transport, url)? {
             let id = value["id"].as_u64().context("missing intake item id")?;
+            ensure!(id > 0, "invalid intake item id");
             ensure!(ids.insert(id), "duplicate intake item; listing shifted");
             if kind == "issue" && !value["pull_request"].is_null() {
                 continue;
@@ -249,6 +264,17 @@ fn read_repository(
                 author_login: login.into(),
                 is_operator: u64::try_from(author_id).is_ok_and(|id| id == config.operator_id),
                 generated_by: generated_by(super::text(&value, "body")?, footer),
+                source: Source {
+                    id,
+                    author: author_id,
+                    created: super::text(&value, "created_at")?.into(),
+                    updated: value["updated_at"].as_str().map(str::to_owned),
+                    body: super::text(&value, "body")?.into(),
+                    pull_request: !value["pull_request"].is_null()
+                        || value["pull_request_url"]
+                            .as_str()
+                            .is_some_and(|s| !s.is_empty()),
+                },
             });
         }
     }
@@ -470,6 +496,16 @@ mod tests {
                 .unwrap()
                 .items;
             assert_eq!(items.len(), 4);
+            assert_eq!(
+                items.iter().map(|i| i.source.id).collect::<Vec<_>>(),
+                [10, 20, 21, 22]
+            );
+            assert_eq!(
+                items[1].source.body,
+                "Agent response\n\nGenerated-by: https://github.com/cgwalters/#llms"
+            );
+            assert_eq!(items[1].source.created, "2026-10-30T02:00:00Z");
+            assert!(items[2].source.pull_request);
             assert_eq!(items[0].repository, success[0]);
             assert_eq!(
                 items

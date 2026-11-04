@@ -278,13 +278,22 @@ fn explicit(body: &str, bot: &str) -> bool {
 /// The run kind the operator's comments ask for: `research` where a line
 /// addressed to the bot asks for an investigation, else `triage`.
 fn run_kind(said: &[Said], bot: &str) -> &'static str {
-    let research = said.iter().any(|c| {
-        addressed(&c.body, bot).any(|line| {
-            let line = line.to_lowercase();
-            line.contains("research") || line.contains("investigat")
-        })
-    });
+    let research = said
+        .iter()
+        .any(|c| request_kind(&c.body, bot) == Some("research"));
     if research { "research" } else { "triage" }
+}
+
+/// Shared operatorComments grammar, independent of forge identity checks.
+pub(crate) fn request_kind(body: &str, bot: &str) -> Option<&'static str> {
+    if !explicit(body, bot) {
+        return None;
+    }
+    let research = addressed(body, bot).any(|line| {
+        let line = line.to_lowercase();
+        line.contains("research") || line.contains("investigat")
+    });
+    Some(if research { "research" } else { "triage" })
 }
 
 /// The lines of a comment that address the bot: `/bot` or `@BOT`. A mention

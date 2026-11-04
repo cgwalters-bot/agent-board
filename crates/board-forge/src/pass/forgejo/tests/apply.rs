@@ -82,6 +82,17 @@ impl Applying {
                 }
             }
             "owner" => self.slots.borrow_mut()[0].1["claim"] = "replacement-owner".into(),
+            "source-body" => {
+                self.comments.borrow_mut().get_mut(&7).unwrap()[0]["body"] =
+                    "/bot research changed".into()
+            }
+            "source-author" => {
+                self.comments.borrow_mut().get_mut(&7).unwrap()[0]["user"]["id"] = BOT.into()
+            }
+            "source-time" => {
+                self.comments.borrow_mut().get_mut(&7).unwrap()[0]["updated_at"] =
+                    "2026-10-23T15:15:11Z".into()
+            }
             "new-plan" => {
                 let body = self.comments.borrow()[&7][0]["body"]
                     .as_str()
@@ -100,6 +111,34 @@ impl ForgejoTransport for Applying {
         let path = url.path().strip_prefix("/subpath/api/v1/").unwrap();
         let segments: Vec<_> = path.split('/').collect();
         let body = match segments[..] {
+            ["repos", "example", "work", "issues", "comments"] => {
+                let comments: Vec<_> = self
+                    .comments
+                    .borrow()
+                    .iter()
+                    .flat_map(|(number, comments)| comments.iter().map(move |c| (*number, c)))
+                    .filter(|(_, c)| {
+                        url.query_pairs()
+                            .find(|(key, _)| key == "since")
+                            .is_none_or(|(_, since)| text(c, "/created_at") >= since.as_ref())
+                    })
+                    .map(|(number, c)| {
+                        let mut c = c.clone();
+                        c["user"]["login"] = login(c["user"]["id"].as_u64().unwrap()).into();
+                        c["issue_url"] = format!("{URL}/example/work/issues/{number}").into();
+                        c["html_url"] = format!(
+                            "{URL}/example/work/issues/{number}#issuecomment-{}",
+                            c["id"]
+                        )
+                        .into();
+                        c
+                    })
+                    .collect();
+                return Ok(Response {
+                    body: json!(page(url, &comments)),
+                    total: Some(comments.len() as u64),
+                });
+            }
             ["repos", "example", "work", "issues", n] => {
                 let n: u64 = n.parse()?;
                 let mut issue = self
@@ -235,6 +274,9 @@ impl ForgejoTransport for Applying {
                 bail!("receipt write failed");
             }
             self.add(item, id, BOT, comment);
+            if self.fault == "plan-reply-lost" && comment.starts_with("<!-- agent-board-intake:") {
+                bail!("plan reply lost");
+            }
             if self.fault == "receipt-lost" && receipt {
                 bail!("receipt reply lost");
             }
@@ -312,6 +354,8 @@ impl ForgejoTransport for Applying {
         Ok(answer)
     }
 }
+
+mod intake;
 
 fn applying_config() -> Config {
     let mut value = file();

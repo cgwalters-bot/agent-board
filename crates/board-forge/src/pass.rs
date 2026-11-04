@@ -462,6 +462,8 @@ pub struct Config {
     /// Off unless set: spare slots after stage 4's starts revisit a sample
     /// of old issues ([`Scheduler::revisit`]).
     pub revisit: Option<revisit::Revisit>,
+    /// Off unless set: native Forgejo operator issue-comment intake.
+    pub forgejo_intake: Option<forgejo::intake::Setting>,
     /// Off unless set: once a week, one issue lists the candidates outside
     /// every live epic for one triage run ([`Scheduler::sweep`]).
     pub sweep: Option<sweep::Sweep>,
@@ -1023,6 +1025,20 @@ impl Config {
         );
         if let Some(revisit) = &self.revisit {
             revisit.check(self)?;
+        }
+        if let Some(intake) = &self.forgejo_intake {
+            ensure!(
+                self.forgejo_board().is_some(),
+                "forgejoIntake requires a Forgejo board"
+            );
+            ensure!(
+                !intake.state.trim().is_empty(),
+                "forgejoIntake.state is required"
+            );
+            ensure!(
+                self.forgejo_board().is_some_and(|b| b.intake.is_some()),
+                "forgejoIntake requires board.intake"
+            );
         }
         if let Some(sweep) = &self.sweep {
             sweep.check(self)?;

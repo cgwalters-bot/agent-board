@@ -88,9 +88,10 @@ let a deleted or renamed label widen the board. The write side keeps that.
 ### Read-only intake
 
 `agent-board intake --board-config agent-board.json --state intake-state.json`
-reports new issues and comments, one metadata line per item. Nothing acts on
-the output yet: it does not route asks, start jobs, or write to Forgejo, and it
-is not connected to the pass or poll. Intake is off unless explicitly invoked
+reports new issues and comments, one metadata line per item. This standalone
+command remains read-only: it does not route asks, start jobs, or write to Forgejo.
+The pass has a separate opt-in [issue routing path](#native-issue-intake).
+Standalone intake is off unless explicitly invoked
 with `board.intake` configured, reusing the board's `url` and `tokenEnv`:
 
 ```json
@@ -419,6 +420,75 @@ compatibility aliases). Another running pass holds stage 4. Outside Actions,
 both caps are required and serialization against the schedule is not promised.
 These bounded observations are not an atomic cross-workflow lock: deployments
 must serialize pass invocations. Other refusals remain in force.
+
+### Native issue intake
+
+The concrete threats are treating a bot's prose as operator authorization and
+starting the same ask twice after a crash. The single native plan/claim protocol
+handles these; there is no second dispatcher or trailer-based authority.
+`forgejoIntake` is absent/off by default. A dedicated Forgejo pass config can set:
+
+```json
+"forgejoIntake": {"state": ".state/forgejo-intake.json"}
+```
+
+It reuses `board.url`, `board.tokenEnv` and `board.intake.repositories`, including
+bounded `owner/*` expansion. `operator` is the only operator login: the pass's
+resolved id must match `board.intake.operatorId`, both operator and bot must be
+pinned in `board.recorders`, and their ids must differ. A missing, present or
+quoted Generated-by trailer changes no authority. No credentials belong in config.
+
+The per-repository issue and comment feeds use the standalone reader's complete
+bounded pagination and one-second since overlap, under the pass's shared
+500-request/15-minute bound. A 401/404 or incomplete repository is isolated,
+keeps its cursor and counts as a pass failure. Internal facts retain stable ids,
+bodies and creation/update times; diagnostic lines never print bodies. New operator issues are only normal
+candidates under existing author admission, not implement authorization. All other
+discoveries are metadata unless an unedited operator comment addresses `/bot` or
+`@BOT` using the existing `operatorComments` grammar: triage by default, research
+when the addressed line says research or investigation.
+
+Only open issues in both board and work repositories, satisfying membership,
+normal author/candidate admission and holds, qualify. PR requests and targets
+outside that intersection are rejected, with no upstream write or start. Targets
+use the board's configured repository spelling after case-insensitive matching.
+The bot appends an unedited job plan with the stable first-line marker
+`<!-- agent-board-intake: COMMENT-ID -->`, the pinned issue id and source facts,
+and source prose quoted as untrusted data. Pools come from `triagePools`, falling
+back to `planPools`. A pending prior plan is never replaced by the next ask.
+An existing bot source plan is reused, including after local state loss; foreign
+markers provide no deduplication evidence. Edited, changed or conflicting records
+hold rather than creating a replacement plan.
+
+Plan creation consumes `--max-writes`. A repository cursor advances only when
+every ask is durably planned or rejected as unsupported (an edited source, PR,
+closed issue or ineligible board candidate); the saved cursor accounts for rejected
+discoveries without authorizing work. Otherwise its old cursor remains. Pending
+plans, unavailable pools and write caps produce structured holds; actual read or
+planning errors count as pass failures. Durable plans are then ordinary native
+stage 4 work, even when WIP, pools, budget or dispatch
+caps defer their start. They use leases, admission, claims, receipts and read-only
+ambiguous-start recovery. Before dispatch the source author, exact body and times,
+issue id, target eligibility and plan are rechecked. A lost plan reply is found
+by its marker, and a lost dispatch reply is never retried. The usual Forgejo
+administrator/backdating and same-second edit limitations still apply.
+
+`forgejoIntake.state` is a separate per-instance cursor file (instance plus
+repository cursors), not the standalone intake file or the refused PR cache
+`state`. Applying passes atomically replace it; serialize invocations and retain
+the file between passes. Preview, recording and replay neither read nor mutate
+this local state: they discover from the epoch, write nothing and dispatch
+nothing. A large historical feed may exceed bounds and must be inspected before
+deployment; a partial feed never advances a cursor.
+
+PR fix routing, tracking-issue fanout, merges and deployment are unfinished.
+Existing capability refusals remain. Caller configuration is also unfinished:
+after #271's execution prerequisites, the proposed tracker-side follow-up is a
+dedicated `cgwalters-forge/tracker` `.github/forgejo-pass.json` with
+`forgejoIntake: {"state": ".state/forgejo-intake.json"}`, alongside that instance's
+operator, recorder ids, intake selectors and provisioned native leases. Do not add
+this to the existing GitHub `.github/pass.json`. No caller, token or live job is
+activated here; this runner cannot file an issue in the caller repository.
 
 ### Native revisits
 

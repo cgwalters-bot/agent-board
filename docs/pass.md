@@ -99,6 +99,18 @@ Existing GitHub JSON,
 publication requirements and replays are unchanged. No deployed caller config,
 workflow or secrets are changed.
 
+Native Forgejo issue intake is separately off by default behind
+`forgejoIntake: {"state": ".state/forgejo-intake.json"}`. It reuses `board.intake`
+selectors and pass-resolved recorder ids, requires distinct bot/operator accounts
+and a matching `board.intake.operatorId`, and routes only unedited operator asks
+on eligible board/work issues to triage or research. New issues remain normal
+author-admitted candidates, never automatic implement authorization. Source-ID
+bot plans are durable pending work through the existing native stage 4 machinery;
+asks without such a plan keep their repository cursor at capacity/caps. Preview
+and replay use no local cursor state and never write or dispatch. See
+[native issue intake](forges.md#native-issue-intake) for bounds and source rechecks.
+PR fix routing and deployment/caller configuration after #271 remain unfinished.
+
 Stage 1 reads `usage.url`, the broker's `/usage`, without the forge token or
 an environment proxy (plain HTTP is allowed for a broker on a private network
 that encrypts it, such as a tailnet), and paces each configured pool it reads
@@ -2813,6 +2825,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
+| `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs the triage scope `epics`; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
