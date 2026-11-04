@@ -8,6 +8,14 @@ use sha2::{Digest, Sha256};
 /// the day would otherwise write every pass. Hourly confirmation refreshes
 /// them; which sources were read and which limits hold still count.
 pub(super) fn strip_observation_times(list: &mut serde_json::Map<String, Value>) {
+    if let Some(checks) = list
+        .get_mut("carry_validation")
+        .and_then(Value::as_object_mut)
+    {
+        for check in checks.values_mut().filter_map(Value::as_object_mut) {
+            check.remove("checked_at");
+        }
+    }
     if let Some(context) = list.get_mut("context").and_then(Value::as_object_mut) {
         for field in ["observed_at", "wip", "omitted", "items"] {
             context.remove(field);

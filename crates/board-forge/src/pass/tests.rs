@@ -2116,6 +2116,7 @@ struct Forge {
     /// overlapping pass's claim, posted between this one's read and its
     /// read-back.
     rival: Option<Value>,
+    chain_reads: RefCell<Vec<Vec<String>>>,
 }
 
 /// The workflow run an applying pass runs in, a run of workflow 77.
@@ -2157,6 +2158,7 @@ impl Forge {
             dispatch_status: None,
             refuse: RefCell::new(None),
             rival: None,
+            chain_reads: RefCell::new(Vec::new()),
         }
     }
 
@@ -2400,6 +2402,43 @@ impl Transport for Forge {
                 data.insert(format!("i{n}"), json!({"issueOrPullRequest": node}));
             }
             return Ok(Value::Object(data));
+        }
+        if query.contains(needs::epics::CHAIN_FIELDS) {
+            let mut data = json!({});
+            let mut read = Vec::new();
+            for (n, part) in query.split("repository(owner: ").skip(1).enumerate() {
+                let (owner, rest) = part.split_once(", name: ").unwrap();
+                let (name, rest) = rest.split_once(") { issueOrPullRequest(number: ").unwrap();
+                let number = rest.split_once(')').unwrap().0.parse::<u64>().unwrap();
+                let vars = json!({"owner": serde_json::from_str::<String>(owner).unwrap(),
+                    "name": serde_json::from_str::<String>(name).unwrap(), "number": number});
+                read.push(format!(
+                    "{}/{}#{number}",
+                    vars["owner"].as_str().unwrap(),
+                    vars["name"].as_str().unwrap()
+                ));
+                let answer = self
+                    .replay
+                    .graphql(needs::epics::CONTEXT_QUERY, vars.clone())
+                    .or_else(|_| self.replay.graphql("inbox inventory fixture", vars));
+                data[format!("r{n}")] = answer
+                    .map(|a| a["repository"].clone())
+                    .unwrap_or(Value::Null);
+                let node = &mut data[format!("r{n}")]["issueOrPullRequest"];
+                if let Some(fields) = node.as_object_mut()
+                    && let Some(state) = fields.remove("state")
+                {
+                    let field = if fields.contains_key("closingIssuesReferences") {
+                        "pullRequestState"
+                    } else {
+                        "issueState"
+                    };
+                    fields.insert(field.into(), state);
+                }
+            }
+            assert!(read.len() <= 100);
+            self.chain_reads.borrow_mut().push(read);
+            return Ok(data);
         }
         let mut data = match self.replay.graphql(query, variables.clone()) {
             // An issue whose body was not recorded: the operator's, unedited.
@@ -3440,6 +3479,8 @@ fn apply_publishes_what_needs_you() {
             };
             let labels = if live {
                 vec![json!({"name":"epic"})]
+            } else if repo == tracker && [446, 527].contains(&number) {
+                vec![json!({"name":"needs-human"})]
             } else {
                 vec![]
             };
@@ -3479,6 +3520,20 @@ fn apply_publishes_what_needs_you() {
         .unwrap_or_else(|| panic!("{:?}", context_report.lines));
     let context_snapshot = holds::parse(&context_body).unwrap();
     let context_list = &context_snapshot["needs_you"];
+    let reads: Vec<_> = context_forge
+        .chain_reads
+        .borrow()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    assert_eq!(reads.len(), reads.iter().collect::<BTreeSet<_>>().len());
+    assert!(reads.contains(&"cgwalters-forge/agent-board#999".to_owned()));
+    let identities = context_list["identities"].as_array().unwrap();
+    assert!(
+        identities.iter().filter(|i| i["epic"] == "unknown").count() * 100 < identities.len() * 5,
+        "{identities:#?}"
+    );
     let context = context_list["items"]
         .as_array()
         .unwrap()
@@ -3727,10 +3782,17 @@ fn apply_publishes_what_needs_you() {
     }
     let oversized_body = format!("{}\n```json\n{oversized}\n```", holds::HOLDS_MARKER);
     let mut forge = forge_with(Some(&oversized_body));
-    for n in 10000..10400 {
-        inventory_on(&mut forge.replay, "cgwalters-forge/tracker", n, NEEDS_HUMAN);
+    for number in 10000..10400 {
+        let node = json!({"state":"OPEN","labels":{"nodes":[{"name":"needs-human"}],"totalCount":1},
+            "parent":{"number":1,"repository":{"nameWithOwner":"a/ancestors"}}});
+        forge
+            .replay
+            .requests
+            .push(json!({"request":graphql_key(needs::epics::CONTEXT_QUERY,
+            &json!({"owner":"cgwalters-forge","name":"tracker","number":number})),
+            "answer":{"data":{"repository":{"issueOrPullRequest":node}}}}));
     }
-    let report = apply(&forge, &with_wip(2));
+    let report = apply_within(&forge, &with_wip(2), PASS_REQUEST_LIMIT);
     assert_eq!(report.failures, 0, "{:?}", report.lines);
     let capped = forge
         .writes
@@ -3741,6 +3803,24 @@ fn apply_publishes_what_needs_you() {
         .unwrap_or_else(|| panic!("{:?}", report.lines));
     assert!(capped.chars().count() <= holds::MAX_COMMENT_CHARS);
     let capped = holds::parse(&capped).unwrap();
+    assert!(
+        forge
+            .chain_reads
+            .borrow()
+            .iter()
+            .any(|batch| batch.len() == 100)
+    );
+    let reads: Vec<_> = forge
+        .chain_reads
+        .borrow()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    // Even lexically earlier ancestors cannot displace direct carry checks.
+    let ancestor = reads.iter().position(|i| i == "a/ancestors#1").unwrap();
+    assert!(ancestor >= 400);
+    assert_eq!(reads.iter().filter(|i| *i == "a/ancestors#1").count(), 1);
     assert_eq!(capped["needs_you"]["complete"], false);
     assert!(capped["needs_you"]["omitted"].as_u64().unwrap() > 0);
     assert!(capped["needs_you"]["count"].as_u64().unwrap() >= 400);
@@ -3894,6 +3974,79 @@ fn apply_publishes_what_needs_you() {
             .map(|a| text(a, "/key").to_owned())
             .collect()
     };
+    // Across successive WIP-full passes, lightweight validation must retire
+    // a closed hold and a cleared needs-human hold, even without scheduling.
+    // A proposal without needs-human remains its own independent source.
+    let mut prior = body.clone();
+    for pass in 0..2 {
+        let mut forge = with_context(forge_with(Some(&prior)));
+        for entry in &mut forge.replay.requests {
+            let cleared = entry["request"]["variables"]["number"] == 527;
+            if let Some(node) = entry["answer"].pointer_mut("/data/repository/issueOrPullRequest") {
+                if node["parent"]["number"] == 999 {
+                    node["state"] = json!("CLOSED");
+                }
+                if cleared {
+                    node["labels"] = json!({"nodes":[],"totalCount":0});
+                }
+            }
+        }
+        let report = apply(&forge, &with_wip(2));
+        let list = edited(&forge, &report);
+        assert_eq!(list["count"], 3, "pass {pass}: {list}");
+        assert!(
+            list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|a| a["source"] == "proposals")
+        );
+        prior = forge
+            .writes
+            .borrow()
+            .iter()
+            .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
+            .map(|(_, _, value)| text(value, "/body").to_owned())
+            .unwrap();
+        let published = holds::parse(&prior).unwrap();
+        assert!(
+            !published["holds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["item"] == tracker(446) || h["item"] == tracker(527))
+        );
+    }
+    // An unchanged source comment/listing is not proof its target reopened.
+    // Exercise both an already carried target and one absent from inventory.
+    for pass in 0..2 {
+        let mut forge = with_context(forge_with(Some(&prior)));
+        forge.replay.now += time::Duration::hours(2 * (pass + 1));
+        for entry in &mut forge.replay.requests {
+            if entry["request"]["variables"]["name"] == "bot-ops"
+                && entry["request"]["variables"]["number"] == 5
+            {
+                entry["answer"]["data"]["repository"]["issueOrPullRequest"]["state"] =
+                    json!("CLOSED");
+            }
+        }
+        let report = apply(&forge, &with_wip(2));
+        let list = edited(&forge, &report);
+        assert_eq!(list["count"], 0);
+        assert_eq!(
+            list["counts"],
+            json!({"decisions":0,"groups":0,"members":0})
+        );
+        assert!(list["identities"].as_array().unwrap().is_empty());
+        assert!(list.get("requests").is_none());
+        prior = forge
+            .writes
+            .borrow()
+            .iter()
+            .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
+            .map(|(_, _, value)| text(value, "/body").to_owned())
+            .unwrap();
+    }
     let said = |report: &Report, line: &str| {
         let lines = &report.lines;
         assert!(lines.iter().any(|l| l.starts_with(line)), "{lines:#?}");
@@ -3949,6 +4102,55 @@ fn apply_publishes_what_needs_you() {
         (report, limit - bounds.left.get())
     };
     let (_, used) = within(&forge_with(Some(&body)), PASS_REQUEST_LIMIT);
+    let busy_context = || {
+        let mut forge = with_context(forge_with(Some(&body)));
+        let children: Vec<_> = (100..130)
+            .map(|n| json!({"number":n,"repository":{"nameWithOwner":"example/activity"}}))
+            .collect();
+        for entry in &mut forge.replay.requests {
+            if entry["request"]["graphql"] == fnv(needs::epics::CONTEXT_QUERY)
+                && entry["request"]["variables"]["number"] == 766
+            {
+                let node = &mut entry["answer"]["data"]["repository"]["issueOrPullRequest"];
+                node["subIssues"]["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(children.clone());
+                node["subIssues"]["totalCount"] = json!(31);
+            }
+        }
+        for number in 100..130 {
+            let node = json!({"state":"OPEN","labels":{"nodes":[],"totalCount":0},
+                "parent":{"number":766,"repository":{"nameWithOwner":"cgwalters-forge/tracker"}},
+                "subIssues":{"nodes":[],"totalCount":0},"comments":{"nodes":[],"totalCount":0},
+                "closedByPullRequestsReferences":{"totalCount":0}});
+            forge
+                .replay
+                .requests
+                .push(json!({"request":graphql_key(needs::epics::CONTEXT_QUERY,
+                &json!({"owner":"example","name":"activity","number":number})),
+                "answer":{"data":{"repository":{"issueOrPullRequest":node}}}}));
+        }
+        forge
+    };
+    let baseline = busy_context();
+    let (baseline_report, context_used) = within(&baseline, PASS_REQUEST_LIMIT);
+    assert_eq!(
+        edited(&baseline, &baseline_report)["epics"]["cgwalters-forge/tracker#766"]["complete"],
+        true
+    );
+    let summary_before_activity =
+        (context_used - 20..=context_used + needs::NEEDS_READS).any(|limit| {
+            let limited_context = busy_context();
+            let (report, _) = within(&limited_context, limit);
+            let list = edited(&limited_context, &report);
+            list["summaries"] == "complete"
+                && list["epics"]["cgwalters-forge/tracker#766"]["complete"] == false
+        });
+    assert!(
+        summary_before_activity,
+        "summary enrichment must precede optional activity reads"
+    );
     // The hold comment's edits, the listing, its issue and two summaries
     // are the last reads of an unchanged pass: leave room for the first.
     let forge = forge_with(Some(&body));
@@ -3971,9 +4173,26 @@ fn apply_publishes_what_needs_you() {
             .iter()
             .all(|r| { r["quality"] == "unverified-carried" || r["target"]["type"] == "hold" })
     );
+    // A failed transport check, just like exhaustion, retains the evidence
+    // and never advances a carry's validation clock or claims resolution.
+    let mut failed = forge_with(Some(&body));
+    failed.fail = RefCell::new(Some("query { r0:".into()));
+    let failed_report = apply(&failed, &full);
+    let failed_list = edited(&failed, &failed_report);
+    assert_eq!(
+        failed_list["carry_validation"][tracker(446)]["status"],
+        "unknown"
+    );
+    assert!(
+        failed_list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["item"] == tracker(446))
+    );
     said(
         &report,
-        "needs-you inventory error: the pass's request budget",
+        "needs-you proposals error: the pass's request budget",
     );
     // A later pass that reads the same list keeps its `changed_at`, and
     // so does one that cannot read #446's summary: it keeps the question

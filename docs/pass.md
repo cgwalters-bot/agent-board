@@ -447,12 +447,17 @@ the last seven days). Windows include their boundary and exclude future
 timestamps. Completed runs use GitHub's `updated_at` completion clock.
 
 Context reads share the existing pass request/time budget, reserving publication
-requests. Before optional summaries or descendant activity, the pass queries
-state, labels and parentage for every inbox identity, including carried and
-cross-repository identities, in batches of at most 100. Shared ancestors are
-read once per pass in subsequent batches; descendants cannot consume the budget
-needed for those chains. Label connections are capped at 100 and PR closing
-issues at two (only zero or one gives an unambiguous chain).
+requests. Lightweight state, labels and upward parent/closing-issue reads run
+first, before summaries and downward activity expansion. They batch at most
+100 distinct identities per request, breadth-first across repositories, and
+deduplicate parents across all identities, including carried decisions and
+members whose detail card was evicted. A missing node, incomplete labels or
+closing-issue connection, ambiguous PR parent or cycle is `unknown`, never
+`none`. A complete chain without a live epic proves `none`; no membership is
+inferred from a percentage target. Epic label provenance checks still apply.
+Only after upward resolution does spare budget expand epic activity.
+Label connections are capped at 100 and PR closing issues at two (only zero
+or one gives an unambiguous chain).
 Each issue activity context reads at most 100 children and the latest 100
 comments; incomplete connections and unread descendants make epic activity
 `complete: false`, not proof of inactivity. All live epics already found by the
@@ -602,6 +607,20 @@ truncated, so this does not validate a complete live inbox or frontend
 rendering. There is no per-source age field beyond each request source's
 `observed_at` and the context facts' own clocks.
 
+For #668, the private `bot-ops` comments endpoint again returned HTTP 404;
+the 4 November snapshot and complete historical state/label/parent responses
+were not accessible. The 3 November fixture above has no complete parent
+evidence and cannot establish an epic-unknown percentage.
+`fixtures/needs-you-chains-sanitized.json` is an explicitly representative
+model, not a historical API recording. It asserts the reported
+`composefs-rs#33` → `tracker#160` assignment and synthetic cross-repository
+and proven-none cases. Its complete modeled parent evidence and the full-pass
+transport regression require fewer than 5% unknown (currently zero); missing
+evidence must instead become unknown. This is not proof of the percentage on
+the real 214-identity inbox. Deployment acceptance still requires a complete
+authenticated historical replay and comparison after updating tracker's
+`.github/workflows/poll.yml` `env.AGENT_BOARD_REV` to the reviewed commit.
+
 Caller follow-up is in `cgwalters-forge/tracker`, not this repository:
 `.github/pass.json` needs `decisions = {"repository":
 "cgwalters-forge/operator", "issue": 1}` (already present only in the
@@ -643,7 +662,35 @@ without carrying over facts or authority bound to the removed PR's head.
 No part of a published list is carried, including its `waiting_since`, questions or
 `changed_at`, unless GitHub says the bot both wrote and last edited its
 comment (one GraphQL read): anyone with write access may edit it. Stage 4's
-holds are carried as above. `complete` is true only where each source is
+holds are carried as above.
+
+Before publication, the lightweight batch revalidates the carried targets'
+state and labels, ahead of optional summary/activity reads and within the
+existing request/time and publication reserves. Closed/merged targets retire;
+`needs-human` item/epic holds retire on proven label removal, approval holds
+on removal of `needs-operator-approval`, and review drafts on removal of
+`review-draft`. Other poll stops, proposals, digests and policy holds are not
+cleared merely because they lack `needs-human`: only their own source/policy
+read or a closed target can prove retirement. A newly reread digest or comment
+cannot resurrect an ask on a target proven closed in the same pass.
+Cards, group representatives,
+source evidence, inventory and counts are rebuilt together. This adds no
+control or write authority, and stays off unless `holds.needsYou` is set.
+
+An unchecked carried hold is never a fresh decision. `carried` remains true
+even on a hold projected from the previous snapshot. Optional list-level
+`carry_validation`, keyed by target identity, records `status` as
+`state-labels-checked` or `unknown` and `checked_at`, the last successful cheap
+check's clock (null if unknown). A failed, truncated or budget-skipped check
+keeps the old clock and decision evidence, marks the list incomplete, and
+does not imply resolution. Consumers must show unknown/stale evidence and
+age it from `checked_at` and the decision's separate `observed_at`, not the
+new publication clock. A successful state/label check does not refresh an
+old policy decision, summary or head-bound approval: its carried quality and
+decision observation time remain unchanged. Detail fitting can omit the check
+along with its inventory identity; absence means unknown, not fresh.
+
+`complete` is true only where each source is
 `complete` or `off` and none was omitted, so an empty list is "nothing
 waits" only then. A pass whose stage 3 or 4 failed publishes nothing, as
 above. A read that fails is a `needs-you … error: …` line, not a failure:
