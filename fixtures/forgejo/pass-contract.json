@@ -246,6 +246,7 @@
     "pr.reviewWorkflow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.checkReruns": {"verdict": "refused", "reason": "PR check retries (stage 2) require GitHub checks and Actions runs"},
     "pr.ownerBranches": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.unstall": {"verdict": "refused", "reason": "PR follow-up (stage 2) reruns GitHub Actions review runs"},
     "pr.reviewPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.reviewDispatchRepositories": {"verdict": "refused", "reason": "GitHub-only ordinary review routing (stage 2)"},
     "pr.fixPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},

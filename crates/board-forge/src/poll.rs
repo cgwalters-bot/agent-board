@@ -577,6 +577,13 @@ pub struct PollPolicy {
     /// The pass's `pr.checkReruns`: only the pre-fix check retry and its
     /// recovery wait. Off by default; legacy `reruns` also enables this path.
     pub check_reruns: bool,
+    /// The pass's `pr.unstall` (agent-board#666): a pull request that would
+    /// sit unseen moves or is surfaced. The review job's failed run is re-run
+    /// once as with [`Self::reruns`], and one too old to re-run is a stop; a
+    /// `mergeAuthors` head behind its base is brought up to date as the bot's
+    /// is; and a draft whose continuation is used up or failed gets one fresh
+    /// continuation round on another pool before its stop. Off by default.
+    pub unstall: bool,
     /// The pass's `pr.ownerBranches`: a round on a head that is not the bot's
     /// fork is skipped where agentic-job's apply would refuse to push there
     /// ([`OWNER_BRANCHES`]). Off by default.
@@ -899,6 +906,7 @@ impl PollPolicy {
             stale_days: 0,
             reruns: false,
             check_reruns: false,
+            unstall: false,
             owner_branches: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
@@ -3147,10 +3155,30 @@ pub fn decide(
             Ok(None) => {}
             Ok(Some(at)) => {
                 let why = format!("its checkpoint says {}", at.reason);
-                if marker.sha.as_deref() == Some(head) {
-                    return started(config, marker, (fix_run, outages), head, &why, now);
-                }
                 let rounds = config.policy.continuation.rounds;
+                // With `unstall`, one fresh round on another pool before a
+                // person is asked to take the draft over (#666); it counts as
+                // the round past the last, so it is given once.
+                let refit = |stuck: &str| Decision {
+                    action: "continue",
+                    reason: format!("{stuck}, so a fresh continuation round on another pool"),
+                    round: Some(rounds + 1),
+                    queue: None,
+                };
+                let refits = config.policy.unstall && rounds > 0 && marker.continued <= rounds;
+                if marker.sha.as_deref() == Some(head) {
+                    let decision = started(config, marker, (fix_run, outages), head, &why, now);
+                    if refits && marker.continuing && decision.action == "needs-human" {
+                        return refit(&decision.reason);
+                    }
+                    return decision;
+                }
+                if refits && marker.continued == rounds {
+                    return refit(&format!(
+                        "{rounds} of {rounds} continuation rounds used and {} is still a draft ({why})",
+                        short(head)
+                    ));
+                }
                 if marker.continued >= rounds {
                     return step(
                         "needs-human",
@@ -4187,7 +4215,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let after_toil = marker.pool.as_ref().is_some_and(|p| {
             !p.is_empty() && (*p == policy.toil_fix_pool || *p == policy.conflict_fix_pool)
         });
-        let raise = checkpoint.as_ref().and_then(|at| {
+        let rounds = self.config.policy.continuation.rounds;
+        // [`PollPolicy::unstall`]'s round past the last, on another pool.
+        let refit = continuing && round > rounds;
+        let raise = checkpoint.as_ref().filter(|_| !refit).and_then(|at| {
             self.config
                 .policy
                 .continuation
@@ -4207,6 +4238,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         } else if diagnostic {
             // Decide gives the round only where the pool is set.
             single(Some(self.config.policy.diagnostic_pool.clone()).filter(|p| !p.is_empty()))
+        } else if refit {
+            // The fix pools but the last round's, unless it is the only one.
+            let pools = fix_pools(&apply.pools, self.config);
+            let last = marker.pool.as_deref().unwrap_or_default();
+            let others: Vec<String> = pools.iter().filter(|p| *p != last).cloned().collect();
+            let pools = if others.is_empty() { pools } else { others };
+            (pools.first().cloned(), pools)
         } else if !toil_pool.is_empty() && pool_round == 1 && toil {
             single(Some(toil_pool.clone()))
         } else {
@@ -4228,8 +4266,15 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .as_u64()
             .context("pull request has no number")?;
         let head = text(pull, "/headRefOid");
-        let rounds = self.config.policy.continuation.rounds;
-        let (name, of) = if continuing {
+        let (name, of) = if refit {
+            (
+                format!("continuation round {round}"),
+                format!(
+                    "Fresh continuation round {round}, after {rounds}, for `{}`",
+                    short(head)
+                ),
+            )
+        } else if continuing {
             (
                 format!("continuation round {round}"),
                 format!(
@@ -4443,9 +4488,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         "not merged: the base no longer has a merge queue".into(),
                     ))
                 } else if pull["mergeStateStatus"] == BEHIND {
-                    // Only the bot's own: a `mergeAuthors` one is a skip
-                    // before it gets here. The approval was of the old head
-                    // and does not carry over.
+                    // The bot's own, or with `unstall` a `mergeAuthors` one,
+                    // which is a skip before it gets here otherwise. The
+                    // approval was of the old head and does not carry over.
                     self.update(repo, pull, "not merged: ").map(Some)
                 } else {
                     let repo_settings = self.get(&format!("repos/{repo}"))?;
@@ -4552,7 +4597,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         }
     }
 
-    /// Rebases the bot's `pull` onto its base, pinned to the head read, once
+    /// Rebases `pull`, the bot's or with [`PollPolicy::unstall`] a
+    /// `mergeAuthors` one, onto its base, pinned to the head read, once
     /// a pass for each base; the new head waits for its review. `not` starts
     /// the line of one that waits for another pass.
     fn update(&mut self, repo: &str, pull: &Value, not: &str) -> Result<String> {
@@ -4902,6 +4948,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 REVIEW_RERUN,
                 format!("{ended} with no review of the head, so its failed jobs run once more"),
             )
+        } else if self.config.policy.unstall {
+            // Too old to re-run, it would otherwise wait for good, unseen
+            // (agent-board#666).
+            step(
+                "needs-human",
+                format!(
+                    "{ended} with no review of {}, too long ago to re-run; re-run or review it",
+                    short(head)
+                ),
+            )
         } else {
             return Ok(None);
         };
@@ -4954,7 +5010,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             );
             return Ok(Some((step("wait", why), None)));
         }
-        if !self.config.policy.reruns {
+        if !self.config.policy.reruns && !self.config.policy.unstall {
             return Ok(ordinary_reviews(self.config, repo).then(|| {
                 (
                     step(
@@ -6414,8 +6470,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             );
         }
         // GitHub refuses to merge it directly (#273), and the branch is its
-        // author's to update; the bot's own is updated where it is taken.
+        // author's to update; the bot's own is updated where it is taken,
+        // and with `unstall` so is this one where its head is a branch of
+        // the base repository, which the bot can push to (#666).
+        let updatable = self.config.policy.unstall && pull["isCrossRepository"] == false;
         if merge_only
+            && !updatable
             && decision.action == "merge"
             && !*queued
             && pull["mergeStateStatus"] == BEHIND
@@ -6446,7 +6506,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             && from_fork(&pull, &self.config.bot);
         let review_step = if unreviewed && !self.config.policy.review_pools.is_empty() {
             self.review_dispatch(repo, &pull, &comments)?
-        } else if unreviewed && self.config.policy.reruns {
+        } else if unreviewed && (self.config.policy.reruns || self.config.policy.unstall) {
             self.review_rerun(repo, &pull)?
                 .map(|(step, run)| (step, Some((run, None))))
         } else {
@@ -7759,6 +7819,61 @@ mod tests {
                 "needs-human",
                 None,
             ),
+            // With `unstall`, a held draft gets one fresh round first (#666).
+            (
+                "unstall: continuation rounds used up get a fresh round",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "unstall": true}),
+                json!({"rounds": 0, "continued": 2, "sha": "older"}),
+                none.clone(),
+                "continue",
+                Some(3),
+            ),
+            (
+                "unstall: no fresh round where continuations are off",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "unstall": true, "policy": {"continuation": {"rounds": 0}}}),
+                json!({"rounds": 0}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "unstall: a failed continuation gets a fresh round",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "unstall": true}),
+                json!({"rounds": 0, "continued": 1, "continuing": true, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "continue",
+                Some(3),
+            ),
+            (
+                "unstall: a running fresh round waits",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "unstall": true}),
+                json!({"rounds": 0, "continued": 3, "continuing": true, "sha": HEAD, "run": 7}),
+                running.clone(),
+                "wait",
+                None,
+            ),
+            (
+                "unstall: a failed fresh round goes to a human",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "unstall": true}),
+                json!({"rounds": 0, "continued": 3, "continuing": true, "sha": HEAD, "run": 7}),
+                failed_run.clone(),
+                "needs-human",
+                None,
+            ),
+            (
+                "unstall: a fresh round that left a draft goes to a human",
+                "pull-470",
+                json!({"isDraft": true, "body": checkpointed("budget"), "unstall": true}),
+                json!({"rounds": 0, "continued": 3, "sha": "older"}),
+                none.clone(),
+                "needs-human",
+                None,
+            ),
             (
                 "removing needs-human gives continuation rounds back",
                 "pull-470",
@@ -9001,6 +9116,7 @@ mod tests {
                 cfg.policy = PollPolicy::from_json(&policy).unwrap();
             }
             cfg.policy.reruns = fields.remove("reruns").is_some();
+            cfg.policy.unstall = fields.remove("unstall").is_some();
             // Check-only must not affect any agent recovery or stack decision.
             cfg.policy.check_reruns = true;
             if let Some(owners) = fields.remove("headOwners") {
@@ -11106,6 +11222,10 @@ mod tests {
     fn a_behind_head_is_updated_once_a_base_and_never_merged() {
         // #469 comes first, then #470; both approved and green on main.
         let (update, merge) = ("update", "merge");
+        // A merge author whose pass has `unstall`, from a branch of the base
+        // repository, and one from a fork, which the bot cannot push to.
+        const UNSTALLED: &str = "unstalled";
+        const FORKED: &str = "forked";
         for (queue, author, states, apply, expected, line) in [
             (
                 false,
@@ -11118,6 +11238,31 @@ mod tests {
             (
                 false,
                 "updater",
+                [BEHIND, BEHIND],
+                true,
+                vec![(update, 470)],
+                "#469 488f45ebacd0 skip: behind main, left to its author",
+            ),
+            // With `unstall` (#666), a `mergeAuthors` head is updated too.
+            (
+                false,
+                UNSTALLED,
+                [BEHIND, BEHIND],
+                true,
+                vec![(update, 469)],
+                "#469 488f45ebacd0 merge: review approved and checks green -> brought up to date with main; waits for the review of the new head",
+            ),
+            (
+                false,
+                UNSTALLED,
+                ["CLEAN", BEHIND],
+                true,
+                vec![(merge, 469), (update, 470)],
+                "#469 488f45ebacd0 merge: review approved and checks green -> merged",
+            ),
+            (
+                false,
+                FORKED,
                 [BEHIND, BEHIND],
                 true,
                 vec![(update, 470)],
@@ -11192,6 +11337,9 @@ mod tests {
             );
             let kind = if author == BOT { "User" } else { "Bot" };
             p["author"] = json!({"__typename": kind, "login": author});
+            if author == UNSTALLED {
+                p["isCrossRepository"] = false.into();
+            }
             p["reviews"]["nodes"] = json!([review(
                 "APPROVED",
                 json!({"__typename": "User", "login": "cgwalters"}),
@@ -11203,7 +11351,11 @@ mod tests {
             p["id"] = "pull-470".into();
             p["mergeStateStatus"] = states[1].into();
             let mut cfg = config();
-            cfg.policy = PollPolicy::from_json(&json!({"mergeAuthors": ["updater[bot]"]})).unwrap();
+            cfg.policy = PollPolicy::from_json(
+                &json!({"mergeAuthors": ["updater[bot]", "unstalled[bot]", "forked[bot]"]}),
+            )
+            .unwrap();
+            cfg.policy.unstall = matches!(author, UNSTALLED | FORKED);
             let dispatcher = Fake::default();
             let outcome = run(
                 &fake,
@@ -11817,6 +11969,81 @@ mod tests {
                 body["body"]
                     .as_str()
                     .is_some_and(|s| s.contains(&format!("\"pool\":\"{expected}\"")))
+            }));
+        }
+    }
+
+    #[test]
+    fn unstall_gives_a_held_draft_a_fresh_round_on_another_pool() {
+        for (marker, expected) in [
+            (
+                json!({"rounds": 0, "continued": 2, "pool": "claude", "sha": "old"}),
+                "openai",
+            ),
+            (
+                json!({"rounds": 0, "continued": 2, "pool": "openai", "sha": "old"}),
+                "claude",
+            ),
+            // A failed continuation, on its head, gets it as well.
+            (
+                json!({"rounds": 0, "continued": 1, "continuing": true, "pool": "openai", "sha": HEAD, "run": 7, "at": "2026-10-12T01:00:00Z"}),
+                "claude",
+            ),
+        ] {
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull(
+                    "pull-470",
+                    json!({"isDraft": true, "body": checkpointed("budget")}),
+                ),
+            );
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id": 5, "user": {"login": BOT}, "body": marker_body(&marker, "old")} ]),
+            );
+            fake.page(
+                "repos/cgwalters-forge/tracker/actions/runs/7",
+                None,
+                None,
+                json!({"status": "completed", "conclusion": "failure", "run_attempt": 1,
+                    "created_at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:30:00Z"}),
+            );
+            let mut cfg = config();
+            cfg.policy.unstall = true;
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l
+                        .contains("so a fresh continuation round on another pool -> run started")),
+                "{:?}",
+                outcome.lines
+            );
+            assert_eq!(
+                dispatcher.writes.borrow()[0].1["inputs"]["pool"],
+                expected,
+                "{marker}"
+            );
+            assert!(fake.writes.borrow().iter().any(|(_, body)| {
+                body["body"].as_str().is_some_and(|s| {
+                    s.contains(&format!("\"pool\":\"{expected}\"")) && s.contains("\"continued\":3")
+                })
             }));
         }
     }
@@ -13069,6 +13296,12 @@ mod tests {
             short(&head),
             short(&head)
         );
+        let again2 = again.clone();
+        let stale = format!(
+            "{REPO}#470 {} needs-human: the review job's run https://github.com/{REPO}/actions/runs/77 ended (failure) with no review of {}, too long ago to re-run; re-run or review it -> labelled {LABEL}",
+            short(&head),
+            short(&head)
+        );
         let unread = format!(
             "{REPO}#470 {} needs-human: the review job's run https://github.com/{REPO}/actions/runs/77 ended (failure) with no review of {}, which has more runs than the {REVIEW_RUN_READS} read for an earlier rerun; re-run or review it -> labelled {LABEL}",
             short(&head),
@@ -13100,7 +13333,7 @@ mod tests {
                 json!({}), again, labelled.clone()),
             // A full read may leave out an older run that was re-run.
             ("so does one of a head with more runs than read", true, Value::Array((0..REVIEW_RUN_READS).map(|n| json!({"id": 77 - n})).collect()),
-                json!({}), unread, labelled),
+                json!({}), unread, labelled.clone()),
             ("one that failed over a day ago is waited on", true, json!({"created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:30:00Z"}), json!({}), wait.clone(), vec![]),
             // Re-run, it would run a workflow over a day old.
             ("so is one created over a day ago that failed just now", true, json!({"created_at": "2026-10-11T01:59:59Z"}), json!({}), wait.clone(), vec![]),
@@ -13114,10 +13347,17 @@ mod tests {
             ("a run from before the base changed is not", true, json!({}),
                 json!({"baseChange": {"nodes": [{"createdAt": "2026-10-12T01:30:00Z"}]}}), wait.clone(), vec![]),
             ("a run that reviewed the head is not", true, json!({}), json!({"reviews": commented}), wait, vec![]),
+            // `unstall` (a pull request change here) re-runs it too, and
+            // stops one too old to re-run rather than wait unseen (#666).
+            ("unstall re-runs a failed review run", false, json!({}), json!({"unstall": true}), ended("failure", RE_RUN), vec![rerun.clone()]),
+            ("unstall: one that failed again goes to a person", false, json!({"run_attempt": 2}), json!({"unstall": true}), again2, labelled.clone()),
+            ("unstall: one that failed over a day ago goes to a person", false, json!({"created_at": "2026-10-11T01:00:00Z", "updated_at": "2026-10-11T01:30:00Z"}),
+                json!({"unstall": true}), stale, labelled),
         ];
         for (name, reruns, run, change, line, writes) in cases {
             let mut fake = github();
             let mut change = change;
+            let unstall = change.as_object_mut().unwrap().remove("unstall").is_some();
             if change.get("reviews").is_none() {
                 change["reviews"] = json!({"nodes": []});
             }
@@ -13153,6 +13393,7 @@ mod tests {
             );
             let mut cfg = config();
             cfg.policy.reruns = reruns;
+            cfg.policy.unstall = unstall;
             cfg.policy.check_reruns = true;
             let dispatcher = Fake::default();
             let follow = [REPO.to_owned()];
@@ -13175,7 +13416,7 @@ mod tests {
                 .borrow()
                 .iter()
                 .any(|(url, _)| url.contains("review.yml/runs"));
-            assert_eq!(read, reruns, "{name}");
+            assert_eq!(read, reruns || unstall, "{name}");
         }
         // A fix round's run that failed on its first attempt, as the caller's
         // token started it: its failed jobs run once more, as a dispatch.

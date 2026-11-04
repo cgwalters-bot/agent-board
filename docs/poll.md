@@ -357,7 +357,8 @@ later pass, and the base moving again means another update. Updates are not
 counted against `rebaseRounds` or any cap but `--max-writes`. As after a rebase
 round, the new head needs the review's (or the operator's) approval again
 before it merges. A `mergeAuthors` pull request that is behind is a skip, left
-to its author. Only `BEHIND` is read: a head GitHub reports with another state,
+to its author, unless the pass's [`pr.unstall`](pass.md#unstall) has it
+updated the same way. Only `BEHIND` is read: a head GitHub reports with another state,
 such as `BLOCKED`, is merged as before, and a refusal is an error.
 
 Stacked pull requests ([job plans](job-plans.md#stacking), agent-board#133):
@@ -616,7 +617,8 @@ unfinished work). Its decision line reads `continue: continuing (round N): its
 checkpoint says REASON`. Continuation rounds are counted in the marker apart
 from fix rounds; `continuation.rounds` (0 to 5, default 2) caps them, past
 which, or for a malformed checkpoint, the pull request gets `needs-human`
-with the reason. A draft with no checkpoint also goes to `needs-human`
+with the reason (the pass's [`pr.unstall`](pass.md#unstall) gives one fresh
+round on another pool first). A draft with no checkpoint also goes to `needs-human`
 instead of being marked ready on green checks, except on a base repository
 in the pass's `pr.noMerge`, where a draft is the finished state: its fix
 and rebase rounds run as for any other (a conflict is rebased without the

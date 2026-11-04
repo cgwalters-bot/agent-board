@@ -789,6 +789,10 @@ pub struct Pr {
     /// Retry failed checks without enabling agent/review recovery or stack updates.
     #[serde(default)]
     pub check_reruns: bool,
+    /// [`PollPolicy::unstall`]; also requires every work repository to be
+    /// followed, so that every work repository's pull requests are seen.
+    #[serde(default)]
+    pub unstall: bool,
     /// [`PollPolicy::owner_branches`].
     #[serde(default)]
     pub owner_branches: bool,
@@ -1227,6 +1231,16 @@ impl Config {
             self.pr.review_pools.is_empty() || self.pr.review_workflow.is_some(),
             "pr reviewPools needs pr reviewWorkflow, the workflow it starts"
         );
+        // A work repository's pull requests, unfollowed, are never merged,
+        // fixed or surfaced, and their failed reviews never seen (#666).
+        if self.pr.unstall {
+            for repo in &self.work_repositories {
+                ensure!(
+                    self.follow.iter().any(|r| r.eq_ignore_ascii_case(repo)),
+                    "pr unstall needs every work repository followed, and {repo} is not in follow"
+                );
+            }
+        }
         for author in &self.pr.merge_authors {
             ensure!(!author.is_empty(), "pr mergeAuthors names an empty login");
         }
@@ -1355,6 +1369,7 @@ impl Config {
             stale_days: self.pr.stale_days,
             reruns: self.reruns,
             check_reruns: self.pr.check_reruns,
+            unstall: self.pr.unstall,
             owner_branches: self.pr.owner_branches,
             review_pools: self.pr.review_pools.clone(),
             review_dispatch_repositories: self.pr.review_dispatch_repositories.clone(),
