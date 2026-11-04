@@ -170,13 +170,38 @@ promotion reads or writes.
   tree is that head's; otherwise `policy loosened by LOGIN at SHA`. As in
   homegit, a record's first version sets the baseline unvouched, since the
   policy-check agent creates records. GitHub's path history does not follow
-  renames, unlike homegit's. `bot-ok` passes; `human-text` holds until its provenance
-  gate is built; `human-only` and `no-go` hold naming the record's sources.
+  renames, unlike homegit's. `bot-ok` passes; `human-text` requires the per-PR
+  provenance gate below; `human-only` and `no-go` hold naming the record's sources.
   The threat is the bot publishing where maintainers refuse it, on a record
   that no longer describes the upstream, or one someone else loosened.
   Passing prints `would promote ... (policy bot-ok)`, not publication
-  permission: human-text provenance and publication still remain. No
+  permission: publication still remains. No
   bot-fork staging success is implied.
+* **Human-text provenance.** The threat is passing bot-written or changed text
+  off as the operator's merely because the operator posted a command. Only a
+  fresh, unloosened `human-text` policy invokes this gate; `bot-ok` needs none
+  of these proofs. The selected exact command must be `/promote --human-text`,
+  and authenticated branch activity must name the operator as the actor of the
+  latest push establishing this head, including a force-push back to an old oid.
+  Commit authorship, committer identity and the command author are not push proof.
+  A separate GraphQL read must agree with REST on PR identity, head, title and
+  body. Its complete `userContentEdits` history and body's `editor`/`lastEditedAt`
+  must agree on an operator last edit; its complete `RENAMED_TITLE_EVENT`
+  timeline must chain to the current title with an operator last renamer.
+  No edit or rename on a bot-authored PR is not operator authorship. Deleted or
+  unnamed editors, ambiguous order, missing metadata or pagination holds as
+  `needs-text`, naming the failed proof. A single bounded read accepts fewer
+  than 100 edits and rename events, with `hasNextPage=false`; larger histories
+  hold, within the shared request/time budget. GitHub's filtered timeline
+  `totalCount` includes other event types, so it is not a rename count.
+  The observed API exposes edit actors/times, not a signed text-version digest;
+  the current GraphQL body and matching last-edit metadata bind the proof, not
+  a timestamp alone. Both last text changes must strictly predate the selected
+  command; equal-second or later changes require a fresh command. A body still
+  containing `Generated-by:` holds. Only upstream policy results are cached:
+  every PR's provenance is independently evaluated. Passing reports `(policy
+  human-text; provenance verified)`, not live publication. No labels or notices
+  are written, and title/body text is never altered or supplemented.
 * **Kept.** The upstream contribution-policy gate; the operator's sign-off
   added at promote where the upstream wants DCO; the stacked wait (a pull
   request whose dependency is not yet upstream waits); one notice per reason
@@ -208,8 +233,8 @@ The answers to the brief's open questions:
    an open one recorded there as In Progress and its merge as Done. A replay
    scenario must show that before anything closes a fork pull request. This
    Status/scheduling handoff is not built by the preview.
-2. **`--human-text`.** Only the operator's command carries the marker. Checking
-   the pusher and the title/body editors is a later gate, not implemented here.
+2. **`--human-text`.** Only the operator's command carries the marker; the
+   read-only provenance gate checks the current-head pusher and title/body editors.
 3. **Policy records.** Read from the configured repository's default
    branch, with homegit's rule that a verdict is loosened only by the
    operator, ported; never written.
@@ -230,6 +255,9 @@ Three rules learned from reviewing the first attempt (agent-board#312):
   re-read the command, its authorship/edit evidence, cancellations, PR head,
   branch push evidence and readiness/labels; hold unless it is still the same
   command bound to the same observed head and no `needs-human` was added.
+  Revalidate policy and all human-text provenance too, including the exact
+  title/body version predating that command. Future human-text publication must
+  send those unchanged title/body bytes, with no attribution or sign-off note.
 * **Move a ref only by compare-and-swap.** The branch ref is moved only by
   an update that names the expected old object id (GraphQL `updateRefs`),
   never by a read, a REST `PATCH` and a second read, which lose a push that
@@ -239,8 +267,9 @@ Three rules learned from reviewing the first attempt (agent-board#312):
   response against the command-bound one; on a mismatch it refuses, records no
   success and closes nothing.
 
-The preview reports candidates only: human-text provenance and publication are
-not evaluated. Sign-off semantics/proof, capped writes/recovery, the Status/scheduling handoff
+The preview evaluates human-text provenance but reports candidates only:
+publication, first-write revalidation and unchanged-text publication are not
+implemented. Sign-off semantics/proof, capped writes/recovery, the Status/scheduling handoff
 and the caller's independent 10–15 minute tracker schedule remain follow-up
 slices. Bot-fork acceptance and `maintainer_can_modify` still require the
 recorded staging call before live publication; no staging or live promotion

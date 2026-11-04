@@ -85,7 +85,30 @@ files, error statuses,
 truncation, commit authors and verification. The merged policy pull request,
 its reviews and its commits' trees are invented scenario data.
 
-No caller setting, schedule, forge write, live promotion or staging test was
-enabled. Human-text provenance/publication checks, bounded writes and
-recovery, sign-off, and Status/scheduling handoff remain separate slices of
-#308.
+`provenance-public-2026-11-04.json` contains the exact public GraphQL query,
+variables and response data read with `gh api graphql` on 4 November 2026 for
+cgwalters-forge/agent-board#1. It includes current PR identity/head/title/body,
+`editor`, `lastEditedAt`, `userContentEdits` and the filtered title-rename
+timeline. These fields were accessible. That PR has no body edits or renames:
+this is not evidence of operator authorship. The filtered timeline reports
+`totalCount=10` but no rename nodes; GitHub counts other timeline types there.
+An additional public read of composefs-rs#34 likewise had no edits or renames;
+neither is a live passing provenance case. The fixture retains public text
+verbatim, including its historical attribution wording.
+
+Tests use this response's endpoint shape and explicitly replace PR identity,
+head/text, editor/edit history, rename history and activity actor to construct
+hypothetical operator evidence for #34, then remove or corrupt each proof.
+Successful and held token-free CLI scenarios are also hypothetical. No absent
+edit/rename is treated as proof, and no inaccessible evidence is invented as a
+live observation. Provenance reads accept only a complete single page of fewer
+than 100 edits and renames; longer, deleted or unverifiable histories hold.
+
+No caller setting, schedule, policy record, forge write, live promotion or
+staging test was enabled. Provenance evaluation is implemented; publication,
+first-write revalidation and unchanged-text publication, bounded writes/recovery,
+sign-off semantics/proof, recorded bot-fork staging verification,
+Status/scheduling handoff and tracker deployment remain follow-ups to #308.
+The shared recorder's known not-found limitation remains: live-client 404 errors
+are not saved as replayable responses. These separate public observations and
+edited scenarios do not claim a successful live promote record/replay.

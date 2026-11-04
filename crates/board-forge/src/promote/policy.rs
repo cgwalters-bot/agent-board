@@ -38,9 +38,15 @@ struct Record {
     sources: Vec<Source>,
 }
 
-/// Ok only for a fresh, unloosened `bot-ok` record; every hold is an error
+#[derive(Clone, Copy)]
+pub(super) enum Permitted {
+    BotOk,
+    HumanText,
+}
+
+/// Ok only for a fresh, unloosened permitted record; every hold is an error
 /// whose text starts with `policy`.
-pub(super) fn gate(client: &impl Rest, config: &Config, upstream: &str) -> Result<()> {
+pub(super) fn gate(client: &impl Rest, config: &Config, upstream: &str) -> Result<Permitted> {
     validate_repository(upstream)?;
     let promote = config.promote.as_ref().context("promote configuration")?;
     let policy = promote
@@ -62,10 +68,8 @@ pub(super) fn gate(client: &impl Rest, config: &Config, upstream: &str) -> Resul
     fresh(client, upstream, &record)?;
     loosening(client, config, policy, &file, (&found["sha"], &current))?;
     match record.verdict.as_str() {
-        "bot-ok" => Ok(()),
-        "human-text" => {
-            anyhow::bail!("policy human-text: the human-text provenance gate is not built")
-        }
+        "bot-ok" => Ok(Permitted::BotOk),
+        "human-text" => Ok(Permitted::HumanText),
         verdict => {
             let sources: Vec<_> = record
                 .sources
