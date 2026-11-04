@@ -85,7 +85,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     ) -> BTreeMap<String, String> {
         // Refused before and unchanged, repository, number, `updated_at`.
         let mut queue = Vec::new();
-        for repo in follow {
+        // A lock is a write: none outside our own space with `ownSpaceOnly`.
+        for repo in follow.iter().filter(|r| self.config.writes_in(r)) {
             match self.open_items(repo) {
                 Ok(items) => {
                     for item in items {

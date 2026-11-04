@@ -796,6 +796,9 @@ pub struct Pr {
     /// [`PollPolicy::owner_branches`].
     #[serde(default)]
     pub owner_branches: bool,
+    /// [`PollPolicy::own_space_only`].
+    #[serde(default)]
+    pub own_space_only: bool,
     pub review_workflow: Option<String>,
     /// Pools the pass starts the review job on itself ([`PollPolicy::review_pools`]);
     /// empty leaves reviews to the job's `pull_request_target` runs.
@@ -1371,6 +1374,7 @@ impl Config {
             check_reruns: self.pr.check_reruns,
             unstall: self.pr.unstall,
             owner_branches: self.pr.owner_branches,
+            own_space_only: self.pr.own_space_only,
             review_pools: self.pr.review_pools.clone(),
             review_dispatch_repositories: self.pr.review_dispatch_repositories.clone(),
             ..PollPolicy::default()

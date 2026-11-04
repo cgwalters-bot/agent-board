@@ -15,7 +15,8 @@ authority for their operations. The differences below are intentional.
 The GitHub pass implements the configuration below and stages 1 to 5, except
 that the one rerun is the plain [`reruns`](#reruns) rather than one only of
 infrastructure failures, and stage 2 still writes poll's claim
-and marker comments in every followed repository, external ones included.
+and marker comments in every followed repository, external ones included,
+unless `pr.ownSpaceOnly` keeps every write out of them.
 The old stage 4b promote line is compatibility scaffolding only: it evaluates
 no fork pull request, reads nothing and writes nothing. The shared `promote`
 configuration now serves the separate read-only
@@ -3071,6 +3072,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.noMerge` | Exact `OWNER/REPO` base repositories never directly merged, enqueued or re-enqueued by the pass, while authorized rounds continue; no globs; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
+| `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
