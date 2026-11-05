@@ -231,7 +231,7 @@ pub(super) fn step_facts(
             kind: format!("{progress:?}").to_ascii_lowercase(),
             reason: holds::one_line(&reason, holds::MAX_ASK).unwrap_or_default(),
             url: Some(Reference::new(RefKind::PullRequest, &repository, number).url()),
-            since: step.moved_at.and_then(|t| t.format(&Rfc3339).ok()),
+            since: step.waiting_since().and_then(|t| t.format(&Rfc3339).ok()),
             observed_at: Some(at.to_owned()),
         });
     }
@@ -997,6 +997,11 @@ mod tests {
             reason: reason.into(),
             ran,
             moved_at: OffsetDateTime::parse("2026-10-28T08:00:00Z", &Rfc3339).ok(),
+            waiting: if action == "wait" {
+                poll::WaitReason::Followed { since: None }
+            } else {
+                poll::WaitReason::Person
+            },
         };
         let stepped = [
             step("o/r", 1, "wait", "checks pending: build", false),
