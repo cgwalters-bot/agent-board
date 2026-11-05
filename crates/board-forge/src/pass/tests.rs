@@ -1924,7 +1924,7 @@ fn replay_scenarios() {
             vec![
                 "candidates: 1 (0 opened by others, 0 outside a live epic)",
                 "hold cgwalters-forge/tracker#446: no plan, and triage is off",
-                "idle: 6 slot(s) free and nothing started",
+                "idle: 6 slot(s) free and nothing started; candidates: 1, considered: 1; reasons: hold cgwalters-forge/tracker#446: no plan, and triage is off; 0 more reason(s) in candidate lines",
             ],
             0,
             0,
@@ -4632,9 +4632,9 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
         "{:#?}",
         second.lines
     );
-    assert_eq!(
-        last_scheduled(&second),
-        "idle: 6 slot(s) free and nothing started"
+    assert!(
+        last_scheduled(&second)
+            .starts_with("idle: 6 slot(s) free and nothing started; candidates:")
     );
 }
 
@@ -9759,15 +9759,6 @@ fn stacked_plan_waits_for_the_lower_issues_next_run() {
     }
 }
 
-/// An accepted, unrecorded triage plan, the operator's or the planner's,
-/// starts once through the plan protocol, with its exact brief and kind,
-/// counted as a triage start and checked for no overlap (the recording has
-/// no text of tracker#446 for one); its record, once the run is done, holds
-/// it on the next pass. An explicit held pool, a held `triagePools` for one
-/// without a pool and `--max-dispatch` hold it writing nothing,
-/// `--max-writes` does not (a start is a dispatch), the pass's own triage is
-/// as before, and a research plan, or a triage of another issue, whose
-/// follow-up this issue's would miss, stays manual.
 #[test]
 fn heavy_plan_cannot_bypass_the_weekly_budget() {
     for effort in [None, Some("heavy")] {
@@ -9789,13 +9780,22 @@ fn heavy_plan_cannot_bypass_the_weekly_budget() {
     }
 }
 
+/// Accepted triage and opt-in research plans start once with the exact brief
+/// and kind, without overlap reads. Pool holds and caps still apply, and a
+/// plan targeting another issue stays manual.
 #[test]
 fn accepted_triage_plans_start_once() {
+    assert!(!config(json!({})).research_plans);
+    assert!(forgejo::check_options(&json!({"researchPlans": true})).is_err());
     let plan = "plan=9@2026-10-23T00:00:00Z";
     let start = format!("start triage cgwalters-forge/tracker#446 {plan} pool=claude record=");
     let generated = "start triage cgwalters-forge/tracker#446 pool=claude record=";
     let held = format!("held by --max-dispatch: start triage cgwalters-forge/tracker#446 {plan}");
     let research = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z is for research, which is dispatched by hand; the pass starts only implement and triage plans";
+    let research_start =
+        format!("start research cgwalters-forge/tracker#446 {plan} pool=claude record=");
+    let research_held =
+        format!("held by --max-dispatch: start research cgwalters-forge/tracker#446 {plan}");
     let other = "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z triages cgwalters-forge/tracker#527, not this issue; it is dispatched by hand";
     let pool = "hold cgwalters-forge/tracker#446: no pool: openai is held";
     let limits = |dispatch, writes| Limits {
@@ -9819,15 +9819,22 @@ fn accepted_triage_plans_start_once() {
         ("on a held pool", Some((triage, "cgwalters", Some("openai"))), None, none, pool),
         ("on held triagePools", Some((triage, "cgwalters", None)), Some("openai"), none, pool),
         ("a research plan", Some((("research", 446), "cgwalters-bot", None)), None, none, research),
+        ("research enabled", Some((("research", 446), "cgwalters-bot", None)), None, none, &research_start),
+        ("research enabled operator", Some((("research", 446), "cgwalters", None)), None, none, &research_start),
+        ("research enabled capped", Some((("research", 446), "cgwalters", None)), None, limits(Some(0), None), &research_held),
+        ("research enabled held pool", Some((("research", 446), "cgwalters", Some("openai"))), None, none, pool),
+        ("research enabled held triagePools", Some((("research", 446), "cgwalters", None)), Some("openai"), none, pool),
+        ("research enabled another issue", Some((("research", 527), "cgwalters", None)), None, none, "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z researches cgwalters-forge/tracker#527, not this issue; it is dispatched by hand"),
         ("another issue's", Some((("triage", 527), "cgwalters", None)), None, none, other),
         ("no plan", None, None, none, generated),
     ];
     for effort in [None, Some("heavy")] {
         for (name, planned, pools, limits, expected) in cases.iter().copied() {
-            let config = match pools {
+            let mut config = match pools {
                 Some(pool) => config(json!({"wip": 3, "triagePools": [pool]})),
                 None => config(json!({"wip": 3})),
             };
+            config.research_plans = name.starts_with("research enabled");
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
             if let Some((plan, author, pool)) = planned {
@@ -9850,14 +9857,30 @@ fn accepted_triage_plans_start_once() {
             }
             assert_eq!(
                 first.effects.starts,
-                BTreeMap::from([("triage".into(), 1)]),
+                BTreeMap::from([(
+                    if config.research_plans {
+                        "research"
+                    } else {
+                        "triage"
+                    }
+                    .into(),
+                    1
+                )]),
                 "{name}"
             );
             let writes = forge.writes.borrow();
             let (_, _, sent) = (writes.iter())
                 .find(|(_, url, _)| url.ends_with("/dispatches"))
                 .unwrap();
-            assert_eq!(sent["inputs"]["kind"], "triage", "{name}");
+            assert_eq!(
+                sent["inputs"]["kind"],
+                if config.research_plans {
+                    "research"
+                } else {
+                    "triage"
+                },
+                "{name}"
+            );
             assert_eq!(sent["inputs"]["pool"], "claude", "{name}");
             assert_eq!(
                 sent["inputs"].get("effort").cloned(),
@@ -9895,6 +9918,57 @@ fn accepted_triage_plans_start_once() {
             );
         }
     }
+}
+
+#[test]
+fn idle_summary_names_candidates_and_bounded_reasons() {
+    let mut replay = replay();
+    only(
+        &mut replay,
+        &[
+            "cgwalters-forge/tracker#446",
+            "cgwalters-forge/tracker#7",
+            "cgwalters-forge/tracker#19",
+            "cgwalters-forge/tracker#308",
+            "cgwalters-forge/tracker#317",
+            "cgwalters-forge/tracker#12",
+            "cgwalters-forge/tracker#14",
+        ],
+    );
+    let mut settings = config(json!({"triage": false}));
+    settings.epics = None;
+    let report = preview(&settings, &replay);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let idle = report
+        .lines
+        .iter()
+        .find(|l| l.starts_with("idle:"))
+        .unwrap();
+    let candidate_count = report.tally.1.candidates.unwrap();
+    assert!(
+        idle.contains(&format!(
+            "candidates: {candidate_count}, considered: {candidate_count}"
+        )),
+        "{idle}"
+    );
+    let reasons: Vec<_> = report
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("hold cgwalters-forge/"))
+        .collect();
+    assert!(reasons.len() > IDLE_REASON_LIMIT, "{:#?}", report.lines);
+    for reason in reasons.iter().take(IDLE_REASON_LIMIT) {
+        let clipped: String = reason.chars().take(IDLE_REASON_CHARS).collect();
+        assert!(idle.contains(&clipped), "{idle}");
+    }
+    assert!(
+        idle.ends_with(&format!(
+            "{} more reason(s) in candidate lines",
+            reasons.len() - IDLE_REASON_LIMIT
+        )),
+        "{idle}"
+    );
+    assert!(idle.len() <= 4 * IDLE_REASON_LIMIT * IDLE_REASON_CHARS + 250);
 }
 
 /// Unlike standalone dispatch, the pass waits when its overlap check cannot

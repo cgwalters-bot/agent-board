@@ -142,9 +142,12 @@ const RUN_LIST_LIMIT: u64 = 1000;
 const RUNS_PER_PAGE: u64 = 100;
 /// The runner a triage plan asks for.
 const TRIAGE_RUNNER: &str = "hosted";
-/// The plan kinds the pass dispatches from an accepted, unrecorded plan; a
-/// research plan is dispatched by hand.
+/// The plan kinds dispatched without an additional opt-in.
 const PASS_PLAN_KINDS: &[&str] = &["implement", "triage"];
+
+/// Keep an idle summary bounded; full reasons remain on candidate lines.
+const IDLE_REASON_LIMIT: usize = 5;
+const IDLE_REASON_CHARS: usize = 300;
 /// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// `overlap.staleDraftHours` when the key is left out, and the most it may
@@ -451,6 +454,9 @@ pub struct Config {
     /// pass when the selected planning pool is under-used near its reset.
     #[serde(default)]
     pub idle_replan: bool,
+    /// Avoid spending on previously manual research plans without caller consent.
+    #[serde(default)]
+    pub research_plans: bool,
     /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
     /// issue rather than asking the operator; needs `triageFollowUpDays`.
     #[serde(default)]
@@ -3370,6 +3376,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(());
         };
         let holds = self.report.holds.len();
+        let decisions = self.report.lines.len();
         let mut candidates = self.candidates(&board);
         self.focus_first(&mut candidates);
         // From here on, until stage 4 is done, a read that would leave too
@@ -3404,7 +3411,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             if earlier == 0 && self.holds_whole && self.report.failures == 0 {
                 self.line("pools: no ready work; unused headroom does not release holds".into());
             }
-            self.line(format!("idle: {free} slot(s) free and nothing started"));
+            let reasons: Vec<_> = self.report.lines[decisions..]
+                .iter()
+                .filter(|line| line.starts_with("hold ") || line.starts_with("fail "))
+                .collect();
+            let details = reasons
+                .iter()
+                .take(IDLE_REASON_LIMIT)
+                .map(|line| line.chars().take(IDLE_REASON_CHARS).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.line(format!(
+                "idle: {free} slot(s) free and nothing started; candidates: {}, considered: {}; reasons: {}; {} more reason(s) in candidate lines",
+                ranked.len(), ranked.len().saturating_sub(self.unconsidered),
+                if details.is_empty() { "none" } else { &details },
+                reasons.len().saturating_sub(IDLE_REASON_LIMIT)
+            ));
         }
         self.stall(holds, (earlier, taken, free), newest);
         Ok(())
@@ -4340,9 +4362,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 }
             }
         };
-        // An issue's research run's report has no follow-up here: the pass
-        // starts implement and triage plans only.
-        if !PASS_PLAN_KINDS.contains(&plan.kind.as_str()) && failed.is_none() {
+        // Research uses the same admission and dispatch path, but only when
+        // the caller explicitly opts into spending on previously manual plans.
+        if !(PASS_PLAN_KINDS.contains(&plan.kind.as_str())
+            || plan.kind == "research" && config.research_plans)
+            && failed.is_none()
+        {
             let why = format!(
                 "plan {id} is for {}, which is dispatched by hand; the pass starts only implement and triage plans",
                 plan.kind
@@ -4386,7 +4411,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // issue's follow-up does not look.
         if !implement && dest != *issue {
             let why = format!(
-                "plan {id} triages {}, not this issue; it is dispatched by hand",
+                "plan {id} {} {}, not this issue; it is dispatched by hand",
+                if plan.kind == "research" {
+                    "researches"
+                } else {
+                    "triages"
+                },
                 dest.display()
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));

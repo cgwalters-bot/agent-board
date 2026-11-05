@@ -206,7 +206,7 @@ releases: `needs-human` (labelled so, by a person or a triage verdict),
 `epic-unplanned` (an epic's planning request got no plan) and
 `needs-operator` (an invalid or refused plan, a plan that names a pull
 request, an apply cut short and not
-proved, a plan dispatched by hand (an issue's research plan, or a triage plan
+proved, a plan dispatched by hand (an issue's research plan without `researchPlans`, or a triage plan
 of another issue), no plan with triage off, or a run that failed again after
 its [rerun](#reruns)), and `pr-open` on an issue labelled
 `needs-operator-approval` (below). The one
@@ -976,7 +976,7 @@ epic, or an in-flight planning request eligible. Stage 4 must have completed
 its candidate checks without failures or unread candidates.
 
 The selected `planPools` pool must have fresh usage from a fixed provider
-window (`source: "praxis"`), be unheld, have used at most half its positive
+window (`source: "praxis"`), be unheld, have used less than its positive
 `allowed_percent` (not its burst allowance), and reset in more than zero and
 at most 48 hours. A rolling grant has no reset deadline and never qualifies.
 Each attempt still uses the existing pool choice, dollar budget, WIP, leases,
@@ -987,6 +987,10 @@ Without this setting or signal, the existing one-epic idle fallback remains.
 An otherwise successful pass with free slots and no start in any stage prints
 `pools: no ready work; unused headroom does not release holds` beside its
 `idle:` line, so available quota is not mistaken for ready work.
+The idle line also names the candidate count, the count considered, and up to
+five hold/failure reasons in candidate order (300 characters each), with the
+number of remaining reason lines. Full reasons remain on the candidate lines;
+the summary makes no additional reads or writes.
 
 The caller is external: in `cgwalters-forge/tracker`, set `.github/pass.json`
 `idleReplan` to `true` to enable it after deploying the reviewed revision.
@@ -1677,14 +1681,20 @@ do not run again, except by the rerun above, or with `starts` once an
 implement plan's run and its rerun failed on infrastructure; an operator/planner
 edit or replacement is needed. A recorded triage plan whose run has ended is
 never started again: with `triageFollowUpDays` it is followed up as the pass's
-own triage plans are, else held as `dispatched`. Two kinds of plan stay
-manual dispatches (`needs-operator`): a triage plan of another issue than the
+own triage plans are, else held as `dispatched`. Research plans remain manual
+by default. `researchPlans: true` (GitHub only) starts accepted, unrecorded
+research plans on their own issue through the same start path, pacing, WIP,
+leases and caps as implement and triage plans. The opt-in prevents unexpected
+spending on research that previously required manual dispatch. An explicit pool
+is respected; without one, `triagePools` (or `planPools`) applies. Research
+changes no files, so overlap/stack/batch checks do not apply. Its dispatch record
+prevents another start; report follow-up and automatic research reruns remain
+manual. `skipActiveWork` retains precedence as described by that setting.
+Plans for a different issue stay manual (`needs-operator`): a triage plan of another issue than the
 one it is on (`hold OWNER/REPO#N: plan ID triages OWNER/REPO#M, not this
 issue; …`), whose run's verdict or plan would land where this issue's
-follow-up does not look; and an issue's research plan (`hold OWNER/REPO#N:
-plan ID is for research, which is dispatched by hand; …`), whose report no
-step of the pass follows up. With `skipActiveWork` a research plan is handled
-as that setting says instead. The maintain digest's research run is
+follow-up does not look; likewise a research plan for a different issue.
+The maintain digest's research run is
 the pass's own, not an issue's plan.
 
 Draw among the eligible configured automatic pools, each in proportion to its
@@ -3279,7 +3289,8 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
-| `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is at most half pace and resets within 48 hours; existing holds and caps remain; `false` |
+| `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
+| `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
