@@ -12730,6 +12730,57 @@ fn blockers_move_or_are_carded() {
             false,
         ),
         (
+            "a fresh run on an old head is not already stuck",
+            follow.clone(),
+            Read::Followed(
+                stuck.clone(),
+                marker.clone(),
+                Some((
+                    fix_run.clone(),
+                    json!({"id": 7, "status": "in_progress", "created_at": ago(1)}),
+                )),
+            ),
+            None,
+            vec![moves("wait: fix round 1 is running for abc")],
+            0,
+            false,
+        ),
+        (
+            "a fresh dispatch marker on an old head is not already stuck",
+            follow.clone(),
+            Read::Followed(
+                stuck.clone(),
+                json!([{"id": 1, "user": {"login": "cgwalters-bot"},
+                    "body": format!("<!-- tracker-poll: {} -->", json!({"rounds": 1, "sha": "abc", "run": 7, "at": ago(1)}))}]),
+                Some((fix_run.clone(), json!({"id": 7, "status": "in_progress"}))),
+            ),
+            None,
+            vec![moves("wait: fix round 1 is running for abc")],
+            0,
+            false,
+        ),
+        (
+            "a followed wait becomes stuck at exactly staleHours",
+            follow.clone(),
+            Read::Followed(
+                stuck.clone(),
+                marker.clone(),
+                Some((
+                    fix_run.clone(),
+                    json!({"id": 7, "status": "in_progress", "created_at": ago(24)}),
+                )),
+            ),
+            None,
+            vec![
+                format!(
+                    "blocker {REPO}#889: stage 2's step has not moved it in 24 hours (wait: fix round 1 is running for abc); {holds}"
+                ),
+                format!("stall hold {REPO}#527: "),
+            ],
+            0,
+            false,
+        ),
+        (
             "but a wait as long as staleHours is not moving it",
             follow.clone(),
             Read::Followed(

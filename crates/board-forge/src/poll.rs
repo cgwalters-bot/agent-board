@@ -2920,6 +2920,30 @@ pub struct Decision {
     pub round: Option<u64>,
     /// The merge queue state the step records in the marker when it is taken.
     pub queue: Option<QueueState>,
+    /// Who advances a wait, and when the followed work began, where known.
+    pub waiting: WaitReason,
+}
+
+/// Wait semantics decided by the poll, independent of diagnostic wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    Person,
+    Unreviewed,
+    Followed { since: Option<OffsetDateTime> },
+}
+
+impl Decision {
+    fn followed(mut self, since: Option<OffsetDateTime>) -> Self {
+        self.waiting = WaitReason::Followed { since };
+        self
+    }
+}
+
+fn unreviewed(reason: impl Into<String>) -> Decision {
+    Decision {
+        waiting: WaitReason::Unreviewed,
+        ..step("wait", reason)
+    }
 }
 
 /// What taking a decision's step spends of a capped pass ([`caps`]), or
@@ -2941,6 +2965,7 @@ fn step(action: &'static str, reason: impl Into<String>) -> Decision {
         reason: reason.into(),
         round: None,
         queue: None,
+        waiting: WaitReason::Person,
     }
 }
 
@@ -3069,7 +3094,8 @@ fn started(
                             window.issue
                         );
                         return match window.to {
-                            None => step("wait", format!("{ended}{OUTAGE_OPEN}")),
+                            None => step("wait", format!("{ended}{OUTAGE_OPEN}"))
+                                .followed(Some(window.from)),
                             Some(_) => {
                                 step("refund", format!("{ended}, so the round is given back"))
                             }
@@ -3122,7 +3148,10 @@ fn started(
             ),
         );
     }
-    step("wait", format!("{round}{RUNNING}{}", short(head)))
+    step("wait", format!("{round}{RUNNING}{}", short(head))).followed(
+        timestamp(marker.at.as_deref())
+            .max(fix_run.and_then(|run| timestamp(run["created_at"].as_str()))),
+    )
 }
 
 /// The one step for a pull request, as poll.cjs's `decide`, except that the
@@ -3145,10 +3174,10 @@ pub fn decide(
         return step("skip", format!("labelled {LABEL}"));
     }
     if !pull["mergeQueueEntry"].is_null() {
-        return step("skip", QUEUED);
+        return step("skip", QUEUED).followed(None);
     }
     if !pull["autoMergeRequest"].is_null() {
-        return step("skip", AUTO_MERGE);
+        return step("skip", AUTO_MERGE).followed(None);
     }
     let partial = truncated(pull);
     if !partial.is_empty() {
@@ -3235,6 +3264,7 @@ pub fn decide(
                     reason: format!("{stuck}, so a fresh continuation round on another pool"),
                     round: Some(rounds + 1),
                     queue: None,
+                    waiting: WaitReason::Person,
                 };
                 let refits = config.policy.unstall && rounds > 0 && marker.continued <= rounds;
                 if marker.sha.as_deref() == Some(head) {
@@ -3266,6 +3296,7 @@ pub fn decide(
                     reason: format!("continuing (round {round}): {why}"),
                     round: Some(round),
                     queue: None,
+                    waiting: WaitReason::Person,
                 };
             }
         }
@@ -3299,6 +3330,7 @@ pub fn decide(
                 reason: format!("{why}; {approved}, so rebase round {round} of {rebases}"),
                 round: Some(round),
                 queue: None,
+                waiting: WaitReason::Person,
             };
         }
         // The diagnostic round is one more, counted in `rounds` as the next
@@ -3312,6 +3344,7 @@ pub fn decide(
                 ),
                 round: Some(MAX_FIX_ROUNDS + 1),
                 queue: None,
+                waiting: WaitReason::Person,
             };
         }
         if marker.rounds >= MAX_FIX_ROUNDS {
@@ -3334,6 +3367,7 @@ pub fn decide(
             },
             round: Some(marker.rounds + 1),
             queue: None,
+            waiting: WaitReason::Person,
         };
     }
     let unwritten = undescribed(pull);
@@ -3380,14 +3414,17 @@ pub fn decide(
     // clean, green one waits for that promotion rather than a label, which
     // would stop its later rounds (agent-board#628).
     if midstream {
-        let why = if !checks.pending.is_empty() {
-            format!("{CHECKS_PENDING}{}", checks.pending.join(", "))
+        return if !checks.pending.is_empty() {
+            step(
+                "wait",
+                format!("{CHECKS_PENDING}{}", checks.pending.join(", ")),
+            )
+            .followed(None)
         } else if pull["mergeable"] != "MERGEABLE" {
-            format!("{MERGEABILITY}{base} not known yet")
+            step("wait", format!("{MERGEABILITY}{base} not known yet")).followed(None)
         } else {
-            PROMOTE_WAIT.to_owned()
+            step("wait", PROMOTE_WAIT)
         };
-        return step("wait", why);
     }
     // agentic-job marks complete work ready itself, so a draft of ours with
     // no checkpoint says nothing of how to go on: a person marks it ready or
@@ -3420,7 +3457,7 @@ pub fn decide(
     match review {
         Some(Review::Approved) => {}
         Some(Review::Withheld) => return step("wait", WITHHELD_WAIT),
-        _ => return step("wait", NO_REVIEW),
+        _ => return unreviewed(NO_REVIEW),
     }
     // Every merge and re-queue ([`queue_step`]) is this step's, so none passes
     // the label on the review job's approval alone.
@@ -3449,12 +3486,13 @@ pub fn decide(
         return step(
             "wait",
             format!("{CHECKS_PENDING}{}", checks.pending.join(", ")),
-        );
+        )
+        .followed(None);
     }
     // GitHub works mergeability out again after every push to either side; an
     // answer that is not in yet is neither a conflict nor a go-ahead.
     if pull["mergeable"] != "MERGEABLE" {
-        return step("wait", format!("{MERGEABILITY}{base} not known yet"));
+        return step("wait", format!("{MERGEABILITY}{base} not known yet")).followed(None);
     }
     // A stacked pull request merged into its lower one's branch would carry
     // its change into that one's unreviewed head; it waits to be retargeted
@@ -3664,6 +3702,8 @@ pub struct Stepped {
     /// When the head was committed or last reviewed, the later, where
     /// either reads.
     pub moved_at: Option<OffsetDateTime>,
+    /// The decision's typed wait semantics, including its start clock.
+    pub waiting: WaitReason,
 }
 
 /// How a [`Stepped`] pull request goes on, as one that waits on it sees it.
@@ -3687,28 +3727,23 @@ pub enum Progress {
 
 impl Stepped {
     pub fn progress(&self) -> Progress {
-        let reason = self.reason.as_str();
-        let followed = reason.contains(RUNNING)
-            || reason.ends_with(OUTAGE_OPEN)
-            || reason.starts_with(CHECKS_PENDING)
-            || (reason.starts_with(MERGEABILITY) && reason.ends_with(" not known yet"))
-            || reason.contains(AHEAD_IN_QUEUE)
-            || reason == CLAIM_AWAITING
-            || reason == RERUN_UNFINISHED
-            || reason == REVIEW_RESERVED
-            || reason == REVIEW_CLAIMED
-            || (reason.starts_with("the review job's run ") && reason.ends_with(REVIEWS_THE_HEAD));
         match self.action {
             "needs-human" => Progress::Person,
-            "skip" if matches!(reason, QUEUED | AUTO_MERGE) => Progress::Waiting,
-            "skip" => Progress::Person,
-            "wait" if followed => Progress::Waiting,
-            "wait" if reason.starts_with(NO_REVIEW) => Progress::Unreviewed,
-            // Anything else a wait says only a person moves: unknown is
-            // never taken for moving.
-            "wait" => Progress::Person,
+            "skip" | "wait" => match self.waiting {
+                WaitReason::Followed { .. } => Progress::Waiting,
+                WaitReason::Unreviewed => Progress::Unreviewed,
+                WaitReason::Person => Progress::Person,
+            },
             _ if self.ran => Progress::Moving,
             _ => Progress::Held,
+        }
+    }
+
+    /// A new round/claim on an old head is not already a stale wait.
+    pub fn waiting_since(&self) -> Option<OffsetDateTime> {
+        match self.waiting {
+            WaitReason::Followed { since } => self.moved_at.max(since),
+            _ => self.moved_at,
         }
     }
 }
@@ -4941,7 +4976,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if orphan.is_some() || receipt.is_none() {
             return Ok(orphan.map(|(_, at)| {
                 if age(at.as_deref()).is_some_and(|age| age < CHECK_RERUN_START_SECONDS) {
-                    step("wait", CLAIM_AWAITING)
+                    step("wait", CLAIM_AWAITING).followed(timestamp(at.as_deref()))
                 } else {
                     step(
                         "needs-human",
@@ -5005,7 +5040,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             RERUN_WINDOW_SECONDS
         };
         Ok(Some(if elapsed.is_some_and(|age| age < limit) {
-            step("wait", RERUN_UNFINISHED)
+            step("wait", RERUN_UNFINISHED).followed(timestamp(receipt["checks_at"].as_str()))
         } else {
             step(
                 "needs-human",
@@ -5205,7 +5240,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let why = format!(
                 "{NO_REVIEW}, and the review job has more runs since yesterday than the {REVIEW_DISPATCH_READS} read"
             );
-            return Ok(Some((step("wait", why), None)));
+            return Ok(Some((unreviewed(why), None)));
         };
         let mine: Vec<Value> = runs
             .into_iter()
@@ -5221,7 +5256,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let why = format!(
                 "the review job's run https://github.com/{repo}/actions/runs/{id}{REVIEWS_THE_HEAD}"
             );
-            return Ok(Some((step("wait", why), None)));
+            return Ok(Some((
+                step("wait", why).followed(timestamp(newest["created_at"].as_str())),
+                None,
+            )));
         }
         if !self.config.policy.reruns && !self.config.policy.unstall {
             return Ok(ordinary_reviews(self.config, repo).then(|| {
@@ -5345,7 +5383,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let age = timestamp(at.as_deref()).map(|at| (self.now - at).whole_seconds());
         if age.is_some_and(|age| age < REVIEW_START_SECONDS) {
             self.reviewing += 1;
-            waiting
+            waiting.followed(timestamp(at.as_deref()))
         } else {
             step("needs-human", stop)
         }
@@ -6354,6 +6392,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             reason: reason.clone(),
             ran: self.apply.is_none(),
             moved_at: moved_at(listed),
+            waiting: WaitReason::Person,
         });
         let line = format!("{repo}#{number} {} skip: {reason}", short(head));
         (line, false, Some(wait), stepped)
@@ -6691,7 +6730,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     "{ahead}{AHEAD_IN_QUEUE}{} after it",
                     if rebase { "rebased" } else { "queued" }
                 ),
-            );
+            )
+            .followed(None);
         }
         // GitHub refuses to merge it directly (#273), and the branch is its
         // author's to update; the bot's own is updated where it is taken,
@@ -7038,6 +7078,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             reason: decision.reason.clone(),
             ran,
             moved_at: moved_at(&pull),
+            waiting: decision.waiting,
         });
         if deferred {
             // A pull request inherits the best rank of the board issues it
@@ -13366,6 +13407,20 @@ mod tests {
         for (claim, at, attempt, status, expected) in [
             (true, Some("2026-10-12T01:59:00Z"), 1, "completed", " wait:"),
             (
+                false,
+                Some("2026-10-12T01:59:00Z"),
+                1,
+                "completed",
+                " wait:",
+            ),
+            (
+                false,
+                Some("2026-10-12T01:00:00Z"),
+                2,
+                "in_progress",
+                " wait:",
+            ),
+            (
                 true,
                 Some("2026-10-12T01:00:00Z"),
                 1,
@@ -13428,6 +13483,22 @@ mod tests {
             )
             .unwrap();
             assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let step = outcome
+                .steps
+                .iter()
+                .find(|step| step.number == 470)
+                .unwrap();
+            if expected == " wait:" {
+                assert_eq!(
+                    step.waiting,
+                    WaitReason::Followed {
+                        since: timestamp(at)
+                    }
+                );
+                assert_eq!(step.progress(), Progress::Waiting);
+            } else {
+                assert_eq!(step.progress(), Progress::Person);
+            }
             assert!(
                 outcome.lines.iter().any(|l| l.contains(expected)),
                 "{:?}",
@@ -14206,6 +14277,34 @@ mod tests {
             assert_eq!(written(&fake.writes), writes, "{name}");
             assert!(dispatcher.writes.borrow().is_empty(), "{name}");
             assert_eq!(outcome.reviewing, reviewing, "{name}");
+            let step = outcome
+                .steps
+                .iter()
+                .find(|step| step.number == 470)
+                .unwrap();
+            let since = if line == wait(REVIEW_RESERVED) || line == wait(REVIEW_CLAIMED) {
+                Some(recent)
+            } else if line
+                == wait(&format!(
+                    "the review job's run https://github.com/{REPO}/actions/runs/77 reviews the head"
+                ))
+            {
+                Some("2026-10-12T01:00:00Z")
+            } else {
+                None
+            };
+            if let Some(since) = since {
+                assert_eq!(
+                    step.waiting,
+                    WaitReason::Followed {
+                        since: timestamp(Some(since))
+                    },
+                    "{name}"
+                );
+                assert_eq!(step.progress(), Progress::Waiting, "{name}");
+            } else if step.action == "wait" {
+                assert_eq!(step.progress(), Progress::Unreviewed, "{name}");
+            }
             // A rerun is a dispatch too, as its run takes a slot.
             let started = writes.iter().any(|w| w.ends_with("/dispatches"));
             let rerun = writes.iter().any(|w| w.ends_with("/rerun-failed-jobs"));
@@ -17553,81 +17652,135 @@ mod tests {
     /// request makes of it ([`Stepped::progress`]): only those the poll
     /// follows by itself move it, and one it does not know does not.
     #[test]
+    fn decided_wait_kinds() {
+        for (change, action, waiting) in [
+            (
+                json!({"mergeQueueEntry": {}}),
+                "skip",
+                WaitReason::Followed { since: None },
+            ),
+            (
+                json!({"autoMergeRequest": {}}),
+                "skip",
+                WaitReason::Followed { since: None },
+            ),
+            (
+                json!({"contexts": {"ci": {"status": "IN_PROGRESS", "conclusion": null}}}),
+                "wait",
+                WaitReason::Followed { since: None },
+            ),
+            (
+                json!({"mergeable": "UNKNOWN"}),
+                "wait",
+                WaitReason::Followed { since: None },
+            ),
+            (
+                json!({"reviews": {"nodes": []}}),
+                "wait",
+                WaitReason::Unreviewed,
+            ),
+            (
+                json!({"labels": {"nodes": [{"name": LABEL}]}}),
+                "skip",
+                WaitReason::Person,
+            ),
+            (
+                json!({"labels": {"nodes": [{"name": OPERATOR_APPROVAL_LABEL}]}}),
+                "wait",
+                WaitReason::Person,
+            ),
+        ] {
+            let pull = pull("pull-470", change.clone());
+            let decision = decide(
+                &config(),
+                &pull,
+                &classify_checks(&pull, &required()),
+                &Marker::default(),
+                (None, review_run(&pull).as_ref()),
+                &Outages::Off,
+                now(),
+            );
+            assert_eq!(decision.action, action, "{change}: {}", decision.reason);
+            assert_eq!(decision.waiting, waiting, "{change}: {}", decision.reason);
+        }
+    }
+
+    #[test]
+    fn round_wait_clocks_and_outage_refund() {
+        let cfg = config();
+        let recent = now() - time::Duration::hours(1);
+        let older = now() - time::Duration::hours(2);
+        let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+        for (marker_at, run_at, expected) in [
+            (Some(stamp(recent)), None, Some(recent)),
+            (None, Some(stamp(recent)), Some(recent)),
+            (Some(stamp(older)), Some(stamp(recent)), Some(recent)),
+            (Some(stamp(recent)), Some(stamp(older)), Some(recent)),
+            (Some("invalid".into()), Some(stamp(recent)), Some(recent)),
+            (None, None, None),
+        ] {
+            // A named run can still be unlisted, so the dispatch marker is
+            // sufficient, and missing timestamps never become the pass clock.
+            let marker = Marker {
+                run: Some(7),
+                at: marker_at,
+                ..Marker::default()
+            };
+            let run = json!({"status": "in_progress", "created_at": run_at});
+            let decision = started(
+                &cfg,
+                &marker,
+                (Some(&run), &Outages::Off),
+                HEAD,
+                "test",
+                now(),
+            );
+            assert_eq!(decision.action, "wait");
+            assert_eq!(decision.waiting, WaitReason::Followed { since: expected });
+        }
+        let marker = Marker {
+            run: Some(7),
+            ..Marker::default()
+        };
+        let run =
+            json!({"status": "completed", "conclusion": "failure", "updated_at": stamp(recent)});
+        for (to, action, waiting) in [
+            (None, "wait", WaitReason::Followed { since: Some(older) }),
+            (Some(now()), "refund", WaitReason::Person),
+        ] {
+            let outages = Outages::Read(vec![Window {
+                issue: "o/r#9".into(),
+                from: older,
+                to,
+            }]);
+            let decision = started(&cfg, &marker, (Some(&run), &outages), HEAD, "test", now());
+            assert_eq!(decision.action, action);
+            assert_eq!(decision.waiting, waiting);
+            let step = Stepped {
+                repository: "o/r".into(),
+                number: 1,
+                head: HEAD.into(),
+                action,
+                reason: "diagnostic changed".into(),
+                ran: true,
+                moved_at: None,
+                waiting,
+            };
+            assert_eq!(
+                step.progress(),
+                if action == "wait" {
+                    Progress::Waiting
+                } else {
+                    Progress::Moving
+                }
+            );
+        }
+    }
+
+    #[test]
     fn wait_progress_table() {
         use Progress::*;
-        let url = "https://github.com/o/r/actions/runs/7";
-        let approval = format!(
-            "labelled {OPERATOR_APPROVAL_LABEL} (it or an issue it closes); it needs cgwalters's approval of the head"
-        );
-        let waits = [
-            (
-                format!(
-                    "fix round 1's run {url} ended (failure) during the broker outage https://github.com/o/t/issues/9{OUTAGE_OPEN}"
-                ),
-                Waiting,
-            ),
-            (format!("fix round 1{RUNNING}abc"), Waiting),
-            (
-                "more checks than one query reads; not decided on part of them".into(),
-                Person,
-            ),
-            (
-                "undescribed; waiting for approval and green checks before retitling".into(),
-                Person,
-            ),
-            (WITHHELD_WAIT.into(), Person),
-            (NO_REVIEW.into(), Unreviewed),
-            (approval, Person),
-            (
-                format!(
-                    "{OPERATOR_PATHS_WAIT}it changes .github/pass.json; it needs cgwalters's approval of the head"
-                ),
-                Person,
-            ),
-            (format!("{CHECKS_PENDING}ci"), Waiting),
-            (format!("{MERGEABILITY}main not known yet"), Waiting),
-            (
-                "the default branch is not known; merged only into it".into(),
-                Person,
-            ),
-            (
-                "its base b is not the default branch main; merged only into that".into(),
-                Person,
-            ),
-            (
-                "approved before its base became b; the head needs a review against it".into(),
-                Person,
-            ),
-            (CLAIM_AWAITING.into(), Waiting),
-            (RERUN_UNFINISHED.into(), Waiting),
-            (REVIEW_RESERVED.into(), Waiting),
-            (REVIEW_CLAIMED.into(), Waiting),
-            (
-                format!(
-                    "{NO_REVIEW}, and the review job has more runs since yesterday than the {REVIEW_DISPATCH_READS} read"
-                ),
-                Unreviewed,
-            ),
-            (
-                format!("the review job's run {url}{REVIEWS_THE_HEAD}"),
-                Waiting,
-            ),
-            (format!("o/r#3{AHEAD_IN_QUEUE}rebased after it"), Waiting),
-            (
-                "pr.noMerge: merging into this base repository is disabled".into(),
-                Person,
-            ),
-            (PROMOTE_WAIT.into(), Person),
-            ("a wait nobody wrote yet".into(), Person),
-        ];
-        // One case a wait the poll decides, and one it does not know.
-        let source = include_str!("poll.rs");
-        let code: String = source[..source.find("mod tests {").unwrap()]
-            .split_whitespace()
-            .collect();
-        let decided = code.matches(r#"step("wait","#).count() + code.matches(r#"{"wait"}"#).count();
-        assert_eq!(waits.len(), decided + 1, "a wait without a case");
-        let stepped = |action, reason: &str, ran| Stepped {
+        let stepped = |action, reason: &str, ran, waiting| Stepped {
             repository: "o/r".into(),
             number: 1,
             head: "abc".into(),
@@ -17635,13 +17788,17 @@ mod tests {
             reason: reason.into(),
             ran,
             moved_at: None,
+            waiting,
         };
-        for (reason, progress) in &waits {
-            assert_eq!(
-                stepped("wait", reason, false).progress(),
-                *progress,
-                "{reason}"
-            );
+        for (waiting, progress) in [
+            (WaitReason::Followed { since: None }, Waiting),
+            (WaitReason::Unreviewed, Unreviewed),
+            (WaitReason::Person, Person),
+        ] {
+            // Diagnostic wording is not part of the progress protocol.
+            for reason in ["changed wording", RUNNING, NO_REVIEW, OUTAGE_OPEN] {
+                assert_eq!(stepped("wait", reason, false, waiting).progress(), progress);
+            }
         }
         for (action, reason, ran, progress) in [
             ("fix", "conflicts with main", true, Moving),
@@ -17653,7 +17810,17 @@ mod tests {
             ("needs-human", "2 fix rounds used", true, Person),
         ] {
             assert_eq!(
-                stepped(action, reason, ran).progress(),
+                stepped(
+                    action,
+                    reason,
+                    ran,
+                    if progress == Waiting {
+                        WaitReason::Followed { since: None }
+                    } else {
+                        WaitReason::Person
+                    }
+                )
+                .progress(),
                 progress,
                 "{action}: {reason}"
             );

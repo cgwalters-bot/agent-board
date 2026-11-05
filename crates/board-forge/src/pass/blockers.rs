@@ -48,7 +48,7 @@ enum Seen {
     /// Its step moved it this pass: how.
     Moving(String),
     /// It waits on what stage 2 follows by itself: how, and since when
-    /// its head has not changed, where that reads. A wait as long as
+    /// the wait began or its head last moved, the later. A wait as long as
     /// `overlap.staleHours` is not moving it.
     Waiting {
         how: String,
@@ -79,7 +79,7 @@ fn stepped(step: &Stepped) -> Seen {
         Progress::Moving => Seen::Moving(format!("stage 2 moves it ({said})")),
         Progress::Waiting => Seen::Waiting {
             how: said,
-            since: step.moved_at,
+            since: step.waiting_since(),
         },
         Progress::Held => Seen::Unseen(format!("stage 2's step did not run this pass ({said})")),
         Progress::Unreviewed => still(format!("{said}, and no review of it has come")),
@@ -283,6 +283,13 @@ mod tests {
             reason: reason.into(),
             ran,
             moved_at: at("2026-10-20T00:00:00Z"),
+            waiting: match reason {
+                "fix round 1 is running for abc" | "auto-merge already on" => {
+                    poll::WaitReason::Followed { since: None }
+                }
+                "no approving review of the head yet" => poll::WaitReason::Unreviewed,
+                _ => poll::WaitReason::Person,
+            },
         };
         let still = |why: &str| Seen::Still {
             head: "abc".into(),
@@ -336,6 +343,44 @@ mod tests {
             ),
         ] {
             assert_eq!(stepped(&step), seen, "{step:?}");
+        }
+        // A fresh followed wait on an old head suppresses the held items'
+        // alarms; missing clocks retain the head clock, never the pass clock.
+        for (moved, started, expected) in [
+            (
+                Some("2026-10-20T00:00:00Z"),
+                Some("2026-10-29T00:00:00Z"),
+                Some("2026-10-29T00:00:00Z"),
+            ),
+            (
+                Some("2026-10-30T00:00:00Z"),
+                Some("2026-10-29T00:00:00Z"),
+                Some("2026-10-30T00:00:00Z"),
+            ),
+            (
+                Some("2026-10-20T00:00:00Z"),
+                None,
+                Some("2026-10-20T00:00:00Z"),
+            ),
+            (
+                None,
+                Some("2026-10-29T00:00:00Z"),
+                Some("2026-10-29T00:00:00Z"),
+            ),
+            (None, None, None),
+        ] {
+            let mut step = step("wait", "wording is not a protocol", false);
+            step.moved_at = moved.and_then(at);
+            step.waiting = poll::WaitReason::Followed {
+                since: started.and_then(at),
+            };
+            assert_eq!(
+                stepped(&step),
+                Seen::Waiting {
+                    how: "wait: wording is not a protocol".into(),
+                    since: expected.and_then(at),
+                }
+            );
         }
         let node = |change: Value| {
             let mut node = json!({"state": "OPEN", "isDraft": false, "mergeable": "MERGEABLE",

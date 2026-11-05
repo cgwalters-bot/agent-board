@@ -2241,8 +2241,14 @@ line is `blocker OWNER/REPO#N: stage 2 moves it (ACTION: REASON); it holds
 ITEMS`. A wait stage 2 follows by itself (a round's run, checks pending,
 mergeability not known yet, ahead in the merge queue, a broker outage, a
 check rerun, the review job's run, or a pull request already queued or set
-to auto-merge) counts as moving only until the head has stood still for
-`overlap.staleHours`: then the line is `… stage 2's step has not moved it in
+to auto-merge) counts as moving only for `overlap.staleHours` since the later
+of the head's last movement (commit or review) and the wait's start, where
+known. A round uses its dispatch marker or run creation time, a check rerun
+or review reservation uses its claim/receipt time, a listed review run uses
+its creation time, and an outage uses its window's start. Checks pending,
+mergeability and queue waits have no separate start and keep the head's
+clock. Wait kinds come from the poll's decision, not its reason text. After
+that interval the line is `… stage 2's step has not moved it in
 H hours (…)` and its items' holds stall as before. So do they where the
 step was not taken (`… stage 2's step did not run this pass (…)`: a cap,
 pacing, the poll's dispatch limit, a refused merge, another pass first).
