@@ -12,7 +12,7 @@ pub const MAX_REASON_BYTES: usize = 1024;
 /// Base-owned dispatch must reserve this job name for the review result writer.
 pub const RESULT_JOB: &str = "agent-board-review-result-v1";
 pub const MAX_REVIEW_JOBS: usize = 100;
-pub(super) const REVIEW_TASK: &str = "Review the pinned draft head using the base-owned review task and bounds. Never mark ready, promote, merge, enqueue or fix it. Include exactly one agent-board-draft-review JSON fence in the submitted review using agent-board/draft-review/v1 (docs/poll.md): repository, pr, reviewed_head, title, description, semantic_diff, description_assessment, change_category, risk, evidence, reason. Assess semantics and description, not just paths/size; missing or uncertain evidence is deep.";
+pub(super) const REVIEW_TASK: &str = "Review the pinned draft head using the base-owned review task and bounds. Never mark ready, promote, merge, enqueue or fix it. Include exactly one agent-board-draft-review JSON fence in the submitted review using agent-board/draft-review/v1 (docs/poll.md): repository, pr, reviewed_head, title, description, semantic_diff, description_assessment, change_category, risk, evidence, reason, and architecture_findings (a list of strings) when the architecture pass ran. Assess semantics and description, not just paths/size; missing or uncertain evidence is deep.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +147,10 @@ struct ReviewResult {
     risk: String,
     evidence: String,
     reason: String,
+    /// Absent when the architecture pass skipped the PR; present and empty when
+    /// it ran and found nothing.
+    #[serde(default)]
+    architecture_findings: Option<Vec<String>>,
 }
 
 pub(super) fn eligible(config: &Config, repo: &str, pull: &Value) -> bool {
@@ -272,6 +276,15 @@ fn result(pull: &Value, repo: &str, review: &Value) -> Result<ReviewResult> {
             && r.reviewed_head == text(pull, "/headRefOid"),
         "stale or mismatched review result"
     );
+    // Threat: a structural problem the reviewer reported is buried in quick
+    // because every other criterion passed. Any finding is deep, first.
+    if let Some(findings) = r.architecture_findings.as_ref().filter(|f| !f.is_empty()) {
+        bail!(
+            "architecture review found {} finding(s): {}",
+            findings.len(),
+            findings[0]
+        );
+    }
     ensure!(
         r.title == text(pull, "/title") && r.description == text(pull, "/body"),
         "description changed since review"

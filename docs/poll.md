@@ -142,6 +142,13 @@ evidence/reason, each nonempty, single-line and at most 1024 bytes
 (`MAX_REASON_BYTES`). The whole review body is at most 8192 bytes
 (`MAX_RESULT_BYTES`); larger evidence is deep, not silently truncated into quick.
 
+The optional `architecture_findings` field is the architecture reviewer's
+section (tracker#1228), a list of strings: absent when that pass skipped the
+PR, `[]` when it ran and found nothing. Either way the criteria above decide.
+Any finding makes the draft deep whatever the other criteria say, and the
+published reason is `architecture review found N finding(s): ` followed by
+the first finding (agent-board#651).
+
 Provenance requires the immutable Actions bot identity, a review of the current
 head, a real successful completed run of the configured per-repository review
 dispatch workflow, matching repository/default branch/head title, submission

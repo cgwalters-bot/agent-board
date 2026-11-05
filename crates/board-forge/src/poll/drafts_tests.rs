@@ -137,6 +137,31 @@ fn draft_review_vetoes_forgery_staleness_and_incomplete_reads() {
 }
 
 #[test]
+fn draft_review_architecture_findings_are_always_deep() {
+    let architecture = "architecture review found 1 finding(s): Duplicates the pass's label reconciliation";
+    for (findings, risk, bucket, reason) in [
+        (None, "none", drafts::Bucket::Quick, "Small mechanical spelling correction"),
+        (Some(json!([])), "none", drafts::Bucket::Quick, "Small mechanical spelling correction"),
+        (Some(json!([])), "unknown", drafts::Bucket::Deep, "semantic review failed, mismatched or unknown risk"),
+        (Some(json!(["Duplicates the pass's label reconciliation"])), "none", drafts::Bucket::Deep, architecture),
+        (Some(json!(["Duplicates the pass's label reconciliation"])), "unknown", drafts::Bucket::Deep, architecture),
+    ] {
+        let (mut fake, cfg) = draft_fixture();
+        let p = fake.pulls.get_mut(&470).unwrap();
+        let mut r = draft_result(p);
+        r["risk"] = risk.into();
+        if let Some(findings) = &findings { r["architecture_findings"] = findings.clone(); }
+        p["reviews"]["nodes"][0]["body"] = format!("```{}\n{}\n```\n<!-- gh-aw-agentic-workflow: review, id: 1, run: https://github.com/{DRAFT_REPO}/actions/runs/{REVIEW_RUN} -->", drafts::RESULT_FENCE, r).into();
+        let out = draft_pass(&fake, &cfg, false, None);
+        assert_eq!(out.errors, 0, "{findings:?}: {:?}", out.lines);
+        let assessment = out.waits[0].review_bucket.as_ref().unwrap();
+        assert_eq!((&assessment.bucket, assessment.reason.as_str()), (&bucket, reason), "{findings:?} {risk}");
+        // The reason is what the needs-you data publishes for this member.
+        assert!(out.lines.iter().any(|l| l.contains(reason)), "{:?}", out.lines);
+    }
+}
+
+#[test]
 fn draft_review_interrupted_labels_caps_and_head_races() {
     for interrupted in [false, true] {
         let (mut fake, cfg) = draft_fixture();
