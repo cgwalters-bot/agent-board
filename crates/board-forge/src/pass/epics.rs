@@ -915,11 +915,13 @@ struct Refusal {
 
 /// What one stage 3 has taken: at most `epics.maxAppliesPerPass` applies
 /// and one planning start a pass, and the runs it started or the cap held.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct Turn {
     applied: usize,
     planned: bool,
     starts: usize,
+    /// Only the bounded, opt-in idle path may plan more than one epic.
+    idle: bool,
 }
 
 /// Stage 3's board, the runs in flight, if they were read, and its target.
@@ -956,6 +958,37 @@ pub(super) struct Waited {
     /// Stage 3's board, runs in flight and target, once it finished.
     later: Option<Later>,
     turn: Turn,
+    changed: bool,
+}
+
+/// An idle pass must not turn spare quota into unbounded planning overhead.
+const IDLE_REPLAN_LIMIT: usize = 2;
+const IDLE_RESET_HOURS: i64 = 48;
+
+/// Only fixed provider windows have a reset to spend towards. Grants use a
+/// rolling window, so their apparent deadline is not an idle-spend signal.
+fn underused(snapshot: Option<&Value>, pool: &str, now: OffsetDateTime) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    if fresh(Some(snapshot), now).is_err() {
+        return false;
+    }
+    let entry = &snapshot["pools"][pool];
+    if entry["source"] != "praxis" || entry["hold"] != false {
+        return false;
+    }
+    let Some(reset) = at(&entry["resets_at"]) else {
+        return false;
+    };
+    let left = reset - now;
+    let used = entry["used_percent"].as_f64().unwrap_or(f64::NAN);
+    let allowed = entry["allowed_percent"].as_f64().unwrap_or(f64::NAN);
+    left > time::Duration::ZERO
+        && left <= time::Duration::hours(IDLE_RESET_HOURS)
+        && used >= 0.0
+        && allowed > 0.0
+        && used <= allowed / 2.0
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -969,12 +1002,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut turn = Turn::default();
         if let Err(error) = self.epics_within(&epics.repository, earlier, git_ref, &mut turn) {
             self.holds_whole = false;
-            self.waited = None;
+            self.waited.clear();
             self.report.failures += 1;
             self.line(format!("epics error: {error:#}"));
         }
         let starts = turn.starts;
-        if let Some(waited) = &mut self.waited {
+        for waited in &mut self.waited {
             waited.turn = turn;
         }
         starts
@@ -987,15 +1020,32 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// runs it started or `--max-dispatch` held; `holds`, where stage 4's
     /// holds start, moves down when its hold is taken back.
     pub(super) fn replan_idle(&mut self, free: usize, holds: &mut usize) -> usize {
-        let Some(mut waited) = self.waited.take() else {
-            return 0;
-        };
+        let waiting = std::mem::take(&mut self.waited);
+        let mut started = 0;
+        let mut removed = 0;
+        for mut waited in waiting {
+            if started >= free {
+                break;
+            }
+            // Earlier removals shift the stored stage-3 hold indices.
+            waited.at = waited.at.saturating_sub(removed);
+            let before = *holds;
+            started += self.replan_waited(waited, free - started, holds, started);
+            removed += before - *holds;
+        }
+        started
+    }
+
+    fn replan_waited(
+        &mut self,
+        mut waited: Waited,
+        free: usize,
+        holds: &mut usize,
+        started: usize,
+    ) -> usize {
         let Some((project, slots, target)) = waited.later.take() else {
             return 0;
         };
-        if waited.turn.planned || !self.epic_starts.is_empty() {
-            return 0;
-        }
         // Another epic's planning is spillover too.
         if !self.may_spill(&waited.facts.issue) {
             return 0;
@@ -1008,7 +1058,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             &config.plan_pools,
             self.now,
         );
-        if pool.is_err() || self.budget_hold(1.0).is_some() {
+        let Ok(pool) = pool else {
+            return 0;
+        };
+        if self.budget_hold(1.0).is_some() {
+            return 0;
+        }
+        let bonus = config.idle_replan
+            && waited.changed
+            && self.holds_whole
+            && self.report.failures == 0
+            && self.unconsidered == 0
+            && underused(snapshot.as_ref(), &pool, self.now);
+        if !bonus && (started > 0 || waited.turn.planned || !self.epic_starts.is_empty()) {
             return 0;
         }
         let scope = Scope::Epic(waited.facts.issue.clone());
@@ -1026,6 +1088,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let ask = (why.as_str(), waited.intro.clone(), waited.reuse.as_ref());
         let before = waited.turn.starts;
         let turn = &mut waited.turn;
+        turn.idle = bonus;
+        turn.starts += started;
+        if bonus {
+            self.line(format!(
+                "pools: {pool} under pace near reset; bounded idle replan ({IDLE_REPLAN_LIMIT} per pass)"
+            ));
+        }
         self.plan_now(
             &waited.facts,
             ask,
@@ -1034,7 +1103,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             &target,
             turn,
         );
-        waited.turn.starts - before
+        waited.turn.starts - before - started
     }
 
     /// Whether stage 4 may start something for `issue`'s epic beside the
@@ -1198,8 +1267,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             self.epic(facts, project.as_ref(), slots.as_ref(), &target, turn);
         }
-        if let Some(waited) = &mut self.waited {
-            waited.later = Some((project, slots, target));
+        for waited in &mut self.waited {
+            waited.later = Some((project.clone(), slots.clone(), target.clone()));
         }
         Ok(())
     }
@@ -1460,8 +1529,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Next::Wait { why, hold, early } => {
                 let at = self.report.holds.len();
                 self.epic_held(facts, hold);
-                if early && self.waited.is_none() && busy.is_none() && !turn.planned {
-                    self.waited = Some(Waited {
+                let limit = if self.config.idle_replan {
+                    IDLE_REPLAN_LIMIT
+                } else {
+                    1
+                };
+                if early
+                    && self.waited.len() < limit
+                    && busy.is_none()
+                    && (!turn.planned || self.config.idle_replan)
+                {
+                    self.waited.push(Waited {
                         at,
                         facts: facts.clone(),
                         why: format!("{why}; early"),
@@ -1469,6 +1547,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         reuse: reuse.cloned(),
                         later: None,
                         turn: Turn::default(),
+                        changed: true,
                     });
                 }
             }
@@ -2164,8 +2243,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let at = self.report.holds.len();
             let held = format!("due ({why}); the focus epic {} goes first", focus.display());
             self.epic_held(facts, Hold::new(HoldKind::Focus, held));
-            if self.waited.is_none() {
-                self.waited = Some(Waited {
+            if self.waited.is_empty() {
+                self.waited.push(Waited {
                     at,
                     facts: facts.clone(),
                     why: why.to_owned(),
@@ -2173,6 +2252,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     reuse: reuse.cloned(),
                     later: None,
                     turn: Turn::default(),
+                    changed: false,
                 });
             }
             return;
@@ -2192,7 +2272,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let config = self.config;
         let name = facts.issue.display();
         let due = |kind: HoldKind, then: &str| Hold::new(kind, format!("due ({why}); {then}"));
-        if turn.planned {
+        if turn.planned && !turn.idle {
             self.epic_held(facts, due(HoldKind::Other, "one epic is planned a pass"));
             return;
         }

@@ -2356,6 +2356,12 @@ fn idle_pass_plans_a_waiting_epic_early() {
         }
         if name.starts_with("its last plan had nothing") {
             assert!(lines[0].ends_with(NOT_EARLY), "{}", lines[0]);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("pools: no ready work;"))
+            );
         }
         // The early start's hold is taken back; a waiting one stays.
         let early = expected.contains(&EARLY_890);
@@ -2368,6 +2374,178 @@ fn idle_pass_plans_a_waiting_epic_early() {
                 line.ends_with("; early, with 6 slot(s) free and nothing started"),
                 "{line}"
             );
+        }
+    }
+}
+
+#[test]
+fn idle_replan_requires_fixed_underused_window_near_reset() {
+    assert!(!config(json!({})).idle_replan);
+    assert!(forgejo::check_options(&json!({"idleReplan": true})).is_err());
+    let now = OffsetDateTime::parse(EPICS_READ, &Rfc3339).unwrap();
+    let baseline = json!({"updated_at": EPICS_READ, "pools": {"claude": {
+        "source": "praxis", "hold": false, "used_percent": 50.0,
+        "allowed_percent": 100.0,
+        "resets_at": (now + time::Duration::hours(48)).format(&Rfc3339).unwrap()
+    }}});
+    for (pointer, value, expected) in [
+        ("/pools/claude/used_percent", json!(50.0), true),
+        ("/pools/claude/used_percent", json!(50.01), false),
+        ("/pools/claude/used_percent", json!(-1), false),
+        ("/pools/claude/used_percent", Value::Null, false),
+        ("/pools/claude/allowed_percent", json!(0), false),
+        ("/pools/claude/hold", json!(true), false),
+        ("/pools/claude/source", json!("grant"), false),
+        ("/pools/claude/source", Value::Null, false),
+        ("/pools/claude/resets_at", json!(EPICS_READ), false),
+        ("/pools/claude/resets_at", json!("invalid"), false),
+        (
+            "/pools/claude/resets_at",
+            json!((now + time::Duration::hours(49)).format(&Rfc3339).unwrap()),
+            false,
+        ),
+        (
+            "/updated_at",
+            json!((now - time::Duration::hours(1)).format(&Rfc3339).unwrap()),
+            false,
+        ),
+        (
+            "/updated_at",
+            json!((now + time::Duration::hours(1)).format(&Rfc3339).unwrap()),
+            false,
+        ),
+    ] {
+        let mut snapshot = baseline.clone();
+        *snapshot.pointer_mut(pointer).unwrap() = value.clone();
+        assert_eq!(
+            underused(Some(&snapshot), "claude", now),
+            expected,
+            "{pointer}={value}"
+        );
+    }
+    assert!(!underused(None, "claude", now));
+    assert!(!underused(Some(&baseline), "missing", now));
+}
+
+#[test]
+fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
+    for (name, enabled, edit, count) in [
+        ("default", false, json!({}), 1),
+        ("underused", true, json!({}), 2),
+        ("not under pace", true, json!({"used_percent": 60}), 1),
+        ("rolling grant", true, json!({"source": "grant"}), 1),
+        (
+            "distant reset",
+            true,
+            json!({"resets_at": "2026-10-30T00:00:00Z"}),
+            1,
+        ),
+        ("held pool", true, json!({"hold": true}), 0),
+        ("empty plan", true, json!({}), 1),
+        ("human hold", true, json!({}), 1),
+        ("design hold", true, json!({}), 1),
+        ("busy", true, json!({}), 0),
+        ("one slot", true, json!({}), 1),
+        ("budget", true, json!({}), 0),
+    ] {
+        let mut replay = replay();
+        unfinished(&mut replay);
+        label_596(&mut replay, &["needs-human"]);
+        waiting_766(&mut replay);
+        if name != "busy" {
+            crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        }
+        if name == "human hold" {
+            label(&mut replay, 890, &["needs-human"]);
+        } else if name == "design hold" {
+            label(&mut replay, 890, &["needs-design"]);
+        } else if name == "empty plan" {
+            let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
+                "outcome": "applied", "actions": []});
+            let mut node = comments(&mut replay, COMMENTS_890).last().unwrap().clone();
+            node["url"] =
+                "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098"
+                    .into();
+            node["author"] = json!({"login": "cgwalters-bot"});
+            node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
+            comments(&mut replay, COMMENTS_890).push(node);
+        }
+        let mut snapshot = usage(&mut replay);
+        snapshot["pools"]["claude"] = json!({"source": "praxis", "hold": false,
+            "used_percent": 40, "allowed_percent": 100, "window_minutes": 10080,
+            "observed_at": replay.now.format(&Rfc3339).unwrap(),
+            "resets_at": (replay.now + time::Duration::hours(24)).format(&Rfc3339).unwrap()});
+        snapshot["pools"]["claude"]
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        set_usage(&mut replay, &snapshot);
+        let mut settings = config(
+            json!({"idleReplan": enabled, "triage": name == "busy", "planPools": ["claude"]}),
+        );
+        if name == "one slot" {
+            settings.wip = 3;
+        } else if name == "budget" {
+            settings.budget.as_mut().unwrap().weekly_usd = Some(1.0);
+        }
+        let report = preview(&settings, &replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let starts: Vec<_> = report
+            .lines
+            .iter()
+            .filter(|l| l.starts_with("start planning"))
+            .collect();
+        assert_eq!(starts.len(), count, "{name}: {:#?}", report.lines);
+        assert!(
+            report
+                .holds
+                .iter()
+                .any(|e| matches!(&e.scope, Scope::Epic(i) if i.number == 596))
+        );
+        if name == "underused" {
+            assert!(starts[0].contains("tracker#890"));
+            assert!(starts[1].contains("tracker#766"));
+            assert!(
+                !report.holds.iter().any(
+                    |e| matches!(&e.scope, Scope::Epic(i) if i.number == 890 || i.number == 766)
+                )
+            );
+            assert_eq!(
+                report
+                    .lines
+                    .iter()
+                    .filter(|l| l.contains("under pace near reset"))
+                    .count(),
+                2
+            );
+            for (dispatch, sent) in [(Some(1), 1), (Some(0), 0)] {
+                let capped = block(run(
+                    &replay,
+                    &replay,
+                    &settings,
+                    State::default(),
+                    (
+                        Mode::Preview,
+                        Limits {
+                            dispatch,
+                            ..Limits::default()
+                        },
+                    ),
+                    replay.now,
+                ))
+                .unwrap();
+                assert_eq!(capped.failures, 0, "{:#?}", capped.lines);
+                assert_eq!(
+                    capped
+                        .lines
+                        .iter()
+                        .filter(|l| l.starts_with("start planning"))
+                        .count(),
+                    sent,
+                    "dispatch={dispatch:?}: {:#?}",
+                    capped.lines
+                );
+            }
         }
     }
 }

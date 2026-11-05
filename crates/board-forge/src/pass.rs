@@ -447,6 +447,10 @@ pub struct Config {
     /// Avoid duplicate planning while a PR or research answer owns the work.
     #[serde(default)]
     pub skip_active_work: bool,
+    /// Opt-in: up to two changed epics may be planned early in an idle
+    /// pass when the selected planning pool is under-used near its reset.
+    #[serde(default)]
+    pub idle_replan: bool,
     /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
     /// issue rather than asking the operator; needs `triageFollowUpDays`.
     #[serde(default)]
@@ -2679,7 +2683,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         snapshot: None,
         other: None,
         epic_starts: Vec::new(),
-        waited: None,
+        waited: Vec::new(),
         focus: epics::Focus::default(),
         considered: false,
         probes: BTreeMap::new(),
@@ -2979,8 +2983,8 @@ struct Scheduler<'a, C> {
     other: Option<std::result::Result<Option<String>, String>>,
     /// The epics stage 3 started planning runs on.
     epic_starts: Vec<ItemRef>,
-    /// The epic stage 4 plans early where it would be idle.
-    waited: Option<epics::Waited>,
+    /// The epics stage 4 may plan early where it would be idle.
+    waited: Vec<epics::Waited>,
     /// Stage 4's account of `epics.focus`.
     focus: epics::Focus,
     /// Whether stage 4 has considered a candidate, after which a budget
@@ -3378,6 +3382,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
         if taken == 0 && free > 0 {
+            if earlier == 0 && self.holds_whole && self.report.failures == 0 {
+                self.line("pools: no ready work; unused headroom does not release holds".into());
+            }
             self.line(format!("idle: {free} slot(s) free and nothing started"));
         }
         self.stall(holds, (earlier, taken, free), newest);

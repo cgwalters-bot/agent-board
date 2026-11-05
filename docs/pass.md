@@ -933,6 +933,34 @@ their wait, and an epic a person holds (`needs-human`, `needs-design`,
 board Blocked) or with a planning run or request in flight is never one.
 Where stage 4 starts anything, the wait stands.
 
+Idle capacity is not permission to spend more on planning. To avoid turning
+every quiet pass into extra overhead, `idleReplan` is **off by default**.
+On GitHub, setting it to `true` lets an otherwise idle stage 4 bring forward
+at most **two** changed live epics, in Priority order, even if stage 3 already
+planned one. It reuses the existing early-planning path; it does not make a
+pending apply, an empty plan's backoff, a human/design/board hold, an unchanged
+epic, or an in-flight planning request eligible. Stage 4 must have completed
+its candidate checks without failures or unread candidates.
+
+The selected `planPools` pool must have fresh usage from a fixed provider
+window (`source: "praxis"`), be unheld, have used at most half its positive
+`allowed_percent` (not its burst allowance), and reset in more than zero and
+at most 48 hours. A rolling grant has no reset deadline and never qualifies.
+Each attempt still uses the existing pool choice, dollar budget, WIP, leases,
+overlap, request/time reserve and `--max-dispatch`/`--max-writes` checks. No
+pool is activated and no cap is raised. The reason is logged as
+`pools: P under pace near reset; bounded idle replan (2 per pass)`.
+Without this setting or signal, the existing one-epic idle fallback remains.
+An otherwise successful pass with free slots and no start in any stage prints
+`pools: no ready work; unused headroom does not release holds` beside its
+`idle:` line, so available quota is not mistaken for ready work.
+
+The caller is external: in `cgwalters-forge/tracker`, set `.github/pass.json`
+`idleReplan` to `true` to enable it after deploying the reviewed revision.
+Backlog discovery and automatic activation of heavy pools are not implemented
+by this option; effort routing and approval holds are unchanged. Forgejo
+refuses the option rather than silently ignoring it.
+
 The opt-in supervisor [`plan_epic`](supervisor-requests.md#lines) action is an
 explicit exception: its executor's exact fixed marker comment, authored by the
 configured bot and unedited, newer than the epic's last planning request,
@@ -3209,6 +3237,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
+| `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is at most half pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
