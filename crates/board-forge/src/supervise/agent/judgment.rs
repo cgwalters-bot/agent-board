@@ -17,9 +17,170 @@ pub const ACTIONS: &[&str] = &[
     "close",
     "remove_needs_human",
     "clear_needs_human",
+    "release_listed",
     "replace_state",
     "status_update",
 ];
+
+/// An entry of `agent.releaseList` in the caller's supervisor file, whose
+/// changes need the operator's approval: the authority for `release_listed`,
+/// so one approval stands for many `/release` comments.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Release {
+    /// `owner/repo#N`.
+    pub item: String,
+    /// REST issue-event ID of the approved `needs-human` label addition.
+    #[serde(rename = "holdEvent")]
+    pub hold_event: u64,
+    /// One line, posted on the item before its hold comes off.
+    pub reason: String,
+    /// Close the issue too, as resolved or obsolete.
+    #[serde(default)]
+    pub close: Option<CloseReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseReason {
+    Completed,
+    NotPlanned,
+}
+
+/// The longest release list: it is shown to the agent, whose task is bounded.
+const MAX_RELEASES: usize = 200;
+/// Labels that mark a topic only the operator decides: credentials, upstream
+/// posting, rulesets, security disclosure, budget, and bounds, `follow` or
+/// target changes. A reviewer approving a long list could pass over one such
+/// row, or the label could come after the review; either way its item stays
+/// the operator's to release.
+const OPERATOR_ONLY: &[&str] = &[
+    "credentials",
+    "upstream",
+    "ruleset",
+    "security",
+    "budget",
+    "bounds",
+    "scope",
+    "operator-action",
+    "needs-operator",
+    "needs-operator-approval",
+];
+
+/// `agent.releaseList`, checked: full refs, each once, with a one-line
+/// reason that cannot forge a protocol marker.
+pub fn release_list(value: Option<&Value>) -> Result<Vec<Release>> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(vec![]);
+    };
+    let list: Vec<Release> =
+        serde_json::from_value(value.clone()).context("supervisor agent.releaseList")?;
+    ensure!(
+        list.len() <= MAX_RELEASES,
+        "supervisor agent.releaseList: at most {MAX_RELEASES} entries"
+    );
+    let mut seen = BTreeSet::new();
+    for r in &list {
+        ensure!(
+            r.hold_event > 0,
+            "supervisor agent.releaseList: holdEvent must be positive"
+        );
+        let (repo, n) = changes::parse_ref(&r.item).with_context(|| {
+            format!(
+                "supervisor agent.releaseList: {:?} is not owner/repo#N",
+                r.item
+            )
+        })?;
+        ensure!(
+            seen.insert((repo.to_ascii_lowercase(), n)),
+            "supervisor agent.releaseList: {} is listed twice",
+            r.item
+        );
+        text(&r.reason, NOTE_LIMIT, true, &Footer::default())
+            .and_then(|()| {
+                ensure!(!r.reason.contains(['\n', '\r']), "A reason is one line");
+                Ok(())
+            })
+            .with_context(|| format!("supervisor agent.releaseList: {}'s reason", r.item))?;
+    }
+    Ok(list)
+}
+
+/// The release list's entry for `item`, if it has one.
+fn listed<'p>(p: &'p Policy, repo: &str, item: u64) -> Option<&'p Release> {
+    p.agent.release_list.iter().find(|r| {
+        changes::parse_ref(&r.item).is_some_and(|(r, n)| r.eq_ignore_ascii_case(repo) && n == item)
+    })
+}
+
+/// Why a listed item needs no release now, read from `issue` as it is; an
+/// error where the release is refused. `allow_closed` is only for the final
+/// label removal after this apply has successfully closed the issue.
+fn release_check(
+    api: &dyn Api,
+    repo: &str,
+    item: u64,
+    issue: &Value,
+    entry: &Release,
+    allow_closed: bool,
+) -> Result<Option<Skipped>> {
+    ensure!(issue["labels"].is_array(), "Missing target labels");
+    // Preflight refuses an epic; the apply's read must too.
+    ensure!(
+        !has_label(issue, "epic"),
+        "The epic is not a supervisor target"
+    );
+    ensure!(
+        !OPERATOR_ONLY.iter().any(|l| has_label(issue, l)),
+        "The item carries an operator-only label"
+    );
+    ensure!(
+        entry.close.is_none() || issue.get("pull_request").is_none_or(Value::is_null),
+        "The release list closes issues, not pull requests"
+    );
+    if issue["state"] != "open" && !(allow_closed && issue["state"] == "closed") {
+        return Ok(Some(Skipped("no longer open")));
+    }
+    if !has_label(issue, NEEDS_HUMAN) {
+        return Ok(Some(Skipped("no longer held")));
+    }
+    // An approval belongs to one label addition, not to the item forever.
+    // Include the event ID in the ordering: a release and re-hold can happen
+    // within the same timestamp second. Pagination fails closed.
+    let mut latest = None;
+    for e in paged(api, repo, item, "events")? {
+        if e["event"] == "labeled"
+            && e["label"]["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(NEEDS_HUMAN))
+        {
+            let id = e["id"]
+                .as_u64()
+                .filter(|id| *id > 0)
+                .context("Label event ID")?;
+            let at = millis(&e["created_at"]).context("Label timestamp")?;
+            latest = latest.max(Some((at, id)));
+        }
+    }
+    let (_, id) = latest.context("No label provenance")?;
+    ensure!(
+        id == entry.hold_event,
+        "The current hold is not the approved holdEvent"
+    );
+    Ok(None)
+}
+
+/// A request with nothing left to do, which is not a failure of the batch.
+#[derive(Debug)]
+pub struct Skipped(pub &'static str);
+
+impl std::fmt::Display for Skipped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Skipped {}
 
 /// What shows that the operator no longer waits on an item held
 /// `needs-human`: facts the executor reads, never the agent's reading of
@@ -88,6 +249,13 @@ pub enum Write {
         evidence: Evidence,
         #[serde(default)]
         comment: Option<u64>,
+    },
+    /// Takes `needs-human` off an item [`Release`] names, after posting its
+    /// reason, and closes it where the entry says to. The operator-approved
+    /// list is the authority; the agent only chooses when.
+    ReleaseListed {
+        repository: String,
+        item: u64,
     },
     ReplaceState {
         body: String,
@@ -304,6 +472,7 @@ impl Checked {
                 Write::Close { .. } => "close",
                 Write::RemoveNeedsHuman { .. } => "remove_needs_human",
                 Write::ClearNeedsHuman { .. } => "clear_needs_human",
+                Write::ReleaseListed { .. } => "release_listed",
                 Write::ReplaceState { .. } => "replace_state",
                 Write::StatusUpdate { .. } => "status_update",
             },
@@ -321,6 +490,7 @@ impl Checked {
                     repository, item, ..
                 }
                 | Write::RemoveNeedsHuman { repository, item }
+                | Write::ReleaseListed { repository, item }
                 | Write::ClearNeedsHuman {
                     repository, item, ..
                 },
@@ -411,6 +581,10 @@ impl Checked {
                     ensure!(*triage_comment > 0, "Missing triage receipt");
                 }
                 Write::RemoveNeedsHuman { .. } => (),
+                Write::ReleaseListed { repository, item } => ensure!(
+                    listed(p, repository, *item).is_some(),
+                    "The item is not on the release list"
+                ),
                 Write::ClearNeedsHuman {
                     evidence, comment, ..
                 } => ensure!(
@@ -558,6 +732,12 @@ impl Checked {
                 }
                 Self::Write(Write::ClearNeedsHuman { comment, .. }) => {
                     settled(api, p, repo, item, *comment)?;
+                }
+                // One no longer held passes here and is skipped when applied.
+                Self::Write(Write::ReleaseListed { .. }) => {
+                    let entry =
+                        listed(p, repo, item).context("The item is not on the release list")?;
+                    release_check(api, repo, item, &issue, entry, false)?;
                 }
                 _ => (),
             }
@@ -732,6 +912,56 @@ impl Checked {
                         format!("/repos/{repository}/issues/{item}/labels/needs-human"),
                         json!({}),
                     )
+                }
+                Write::ReleaseListed { repository, item } => {
+                    let entry = listed(p, repository, *item)
+                        .context("The item is not on the release list")?;
+                    // Read again: the operator, or an earlier request, may
+                    // have settled or relabelled it since the check.
+                    let path = format!("/repos/{repository}/issues/{item}");
+                    if let Some(skip) =
+                        release_check(api, repository, *item, &api.get(&path)?, entry, false)?
+                    {
+                        return Err(skip.into());
+                    }
+                    let what = if entry.close.is_some() {
+                        "Closed"
+                    } else {
+                        "Released from `needs-human`"
+                    };
+                    let note = format!("{what} on the operator's release list: {}", entry.reason);
+                    api.send(
+                        "POST",
+                        &format!("{path}/comments"),
+                        &json!({"body": signed(&note, None, &p.settings.footer)}),
+                    )?;
+                    // A human can re-hold the item while the comment is sent.
+                    if let Some(skip) =
+                        release_check(api, repository, *item, &api.get(&path)?, entry, false)?
+                    {
+                        return Err(skip.into());
+                    }
+                    // Closed before the hold comes off: a failed close must
+                    // not leave an obsolete issue open and dispatchable.
+                    if let Some(reason) = entry.close {
+                        let reason = match reason {
+                            CloseReason::Completed => "completed",
+                            CloseReason::NotPlanned => "not_planned",
+                        };
+                        api.send(
+                            "PATCH",
+                            &path,
+                            &json!({"state": "closed", "state_reason": reason}),
+                        )?;
+                        // The close is another network write: do not remove a
+                        // new hold imposed in the meantime.
+                        if let Some(skip) =
+                            release_check(api, repository, *item, &api.get(&path)?, entry, true)?
+                        {
+                            return Err(skip.into());
+                        }
+                    }
+                    ("DELETE", format!("{path}/labels/{NEEDS_HUMAN}"), json!({}))
                 }
                 Write::ReplaceState { body } => {
                     let s = p.agent.state.as_ref().context("No state issue")?;

@@ -503,6 +503,7 @@ A complete supervisor file:
       "close": 2,
       "remove_needs_human": 1,
       "clear_needs_human": 4,
+      "release_listed": 10,
       "replace_state": 4,
       "status_update": 1
     },
@@ -512,7 +513,11 @@ A complete supervisor file:
     "project": "PVT_CONFIGURED_NODE_ID",
     "profile": {"repository": "OWNER/agenthome", "ref": "0123456789abcdef0123456789abcdef01234567"},
     "skipUnchangedFailures": false,
-    "passConfig": ".github/pass.json"
+    "passConfig": ".github/pass.json",
+    "releaseList": [
+      {"item": "OWNER/repo#7", "holdEvent": 123456, "reason": "Answered on OWNER/tracker#12."},
+      {"item": "OWNER/repo#8", "holdEvent": 123457, "reason": "Obsolete since the rewrite.", "close": "not_planned"}
+    ]
   }
 }
 ```
@@ -566,7 +571,7 @@ while it is left out, so a dropped or misspelled key is seen:
   (the pools file's pool the agent's run uses) and `agent.cooldownHours` (how
   long after an agent run a failing check may start another, a positive number) are
   required. The cooldown applies outside the daily pass. `kinds`, `maxDispatchesPerPass`, `maxDispatchesPerDay`,
-  `dailyCaps`, `tracker`, `state`, `project` and `passConfig` are described below;
+  `dailyCaps`, `tracker`, `state`, `project`, `passConfig` and `releaseList` are described below;
   `profile` and `skipUnchangedFailures` under [workflow steps](#workflow-steps).
   The health pass reads `passConfig` too: the `held` check leaves out a draft
   pull request whose base repository is in its `pr.noMerge`, the operator's
@@ -633,6 +638,7 @@ The examples below show all fields for each action; none accepts extra fields.
 {"type":"supervisor_action","action":"remove_needs_human","repository":"OWNER/repo","item":2}
 {"type":"supervisor_action","action":"clear_needs_human","repository":"OWNER/repo","item":5,"evidence":"operator_comment","comment":901}
 {"type":"supervisor_action","action":"clear_needs_human","repository":"OWNER/repo","item":6,"evidence":"closed"}
+{"type":"supervisor_action","action":"release_listed","repository":"OWNER/repo","item":7}
 {"type":"supervisor_action","action":"replace_state","body":"Arbitrary memory, including structured state."}
 {"type":"supervisor_action","action":"status_update","status":"on-track","summary":"What it means.","notes":{"OWNER/repo#1":"Why it matters."}}
 ```
@@ -808,6 +814,35 @@ a decision made elsewhere) is not evidence: without this rule, a
 prompt-injected agent could release any of the operator's holds and so get
 the work dispatched. The action has no text and sets no project field: it never answers a
 question for the operator nor writes Priority.
+
+`release_listed` releases holds the operator has approved in bulk
+(agent-board#704), so that one approval of the list replaces a `/release`
+comment per item. Its authority is `agent.releaseList` in the supervisor
+file: at most 200 entries, each `item` (`owner/repo#N`, once), `holdEvent`
+(the positive REST issue-event ID of the approved `needs-human` label addition), `reason` (one
+line of at most 280 characters, without fences or HTML comment markers) and
+optionally `close` (`completed` or `not_planned`), for an issue that is
+resolved or obsolete. The caller must make that file a `pr.operatorPaths`
+entry, so that a change to the list needs the operator's approval; nothing
+here checks that. The agent only
+chooses which listed items to ask for, and sees their refs, not their
+reasons. Off unless `dailyCaps.release_listed` is set. A request for an
+item the list does not name is refused, as is one whose item carries a
+label of a topic only the operator decides (`credentials`, `upstream`,
+`ruleset`, `security`, `budget`, `bounds`, `scope`, `operator-action`,
+`needs-operator` or `needs-operator-approval`, exactly, in any case), an
+epic, or a `close` entry naming a pull request. Immediately before writing,
+the executor reads the item again: one no longer open or no longer held
+`needs-human` is skipped, logged as such and not a failure. Otherwise it
+posts the entry's reason on the item, with `close` closes the issue with
+that reason, and then removes the label, so that a failed close leaves the
+issue held. Both preflight and apply require the newest `needs-human` label
+addition to match `holdEvent`; missing or incomplete event history fails closed.
+Read the ID from the item's paginated `/repos/OWNER/REPO/issues/N/events`
+REST endpoint when preparing the list. A later hold, including an exhausted-round
+PR or a reopened issue, needs a separately approved entry with its new event ID.
+The comment is the bot's, from the list,
+not the agent's text, so it carries no supervisor note.
 No other label change is supported.
 
 ## Accounting and limits

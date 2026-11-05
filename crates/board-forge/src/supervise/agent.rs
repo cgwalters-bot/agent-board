@@ -248,6 +248,8 @@ pub fn compose(
         "tracker": policy.agent.tracker,
         "bugEpic": policy.agent.bug_epic,
         "project": policy.agent.project,
+        // The items only: the executor posts each one's reason itself.
+        "releaseList": policy.agent.release_list.iter().map(|r| &r.item).collect::<Vec<_>>(),
     });
     // The operator is a checked login ([`Settings::from_json`]), so it
     // cannot add text of its own to the playbook.
@@ -915,6 +917,9 @@ pub fn execute(api: &dyn Api, policy: &Policy, ctx: &Run) -> Outcome {
         let link = r.link(policy, sent.as_ref().ok());
         match sent {
             Ok(_) => lines.push(format!("- {}: done, {link}", r.describe())),
+            Err(error) if error.is::<judgment::Skipped>() => {
+                lines.push(format!("- {}: skipped ({error}), {link}", r.describe()));
+            }
             Err(error) => {
                 // Stop at the first failure: a failing dispatch is likely to fail again.
                 ok = false;

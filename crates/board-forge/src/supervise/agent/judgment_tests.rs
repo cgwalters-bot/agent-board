@@ -1940,3 +1940,443 @@ fn implement_requires_native_membership_under_an_epic_labeled_plan() {
     );
     assert!(run(&fake, &s, RESULT_URL, 1).ok);
 }
+
+fn release_events(fake: &mut Fake, n: u64) {
+    fake.objects.insert(
+        format!("/repos/example/project/issues/{n}/events?per_page=100&page=1"),
+        json!([{"id": 90, "event": "labeled", "label": {"name": "Needs-Human"},
+            "created_at": "2026-10-16T09:00:00Z"}]),
+    );
+}
+
+#[test]
+fn listed_release_requires_complete_hold_provenance() {
+    let mut cfg = supervisor();
+    cfg["agent"]["releaseList"] = json!([
+        {"item": "example/project#9", "holdEvent": 90, "reason": "Settled."}
+    ]);
+    cfg["agent"]["dailyCaps"] = json!({"release_listed": 1});
+    let s = Settings::from_json(&board(), &cfg, None).unwrap();
+    let request = action(
+        "release_listed",
+        json!({"repository": "example/project", "item": 9}),
+    );
+    let event = json!({"id": 90, "event": "labeled", "label": {"name": "needs-human"},
+        "created_at": "2026-10-16T09:00:00Z"});
+    for events in [
+        Value::Null,
+        json!([]),
+        json!([{"event": "labeled", "label": {"name": "needs-human"}, "created_at": "2026-10-16T09:00:00Z"}]),
+        json!([{"id": 90, "event": "labeled", "label": {"name": "needs-human"}}]),
+        json!([{"id": 90, "event": "labeled", "label": {"name": "bug"}, "created_at": "2026-10-16T09:00:00Z"}]),
+        json!(vec![event.clone(); 100]),
+    ] {
+        let mut fake = Fake::new(&block(std::slice::from_ref(&request)));
+        fake.issue(9, json!({"rest": {"labels": [{"name": "needs-human"}]}}));
+        fake.objects.insert(
+            "/repos/example/project/issues/9/events?per_page=100&page=1".into(),
+            events,
+        );
+        let out = run(&fake, &s, RESULT_URL, 1);
+        assert!(!out.ok, "{out:?}");
+        assert!(fake.writes().is_empty());
+    }
+    // The approved event on page one is insufficient when a newer hold is on page two.
+    let mut fake = Fake::new(&block(&[request]));
+    fake.issue(9, json!({"rest": {"labels": [{"name": "needs-human"}]}}));
+    fake.objects.insert(
+        "/repos/example/project/issues/9/events?per_page=100&page=1".into(),
+        json!(vec![event; 100]),
+    );
+    fake.objects.insert("/repos/example/project/issues/9/events?per_page=100&page=2".into(),
+        json!([{"id": 91, "event": "labeled", "label": {"name": "needs-human"}, "created_at": "2026-10-16T10:00:00Z"}]));
+    let out = run(&fake, &s, RESULT_URL, 1);
+    assert!(!out.ok, "{out:?}");
+    assert!(fake.writes().is_empty());
+}
+
+#[test]
+fn listed_release_rechecks_holds_after_its_intermediate_writes() {
+    struct Changing {
+        fake: RefCell<Fake>,
+        during: &'static str,
+        operator_only: bool,
+    }
+
+    impl Api for Changing {
+        fn get(&self, path: &str) -> Result<Value> {
+            self.fake.borrow().get(path)
+        }
+
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            self.fake.borrow().graphql(query, variables)
+        }
+
+        fn download(&self, path: &str, limit: u64) -> Result<Vec<u8>> {
+            self.fake.borrow().download(path, limit)
+        }
+
+        fn send(&self, method: &str, path: &str, body: &Value) -> Result<Value> {
+            let mut fake = self.fake.borrow_mut();
+            let reply = fake.send(method, path, body)?;
+            if method == "PATCH" {
+                fake.objects
+                    .get_mut("/repos/example/project/issues/9")
+                    .unwrap()["state"] = json!("closed");
+            }
+            if method == self.during {
+                if self.operator_only {
+                    fake.objects
+                        .get_mut("/repos/example/project/issues/9")
+                        .unwrap()["labels"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"name": "operator-action"}));
+                } else {
+                    let events = fake
+                        .objects
+                        .get_mut("/repos/example/project/issues/9/events?per_page=100&page=1")
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    events.push(
+                        json!({"id": 91, "event": "unlabeled", "label": {"name": "needs-human"},
+                        "created_at": "2026-10-16T09:00:00Z"}),
+                    );
+                    events.push(
+                        json!({"id": 92, "event": "labeled", "label": {"name": "needs-human"},
+                        "created_at": "2026-10-16T09:00:00Z"}),
+                    );
+                }
+            }
+            Ok(reply)
+        }
+    }
+
+    for (during, close) in [("POST", false), ("POST", true), ("PATCH", true)] {
+        for operator_only in [false, true] {
+            let mut cfg = supervisor();
+            let mut entry =
+                json!({"item": "example/project#9", "holdEvent": 90, "reason": "Settled."});
+            if close {
+                entry["close"] = json!("completed");
+            }
+            cfg["agent"]["releaseList"] = json!([entry]);
+            cfg["agent"]["dailyCaps"] = json!({"release_listed": 1});
+            let s = Settings::from_json(&board(), &cfg, None).unwrap();
+            let p = policy(&s);
+            let request = action(
+                "release_listed",
+                json!({"repository": "example/project", "item": 9}),
+            );
+            let mut requests = judgment::parse_batch(&request.to_string(), &p).unwrap();
+            let mut fake = Fake::new("");
+            fake.issue(9, json!({"rest": {"labels": [{"name": "needs-human"}]}}));
+            release_events(&mut fake, 9);
+            let api = Changing {
+                fake: RefCell::new(fake),
+                during,
+                operator_only,
+            };
+            requests[0].preflight(&api, &p, 0).unwrap();
+            let err = requests[0].apply(&api, &p, &ctx(RESULT_URL)).unwrap_err();
+            let expected = if operator_only {
+                "operator-only label"
+            } else {
+                "not the approved holdEvent"
+            };
+            assert!(err.to_string().contains(expected), "{err:#}");
+            let writes = api.fake.borrow().writes();
+            assert_eq!(writes.len(), if during == "PATCH" { 2 } else { 1 });
+            assert!(writes.iter().all(|(method, _, _)| method != "DELETE"));
+        }
+    }
+}
+
+#[test]
+fn listed_release_cannot_authorize_a_later_hold() {
+    for pr in [false, true] {
+        // Re-hold both after a completed release and between preflight/apply.
+        for released in [false, true] {
+            let mut cfg = supervisor();
+            let mut entry =
+                json!({"item": "example/project#9", "holdEvent": 90, "reason": "Settled."});
+            if !pr {
+                entry["close"] = json!("completed");
+            }
+            cfg["agent"]["releaseList"] = json!([entry]);
+            cfg["agent"]["dailyCaps"] = json!({"release_listed": 2});
+            let s = Settings::from_json(&board(), &cfg, None).unwrap();
+            let p = policy(&s);
+            let request = action(
+                "release_listed",
+                json!({"repository": "example/project", "item": 9}),
+            );
+            let mut requests = judgment::parse_batch(&request.to_string(), &p).unwrap();
+            let mut fake = Fake::new("");
+            let mut issue = json!({"rest": {"labels": [{"name": "needs-human"}]}});
+            if pr {
+                issue["rest"]["pull_request"] = json!({});
+                fake.objects.insert("/repos/example/project/issues/9/comments?per_page=100&page=1".into(),
+                    json!([{"body": "Stopped: 2 fix rounds and a diagnostic round used; needs-human."}]));
+            }
+            fake.issue(9, issue);
+            release_events(&mut fake, 9);
+            requests[0].preflight(&fake, &p, 0).unwrap();
+            let ctx = Run {
+                source: Source::Comment(String::new()),
+                run_url: String::new(),
+                default_branch: "main".into(),
+                attempt: 1,
+                now: 0,
+            };
+            if released {
+                requests[0].apply(&fake, &p, &ctx).unwrap();
+                assert_eq!(fake.writes().len(), if pr { 2 } else { 3 });
+            }
+            let events = fake
+                .objects
+                .get_mut("/repos/example/project/issues/9/events?per_page=100&page=1")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            events.push(
+                json!({"id": 91, "event": "unlabeled", "label": {"name": "needs-human"},
+                "created_at": "2026-10-16T09:00:00Z"}),
+            );
+            if !pr {
+                events.push(
+                    json!({"id": 92, "event": "closed", "created_at": "2026-10-16T09:00:00Z"}),
+                );
+                events.push(
+                    json!({"id": 93, "event": "reopened", "created_at": "2026-10-16T09:00:00Z"}),
+                );
+            }
+            // Same second as the approved hold: the event identity must differ.
+            events.push(
+                json!({"id": 94, "event": "labeled", "label": {"name": "needs-human"},
+                "created_at": "2026-10-16T09:00:00Z"}),
+            );
+            fake.calls.borrow_mut().clear();
+            let err = requests[0].apply(&fake, &p, &ctx).unwrap_err();
+            assert!(
+                err.to_string().contains("not the approved holdEvent"),
+                "{err:#}"
+            );
+            assert!(requests[0].preflight(&fake, &p, 0).is_err());
+            assert!(fake.writes().is_empty(), "pr={pr}, released={released}");
+            // Renewed approval names the new hold, and can release it.
+            cfg["agent"]["releaseList"][0]["holdEvent"] = json!(94);
+            let s = Settings::from_json(&board(), &cfg, None).unwrap();
+            let p = policy(&s);
+            requests[0].preflight(&fake, &p, 0).unwrap();
+            requests[0].apply(&fake, &p, &ctx).unwrap();
+        }
+    }
+}
+
+/// `needs-human` comes off by the release list only for an item it names,
+/// still open and held, and not marked as the operator's alone; within the cap.
+#[test]
+fn a_hold_is_released_only_from_the_operators_release_list() {
+    let mut cfg = supervisor();
+    cfg["agent"]["dailyCaps"] = json!({"release_listed": 2});
+    cfg["agent"]["releaseList"] = json!([
+        {"item": "example/project#9", "holdEvent": 90, "reason": "Answered on example/control#1."},
+        {"item": "Example/Project#11", "holdEvent": 90, "reason": "Obsolete since the rewrite.", "close": "not_planned"}
+    ]);
+    let s = Settings::from_json(&board(), &cfg, None).unwrap();
+    let footer = &s.footer;
+    let release = |n: u64| {
+        action(
+            "release_listed",
+            json!({"repository": "example/project", "item": n}),
+        )
+    };
+    let labels = |names: &[&str]| json!({"rest": {"labels": names.iter().map(|n| json!({"name": n})).collect::<Vec<_>>()}});
+    let held = labels(&["Needs-Human", "bug"]);
+    let issue = |n: u64| format!("/repos/example/project/issues/{n}");
+    let comment = |text: &str| json!({"body": format!("{text}\n\n{footer}")});
+    // Item, its overrides, and the writes after the log's, or None where
+    // the batch is refused before any write.
+    let cases = [
+        (
+            "a listed item",
+            9,
+            held.clone(),
+            Some(vec![
+                (
+                    "POST",
+                    format!("{}/comments", issue(9)),
+                    comment(
+                        "Released from `needs-human` on the operator's release list: Answered on example/control#1.",
+                    ),
+                ),
+                (
+                    "DELETE",
+                    format!("{}/labels/needs-human", issue(9)),
+                    json!({}),
+                ),
+            ]),
+        ),
+        (
+            "a listed item to close",
+            11,
+            held.clone(),
+            Some(vec![
+                (
+                    "POST",
+                    format!("{}/comments", issue(11)),
+                    comment("Closed on the operator's release list: Obsolete since the rewrite."),
+                ),
+                (
+                    "PATCH",
+                    issue(11),
+                    json!({"state": "closed", "state_reason": "not_planned"}),
+                ),
+                (
+                    "DELETE",
+                    format!("{}/labels/needs-human", issue(11)),
+                    json!({}),
+                ),
+            ]),
+        ),
+        (
+            "a listed item no longer held",
+            9,
+            labels(&["bug"]),
+            Some(vec![]),
+        ),
+        (
+            "a listed item closed since",
+            9,
+            json!({"rest": {"state": "closed", "labels": [{"name": "needs-human"}]}}),
+            Some(vec![]),
+        ),
+        ("an unlisted item", 10, held.clone(), None),
+        (
+            "an operator-only label",
+            9,
+            labels(&["needs-human", "Security"]),
+            None,
+        ),
+        (
+            "a pull request to close",
+            11,
+            json!({"rest": {"pull_request": {}, "labels": [{"name": "needs-human"}]}}),
+            None,
+        ),
+    ];
+    for (name, n, overrides, writes) in cases {
+        let mut fake = Fake::new(&block(&[release(n)]));
+        fake.issue(n, overrides);
+        release_events(&mut fake, n);
+        let out = run(&fake, &s, RESULT_URL, 1);
+        let Some(expected) = writes else {
+            assert!(!out.ok, "{name}: {out:?}");
+            assert_eq!(fake.writes(), [], "{name}");
+            continue;
+        };
+        assert!(out.ok, "{name}: {out:?}");
+        let written = fake.writes();
+        assert!(
+            written[0].2["body"]
+                .as_str()
+                .unwrap()
+                .contains(": starting")
+        );
+        let expected: Vec<_> = expected
+            .into_iter()
+            .map(|(m, p, b)| (m.to_owned(), p, b))
+            .collect();
+        assert_eq!(written[1..], expected, "{name}");
+        let outcome = if expected.is_empty() {
+            ": skipped (no longer"
+        } else {
+            ": done"
+        };
+        assert!(out.lines[0].contains(outcome), "{name}: {out:?}");
+    }
+    // Off without a cap, however long the list, and the cap holds once reached.
+    cfg["agent"]["dailyCaps"] = json!({});
+    let off = Settings::from_json(&board(), &cfg, None).unwrap();
+    let mut fake = Fake::new(&block(&[release(9)]));
+    fake.issue(9, held.clone());
+    let out = run(&fake, &off, RESULT_URL, 1);
+    assert!(out.lines[0].contains("action is disabled"), "{out:?}");
+    assert_eq!(fake.writes(), []);
+    let mut fake = Fake::new(&block(&[release(9), release(11), release(9)]));
+    fake.issue(9, held.clone());
+    fake.issue(11, held);
+    release_events(&mut fake, 9);
+    release_events(&mut fake, 11);
+    let out = run(&fake, &s, RESULT_URL, 1);
+    assert!(out.ok, "{out:?}");
+    assert_eq!(out.lines.len(), 3, "{out:?}");
+    assert!(
+        out.lines[2].contains(
+            "dropped `release_listed` example/project #9: The daily release_listed cap is reached"
+        ),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn release_lists_name_each_item_once_with_a_one_line_reason() {
+    let entry = |item: &str, reason: &str| json!({"item": item, "holdEvent": 90, "reason": reason});
+    let many: Vec<Value> = (1..=201)
+        .map(|n| entry(&format!("example/project#{n}"), "Done."))
+        .collect();
+    for (list, accepted) in [
+        (json!([entry("example/project#9", "Done.")]), true),
+        (json!(null), true),
+        (
+            json!([{"item": "example/project#9", "reason": "Done."}]),
+            false,
+        ),
+        (
+            json!([{"item": "example/project#9", "holdEvent": 0, "reason": "Done."}]),
+            false,
+        ),
+        (
+            json!([{"item": "example/project#9", "holdEvent": "90", "reason": "Done."}]),
+            false,
+        ),
+        (json!([entry("example/project#09", "Done.")]), false),
+        (json!([entry("project#9", "Done.")]), false),
+        (
+            json!([
+                entry("example/project#9", "Done."),
+                entry("Example/project#9", "Again.")
+            ]),
+            false,
+        ),
+        (json!([entry("example/project#9", "")]), false),
+        (json!([entry("example/project#9", "Done.\nMore.")]), false),
+        (
+            json!([entry(
+                "example/project#9",
+                "Done. <!-- agent-board-plan-epic -->"
+            )]),
+            false,
+        ),
+        (json!([entry("example/project#9", &"x".repeat(281))]), false),
+        (
+            json!([{"item": "example/project#9", "holdEvent": 90, "reason": "Done.", "close": "merged"}]),
+            false,
+        ),
+        (
+            json!([{"item": "example/project#9", "holdEvent": 90, "reason": "Done.", "label": "bug"}]),
+            false,
+        ),
+        (json!(many), false),
+    ] {
+        let mut cfg = supervisor();
+        cfg["agent"]["releaseList"] = list.clone();
+        assert_eq!(
+            Settings::from_json(&board(), &cfg, None).is_ok(),
+            accepted,
+            "{list}"
+        );
+    }
+}
