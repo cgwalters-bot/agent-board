@@ -1,0 +1,20 @@
+{
+  "schema": "agent-board/needs-you/v2",
+  "group": {"reason": "drafts waiting for promotion", "numbers": [1, 2, 3]},
+  "review_buckets": {
+    "cgwalters-forge/bootc#1": {
+      "bucket": "quick",
+      "assessed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "reason": "Small mechanical spelling correction",
+      "summary": "Inspected README diff: correct spelling only",
+      "ci": "green"
+    },
+    "cgwalters-forge/bootc#2": {
+      "bucket": "deep",
+      "assessed_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "reason": "risky or unknown path: src/install.rs",
+      "summary": "Pending fresh verified semantic review",
+      "ci": "unknown"
+    }
+  }
+}

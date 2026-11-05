@@ -536,6 +536,7 @@ mod tests {
         let on = on_github("a/ops", 1);
         let waits = (1..=2)
             .map(|number| poll::Wait {
+                review_bucket: None,
                 repository: "a/work".into(),
                 number,
                 head: "a".repeat(40),

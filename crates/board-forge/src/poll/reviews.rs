@@ -329,7 +329,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         comments: &[Value],
         marker: &Marker,
     ) -> Result<Option<IntakeStep>> {
-        if pull["isDraft"] != false
+        let draft = drafts::eligible(self.config, repo, pull);
+        if (pull["isDraft"] != false && !draft)
             || pull["baseRepository"]["isPrivate"] != false
             || is_held(pull)
             || labelled(pull)
@@ -353,7 +354,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "invalid review head"
         );
         let mut requested = pull.clone();
-        let command = self.review_command(repo, pull, comments)?;
+        let command = if draft {
+            None
+        } else {
+            self.review_command(repo, pull, comments)?
+        };
         if let Some(command) = command {
             requested["reviewRequest"] = command;
         } else {
@@ -364,7 +369,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 return Ok(None);
             }
             let raw = self.get(&format!("repos/{repo}/pulls/{number}"))?;
-            if raw["state"] != "open" || raw["draft"] != false || text(&raw, "/head/sha") != head {
+            if raw["state"] != "open"
+                || raw["draft"] != pull["isDraft"]
+                || text(&raw, "/head/sha") != head
+            {
                 return Ok(Some((
                     format!("{repo}#{number} wait: review intake changed"),
                     false,

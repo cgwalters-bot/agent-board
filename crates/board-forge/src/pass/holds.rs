@@ -1206,6 +1206,10 @@ pub mod requests;
 /// The needs-you list ([`NEEDS_YOU_SCHEMA`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct NeedsYou {
+    /// Fresh per-member informational assessments, never carried from old asks.
+    /// Absent members (including unread/carried ones) are unknown, not quick.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub review_buckets: BTreeMap<String, crate::poll::drafts::Assessment>,
     pub schema: &'static str,
     /// Whether every source was read whole ([`Read::Complete`] or off) and
     /// none was left out, so that an empty list means nothing waits.
@@ -1523,6 +1527,15 @@ impl NeedsYou {
     /// Evicts detail only; the complete identity inventory stays intact.
     fn cut(&mut self) -> Option<Ask> {
         let ask = self.items.pop()?;
+        let repo = ask.action.repository.to_ascii_lowercase();
+        let numbers = ask
+            .group
+            .as_ref()
+            .map(|g| g.numbers.clone())
+            .unwrap_or_else(|| vec![ask.action.number]);
+        for number in numbers {
+            self.review_buckets.remove(&format!("{repo}#{number}"));
+        }
         self.requests.retain(|r| r.key != ask.key);
         self.request_sources.retain(|r| r.key != ask.key);
         self.summary_cache.remove(&ask.key);
@@ -1538,6 +1551,7 @@ impl NeedsYou {
 /// What one of the needs-you list's own sources read this pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collected {
+    pub review_buckets: BTreeMap<String, crate::poll::drafts::Assessment>,
     pub read: Read,
     pub asks: Vec<Ask>,
     /// Where `read` is partial, the repositories (`owner/repo`) and items
@@ -1554,6 +1568,7 @@ impl Collected {
     pub fn of(read: Read) -> Self {
         Self {
             read,
+            review_buckets: BTreeMap::new(),
             asks: Vec::new(),
             unread: BTreeSet::new(),
         }
@@ -2350,6 +2365,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         .filter(|i| !items.iter().any(|a| a.key == i.detail_key))
         .count();
     let mut list = NeedsYou {
+        review_buckets: reading.reviews.review_buckets.clone(),
         schema: NEEDS_YOU_SCHEMA,
         complete: omitted == 0
             && read
@@ -4256,7 +4272,12 @@ mod tests {
 
     fn collected(read: Read, asks: Vec<Ask>, unread: &[&str]) -> Collected {
         let unread = unread.iter().map(|&u| u.to_owned()).collect();
-        Collected { read, asks, unread }
+        Collected {
+            read,
+            asks,
+            unread,
+            review_buckets: BTreeMap::new(),
+        }
     }
 
     #[test]

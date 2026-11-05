@@ -23,6 +23,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub mod bounds;
 pub mod comments;
+pub mod drafts;
 pub mod lock;
 pub mod notify;
 pub mod pace;
@@ -311,7 +312,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
       series: commits(first: 100) { nodes { commit { oid messageHeadline } } pageInfo { hasNextPage } }
-      commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { contexts(first: 100) { "#,
+      commits(last: 1) { nodes { commit { oid committedDate message statusCheckRollup { state contexts(first: 100) { "#,
     check_fields!(),
     r#" } } } } }
     }
@@ -622,6 +623,7 @@ pub struct PollPolicy {
     pub review_pools: Vec<String>,
     /// Explicit base-repository opt-in to ordinary dispatched review intake.
     pub review_dispatch_repositories: Vec<String>,
+    pub draft_review_repositories: Vec<String>,
     /// Caller workflow already inventoried by pass, to avoid counting its reviews twice.
     pub review_caller_workflow: Option<String>,
     /// The pass's `wip` as the review starts and reruns of
@@ -938,6 +940,7 @@ impl PollPolicy {
             own_space_only: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
+            draft_review_repositories: Vec::new(),
             review_caller_workflow: None,
             review_wip: None,
             review_ranks: BTreeMap::new(),
@@ -3598,6 +3601,7 @@ pub struct Wait {
     pub kind: &'static str,
     /// The step's reason.
     pub reason: String,
+    pub review_bucket: Option<drafts::Assessment>,
 }
 
 /// The step a pass decided for a followed pull request of the bot, at the
@@ -5272,7 +5276,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let (owner, name) = repo.split_once('/').context("review repository")?;
             let current = self.read_pull(owner, name, review.number)?;
             if current["state"] != "OPEN"
-                || current["isDraft"] != false
+                || (current["isDraft"] != false && !drafts::eligible(self.config, repo, &current))
                 || current["headRefOid"] != pull["headRefOid"]
                 || current["baseRefName"] != pull["baseRefName"]
                 || is_held(&current)
@@ -5372,8 +5376,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         );
         self.mark_claim(repo, claim, &mut reserved, &text)?;
         let inputs = if ordinary_reviews(self.config, repo) {
+            let task = if drafts::eligible(self.config, repo, pull) {
+                drafts::REVIEW_TASK
+            } else {
+                "Review the pinned pull request head using the base-owned review task and bounds."
+            };
             json!({"kind": REVIEW, "repo": repo, "item": number.to_string(),
-                "head": head, "pool": pool, "task": "Review the pinned pull request head using the base-owned review task and bounds."})
+                "head": head, "pool": pool, "task": task})
         } else {
             json!({"pr": number.to_string(), "head": head, "pool": pool})
         };
@@ -6178,6 +6187,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             head: head.to_owned(),
             kind: "needs-human",
             reason: needs_you_reason(listed, &reason),
+            review_bucket: None,
         };
         let stepped = (!merge_only).then(|| Stepped {
             repository: repo.to_owned(),
@@ -6339,6 +6349,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 None,
                 None,
             ));
+        }
+        if drafts::eligible(self.config, repo, &pull) {
+            return self.draft_review(repo, &mut pull, &comments, &marker, intake);
         }
         if intake && let Some(result) = self.ordinary_review(repo, &pull, &comments, &marker)? {
             return Ok(result);
@@ -6845,6 +6858,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let wait = operator_wait(&pull, &decision)
             .or_else(|| approval_only.then_some("approve"))
             .map(|kind| Wait {
+                review_bucket: None,
                 repository: repo.to_owned(),
                 number,
                 head: head.to_owned(),
@@ -7266,6 +7280,7 @@ mod tests {
     use std::cell::RefCell;
 
     include!("poll/reviews_tests.rs");
+    include!("poll/drafts_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.
     pub(super) fn marker_body(state: &Value, text: &str) -> String {
@@ -10448,6 +10463,8 @@ mod tests {
     struct Fake {
         /// ETag, Last-Modified, next page and body, by URL.
         rest: BTreeMap<String, Page>,
+        /// Uncached REST races, in response order, then the ordinary page.
+        read_answers: RefCell<BTreeMap<String, Vec<Value>>>,
         /// URLs GitHub answers 404 for.
         missing: Vec<String>,
         pulls: BTreeMap<u64, Value>,
@@ -10534,6 +10551,11 @@ mod tests {
                 _ => true,
             };
             let mut body = body.clone();
+            if let Some(answers) = self.read_answers.borrow_mut().get_mut(url)
+                && !answers.is_empty()
+            {
+                body = answers.remove(0);
+            }
             let posted = format!("POST {API_ROOT}repos/{REPO}/issues/470/comments");
             if url.ends_with("issues/470/comments?per_page=100")
                 && self.writes.borrow().iter().any(|(w, _)| *w == posted)
