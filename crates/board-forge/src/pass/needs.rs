@@ -139,6 +139,7 @@ pub(super) fn review_asks(
     };
     let mut collected = Collected::of(Read::Complete);
     collected.unread = undecided.clone();
+    let mut evidence = BTreeMap::new();
     for wait in waits {
         let head = Some(wait.head.clone()).filter(|h| holds::full_head(h));
         let Some(((repository, number), head)) =
@@ -158,6 +159,9 @@ pub(super) fn review_asks(
             collected
                 .review_buckets
                 .insert(item.to_ascii_lowercase(), assessment.clone());
+        }
+        if let Some(read) = wait.approval.as_ref().filter(|e| e.assessed_head == head) {
+            evidence.insert(item.to_ascii_lowercase(), read.clone());
         }
         let action = Reference {
             head: Some(head.clone()),
@@ -187,6 +191,7 @@ pub(super) fn review_asks(
     if !collected.unread.is_empty() {
         collected.read = Read::Partial;
     }
+    collected.approval_evidence = Some(evidence);
     collected
 }
 
@@ -500,11 +505,14 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             _ => Vec::new(),
         };
         let config = self.config;
-        let reviews = review_asks(
+        let mut reviews = review_asks(
             !config.follow.is_empty(),
             self.followed.as_ref(),
             &snapshot.at,
         );
+        if !config.holds.as_ref().is_some_and(|h| h.approval_evidence) {
+            reviews.approval_evidence = None;
+        }
         let proposals = match config.holds.as_ref().and_then(|h| h.proposals.as_ref()) {
             Some(at) => self.proposals(at),
             None => Collected::off(),
@@ -553,6 +561,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         inventory::revalidate(&mut list, &nodes, proposal_label);
         self.inbox_epics(&mut list, &nodes, true);
         carry::evidence(&mut list, previous, &nodes);
+        list.retain_evidence();
         holds::preserve_changed_at(&mut list, previous);
         list
     }
@@ -678,6 +687,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 let (asks, whole) = digest_asks(&on, &comments, &self.config.bot, &scope);
                 Collected {
                     review_buckets: BTreeMap::new(),
+                    approval_evidence: None,
                     read: if whole { Read::Complete } else { Read::Partial },
                     asks,
                     unread: BTreeSet::new(),
@@ -896,6 +906,7 @@ mod tests {
     fn review_waits() {
         let wait = |number, kind, head: &str| poll::Wait {
             review_bucket: None,
+            approval: None,
             repository: "cgwalters-bot/praxis-credential-broker".into(),
             number,
             head: head.into(),
@@ -1243,6 +1254,85 @@ mod tests {
         assert_eq!(bot_summary(&comments[2..], BOT), None);
     }
 
+    /// The shared consumer fixture is what the producer publishes for its
+    /// rows: current evidence, evidence of another head left out, and one
+    /// row's evicted for size and counted. A row is current only where its
+    /// entry's head is the row's.
+    #[test]
+    fn approval_evidence_matches_the_shared_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/approval-evidence-needs-you.json"
+        ))
+        .unwrap();
+        let expected = &fixture["approval_evidence"];
+        let at = expected["observed_at"].as_str().unwrap();
+        let rows = fixture["rows"].as_array().unwrap();
+        let waits = rows
+            .iter()
+            .map(|row| {
+                let key = row["key"].as_str().unwrap();
+                let (repository, number) = pull_ref(key).unwrap();
+                let head = row["head"].as_str().unwrap();
+                let read_at = row["read_at"].as_str().unwrap_or(head);
+                let approval = match expected["items"].get(key) {
+                    Some(e) => serde_json::from_value(e.clone()).unwrap(),
+                    None => poll::approval::Evidence {
+                        assessed_head: read_at.into(),
+                        diff: poll::approval::Diff::Lines {
+                            additions: 1,
+                            deletions: 0,
+                        },
+                        ci: poll::approval::Ci {
+                            state: poll::approval::CiState::Green,
+                            complete: true,
+                        },
+                        review: None,
+                    },
+                };
+                poll::Wait {
+                    repository,
+                    number,
+                    head: head.into(),
+                    kind: "approve",
+                    reason: "approve this head?".into(),
+                    review_bucket: None,
+                    approval: Some(approval),
+                }
+            })
+            .collect();
+        let on = on_github("a/ops", 1);
+        let reading = holds::Reading {
+            operator: BOT,
+            epics: false,
+            considered: true,
+            options: &[],
+            on: &on,
+            reviews: review_asks(true, Some(&(waits, BTreeSet::new())), at),
+            proposals: Collected::off(),
+            digest: Collected::off(),
+            inbox: BTreeMap::new(),
+            observed: holds::Observed::off(),
+            summaries: (Read::Off, BTreeMap::new()),
+        };
+        let snapshot = holds::snapshot(&[], at.into(), Default::default());
+        let mut list = holds::needs_you(&snapshot, None, &reading);
+        assert_eq!(list.items.len(), rows.len());
+        assert!(list.evict_evidence());
+        let published = serde_json::to_value(&list).unwrap();
+        assert_eq!(published["schema"], fixture["schema"]);
+        assert_eq!(&published["approval_evidence"], expected);
+        for row in rows {
+            let entry = &published["approval_evidence"]["items"][row["key"].as_str().unwrap()];
+            let current = entry["assessed_head"] == row["head"];
+            let shown = row["shown"].as_str().unwrap();
+            assert_eq!(current, !shown.starts_with("unknown"), "{shown}");
+            if current {
+                // Consumers read it back strictly.
+                serde_json::from_value::<poll::approval::Evidence>(entry.clone()).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn draft_buckets_survive_grouping_but_never_carry_as_quick() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -1267,6 +1357,7 @@ mod tests {
                     kind: "promote",
                     reason: "drafts to inspect and promote".into(),
                     review_bucket: bucket,
+                    approval: None,
                 }
             })
             .collect();

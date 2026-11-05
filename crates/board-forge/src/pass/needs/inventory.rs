@@ -565,6 +565,7 @@ mod tests {
         let at = "2026-11-04T21:00:00Z";
         let waits = vec![poll::Wait {
             review_bucket: None,
+            approval: None,
             repository: "a/work".into(),
             number: 1,
             head: "a".repeat(40),
@@ -625,6 +626,7 @@ mod tests {
         let waits = (1..=2)
             .map(|number| poll::Wait {
                 review_bucket: None,
+                approval: None,
                 repository: "a/work".into(),
                 number,
                 head: "a".repeat(40),

@@ -16,6 +16,12 @@ pub(super) fn strip_observation_times(list: &mut serde_json::Map<String, Value>)
             check.remove("checked_at");
         }
     }
+    if let Some(evidence) = list
+        .get_mut("approval_evidence")
+        .and_then(Value::as_object_mut)
+    {
+        evidence.remove("observed_at");
+    }
     if let Some(context) = list.get_mut("context").and_then(Value::as_object_mut) {
         for field in ["observed_at", "wip", "omitted", "items"] {
             context.remove(field);

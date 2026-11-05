@@ -466,6 +466,51 @@ pass remain listed even when their context is unread. This adds no option or
 mutation authority and remains off behind existing `holds.needsYou`; callers
 already publishing the inbox need no setting change.
 
+#### Approval evidence (optional v2 extension)
+
+With `holds.approvalEvidence` (off unless set; needs `holds.needsYou`, GitHub
+only), the list also has `approval_evidence`, so that a compact approval row
+can show its size, CI and review without the app reading the pull request
+itself. The threat it stops is a row that shows green or reviewed for a head
+other than the one approval would apply to: evidence is bound to one head, read
+in this pass, and never inferred from labels or prose.
+
+```json
+"approval_evidence":{"schema":"agent-board/approval-evidence/v1","observed_at":"2026-11-05T12:00:00Z","omitted":0,"items":{
+"cgwalters-forge/tracker#1261":{"assessed_head":"aaaa…","diff":{"additions":12,"deletions":3},"ci":{"state":"green","complete":true},"review":{"verdict":"approved","at":"2026-11-05T11:00:00Z"}}}}
+```
+
+`items` is keyed by a `reviews` row's `key`. An entry exists only for an
+uncarried, ungrouped `approve_pull_request` row of stage 2 whose `head` is the
+entry's `assessed_head`; a row carried from the published list, read at another
+head, or past the bounds below has none, and none means unknown, never green or
+reviewed. Nothing of it is carried from one pass to the next. Its facts are those
+stage 2 already read of the pull request for its step, at no extra request:
+`diff` is the pull request's `additions` and `deletions`, or `"unavailable"`.
+`ci.state` judges every check on the head, as a direct merge does: `unknown`
+where the checks read are another commit's, else `failing` if any failed, else
+`unknown` unless `ci.complete` (every check page read, of the head commit), else
+`pending` or `green`. A head with no checks and none required is `green`, as a
+direct merge judges it. `review` is the review job's newest
+verdict on the head (`approved`, `changes_requested` or `withheld`) and when it
+was submitted, only where its run was verified as the review workflow's run for
+the head, else null.
+
+At most 50 rows (`MAX_APPROVAL_EVIDENCE`) are described, highest ranked first.
+Over the comment limit, entries are left out after the summary cache and context
+and before any hold or detail card, lowest ranked first; `omitted` counts both
+kinds. The identity inventory, counts and order are unchanged by it. The schema
+is versioned inside the extension; needs-you stays v2, and readers that do not
+know it, including review's current `src/github/holds.ts`, ignore it.
+`observed_at` is this pass's clock, and alone neither moves `changed_at` nor
+forces a write. No request, write, action or permission is added: stage 2's
+existing pull request query now also asks for `additions` and `deletions`, and
+the evidence is made for every approve wait but published only with the option.
+The [shared fixture](../fixtures/approval-evidence-needs-you.json) has current,
+non-green, moved-head and evicted rows; a producer test binds and serializes
+those entries into exactly its `approval_evidence`, and poll tests build the
+evidence itself from pull request reads.
+
 #### Semantic operator requests (optional v2 extension)
 
 `needs_you.requests` is optional list-level metadata. Each descriptor joins a legacy
@@ -3188,6 +3233,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.needsYou` | Add the ranked [needs-you list](#what-is-built) (`agent-board/needs-you/v2`) to the hold snapshot; needs `holds`; `false` |
 | `holds.proposals` | `{"repository", "label", "repositories", "org"?}`: list in the needs-you list the operator-action proposals on that repository's open issues with that label, checked as `action check` would with those `repositories` and `org`; needs `holds.needsYou`; absent (off) |
 | `holds.drafts` | Repository whose open `review-draft` issues the needs-you list reads with review-send's source rules; needs `holds.needsYou`, GitHub only; absent (off) |
+| `holds.approvalEvidence` | Add stage 2's head-bound [approval evidence](#approval-evidence-optional-v2-extension) to the needs-you list; needs `holds.needsYou`, GitHub only; `false` |
 | `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |

@@ -571,6 +571,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind: "promote",
             reason: "drafts to inspect and promote".into(),
             review_bucket: Some(assessment),
+            approval: None,
         };
         let intake = if intake && text(&published, "/head/sha") == head {
             self.ordinary_review(repo, pull, comments, marker)?
