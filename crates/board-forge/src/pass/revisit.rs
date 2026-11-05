@@ -23,10 +23,11 @@ pub(super) const UNCHANGED_DAYS: u64 = DAYS_LIMIT;
 /// How many `afterDays` (or `heldAfterDays`) of silence count towards an
 /// item's weight; longer is no heavier.
 const SILENCE_STEPS: i64 = 4;
-/// Issues drawn a pass for each of `perPass`, so that drawn issues left
-/// alone (a recent revisit, a plan waiting to start) do not use up the
-/// pass's revisits, while a board of them costs a bounded number of reads.
-pub(super) const DRAWS_PER_REVISIT: usize = 3;
+/// The most issues drawn a pass: a drawn issue left alone (a recent
+/// revisit, a plan waiting to start) is followed by the next draw until
+/// `perPass` are revisited or no slot is left (agent-board#701), while a
+/// board of them costs a bounded number of reads, each draw its comments.
+pub(super) const DRAW_LIMIT: usize = 3 * PER_PASS_LIMIT as usize;
 /// What a revisit's triage plan says first: the record that keeps the issue
 /// from being revisited again within its days.
 pub(super) const REVISIT: &str =
@@ -188,7 +189,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// and a revisit pool has room: the `candidates` due, drawn by
     /// [`weight`] from the pass's run id (the clock outside Actions), each
     /// revisited by a triage run in turn until `perPass` are, or
-    /// [`DRAWS_PER_REVISIT`] times that were drawn. How many slots are left,
+    /// [`DRAW_LIMIT`] were drawn. How many slots are left,
     /// and how many runs it took.
     pub(super) fn revisit(
         &mut self,
@@ -220,10 +221,20 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             return (free, 0);
         }
         let writers = self.writers();
+        // Held for the operator by stage 4 this pass: a plan the pass never
+        // starts (its revisit would wait on it), or one it will not act on.
+        let operator: BTreeSet<&ItemRef> = (self.report.holds.iter())
+            .filter(|e| e.hold.kind == HoldKind::NeedsOperator)
+            .filter_map(|e| match &e.scope {
+                Scope::Item(issue) => Some(issue),
+                _ => None,
+            })
+            .collect();
         let mut due = Vec::new();
         for (rank, facts) in candidates {
             if revisit_hold(facts, &slots.busy, &writers).is_some()
                 || self.outside_epics(facts).is_some()
+                || operator.contains(&facts.issue)
             {
                 continue;
             }
@@ -253,7 +264,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             .map_or(self.now.unix_timestamp() as u64, |run| run.id);
         let weights: Vec<u64> = due.iter().map(|d| d.weight).collect();
         let per_pass = revisit.per_pass as usize;
-        let drawn = sample(&weights, per_pass * DRAWS_PER_REVISIT, seed);
+        let drawn = sample(&weights, DRAW_LIMIT, seed);
         let names: Vec<String> = (drawn.iter())
             .map(|n| {
                 format!(

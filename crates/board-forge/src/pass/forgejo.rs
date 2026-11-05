@@ -1172,11 +1172,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             _ => self.now.unix_timestamp() as u64,
         };
         let weights: Vec<_> = due.iter().map(|d| d.3).collect();
-        let drawn = revisit::sample(
-            &weights,
-            settings.per_pass as usize * revisit::DRAWS_PER_REVISIT,
-            seed,
-        );
+        let drawn = revisit::sample(&weights, revisit::DRAW_LIMIT, seed);
         self.line(format!(
             "revisit: {} due, seed {seed}, drawn: {}",
             due.len(),

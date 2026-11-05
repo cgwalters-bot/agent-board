@@ -7429,6 +7429,58 @@ fn revisit_draws_by_focus_first() {
     assert_eq!(revisits.len(), 2, "{revisits:#?}");
 }
 
+/// An item that can never start draws no revisit (agent-board#701): with
+/// `pr.ownSpaceOnly`, tracker#446's implement plan for bootc-dev/bootc
+/// waits on the operator, so the heaviest candidate is left out of the
+/// draw and the light agentic-job#188 and tracker#468 are revisited in the
+/// same pass.
+#[test]
+fn revisit_skips_an_item_that_cannot_start() {
+    let mut forge = Forge::new(None, false);
+    let days = [
+        ("cgwalters-forge/agentic-job#188", 20),
+        ("cgwalters-forge/tracker#446", 20),
+        ("cgwalters-forge/tracker#468", 4),
+    ];
+    silent(&mut forge.replay, &days, &["cgwalters-forge/tracker#468"]);
+    implement_plan(&mut forge.replay);
+    let issue = answer(&mut forge.replay, r#""name":"tracker","number":446"#);
+    let comments = &mut issue["data"]["repository"]["issue"]["comments"]["nodes"];
+    let plan = comments.as_array_mut().unwrap().last_mut().unwrap();
+    let body = text(plan, "/body").replace("cgwalters-forge/tracker", "bootc-dev/bootc");
+    plan["body"] = body.into();
+    let mut works: Value = serde_json::from_str(CONFIG).unwrap();
+    let works = works["workRepositories"].as_array_mut().unwrap();
+    works.push("bootc-dev/bootc".into());
+    let section = json!({"perPass": 2, "afterDays": 14, "heldAfterDays": 3});
+    let settings = json!({"wip": 12, "revisit": section, "workRepositories": works,
+        "pr": {"ownSpaceOnly": true}});
+    let report = apply(&forge, &config(settings));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let hold = "hold cgwalters-forge/tracker#446: its plan's bootc-dev/bootc#446 is outside our own space (pr.ownSpaceOnly), so the pass writes nothing there; it is dispatched by hand";
+    assert!(
+        report.lines.iter().any(|l| l == hold),
+        "{:#?}",
+        report.lines
+    );
+    let revisits: Vec<&str> = (report.lines.iter())
+        .filter(|l| l.contains("revisit"))
+        .map(String::as_str)
+        .collect();
+    assert!(
+        !revisits.iter().any(|l| l.contains("tracker#446")),
+        "{revisits:#?}"
+    );
+    for item in ["agentic-job#188", "tracker#468"] {
+        let start = format!("start revisit cgwalters-forge/{item} pool=claude record=");
+        assert!(
+            revisits.iter().any(|l| l.starts_with(&start)),
+            "{item}: {revisits:#?}"
+        );
+    }
+    assert_eq!(report.tally.1.revisited, Some(Some(2)));
+}
+
 /// Without `revisit` the pass reads the board as it always did and its
 /// lines are the same; with it, its stages but the revisits are too.
 #[test]
