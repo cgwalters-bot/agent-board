@@ -1017,8 +1017,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// and start nothing: the wait after a planning request saves runs
     /// while slots are taken, not while they sit empty. Only where planning's
     /// pools and the budget allow it now, else its hold stands. Returns the
-    /// runs it started or `--max-dispatch` held; `holds`, where stage 4's
-    /// holds start, moves down when its hold is taken back.
+    /// runs it started; `holds`, where stage 4's holds start, moves down
+    /// when its hold is taken back and a fresh hold replaces it.
     pub(super) fn replan_idle(&mut self, free: usize, holds: &mut usize) -> usize {
         let waiting = std::mem::take(&mut self.waited);
         let mut started = 0;
@@ -1080,8 +1080,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         {
             return 0;
         }
-        self.report.holds.remove(waited.at);
+        let wait = self.report.holds.remove(waited.at);
         *holds -= 1;
+        let (recorded, planned) = (self.report.holds.len(), self.epic_starts.len());
+        let not_started = self.not_started;
         let why = format!(
             "{}, with {free} slot(s) free and nothing started",
             waited.why
@@ -1104,6 +1106,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             &target,
             turn,
         );
+        // Neither started nor held anew (capped, stopped or failed before
+        // a start): its wait stands, and it took no slot. Not returned as a
+        // start, a capped one is not taken off the starts either. Its slot
+        // free, the next waited epic is still tried, within the limit.
+        let held = self.report.holds[recorded..]
+            .iter()
+            .any(|e| e.scope == scope);
+        if self.epic_starts.len() == planned && !held {
+            self.report.holds.insert(waited.at, wait);
+            *holds += 1;
+            self.not_started = not_started;
+            return 0;
+        }
         waited.turn.starts - before - started
     }
 

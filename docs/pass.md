@@ -980,8 +980,11 @@ window (`source: "praxis"`), be unheld, have used less than its positive
 `allowed_percent` (not its burst allowance), and reset in more than zero and
 at most 48 hours. A rolling grant has no reset deadline and never qualifies.
 Each attempt still uses the existing pool choice, dollar budget, WIP, leases,
-overlap, request/time reserve and `--max-dispatch`/`--max-writes` checks. No
-pool is activated and no cap is raised. The reason is logged as
+overlap, request/time reserve and `--max-dispatch` checks; a planning start
+makes no write that `--max-writes` counts. No pool is activated and no cap is
+raised. An epic an attempt does not start keeps a hold: a fresh one where a
+check refuses it, else its wait, so one held by `--max-dispatch` is not
+counted as started. The reason is logged as
 `pools: P under pace near reset; bounded idle replan (2 per pass)`.
 Without this setting or signal, the existing one-epic idle fallback remains.
 An otherwise successful pass with free slots, no unread candidate and no start
@@ -989,9 +992,9 @@ in any stage prints
 `pools: no ready work; unused headroom does not release holds` beside its
 `idle:` line, so available quota is not mistaken for ready work.
 The idle line also names the candidate count, the count considered, and up to
-five hold/failure reasons in candidate order (300 characters each), with the
-number of remaining reason lines. Full reasons remain on the candidate lines;
-the summary makes no additional reads or writes.
+five hold, failure and `held by --max-…` reasons in candidate order (300
+characters each), with the number of remaining reason lines. Full reasons
+remain on the candidate lines; the summary makes no additional reads or writes.
 
 The caller is external: in `cgwalters-forge/tracker`, set `.github/pass.json`
 `idleReplan` to `true` to enable it after deploying the reviewed revision.
