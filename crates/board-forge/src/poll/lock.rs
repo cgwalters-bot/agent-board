@@ -504,6 +504,7 @@ mod tests {
             deferred: Vec::new(),
             deferring: None,
             planned: 0,
+            folds: Vec::new(),
         };
         let mut outcome = Outcome::default();
         let repo = REPO.to_owned();

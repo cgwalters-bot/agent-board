@@ -250,6 +250,7 @@
     "pr.ownerBranches": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.unstall": {"verdict": "refused", "reason": "PR follow-up (stage 2) reruns GitHub Actions review runs"},
     "pr.ownSpaceOnly": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.foldRounds": {"verdict": "refused", "reason": "PR follow-up (stage 2) minimizes GitHub comments"},
     "pr.reviewPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.reviewDispatchRepositories": {"verdict": "refused", "reason": "GitHub-only ordinary review routing (stage 2)"},
     "pr.draftReviewRepositories": {"verdict": "refused", "reason": "GitHub-only draft review jobs, CI and labels (stage 2)"},

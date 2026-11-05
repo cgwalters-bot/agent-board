@@ -905,7 +905,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // The answer is pending until its run may have started, as for any
         // round on the operator's comments ([`handled`]).
-        self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
+        self.mark_claim(
+            repo,
+            claim,
+            &mut marker,
+            &format!("{of}: starting."),
+            (stop, read),
+        )?;
         let start = Start {
             repository: repo,
             item: number,
@@ -1359,12 +1365,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         };
         self.dispatched += 1;
+        let superseded = marker;
         let mut marker = Marker {
             rounds: round,
             sha: Some(head.clone()),
             at: Some(stamp(self.now)?),
             pool: pool.clone(),
-            queue: marker.queue.clone(),
+            queue: superseded.queue.clone(),
             continued: carried.continued,
             raised: carried.raised,
             rebased: carried.rebased,
@@ -1373,7 +1380,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // The round is counted before its dispatch, so that no failure after
         // it can start more rounds than the bound; the comments are pending.
-        self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
+        self.mark_claim(
+            repo,
+            claim,
+            &mut marker,
+            &format!("{of}: starting."),
+            (&superseded, read),
+        )?;
         let url = format!("https://github.com/{repo}/pull/{number}");
         let brief = fix_brief(repo, number, &head, round, &url, said, &operator);
         let start = Start {
@@ -3704,6 +3717,7 @@ pub(super) mod tests {
                 deferred: Vec::new(),
                 deferring: None,
                 planned: 0,
+                folds: Vec::new(),
             };
             let events = "repos/upstream/app/issues/7/events?per_page=100";
             fake.page(
