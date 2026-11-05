@@ -529,7 +529,10 @@ the head, else null.
 At most 50 rows (`MAX_APPROVAL_EVIDENCE`) are described, highest ranked first.
 Over the comment limit, entries are left out after the summary cache and context
 and before any hold or detail card, lowest ranked first; `omitted` counts both
-kinds. The identity inventory, counts and order are unchanged by it. The schema
+kinds, among rows still qualifying after identity revalidation. Retired, carried,
+grouped or moved-head rows neither consume the cap nor add to `omitted`; freed
+slots are filled from this pass's existing observations, without another read.
+The identity inventory, counts and order are unchanged by it. The schema
 is versioned inside the extension; needs-you stays v2, and readers that do not
 know it, including review's current `src/github/holds.ts`, ignore it.
 `observed_at` is this pass's clock, and alone neither moves `changed_at` nor

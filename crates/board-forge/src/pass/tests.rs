@@ -11633,6 +11633,153 @@ fn followed_draft(replay: &mut Replay, settings: &mut Value) {
     settings["pr"] = json!({"fixPools": ["claude"]});
 }
 
+/// Exercise the option at publication, not just in the evidence collector.
+/// Every forge write here is captured by the offline transport.
+#[test]
+fn approval_evidence_pass_option_and_head_observations() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    let head = "a".repeat(40);
+    for gate in [None, Some(false), Some(true)] {
+        for (commit, partial, state) in [
+            (head.as_str(), false, "green"),
+            (head.as_str(), true, "unknown"),
+            ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", false, "unknown"),
+        ] {
+            let mut forge = Forge::new(None, false);
+            let mut settings = json!({"wip":0,"follow":[REPO],"pr":{"fixPools":["claude"],"reviewWorkflow":"review.yml"},
+                "holds":{"repository":"cgwalters-forge/bot-ops","issue":1,"needsYou":true}});
+            if let Some(gate) = gate {
+                settings["holds"]["approvalEvidence"] = json!(gate);
+            }
+            followed(
+                &mut forge.replay,
+                (REPO, 9),
+                json!({
+                    "headRefOid":head,"additions":12,"deletions":3,
+                    "labels":{"nodes":[{"name":"needs-operator-approval"}],"pageInfo":{"hasNextPage":false}},
+                    "reviews":{"nodes":[{"state":"APPROVED","commit":{"oid":head},
+                        "author":{"__typename":"Bot","login":"github-actions","databaseId":poll::ACTIONS_BOT_ID},
+                        "submittedAt":"2026-10-23T13:00:00Z",
+                        "body":format!("VERDICT: APPROVE\n\n<!-- gh-aw-agentic-workflow: review, id: 77, workflow_id: agentic-job, run: https://github.com/{REPO}/actions/runs/77 -->")}],
+                        "pageInfo":{"hasPreviousPage":false}},
+                    "commits":{"nodes":[{"commit":{"oid":commit,
+                        "committedDate":"2026-10-23T12:00:00Z","message":"Change",
+                        "statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun",
+                            "name":"CI","status":"COMPLETED","conclusion":"SUCCESS"}],
+                            "pageInfo":{"hasNextPage":partial,"endCursor":null}}}}}]}
+                }),
+                json!([]),
+            );
+            forge.replay.requests.push(
+                json!({"request":{"get":format!("{API_ROOT}repos/{REPO}/actions/runs/77")},
+                "answer":{"status":200,"body":{"id":77,"path":".github/workflows/review.yml",
+                    "event":"pull_request_target","head_sha":head,"status":"completed",
+                    "run_started_at":"2026-10-23T12:50:00Z","updated_at":"2026-10-23T13:05:00Z",
+                    "repository":{"full_name":REPO}}}}),
+            );
+            for (path, body) in [
+                ("user", json!({"login":"cgwalters-bot"})),
+                ("repos/cgwalters-forge/bot-ops", json!({"private":true})),
+            ] {
+                forge
+                    .replay
+                    .requests
+                    .push(json!({"request":{"get":format!("{API_ROOT}{path}")},
+                    "answer":{"status":200,"link":null,"body":body}}));
+            }
+            let cfg = config(settings);
+            let report = apply(&forge, &cfg);
+            let bodies = forge.comments_on("cgwalters-forge/bot-ops", 1);
+            let body = bodies
+                .iter()
+                .find(|b| holds::parse(b).is_some())
+                .unwrap_or_else(|| panic!("{:?}", report.lines));
+            let published = holds::parse(body).unwrap();
+            let list = &published["needs_you"];
+            let row = list["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["item"] == format!("{REPO}#9"));
+            if partial {
+                // A partial read cannot produce an approval decision at all;
+                // absent evidence remains unknown, never invented coverage.
+                assert!(row.is_none());
+                assert!(
+                    list["approval_evidence"]["items"]
+                        .get(format!("{REPO}#9"))
+                        .is_none()
+                );
+                continue;
+            }
+            let row = row.unwrap_or_else(|| panic!("{list:#?}\n{:?}", report.lines));
+            assert_eq!(row["head"], head);
+            assert_eq!(row["action"]["type"], "approve_pull_request");
+            if gate == Some(true) {
+                let evidence = &list["approval_evidence"];
+                let entry = &evidence["items"][format!("{REPO}#9")];
+                assert_eq!(entry["assessed_head"], head);
+                assert_eq!(entry["diff"], json!({"additions":12,"deletions":3}));
+                assert_eq!(entry["ci"]["state"], state, "{entry:#?}");
+                assert_eq!(evidence["omitted"], 0);
+                if state == "green" {
+                    // The next pass cannot list stage 2. Revalidate the
+                    // carried identity cheaply, but never carry its evidence.
+                    let previous = body.clone();
+                    let comments =
+                        &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+                    comments
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"id":7,"node_id":"IC_7",
+                        "user":{"login":"cgwalters-bot"},"body":previous}));
+                    inventory_on(&mut forge.replay, REPO, 9, "needs-operator-approval");
+                    let inventory_index = forge.replay.requests.len() - 1;
+                    for (status, count) in [("OPEN", 1), ("CLOSED", 0)] {
+                        forge.replay.requests[inventory_index]["answer"]["data"]["repository"]["issueOrPullRequest"]
+                            ["state"] = json!(status);
+                        forge.added.borrow_mut().clear();
+                        forge.writes.borrow_mut().clear();
+                        forge.chain_reads.borrow_mut().clear();
+                        *forge.fail.borrow_mut() = Some(poll::PULL_QUERY.into());
+                        let report = apply(&forge, &cfg);
+                        let body = forge
+                            .writes
+                            .borrow()
+                            .iter()
+                            .find_map(|(_, _, value)| {
+                                value["body"]
+                                    .as_str()
+                                    .filter(|b| holds::parse(b).is_some())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_else(|| panic!("{:?}", report.lines));
+                        let published = holds::parse(&body).unwrap();
+                        let list = &published["needs_you"];
+                        assert_eq!(list["count"], count, "{list:#?}");
+                        assert_eq!(list["complete"], false);
+                        assert_eq!(list["approval_evidence"]["items"], json!({}));
+                        assert_eq!(list["approval_evidence"]["omitted"], 0);
+                        if count == 1 {
+                            assert_eq!(list["items"][0]["carried"], true);
+                        }
+                        let reads: Vec<_> = forge
+                            .chain_reads
+                            .borrow()
+                            .iter()
+                            .flatten()
+                            .cloned()
+                            .collect();
+                        assert_eq!(reads.len(), reads.iter().collect::<BTreeSet<_>>().len());
+                    }
+                }
+            } else {
+                assert!(list.get("approval_evidence").is_none());
+            }
+        }
+    }
+}
+
 /// The bot's open pull request `number` of `repo` from its fork, the one
 /// open pull request there, as stage 2 reads it once `repo` is followed:
 /// mergeable, unreviewed, with no checks, committed when the recording was
