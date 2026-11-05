@@ -146,6 +146,9 @@ const PASS_PLAN_KINDS: &[&str] = &["implement", "triage"];
 /// Keep an idle summary bounded; full reasons remain on candidate lines.
 const IDLE_REASON_LIMIT: usize = 5;
 const IDLE_REASON_CHARS: usize = 300;
+/// The prefixes of the lines an idle summary names: holds, failures and
+/// the caps' `held by --…` lines ([`Caps::check`]).
+const IDLE_REASONS: &[&str] = &["hold ", "fail ", "held by --"];
 /// The most `triageFollowUpDays` and `replanAfterDays` may be.
 const FOLLOW_UP_DAYS_LIMIT: u64 = 30;
 /// `overlap.staleDraftHours` when the key is left out, and the most it may
@@ -3318,7 +3321,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             let reasons: Vec<_> = self.report.lines[decisions..]
                 .iter()
-                .filter(|line| line.starts_with("hold ") || line.starts_with("fail "))
+                .filter(|line| IDLE_REASONS.iter().any(|p| line.starts_with(p)))
                 .collect();
             let details = reasons
                 .iter()

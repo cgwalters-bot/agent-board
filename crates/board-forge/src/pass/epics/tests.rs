@@ -2645,24 +2645,34 @@ fn idle_replan_applies_two_bounded_starts() {
         }))
     };
     let none: fn() -> Option<Late> = || None;
-    // Name, limits, the edit after the first dispatch, and the second's line.
+    // Name, limits, the edit after the first dispatch, a line, and the
+    // epics started.
     let cases = [
-        ("both", limits(None, None), none, SECOND),
+        ("both", limits(None, None), none, SECOND, 2),
         (
             "--max-dispatch 1",
             limits(Some(1), None),
             none,
             "held by --max-dispatch: ",
+            1,
         ),
-        ("--max-writes 0", limits(None, Some(0)), none, SECOND),
+        (
+            "--max-dispatch 0",
+            limits(Some(0), None),
+            none,
+            "idle: 6 slot(s) free and nothing started; candidates: 1, considered: 1; reasons: hold cgwalters-forge/tracker#446: no plan, and triage is off; held by --max-dispatch: start planning cgwalters-forge/tracker#890 pool=claude: ",
+            0,
+        ),
+        ("--max-writes 0", limits(None, Some(0)), none, SECOND, 2),
         (
             "needs-human on the reread",
             limits(None, None),
             human,
             "hold epic cgwalters-forge/tracker#766: labelled needs-human",
+            1,
         ),
     ];
-    for (name, limits, late, second) in cases {
+    for (name, limits, late, line, starts) in cases {
         let mut forge = Forge::new(None, false);
         let mut replay = idle_board(&json!({}));
         crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
@@ -2687,32 +2697,40 @@ fn idle_replan_applies_two_bounded_starts() {
             config(json!({"idleReplan": true, "triage": false, "planPools": ["claude"]}));
         let report = apply_limited(&forge, &settings, limits);
         assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
-        let both = second == SECOND;
-        let mut expected = vec!["cgwalters-forge/tracker#890".to_owned()];
-        if both {
-            expected.push("cgwalters-forge/tracker#766".to_owned());
-        }
+        let epics = [890, 766];
+        let expected: Vec<String> = (epics[..starts].iter())
+            .map(|n| format!("cgwalters-forge/tracker#{n}"))
+            .collect();
         assert_eq!(forge.dispatches(), expected, "{name}: {:#?}", report.lines);
-        assert!(
+        assert_eq!(
             (report.lines.iter()).any(|l| l
                 .starts_with("start planning cgwalters-forge/tracker#890 pool=claude: ")
                 && l.contains(" record=")),
+            starts > 0,
             "{name}: {:#?}",
             report.lines
         );
         assert!(
-            (report.lines.iter()).any(|l| l.starts_with(second)),
-            "{name}: {second} in {:#?}",
+            (report.lines.iter()).any(|l| l.starts_with(line)),
+            "{name}: {line} in {:#?}",
             report.lines
         );
-        for (number, started) in [(890, true), (766, both)] {
+        // Each epic ends the pass started or held, exactly once.
+        for (at, number) in epics.into_iter().enumerate() {
+            let started = at < starts;
             let records = (forge.comments_on("cgwalters-forge/tracker", number).iter())
                 .filter(|b| b.starts_with("<!-- agent-board-dispatch"))
                 .count();
             assert_eq!(records, usize::from(started), "{name}: #{number}");
             let held = (report.holds.iter())
-                .any(|e| matches!(&e.scope, Scope::Epic(i) if i.number == number));
-            assert!(!(started && held), "{name}: #{number} {:#?}", report.holds);
+                .filter(|e| matches!(&e.scope, Scope::Epic(i) if i.number == number))
+                .count();
+            assert_eq!(
+                held,
+                usize::from(!started),
+                "{name}: #{number} {:#?}",
+                report.holds
+            );
         }
     }
 }
