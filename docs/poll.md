@@ -46,6 +46,25 @@ their newer queue state is read separately, without replacing the round's
 identity or accounting, including while its winning claim is being patched.
 A queue write after a reset records `queue_reset_from`, clearing only that
 stop's state without changing the identity a concurrent reset claim names.
+
+With the pass's [`pr.foldRounds: true`](pass.md#one-configuration-file) (off
+by default; not a standalone poll option), routine progress leaves one current
+comment on the thread rather than one per event (agent-board#691). Once a
+pass writes a marker over its claim, for a fix, rebase, continuation or
+operator-comment round, a refund, a check rerun or a review start, the bot's
+marker that claim was decided from is minimized as outdated, at the end of the
+pass and after its other writes, so that it never spends a request a round
+needs. A folded marker is still read back as every marker is, and GitHub shows
+it collapsed with its date, so the thread keeps the history. A comment that
+asks a person to act is never folded: a `needs-human` stop or a stale close is
+added as before and left visible, and a round started from a stop (a reset or
+an answer) folds nothing. A pass folds at most 20 markers, as one write under
+`--max-writes`; a fold that fails or is held is a line, not an error, and is
+not tried again. A claim that lost, a queue-only marker, and agentic-job's own
+run-status comment are not folded; agentic-job keeps that one comment per item
+edited in place (cgwalters-forge/agentic-job#3057). gh-aw's
+`hide-older-comments` hides older comments the same way.
+
 A stop is added after its label, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`

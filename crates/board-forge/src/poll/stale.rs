@@ -203,6 +203,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 "The poll closed this pull request: {reason}. Its overlapping items are no longer held by it. Reopen it to keep it: the poll leaves it to a person for another {} days.",
                 self.config.policy.stale_days
             ),
+            (stop, &comments),
         )?;
         let rest = self.rest;
         self.send(

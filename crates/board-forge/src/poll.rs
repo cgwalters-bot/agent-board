@@ -285,6 +285,13 @@ const ENQUEUE: &str = "mutation($id: ID!, $head: GitObjectID!) { enqueuePullRequ
 // merge (#273), is rebased onto the base instead; the new head is reviewed
 // again before it merges.
 const UPDATE: &str = "mutation($id: ID!, $head: GitObjectID!) { updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $head, updateMethod: REBASE}) { clientMutationId } }";
+/// `pr.foldRounds`: a superseded marker of the bot's, hidden as outdated.
+/// Its body stays readable through the API, so the markers and claims are
+/// read back as before (gh-aw's `hide-older-comments` does the same for its
+/// own comments).
+const MINIMIZE: &str = "mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }";
+/// The superseded markers one pass folds at most; the rest stay visible.
+pub const FOLD_LIMIT: usize = 20;
 
 /// What `PULL_QUERY` and `CHECKS_QUERY` read of each check, so a later page
 /// is read as the first one is.
@@ -308,7 +315,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       author { __typename login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
-      comments(last: 100) { nodes { fullDatabaseId author { __typename login } body createdAt updatedAt } pageInfo { hasPreviousPage } }
+      comments(last: 100) { nodes { id fullDatabaseId author { __typename login } body createdAt updatedAt } pageInfo { hasPreviousPage } }
       closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
@@ -628,6 +635,14 @@ pub struct PollPolicy {
     /// lists, with nothing written there ([`Config::writes_in`]). Off by
     /// default.
     pub own_space_only: bool,
+    /// The pass's `pr.foldRounds` (agent-board#691): once a routine marker
+    /// (a round, a refund, a check rerun or review start reservation) is
+    /// written, the bot's marker it supersedes is minimized as outdated at
+    /// the end of the pass ([`Pass::fold`]), so a pull request shows its
+    /// current round with the earlier ones folded above it rather than a
+    /// comment for each. A stop is never folded: it asks a person to act.
+    /// Off by default.
+    pub fold_rounds: bool,
     /// The pass's `pr.reviewPools`: the pass starts the review job for a
     /// head that has no run of it, paced on these pools, and the runs it
     /// started count as the job's ([`reviews_head`]). Empty (the default)
@@ -951,6 +966,7 @@ impl PollPolicy {
             unstall: false,
             owner_branches: false,
             own_space_only: false,
+            fold_rounds: false,
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
             draft_review_repositories: Vec::new(),
@@ -3724,6 +3740,7 @@ fn rest_comment(node: &Value) -> Result<Value> {
         .context("a pull request comment has no id")?;
     Ok(json!({
         "id": id,
+        "node_id": node["id"],
         "user": {"login": author_login(&node["author"]), "type": node["author"]["__typename"]},
         "body": node["body"],
         "created_at": node["createdAt"],
@@ -3873,6 +3890,9 @@ struct Pass<'a, R, G> {
     /// The review starts and reruns a preview plans, as an applying pass
     /// counts them in `dispatched`.
     planned: usize,
+    /// The node ids, with their repository, of the markers this pass
+    /// superseded, to fold at its end ([`PollPolicy::fold_rounds`]).
+    folds: Vec<(String, String)>,
 }
 
 /// A review start or rerun, deferred so that they go in Priority order.
@@ -4085,15 +4105,79 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// write is newer and stays the state, where a marker posted after it
     /// used to roll it back. Queue-only writes are read independently and
     /// cannot hide this round, even when posted before this PATCH.
+    ///
+    /// `superseded` is the marker the claim was decided from, among the
+    /// comments read, which [`PollPolicy::fold_rounds`] folds.
     fn mark_claim(
         &mut self,
         repo: &str,
         claim: u64,
         marker: &mut Marker,
         text: &str,
+        superseded: (&Marker, &[Value]),
     ) -> Result<()> {
         marker.id = Some(claim);
-        self.record_run(repo, marker, text)
+        self.record_run(repo, marker, text)?;
+        self.supersede(repo, superseded);
+        Ok(())
+    }
+
+    /// With [`PollPolicy::fold_rounds`], `marker`, which a newer marker of
+    /// this pass's now follows, is queued to fold at the end of the pass:
+    /// not before, so that it never spends a request a round's dispatch
+    /// needs. A stop is left visible, as it asks a person to act, and so is a
+    /// comment that is not the bot's.
+    fn supersede(&mut self, repo: &str, (marker, read): (&Marker, &[Value])) {
+        if !self.config.policy.fold_rounds || marker.stopped {
+            return;
+        }
+        let Some(id) = marker.id else {
+            return;
+        };
+        let node = read
+            .iter()
+            .find(|c| c["id"].as_u64() == Some(id) && text(c, "/user/login") == self.config.bot)
+            .and_then(|c| c["node_id"].as_str());
+        if let Some(node) = node {
+            self.folds.push((repo.to_owned(), node.to_owned()));
+        }
+    }
+
+    /// The markers [`Self::supersede`] queued, minimized as outdated, at most
+    /// [`FOLD_LIMIT`] and as one write step under the pass's caps. Each is a
+    /// receipt already superseded, so one that is not folded is only noise:
+    /// a failure is a warning, not an error of the pass.
+    fn fold(&mut self, lines: &mut Vec<String>) {
+        let folds = std::mem::take(&mut self.folds);
+        if folds.is_empty() {
+            return;
+        }
+        if let Some(held) = self.caps.and_then(|caps| caps.check(Kind::Write)) {
+            lines.push(format!("fold: {} superseded markers {held}", folds.len()));
+            return;
+        }
+        let before = self.writes;
+        let mut folded = 0;
+        for (repo, node) in folds.iter().take(FOLD_LIMIT) {
+            match self.mutate(MINIMIZE, json!({"id": node})) {
+                Ok(()) => folded += 1,
+                Err(error) => lines.push(format!(
+                    "warning: {repo}: marker {node} not folded: {error:#}"
+                )),
+            }
+        }
+        if let Some(caps) = self.caps
+            && self.writes > before
+        {
+            caps.count(Kind::Write);
+        }
+        let left = folds.len().saturating_sub(FOLD_LIMIT);
+        let left = if left > 0 {
+            format!(", {left} left visible past {FOLD_LIMIT}")
+        } else {
+            String::new()
+        };
+        lines.push(format!("fold: {folded} superseded markers minimized{left}"));
     }
 
     /// The run id, into the round's marker that this pass wrote. Late, it
@@ -4446,6 +4530,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         };
         // Counted once the round is this pass's to start, whatever follows.
         self.dispatched += 1;
+        let superseded = marker;
         let mut marker = Marker {
             id: None,
             rounds: if continuing || rebasing {
@@ -4476,7 +4561,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             review_head: None,
             review_at: None,
         };
-        self.mark_claim(repo, claim, &mut marker, &format!("{of}: starting."))?;
+        self.mark_claim(
+            repo,
+            claim,
+            &mut marker,
+            &format!("{of}: starting."),
+            (superseded, read),
+        )?;
         let task = match &checkpoint {
             Some(at) => continue_task(repo, pull, at, round, rounds),
             None if rebasing => {
@@ -4670,6 +4761,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     claim,
                     &mut refunded,
                     &format!("Round given back: {}.", decision.reason),
+                    (marker, read),
                 )?;
                 Ok(Some("round given back".into()))
             }
@@ -4969,6 +5061,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             claim,
             &mut recorded,
             "Failed checks: one rerun reserved for these checks on this head.",
+            (marker, read),
         )?;
         let rest = self.rest;
         for run in runs.keys() {
@@ -5437,7 +5530,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let text = format!(
             "Review: the review job starts for this head on {pool}; no later pass starts it again."
         );
-        self.mark_claim(repo, claim, &mut reserved, &text)?;
+        self.mark_claim(repo, claim, &mut reserved, &text, (marker, read))?;
         let inputs = if ordinary_reviews(self.config, repo) {
             let task = if drafts::eligible(self.config, repo, pull) {
                 drafts::REVIEW_TASK
@@ -7194,6 +7287,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         deferred: Vec::new(),
         deferring: None,
         planned: 0,
+        folds: Vec::new(),
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -7335,11 +7429,13 @@ pub fn run_capped<R: Rest, G: Transport>(
     if let Some(line) = pass.pace_line() {
         outcome.lines.push(line);
     }
-    // Last, on what is left of the request budget.
+    // After the rounds, on what is left of the request budget.
     let lock_refused = match config.policy.lock_items {
         Some(limit) => pass.lock(&follow, limit, &state.lock_refused, &mut outcome),
         None => BTreeMap::new(),
     };
+    // Cosmetic cleanup comes last, after locking has spent its budget too.
+    pass.fold(&mut outcome.lines);
     // What could not be read counts as a change: an API error must not stretch
     // the gap while a pull request may be waiting on it.
     let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
@@ -14887,11 +14983,24 @@ mod tests {
 
     /// [`applied_with`] over `fake`.
     fn applied_from(
-        mut fake: Fake,
+        fake: Fake,
         policy: Value,
         change: Value,
         state: Value,
     ) -> (String, Fake, Fake) {
+        let policy = PollPolicy::from_json(&policy).unwrap();
+        let (outcome, fake, dispatcher) = applied_policy(fake, policy, change, state);
+        let line = outcome.lines.last().unwrap().clone();
+        (line, fake, dispatcher)
+    }
+
+    /// [`applied_from`] under `policy`, with the whole outcome.
+    fn applied_policy(
+        mut fake: Fake,
+        policy: PollPolicy,
+        change: Value,
+        state: Value,
+    ) -> (Outcome, Fake, Fake) {
         fake.pulls.insert(470, pull("pull-470", change));
         fake.answers.borrow_mut().insert(
             format!("{API_ROOT}repos/{REPO}/labels"),
@@ -14899,7 +15008,7 @@ mod tests {
         );
         let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
         fake.rest.get_mut(&comments).unwrap().3 = json!([
-            {"id": 5, "user": {"login": BOT}, "body": marker_body(&state, "Fix round.")}
+            {"id": 5, "node_id": "IC_5", "user": {"login": BOT}, "body": marker_body(&state, "Fix round.")}
         ]);
         // The `ci` check's job, and the annotations of its check run: more
         // than a task carries, a backtick in the last.
@@ -14931,7 +15040,7 @@ mod tests {
             vec![(200, json!({"workflow_run_id": 1234}))],
         );
         let mut cfg = config();
-        cfg.policy = PollPolicy::from_json(&policy).unwrap();
+        cfg.policy = policy;
         let outcome = run(
             &fake,
             &fake,
@@ -14943,8 +15052,171 @@ mod tests {
             now(),
         )
         .unwrap();
-        let line = outcome.lines.last().unwrap().clone();
-        (line, fake, dispatcher)
+        (outcome, fake, dispatcher)
+    }
+
+    /// With `pr.foldRounds`, a round's marker folds the routine marker it
+    /// follows once the pass is done, and nothing else: a stop is added and
+    /// left visible, as is the marker before it, and a fold GitHub refuses
+    /// is a warning, not an error of the pass (agent-board#691).
+    #[test]
+    fn fold_rounds_minimizes_the_superseded_marker_only() {
+        let failing = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
+        let folded = || (MINIMIZE.to_owned(), json!({"id": "IC_5"}));
+        for (name, fold, refused, state, change, step, last) in [
+            (
+                "a fix round folds the round it follows",
+                true,
+                false,
+                json!({"rounds": 1, "sha": "older"}),
+                failing.clone(),
+                "fix: check ci failed -> https://",
+                Some("fold: 1 superseded markers minimized"),
+            ),
+            (
+                "off (the default), nothing is folded",
+                false,
+                false,
+                json!({"rounds": 1, "sha": "older"}),
+                failing.clone(),
+                "fix: check ci failed -> https://",
+                None,
+            ),
+            (
+                "a rebase round folds the round it follows",
+                true,
+                false,
+                json!({"rounds": 2, "sha": "older"}),
+                json!({"mergeable": CONFLICTING}),
+                "rebase round 1 of 2 -> https://",
+                Some("fold: 1 superseded markers minimized"),
+            ),
+            (
+                "a stop is a new comment and folds nothing",
+                true,
+                false,
+                json!({"rounds": 2, "sha": "older"}),
+                failing.clone(),
+                "-> labelled needs-human",
+                None,
+            ),
+            (
+                "a refused fold is a warning",
+                true,
+                true,
+                json!({"rounds": 1, "sha": "older"}),
+                failing,
+                "fix: check ci failed -> https://",
+                Some("fold: 0 superseded markers minimized"),
+            ),
+        ] {
+            for graphql in [false, true] {
+                let mut fake = github();
+                if refused {
+                    fake.refused.push(MINIMIZE);
+                }
+                let mut policy = PollPolicy::from_json(&json!({"rebaseRounds": 2})).unwrap();
+                policy.fold_rounds = fold;
+                let mut change = change.clone();
+                if graphql {
+                    change["comments"] = json!({
+                        "pageInfo": {"hasPreviousPage": false},
+                        "nodes": [{"id": "IC_5", "fullDatabaseId": "5",
+                            "author": {"__typename": "User", "login": BOT},
+                            "body": marker_body(&state, "Fix round."),
+                            "createdAt": "2026-10-12T01:00:00Z", "updatedAt": "2026-10-12T01:00:00Z"}],
+                    });
+                }
+                let (outcome, fake, _) = applied_policy(fake, policy, change, state.clone());
+                assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+                let lines = outcome.lines.join("\n");
+                assert!(lines.contains(step), "{name}: {lines}");
+                let writes = fake.writes.borrow();
+                let minimized: Vec<_> = writes.iter().filter(|w| w.0 == MINIMIZE).collect();
+                match last {
+                    Some(last) => {
+                        assert_eq!(outcome.lines.last().unwrap(), last, "{name}");
+                        assert_eq!(minimized, [&folded()], "{name}");
+                        // After every other write of the pass.
+                        assert_eq!(writes.last(), Some(&folded()), "{name}");
+                    }
+                    None => assert!(minimized.is_empty(), "{name}: {lines}"),
+                }
+                assert_eq!(
+                    lines.contains("warning: ") && lines.contains("not folded"),
+                    refused,
+                    "{name}: {lines}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_rounds_uses_only_the_budget_left_after_locking() {
+        let issues = format!("{API_ROOT}repos/{REPO}/issues?state=open&per_page=100");
+        let policy = PollPolicy {
+            fold_rounds: true,
+            lock_items: Some(1),
+            ..PollPolicy::default()
+        };
+        let change = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
+        let state = json!({"rounds": 1, "sha": "older"});
+        let mut fake = github();
+        fake.rest
+            .insert(issues.clone(), (None, None, None, json!([])));
+        let (outcome, fake, dispatcher) =
+            applied_policy(fake, policy.clone(), change.clone(), state.clone());
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        // Count this fixture's requests, including dispatch and mutations,
+        // then extend the lock list to leave no request for cosmetic folds.
+        let spent = fake.sent.borrow().len()
+            + *fake.pull_reads.borrow()
+            + *fake.shared_reads.borrow()
+            + fake.lower_reads.borrow().len()
+            + *fake.check_page_reads.borrow()
+            + fake.writes.borrow().len()
+            + dispatcher.writes.borrow().len();
+        for spare in [0, 1] {
+            let pages = POLL_REQUEST_LIMIT - spent + 2 - spare;
+            let mut fake = github();
+            for page in 0..pages {
+                let url = if page == 0 {
+                    issues.clone()
+                } else {
+                    format!("{issues}&page={page}")
+                };
+                let next = (page + 1 < pages).then(|| format!("{issues}&page={}", page + 1));
+                fake.rest.insert(url, (None, None, next, json!([])));
+            }
+            let (outcome, fake, _) =
+                applied_policy(fake, policy.clone(), change.clone(), state.clone());
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("lock: 0 locked"))
+            );
+            assert_eq!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .filter(|w| w.0 == MINIMIZE)
+                    .count(),
+                spare,
+                "{:?}",
+                outcome.lines
+            );
+            assert_eq!(
+                outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("request budget") && l.contains("not folded")),
+                spare == 0,
+                "{:?}",
+                outcome.lines
+            );
+        }
     }
 
     /// A pull request merged or closed after the open list was read, or one
@@ -17705,6 +17977,7 @@ mod tests {
             deferred: Vec::new(),
             deferring: None,
             planned: 0,
+            folds: Vec::new(),
         };
         let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();
