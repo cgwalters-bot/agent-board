@@ -218,6 +218,21 @@ class ReviewContracts(unittest.TestCase):
         self.assertIn("cd site && npm ci --ignore-scripts --no-audit --no-fund\n", justfile)
         self.assertIn("node --test site/links.test.mjs\n", justfile)
 
+    def test_site_uses_the_reviewed_listener_correction_without_overrides(self):
+        # tracker#1212: stop the unnecessary acpid listener upstream, rather
+        # than admit it. This pin contains actions c9a9501 and the verified
+        # v0.6.4 image; a stale pin can pass on a VM without that listener.
+        site = (ROOT / ".github/workflows/site.yml").read_text()
+        check = site.split("\n  check:\n", 1)[1].split("\n  deploy:\n", 1)[0]
+        hardening = check.split("uses: cgwalters-forge/actions/secure-host@", 1)[1]
+        step = hardening.split("\n      - ", 1)[0].strip()
+        # No config, image archive or check override: use the reusable
+        # hosted stop list, attested image and default sandbox check.
+        self.assertEqual(
+            step,
+            "c763a8950778743f51857a37b2a59daf9e96ee23 # secure-host:v0.6.4; stops acpid",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
