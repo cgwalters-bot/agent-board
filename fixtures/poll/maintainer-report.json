@@ -22,6 +22,7 @@
     }]
   },
   "merge_queue_events": [],
+  "merge_queues": {"cgwalters-forge/agentic-job": []},
   "needs_human": [],
   "undecided_repositories": [],
   "errors": 0

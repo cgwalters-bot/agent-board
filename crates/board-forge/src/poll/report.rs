@@ -7,6 +7,24 @@ pub const MARKER: &str = "<!-- agent-board-maintainer-report -->";
 // GitHub rejects oversized comments. Refuse rather than publish a partial inventory.
 const MAX_COMMENT_BYTES: usize = 60_000;
 
+/// A repository's merge queue for its default branch, which `mergeQueue`
+/// reads without a branch: a readout of what is queued, not an input to any
+/// step (tracker#1356).
+pub(super) const QUEUE_QUERY: &str = r#"query($owner: String!, $name: String!, $entries: Int!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue { entries(first: $entries) {
+      nodes { position state headCommit { oid } pullRequest { number } }
+      pageInfo { hasNextPage }
+    } }
+  }
+}"#;
+/// Queue entries read per repository; a longer queue is reported unread
+/// rather than partial.
+const QUEUE_ENTRIES: u64 = 100;
+/// Requests queue reads leave for publishing: the destination repository,
+/// the issue, a page of its comments and the write.
+const PUBLISH_REQUESTS: usize = 4;
+
 #[derive(Clone, Debug)]
 pub struct Destination {
     pub repository: String,
@@ -74,6 +92,7 @@ fn render(
     apply: bool,
     follow: &BTreeSet<&String>,
     pulls: &BTreeMap<(String, u64), Pull>,
+    queues: &BTreeMap<&String, Value>,
     outcome: &Outcome,
 ) -> Result<String> {
     let mut grouped: BTreeMap<&str, Vec<&Pull>> = BTreeMap::new();
@@ -102,6 +121,7 @@ fn render(
         "repositories": follow,
         "pull_requests": grouped,
         "merge_queue_events": events,
+        "merge_queues": queues,
         "needs_human": needs_human,
         "undecided_repositories": outcome.undecided,
         "errors": outcome.errors,
@@ -135,12 +155,29 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 pull.ran = step.ran;
             }
         }
+        // Undecided repositories, as outside the envelope, have no inventory
+        // and no queue read either; an unread queue is null and an error.
+        let mut queues = BTreeMap::new();
+        for repo in follow {
+            if outcome.undecided.contains(&repo.to_ascii_lowercase()) {
+                continue;
+            }
+            let entries = self.merge_queue(repo).unwrap_or_else(|error| {
+                outcome.errors += 1;
+                outcome.lines.push(format!(
+                    "maintainer report: {repo} merge queue error: {error:#}"
+                ));
+                Value::Null
+            });
+            queues.insert(*repo, entries);
+        }
         let result = (|| -> Result<()> {
             let body = render(
                 self.now,
                 self.apply.is_some(),
                 follow,
                 &self.report_pulls,
+                &queues,
                 outcome,
             )?;
             if self.apply.is_none() {
@@ -155,6 +192,40 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 .lines
                 .push(format!("maintainer report error: {error:#}"));
         }
+    }
+
+    /// `repo`'s default-branch queue entries in order, empty where it has no
+    /// merge queue. A longer queue than is read, or a budget down to what
+    /// publishing needs, is an error.
+    fn merge_queue(&mut self, repo: &str) -> Result<Value> {
+        let (owner, name) = repo.split_once('/').context("repository")?;
+        ensure!(
+            self.remaining > PUBLISH_REQUESTS,
+            "request budget left for publishing the report"
+        );
+        self.spend()?;
+        let data = self.graphql.graphql(
+            QUEUE_QUERY,
+            json!({"owner": owner, "name": name, "entries": QUEUE_ENTRIES}),
+        )?;
+        let queue = data
+            .pointer("/repository/mergeQueue")
+            .context("merge queue not given")?;
+        ensure!(
+            queue.is_null()
+                || queue.pointer("/entries/pageInfo/hasNextPage") == Some(&Value::Bool(false)),
+            "more than {QUEUE_ENTRIES} entries queued"
+        );
+        let entries = nodes(queue, "/entries/nodes")
+            .iter()
+            .map(|e| {
+                json!({
+                    "number": e["pullRequest"]["number"], "head": e["headCommit"]["oid"],
+                    "position": e["position"], "state": e["state"],
+                })
+            })
+            .collect();
+        Ok(Value::Array(entries))
     }
 
     fn publish_report(
@@ -241,6 +312,7 @@ mod tests {
             false,
             &BTreeSet::new(),
             &pulls,
+            &BTreeMap::new(),
             &outcome,
         )
         .unwrap();
@@ -261,6 +333,7 @@ mod tests {
                 false,
                 &BTreeSet::new(),
                 &pulls,
+                &BTreeMap::new(),
                 &outcome
             )
             .is_err()

@@ -47,6 +47,37 @@ fn maintainer_report_includes_queue_events_and_human_waits() {
 }
 
 #[test]
+fn maintainer_report_reads_each_merge_queue_without_changing_decisions() {
+    let entry = json!({"position": 1, "state": "AWAITING_CHECKS",
+        "headCommit": {"oid": "abc"}, "pullRequest": {"number": 470}});
+    let queue = |nodes: Value, more: bool| {
+        Some(json!({"entries": {"nodes": nodes, "pageInfo": {"hasNextPage": more}}}))
+    };
+    let baseline = configured_pass(&github(), &config(), State::default(), &[], &[REPO]);
+    // No merge queue, an empty one, one entry, more than are read, a failed read.
+    for (queue, expected, errors) in [
+        (None, json!([]), 0),
+        (queue(json!([]), false), json!([]), 0),
+        (
+            queue(json!([entry]), false),
+            json!([{"number": 470, "head": "abc", "position": 1, "state": "AWAITING_CHECKS"}]),
+            0,
+        ),
+        (queue(json!([entry]), true), json!(null), 1),
+        (Some(json!(null)), json!(null), 1),
+    ] {
+        let mut fake = github();
+        fake.report_queue = queue;
+        let outcome = configured_pass(&fake, &maintainer_config(), State::default(), &[], &[REPO]);
+        assert_eq!(outcome.steps, baseline.steps);
+        assert_eq!(outcome.errors, baseline.errors + errors, "{:?}", outcome.lines);
+        let snapshot = report_json(outcome.maintainer_report.as_ref().unwrap());
+        assert_eq!(snapshot["merge_queues"], json!({REPO: expected}));
+        assert_eq!(snapshot["errors"], errors);
+    }
+}
+
+#[test]
 fn maintainer_report_creates_edits_and_leaves_unchanged() {
     let c = maintainer_config();
     let repo = "cgwalters-forge/tracker";

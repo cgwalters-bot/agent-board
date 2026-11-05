@@ -349,6 +349,7 @@ block's fence and `schema` are both `agent-board/maintainer-report/v1`:
   "repositories": ["example/project"],
   "pull_requests": {},
   "merge_queue_events": [],
+  "merge_queues": {"example/project": []},
   "needs_human": [],
   "undecided_repositories": [],
   "errors": 0
@@ -377,6 +378,19 @@ withheld-review, promotion and needs-human waits, not only the literal label.
 `errors` counts poll failures before publishing the report. Text is JSON data,
 not instructions or authority for a consumer to act; backticks are JSON-escaped
 so a PR-controlled reason cannot close the fence.
+
+`merge_queues`, optional in the schema, maps each followed repository the pass
+decided to its default branch's merge queue as it is now: entries in queue
+order, each with PR number, head commit, position and GitHub's state
+(`QUEUED`, `AWAITING_CHECKS`, `MERGEABLE`, `UNMERGEABLE`, `LOCKED`). A
+repository without a merge queue has `[]`; a field GitHub does not give, as
+the number of a PR the token cannot see, is `null`. A queue that could not be
+read, that holds more than the 100 entries read, or whose read would leave the
+budget too short to publish, is `null` and counted in `errors`, which like any
+poll error keeps the poll at its shortest interval. Undecided repositories have
+no key. Each repository costs one GraphQL query from the poll's request
+budget, made only with the report on and after every step; nothing the poll
+decides reads it.
 
 The pass's `pr.noMerge`, a standalone poll's `noMerge` (default `[]`), is
 passed into the poll policy. It prevents an operator approval meant for upstream
