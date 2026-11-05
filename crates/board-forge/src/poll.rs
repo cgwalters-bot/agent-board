@@ -59,6 +59,9 @@ const CLAIM: &str = "agent-board-fix-claim";
 /// On a pull request or an issue it closes: the review job's approval alone
 /// does not merge it, the operator's of the head does (agent-board#293).
 pub(crate) const OPERATOR_APPROVAL_LABEL: &str = "needs-operator-approval";
+/// The start of the wait of a pull request that changes one of the pass's
+/// `pr.operatorPaths` without the operator's approval of its head.
+const OPERATOR_PATHS_WAIT: &str = "pr.operatorPaths: ";
 const MAX_FIX_ROUNDS: u64 = 2;
 /// The ref fix runs are started at, as poll.cjs starts dispatch.yml.
 const DISPATCH_REF: &str = "main";
@@ -308,7 +311,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
       mergeQueueEntry { state }
-      files(first: 100) { nodes { path } pageInfo { hasNextPage } }
+      files(first: 100) { nodes { path changeType } pageInfo { hasNextPage } }
       timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { id createdAt reason beforeCommit { oid } } } }
       baseChange: timelineItems(last: 1, itemTypes: [BASE_REF_CHANGED_EVENT]) { nodes { ... on BaseRefChangedEvent { createdAt } } }
       reviews(last: 100) { nodes { state body submittedAt author { __typename login ... on Bot { databaseId } } commit { oid } } pageInfo { hasPreviousPage } }
@@ -524,6 +527,13 @@ pub struct PollPolicy {
     /// The pass's `pr.noMerge`: exact base repositories never merged or
     /// enqueued by the poll. Empty leaves merge decisions unchanged.
     pub no_merge: Vec<String>,
+    /// The pass's `pr.operatorPaths` (agent-board#683): paths, or with a
+    /// trailing `/` directories, a pull request changing any of which merges
+    /// or is enqueued only on the operator's approval of its head, as under
+    /// [`OPERATOR_APPROVAL_LABEL`]: what agents may target or the pass
+    /// follows is the operator's to change, not the review job's. Empty (the
+    /// default) checks nothing.
+    pub operator_paths: Vec<String>,
     pub toil_fix_pool: String,
     /// `conflictFixPool`: the pool for a toil or rebase round whose pull
     /// request conflicts with its base, where conflicts and the other toil
@@ -933,6 +943,7 @@ impl PollPolicy {
             // The pass's only.
             head_owners: Vec::new(),
             no_merge: Vec::new(),
+            operator_paths: Vec::new(),
             stale_days: 0,
             reruns: false,
             check_reruns: false,
@@ -3396,13 +3407,23 @@ pub fn decide(
     }
     // Every merge and re-queue ([`queue_step`]) is this step's, so none passes
     // the label on the review job's approval alone.
-    if needs_operator_approval(pull)
-        && !matches!(verdicts(pull, config).0, Some((Review::Approved, _)))
-    {
+    let operator_approved = matches!(verdicts(pull, config).0, Some((Review::Approved, _)));
+    if needs_operator_approval(pull) && !operator_approved {
         return step(
             "wait",
             format!(
                 "labelled {OPERATOR_APPROVAL_LABEL} (it or an issue it closes); it needs {}'s approval of the head",
+                config.operator
+            ),
+        );
+    }
+    if let Some(touched) = operator_paths(config, pull)
+        && !operator_approved
+    {
+        return step(
+            "wait",
+            format!(
+                "{OPERATOR_PATHS_WAIT}{touched}; it needs {}'s approval of the head",
                 config.operator
             ),
         );
@@ -3718,7 +3739,12 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
             Some("needs-human")
         }
         "wait" if decision.reason == WITHHELD_WAIT => Some("withheld"),
-        "wait" if decision.reason.starts_with(&approval) => Some("approve"),
+        "wait"
+            if decision.reason.starts_with(&approval)
+                || decision.reason.starts_with(OPERATOR_PATHS_WAIT) =>
+        {
+            Some("approve")
+        }
         "wait" if decision.reason == PROMOTE_WAIT => Some("promote"),
         _ => None,
     }
@@ -3746,6 +3772,39 @@ fn no_merge(config: &Config, pull: &Value) -> bool {
         .no_merge
         .iter()
         .any(|r| r.eq_ignore_ascii_case(repository))
+}
+
+/// Which of `pr.operatorPaths` `pull` changes, named for its wait: none
+/// where it changes none of them. Changed files past those read may be any,
+/// so they count as one. GraphQL gives no previous filename for a rename;
+/// conservatively hold every rename because its source could be protected.
+fn operator_paths(config: &Config, pull: &Value) -> Option<String> {
+    let protected = &config.policy.operator_paths;
+    if protected.is_empty() {
+        return None;
+    }
+    let Some(changed) = changed(pull) else {
+        return Some("its changed files were not all read".into());
+    };
+    for file in nodes(pull, "/files/nodes") {
+        match file["changeType"].as_str() {
+            Some("ADDED" | "MODIFIED" | "DELETED" | "COPIED" | "CHANGED" | "UNCHANGED") => {}
+            Some("RENAMED") => {
+                return Some("it renames a file whose previous path is unknown".into());
+            }
+            _ => return Some("its file change types were not all read".into()),
+        }
+    }
+    let touched: Vec<&str> = (changed.iter())
+        .filter(|path| {
+            protected.iter().any(|p| match p.strip_suffix('/') {
+                Some(dir) => path.strip_prefix(dir).is_some_and(|r| r.starts_with('/')),
+                None => *path == p,
+            })
+        })
+        .map(String::as_str)
+        .collect();
+    (!touched.is_empty()).then(|| format!("it changes {}", touched.join(", ")))
 }
 
 /// Keep draft housekeeping distinct even on the labelled-list shortcut.
@@ -7141,9 +7200,20 @@ pub fn run_capped<R: Rest, G: Transport>(
         );
     }
     let mut outcome = Outcome::default();
+    // A listed repository that is not there, as one a merged configuration
+    // change named by mistake (agent-board#683), is the operator's to fix;
+    // it stops nothing else.
+    let mut missing = BTreeSet::new();
+    let not_found = |repo: &str| {
+        format!("warning: {repo} was not found (404); fix its entry in the configuration")
+    };
     for repo in &repositories {
         match pass.activity(repo, &mut outcome.lines) {
             Ok(count) => outcome.activity += count,
+            Err(error) if error.is::<crate::github::NotFound>() => {
+                outcome.lines.push(not_found(repo));
+                missing.insert(repo.to_ascii_lowercase());
+            }
             Err(error) => {
                 outcome.errors += 1;
                 outcome.lines.push(format!("{repo} error: {error:#}"));
@@ -7191,10 +7261,23 @@ pub fn run_capped<R: Rest, G: Transport>(
             outcome.undecided.insert(repo.to_ascii_lowercase());
             continue;
         }
-        if let Err(error) = pass.follow(repo, &mut outcome) {
-            outcome.errors += 1;
+        if missing.contains(&repo.to_ascii_lowercase()) {
             outcome.undecided.insert(repo.to_ascii_lowercase());
-            outcome.lines.push(format!("{repo} error: {error:#}"));
+            continue;
+        }
+        match pass.follow(repo, &mut outcome) {
+            Ok(()) => {}
+            // Only its list of pull requests passes a 404 up: each pull
+            // request's own errors stay its own.
+            Err(error) if error.is::<crate::github::NotFound>() => {
+                outcome.undecided.insert(repo.to_ascii_lowercase());
+                outcome.lines.push(not_found(repo));
+            }
+            Err(error) => {
+                outcome.errors += 1;
+                outcome.undecided.insert(repo.to_ascii_lowercase());
+                outcome.lines.push(format!("{repo} error: {error:#}"));
+            }
         }
     }
     // Once every repository's review runs are counted toward `wip`.
@@ -10765,11 +10848,21 @@ mod tests {
     }
 
     fn pass(fake: &Fake, state: State, watch: &[&str], follow: &[&str]) -> Outcome {
+        configured_pass(fake, &config(), state, watch, follow)
+    }
+
+    fn configured_pass(
+        fake: &Fake,
+        config: &Config,
+        state: State,
+        watch: &[&str],
+        follow: &[&str],
+    ) -> Outcome {
         let owned = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let outcome = run(
             fake,
             fake,
-            &config(),
+            config,
             state,
             &owned(watch),
             &owned(follow),
@@ -10858,6 +10951,157 @@ mod tests {
             "{:?}",
             outcome.lines
         );
+    }
+
+    /// A pull request changing a `pr.operatorPaths` entry is one approve row
+    /// naming the paths until the operator approves its head, the review
+    /// job's approval notwithstanding; then it merges (agent-board#683).
+    #[test]
+    fn operator_paths_merge_only_on_the_operators_approval() {
+        let mut cfg = config();
+        cfg.policy.operator_paths = vec![".github/pass.json".into(), ".github/agentic-job/".into()];
+        let files = json!({"nodes": [{"path": ".github/agentic-job/midstream.toml", "changeType": "MODIFIED"},
+            {"path": ".github/pass.json", "changeType": "MODIFIED"}, {"path": "README.md", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}});
+        let job_only = json!({"nodes": [review("APPROVED", job(), HEAD, "approved")]});
+        let operator = json!({"nodes": [review("APPROVED", job(), HEAD, "approved"),
+            later(review("APPROVED", user("cgwalters"), HEAD, "approved"))]});
+        let older = json!({"nodes": [review("APPROVED", job(), HEAD, "approved"),
+            later(review("APPROVED", user("cgwalters"), "older", "approved"))]});
+        // A preview's merge line: the review job's approval or the operator's.
+        let merges = |outcome: &Outcome| {
+            (outcome.lines.iter()).any(|l| l.contains(" merge:") || l.starts_with("merge "))
+        };
+        let held = "pr.operatorPaths: it changes .github/agentic-job/midstream.toml, .github/pass.json; it needs cgwalters's approval of the head";
+        for (name, reviews, wait) in [
+            ("the review job's approval alone", job_only, Some(held)),
+            (
+                "the operator's approval of an older head",
+                older,
+                Some(held),
+            ),
+            ("the operator's approval of the head", operator, None),
+        ] {
+            let mut fake = github();
+            fake.pulls.insert(
+                470,
+                pull("pull-470", json!({"files": files, "reviews": reviews})),
+            );
+            let outcome = configured_pass(&fake, &cfg, State::default(), &[], &[REPO]);
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            let waits: Vec<(&str, &str, &str)> = (outcome.waits.iter())
+                .map(|w| (w.kind, w.head.as_str(), w.reason.as_str()))
+                .collect();
+            let expected: Vec<(&str, &str, &str)> =
+                wait.map(|r| ("approve", HEAD, r)).into_iter().collect();
+            assert_eq!(waits, expected, "{name}");
+            let merged = merges(&outcome);
+            assert_eq!(merged, wait.is_none(), "{name}: {:?}", outcome.lines);
+        }
+        // A change elsewhere, a name that only starts like a listed
+        // directory, merges as before; files past those read are held.
+        for (name, files, merged) in [
+            (
+                "elsewhere",
+                json!({"nodes": [{"path": ".github/agentic-jobs/x", "changeType": "ADDED"}, {"path": ".github/pass.json.old", "changeType": "DELETED"}], "pageInfo": {"hasNextPage": false}}),
+                true,
+            ),
+            (
+                "not all read",
+                json!({"nodes": [{"path": "README.md"}], "pageInfo": {"hasNextPage": true}}),
+                false,
+            ),
+        ] {
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"files": files})));
+            let outcome = configured_pass(&fake, &cfg, State::default(), &[], &[REPO]);
+            let got = merges(&outcome);
+            assert_eq!(got, merged, "{name}: {:?}", outcome.lines);
+            assert_eq!(outcome.waits.len(), usize::from(!merged), "{name}");
+        }
+    }
+
+    #[test]
+    fn operator_paths_hold_renames_with_unknown_sources() {
+        // GraphQL reports only the destination. Each rename could have come
+        // from the exact protected file or from within the protected directory.
+        for (protected, destination) in [
+            (".github/pass.json", ".github/pass-disabled.json"),
+            (".github/agentic-job/", "disabled/midstream.toml"),
+        ] {
+            let mut cfg = config();
+            cfg.policy.operator_paths = vec![protected.into()];
+            for change_type in [json!("RENAMED"), Value::Null, json!("UNKNOWN")] {
+                for approval in [None, Some("older"), Some(HEAD)] {
+                    let mut reviews = vec![review("APPROVED", job(), HEAD, "approved")];
+                    if let Some(head) = approval {
+                        reviews.push(later(review(
+                            "APPROVED",
+                            user("cgwalters"),
+                            head,
+                            "approved",
+                        )));
+                    }
+                    let mut fake = github();
+                    fake.pulls.insert(470, pull("pull-470", json!({
+                        "files": {"nodes": [{"path": destination, "changeType": change_type}],
+                            "pageInfo": {"hasNextPage": false}},
+                        "reviews": {"nodes": reviews}
+                    })));
+                    let outcome = configured_pass(&fake, &cfg, State::default(), &[], &[REPO]);
+                    assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                    let approved = approval == Some(HEAD);
+                    let merged = outcome
+                        .lines
+                        .iter()
+                        .any(|l| l.contains(" merge:") || l.starts_with("merge "));
+                    assert_eq!(
+                        merged, approved,
+                        "{protected} -> {destination}, {change_type}, {approval:?}: {:?}",
+                        outcome.lines
+                    );
+                    assert_eq!(outcome.waits.len(), usize::from(!approved));
+                    if !approved {
+                        assert_eq!(outcome.waits[0].kind, "approve");
+                        assert!(outcome.waits[0].reason.starts_with(OPERATOR_PATHS_WAIT));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A followed repository that answers 404, as one a merged configuration
+    /// change named by mistake, is a warning naming it and left undecided;
+    /// the pass goes on with the rest and fails nothing (agent-board#683).
+    #[test]
+    fn a_missing_followed_repository_is_a_warning() {
+        const MISSING: &str = "o/missing";
+        let warning =
+            format!("warning: {MISSING} was not found (404); fix its entry in the configuration");
+        // Its events, or only its pull requests, not found.
+        for events in [false, true] {
+            let mut fake = github();
+            let pulls = format!("repos/{MISSING}/pulls?state=open&per_page=100");
+            fake.missing.push(format!("{API_ROOT}{pulls}"));
+            let events_path = format!("repos/{MISSING}/events?per_page=100");
+            if events {
+                fake.page(&events_path, None, None, json!([]));
+            } else {
+                fake.missing.push(format!("{API_ROOT}{events_path}"));
+            }
+            let outcome = pass(&fake, State::default(), &[], &[MISSING, REPO]);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let warnings: Vec<&String> = (outcome.lines.iter())
+                .filter(|l| l.starts_with("warning: "))
+                .collect();
+            assert_eq!(warnings, [&warning], "{:?}", outcome.lines);
+            assert_eq!(outcome.undecided, [MISSING.to_owned()].into());
+            assert!(
+                outcome.lines.iter().any(|l| l.contains(" merge:")),
+                "{:?}",
+                outcome.lines
+            );
+        }
     }
 
     #[test]
@@ -16924,6 +17168,12 @@ mod tests {
             (WITHHELD_WAIT.into(), Person),
             (NO_REVIEW.into(), Unreviewed),
             (approval, Person),
+            (
+                format!(
+                    "{OPERATOR_PATHS_WAIT}it changes .github/pass.json; it needs cgwalters's approval of the head"
+                ),
+                Person,
+            ),
             (format!("{CHECKS_PENDING}ci"), Waiting),
             (format!("{MERGEABILITY}main not known yet"), Waiting),
             (

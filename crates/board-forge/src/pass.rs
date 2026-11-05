@@ -106,6 +106,8 @@ const DEFAULT_TARGET: f64 = 0.95;
 const BURST_LIMIT: f64 = 100.0;
 const REBASE_ROUNDS_LIMIT: u64 = 3;
 const QUEUE_TRIES_LIMIT: u64 = 5;
+/// The most `pr.operatorPaths` entries: a few bounds and pass files.
+const OPERATOR_PATHS_LIMIT: usize = 50;
 /// The most `budget.weeklyUsd` may be: a typo of a few zeros is no budget.
 const WEEKLY_USD_LIMIT: f64 = 100_000.0;
 /// How far past the weekly budget pull requests' fix rounds go on, so that
@@ -822,6 +824,9 @@ pub struct Pr {
     /// Base repositories followed for rounds but never merged into.
     #[serde(default)]
     pub no_merge: Vec<String>,
+    /// [`PollPolicy::operator_paths`].
+    #[serde(default)]
+    pub operator_paths: Vec<String>,
     #[serde(default)]
     pub rebase_rounds: u64,
     pub merge_queue: Option<MergeQueue>,
@@ -1281,6 +1286,18 @@ impl Config {
             poll::validate_repository(repository).context("pr noMerge repository")?;
         }
         ensure!(
+            self.pr.operator_paths.len() <= OPERATOR_PATHS_LIMIT,
+            "pr operatorPaths has more than {OPERATOR_PATHS_LIMIT} entries"
+        );
+        // As the API names a changed file: relative, no globs, no dot segments.
+        for path in &self.pr.operator_paths {
+            let mut segments = path.strip_suffix('/').unwrap_or(path).split('/');
+            ensure!(
+                !path.contains('*') && segments.all(|s| !s.is_empty() && s != "." && s != ".."),
+                "pr operatorPaths entry {path:?} is not a relative path, or a directory ending in /"
+            );
+        }
+        ensure!(
             self.pr.rebase_rounds <= REBASE_ROUNDS_LIMIT,
             "pr rebaseRounds is not 0 to {REBASE_ROUNDS_LIMIT}"
         );
@@ -1380,6 +1397,7 @@ impl Config {
             merge_authors: self.pr.merge_authors.clone(),
             head_owners: self.pr.head_owners.clone(),
             no_merge: self.pr.no_merge.clone(),
+            operator_paths: self.pr.operator_paths.clone(),
             toil_fix_pool: self.pr.toil_fix_pool.clone().unwrap_or_default(),
             conflict_fix_pool: self.pr.conflict_fix_pool.clone().unwrap_or_default(),
             merge_queue: self.pr.merge_queue.as_ref().map(|q| q.tries),
