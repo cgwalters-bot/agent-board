@@ -1,4 +1,4 @@
-//! Standalone, preview-only promotion evidence reads.
+//! Standalone promotion; preview by default, publication explicitly opted in.
 use anyhow::{Context, Result, ensure};
 use board_forge::{
     github::Client,
@@ -13,6 +13,12 @@ use std::{
 
 #[derive(clap::Args)]
 pub struct Promote {
+    /// Publish at most one approved candidate; also requires promote.publish.
+    #[arg(long, conflicts_with_all = ["record", "replay"], requires = "max_writes")]
+    pub apply: bool,
+    /// Whole-step publication cap (three writes reserved per candidate).
+    #[arg(long, requires = "apply")]
+    pub max_writes: Option<usize>,
     /// Trusted shared pass configuration; promote.forks absent or empty means off, with no forge reads or token lookup. The pass remains inert. With forks, GH_TOKEN reads within the pass's request/time bounds and ten 100-row pages per listing.
     #[arg(long, value_name = "FILE")]
     pub config: PathBuf,
@@ -33,6 +39,12 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         config.forgejo_board().is_none(),
         "promote supports GitHub only"
     );
+    if args.apply && promote::enabled(&config) {
+        ensure!(
+            config.promote.as_ref().is_some_and(|p| p.publish),
+            "promote.publish must be true for --apply"
+        );
+    }
     let replay = args
         .replay
         .as_ref()
@@ -61,6 +73,13 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
             std::fs::write(path, recording(&recorder.fixture(now)?)?)
                 .with_context(|| format!("write {}", path.display()))?;
             result?
+        } else if args.apply {
+            promote::apply(
+                &client,
+                &config,
+                now,
+                args.max_writes.context("--max-writes required")?,
+            )?
         } else {
             promote::preview(&client, &config, now)?
         }

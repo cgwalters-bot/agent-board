@@ -130,7 +130,7 @@ fn plan_comments(replay: &mut Replay, nodes: Value) {
 
 fn candidate(human: bool) -> String {
     format!(
-        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
+        "would promote {REPO}#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); preview only; publication revalidates approval and all gates; stack=none (no plan); dco=required; head={HEAD} command=https://github.com/{REPO}/pull/34#issuecomment-1 at={COMMAND} human-text={human} push={PUSH}; staging verification required for bot-fork head"
     )
 }
 
@@ -879,7 +879,7 @@ fn upstream(replay: &mut Replay) -> &mut Value {
 }
 
 fn upstream_pr() -> Value {
-    json!({"number":70,"state":"open","merged_at":null,"base":{"ref":"main"},"head":{"sha":HEAD,"ref":"dispatch/implement/agent-run-39714560993","repo":{"owner":{"login":"cgwalters-bot"}}}})
+    json!({"number":70,"state":"open","merged_at":null,"base":{"ref":"main","repo":{"full_name":"composefs/composefs-rs"}},"head":{"sha":HEAD,"ref":"dispatch/implement/agent-run-39714560993","repo":{"full_name":"cgwalters-bot/composefs-rs","owner":{"login":"cgwalters-bot"}}}})
 }
 
 fn signed_dag(replay: &mut Replay) {
@@ -1245,6 +1245,345 @@ fn run(replay: Replay, config: &Config) -> (Result<Vec<String>>, Forge) {
     let result = preview(&forge, config, forge.replay.now);
     assert_eq!(forge.writes.get(), 0);
     (result, forge)
+}
+
+// Publication scenarios edit the same public recording. None is live write or
+// staging evidence. The fake records every attempted mutation in order.
+struct PublishingForge {
+    replay: Replay,
+    writes: RefCell<Vec<(String, String, Value)>>,
+    fresh: Value,
+    moved: bool,
+    returned_head: bool,
+    fail: Option<usize>,
+    writer: String,
+    returned_number: bool,
+}
+
+impl Rest for PublishingForge {
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        let value = if url == format!("{API}user") {
+            Some(json!({"login":self.writer}))
+        } else if url == format!("{API}repos/{REPO}/pulls/34") {
+            Some(self.fresh.clone())
+        } else if url == format!("{API}repos/{REPO}/pulls/35") {
+            let mut replay = Replay {
+                now: self.replay.now,
+                requests: self.replay.requests.clone(),
+            };
+            Some(body(&mut replay, "pulls?state=open")[1].clone())
+        } else if url.contains("/git/ref/heads/") {
+            Some(json!({"object":{"sha":if self.moved { "a".repeat(40) } else { HEAD.into() }}}))
+        } else {
+            None
+        };
+        if let Some(body) = value {
+            return Ok(RestResponse {
+                status: 200,
+                body,
+                etag: None,
+                last_modified: None,
+                link: None,
+            });
+        }
+        self.replay.get(url, validator)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        let mut writes = self.writes.borrow_mut();
+        writes.push((method.into(), url.into(), body.clone()));
+        if self.fail == Some(writes.len()) {
+            anyhow::bail!("simulated lost response");
+        }
+        if url.contains("/pulls") {
+            let mut result = upstream_pr();
+            result["base"] = json!({"ref":"main","repo":{"full_name":"composefs/composefs-rs"}});
+            result["title"] = body["title"].clone();
+            result["body"] = body["body"].clone();
+            if let Some(head) = body["head"].as_str() {
+                result["head"]["ref"] = json!(head.split_once(':').unwrap().1);
+            }
+            if self.returned_head {
+                result["head"]["sha"] = json!("b".repeat(40));
+            }
+            if self.returned_number {
+                result["number"] = json!(71);
+            }
+            Ok((200, result))
+        } else {
+            Ok((200, json!({"id":99})))
+        }
+    }
+}
+
+impl Transport for PublishingForge {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.replay.graphql(query, variables)
+    }
+}
+
+fn publication() -> (PublishingForge, Config) {
+    let mut replay = scenario();
+    *reviews(&mut replay) = json!([{"id":5,"user":{"login":"cgwalters"},"state":"APPROVED","submitted_at":COMMAND,"commit_id":HEAD}]);
+    body(&mut replay, "/compare/")["commits"][0]["commit"]["message"] =
+        json!("Implement\n\nSigned-off-by: Preview fixture <preview@example.invalid>");
+    let fresh = pull(&mut replay).clone();
+    let forge = PublishingForge {
+        replay,
+        fresh,
+        writes: RefCell::new(vec![]),
+        moved: false,
+        returned_head: false,
+        fail: None,
+        writer: "cgwalters-bot".into(),
+        returned_number: false,
+    };
+    let mut config = Config::parse(CONFIG).unwrap();
+    config.promote.as_mut().unwrap().publish = true;
+    (forge, config)
+}
+
+#[test]
+fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
+    for existing in [false, true] {
+        let (mut forge, config) = publication();
+        if existing {
+            let mut pr = upstream_pr();
+            pr["base"] = json!({"ref":"main","repo":{"full_name":"composefs/composefs-rs"}});
+            *upstream(&mut forge.replay) = json!([pr]);
+            comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":"<!-- agent-board-promote-status -->"}));
+            sync_metadata(&mut forge.replay);
+        }
+        let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+        assert_eq!(
+            lines,
+            [format!(
+                "promoted {REPO}#34 -> https://github.com/composefs/composefs-rs/pull/70 head={HEAD}"
+            )]
+        );
+        let writes = forge.writes.borrow();
+        assert_eq!(writes.len(), 3);
+        let publication = &writes[1];
+        assert_eq!(publication.0, if existing { "PATCH" } else { "POST" });
+        assert_eq!(
+            publication.1,
+            format!(
+                "{API}repos/composefs/composefs-rs/pulls{}",
+                if existing { "/70" } else { "" }
+            )
+        );
+        assert_eq!(publication.2["title"], forge.fresh["title"]);
+        assert_eq!(publication.2["body"], forge.fresh["body"]);
+        if existing {
+            assert_eq!(publication.2.as_object().unwrap().len(), 2);
+        } else {
+            assert_eq!(publication.2["draft"], true);
+            assert_eq!(publication.2["maintainer_can_modify"], false);
+            assert_eq!(
+                publication.2["head"],
+                "cgwalters-bot:dispatch/implement/agent-run-39714560993"
+            );
+        }
+        assert!(writes.last().unwrap().1.ends_with("/issues/comments/99"));
+        assert!(
+            writes.last().unwrap().2["body"]
+                .as_str()
+                .unwrap()
+                .contains("Published approved head")
+        );
+        assert!(writes.iter().all(|(_, url, _)| !url.contains("/git/")));
+    }
+}
+
+#[test]
+fn publication_refusals_never_publish_an_unapproved_head() {
+    for case in [
+        "disabled",
+        "cap",
+        "no approval",
+        "old approval",
+        "change request",
+        "draft",
+        "needs human",
+        "policy",
+        "DCO rewrite",
+        "stale command",
+        "fresh text",
+        "moved",
+        "returned head",
+        "write failure",
+        "closed upstream",
+        "different upstream head",
+        "different head repository",
+        "different returned number",
+        "wrong writer",
+    ] {
+        let (mut forge, mut config) = publication();
+        match case {
+            "disabled" => config.promote.as_mut().unwrap().publish = false,
+            "no approval" => *reviews(&mut forge.replay) = json!([]),
+            "old approval" => reviews(&mut forge.replay)[0]["commit_id"] = json!("a".repeat(40)),
+            "change request" => reviews(&mut forge.replay)[0]["state"] = json!("CHANGES_REQUESTED"),
+            "draft" => pull(&mut forge.replay)["draft"] = json!(true),
+            "needs human" => pull(&mut forge.replay)["labels"] = json!([{"name":"needs-human"}]),
+            "policy" => set_verdict(&mut forge.replay, None, "no-go"),
+            "DCO rewrite" => {
+                body(&mut forge.replay, "/compare/")["commits"][0]["commit"]["message"] =
+                    json!("Unsigned")
+            }
+            "stale command" => comments(&mut forge.replay)[0]["body"] = json!("No command"),
+            "fresh text" => forge.fresh["title"] = json!("Changed after approval"),
+            "moved" => forge.moved = true,
+            "returned head" => forge.returned_head = true,
+            "write failure" => forge.fail = Some(2),
+            "wrong writer" => forge.writer = "cgwalters".into(),
+            "different head repository" => {
+                let mut pr = upstream_pr();
+                pr["head"]["repo"]["full_name"] = json!("cgwalters-bot/another-fork");
+                *upstream(&mut forge.replay) = json!([pr]);
+            }
+            "different returned number" => {
+                forge.returned_number = true;
+                *upstream(&mut forge.replay) = json!([upstream_pr()]);
+            }
+            "closed upstream" | "different upstream head" => {
+                let mut pr = upstream_pr();
+                if case == "closed upstream" {
+                    pr["state"] = json!("closed");
+                } else {
+                    pr["head"]["sha"] = json!("a".repeat(40));
+                }
+                *upstream(&mut forge.replay) = json!([pr]);
+            }
+            _ => {}
+        }
+        let result = apply(
+            &forge,
+            &config,
+            forge.replay.now,
+            if case == "cap" { 2 } else { 3 },
+        );
+        assert!(
+            result.is_err()
+                || result
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|l| !l.starts_with("promoted ")),
+            "{case}: {result:?}"
+        );
+        let writes = forge.writes.borrow();
+        assert_eq!(
+            writes.len(),
+            match case {
+                "moved" => 2,
+                "returned head" | "write failure" | "different returned number" => 3,
+                _ => 0,
+            },
+            "{case}: {writes:?}"
+        );
+    }
+}
+
+#[test]
+fn publication_human_text_requires_provenance_and_preserves_bytes() {
+    for valid in [false, true] {
+        let (mut forge, config) = publication();
+        let approved = reviews(&mut forge.replay).clone();
+        let signed = body(&mut forge.replay, "/compare/")["commits"].clone();
+        forge.replay = human_scenario();
+        *reviews(&mut forge.replay) = approved;
+        body(&mut forge.replay, "/compare/")["commits"] = signed;
+        if !valid {
+            activity(&mut forge.replay)[0]["actor"]["login"] = json!("someone-else");
+        }
+        let result = apply(&forge, &config, forge.replay.now, 3).unwrap();
+        if valid {
+            assert!(result[0].starts_with("promoted "));
+            let writes = forge.writes.borrow();
+            assert_eq!(writes[1].2["body"], forge.fresh["body"]);
+            assert_eq!(writes[1].2["title"], forge.fresh["title"]);
+        } else {
+            assert!(result[0].contains("pusher"));
+            assert!(forge.writes.borrow().is_empty());
+        }
+    }
+}
+
+#[test]
+fn publication_caps_and_existing_receipt_are_bounded() {
+    for cap in [0, 1, 2, 3, 100] {
+        let (mut forge, config) = publication();
+        comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":"Previous attempt: outcome unknown. <!-- agent-board-promote-status -->"}));
+        sync_metadata(&mut forge.replay);
+        // The second candidate is never evaluated or published this invocation.
+        let mut second = forge.fresh.clone();
+        second["number"] = json!(35);
+        body(&mut forge.replay, "pulls?state=open")
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+        let lines = apply(&forge, &config, forge.replay.now, cap).unwrap();
+        assert_eq!(lines.len(), 1);
+        if cap < 3 {
+            assert!(lines[0].starts_with("held by --max-writes"));
+            assert!(forge.writes.borrow().is_empty());
+        } else {
+            let writes = forge.writes.borrow();
+            assert_eq!(writes.len(), 3);
+            assert!(writes[0].1.ends_with("/issues/comments/99"));
+            assert!(writes[1].1.ends_with("/pulls"));
+            assert!(writes[2].1.ends_with("/issues/comments/99"));
+        }
+    }
+}
+
+#[test]
+fn confirmed_publication_does_not_starve_the_next_candidate() {
+    let (mut forge, config) = publication();
+    // A second hypothetical PR on another branch, derived from exactly the
+    // same scenario reads. Preserve it across two invocations of the job.
+    fn second(value: &mut Value) {
+        match value {
+            Value::String(text) => {
+                *text = text
+                    .replace("/34", "/35")
+                    .replace("agent-run-39714560993", "agent-run-second")
+            }
+            Value::Array(values) => values.iter_mut().for_each(second),
+            Value::Object(values) => {
+                if values.get("number") == Some(&json!(34)) {
+                    values.insert("number".into(), json!(35));
+                }
+                values.values_mut().for_each(second);
+            }
+            _ => {}
+        }
+    }
+    let mut requests = forge.replay.requests.clone();
+    requests.iter_mut().for_each(second);
+    forge.replay.requests.extend(requests);
+    let mut next = forge.fresh.clone();
+    second(&mut next);
+    body(&mut forge.replay, "pulls?state=open")
+        .as_array_mut()
+        .unwrap()
+        .push(next);
+    let first = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert!(first[0].contains("#34 ->"));
+    // Retain what the fake forge accepted: upstream PR and final fork receipt.
+    let writes = forge.writes.take();
+    let mut published = upstream_pr();
+    published["title"] = writes[1].2["title"].clone();
+    published["body"] = writes[1].2["body"].clone();
+    *upstream(&mut forge.replay) = json!([published]);
+    comments(&mut forge.replay).as_array_mut().unwrap().push(json!({"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":writes[2].2["body"]}));
+    sync_metadata(&mut forge.replay);
+    let second = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(second[0].contains("#35 ->"), "{second:?}");
+    assert_eq!(forge.writes.borrow().len(), 3);
+    assert!(forge.writes.borrow()[0].1.contains("/issues/35/comments"));
 }
 
 #[test]

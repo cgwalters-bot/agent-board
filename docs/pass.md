@@ -1268,10 +1268,13 @@ A pass captures one clock and performs these stages in order:
     to promote. The standalone preview checks operator command/head evidence,
     then candidate upstream PRs, distance, accepted-plan stacks, GitHub DCO
     facts and title/body references, then the upstream's contribution-policy
-    record. Passing says `would promote`, not that publication is permitted:
-    human-text provenance and publication remain gates. The contract and minimal-noise requirements remain in the
-   [architecture](architecture.md#promote); write/recovery, sign-off and
-   Status/scheduling handoff tests come before a future write slice. A
+     record and human-text provenance. Passing says `would promote`, not that
+     publication is permitted. Standalone `--apply` also needs caller opt-in,
+     a whole-step write cap and the operator's current-head approval; it
+     revalidates all gates, creates an upstream draft or updates a same-head PR,
+     and edits one fork status comment. It never pushes, marks ready or closes
+     a fork. See the [architecture](architecture.md#promote); DCO rewrites and
+     the Status/scheduling handoff remain unbuilt. A
    separate tracker schedule and recorded bot-fork staging verification are
    still required; neither is enabled or claimed here.
 5. Derive Status for every board item, closed issues and merged pull
@@ -3334,6 +3337,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
 | `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, read by standalone `promote`, never the pass; the destination comes from here, never a pull request's body; a fork is named once ignoring case, is not its own upstream, nor in `follow` (its main moves only by sync); `base` non-empty; absent or `{}` means off with no forge reads |
+| `promote.publish` | Default `false`: allow standalone `promote --apply --max-writes N` to publish one upstream draft or update one same-head PR after fresh gates and operator current-head approval; three writes reserved; no pushes, ready changes or fork closure; the pass remains inert |
 | `promote.signoff.name`, `promote.signoff.email` | Reserved operator sign-off identity; both non-empty; required with `promote.forks`, no default; no sign-off is performed in the preview |
 | `promote.policyRepository` | Repository whose default branch will supply upstream policy records, never written; required with `promote.forks`, but policy is not read by this preview |
 | `promote.policyPath` | Directory of the records in it, one `OWNER/REPO.md` per upstream; absent, its top level |

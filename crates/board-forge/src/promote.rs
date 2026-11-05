@@ -1,5 +1,5 @@
 //! Standalone promotion evidence preview, including the upstream
-//! contribution-policy gate. No mutation or publication evaluation.
+//! contribution-policy gate, plus explicitly opted-in bounded publication.
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,10 +15,11 @@ use crate::{
 const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
-pub const REMAINING: &str = "promote: remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; bot-fork heads require recorded staging verification";
+pub const REMAINING: &str = "promote: preview only; publication requires promote.publish, --apply and --max-writes; DCO rewrites and fork closure not implemented; bot-fork heads require recorded staging verification";
 
 /// Authenticated command selection and its observed branch binding, not output
 /// parsed back into authority. The pusher is from the newest activity event.
+#[derive(Debug, PartialEq, Eq)]
 struct Command {
     url: String,
     author: String,
@@ -47,7 +48,11 @@ enum Gates {
     /// The full line: an open upstream PR already has this head.
     Promoted(String),
     /// Every read gate passed: the commit summary and the gate details.
-    Ready { summary: String, detail: String },
+    Ready {
+        summary: String,
+        detail: String,
+        signoffs: usize,
+    },
 }
 
 pub fn enabled(config: &Config) -> bool {
@@ -114,7 +119,9 @@ pub fn preview<C: Rest + Transport>(
                             Ok(Gates::Promoted(result)) => {
                                 lines.push(format!("{result}; head={head} {command}; staging verification required for bot-fork head"));
                             }
-                            Ok(Gates::Ready { summary, detail }) => {
+                            Ok(Gates::Ready {
+                                summary, detail, ..
+                            }) => {
                                 let policy = policies
                                     .entry(target.upstream.to_ascii_lowercase())
                                     .or_insert_with(|| {
@@ -132,7 +139,7 @@ pub fn preview<C: Rest + Transport>(
                                 };
                                 lines.push(match permission {
                                     Ok(verdict) => format!(
-                                        "would promote {repo}#{number} -> {} ({summary}) (policy {verdict}); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; {detail}; head={head} {command}; staging verification required for bot-fork head",
+                                         "would promote {repo}#{number} -> {} ({summary}) (policy {verdict}); preview only; publication revalidates approval and all gates; {detail}; head={head} {command}; staging verification required for bot-fork head",
                                         target.upstream
                                     ),
                                     Err(why) => {
@@ -219,6 +226,18 @@ fn gates(
     upstream: &str,
     base: &str,
 ) -> Result<Gates> {
+    gates_impl(client, config, repo, pull, upstream, base, true)
+}
+
+fn gates_impl(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    repo: &str,
+    pull: &Value,
+    upstream: &str,
+    base: &str,
+    observe_existing: bool,
+) -> Result<Gates> {
     validate_repository(repo)?;
     validate_repository(upstream)?;
     validate_branch(base)?;
@@ -253,9 +272,11 @@ fn gates(
             p["head"]["sha"] == head,
             "upstream {upstream}#{n} has a different head"
         );
-        return Ok(Gates::Promoted(format!(
-            "already promoted {repo}#{number} -> {upstream}#{n}"
-        )));
+        if observe_existing {
+            return Ok(Gates::Promoted(format!(
+                "already promoted {repo}#{number} -> {upstream}#{n}"
+            )));
+        }
     }
     let path = format!(
         "repos/{upstream}/compare/{}...{}",
@@ -302,8 +323,13 @@ fn gates(
     Ok(Gates::Ready {
         summary: dco.1,
         detail: format!("{stack}; {}", dco.0),
+        signoffs: dco.2,
     })
 }
+
+mod publish;
+
+pub use publish::apply;
 
 fn comparison(client: &impl Rest, path: &str, head: &str) -> Result<Value> {
     let mut first: Option<Value> = None;
@@ -532,7 +558,7 @@ fn dco_gate(
     base: &str,
     compare: &Value,
     head: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, usize)> {
     let rules = pages(
         client,
         &format!("repos/{upstream}/rules/branches/{}", encode(base)),
@@ -572,7 +598,7 @@ fn dco_gate(
         }
     }
     if !dco {
-        return Ok(("dco=not-required".into(), "no DCO".into()));
+        return Ok(("dco=not-required".into(), "no DCO".into(), 0));
     }
     (|| {
         let commits = compare["commits"]
@@ -647,6 +673,7 @@ fn dco_gate(
         Ok((
             "dco=required".into(),
             format!("sign-off on {missing} of {} commits", commits.len()),
+            missing,
         ))
     })()
     .context("dco=required")

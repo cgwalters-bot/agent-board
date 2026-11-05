@@ -10,6 +10,11 @@ use super::*;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Promote {
+    /// Permit standalone publication with --apply. Off by default so existing
+    /// preview callers cannot unexpectedly publish to an upstream repository.
+    #[serde(default)]
+    pub publish: bool,
+
     /// Each fork repository to its upstream and base branch; empty is off.
     #[serde(default)]
     pub forks: BTreeMap<String, Fork>,
