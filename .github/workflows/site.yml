@@ -42,9 +42,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned by commit, as the workflow check requires of a step that
-      # runs as root; this is main when written, with secure-host:v0.6.3.
-      - uses: cgwalters-forge/actions/secure-host@4642b4f3a2803489a2714f5e1211371b24150fdc # main, with secure-host:v0.6.3
+      # Reviewed root action pin, including c9a9501: stop acpid's socket
+      # and service so the sandbox cannot reach that unnecessary daemon
+      # (tracker#1212). Keep the default hosted config and strict check;
+      # the action verifies the digest-pinned v0.6.4 image's signer first.
+      - uses: cgwalters-forge/actions/secure-host@c763a8950778743f51857a37b2a59daf9e96ee23 # secure-host:v0.6.4; stops acpid
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: just@1.58.0
