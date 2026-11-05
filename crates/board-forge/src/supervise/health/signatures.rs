@@ -225,20 +225,27 @@ impl Collector<'_> {
         Ok(value.as_array().cloned().unwrap_or_default())
     }
 
-    /// The lookback's runs, shared with other checks, and failed runs created
-    /// in the last [`RERUN_DAYS`]: listings filter by creation, so an older
-    /// run rerun today is only found among those. Completion times are judged
-    /// afterwards. Past maxPages coverage is unavailable, not green.
+    /// The lookback's runs, shared with other checks, and runs created in the
+    /// last [`RERUN_DAYS`] with each [`FAILED`] conclusion: listings filter
+    /// by creation, so an older run rerun today is only found among those.
+    /// Completion times are judged afterwards. GitHub's `status` filter
+    /// takes `startup_failure` as `gh run list --status` sends it, though
+    /// its REST reference omits it; a filter it ignored would list every
+    /// run and so run past maxPages, which is unavailable, not green. A run
+    /// listed twice counts once per attempt ([`Self::failure_events`]).
     fn failed_dispatch_runs(&self) -> Result<Vec<Value>> {
         let since = encode(&format!(">={}", iso(self.now - RERUN_DAYS * DAY)));
         let mut runs = self.dispatch_runs()?;
-        runs.extend(self.run_pages(
-            &format!(
-                "{}/actions/workflows/{}/runs?status=failure&created={since}",
+        for conclusion in FAILED {
+            let path = format!(
+                "{}/actions/workflows/{}/runs?status={conclusion}&created={since}",
                 self.root, self.s.dispatch_workflow
-            ),
-            "failed dispatch runs",
-        )?);
+            );
+            let listed = self.once(&format!("runs {path}"), || {
+                Ok(Value::Array(self.run_pages(&path, "failed dispatch runs")?))
+            })?;
+            runs.extend(listed.as_array().cloned().unwrap_or_default());
+        }
         Ok(runs)
     }
 

@@ -1323,7 +1323,8 @@ fn successful_snapshot_skips_old_pull_request_detail_and_keeps_commented_approva
     });
     let snapshot = collect(&fake, &s, "main", now, None);
     let calls = fake.calls.borrow();
-    assert!(calls.len() < 25, "request count {}", calls.len());
+    // Including one rerun listing for each failed conclusion.
+    assert!(calls.len() < 27, "request count {}", calls.len());
     assert!(!calls.iter().any(|p| p.contains("/timeline")));
     let checks = evaluate(&snapshot, now, &s.limits);
     let status = |id: &str| checks.iter().find(|c| c["id"] == id).unwrap()["status"].clone();

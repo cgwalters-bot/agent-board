@@ -129,7 +129,14 @@ queue head cannot inherit the old head's run. Missing queue timestamps or heads
 make the observation unavailable.
 
 `reviews` covers open, non-draft PRs by the configured bot or `mergeAuthors` in
-`follow`, using the poll's existing `reviewWorkflow`. After **15 minutes**
+`follow`, using the workflow the poll uses for the PR's base repository:
+`dispatch.yml` where the pass config's `pr.reviewDispatchRepositories` names
+it ([ordinary dispatched reviews](pass.md#ordinary-dispatched-reviews-opt-in)),
+the existing global `reviewWorkflow` elsewhere. The routes are read from the
+pass config file `agent.passConfig` names, as `held` reads `pr.noMerge`;
+without that setting every repository uses `reviewWorkflow`, and a pass config
+that does not read makes the check unavailable. Listings, current-head matching
+and the cited-run fallback below all use that one workflow. After **15 minutes**
 (`REVIEW_GRACE_MS`) since the last PR update it reports a head with neither an
 active nor successful review run. The update time is a conservative grace
 basis (comments can postpone the alarm), not a claim about when a commit was
@@ -150,7 +157,8 @@ lookback. Old-head approvals, cancelled runs, unrelated workflows and
 uncorrelated dispatch titles cannot satisfy it.
 This check does not infer ordinary contributor intake eligibility or prove a
 review was posted; it diagnoses missing runs for the existing dedicated reviewer.
-If eligible PRs exist without `reviewWorkflow`, the check is unavailable.
+If eligible PRs exist in a repository without a review workflow, the check is
+unavailable.
 
 `apply-failures` uses the same signatures as `signatures`, of kind `apply`, for
 dispatch attempts with a successful `agent` job and failed `apply` job. Reusable
@@ -180,10 +188,13 @@ checks use the shared read-only request/time/page/download budgets, `maxItems`,
 only problem PRs, so healthy ones do not count against it. A full single-page run listing or open-PR
 connection with another page is incomplete, not healthy. GitHub filters run
 listings by creation, so failure collection reads the lookback's dispatch runs
-and, for reruns, the failed dispatch runs created in the last seven days
-(`RERUN_DAYS`); a rerun of an older run is not seen. Either listing exceeding
-the existing `maxPages` makes coverage unavailable; successful history is never
-paged. Unavailable checks use the normal warning/escalation
+and, for reruns, the dispatch runs created in the last seven days
+(`RERUN_DAYS`) with each conclusion failure processing accepts: one listing
+each for `failure`, `timed_out` and `startup_failure` (GitHub's `status`
+filter takes the last as `gh run list --status` sends it, though its REST
+reference omits it). A rerun of an older run is not seen, and a run listed more
+than once counts once per attempt. Any listing exceeding the existing
+`maxPages` makes coverage unavailable; successful history is never paged. Unavailable checks use the normal warning/escalation
 policy. Live behavior and the incident runs have not been verified here.
 
 The playbook requests `file_bug` for each problem signature with at least two
