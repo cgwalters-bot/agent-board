@@ -561,7 +561,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         inventory::revalidate(&mut list, &nodes, proposal_label);
         self.inbox_epics(&mut list, &nodes, true);
         carry::evidence(&mut list, previous, &nodes);
-        list.retain_evidence();
+        list.retain_evidence(reading.reviews.approval_evidence.as_ref());
         holds::preserve_changed_at(&mut list, previous);
         list
     }
@@ -1314,13 +1314,60 @@ mod tests {
             observed: holds::Observed::off(),
             summaries: (Read::Off, BTreeMap::new()),
         };
-        let snapshot = holds::snapshot(&[], at.into(), Default::default());
-        let mut list = holds::needs_you(&snapshot, None, &reading);
+        let mut snapshot = holds::snapshot(&[], at.into(), Default::default());
+        let list = holds::needs_you(&snapshot, None, &reading);
         assert_eq!(list.items.len(), rows.len());
-        assert!(list.evict_evidence());
-        let published = serde_json::to_value(&list).unwrap();
+        snapshot.needs_you = Some(list);
+        snapshot.holds.push(holds::Published {
+            item: None,
+            url: None,
+            epic: false,
+            kind: holds::HoldKind::Wip,
+            reason: String::new(),
+            operator: false,
+            priority: None,
+            question: None,
+            since: at.into(),
+            carried: false,
+            watched: false,
+        });
+        snapshot.holds[0].reason = "x".into();
+        let size = holds::render(&snapshot).unwrap().chars().count();
+        snapshot.holds[0].reason.push('x');
+        let per_char = holds::render(&snapshot).unwrap().chars().count() - size;
+        let pad = (holds::MAX_COMMENT_CHARS - size) / per_char + 2;
+        snapshot.holds[0].reason = "x".repeat(pad);
+        let (fitted, body) = holds::fit(snapshot).unwrap();
+        assert!(body.chars().count() <= holds::MAX_COMMENT_CHARS);
+        assert_eq!(fitted.truncated, 0);
+        let parsed = holds::parse(&body).unwrap();
+        let published = &parsed["needs_you"];
         assert_eq!(published["schema"], fixture["schema"]);
         assert_eq!(&published["approval_evidence"], expected);
+        // Older v2 publications and unknown extensions still carry the same
+        // decision inventory; neither supplies fresh approval observations.
+        for extension in [None, Some(json!({"schema":"future/v99","items":{}}))] {
+            let mut previous = parsed.clone();
+            let list = previous["needs_you"].as_object_mut().unwrap();
+            list.remove("approval_evidence");
+            if let Some(extension) = extension {
+                list.insert("approval_evidence".into(), extension);
+            }
+            let unread = holds::Reading {
+                reviews: Collected::of(Read::Unread),
+                proposals: Collected::off(),
+                digest: Collected::off(),
+                inbox: BTreeMap::new(),
+                observed: holds::Observed::off(),
+                summaries: (Read::Off, BTreeMap::new()),
+                ..reading
+            };
+            let snapshot = holds::snapshot(&[], at.into(), Default::default());
+            let carried = holds::needs_you(&snapshot, Some(&previous), &unread);
+            assert_eq!(carried.count, rows.len());
+            assert!(carried.items.iter().all(|a| a.carried));
+            assert!(carried.approval_evidence.is_none());
+        }
         for row in rows {
             let entry = &published["approval_evidence"]["items"][row["key"].as_str().unwrap()];
             let current = entry["assessed_head"] == row["head"];

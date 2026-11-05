@@ -1630,14 +1630,12 @@ impl NeedsYou {
         true
     }
 
-    /// Drops the approval evidence of rows that are no longer listed as
-    /// they were read, as by [`ApprovalEvidence::of`].
-    pub(super) fn retain_evidence(&mut self) {
-        let Some(evidence) = self.approval_evidence.as_mut() else {
-            return;
-        };
-        let items = &self.items;
-        (evidence.items).retain(|key, e| items.iter().any(|ask| &ask.key == key && bound(ask, e)));
+    /// Rebinds this pass's observations after identity revalidation, then
+    /// applies the cap. Removed rows must neither consume slots nor count
+    /// as omitted qualifying evidence. No previous publication is reused.
+    pub(super) fn retain_evidence(&mut self, fresh: Option<&BTreeMap<String, approval::Evidence>>) {
+        self.approval_evidence =
+            fresh.map(|fresh| ApprovalEvidence::of(&self.items, fresh, &self.validated_at));
     }
 
     fn evidence_len(&self) -> usize {
@@ -5048,6 +5046,46 @@ mod tests {
             (list.count, list.items.len()),
             (over as usize, over as usize)
         );
+    }
+
+    #[test]
+    fn approval_evidence_cap_is_applied_after_retention() {
+        let at = "2026-11-05T12:00:00Z";
+        let reviews = approvals(1..=52, HEAD_A);
+        let fresh = reviews.approval_evidence.clone().unwrap();
+        for removed in [1, 2, 3, 52] {
+            let mut list = own_listed(&[], at, (reviews.clone(), Collected::off()), None);
+            assert_eq!(list.approval_evidence.as_ref().unwrap().omitted, 2);
+            // Final validation can remove rows on either side of the cap.
+            list.items.drain(..removed);
+            let decisions = (list.count, list.counts.clone(), list.identities.clone());
+            list.retain_evidence(Some(&fresh));
+            let evidence = list.approval_evidence.as_ref().unwrap();
+            let qualifying = 52 - removed;
+            assert_eq!(evidence.items.len(), qualifying.min(MAX_APPROVAL_EVIDENCE));
+            assert_eq!(
+                evidence.omitted,
+                qualifying.saturating_sub(MAX_APPROVAL_EVIDENCE)
+            );
+            assert_eq!(
+                decisions,
+                (list.count, list.counts.clone(), list.identities.clone())
+            );
+            assert_eq!(evidence.observed_at, at);
+        }
+        let mut list = own_listed(&[], at, (reviews, Collected::off()), None);
+        list.items[0].carried = true;
+        list.items[1].head = Some(HEAD_B.into());
+        list.items[2].group = Some(AskGroup {
+            reason: "grouped".into(),
+            numbers: vec![3, 4],
+        });
+        list.retain_evidence(Some(&fresh));
+        let evidence = list.approval_evidence.unwrap();
+        assert_eq!((evidence.items.len(), evidence.omitted), (49, 0));
+        for ask in &list.items[..3] {
+            assert!(!evidence.items.contains_key(&ask.key));
+        }
     }
 
     /// Over the comment limit, evidence goes before any hold or card,
