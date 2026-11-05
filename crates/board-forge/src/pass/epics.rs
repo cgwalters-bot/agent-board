@@ -988,7 +988,7 @@ fn underused(snapshot: Option<&Value>, pool: &str, now: OffsetDateTime) -> bool 
         && left <= time::Duration::hours(IDLE_RESET_HOURS)
         && used >= 0.0
         && allowed > 0.0
-        && used <= allowed / 2.0
+        && used < allowed
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {

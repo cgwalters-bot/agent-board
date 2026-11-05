@@ -2390,7 +2390,9 @@ fn idle_replan_requires_fixed_underused_window_near_reset() {
     }}});
     for (pointer, value, expected) in [
         ("/pools/claude/used_percent", json!(50.0), true),
-        ("/pools/claude/used_percent", json!(50.01), false),
+        ("/pools/claude/used_percent", json!(74.0), true),
+        ("/pools/claude/used_percent", json!(100.0), false),
+        ("/pools/claude/used_percent", json!(101.0), false),
         ("/pools/claude/used_percent", json!(-1), false),
         ("/pools/claude/used_percent", Value::Null, false),
         ("/pools/claude/allowed_percent", json!(0), false),
@@ -2432,7 +2434,18 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
     for (name, enabled, edit, count) in [
         ("default", false, json!({}), 1),
         ("underused", true, json!({}), 2),
-        ("not under pace", true, json!({"used_percent": 60}), 1),
+        (
+            "74% of pace",
+            true,
+            json!({"used_percent": 31, "allowed_percent": 42}),
+            2,
+        ),
+        (
+            "not under pace",
+            true,
+            json!({"used_percent": 60, "allowed_percent": 60}),
+            1,
+        ),
         ("rolling grant", true, json!({"source": "grant"}), 1),
         (
             "distant reset",
