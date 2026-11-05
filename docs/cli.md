@@ -1067,8 +1067,21 @@ agent-board test [OPTIONS] <COMMAND>
 
 Commands:
 
+- [`review-setup`](#agent-board-test-review-setup): Check review wrapper variables in every workRepositories target; read-only, opt-in
 - [`deploy`](#agent-board-test-deploy): Read-only staging deployment preflight, and with --apply the smoke path (writes); emits a JSON report
 - [`project`](#agent-board-test-project): Create and clean up scratch objects in the staging project (writes)
+
+## agent-board test review-setup
+
+Check review wrapper variables in every workRepositories target; read-only, opt-in
+
+```text
+agent-board test review-setup [OPTIONS] --config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: Trusted pass config; checks workRepositories and pr.reviewWorkflow
 
 ## agent-board test deploy
 

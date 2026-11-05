@@ -10,6 +10,36 @@ layer. Existing [PR follow-up](poll.md),
 [job-plan](job-plans.md) and [epic-plan](epic-plans.md) protocols remain the
 authority for their operations. The differences below are intentional.
 
+## Review setup diagnostic
+
+The concrete failure this check catches is a dispatch target whose review wrapper
+cannot start or post because its required Actions variables were never provisioned.
+`agent-board test review-setup --config .github/pass.json` is an explicit, read-only
+config test; normal passes do not run it or need Variables access. Run it from a
+trusted checkout with a separate token that can read Actions workflows and Variables
+in every `workRepositories` target (`GH_TOKEN`, falling back to `GITHUB_TOKEN`).
+It uses `pr.reviewWorkflow` to identify the wrapper (`dispatch.yml` for targets in
+`pr.reviewDispatchRepositories`), not issue text or workflow contents, and checks
+each distinct target once. Repositories without that workflow
+are reported as not applicable. A disabled workflow fails the check.
+
+For targets with that workflow, `INFERENCE_URL`, `INFERENCE_AUDIENCE`, `AGENT_RUNNER`
+and `AGENT_REAL_REVIEWS` must be nonempty; the last must be exactly `true`.
+Repository variables override organization variables shared with that repository.
+Values and raw API errors are never printed, and no inference address is compiled
+in or contacted. This checks provisioning, not reachability, runner availability,
+environment-level variables, wrapper contents or permission to post reviews.
+
+The command refuses more than 50 distinct targets before token lookup. It reads
+one workflow page (100 entries) and at most two variable pages (30 entries each)
+per target, at most 150 logical GETs, with the shared transport's bounded retries.
+Incomplete, malformed, denied and missing API responses fail as unverified, never
+as successful setup. New reads stop after 120 seconds (an in-progress read may
+finish later); remaining targets are reported unverified. All targets get a line,
+and any failed target makes the command exit nonzero. It creates no forge comments,
+dispatches or local state. Adoption in tracker's trusted config-test workflow with
+a Variables-read token is separate from merging this command.
+
 ## What is built
 
 The GitHub pass implements the configuration below and stages 1 to 5, except

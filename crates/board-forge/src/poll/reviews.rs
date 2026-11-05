@@ -38,7 +38,7 @@ pub(super) fn review_workflow<'a>(config: &'a Config, repo: &str) -> Option<&'a 
 /// The review workflow of `repo`'s pull requests: `dispatch.yml` where the
 /// pass's `pr.reviewDispatchRepositories` (`routed`) names it, else the
 /// global `reviewWorkflow`. Shared by the poll and the supervisor's health.
-pub(crate) fn routed_review_workflow<'a>(
+pub fn routed_review_workflow<'a>(
     routed_to: &[String],
     global: Option<&'a str>,
     repo: &str,

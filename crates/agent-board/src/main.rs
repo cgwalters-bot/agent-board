@@ -23,6 +23,7 @@ mod promote;
 mod prune;
 mod release_train;
 mod review;
+mod review_setup;
 mod supervise;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -393,6 +394,8 @@ enum Apps {
 
 #[derive(Subcommand)]
 enum Test {
+    /// Check review wrapper variables in every workRepositories target; read-only, opt-in.
+    ReviewSetup(review_setup::Options),
     /// Read-only staging deployment preflight, and with --apply the smoke path (writes); emits a JSON report.
     Deploy(deploy::Options),
     /// Create and clean up scratch objects in the staging project (writes).
@@ -1355,6 +1358,21 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
                 board_forge::github::DEFAULT_HOST
             );
             apps::create(args)
+        }
+        Command::Test {
+            command: Test::ReviewSetup(options),
+        } => {
+            ensure!(
+                cli.snapshot.is_none()
+                    && cli.board_config.is_none()
+                    && cli.owner.is_none()
+                    && cli.repo.is_none()
+                    && cli.project.is_none()
+                    && cli.policy.is_none()
+                    && cli.hostname == board_forge::github::DEFAULT_HOST,
+                "test review-setup takes identities only from --config on github.com"
+            );
+            review_setup::run(options)
         }
         Command::Test {
             command: Test::Deploy(options),

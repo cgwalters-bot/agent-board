@@ -10,6 +10,51 @@ fn fixture() -> String {
 }
 
 #[test]
+fn review_setup_rejects_invalid_config_before_token_lookup() {
+    let dir = std::env::temp_dir().join(format!("agent-board-review-setup-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.json");
+    for (field, value, diagnostic) in [
+        (
+            "workRepositories",
+            serde_json::json!([]),
+            "needs workRepositories",
+        ),
+        (
+            "workRepositories",
+            serde_json::json!(["owner/repo?escape"]),
+            "invalid",
+        ),
+        (
+            "workRepositories",
+            serde_json::json!((0..51).map(|n| format!("owner/r{n}")).collect::<Vec<_>>()),
+            "more than 50",
+        ),
+    ] {
+        let mut config: Value =
+            serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+        config["pr"]["reviewWorkflow"] = "review.yml".into();
+        config[field] = value;
+        std::fs::write(&path, config.to_string()).unwrap();
+        let result = command()
+            .args(["test", "review-setup", "--config"])
+            .arg(&path)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(diagnostic),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn maintain_digest_check_is_offline_for_file_and_stdin() {
     let valid = include_str!("../../../fixtures/pass/maintain-digest.md");
     for (body, code, diagnostic) in [
