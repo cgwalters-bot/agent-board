@@ -154,6 +154,11 @@ pub(super) fn review_asks(
             _ => RefKind::ApprovePullRequest,
         };
         let item = format!("{repository}#{number}");
+        if let Some(assessment) = &wait.review_bucket {
+            collected
+                .review_buckets
+                .insert(item.to_ascii_lowercase(), assessment.clone());
+        }
         let action = Reference {
             head: Some(head.clone()),
             ..Reference::new(kind, &repository, number)
@@ -672,6 +677,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             Ok((comments, scope)) => {
                 let (asks, whole) = digest_asks(&on, &comments, &self.config.bot, &scope);
                 Collected {
+                    review_buckets: BTreeMap::new(),
                     read: if whole { Read::Complete } else { Read::Partial },
                     asks,
                     unread: BTreeSet::new(),
@@ -889,6 +895,7 @@ mod tests {
     #[test]
     fn review_waits() {
         let wait = |number, kind, head: &str| poll::Wait {
+            review_bucket: None,
             repository: "cgwalters-bot/praxis-credential-broker".into(),
             number,
             head: head.into(),
@@ -1234,5 +1241,69 @@ mod tests {
         let said = bot_summary(&comments, BOT).unwrap();
         assert_eq!(said.question.as_deref(), Some("New?"));
         assert_eq!(bot_summary(&comments[2..], BOT), None);
+    }
+
+    #[test]
+    fn draft_buckets_survive_grouping_but_never_carry_as_quick() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/draft-review-needs-you.json"
+        ))
+        .unwrap();
+        let on = on_github("a/ops", 1);
+        let at = "2026-11-05T00:00:00Z";
+        let waits = (1..=3)
+            .map(|number| {
+                let key = format!("cgwalters-forge/bootc#{number}");
+                let bucket = fixture["review_buckets"].get(&key).map(|v| {
+                    serde_json::from_value::<poll::drafts::Assessment>(v.clone()).unwrap()
+                });
+                poll::Wait {
+                    repository: "cgwalters-forge/bootc".into(),
+                    number,
+                    head: bucket
+                        .as_ref()
+                        .map(|b| b.assessed_head.clone())
+                        .unwrap_or_else(|| "c".repeat(40)),
+                    kind: "promote",
+                    reason: "drafts to inspect and promote".into(),
+                    review_bucket: bucket,
+                }
+            })
+            .collect();
+        let mut reading = holds::Reading {
+            operator: BOT,
+            epics: false,
+            considered: false,
+            options: &[],
+            on: &on,
+            reviews: review_asks(true, Some(&(waits, BTreeSet::new())), at),
+            proposals: Collected::off(),
+            digest: Collected::off(),
+            inbox: BTreeMap::new(),
+            observed: holds::Observed::off(),
+            summaries: (Read::Off, BTreeMap::new()),
+        };
+        let snapshot = holds::snapshot(&[], at.into(), Default::default());
+        let first = holds::needs_you(&snapshot, None, &reading);
+        let published = serde_json::to_value(&first).unwrap();
+        assert_eq!(published["schema"], fixture["schema"]);
+        assert_eq!(published["items"][0]["group"], fixture["group"]);
+        assert_eq!(published["review_buckets"], fixture["review_buckets"]);
+        // Old strict Ask parsers still round-trip the grouped card unchanged;
+        // assessments are a separate optional list extension, per member.
+        let ask: Ask = serde_json::from_value(published["items"][0].clone()).unwrap();
+        assert_eq!(serde_json::to_value(ask).unwrap(), published["items"][0]);
+        reading.reviews = Collected::of(Read::Unread);
+        let carried = holds::needs_you(
+            &snapshot,
+            Some(&json!({"schema":holds::HOLDS_SCHEMA,"needs_you":published})),
+            &reading,
+        );
+        assert!(!carried.items.is_empty());
+        assert!(carried.items[0].carried);
+        assert!(
+            carried.review_buckets.is_empty(),
+            "unread asks cannot retain quick"
+        );
     }
 }

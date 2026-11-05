@@ -2183,7 +2183,7 @@ and claim/reservation protocol, not a second queue or an unpaced fallback.
 For selected repositories, stage 2 considers at most ten additional open pull
 requests per pass, independent of `mergeAuthors`, and performs ordinary intake
 on at most ten PRs total. Existing merge/fix processing is not capped by these
-intake limits. Drafts, private repositories and human
+intake limits. Drafts (except the explicit review-only opt-in below), private repositories and human
 holds still get no review. Automatic admission reads the base repository's
 default-branch `workflow/review.toml`: exact `hosts`, `repos`, `bases`,
 `github.trigger.events`, `roles`, `bots` and `forks`. Only the current deployment
@@ -2257,6 +2257,98 @@ this option. No live review workflow has exercised this route. Tracker's future
 pilot setting is `.github/pass.json`: `pr.reviewDispatchRepositories =
 ["cgwalters-forge/review"]`, together with a nonempty `pr.reviewPools` drawn from
 its configured pools. Do not turn it on before the coordinated caller cutover.
+
+### Midstream draft buckets (opt-in, producer slice of #648)
+
+The concrete threat is presenting a forged, stale or merely small draft as
+semantically reviewed, or giving its review new merge/fix authority.
+`pr.draftReviewRepositories` is an exact base-repository allowlist, absent/`[]`
+by default, limited to 50 entries. Every entry must already be in `follow`,
+`pr.reviewDispatchRepositories` and `pr.noMerge`; ordinary intake also requires
+`pr.reviewPools` and `pr.reviewWorkflow`. It selects only public drafts by the
+configured `bot`, not all bots. This route never marks ready, promotes, fixes,
+merges or enqueues. Other authors and non-drafts keep their previous behavior.
+Human holds suppress writes and dispatch. Rescue is not a hold and is preserved.
+
+Admission still reads the base-owned automatic review policy. Drafts do not
+consume `/review` commands. Starts use the existing per-repository dispatch,
+pacing, WIP, Priority, caps and durable head reservations, including ambiguous
+POST recovery. At most ten PRs per pass receive semantic-result/file/CI reads
+and intake; excess drafts are deep/pending, not passed to continuation/fix.
+Each visited eligible draft gets fresh head checks and bounded label
+reconciliation. Exactly one `review:quick`/`review:deep` is desired: remove the
+other, then add the desired one, as one write step under `--max-writes`, with
+no writes in preview. Do not replace the whole label set: `rescue` and unrelated
+labels remain independent. An interrupted pair is repaired on the next pass.
+Caps or unavailable reads can delay label repair; published evidence is never
+inferred from the labels. Preview lines show the bucket, inspected head and reason.
+
+The [result contract and deterministic vetoes](poll.md#draft-review-result-contract)
+require semantic evidence from a verified review-result writer job, not a run
+title alone. This classifier provenance is deliberately separate from
+merge-approval provenance: an in-repository branch can receive an informational
+quick classification without a job review becoming merge or fix permission.
+Every pass rechecks CI even without a push. Any observed head change invalidates
+quick immediately; deep/pending is published until fresh matching evidence exists.
+Heads are read uncached before reconciliation and again before publication;
+a race demotes the result and repairs quick where the write cap permits. GitHub
+has no conditional label write, so a push after the final read is observed on
+the next pass, not atomically prevented. Consumers must enforce displayed-head
+approval independently.
+
+Needs-you v2 adds optional list-level `review_buckets`, keyed by lower-case
+`owner/repo#N`. Each value has `bucket` (`quick`/`deep`), `assessed_head`, `reason`,
+`summary` (review evidence, or pending), and `ci` (`green`/`unknown`). The extension
+does not change strict Ask records. Grouped draft cards keep their old
+`group.numbers`; look up **each member**, not the representative's bucket or
+head. Missing metadata, evicted detail, a mismatching displayed head, and all
+carried/unread asks mean unknown/deep. Assessment metadata is never carried
+from a previous list, even when the ask itself is retained. The offline
+[consumer projection fixture](../fixtures/draft-review-needs-you.json) covers
+quick, deep and an unknown member in one group; producer tests compare it to
+serialized publication and round-trip the old Ask parser.
+
+#### Coordinated caller and consumer deployment
+
+Nothing is enabled here. The tracker follow-up is repository
+`cgwalters-forge/tracker`, file `.github/pass.json`, key
+`pr.draftReviewRepositories`, value
+`["cgwalters-forge/bootc", "cgwalters-forge/composefs-rs", "cgwalters-forge/bcvk", "cgwalters-forge/rpm-ostree"]`.
+Keep the existing `pr.noMerge` entries; add those same four repositories to
+`pr.reviewDispatchRepositories` and set `pr.reviewPools` to `["openai", "claude"]`
+only in the coordinated deployment change. `follow` already includes them.
+The supervisor's unset inventory names `pr.draftReviewRepositories` until set.
+Do not enable live controllers just to test this producer patch.
+
+Before that caller change: land the actions#174 expected-head wrapper and the
+base-owned dispatch/task/bounds changes in all four repositories. The result
+writer must implement the exact job/fence contract below; old review jobs
+without it remain deep. Ensure the poll token can read Actions runs/jobs,
+contents, complete checks and branch rules and write only the existing PR
+labels/comments; review tokens remain in the reviewed caller's independent
+bounds/apply boundary. Exercise preview, stale-head and interrupted-write
+fixtures before rollout. Rollback is removing the draft opt-in; manually
+created or last-published quick labels are not authority after rollback.
+
+Request the matching **cgwalters-forge/review** consumer slice through approved
+parent-epic planning in [tracker#976](https://github.com/cgwalters-forge/tracker/issues/976),
+not a new unrelated issue. This producer PR is **Part of #648**, not a closure:
+the app remains outstanding. Consumer acceptance/handoff:
+
+- Group midstream members into quick, deep and unknown/deep. Missing/invalid
+  metadata, carried asks and stale `assessed_head` must never enter quick.
+  Show the summary, CI state, reason and inspected head for **each** PR;
+  fetch current heads/CI before enabling an action, not from labels/prose.
+- Reuse review#222/#229's one-PR approval bound to the **displayed** head.
+  Never bulk approve a group or silently switch the approved head on refresh;
+  refuse stale heads and require redisplay/reinspection.
+- Provide fast next/previous navigation with stable member identity; do not
+  lose a PR when CI moves it between groups. Quick is informational, never
+  ready/promotion/merge/queue authority.
+- Use the shared fixture to render all three groups (including a mixed grouped
+  draft card), add legacy-without-extension and unknown-schema cases, and
+  test refresh/push/CI-change races, carried asks and stale-head refusal
+  offline against the existing displayed-head approval tests.
 
 ### Legacy review workflow route
 
@@ -3112,6 +3204,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.reviewWorkflow` | Existing trusted review workflow; absent counts only operator reviews |
 | `pr.reviewPools` | Ordered pools the pass starts the review job on itself, see [reviews](#reviews); needs `pr.reviewWorkflow`; `[]` leaves reviews to the job's `pull_request_target` runs |
 | `pr.reviewDispatchRepositories` | Exact followed base repositories using ordinary `dispatch.yml` reviews and separate all-author intake; `[]` by default; needs `pr.reviewPools`; at most 50; GitHub only |
+| `pr.draftReviewRepositories` | Review-only bot drafts and informational head-bound quick/deep buckets; `[]` by default; subset of `pr.reviewDispatchRepositories` and `pr.noMerge`; at most 50; GitHub only; see [draft buckets](#midstream-draft-buckets-opt-in-producer-slice-of-648) |
 | `pr.fixPools` | Ordered fix-round pools; `[]` leaves caller default, unpaced, so required when `follow` and `usage` are set |
 | `pr.toilFixPool`, `pr.conflictFixPool` | Special fix pools; absent uses ordinary fix choice |
 | `pr.mergeAuthors` | Extra authors eligible for existing green-check merge path; `[]` |

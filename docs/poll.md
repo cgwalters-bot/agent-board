@@ -103,6 +103,97 @@ required or not, must have passed, been skipped or be neutral, but for an option
 `review` status (agent-board#163); a failed optional check gets fix rounds as a
 required one does. It has been exercised against recorded responses only.
 
+## Draft review result contract
+
+The [pass's opt-in draft route](pass.md#midstream-draft-buckets-opt-in-producer-slice-of-648)
+is the producer slice of #648. The result producer must submit an Actions-bot
+`APPROVED` review at the inspected head, containing exactly one JSON fence
+named `agent-board-draft-review` and the existing single gh-aw run marker.
+This is not a PR-body annotation, label or arbitrary comment. For example
+(the title/description must be the exact current PR strings):
+
+````markdown
+```agent-board-draft-review
+{
+  "schema": "agent-board/draft-review/v1",
+  "repository": "cgwalters-forge/bootc",
+  "pr": 1,
+  "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "title": "docs: Correct spelling",
+  "description": "Correct a spelling error in README.",
+  "semantic_diff": "pass",
+  "description_assessment": "matches",
+  "change_category": "docs",
+  "risk": "none",
+  "evidence": "Inspected README diff: spelling only; no behavior changes",
+  "reason": "Small mechanical correction with a matching description"
+}
+```
+````
+
+Unknown fields, duplicate fences, unsupported versions, mismatching repo/PR/head
+or edited title/description invalidate it. `semantic_diff` must be `pass`,
+`description_assessment` must be `matches`, and `risk` must be `none` to allow
+quick. Any other value, including unknown/failed semantic review, forces deep.
+`change_category` must be `docs`, `dependencies`, `ci`, `mechanical` or
+`narrow_fix_with_test`; categories are attestations, not inferred from paths.
+The reviewer must actually inspect the diff/description and supply concrete
+evidence/reason, each nonempty, single-line and at most 1024 bytes
+(`MAX_REASON_BYTES`). The whole review body is at most 8192 bytes
+(`MAX_RESULT_BYTES`); larger evidence is deep, not silently truncated into quick.
+
+Provenance requires the immutable Actions bot identity, a review of the current
+head, a real successful completed run of the configured per-repository review
+dispatch workflow, matching repository/default branch/head title, submission
+within its latest attempt, and a bot-authored durable reservation for that head
+preceding the run. It also reads **one page**, at most 100 jobs
+(`MAX_REVIEW_JOBS`), of that exact attempt. Exactly one successful completed job
+must have the fixed name `agent-board-review-result-v1` (`RESULT_JOB`), name the
+same run ID and contain the review's submission time in its start/end interval.
+The trusted default-branch caller must reserve that job name for the independently
+checked review-result writer, conditional on `kind=review`, and must not execute
+the untrusted head with its write token. A general implementation job with a
+review-shaped title cannot attest a classifier result. Missing/partial jobs or
+an old caller without this writer contract means deep. As with existing review
+provenance, trusted base-repository workflow writers can impersonate a job;
+this is not protection from a compromised configured caller. These checks do
+not widen the dedicated workflow/public-bot-fork merge-verdict boundary.
+
+Deterministic vetoes apply **after** verified semantics. Named conservative
+limits are `MAX_QUICK_FILES = 5` and `MAX_QUICK_LINES = 150` added/deleted lines
+total. Read one page of up to 100 PR files; require its length to match
+`changed_files`, no next page, recognized statuses, nonzero known changes and
+a textual patch. Check both names of a rename. Binary/missing diffs, unknown
+paths or size, and incomplete reads are deep. Known-safe candidates by base
+repository name are deliberately narrow:
+
+| Repository | Candidate paths, still subject to semantic/risk/size/CI vetoes |
+| --- | --- |
+| bootc | `README.md`, `CONTRIBUTING.md`, `Cargo.toml`, `Cargo.lock`, Markdown under `docs/` or `site/src/content/docs/`, `.github/workflows/docs.yml` |
+| composefs-rs | same four root files, Markdown under `docs/`, `.github/workflows/rust.yml` |
+| bcvk | same four root files, Markdown under `docs/`, `.github/workflows/ci.yml` |
+| rpm-ostree | same four root files, Markdown under `docs/` or `man/`, `.github/workflows/docs.yml` |
+
+All other repositories/paths are deep, including source/test paths: a narrow fix
+with a test is **not automatically quick**. Before the allowlist, case-insensitive
+path substrings `boot`, `install`, `gc`, `garbage`, `lock`, `disk`, `format`,
+`security`, `policy`, `selinux`, `ima`, `signature`, `privilege` veto quick;
+the exact root dependency lockfile `Cargo.lock` alone is exempt from the `lock`
+substring veto. This intentionally overclassifies docs about risky areas too.
+Source trees are unknown/deep for each repository, so boot/install/GC/locking,
+on-disk and security-policy implementations cannot slip through an unlisted
+repository-specific source layout. A reviewer must additionally veto these
+semantic changes even in an allowlisted manifest or CI file. These rules can
+only reject quick; they cannot attest semantic correctness.
+
+CI must have a complete nonempty current-head check inventory, a SUCCESS
+rollup and no failed/pending/missing required checks. Read pagination through
+the existing five-page check bound and the base's classic protection/rulesets;
+unknown rules, missing counts or a changing head force deep. Reevaluate each
+pass, not just on pushes. Retargets require a review run started after the
+last base change. Missing/stale evidence and review failures remain deep/pending;
+the classifier never starts fix work to make a draft quick.
+
 ## Failed checks before fix rounds
 
 A transient CI or infrastructure failure can spend both paid fix rounds on

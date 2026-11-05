@@ -362,6 +362,9 @@ fn unset(board: &Value, supervisor: &Value) -> Vec<String> {
         .chain(SUPERVISOR_OPTIONS.iter().filter(|k| absent(supervisor, k)))
         .map(|k| (*k).to_owned())
         .collect();
+    if absent(&board["pr"], "draftReviewRepositories") {
+        names.push("pr.draftReviewRepositories".into());
+    }
     if let Some(agent) = supervisor.get("agent").filter(|a| !a.is_null()) {
         names.extend(
             AGENT_OPTIONS
@@ -1209,6 +1212,7 @@ pub(crate) mod tests {
             .map(|k| (*k).to_owned())
             .collect();
         expected.push(CAPACITY_MARGIN.to_owned());
+        expected.push("pr.draftReviewRepositories".into());
         expected.extend(
             [
                 "dailyCaps",

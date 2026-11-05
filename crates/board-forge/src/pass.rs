@@ -807,6 +807,9 @@ pub struct Pr {
     /// Base repositories whose reviews use ordinary dispatch and separate intake.
     #[serde(default)]
     pub review_dispatch_repositories: Vec<String>,
+    /// Review-only bot drafts; never grants fix, ready or merge authority.
+    #[serde(default)]
+    pub draft_review_repositories: Vec<String>,
     #[serde(default)]
     pub fix_pools: Vec<String>,
     pub toil_fix_pool: Option<String>,
@@ -1231,6 +1234,27 @@ impl Config {
             "pr reviewDispatchRepositories needs pr reviewPools"
         );
         ensure!(
+            self.pr.draft_review_repositories.len() <= POLL_REPOSITORY_LIMIT,
+            "pr draftReviewRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
+        );
+        for repo in &self.pr.draft_review_repositories {
+            poll::validate_repository(repo)?;
+            ensure!(
+                self.pr
+                    .review_dispatch_repositories
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(repo)),
+                "pr draftReviewRepositories repository {repo} needs reviewDispatchRepositories"
+            );
+            ensure!(
+                self.pr
+                    .no_merge
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(repo)),
+                "pr draftReviewRepositories repository {repo} needs noMerge"
+            );
+        }
+        ensure!(
             self.pr.review_pools.is_empty() || self.pr.review_workflow.is_some(),
             "pr reviewPools needs pr reviewWorkflow, the workflow it starts"
         );
@@ -1377,6 +1401,7 @@ impl Config {
             own_space_only: self.pr.own_space_only,
             review_pools: self.pr.review_pools.clone(),
             review_dispatch_repositories: self.pr.review_dispatch_repositories.clone(),
+            draft_review_repositories: self.pr.draft_review_repositories.clone(),
             ..PollPolicy::default()
         };
         poll::Config {

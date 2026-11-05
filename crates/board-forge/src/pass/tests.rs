@@ -10430,6 +10430,34 @@ fn config_table() {
         assert!(Config::parse(&routed.to_string()).is_err(), "{bad}");
     }
     routed["pr"]["reviewDispatchRepositories"] = json!(["o/r"]);
+    assert!(
+        parsed
+            .poll(None)
+            .policy
+            .draft_review_repositories
+            .is_empty()
+    );
+    routed["pr"]["draftReviewRepositories"] = json!(["O/R"]);
+    assert!(Config::parse(&routed.to_string()).is_err(), "needs noMerge");
+    routed["pr"]["noMerge"] = json!(["o/r"]);
+    assert_eq!(
+        Config::parse(&routed.to_string())
+            .unwrap()
+            .poll(None)
+            .policy
+            .draft_review_repositories,
+        ["O/R"]
+    );
+    for bad in [
+        json!(["o/elsewhere"]),
+        json!(["o/*"]),
+        json!(true),
+        json!(null),
+    ] {
+        routed["pr"]["draftReviewRepositories"] = bad;
+        assert!(Config::parse(&routed.to_string()).is_err());
+    }
+    routed["pr"]["draftReviewRepositories"] = json!([]);
     routed["pr"]["reviewPools"] = json!([]);
     assert!(Config::parse(&routed.to_string()).is_err());
     let usage = json!({"url": "http://b.example/usage", "repository": "o/ops", "issue": 1});
