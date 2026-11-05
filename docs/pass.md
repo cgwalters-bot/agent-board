@@ -984,7 +984,8 @@ overlap, request/time reserve and `--max-dispatch`/`--max-writes` checks. No
 pool is activated and no cap is raised. The reason is logged as
 `pools: P under pace near reset; bounded idle replan (2 per pass)`.
 Without this setting or signal, the existing one-epic idle fallback remains.
-An otherwise successful pass with free slots and no start in any stage prints
+An otherwise successful pass with free slots, no unread candidate and no start
+in any stage prints
 `pools: no ready work; unused headroom does not release holds` beside its
 `idle:` line, so available quota is not mistaken for ready work.
 The idle line also names the candidate count, the count considered, and up to

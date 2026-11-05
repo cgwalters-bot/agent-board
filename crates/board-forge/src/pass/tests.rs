@@ -2094,15 +2094,15 @@ fn replay_scenarios() {
 /// request, once a run is dispatched: what changed since the board was read.
 /// `racing` edits each GraphQL answer, by its query, before then: what
 /// changes while the pass reads.
-struct Forge {
-    replay: Replay,
+pub(super) struct Forge {
+    pub(super) replay: Replay,
     added: RefCell<BTreeMap<(String, u64), Vec<Value>>>,
-    writes: RefCell<Vec<(String, String, Value)>>,
+    pub(super) writes: RefCell<Vec<(String, String, Value)>>,
     fail: RefCell<Option<String>>,
     after_record: bool,
     ids: Cell<u64>,
     login: &'static str,
-    late: Option<Late>,
+    pub(super) late: Option<Late>,
     racing: Option<Late>,
     /// Edits REST reads, including before any dispatch has been made.
     on_get: Option<Late>,
@@ -2140,10 +2140,10 @@ fn listed(body: Value) -> RestResponse {
 }
 
 /// An edit of an answer by its request ([`Forge`]'s `late`).
-type Late = Box<dyn Fn(&str, &mut Value)>;
+pub(super) type Late = Box<dyn Fn(&str, &mut Value)>;
 
 impl Forge {
-    fn new(fail: Option<&str>, after_record: bool) -> Self {
+    pub(super) fn new(fail: Option<&str>, after_record: bool) -> Self {
         let mut replay = without_epics(replay());
         only(&mut replay, FIRST);
         Self {
@@ -2209,7 +2209,7 @@ impl Forge {
         Ok(())
     }
 
-    fn dispatches(&self) -> Vec<String> {
+    pub(super) fn dispatches(&self) -> Vec<String> {
         self.writes
             .borrow()
             .iter()
@@ -2221,7 +2221,7 @@ impl Forge {
             .collect()
     }
 
-    fn comments_on(&self, repo: &str, number: u64) -> Vec<String> {
+    pub(super) fn comments_on(&self, repo: &str, number: u64) -> Vec<String> {
         let added = self.added.borrow();
         let nodes = added
             .get(&(repo.into(), number))
@@ -2509,12 +2509,17 @@ fn inventory_on(replay: &mut Replay, repository: &str, number: u64, label: &str)
 }
 
 fn apply(forge: &Forge, config: &Config) -> Report {
+    apply_limited(forge, config, Limits::default())
+}
+
+/// [`apply`] within `limits`.
+pub(super) fn apply_limited(forge: &Forge, config: &Config, limits: Limits) -> Report {
     block(run(
         forge,
         forge,
         config,
         State::default(),
-        (Mode::Actions(&own()), Limits::default()),
+        (Mode::Actions(&own()), limits),
         forge.replay.now,
     ))
     .unwrap()
@@ -7118,21 +7123,22 @@ fn apply_stops_starting_while_runs_never_start() {
     }
 }
 
+/// tracker#446 alone, its closing pull requests more than the board's page
+/// and not read after: held as unreadable, which the pass does not expect to
+/// end by itself.
+pub(super) fn unread(replay: &mut Replay) {
+    only(replay, &["cgwalters-forge/tracker#446"]);
+    let nodes = (replay.requests.iter_mut())
+        .filter_map(|e| e["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
+        .filter_map(Value::as_array_mut)
+        .flatten();
+    for node in nodes.filter(|n| n["content"]["number"] == 446) {
+        node["content"]["closedByPullRequestsReferences"]["totalCount"] = 12.into();
+    }
+}
+
 #[test]
 fn apply_raises_an_alarm_when_nothing_starts() {
-    // tracker#446 alone, its closing pull requests more than the board's
-    // page and not read after: held as unreadable, which the pass does not
-    // expect to end by itself.
-    let unread = |replay: &mut Replay| {
-        only(replay, &["cgwalters-forge/tracker#446"]);
-        let nodes = (replay.requests.iter_mut())
-            .filter_map(|e| e["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
-            .filter_map(Value::as_array_mut)
-            .flatten();
-        for node in nodes.filter(|n| n["content"]["number"] == 446) {
-            node["content"]["closedByPullRequestsReferences"]["totalCount"] = 12.into();
-        }
-    };
     type Edit = fn(&mut Replay);
     let none: Edit = |_| {};
     // Name, settings, the minutes since the newest run, the edit, the open

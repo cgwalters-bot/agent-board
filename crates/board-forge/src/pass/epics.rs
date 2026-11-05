@@ -1069,6 +1069,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             && self.holds_whole
             && self.report.failures == 0
             && self.unconsidered == 0
+            && self.unread == 0
             && underused(snapshot.as_ref(), &pool, self.now);
         if !bonus && (started > 0 || waited.turn.planned || !self.epic_starts.is_empty()) {
             return 0;

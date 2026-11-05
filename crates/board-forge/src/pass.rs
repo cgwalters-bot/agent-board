@@ -2714,6 +2714,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         probes: BTreeMap::new(),
         holds_whole: true,
         unconsidered: 0,
+        unread: 0,
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
         ignored: RefCell::default(),
@@ -3025,6 +3026,10 @@ struct Scheduler<'a, C> {
     /// it stopped starting, and those whose consideration failed. Any may
     /// wait on the operator ([`holds::needs_you`]).
     unconsidered: usize,
+    /// Stage 4's candidates held for a read that failed, when screened or
+    /// considered ([`Self::held`]): what they wait on is unknown, so an idle
+    /// stage 4 is not taken for one with no ready work.
+    unread: usize,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
     /// The reads of stage 4's look ahead at overlaps ([`Self::kept`]).
@@ -3089,6 +3094,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// A stage 4 candidate's hold.
     fn held(&mut self, facts: &Facts, hold: Hold) {
+        self.unread += usize::from(hold.kind == HoldKind::Unreadable);
         self.record(Entry {
             scope: Scope::Item(facts.issue.clone()),
             hold,
@@ -3408,7 +3414,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
         if taken == 0 && free > 0 {
-            if earlier == 0 && self.holds_whole && self.report.failures == 0 {
+            if earlier == 0 && self.holds_whole && self.report.failures == 0 && self.unread == 0 {
                 self.line("pools: no ready work; unused headroom does not release holds".into());
             }
             let reasons: Vec<_> = self.report.lines[decisions..]
