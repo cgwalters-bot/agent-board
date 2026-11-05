@@ -293,6 +293,46 @@ it so; absent otherwise, and where stage 3 or 4 did not get as far as
 reading them. It too was added to v1 later, and a reader treats
 it as absent in an older comment.
 
+#### Per-repository work
+
+On GitHub, with `holds` and `follow` configured (off otherwise), the same
+private comment also publishes `dispatchable_work`, a read-only projection
+of this pass's decisions, not a second scheduler or dispatch authority:
+
+```json
+{"schema":"agent-board/dispatchable-work/v1","repositories":{"owner/repo":{"reviews_complete":true,"issues_complete":false,"count":1,"counts":{"continue":1},"omitted":0,"items":[{"item":"owner/repo#8","kind":"continue","reason":"finish the work","operator":false,"head":"head-oid","taken":false}]}}}
+```
+
+Every followed or work repository has a section. PR kinds are `fix`,
+`rebase`, `continue`, `merge` (approved and eligible for merge/enqueue), or
+`held`. `taken` distinguishes decisions executed (or previewed) this pass
+from work left by caps or admission. `head` binds PR observations to the
+head read. `accepted-plan` entries have `plan_kind`; issue and epic holds
+have `hold_kind`, `reason`, `operator` and `carried`. Global holds remain in
+the enclosing `holds` array. Counts include every observed entry before
+the limit; at most 200 entries total are included, with each repository's
+`omitted` count. Reasons are clipped to 500 characters. Repositories and
+item identities sort deterministically.
+
+`reviews_complete` is false for an unread or partly decided repository.
+`issues_complete` is currently always false: stage 4 can stop before reading
+plans at WIP, pool or request limits. Accepted plans are those the existing
+schedule reads and admits by scope, not a census of every issue with a plan.
+No extra issue reads are made to fill the view. Carried holds remain marked;
+PR and plan work is never carried as current across an unread pass. The
+enclosing snapshot's `at` is the observation clock. If the comment cannot
+fit, this optional section is omitted before any existing hold or operator
+inbox detail is evicted; absence means unavailable, not zero work. Unchanged
+work alone causes no publication. Forgejo and the review app renderer are
+not implemented by this extension.
+
+The recovery and queue rules are in [PR follow-up](poll.md#dispatching-machine-work).
+Callers already publishing holds need no new publication option. In
+`cgwalters-forge/tracker`'s `.github/pass.json`, recovery needs
+`pr.unstall = true` (including retitling after completion). Known flakes additionally
+need `pr.mergeQueue.fixedFlakes` entries with the exact recorded job/step
+signatures and their fix PRs; no signature is guessed from issue prose.
+
 An applying pass also adds optional `pass.overhead` (added to holds/v1 later):
 `{"today":{"day":"2026-10-31","complete":false,"passes":2,"starts":{"planning":1,"triage":3},"comments_created":8,"comments_edited":4},"history":[]}`.
 `day` is the pass clock's UTC calendar day. `today` accumulates published

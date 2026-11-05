@@ -575,6 +575,8 @@ pub struct PollPolicy {
     /// `mergeQueue`: the re-queues of a head the poll may make, where it owns
     /// the merge queue; none (the default) leaves a removal as it was.
     pub merge_queue: Option<u64>,
+    /// Trusted job/step signatures and the merged fixes that release them.
+    pub fixed_flakes: Vec<FlakeFix>,
     pub continuation: Continuation,
     /// `diagnosticPool`: where a pull request that still fails after its fix
     /// rounds gets one more, whose task carries the failing step and the end
@@ -836,6 +838,37 @@ pub struct Continuation {
     pub retitle: bool,
 }
 
+const MAX_FLAKE_FIXES: usize = 20;
+
+/// A trusted declaration, never inferred from PR or issue prose.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlakeFix {
+    pub repository: String,
+    pub number: u64,
+    pub jobs: Vec<String>,
+}
+
+pub fn check_flake_fixes(fixes: &[FlakeFix]) -> Result<()> {
+    ensure!(
+        fixes.len() <= MAX_FLAKE_FIXES,
+        "at most {MAX_FLAKE_FIXES} fixed flakes"
+    );
+    for fix in fixes {
+        validate_repository(&fix.repository)?;
+        ensure!(fix.number > 0, "flake fix needs a PR number");
+        ensure!(
+            !fix.jobs.is_empty() && fix.jobs.len() <= QUEUE_JOBS_LIMIT,
+            "flake fix needs a bounded job list"
+        );
+        ensure!(
+            fix.jobs.iter().all(|j| !j.is_empty() && plain(j) == *j),
+            "flake fix jobs must be exact marker signatures"
+        );
+    }
+    Ok(())
+}
+
 impl Default for Continuation {
     fn default() -> Self {
         Self {
@@ -1066,7 +1099,10 @@ impl PollPolicy {
             Some(queue) => {
                 let queue = queue.as_object().context("mergeQueue is not an object")?;
                 for key in queue.keys() {
-                    ensure!(key == "tries", "unknown mergeQueue field {key}");
+                    ensure!(
+                        ["tries", "fixedFlakes"].contains(&key.as_str()),
+                        "unknown mergeQueue field {key}"
+                    );
                 }
                 let tries = queue
                     .get("tries")
@@ -1081,9 +1117,18 @@ impl PollPolicy {
                 Some(tries.unwrap_or(QUEUE_TRIES))
             }
         };
+        let fixed_flakes = serde_json::from_value::<Vec<FlakeFix>>(
+            value
+                .pointer("/mergeQueue/fixedFlakes")
+                .cloned()
+                .unwrap_or(json!([])),
+        )
+        .context("mergeQueue fixedFlakes")?;
+        check_flake_fixes(&fixed_flakes)?;
         let mut policy = Self {
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
+            fixed_flakes,
             continuation,
             merge_authors: serde_json::from_value(
                 get("mergeAuthors")?.cloned().unwrap_or(json!([])),
@@ -2110,6 +2155,8 @@ pub struct Marker {
 /// and what it did, so a removal is acted on once and re-queues are counted.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct QueueState {
+    /// One recovery after a known flake fix, per head, not a retry reset loop.
+    pub flake_retried: bool,
     /// The head the counts are for; a new head starts them again.
     pub head: String,
     /// The node id of the newest removal acted on, kept across heads and
@@ -2148,7 +2195,7 @@ fn plain(text: &str) -> String {
 impl QueueState {
     fn to_json(&self) -> Value {
         let some = |text: &Option<String>| text.as_deref().map(plain);
-        json!({
+        let mut value = json!({
             "head": plain(&self.head),
             "seen": plain(&self.seen),
             "tries": self.tries,
@@ -2158,12 +2205,17 @@ impl QueueState {
             "group": some(&self.group),
             "since": some(&self.since),
             "queued": some(&self.queued),
-        })
+        });
+        if self.flake_retried {
+            value["flake_retried"] = true.into();
+        }
+        value
     }
 
     fn from_json(value: &Value) -> Option<Self> {
         let string = |key: &str| value[key].as_str().map(plain);
         Some(Self {
+            flake_retried: value["flake_retried"].as_bool().unwrap_or(false),
             head: string("head")?,
             seen: string("seen")?,
             tries: value["tries"]
@@ -3162,6 +3214,8 @@ fn step(action: &'static str, reason: impl Into<String>) -> Decision {
 /// What a removal from the merge queue asks of the poll; see [`Pass::removal`].
 #[derive(Debug, PartialEq)]
 pub enum Removal {
+    /// A trusted known flake waits for its named fix, not for a person.
+    Wait(String),
     /// None that the marker has not seen, or one that needs nothing (a merge,
     /// or the head's own failure, which is a failed check).
     None,
@@ -3187,6 +3241,10 @@ pub fn queue_step(
         ..step("needs-human", reason)
     };
     match (decision.action, removal) {
+        (_, Removal::Wait(why)) => Decision {
+            queue: Some(state),
+            ..step("wait", why).followed(None)
+        },
         ("merge", Removal::Retry(why)) if state.tries >= tries => {
             state.reasons.push(why);
             let reasons = state.reasons.join("; ");
@@ -3224,7 +3282,7 @@ pub fn queue_step(
         }
         // Before a fix too: a person's removal is not answered by a fix round,
         // which would leave the removal seen and so the queue to the poll.
-        ("merge" | "fix" | "rebase", Removal::Stop(why)) => {
+        ("merge" | "fix" | "rebase" | "continue", Removal::Stop(why)) => {
             stop(format!("{why}, which the poll does not retry"), state)
         }
         ("fix" | "rebase" | "needs-human", _) => Decision {
@@ -3300,6 +3358,7 @@ fn started(
             // Its first attempt only, so a run that fails again is the
             // person's ([`PollPolicy::reruns`]).
             if config.policy.reruns
+                && !(config.policy.unstall && marker.rebasing)
                 && conclusion == RERUN_CONCLUSION
                 && run["run_attempt"].as_u64() == Some(1)
                 && rerun_window(now, run)
@@ -3316,6 +3375,27 @@ fn started(
         if conclusion != "success"
             || older_than(now, run["updated_at"].as_str(), FIX_RUN_GRACE_SECONDS)
         {
+            // A rebase handback can succeed without publishing its replacement
+            // series. Give it one fresh run, then use the normal bounded fix
+            // budget rather than asking a person to repair the handback.
+            if config.policy.unstall && marker.rebasing && !marker.answering {
+                let (action, round) = if marker.rebased == 1 {
+                    ("rebase", 2)
+                } else if marker.rounds < MAX_FIX_ROUNDS {
+                    ("fix", marker.rounds + 1)
+                } else {
+                    ("needs-human", 0)
+                };
+                if round > 0 {
+                    return Decision {
+                        round: Some(round),
+                        ..step(
+                            action,
+                            format!("{round} after {url} pushed no new head; fresh {action} run"),
+                        )
+                    };
+                }
+            }
             let again = match run["run_attempt"].as_u64() {
                 Some(attempt) if attempt > 1 => " again after a rerun",
                 _ => "",
@@ -3491,6 +3571,37 @@ pub fn decide(
             }
         }
     }
+    let unfinished = undescribed(pull);
+    let completed = (marker.continuing || marker.rounds > 0)
+        && !marker.rebasing
+        && marker.sha.as_deref().is_some_and(|sha| sha != head);
+    if config.policy.unstall && harness && !unfinished.is_empty() && !completed {
+        if marker.sha.as_deref() == Some(head) {
+            let decision = started(
+                config,
+                marker,
+                (fix_run, outages),
+                head,
+                "unfinished work",
+                now,
+            );
+            if decision.action != "needs-human" || !marker.continuing {
+                return decision;
+            }
+        }
+        if marker.continued < config.policy.continuation.rounds {
+            return Decision {
+                round: Some(marker.continued + 1),
+                ..step(
+                    "continue",
+                    format!(
+                        "{}; finish the work and write its title and description",
+                        unfinished.join(" and ")
+                    ),
+                )
+            };
+        }
+    }
     if !failing.is_empty() {
         let why = failing.join(", ");
         if !harness {
@@ -3570,7 +3681,7 @@ pub fn decide(
             && !marker.rebasing
             && marker.sha.as_deref().is_some_and(|sha| sha != head);
         if harness
-            && config.policy.continuation.retitle
+            && (config.policy.continuation.retitle || config.policy.unstall)
             && completed
             && !draft
             && head_description(pull).is_some()
@@ -4629,7 +4740,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             marker.clone()
         };
         let checkpoint = if continuing {
-            Some(checkpoint(pull)?.context("a continuation without a checkpoint")?)
+            Some(match checkpoint(pull)? {
+                Some(at) => at,
+                None if self.config.policy.unstall && !undescribed(pull).is_empty() => Checkpoint {
+                    reason: "unfinished".into(),
+                    done: "The existing branch contains unfinished work.".into(),
+                    left: "Finish the issue's scope and write a complete title and description."
+                        .into(),
+                    next: "Inspect the branch and its issue; finish and test the change.".into(),
+                },
+                None => bail!("a continuation without a checkpoint"),
+            })
         } else {
             None
         };
@@ -5997,6 +6118,55 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(count)
     }
 
+    fn flake_recovery(
+        &mut self,
+        repo: &str,
+        pull: &Value,
+        state: &mut QueueState,
+    ) -> Result<Option<Removal>> {
+        let latest = nodes(pull, "/timelineItems/nodes").last();
+        if state.flake_retried
+            || state.jobs.is_empty()
+            || (state.failed.is_none()
+                && state.tries < self.config.policy.merge_queue.unwrap_or(QUEUE_TRIES))
+            || !latest.is_some_and(|e| {
+                text(e, "/id") == state.seen
+                    && matches!(text(e, "/reason"), "failed_checks" | "checks_timed_out")
+            })
+        {
+            return Ok(None);
+        }
+        for fix in self.config.policy.fixed_flakes.clone() {
+            if fix.repository != repo || !state.jobs.iter().all(|j| fix.jobs.contains(j)) {
+                continue;
+            }
+            let merged = self.get(&format!("repos/{repo}/pulls/{}", fix.number))?;
+            let after = timestamp(merged["merged_at"].as_str())
+                .zip(timestamp(state.since.as_deref()))
+                .is_some_and(|(merged, removed)| merged > removed);
+            if merged["merged"] == true
+                && after
+                && text(&merged, "/base/ref") == text(pull, "/baseRefName")
+            {
+                state.flake_retried = true;
+                state.failed = None;
+                state.tries = 0;
+                state.jobs.clear();
+                return Ok(Some(Removal::Retry(format!(
+                    "known flake fix {repo}#{} merged",
+                    fix.number
+                ))));
+            }
+            if merged["merged"] != true && text(&merged, "/state") == "open" {
+                return Ok(Some(Removal::Wait(format!(
+                    "known flaky jobs wait for {repo}#{} to merge",
+                    fix.number
+                ))));
+            }
+        }
+        Ok(None)
+    }
+
     /// The newest removal of `pull` from the merge queue that its marker has
     /// not seen, read for what it asks (#91), with the queue state to record,
     /// and the URL and annotations of a job that failed the head twice.
@@ -6030,6 +6200,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             };
         }
         let latest = nodes(pull, "/timelineItems/nodes").last();
+        if let Some(recovery) = self.flake_recovery(repo, pull, &mut state)? {
+            return Ok((recovery, state, None));
+        }
         let id = latest.map(|r| plain(text(r, "/id"))).unwrap_or_default();
         let Some(latest) = latest.filter(|_| !id.is_empty() && id != state.seen) else {
             return Ok((Removal::None, state, None));
@@ -6074,6 +6247,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                             jobs.iter().find(|j| state.jobs.contains(&plain(&j.what)))
                         {
                             state.failed = Some(format!("merge queue {}", same.what));
+                            state.jobs = jobs
+                                .iter()
+                                .map(|j| plain(&j.what))
+                                .take(QUEUE_JOBS_LIMIT)
+                                .collect();
+                            if let Some(recovery) = self.flake_recovery(repo, pull, &mut state)? {
+                                return Ok((recovery, state, None));
+                            }
                             let log = self.annotations(repo, same.check_run)?;
                             return Ok((Removal::None, state, Some((same.url.clone(), log))));
                         }
@@ -6092,6 +6273,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
             other => Removal::Stop(format!("removed from the merge queue ({})", plain(other))),
         };
+        if let Some(recovery) = self.flake_recovery(repo, pull, &mut state)? {
+            return Ok((recovery, state, None));
+        }
         Ok((removal, state, None))
     }
 
@@ -6910,19 +7094,18 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             (Some(tries), Some((removal, state))) => queue_step(decision, removal, state, tries),
             _ => decision,
         };
-        // Ordering holds for every followed pull request, as it needs no marker.
+        // A conflict can wait for an earlier change to land. An approved,
+        // clean head must be enqueued now: GitHub owns queue ordering and
+        // merge-group revalidation, not a file-overlap guess by this pass.
         let rebase =
             matches!(decision.action, "fix" | "rebase") && pull["mergeable"] == CONFLICTING;
         if tries.is_some()
-            && (decision.action == "merge" || rebase)
+            && rebase
             && let Some(ahead) = self.ahead(repo, &pull)?
         {
             decision = step(
                 "wait",
-                format!(
-                    "{ahead}{AHEAD_IN_QUEUE}{} after it",
-                    if rebase { "rebased" } else { "queued" }
-                ),
+                format!("{ahead}{AHEAD_IN_QUEUE}{} after it", "rebased"),
             )
             .followed(None);
         }
@@ -12831,6 +13014,214 @@ mod tests {
     }
 
     #[test]
+    fn known_flake_waits_for_merged_fix_then_requeues_once() {
+        const JOB: &str = "job rust failed at step Run cargo test";
+        for (name, fix, consumed, removal, expected) in [
+            (
+                "merged",
+                json!({"merged":true,"merged_at":"2026-10-12T01:45:00Z","base":{"ref":"main"}}),
+                false,
+                "failed_checks",
+                "merge",
+            ),
+            (
+                "pending",
+                json!({"merged":false,"state":"open"}),
+                false,
+                "failed_checks",
+                "wait",
+            ),
+            (
+                "old fix",
+                json!({"merged":true,"merged_at":"2026-10-12T01:00:00Z","base":{"ref":"main"}}),
+                false,
+                "failed_checks",
+                "fix",
+            ),
+            (
+                "wrong base",
+                json!({"merged":true,"merged_at":"2026-10-12T01:45:00Z","base":{"ref":"other"}}),
+                false,
+                "failed_checks",
+                "fix",
+            ),
+            ("already recovered", json!({}), true, "failed_checks", "fix"),
+            (
+                "human removal",
+                json!({}),
+                false,
+                "manually_removed",
+                "needs-human",
+            ),
+            (
+                "human removal unfinished",
+                json!({}),
+                false,
+                "manually_removed",
+                "needs-human",
+            ),
+        ] {
+            let mut fake = github();
+            fake.rest
+                .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                .unwrap()
+                .3
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"merge_queue"}));
+            let id = if removal == "manually_removed" {
+                "R2"
+            } else {
+                "R1"
+            };
+            let mut edit = json!({"timelineItems":{"nodes":[{"id":id,"reason":removal,"createdAt":"2026-10-12T01:30:00Z"}]}});
+            if name == "human removal unfinished" {
+                edit["title"] = "Agent run 123".into();
+            }
+            fake.pulls.insert(470, pull("pull-470", edit));
+            let state = json!({"rounds":0,"queue":{"head":HEAD,"seen":"R1","tries":3,"jobs":[JOB],"failed":format!("merge queue {JOB}"),"since":"2026-10-12T01:30:00Z","flake_retried":consumed,"queued":HEAD}});
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id":5,"user":{"login":BOT},"body":marker_body(&state,"queue")} ]),
+            );
+            fake.page(&format!("repos/{REPO}/pulls/99"), None, None, fix);
+            let mut cfg = config();
+            cfg.policy.merge_queue = Some(3);
+            cfg.policy.unstall = true;
+            cfg.policy.fixed_flakes = vec![FlakeFix {
+                repository: REPO.into(),
+                number: 99,
+                jobs: vec![JOB.into()],
+            }];
+            let dispatcher = Fake::default();
+            let out = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(out.errors, 0, "{name}: {:?}", out.lines);
+            if removal == "manually_removed" {
+                assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+            }
+            assert!(
+                out.steps.iter().any(|s| s.action == expected),
+                "{name}: {:?}",
+                out.steps
+            );
+            let enqueued = fake
+                .writes
+                .borrow()
+                .iter()
+                .any(|(url, _)| url.contains("enqueuePullRequest"));
+            assert_eq!(
+                enqueued,
+                expected == "merge",
+                "{name}: {:?}",
+                fake.writes.borrow()
+            );
+            if enqueued {
+                assert!(
+                    fake.writes
+                        .borrow()
+                        .iter()
+                        .filter_map(|(_, b)| parse_marker(MARKER, b["body"].as_str()?))
+                        .any(|m| m["queue"]["flake_retried"] == true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unstall_dispatches_unfinished_work_and_no_head_rebases() {
+        for (name, edit, mut state, action, round) in [
+            (
+                "placeholder",
+                json!({"title":"Agent run 123"}),
+                json!({}),
+                "continue",
+                1,
+            ),
+            (
+                "partial",
+                json!({"title":"[partial: timeout] first half"}),
+                json!({}),
+                "continue",
+                1,
+            ),
+            (
+                "retry rebase",
+                json!({"mergeable":"CONFLICTING"}),
+                json!({"rebased":1,"rebasing":true,"sha":HEAD,"run":7}),
+                "rebase",
+                2,
+            ),
+            (
+                "escalate rebase",
+                json!({"mergeable":"CONFLICTING"}),
+                json!({"rebased":2,"rebasing":true,"sha":HEAD,"run":7}),
+                "fix",
+                1,
+            ),
+        ] {
+            state["rounds"] = 0.into();
+            let mut fake = github();
+            fake.pulls.insert(470, pull("pull-470", edit));
+            fake.page(
+                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                None,
+                None,
+                json!([{"id":5,"user":{"login":BOT},"body":marker_body(&state,"old")} ]),
+            );
+            fake.page("repos/cgwalters-forge/tracker/actions/runs/7", None, None,
+                json!({"status":"completed","conclusion":"success","run_attempt":1,"updated_at":"2026-10-12T01:00:00Z"}));
+            let mut cfg = config();
+            cfg.policy.unstall = true;
+            cfg.policy.rebase_rounds = 1;
+            let dispatcher = Fake::default();
+            let out = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(out.errors, 0, "{name}: {:?}", out.lines);
+            assert!(
+                out.steps.iter().any(|s| s.action == action && s.ran),
+                "{name}: {:?}",
+                out.steps
+            );
+            assert_eq!(dispatcher.writes.borrow().len(), 1, "{name}");
+            let key = match action {
+                "continue" => "continued",
+                "rebase" => "rebased",
+                _ => "rounds",
+            };
+            assert!(
+                fake.writes
+                    .borrow()
+                    .iter()
+                    .filter_map(|(_, b)| parse_marker(MARKER, b["body"].as_str()?))
+                    .any(|m| m[key] == round),
+                "{name}: {:?}",
+                fake.writes.borrow()
+            );
+        }
+    }
+
+    #[test]
     fn unstall_gives_a_held_draft_a_fresh_round_on_another_pool() {
         for (marker, expected) in [
             (
@@ -15884,6 +16275,13 @@ mod tests {
             )]
         );
         // Off by default, a person writes them.
+        let (line, fake, _) =
+            applied_with(json!({"unstall": true}), change(message), continued.clone());
+        assert!(line.ends_with("-> retitled from its head commit"), "{line}");
+        assert_eq!(
+            fake.writes.borrow()[0].1["title"],
+            "docs: Explain the exemption"
+        );
         let (line, fake, _) = applied_with(json!({}), change(message), continued);
         assert!(
             line.contains("needs-human: it is marked as partial work"),
@@ -18694,6 +19092,7 @@ mod tests {
     #[test]
     fn queue_state_survives_its_marker() {
         let queue = QueueState {
+            flake_retried: false,
             head: HEAD.into(),
             seen: "RFMQE_1".into(),
             tries: 2,
@@ -18746,7 +19145,7 @@ mod tests {
     /// The poll owning the merge queue (#91): a removal is read for its reason
     /// and acted on once, re-queues are counted to the cap, a job that fails a
     /// head twice in the queue starts a fix round with its annotations, and an
-    /// overlapping entry ahead holds a merge or a rebase.
+    /// overlapping entry ahead holds only a rebase, never queue admission.
     #[test]
     fn the_poll_owns_the_merge_queue() {
         // The failure every failing case's merge-group run has, as recorded.
@@ -19210,9 +19609,9 @@ mod tests {
                 none.clone(),
                 None,
                 json!([{"pullRequest": {"number": 471, "files": files(&["docs/a b.md"])}}]),
-                "wait: cgwalters-forge/agentic-job#471 changes `docs/a b.md` and is ahead in the merge queue; queued after it",
-                vec![],
-                none.clone(),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"head": HEAD, "tries": 0, "queued": HEAD}),
             ),
             (
                 "an entry whose files were not all read is taken to overlap",
@@ -19221,9 +19620,9 @@ mod tests {
                 none.clone(),
                 None,
                 json!([{"pullRequest": {"number": 471, "files": {"nodes": [], "pageInfo": {"hasNextPage": true}}}}]),
-                "wait: cgwalters-forge/agentic-job#471 may change the same files, as not all were read, and is ahead in the merge queue; queued after it",
-                vec![],
-                none.clone(),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"head": HEAD, "tries": 0, "queued": HEAD}),
             ),
             (
                 "and so is the rest of a queue not read whole",
@@ -19232,20 +19631,20 @@ mod tests {
                 none.clone(),
                 None,
                 json!([{"past": true, "pullRequest": {"number": 471, "files": files(&["crates/a.rs"])}}]),
-                "wait: an entry past the first 50 read may change the same files, and is ahead in the merge queue; queued after it",
-                vec![],
-                none.clone(),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"head": HEAD, "tries": 0, "queued": HEAD}),
             ),
             (
-                "an approved pull request is queued after an overlapping one",
+                "an approved pull request is queued alongside an overlapping one",
                 Some(3),
                 json!({"files": files(&["crates/a.rs"])}),
                 none.clone(),
                 None,
                 ahead.clone(),
-                "wait: cgwalters-forge/agentic-job#471 changes `crates/a.rs` and is ahead in the merge queue; queued after it",
-                vec![],
-                none.clone(),
+                "merge: review approved and checks green -> added to the merge queue",
+                vec![comment.clone(), "enqueuePullRequest".into()],
+                json!({"head": HEAD, "tries": 0, "queued": HEAD}),
             ),
         ];
         let pass = |tries: Option<u64>,

@@ -520,6 +520,9 @@ const START_KINDS: &[&str] = &[
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Snapshot {
+    /// Per-repository observed work; absent means unavailable, not empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatchable_work: Option<Value>,
     pub schema: &'static str,
     /// The clock of the pass that wrote it.
     pub at: String,
@@ -669,6 +672,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
         })
         .collect();
     Snapshot {
+        dispatchable_work: None,
         schema: HOLDS_SCHEMA,
         at,
         truncated: 0,
@@ -2574,8 +2578,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         Some(list) => format!(",\"needs_you\":{}", serde_json::to_string(list)?),
         None => String::new(),
     };
+    let work = match &snapshot.dispatchable_work {
+        Some(work) => format!(",\"dispatchable_work\":{}", serde_json::to_string(work)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -2616,7 +2624,13 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// still not fit, [`cap`] leaves out more, honestly counted, so that size
 /// never keeps the inbox from being published: the body is always at most
 /// [`MAX_COMMENT_CHARS`].
-pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
+pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
+    // Optional work detail never evicts the operator inbox or stall clocks.
+    if snapshot.dispatchable_work.is_some()
+        && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS
+    {
+        snapshot.dispatchable_work = None;
+    }
     let holds = &snapshot.holds;
     let on = |h: &Published| (h.item.clone(), h.epic);
     let stalled = |h: &Published| h.kind == HoldKind::Stalled;
@@ -2651,6 +2665,7 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let mut dropped = BTreeSet::new();
     let mut needs_you = snapshot.needs_you.clone();
     let without = |dropped: &BTreeSet<usize>, needs_you: &Option<NeedsYou>| Snapshot {
+        dispatchable_work: snapshot.dispatchable_work.clone(),
         schema: snapshot.schema,
         at: snapshot.at.clone(),
         truncated: dropped.len(),

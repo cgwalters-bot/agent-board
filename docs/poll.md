@@ -10,6 +10,49 @@ the caller's dispatch workflow ([dispatch](dispatch.md)).
 
 ## One pass
 
+### Dispatching machine work
+
+With `unstall: true` (the pass's `pr.unstall`, still off by default), a
+completed rebase run that published no new head gets one fresh rebase run
+after the successful-push grace period, then a fix round within the existing
+fix budget. Its durable rebase count records the retry even when
+`rebaseRounds` is one. Running and ambiguously dispatched runs still wait;
+outage refunds and operator-answer gates are unchanged.
+
+The same setting continues a harness-placeholder or partial PR even without a
+checkpoint, within `continuation.rounds`. Its implement/fix-kind brief asks it
+to finish the issue's work, test it, and write a commit message fit for the
+whole PR's title and description. `unstall` also enables the existing retitle
+step, which copies that message only after the changed, ready head
+is approved and green. Foreign authors, explicit holds, operator approval,
+scope and fix bounds still apply. Existing `needs-human` labels are not
+automatically removed: their stop markers discarded round/queue evidence,
+and label ownership is not proved by the PR's title. A person must release
+those historical stops; new machine work takes the recovery paths instead.
+
+An approved clean head is enqueued even when an earlier queue entry touches
+the same files or its file listing is incomplete. GitHub orders and tests
+the merge groups. A conflicting head can still wait for that entry before
+rebasing; human removals, review requirements and merge policy still hold.
+
+The concrete threat addressed by `mergeQueue.fixedFlakes` is treating an
+arbitrary failed check or a person's removal as permission to reset queue
+retries. This optional trusted configuration (empty by default) names exact
+marker job/step signatures and a fix PR in the same repository:
+
+```json
+{"mergeQueue":{"tries":3,"fixedFlakes":[{"repository":"owner/repo","number":99,"jobs":["job rust failed at step Run cargo test"]}]}}
+```
+
+At most 20 declarations, each with at most the existing queue job bound, are
+accepted. Only recorded repeated failures or exhausted retries qualify; all
+recorded failed signatures must match one declaration. An open fix holds as
+machine work. Its merge must be read from GitHub, onto this PR's base branch,
+after the removal. Then the head gets one recovery, recorded before enqueue
+in `queue.flake_retried`; it cannot reset again at that head. Unknown jobs,
+closed-unmerged fixes, older fixes, other bases and manual removals retain
+normal handling. Reads and writes use the existing pass budgets and caps.
+
 `agent-board poll` follows the bot's pull requests, one pass a run:
 it prints the operator's and the bot's activity from the events of every
 repository on the board (given by `--owner`/`--project` or `--snapshot`) and of
