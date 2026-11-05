@@ -1417,6 +1417,12 @@ impl Config {
             .any(|r| r.eq_ignore_ascii_case(repository))
     }
 
+    /// Whether a run may change `repository`: with `pr.ownSpaceOnly`, only
+    /// in our own space, as the poll writes ([`poll::Config::writes_in`]).
+    fn writes_in(&self, repository: &str) -> bool {
+        !self.pr.own_space_only || poll::our_space(&self.dispatch_repo, &self.bot, repository)
+    }
+
     /// The pull request poll's settings: today's defaults but for the `pr`
     /// keys, paced where `usage` is set by `snapshot`, this pass's reading,
     /// or without one by the published snapshot.
@@ -4430,6 +4436,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if !config.works_in(&dest.repository) {
             let dest = dest.display();
             let why = format!("its plan's {dest} is not in a work repository");
+            return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
+        }
+        // Its run would change a repository the pass may not write in, so
+        // the pass never starts it: the operator's, not a candidate.
+        if !config.writes_in(&dest.repository) {
+            let dest = dest.display();
+            let why = format!(
+                "its plan's {dest} {}; it is dispatched by hand",
+                poll::NOT_OURS
+            );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
         if dest != *issue {

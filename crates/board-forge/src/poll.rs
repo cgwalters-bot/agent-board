@@ -264,7 +264,7 @@ const PROMOTE_WAIT: &str = "a midstream draft, waiting for promotion";
 pub(crate) const LEFT_TO_OPERATOR: &str = "left to the operator: ";
 /// Why a step, after its repository, is left to the operator with
 /// [`PollPolicy::own_space_only`].
-const NOT_OURS: &str =
+pub(crate) const NOT_OURS: &str =
     "is outside our own space (pr.ownSpaceOnly), so the pass writes nothing there";
 
 /// agentic-job's apply pushes a round's commit to a head repository other
@@ -422,13 +422,19 @@ pub struct Config {
     pub policy: PollPolicy,
 }
 
+/// Whether `repo` is in our own space: the organization of `dispatch_repo`,
+/// or `bot`'s own account.
+pub(crate) fn our_space(dispatch_repo: &str, bot: &str, repo: &str) -> bool {
+    let home = dispatch_repo.split_once('/').map(|(o, _)| o);
+    let ours = [home.unwrap_or(dispatch_repo), bot];
+    comments::in_scope(&ours.map(|owner| format!("{owner}/*")), repo)
+}
+
 impl Config {
     /// Whether `repo` is in our own space: the organization of
     /// [`Self::dispatch_repo`], or the bot's own account.
     pub(crate) fn ours(&self, repo: &str) -> bool {
-        let home = self.dispatch_repo.split_once('/').map(|(o, _)| o);
-        let ours = [home.unwrap_or(&self.dispatch_repo), &self.bot];
-        comments::in_scope(&ours.map(|owner| format!("{owner}/*")), repo)
+        our_space(&self.dispatch_repo, &self.bot, repo)
     }
 
     /// Whether the pass may write in `repo` ([`PollPolicy::own_space_only`]):

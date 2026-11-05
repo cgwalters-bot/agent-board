@@ -1745,9 +1745,12 @@ starts left free on a sample of old candidates:
    it (`needs-human`, `needs-design`, board Blocked). A closed issue, one
    whose labels or pull requests could not all be read, one with an open
    pull request of the bot's or the operator's and one with a run in
-   flight, this pass's starts included, are not; a person's hold and open
-   dependencies do not keep it off.
-3. Three times `revisit.perPass` of them are drawn in order without
+   flight, this pass's starts included, are not; nor is one stage 4 held
+   for the operator this pass (`needs-operator`), such as a plan it never
+   starts, which would otherwise win every draw and wait to start
+   (agent-board#701). A person's hold and open dependencies do not keep it
+   off.
+3. Up to three times the most `revisit.perPass` may be (15) of them are drawn in order without
    replacement, each by weight: focus, times its own Priority, times its
    silence. With N Priority options, focus is (N + 2) to the power of its
    live epic's Priority counted down from the board's first option (with
@@ -1761,7 +1764,8 @@ starts left free on a sample of old candidates:
    `revisit: 9 due, seed 4242, drawn: OWNER/REPO#N (weight 38880), …`, so
    the seed and the board the pass read (`--record`) reproduce it.
 4. Each drawn issue in turn, until `revisit.perPass` are revisited or no
-   slot is left, reads its comments and is left alone
+   slot is left, reads its comments and is left alone, the next draw
+   taking its turn,
    (`revisit OWNER/REPO#N: why`) where a writer's revisit plan comment
    changed less than its days ago, where its newest plan has not been
    dispatched (a revisit's plan would replace it) or is invalid, where its
@@ -3342,7 +3346,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.operatorPaths` | Files, or directories ending in `/`, a pull request changing any of which merges or is enqueued only on the operator's approval of its head, waiting as an approve row naming them, see [the poll](poll.md#configuration); relative, no globs, at most 50; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
-| `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md); `false` |
+| `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit; `false` |
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
