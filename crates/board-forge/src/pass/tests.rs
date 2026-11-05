@@ -11780,6 +11780,208 @@ fn approval_evidence_pass_option_and_head_observations() {
     }
 }
 
+/// Combine fresh observations over the evidence cap with a partial source's
+/// carried identities and a genuinely closed target, through publication/fit.
+/// This cannot reproduce retirement of a *fresh qualifying* row after evidence
+/// collection: carry::retire filters previous records, inventory::revalidate
+/// skips fresh identities, and epic enrichment does not retire approval rows.
+/// The focused manual-drain retention regression covers that otherwise
+/// unreachable transition; it is not an end-to-end retirement replay.
+#[test]
+fn approval_evidence_combined_transport_replay() {
+    const FRESH: &str = "cgwalters-forge/agentic-job";
+    const OLD: &str = "cgwalters-forge/old";
+    const OPS: &str = "cgwalters-forge/bot-ops";
+    const FRESH_COUNT: u64 = 52;
+    let head = "a".repeat(40);
+    let settings = |gate| {
+        json!({"wip":0,"follow":[FRESH, OLD],"pr":{"fixPools":["claude"],"reviewWorkflow":"review.yml"},
+        "holds":{"repository":OPS,"issue":1,"needsYou":true,"approvalEvidence":gate}})
+    };
+    let prepare = |repo: &str, numbers: std::ops::RangeInclusive<u64>| {
+        let mut forge = Forge::new(None, false);
+        for number in numbers.clone() {
+            followed(
+                &mut forge.replay,
+                (repo, number),
+                json!({
+                    "headRefOid":head,"additions":12,"deletions":3,
+                    "labels":{"nodes":[{"name":"needs-operator-approval"}],"pageInfo":{"hasNextPage":false}},
+                    "reviews":{"nodes":[{"state":"APPROVED","commit":{"oid":head},
+                        "author":{"__typename":"Bot","login":"github-actions","databaseId":poll::ACTIONS_BOT_ID},
+                        "submittedAt":"2026-10-23T13:00:00Z",
+                        "body":format!("VERDICT: APPROVE\n\n<!-- gh-aw-agentic-workflow: review, id: 77, workflow_id: agentic-job, run: https://github.com/{repo}/actions/runs/77 -->")}],
+                        "pageInfo":{"hasPreviousPage":false}},
+                    "commits":{"nodes":[{"commit":{"oid":head,
+                        "committedDate":"2026-10-23T12:00:00Z","message":"Change","statusCheckRollup":null}}]}
+                }),
+                json!([]),
+            );
+            inventory_on(&mut forge.replay, repo, number, "needs-operator-approval");
+        }
+        answer(&mut forge.replay, &format!("repos/{repo}/pulls?"))["body"] = json!(
+            numbers
+                .map(|number| json!({"number":number,"user":{"login":"cgwalters-bot"}}))
+                .collect::<Vec<_>>()
+        );
+        for (path, body) in [
+            ("user".to_owned(), json!({"login":"cgwalters-bot"})),
+            (format!("repos/{OPS}"), json!({"private":true})),
+            (
+                format!("repos/{repo}/actions/runs/77"),
+                json!({"id":77,"path":".github/workflows/review.yml",
+                "event":"pull_request_target","head_sha":head,"status":"completed",
+                "run_started_at":"2026-10-23T12:50:00Z","updated_at":"2026-10-23T13:05:00Z",
+                "repository":{"full_name":repo}}),
+            ),
+        ] {
+            forge
+                .replay
+                .requests
+                .push(json!({"request":{"get":format!("{API_ROOT}{path}")},
+                "answer":{"status":200,"link":null,"body":body}}));
+        }
+        forge
+    };
+    let publication = |forge: &Forge, report: &Report| {
+        forge
+            .writes
+            .borrow()
+            .iter()
+            .find_map(|(_, _, value)| {
+                value["body"]
+                    .as_str()
+                    .filter(|b| holds::parse(b).is_some())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("{:?}", report.lines))
+    };
+    // Seed real carried approvals, including evidence at the previous head.
+    let seed = prepare(OLD, 1..=2);
+    let mut seed_settings = settings(true);
+    seed_settings["follow"] = json!([OLD]);
+    let report = apply(&seed, &config(seed_settings));
+    let previous = publication(&seed, &report);
+    let seeded = holds::parse(&previous).unwrap();
+    assert_eq!(seeded["needs_you"]["count"], 2);
+    assert_eq!(seeded["needs_you"]["sources"]["reviews"], "complete");
+    assert_eq!(
+        seeded["needs_you"]["approval_evidence"]["items"]
+            .as_object()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    for fresh_count in [3, FRESH_COUNT] {
+        let mut canonical = None;
+        for gate in [false, true] {
+            let mut forge = prepare(FRESH, 1..=fresh_count);
+            forge.replay.now += time::Duration::hours(1);
+            // Stranded drafts share a group, never an approval-evidence entry.
+            for number in [53, 54] {
+                followed(
+                    &mut forge.replay,
+                    (FRESH, number),
+                    json!({"isDraft":true,"headRefOid":head}),
+                    json!([]),
+                );
+                inventory_on(&mut forge.replay, FRESH, number, "");
+            }
+            answer(&mut forge.replay, &format!("repos/{FRESH}/pulls?"))["body"] = json!(
+                (1..=fresh_count)
+                    .chain([53, 54])
+                    .map(|number| json!({"number":number,"user":{"login":"cgwalters-bot"}}))
+                    .collect::<Vec<_>>()
+            );
+            // OLD cannot be listed; only its cheap identity reads succeed. One
+            // target remains open at an unread head, and the other really closes.
+            *forge.fail.borrow_mut() = Some(format!("repos/{OLD}/pulls?"));
+            for (number, state) in [(1, "OPEN"), (2, "CLOSED")] {
+                inventory_on(&mut forge.replay, OLD, number, "needs-operator-approval");
+                let index = forge.replay.requests.len() - 1;
+                forge.replay.requests[index]["answer"]["data"]["repository"]["issueOrPullRequest"]
+                    ["state"] = json!(state);
+            }
+            answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"] = json!([
+                {"id":7,"node_id":"IC_7","user":{"login":"cgwalters-bot"},"body":previous}
+            ]);
+            let report = apply(&forge, &config(settings(gate)));
+            let body = publication(&forge, &report);
+            let published = holds::parse(&body).unwrap();
+            let list = &published["needs_you"];
+            assert_eq!(list["schema"], "agent-board/needs-you/v2");
+            assert_eq!(list["complete"], false, "{list:#?}");
+            assert_eq!(list["sources"]["reviews"], "partial");
+            assert_eq!(list["count"], fresh_count + 3);
+            assert_eq!(
+                list["counts"],
+                json!({"decisions":fresh_count+2,"groups":1,"members":fresh_count+3})
+            );
+            let identities = list["identities"].as_array().unwrap();
+            assert!(
+                identities
+                    .iter()
+                    .any(|i| i["item"] == format!("{OLD}#1") && i["carried"] == true)
+            );
+            assert!(!identities.iter().any(|i| i["item"] == format!("{OLD}#2")));
+            assert!(body.chars().count() <= holds::MAX_COMMENT_CHARS);
+            let projection = json!({"identities":list["identities"],"counts":list["counts"],
+            "count":list["count"],"complete":list["complete"],"sources":list["sources"]});
+            if gate {
+                assert_eq!(canonical.as_ref().unwrap(), &projection);
+                let evidence = &list["approval_evidence"];
+                assert_eq!(evidence["schema"], "agent-board/approval-evidence/v1");
+                assert_eq!(evidence["observed_at"], list["validated_at"]);
+                let entries = evidence["items"].as_object().unwrap();
+                // The 52-row replay naturally exceeds the real comment bound:
+                // two observations exceed the cap and all 50 retained entries
+                // are then evicted by fit before any detail-card eviction.
+                let expected = if fresh_count == FRESH_COUNT {
+                    0
+                } else {
+                    fresh_count as usize
+                };
+                assert_eq!(entries.len(), expected);
+                assert_eq!(
+                    entries.len() + evidence["omitted"].as_u64().unwrap() as usize,
+                    fresh_count as usize
+                );
+                assert!(entries.len() <= holds::MAX_APPROVAL_EVIDENCE);
+                for (key, entry) in entries {
+                    let row = list["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["key"] == *key)
+                        .unwrap();
+                    assert_ne!(row["carried"], true);
+                    assert!(row.get("group").is_none_or(Value::is_null));
+                    assert_eq!(row["head"], entry["assessed_head"]);
+                    assert_eq!(row["action"]["type"], "approve_pull_request");
+                    assert!(key.starts_with(FRESH));
+                }
+                if fresh_count == 3 {
+                    assert_eq!(
+                        entries.keys().cloned().collect::<Vec<_>>(),
+                        (1..=3).map(|n| format!("{FRESH}#{n}")).collect::<Vec<_>>()
+                    );
+                    assert!(
+                        list["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|r| r["group"]["numbers"] == json!([53, 54]))
+                    );
+                }
+            } else {
+                assert!(list.get("approval_evidence").is_none());
+                canonical = Some(projection);
+            }
+        }
+    }
+}
+
 /// The bot's open pull request `number` of `repo` from its fork, the one
 /// open pull request there, as stage 2 reads it once `repo` is followed:
 /// mergeable, unreviewed, with no checks, committed when the recording was
