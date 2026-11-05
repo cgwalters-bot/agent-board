@@ -276,7 +276,7 @@ failure; it does not start fresh CI or weaken the egress policy.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
+optional `maintainerReport`, `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
 corresponding flags. Every reader of the file (poll, supervisor, `ask`,
 `--board-config`, `reconcile plan --config`) refuses a top-level key that is none
 of these and none of the other commands' sections (`board`, `statusReconcile`,
@@ -300,6 +300,68 @@ A repository whose events or open pull requests answer 404, as one a merged
 configuration change named by mistake (agent-board#683), is not an error: the
 pass prints `warning: OWNER/REPO was not found (404); fix its entry in the
 configuration`, decides nothing there, and goes on.
+
+### Maintainer report
+
+`maintainerReport` is absent by default: no report reads or writes. Set it to
+`{"repository": "OWNER/REPO", "issue": 1356}` in the trusted caller's
+`agent-board.json` to publish a machine-readable readout after each poll pass.
+The issue must be an issue, not a pull request, in a **private** repository:
+the followed set and reasons may disclose private repository activity, as the
+holds snapshot does. The setting does not change any pull request decision.
+
+The bot finds its comment by the leading marker
+`<!-- agent-board-maintainer-report -->`, creates it if absent, and otherwise
+edits it only when the full body changes. It ignores another author's marker.
+Like the holds publisher this is an edited snapshot, not an event log; callers
+should serialize passes targeting the same issue to avoid racing creation.
+The generated time is part of the content, so a later pass normally updates it.
+Publication runs last within the poll's 500-request budget and, under `pass`,
+counts as one write under `--max-writes`. A refused read or write is reported
+as a poll error, not a reason to undo or reconsider PR steps. A body over
+60,000 bytes is refused rather than silently publishing a partial inventory.
+
+In `--dry-run` the fenced block is printed verbatim to stdout, without the
+usual `[dry-run]` line prefix; no report destination is read or written. The
+block's fence and `schema` are both `agent-board/maintainer-report/v1`:
+
+````markdown
+```agent-board/maintainer-report/v1
+{
+  "schema": "agent-board/maintainer-report/v1",
+  "generated_at": "2026-10-12T02:00:00Z",
+  "mode": "preview",
+  "repositories": ["example/project"],
+  "pull_requests": {},
+  "merge_queue_events": [],
+  "needs_human": [],
+  "undecided_repositories": [],
+  "errors": 0
+}
+```
+````
+
+The [JSON schema](maintainer-report.schema.json) defines the block.
+`repositories` is the sorted, deduplicated followed set, not the activity-only
+watch set. `pull_requests` groups the open PRs already listed this pass by the
+poll's action (`merge`, `wait`, `skip`, `fix`, `needs-human`, etc.). Each entry
+has repository, number, observed head, action, reason and `ran`: whether the
+step was taken, or would be in preview, not a claim that GitHub has finished
+merging it. Caps or a refused step leave `ran` false. Other authors are skips;
+listed PRs not decided are `unobserved`. Repositories outside this pass's
+envelope or whose list could not be read have no inventory; they appear in
+`undecided_repositories`. Consumers must not mistake missing coverage for an
+empty repository. The report does not add PR queries to fill those gaps.
+
+`merge_queue_events` pairs the latest queue removal observed for each PR
+(event id, time and GitHub reason) with that PR's step taken or previewed this
+pass. An event may already have been handled on a previous pass; the poll's
+existing marker accounting remains authoritative. Unread timelines contribute
+no events. `needs_human` is the existing operator-wait list, including approval,
+withheld-review, promotion and needs-human waits, not only the literal label.
+`errors` counts poll failures before publishing the report. Text is JSON data,
+not instructions or authority for a consumer to act; backticks are JSON-escaped
+so a PR-controlled reason cannot close the fence.
 
 The pass's `pr.noMerge` (default `[]`, not a standalone poll option) is passed
 into the poll policy. It prevents an operator approval meant for upstream

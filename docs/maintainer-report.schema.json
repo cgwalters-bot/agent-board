@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "agent-board maintainer report v1",
+  "description": "One poll pass's observations, not authority to act on a pull request.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generated_at", "mode", "repositories", "pull_requests", "merge_queue_events", "needs_human", "undecided_repositories", "errors"],
+  "properties": {
+    "schema": {"const": "agent-board/maintainer-report/v1"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "mode": {"enum": ["preview", "apply"]},
+    "repositories": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "pull_requests": {
+      "description": "Grouped by the poll's action, with unobserved for listed PRs not decided this pass.",
+      "type": "object",
+      "additionalProperties": {"type": "array", "items": {"$ref": "#/$defs/pull"}}
+    },
+    "merge_queue_events": {
+      "description": "Latest queue removal observed per PR, possibly already handled in a previous pass, paired with this pass's step.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository", "number", "event", "step"],
+        "properties": {
+          "repository": {"type": "string"},
+          "number": {"type": "integer", "minimum": 1},
+          "event": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "created_at", "reason"],
+            "properties": {
+              "id": {"type": ["string", "null"]},
+              "created_at": {"type": ["string", "null"], "format": "date-time"},
+              "reason": {"type": ["string", "null"]}
+            }
+          },
+          "step": {"$ref": "#/$defs/pull"}
+        }
+      }
+    },
+    "needs_human": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository", "number", "head", "kind", "reason"],
+        "properties": {
+          "repository": {"type": "string"},
+          "number": {"type": "integer", "minimum": 1},
+          "head": {"type": "string"},
+          "kind": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "undecided_repositories": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "errors": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "pull": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "number", "head", "action", "reason", "ran"],
+      "properties": {
+        "repository": {"type": "string"},
+        "number": {"type": "integer", "minimum": 1},
+        "head": {"type": "string"},
+        "action": {"type": "string"},
+        "reason": {"type": "string"},
+        "ran": {"type": "boolean"}
+      }
+    }
+  }
+}

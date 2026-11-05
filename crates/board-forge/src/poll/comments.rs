@@ -3718,6 +3718,7 @@ pub(super) mod tests {
                 deferring: None,
                 planned: 0,
                 folds: Vec::new(),
+                report_pulls: BTreeMap::new(),
             };
             let events = "repos/upstream/app/issues/7/events?per_page=100";
             fake.page(

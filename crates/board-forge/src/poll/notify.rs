@@ -1272,6 +1272,7 @@ mod tests {
                 deferring: None,
                 planned: 0,
                 folds: Vec::new(),
+                report_pulls: BTreeMap::new(),
             };
             let mut outcome = Outcome::default();
             let next = pass
