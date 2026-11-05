@@ -20,18 +20,33 @@ pub(super) struct Intake {
 type IntakeStep = (String, bool, Option<Wait>, Option<Stepped>);
 
 pub(super) fn ordinary_reviews(config: &Config, repo: &str) -> bool {
-    config
-        .policy
-        .review_dispatch_repositories
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(repo))
+    routed(&config.policy.review_dispatch_repositories, repo)
+}
+
+fn routed(repositories: &[String], repo: &str) -> bool {
+    repositories.iter().any(|r| r.eq_ignore_ascii_case(repo))
 }
 
 pub(super) fn review_workflow<'a>(config: &'a Config, repo: &str) -> Option<&'a str> {
-    if ordinary_reviews(config, repo) {
+    routed_review_workflow(
+        &config.policy.review_dispatch_repositories,
+        config.review_workflow.as_deref(),
+        repo,
+    )
+}
+
+/// The review workflow of `repo`'s pull requests: `dispatch.yml` where the
+/// pass's `pr.reviewDispatchRepositories` (`routed`) names it, else the
+/// global `reviewWorkflow`. Shared by the poll and the supervisor's health.
+pub(crate) fn routed_review_workflow<'a>(
+    routed_to: &[String],
+    global: Option<&'a str>,
+    repo: &str,
+) -> Option<&'a str> {
+    if routed(routed_to, repo) {
         Some(WORKFLOW)
     } else {
-        config.review_workflow.as_deref()
+        global
     }
 }
 

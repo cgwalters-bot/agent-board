@@ -29,6 +29,7 @@ pub mod pace;
 mod reviews;
 pub mod stale;
 
+pub(crate) use reviews::routed_review_workflow;
 use reviews::{ordinary_reviews, review_key, review_reserves, review_workflow};
 
 pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";

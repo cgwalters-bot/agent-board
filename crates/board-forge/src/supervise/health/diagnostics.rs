@@ -53,6 +53,7 @@ impl Collector<'_> {
 
     pub(super) fn lost_reviews(&self) -> Result<Vec<Value>> {
         let mut result = vec![];
+        let mut routes = None;
         for p in self.open_pulls()? {
             // The existing merge/review callers cover these authors. Drafts
             // and other contributors are not assumed to have opted in.
@@ -63,11 +64,6 @@ impl Collector<'_> {
                 continue;
             }
             ensure!(p["isDraft"] == false, "draft status unavailable");
-            let workflow = self
-                .s
-                .review_workflow
-                .as_deref()
-                .context("reviewWorkflow not configured")?;
             let head = p["headRefOid"]
                 .as_str()
                 .filter(|h| !h.is_empty())
@@ -76,6 +72,17 @@ impl Collector<'_> {
             let repo = p["baseRepository"]["nameWithOwner"]
                 .as_str()
                 .context("review repository")?;
+            // The poll's route for the repository; an unreadable pass config
+            // is unavailable, never a guess at the legacy workflow.
+            if routes.is_none() {
+                routes = Some(self.review_routes()?);
+            }
+            let workflow = crate::poll::routed_review_workflow(
+                routes.as_deref().unwrap_or_default(),
+                self.s.review_workflow.as_deref(),
+                repo,
+            )
+            .with_context(|| format!("no review workflow for {repo}"))?;
             let updated = millis(&p["updatedAt"]).context("review grace time")?;
             ensure!(updated <= self.now, "future PR update");
             // The head's own runs, and dispatches since the lookback, which
@@ -213,6 +220,10 @@ mod tests {
     use super::*;
     use crate::supervise::{Bounded, tests::settings};
 
+    /// A repository whose reviews the pass config routes to `dispatch.yml`.
+    const ROUTED: &str = "example/routed";
+    const ROUTED_ROOT: &str = "/repos/example/routed/";
+
     struct Recorded {
         data: Value,
         next_page: bool,
@@ -239,6 +250,35 @@ mod tests {
                 return Ok(json!({"workflow_runs":self.data["queue_runs"]}));
             }
             let history = |key: &str| self.data[key].as_array().cloned().unwrap_or_default();
+            // A repository whose runs, of every workflow, are recorded whole:
+            // listings filter them by workflow file as GitHub does.
+            if let Some(rest) = path.strip_prefix(ROUTED_ROOT) {
+                let runs = history("routed_runs");
+                if let Some((workflow, _)) = rest
+                    .strip_prefix("actions/workflows/")
+                    .and_then(|r| r.split_once("/runs?"))
+                {
+                    let file = format!(".github/workflows/{workflow}");
+                    return Ok(listed(
+                        runs.into_iter().filter(|r| r["path"] == file).collect(),
+                        path,
+                    ));
+                }
+                if let Some(id) = rest.strip_prefix("actions/runs/") {
+                    return runs
+                        .into_iter()
+                        .find(|r| r["id"].as_u64() == id.parse().ok())
+                        .context("unrecorded run");
+                }
+                if rest.starts_with("pulls/9/reviews?") {
+                    return Ok(self
+                        .data
+                        .get("routed_reviews")
+                        .cloned()
+                        .unwrap_or(json!([])));
+                }
+                bail!("unrecorded read {path}")
+            }
             let mut reviews = vec![self.data["review"].clone()];
             reviews.extend(history("review_history"));
             if path.contains("/workflows/review.yml/runs?") {
@@ -270,7 +310,7 @@ mod tests {
             bail!("unrecorded read {path}")
         }
 
-        fn graphql(&self, query: &str, _: Value) -> Result<Value> {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
             ensure!(query == OPEN_PULLS, "unrecorded query");
             let mut pulls = vec![self.data["pull"].clone()];
             pulls.extend(
@@ -279,6 +319,9 @@ mod tests {
                     .cloned()
                     .unwrap_or_default(),
             );
+            let name = |key: &str| variables[key].as_str().unwrap_or_default().to_owned();
+            let repo = format!("{}/{}", name("owner"), name("name"));
+            pulls.retain(|p| p["baseRepository"]["nameWithOwner"] == repo.as_str());
             Ok(
                 json!({"repository":{"pullRequests":{"nodes":pulls,"pageInfo":{"hasNextPage":self.next_page}}}}),
             )
@@ -660,6 +703,264 @@ mod tests {
         );
         api.data["reviews"] = json!([]);
         assert!(collector(&api, &s, now).lost_reviews().is_err());
+    }
+
+    /// Settings following a legacy and a routed repository, whose pass
+    /// config, written to `file`, routes the latter's reviews to dispatch.yml.
+    fn routed_settings(file: &std::path::Path) -> Settings {
+        let mut s = configured();
+        s.follow = vec!["example/project".into(), ROUTED.into()];
+        std::fs::write(
+            file,
+            json!({"operator": "owner", "bot": "worker", "dispatchRepo": "example/control",
+                "dispatchWorkflow": "dispatch.yml", "follow": s.follow,
+                "pr": {"reviewWorkflow": "review.yml", "reviewPools": ["a"],
+                    "reviewDispatchRepositories": [ROUTED]}})
+            .to_string(),
+        )
+        .unwrap();
+        s.agent.as_mut().unwrap().pass_config = Some(file.to_str().unwrap().to_owned());
+        s
+    }
+
+    /// The pull requests reported without a review, by URL.
+    fn lost_urls(api: &dyn Api, s: &Settings, now: i64) -> Vec<String> {
+        collector(api, s, now)
+            .lost_reviews()
+            .unwrap()
+            .iter()
+            .map(|r| r["html_url"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn recorded_review_routes_follow_the_pass_config_per_repository() {
+        let file = std::env::temp_dir().join(format!(
+            "supervise-review-routes-{}.json",
+            std::process::id()
+        ));
+        let s = routed_settings(&file);
+        let now = epoch() + HOUR_MS;
+        let mut api = Recorded::new();
+        api.data["review"]["conclusion"] = json!("success");
+        let legacy = api.data["pull"]["url"].as_str().unwrap().to_owned();
+        let routed = format!("https://github.com/{ROUTED}/pull/9");
+        let mut pull = api.data["pull"].clone();
+        pull["url"] = json!(routed);
+        pull["number"] = json!(9);
+        pull["headRefOid"] = json!("routed-head");
+        pull["baseRepository"]["nameWithOwner"] = json!(ROUTED);
+        api.data["other_pulls"] = json!([pull]);
+        let run = |id: u64, workflow: &str, event: &str, head: &str, title: &str| {
+            json!({"id": id, "path": format!(".github/workflows/{workflow}"), "event": event,
+                "head_sha": head, "head_branch": if event == "workflow_dispatch" {"main"} else {"routed"},
+                "display_title": title, "repository": {"full_name": ROUTED},
+                "created_at": "2026-11-03T00:05:00Z", "run_started_at": "2026-11-03T00:05:00Z",
+                "updated_at": "2026-11-03T00:30:00Z", "status": "completed", "conclusion": "success",
+                "html_url": format!("https://github.com/{ROUTED}/actions/runs/{id}")})
+        };
+        let review = run(
+            90,
+            "dispatch.yml",
+            "workflow_dispatch",
+            "main-sha",
+            "review example/routed#9 routed-head (a)",
+        );
+        let others = [
+            // The legacy workflow's run for the head, which the poll no
+            // longer counts there, and another kind's dispatch.
+            run(
+                91,
+                "review.yml",
+                "pull_request_target",
+                "routed-head",
+                "review",
+            ),
+            run(
+                92,
+                "dispatch.yml",
+                "workflow_dispatch",
+                "main-sha",
+                "implement example/routed#9 (a)",
+            ),
+        ];
+        let with = |review: &Value| {
+            let mut runs = vec![review.clone()];
+            runs.extend(others.iter().cloned());
+            json!(runs)
+        };
+        // Each repository's own route satisfies it; the routed repository's
+        // dispatches are read on dispatch.yml, the legacy one's on review.yml.
+        api.data["routed_runs"] = with(&review);
+        assert!(lost_urls(&api, &s, now).is_empty());
+        let reads = api.reads.borrow().clone();
+        assert!(reads.iter().any(|p| p.starts_with(&format!(
+            "{ROUTED_ROOT}actions/workflows/dispatch.yml/runs?event=workflow_dispatch&created="
+        ))));
+        assert!(
+            !reads
+                .iter()
+                .any(|p| p.starts_with(&format!("{ROUTED_ROOT}actions/workflows/review.yml")))
+        );
+        assert!(
+            !reads
+                .iter()
+                .any(|p| p.starts_with("/repos/example/project/actions/workflows/dispatch.yml"))
+        );
+        api.data["review"]["conclusion"] = json!("cancelled");
+        assert_eq!(lost_urls(&api, &s, now), [legacy.as_str()]);
+        api.data["review"]["conclusion"] = json!("success");
+        for (pointer, value, problem) in [
+            ("/status", json!("in_progress"), false),
+            ("/status", json!("queued"), false),
+            ("/conclusion", json!("cancelled"), true),
+            ("/conclusion", json!("failure"), true),
+            (
+                "/display_title",
+                json!("review example/routed#9 old-head (a)"),
+                true,
+            ),
+            (
+                "/display_title",
+                json!("review example/routed#8 routed-head (a)"),
+                true,
+            ),
+            ("/head_branch", json!("routed"), true),
+        ] {
+            let mut changed = review.clone();
+            *changed.pointer_mut(pointer).unwrap() = value.clone();
+            api.data["routed_runs"] = with(&changed);
+            let want = if problem {
+                vec![routed.clone()]
+            } else {
+                vec![]
+            };
+            assert_eq!(lost_urls(&api, &s, now), want, "{pointer} {value}");
+        }
+        // Only the legacy run and another kind's dispatch: not a review.
+        api.data["routed_runs"] = json!(others);
+        assert_eq!(lost_urls(&api, &s, now), [routed.as_str()]);
+        // A dispatch created before the lookback counts only through a
+        // current-head review citing it, and a cited legacy run does not.
+        let mut old = review.clone();
+        old["created_at"] = json!("2026-10-31T00:00:00Z");
+        old["run_started_at"] = json!("2026-10-31T00:00:00Z");
+        old["updated_at"] = json!("2026-10-31T00:30:00Z");
+        api.data["routed_runs"] = with(&old);
+        assert_eq!(lost_urls(&api, &s, now), [routed.as_str()]);
+        let cite = |id: u64, submitted: &str| {
+            json!([{"user": {"login": "github-actions[bot]", "type": "Bot", "id": 41898282},
+                "commit_id": "routed-head", "submitted_at": submitted,
+                "body": format!("<!-- gh-aw-agentic-workflow: review, id: {id}, run: https://github.com/{ROUTED}/actions/runs/{id} -->")}])
+        };
+        api.data["routed_reviews"] = cite(90, "2026-10-31T00:20:00Z");
+        assert!(lost_urls(&api, &s, now).is_empty());
+        assert!(
+            api.reads
+                .borrow()
+                .iter()
+                .any(|p| p == &format!("{ROUTED_ROOT}actions/runs/90"))
+        );
+        for (pointer, value) in [
+            ("/conclusion", json!("cancelled")),
+            ("/run_started_at", json!("2026-11-01T00:00:00Z")),
+            (
+                "/display_title",
+                json!("review example/routed#9 old-head (a)"),
+            ),
+        ] {
+            let mut changed = old.clone();
+            *changed.pointer_mut(pointer).unwrap() = value.clone();
+            api.data["routed_runs"] = with(&changed);
+            assert_eq!(lost_urls(&api, &s, now), [routed.as_str()], "{pointer}");
+        }
+        api.data["routed_runs"] = json!(others);
+        api.data["routed_reviews"] = cite(91, "2026-11-03T00:20:00Z");
+        assert_eq!(lost_urls(&api, &s, now), [routed.as_str()]);
+        // Without the routes the legacy run would hide the lost review: an
+        // unreadable pass config is unavailable, not the legacy route.
+        let mut unread = s.clone();
+        unread.agent.as_mut().unwrap().pass_config = Some("/nonexistent/pass.json".into());
+        assert!(collector(&api, &unread, now).lost_reviews().is_err());
+        // A full routed dispatch listing is truncated, not healthy.
+        let mut many = vec![review.clone()];
+        many.extend(
+            (0..s.limits.max_pages as u64 * s.limits.page_size).map(|n| {
+                let mut r = others[1].clone();
+                r["id"] = json!(1000 + n);
+                r
+            }),
+        );
+        api.data["routed_runs"] = json!(many);
+        assert!(collector(&api, &s, now).lost_reviews().is_err());
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn recorded_reruns_of_every_failed_conclusion_within_the_horizon() {
+        let mut api = Recorded::new();
+        let s = configured();
+        let now = epoch() + HOUR_MS;
+        // Reruns completing now of runs created days ago, outside the
+        // lookback; one more inside it, listed by both reads.
+        let template = api.data["dispatch"].clone();
+        let run = |id: u64, conclusion: &str, created: &str| {
+            let mut run = template.clone();
+            run["id"] = json!(id);
+            run["conclusion"] = json!(conclusion);
+            run["created_at"] = json!(created);
+            run["html_url"] = json!(format!(
+                "https://github.com/example/control/actions/runs/{id}"
+            ));
+            run
+        };
+        let old = "2026-10-30T00:00:00Z";
+        let mut runs = vec![
+            run(20, "timed_out", old),
+            run(21, "startup_failure", old),
+            run(22, "failure", "2026-11-02T23:00:00Z"),
+        ];
+        api.data["dispatches"] = json!(runs);
+        let count = |api: &Recorded| {
+            let got = collector(api, &s, now).apply_failures().unwrap();
+            got.first().map_or(0, |g| g["count"].as_u64().unwrap())
+        };
+        assert_eq!(count(&api), 3);
+        let reads = api.reads.borrow().clone();
+        for conclusion in FAILED {
+            assert!(
+                reads
+                    .iter()
+                    .any(|p| p.contains(&format!("/runs?status={conclusion}&created="))),
+                "{conclusion}"
+            );
+        }
+        // One job read and log per run attempt, however often it is listed.
+        assert_eq!(reads.iter().filter(|p| p.ends_with("/logs")).count(), 3);
+        // The seven-day creation horizon is not widened, and other
+        // conclusions are not failures.
+        for (id, conclusion, created) in [
+            (20, "timed_out", "2026-10-27T00:59:59Z"),
+            (21, "startup_failure", "2026-10-20T00:00:00Z"),
+            (20, "cancelled", old),
+            (21, "success", old),
+        ] {
+            let mut changed = runs.clone();
+            changed[id as usize - 20] = run(id, conclusion, created);
+            api.data["dispatches"] = json!(changed);
+            assert_eq!(count(&api), 2, "{conclusion} {created}");
+        }
+        // A healthy apply job is no failure; a truncated rerun listing is
+        // unavailable, not healthy.
+        api.data["dispatches"] = json!(runs);
+        api.data["jobs"]["jobs"][1]["conclusion"] = json!("success");
+        assert_eq!(count(&api), 0);
+        runs.extend(
+            (0..s.limits.max_pages as u64 * s.limits.page_size)
+                .map(|n| run(100 + n, "timed_out", old)),
+        );
+        api.data["dispatches"] = json!(runs);
+        assert!(collector(&api, &s, now).apply_failures().is_err());
     }
 
     #[test]

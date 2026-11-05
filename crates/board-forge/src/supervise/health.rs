@@ -1606,15 +1606,31 @@ impl Collector<'_> {
         Ok(false)
     }
 
-    /// The pass config's `pr.noMerge`, from the file `agent.passConfig`
-    /// names; none without one.
-    fn no_merge(&self) -> Result<Vec<String>> {
+    /// The pass config `agent.passConfig` names, if any.
+    fn pass_config(&self) -> Result<Option<crate::pass::Config>> {
         let Some(path) = self.s.agent.as_ref().and_then(|a| a.pass_config.as_deref()) else {
-            return Ok(vec![]);
+            return Ok(None);
         };
         let text = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
         let config = crate::pass::Config::parse(&text).with_context(|| path.to_owned())?;
-        Ok(config.pr.no_merge)
+        Ok(Some(config))
+    }
+
+    /// The pass config's `pr.noMerge`; none without one.
+    fn no_merge(&self) -> Result<Vec<String>> {
+        Ok(self
+            .pass_config()?
+            .map(|c| c.pr.no_merge)
+            .unwrap_or_default())
+    }
+
+    /// The pass config's `pr.reviewDispatchRepositories`, whose reviews the
+    /// poll starts on `dispatch.yml`; none without one.
+    fn review_routes(&self) -> Result<Vec<String>> {
+        Ok(self
+            .pass_config()?
+            .map(|c| c.pr.review_dispatch_repositories)
+            .unwrap_or_default())
     }
 
     fn held(&self) -> Result<Vec<Value>> {
