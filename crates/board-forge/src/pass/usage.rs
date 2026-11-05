@@ -871,6 +871,22 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let previous = previous.filter(|_| own);
             snapshot.needs_you = Some(self.needs_you(&mut snapshot, previous, &on));
         }
+        if !self.config.follow.is_empty() {
+            let repositories = self
+                .config
+                .follow
+                .iter()
+                .chain(self.config.work_repositories.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            snapshot.dispatchable_work = Some(super::work::snapshot(
+                &repositories,
+                self.followed.as_ref(),
+                &self.stepped,
+                &self.report.accepted_plans.borrow(),
+                &snapshot.holds,
+            ));
+        }
         snapshot
     }
 }

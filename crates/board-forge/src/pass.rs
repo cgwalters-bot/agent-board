@@ -823,6 +823,8 @@ pub struct Pr {
 pub struct MergeQueue {
     #[serde(default = "queue_tries")]
     pub tries: u64,
+    #[serde(default, rename = "fixedFlakes")]
+    pub fixed_flakes: Vec<poll::FlakeFix>,
 }
 
 fn queue_tries() -> u64 {
@@ -1238,6 +1240,7 @@ impl Config {
             "pr rebaseRounds is not 0 to {REBASE_ROUNDS_LIMIT}"
         );
         if let Some(queue) = &self.pr.merge_queue {
+            poll::check_flake_fixes(&queue.fixed_flakes)?;
             ensure!(
                 (1..=QUEUE_TRIES_LIMIT).contains(&queue.tries),
                 "pr mergeQueue tries is not 1 to {QUEUE_TRIES_LIMIT}"
@@ -1336,6 +1339,12 @@ impl Config {
             toil_fix_pool: self.pr.toil_fix_pool.clone().unwrap_or_default(),
             conflict_fix_pool: self.pr.conflict_fix_pool.clone().unwrap_or_default(),
             merge_queue: self.pr.merge_queue.as_ref().map(|q| q.tries),
+            fixed_flakes: self
+                .pr
+                .merge_queue
+                .as_ref()
+                .map(|q| q.fixed_flakes.clone())
+                .unwrap_or_default(),
             rebase_rounds: self.pr.rebase_rounds,
             pace: self.usage.as_ref().map(|usage| poll::pace::Pace {
                 repository: usage.repository.clone(),
@@ -2408,6 +2417,8 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    /// Accepted, scoped plans observed by stage 4; not a census of unread work.
+    pub accepted_plans: RefCell<BTreeMap<String, String>>,
     /// Suppressed candidates, by rule; absent from the summary when disabled.
     pub triage_skipped: RefCell<BTreeMap<String, u64>>,
     /// Confirmed effects only, independently of the step caps.
@@ -4367,6 +4378,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(Step::Hold(Hold::new(held.kind, why)));
             }
         }
+        self.report
+            .accepted_plans
+            .borrow_mut()
+            .insert(issue.display(), plan.kind.clone());
         if let Some(run) = failed {
             return self.rerun(
                 (issue, &dest),
@@ -6111,6 +6126,7 @@ mod blockers;
 mod cost;
 pub(crate) mod epics;
 pub mod holds;
+
 pub mod lease;
 pub mod maintain;
 pub mod needs;
@@ -6121,6 +6137,7 @@ pub mod starts;
 mod status;
 pub mod sweep;
 mod usage;
+mod work;
 
 pub mod forgejo;
 
