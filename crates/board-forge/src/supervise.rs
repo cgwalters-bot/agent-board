@@ -315,6 +315,9 @@ pub struct AgentSettings {
     /// `budget.harnessRepositories` a status update's spend split reads
     /// ([`crate::budget::split`]); absent, the update has no split.
     pub pass_config: Option<String>,
+    /// `releaseList`: the items whose `needs-human` hold `release_listed`
+    /// may take off, each with its reason ([`agent::judgment::Release`]).
+    pub release_list: Vec<agent::judgment::Release>,
 }
 
 /// The supervisor file's optional settings that switch something on, read
@@ -347,6 +350,7 @@ pub const AGENT_OPTIONS: &[&str] = &[
     "skipUnchangedFailures",
     "passConfig",
     "bugEpic",
+    "releaseList",
 ];
 /// The agent object's other keys, without which it stays off or is refused.
 const AGENT_REQUIRED: &[&str] = &["pool", "cooldownHours", "requests", "log"];
@@ -720,6 +724,7 @@ fn agent_settings(value: Option<&Value>) -> Result<Option<AgentSettings>> {
                     .context("supervisor agent.passConfig: a file path")
             })
             .transpose()?,
+        release_list: agent::judgment::release_list(get("releaseList")?)?,
     }))
 }
 
@@ -1221,6 +1226,7 @@ pub(crate) mod tests {
                 "project",
                 "passConfig",
                 "bugEpic",
+                "releaseList",
             ]
             .map(|k| format!("agent.{k}")),
         );

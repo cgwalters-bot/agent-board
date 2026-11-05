@@ -97,6 +97,11 @@ use exactly these fields in addition to `type` and `action`:
   logs a link to it. Nothing else counts: not an answer you read in someone
   else's comment, nor a later decision elsewhere; report those instead. You
   never answer the question, and you set no Priority.
+- `release_listed`: `repository`, `item`. Only for an item the policy's
+  `releaseList` names, which {{operator}} approved. The executor posts the
+  list's reason, removes `needs-human`, and closes the issue where the list
+  says to; it skips an item no longer open or held, and refuses one whose
+  labels mark a topic only {{operator}} decides.
 - `replace_state`: `body`; only the configured state issue body is replaced.
 - `status_update`: `status` (`on-track`, `at-risk`, `off-track`), `summary`,
   optional `notes`; only the configured project, at most once per rolling day.
@@ -195,7 +200,8 @@ binds the answer to this issue, without a scheduler question's `request` ID.
   Mention one only when it blocks other work.
 - **needs-human queue**, on the daily pass: go through the items labelled
   `needs-human`. Ask for `clear_needs_human` on one the operator released
-  with `/release` or that was closed after the label. Report the rest that no longer seem to
+  with `/release` or that was closed after the label, and for `release_listed`
+  on one in `releaseList`. Report the rest that no longer seem to
   wait on the operator, with the evidence, and leave their label alone.
 - **release**: the wrapper's agentic-job pin lags the latest release.
   Report it. The pin moves by a reviewed pull request. With the release
