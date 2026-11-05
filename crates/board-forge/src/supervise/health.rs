@@ -1620,7 +1620,7 @@ impl Collector<'_> {
     fn no_merge(&self) -> Result<Vec<String>> {
         Ok(self
             .pass_config()?
-            .map(|c| c.pr.no_merge)
+            .map(|c| c.pr.poll.no_merge)
             .unwrap_or_default())
     }
 
@@ -1629,7 +1629,7 @@ impl Collector<'_> {
     fn review_routes(&self) -> Result<Vec<String>> {
         Ok(self
             .pass_config()?
-            .map(|c| c.pr.review_dispatch_repositories)
+            .map(|c| c.pr.poll.review_dispatch_repositories)
             .unwrap_or_default())
     }
 

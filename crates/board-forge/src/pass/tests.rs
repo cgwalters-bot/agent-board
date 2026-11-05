@@ -10472,6 +10472,100 @@ fn promote(edit: Value) -> Value {
     json!({ "promote": section })
 }
 
+/// One `pr` block gives the same policy read by the pass or, at the top
+/// level of agent-board.json, by a standalone poll, and both refuse the same.
+#[test]
+fn pr_block_is_one_policy_for_pass_and_poll() {
+    let mut fixture: Value = serde_json::from_str(CONFIG).unwrap();
+    let follow = fixture["workRepositories"].clone();
+    fixture["follow"] = follow.clone();
+    // Which pacing by usage needs, for the pass with followed repositories.
+    let fix_pools = json!(["claude"]);
+    let pass = |pr: &Value| {
+        let mut value = fixture.clone();
+        value["pr"] = pr.clone();
+        value["pr"]["fixPools"] = fix_pools.clone();
+        Config::parse(&value.to_string()).map(|c| c.poll(None).policy)
+    };
+    let poll = |pr: &Value| {
+        let mut value = pr.clone();
+        value["follow"] = follow.clone();
+        value["fixPools"] = fix_pools.clone();
+        PollPolicy::from_json(&value)
+    };
+    let shared = |p: &PollPolicy| {
+        json!([
+            p.merge_authors,
+            p.toil_fix_pool,
+            p.conflict_fix_pool,
+            p.merge_queue,
+            p.rebase_rounds,
+            p.check_reruns,
+            p.unstall,
+            p.owner_branches,
+            p.own_space_only,
+            p.fold_rounds,
+            p.review_pools,
+            p.review_dispatch_repositories,
+            p.draft_review_repositories,
+            p.head_owners,
+            p.no_merge,
+            p.operator_paths,
+            p.stale_days,
+        ])
+    };
+    let repo = "cgwalters-forge/bootc";
+    let every = json!({
+        "checkReruns": true, "unstall": true, "ownerBranches": true,
+        "ownSpaceOnly": true, "foldRounds": true, "reviewWorkflow": "review.yml",
+        "reviewPools": ["claude"], "reviewDispatchRepositories": [repo],
+        "draftReviewRepositories": [repo], "headOwners": ["cgwalters-forge"],
+        "noMerge": [repo], "operatorPaths": [".github/pass.json", ".github/agentic-job/"],
+        "staleDays": 7, "mergeAuthors": ["updater[bot]"], "toilFixPool": "openai",
+        "conflictFixPool": "claude", "mergeQueue": {"tries": 2}, "rebaseRounds": 1,
+    });
+    let unset = shared(&PollPolicy::default());
+    for (pr, ok) in [
+        (json!({}), true),
+        (every.clone(), true),
+        (json!({"mergeQueue": {}, "staleDays": 0}), true),
+        (json!({"unstall": "true"}), false),
+        (json!({"noMerge": [null]}), false),
+        (json!({"noMerge": ["o/*"]}), false),
+        (json!({"headOwners": ["not a login"]}), false),
+        (json!({"operatorPaths": ["a/../b"]}), false),
+        (json!({"staleDays": 31}), false),
+        (json!({"reviewPools": ["claude"]}), false),
+        (
+            json!({"reviewWorkflow": "review.yml", "reviewPools": ["claude"],
+            "reviewDispatchRepositories": ["o/unfollowed"]}),
+            false,
+        ),
+        (
+            json!({"reviewWorkflow": "review.yml", "reviewPools": ["claude"],
+            "reviewDispatchRepositories": [repo], "draftReviewRepositories": [repo]}),
+            false,
+        ),
+    ] {
+        match (pass(&pr), poll(&pr)) {
+            (Ok(pass), Ok(poll)) if ok => assert_eq!(shared(&pass), shared(&poll), "{pr}"),
+            (Err(_), Err(_)) if !ok => {}
+            (pass, poll) => panic!("{pr}: pass {:?}, poll {:?}", pass.err(), poll.err()),
+        }
+    }
+    let policy = poll(&every).unwrap();
+    let set = shared(&policy);
+    let unchanged: Vec<_> = (0..unset.as_array().unwrap().len())
+        .filter(|&n| set[n] == unset[n])
+        .collect();
+    assert!(
+        unchanged.is_empty(),
+        "the full block leaves {unchanged:?} unset"
+    );
+    // A key that is neither the pass's nor the poll's is still refused.
+    assert!(poll(&json!({"stalledDays": 3})).is_err());
+}
+
 #[test]
 fn v1_representative_config() {
     // Synthetic deployment shape: public placeholders, no live endpoint or credentials.
@@ -10485,7 +10579,7 @@ fn v1_representative_config() {
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_draft_hours, 4);
     assert_eq!(cfg.overlap.as_ref().unwrap().stale_hours, 24);
     assert_eq!(cfg.pr.merge_queue.as_ref().unwrap().tries, 3);
-    assert!(!cfg.pr.check_reruns && !cfg.poll(None).policy.check_reruns);
+    assert!(!cfg.pr.poll.check_reruns && !cfg.poll(None).policy.check_reruns);
     assert!(cfg.reruns && cfg.poll(None).policy.reruns);
     assert!(cfg.grant().is_some());
     assert!(!cfg.leases && !cfg.triage_close && !cfg.body_plans);
@@ -10513,8 +10607,8 @@ fn config_table() {
     let minimal = json!({"operator": "op", "bot": "bot", "dispatchRepo": "o/caller", "dispatchWorkflow": "dispatch.yml"});
     let parsed = Config::parse(&minimal.to_string()).unwrap();
     assert!(!parsed.work() && parsed.triage.is_none() && parsed.follow.is_empty());
-    assert!(parsed.pr.no_merge.is_empty());
-    assert!(!parsed.pr.check_reruns && !parsed.poll(None).policy.check_reruns);
+    assert!(parsed.pr.poll.no_merge.is_empty());
+    assert!(!parsed.pr.poll.check_reruns && !parsed.poll(None).policy.check_reruns);
     for (owner_branches, want) in [(json!(false), false), (json!(true), true)] {
         let mut settings = minimal.clone();
         settings["pr"] = json!({"ownerBranches": owner_branches});
@@ -10546,13 +10640,17 @@ fn config_table() {
         let parsed = Config::parse(&settings.to_string()).unwrap();
         let policy = parsed.poll(None).policy;
         assert_eq!(
-            (parsed.pr.check_reruns, policy.check_reruns, policy.reruns),
+            (
+                parsed.pr.poll.check_reruns,
+                policy.check_reruns,
+                policy.reruns
+            ),
             (checks, checks, reruns)
         );
     }
     // `pr.unstall` is off by default and, set, needs every work repository
     // followed (#666).
-    assert!(!parsed.pr.unstall && !parsed.poll(None).policy.unstall);
+    assert!(!parsed.pr.poll.unstall && !parsed.poll(None).policy.unstall);
     for (follow, work, unfollowed) in [
         (json!([]), json!([]), None),
         (
@@ -10573,7 +10671,7 @@ fn config_table() {
         settings["pr"] = json!({"unstall": true});
         match (Config::parse(&settings.to_string()), unfollowed) {
             (Ok(parsed), None) => {
-                assert!(parsed.pr.unstall && parsed.poll(None).policy.unstall);
+                assert!(parsed.pr.poll.unstall && parsed.poll(None).policy.unstall);
             }
             (Err(error), Some(repo)) => assert_eq!(
                 format!("{error:#}"),
@@ -10595,7 +10693,7 @@ fn config_table() {
         let mut settings = minimal.clone();
         settings["pr"] = json!({"noMerge": repositories});
         let parsed = Config::parse(&settings.to_string()).unwrap();
-        assert_eq!(json!(parsed.pr.no_merge), repositories);
+        assert_eq!(json!(parsed.pr.poll.no_merge), repositories);
         assert_eq!(json!(parsed.poll(None).policy.no_merge), repositories);
     }
     for repositories in [
