@@ -187,6 +187,9 @@ pub fn run(
     for line in &outcome.lines {
         writeln!(out, "{prefix}{line}")?;
     }
+    if let Some(body) = &outcome.maintainer_report {
+        write!(out, "{body}")?;
+    }
     eprintln!(
         "{} pull request(s) in flight, {} activity line(s)",
         outcome.in_flight, outcome.activity

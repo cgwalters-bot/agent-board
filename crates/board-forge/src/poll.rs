@@ -28,6 +28,7 @@ pub mod drafts;
 pub mod lock;
 pub mod notify;
 pub mod pace;
+pub mod report;
 mod reviews;
 pub mod stale;
 
@@ -469,6 +470,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     "reviewWorkflow",
     "dispatchWorkflow",
     "generatedBy",
+    "maintainerReport",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -532,6 +534,8 @@ pub fn option<'a>(value: &'a Value, key: &str) -> Result<Option<&'a Value>> {
 /// Pool selection affects cost only, never fix authority or round limits.
 #[derive(Clone, Debug, Default)]
 pub struct PollPolicy {
+    /// Optional issue for the edited maintainer report; absent publishes nothing.
+    pub maintainer_report: Option<report::Destination>,
     pub merge_authors: Vec<String>,
     /// The pass's `pr.headOwners`: the owners of the head repositories the bot may push
     /// to, besides its own fork, where a pull request it opened is its own
@@ -902,6 +906,7 @@ impl PollPolicy {
             }
         };
         Ok(Self {
+            maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
             continuation,
             merge_authors: serde_json::from_value(
@@ -3643,6 +3648,8 @@ fn describe(repo: &str, event: &Value, config: &Config) -> Option<String> {
 /// The result of one pass.
 #[derive(Default)]
 pub struct Outcome {
+    /// Fenced maintainer report, printed verbatim by the CLI in a dry run.
+    pub maintainer_report: Option<String>,
     pub lines: Vec<String>,
     pub errors: usize,
     pub activity: usize,
@@ -3934,6 +3941,7 @@ struct Pass<'a, R, G> {
     /// The node ids, with their repository, of the markers this pass
     /// superseded, to fold at its end ([`PollPolicy::fold_rounds`]).
     folds: Vec<(String, String)>,
+    report_pulls: BTreeMap<(String, u64), report::Pull>,
 }
 
 /// A review start or rerun, deferred so that they go in Priority order.
@@ -7086,6 +7094,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             moved_at: moved_at(&pull),
             waiting: decision.waiting,
         });
+        if self.config.policy.maintainer_report.is_some() {
+            self.report_pulls.insert(
+                (repo.to_owned(), number),
+                report::Pull::observed(repo, number, &pull, &decision, ran),
+            );
+        }
         if deferred {
             // A pull request inherits the best rank of the board issues it
             // closes; one that closes none on the board goes last.
@@ -7135,6 +7149,24 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             &format!("repos/{repo}/pulls?state=open&per_page=100"),
             false,
         )?;
+        if self.config.policy.maintainer_report.is_some() {
+            for p in &open {
+                if let Some(number) = p["number"].as_u64() {
+                    self.report_pulls.insert(
+                        (repo.to_owned(), number),
+                        report::Pull {
+                            repository: repo.to_owned(),
+                            number,
+                            head: text(p, "/head/sha").to_owned(),
+                            action: "unobserved".into(),
+                            reason: "pull request not decided this pass".into(),
+                            ran: false,
+                            queue_event: None,
+                        },
+                    );
+                }
+            }
+        }
         let mut numbers: Vec<(u64, bool)> = open
             .iter()
             .filter(|p| {
@@ -7153,6 +7185,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 }
                 let followed = managed || extra;
                 if !followed && let Some(number) = p["number"].as_u64() {
+                    if let Some(p) = self.report_pulls.get_mut(&(repo.to_owned(), number)) {
+                        p.action = "skip".into();
+                        p.reason = "pull request author is not followed".into();
+                    }
                     outcome.lines.push(format!(
                         "{repo}#{number} skip: pull request author is not followed"
                     ));
@@ -7199,6 +7235,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             };
             match read {
                 Ok((line, flying, wait, stepped)) => {
+                    if let Some(p) = self.report_pulls.get_mut(&(repo.to_owned(), number))
+                        && let Some(listed) = left.get(&number)
+                    {
+                        p.action = "skip".into();
+                        p.reason = format!("labelled {label}");
+                        p.head = text(listed, "/headRefOid").to_owned();
+                    }
                     if let Some(mut review) = self.deferring.take() {
                         let step = stepped.as_ref().map(|_| outcome.steps.len());
                         review.at = (outcome.lines.len(), step);
@@ -7276,6 +7319,10 @@ pub fn run_capped<R: Rest, G: Transport>(
         ensure!(is_github_login(login), "invalid login {login:?}");
     }
     validate_repository(&config.dispatch_repo)?;
+    if let Some(at) = &policy.maintainer_report {
+        validate_repository(&at.repository)?;
+        ensure!(at.issue > 0, "maintainerReport.issue must be positive");
+    }
     if let Some(workflow) = &config.review_workflow {
         validate_workflow(workflow)?;
     }
@@ -7335,6 +7382,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         deferring: None,
         planned: 0,
         folds: Vec::new(),
+        report_pulls: BTreeMap::new(),
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -7483,6 +7531,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     };
     // Cosmetic cleanup comes last, after locking has spent its budget too.
     pass.fold(&mut outcome.lines);
+    pass.maintainer_report(&follow, &mut outcome);
     // What could not be read counts as a change: an API error must not stretch
     // the gap while a pull request may be waiting on it.
     let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
@@ -7516,6 +7565,7 @@ mod tests {
 
     include!("poll/reviews_tests.rs");
     include!("poll/drafts_tests.rs");
+    include!("poll/report_tests.rs");
 
     /// A marker as a pass with the default attribution posts it.
     pub(super) fn marker_body(state: &Value, text: &str) -> String {
@@ -18151,6 +18201,7 @@ mod tests {
             deferring: None,
             planned: 0,
             folds: Vec::new(),
+            report_pulls: BTreeMap::new(),
         };
         let mut outcome = Outcome::default();
         let error = pass.follow(REPO, &mut outcome).unwrap_err();

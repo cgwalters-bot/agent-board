@@ -1,0 +1,28 @@
+{
+  "schema": "agent-board/maintainer-report/v1",
+  "generated_at": "2026-10-12T02:00:00Z",
+  "mode": "preview",
+  "repositories": ["cgwalters-forge/agentic-job"],
+  "pull_requests": {
+    "merge": [{
+      "repository": "cgwalters-forge/agentic-job",
+      "number": 470,
+      "head": "488f45ebacd03a8bc88dceb3d703a5322850ce77",
+      "action": "merge",
+      "reason": "review approved and checks green",
+      "ran": true
+    }],
+    "skip": [{
+      "repository": "cgwalters-forge/agentic-job",
+      "number": 5,
+      "head": "",
+      "action": "skip",
+      "reason": "pull request author is not followed",
+      "ran": false
+    }]
+  },
+  "merge_queue_events": [],
+  "needs_human": [],
+  "undecided_repositories": [],
+  "errors": 0
+}
