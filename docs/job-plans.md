@@ -281,6 +281,12 @@ an [epic plan](epic-plans.md)) is dispatched only with `--bot`, and then:
 - with #N closed, it runs on the default branch like any plan, and the record
   says it was not stacked.
 
+The pass also waits while #N has a run in flight, of any kind, including when
+a previous `Part of #N` slice merged but the next run has no pull request yet.
+It uses the same bounded active-run and lease reads that hold an issue's own
+run; once that hold ends it resolves the stack again. This run-in-flight hold
+is enforced by the pass, not the standalone `dispatch` command.
+
 A read that fails refuses the dispatch rather than running it unstacked. The
 base is never the plan's to name: only the bot's own `dispatch/` branch can
 become the code a run starts from, so a visitor's pull request that claims to

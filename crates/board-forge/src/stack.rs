@@ -44,7 +44,7 @@ const CLOSING: &[&str] = &[
 /// GitHub's web root, under which its issue URLs lie.
 const GITHUB_WEB: &str = "https://github.com/";
 
-const LOWER_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $pulls: Int!) {
+pub(crate) const LOWER_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $pulls: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) { state }
     pullRequests(states: OPEN, first: $pulls, orderBy: {field: CREATED_AT, direction: DESC}) {

@@ -1922,6 +1922,21 @@ fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) ->
         .map(|run| Hold::new(HoldKind::InFlight, format!("a run is in flight, {run}")))
 }
 
+/// A merged Part of slice must not unstack past the next slice's run,
+/// which may not have opened its pull request yet.
+fn stack_hold(dest: &ItemRef, lower: Option<u64>, busy: &BTreeMap<String, String>) -> Option<Hold> {
+    let lower = ItemRef {
+        number: lower?,
+        ..dest.clone()
+    };
+    let run = busy.get(&key(&lower))?;
+    let why = format!(
+        "it stacks on {}, which has a run in flight, {run}",
+        lower.display()
+    );
+    Some(Hold::new(HoldKind::WaitingOn, why))
+}
+
 /// What stage 4 makes of an open board issue before it ranks it, on any forge.
 enum Screen<'a> {
     /// Not work: closed, outside the work repositories, one of `control`, or
@@ -4113,7 +4128,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         slots: &Slots,
         (issue, dest): (&ItemRef, &ItemRef),
         target: &Target,
-        rule: HoldRule,
+        rule: impl Fn(&Facts, &BTreeMap<String, String>, &[&str]) -> Option<Hold>,
     ) -> Result<Option<Step>> {
         // From here on its reads are the start's, and may spend the reserve.
         self.client.bounds.starting.set(true);
@@ -4447,6 +4462,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // recheck and the plan protocol's reads, nor stopped by the budget
         // a start needs. The overlap's reads are kept until the next write;
         // the dispatch decides both again on what it reads then.
+        let lower = plan.stacks_on;
+        if let Some(held) = stack_hold(&dest, lower, busy) {
+            return Ok(Step::Hold(held));
+        }
         let bot = Some(config.bot.as_str());
         let (plan, base, _) = match plan::stack(&self.client, &dest, plan, bot)? {
             Ok(stacked) => stacked,
@@ -4477,7 +4496,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // What the dispatch's own check waives is what the pass reports.
         self.ignored.borrow_mut().clear();
-        if let Some(step) = self.recheck(slots, (issue, &dest), target, hold)? {
+        let rule = |facts: &Facts, busy: &BTreeMap<String, String>, writers: &[&str]| {
+            hold(facts, busy, writers).or_else(|| stack_hold(&dest, lower, busy))
+        };
+        if let Some(step) = self.recheck(slots, (issue, &dest), target, rule)? {
             return Ok(step);
         }
         // A body plan is dispatched as the copy just posted, and only while

@@ -2104,6 +2104,8 @@ struct Forge {
     login: &'static str,
     late: Option<Late>,
     racing: Option<Late>,
+    /// Edits REST reads, including before any dispatch has been made.
+    on_get: Option<Late>,
     /// Other runs of the pass's own workflow in progress ([`own`]).
     passes: Vec<Value>,
     /// A confirmed response to workflow dispatch, instead of a successful start.
@@ -2154,6 +2156,7 @@ impl Forge {
             login: "cgwalters-bot",
             late: None,
             racing: None,
+            on_get: None,
             passes: vec![],
             dispatch_status: None,
             refuse: RefCell::new(None),
@@ -2329,6 +2332,9 @@ impl Rest for Forge {
             return Ok(listed(body));
         }
         let mut response = self.replay.get(url, validator)?;
+        if let Some(edit) = &self.on_get {
+            edit(url, &mut response.body);
+        }
         self.late(url, &mut response.body);
         let posted = |(method, to, _): &(String, String, Value)| {
             method == "POST" && to.ends_with("/comments") && url.starts_with(&format!("{to}?"))
@@ -9649,6 +9655,108 @@ fn job_plan_effort(
         "createdAt": "2026-10-23T00:00:00Z", "lastEditedAt": null,
         "author": {"login": author}, "editor": null,
     }));
+}
+
+#[test]
+fn stacked_plan_waits_for_the_lower_issues_next_run() {
+    for (kind, status, repo, stacked, ended, waits) in [
+        ("implement", "queued", "tracker", true, false, true),
+        ("implement", "in_progress", "tracker", true, false, true),
+        ("triage", "queued", "tracker", true, false, true),
+        ("implement", "completed", "tracker", true, false, false),
+        ("implement", "in_progress", "tracker", true, true, false),
+        ("implement", "queued", "agent-board", true, false, false),
+        ("implement", "queued", "tracker", false, false, false),
+        ("implement", "late", "tracker", true, false, false),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let replay = &mut forge.replay;
+        only(replay, &["cgwalters-forge/tracker#446"]);
+        implement_plan(replay);
+        if stacked {
+            let comments = &mut answer(replay, r#""name":"tracker","number":446"#)["data"]["repository"]
+                ["issue"]["comments"]["nodes"];
+            let plan = comments.as_array_mut().unwrap().last_mut().unwrap();
+            plan["body"] = text(plan, "/body")
+                .replace("\"item\":446", "\"item\":446,\"stacks_on\":445")
+                .into();
+        }
+        let lower_run = json!({"id": STUCK_RUN, "status": status,
+            "display_title": format!("{kind} cgwalters-forge/{repo}#445 (claude)"),
+            "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/7",
+            "run_started_at": "2026-10-23T13:00:00Z"});
+        for listed in ["queued", "in_progress"] {
+            let body = &mut answer(replay, &format!("status={listed}"))["body"];
+            let runs = if status == listed {
+                vec![lower_run.clone()]
+            } else {
+                vec![]
+            };
+            body["total_count"] = runs.len().into();
+            body["workflow_runs"] = runs.into();
+        }
+        if status == "in_progress" {
+            if ended {
+                jobs(replay, &[("completed", Some(LONG_DONE))]);
+            } else {
+                jobs(replay, &[("in_progress", None)]);
+            }
+        }
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker",
+            "number": 445, "pulls": crate::stack::STACK_PULL_READS});
+        replay.requests.push(json!({
+            "request": graphql_key(crate::stack::LOWER_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": {"state": "OPEN"},
+                "pullRequests": {"nodes": []}, "defaultBranchRef": {"name": "main"},
+                "merged": {"nodes": [{"number": 700, "author": {"login": "cgwalters-bot"},
+                    "headRefName": "dispatch/445", "baseRefName": "main", "body": "Part of #445"}]}}}},
+        }));
+        let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 446});
+        replay.requests.push(json!({
+            "request": graphql_key(overlap::TEXT_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": {"title": "Design", "body": "No paths named."}}}},
+        }));
+        let config = config(json!({"wip": 8}));
+        let report = preview(&config, replay);
+        let held = "hold cgwalters-forge/tracker#446: it stacks on cgwalters-forge/tracker#445, which has a run in flight, https://github.com/cgwalters-forge/tracker/actions/runs/7";
+        let expected = if waits {
+            held
+        } else {
+            "start implement cgwalters-forge/tracker#446 plan="
+        };
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(expected)),
+            "{kind}/{status}/{repo}/stacked={stacked}/ended={ended}: {:#?}",
+            report.lines
+        );
+        if waits || status == "late" {
+            if waits {
+                assert!(report.effects.starts.is_empty());
+            }
+            if status == "late" {
+                // Idle at first, busy at the fresh pre-write run listing.
+                let queued = Cell::new(0);
+                forge.on_get = Some(Box::new(move |url, body| {
+                    if url.contains("status=queued") {
+                        queued.set(queued.get() + 1);
+                        if queued.get() > 1 {
+                            *body = json!({"total_count": 1, "workflow_runs": [lower_run]});
+                        }
+                    }
+                }));
+            }
+            let report = apply(&forge, &config);
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert!(
+                report.lines.iter().any(|l| l == held),
+                "{:#?}",
+                report.lines
+            );
+            assert!(forge.dispatches().is_empty());
+            assert!(forge.writes.borrow().is_empty());
+        }
+    }
 }
 
 /// An accepted, unrecorded triage plan, the operator's or the planner's,
