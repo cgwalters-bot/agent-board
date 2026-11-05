@@ -19,8 +19,8 @@ use crate::overlap::{self, Decision};
 use crate::plan::{self, JOB_PLAN_SCHEMA, PLAN_FENCE, Scheduled, TRIAGE_FENCE, Target};
 use crate::poll::{
     self, OPERATOR_APPROVAL_LABEL, POLL_REPOSITORY_LIMIT, PollPolicy, RERUN_CONCLUSION,
-    RERUN_WINDOW_SECONDS, Rest, RestResponse, State, next_link, stale::STALE_DAYS_LIMIT, text,
-    validate_repository, validate_workflow,
+    RERUN_WINDOW_SECONDS, Rest, RestResponse, State, next_link, text, validate_repository,
+    validate_workflow,
 };
 use crate::stack;
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
@@ -106,8 +106,6 @@ const DEFAULT_TARGET: f64 = 0.95;
 const BURST_LIMIT: f64 = 100.0;
 const REBASE_ROUNDS_LIMIT: u64 = 3;
 const QUEUE_TRIES_LIMIT: u64 = 5;
-/// The most `pr.operatorPaths` entries: a few bounds and pass files.
-const OPERATOR_PATHS_LIMIT: usize = 50;
 /// The most `budget.weeklyUsd` may be: a typo of a few zeros is no budget.
 const WEEKLY_USD_LIMIT: f64 = 100_000.0;
 /// How far past the weekly budget pull requests' fix rounds go on, so that
@@ -803,53 +801,21 @@ fn broker_url(url: &str) -> bool {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Pr {
-    /// Retry failed checks without enabling agent/review recovery or stack updates.
-    #[serde(default)]
-    pub check_reruns: bool,
-    /// [`PollPolicy::unstall`]; also requires every work repository to be
-    /// followed, so that every work repository's pull requests are seen.
-    #[serde(default)]
-    pub unstall: bool,
-    /// [`PollPolicy::owner_branches`].
-    #[serde(default)]
-    pub owner_branches: bool,
-    /// [`PollPolicy::own_space_only`].
-    #[serde(default)]
-    pub own_space_only: bool,
-    /// [`PollPolicy::fold_rounds`].
-    #[serde(default)]
-    pub fold_rounds: bool,
+    /// The keys a standalone poll's agent-board.json takes too. Its `unstall`
+    /// also requires every work repository to be followed, so that every work
+    /// repository's pull requests are seen.
+    #[serde(flatten)]
+    pub poll: poll::PrOptions,
     pub review_workflow: Option<String>,
-    /// Pools the pass starts the review job on itself ([`PollPolicy::review_pools`]);
-    /// empty leaves reviews to the job's `pull_request_target` runs.
-    #[serde(default)]
-    pub review_pools: Vec<String>,
-    /// Base repositories whose reviews use ordinary dispatch and separate intake.
-    #[serde(default)]
-    pub review_dispatch_repositories: Vec<String>,
-    /// Review-only bot drafts; never grants fix, ready or merge authority.
-    #[serde(default)]
-    pub draft_review_repositories: Vec<String>,
     #[serde(default)]
     pub fix_pools: Vec<String>,
     pub toil_fix_pool: Option<String>,
     pub conflict_fix_pool: Option<String>,
     #[serde(default)]
     pub merge_authors: Vec<String>,
-    /// [`PollPolicy::head_owners`].
-    #[serde(default)]
-    pub head_owners: Vec<String>,
-    /// Base repositories followed for rounds but never merged into.
-    #[serde(default)]
-    pub no_merge: Vec<String>,
-    /// [`PollPolicy::operator_paths`].
-    #[serde(default)]
-    pub operator_paths: Vec<String>,
     #[serde(default)]
     pub rebase_rounds: u64,
     pub merge_queue: Option<MergeQueue>,
-    #[serde(default)]
-    pub stale_days: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1251,49 +1217,12 @@ impl Config {
         if let Some(workflow) = &self.pr.review_workflow {
             validate_workflow(workflow)?;
         }
-        ensure!(
-            self.pr.review_dispatch_repositories.len() <= POLL_REPOSITORY_LIMIT,
-            "pr reviewDispatchRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
-        );
-        for repo in &self.pr.review_dispatch_repositories {
-            poll::validate_repository(repo)?;
-            ensure!(
-                self.follow.iter().any(|r| r.eq_ignore_ascii_case(repo)),
-                "pr reviewDispatchRepositories repository {repo} is not followed"
-            );
-        }
-        ensure!(
-            self.pr.review_dispatch_repositories.is_empty() || !self.pr.review_pools.is_empty(),
-            "pr reviewDispatchRepositories needs pr reviewPools"
-        );
-        ensure!(
-            self.pr.draft_review_repositories.len() <= POLL_REPOSITORY_LIMIT,
-            "pr draftReviewRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
-        );
-        for repo in &self.pr.draft_review_repositories {
-            poll::validate_repository(repo)?;
-            ensure!(
-                self.pr
-                    .review_dispatch_repositories
-                    .iter()
-                    .any(|r| r.eq_ignore_ascii_case(repo)),
-                "pr draftReviewRepositories repository {repo} needs reviewDispatchRepositories"
-            );
-            ensure!(
-                self.pr
-                    .no_merge
-                    .iter()
-                    .any(|r| r.eq_ignore_ascii_case(repo)),
-                "pr draftReviewRepositories repository {repo} needs noMerge"
-            );
-        }
-        ensure!(
-            self.pr.review_pools.is_empty() || self.pr.review_workflow.is_some(),
-            "pr reviewPools needs pr reviewWorkflow, the workflow it starts"
-        );
+        self.pr
+            .poll
+            .check("pr ", &self.follow, self.pr.review_workflow.is_some())?;
         // A work repository's pull requests, unfollowed, are never merged,
         // fixed or surfaced, and their failed reviews never seen (#666).
-        if self.pr.unstall {
+        if self.pr.poll.unstall {
             for repo in &self.work_repositories {
                 ensure!(
                     self.follow.iter().any(|r| r.eq_ignore_ascii_case(repo)),
@@ -1304,34 +1233,9 @@ impl Config {
         for author in &self.pr.merge_authors {
             ensure!(!author.is_empty(), "pr mergeAuthors names an empty login");
         }
-        for owner in &self.pr.head_owners {
-            ensure!(
-                crate::is_github_login(owner),
-                "pr headOwners names {owner:?}, not a login"
-            );
-        }
-        for repository in &self.pr.no_merge {
-            poll::validate_repository(repository).context("pr noMerge repository")?;
-        }
-        ensure!(
-            self.pr.operator_paths.len() <= OPERATOR_PATHS_LIMIT,
-            "pr operatorPaths has more than {OPERATOR_PATHS_LIMIT} entries"
-        );
-        // As the API names a changed file: relative, no globs, no dot segments.
-        for path in &self.pr.operator_paths {
-            let mut segments = path.strip_suffix('/').unwrap_or(path).split('/');
-            ensure!(
-                !path.contains('*') && segments.all(|s| !s.is_empty() && s != "." && s != ".."),
-                "pr operatorPaths entry {path:?} is not a relative path, or a directory ending in /"
-            );
-        }
         ensure!(
             self.pr.rebase_rounds <= REBASE_ROUNDS_LIMIT,
             "pr rebaseRounds is not 0 to {REBASE_ROUNDS_LIMIT}"
-        );
-        ensure!(
-            self.pr.stale_days <= STALE_DAYS_LIMIT,
-            "pr staleDays is not 0 to {STALE_DAYS_LIMIT}"
         );
         if let Some(queue) = &self.pr.merge_queue {
             ensure!(
@@ -1343,7 +1247,7 @@ impl Config {
             .pr
             .fix_pools
             .iter()
-            .chain(&self.pr.review_pools)
+            .chain(&self.pr.poll.review_pools)
             .chain(&self.pr.toil_fix_pool)
             .chain(&self.pr.conflict_fix_pool)
         {
@@ -1420,18 +1324,15 @@ impl Config {
     /// Whether a run may change `repository`: with `pr.ownSpaceOnly`, only
     /// in our own space, as the poll writes ([`poll::Config::writes_in`]).
     fn writes_in(&self, repository: &str) -> bool {
-        !self.pr.own_space_only || poll::our_space(&self.dispatch_repo, &self.bot, repository)
+        !self.pr.poll.own_space_only || poll::our_space(&self.dispatch_repo, &self.bot, repository)
     }
 
     /// The pull request poll's settings: today's defaults but for the `pr`
     /// keys, paced where `usage` is set by `snapshot`, this pass's reading,
     /// or without one by the published snapshot.
     pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
-        let policy = PollPolicy {
+        let mut policy = PollPolicy {
             merge_authors: self.pr.merge_authors.clone(),
-            head_owners: self.pr.head_owners.clone(),
-            no_merge: self.pr.no_merge.clone(),
-            operator_paths: self.pr.operator_paths.clone(),
             toil_fix_pool: self.pr.toil_fix_pool.clone().unwrap_or_default(),
             conflict_fix_pool: self.pr.conflict_fix_pool.clone().unwrap_or_default(),
             merge_queue: self.pr.merge_queue.as_ref().map(|q| q.tries),
@@ -1445,18 +1346,10 @@ impl Config {
                 snapshot: snapshot.cloned(),
             }),
             fix_bounds: self.fix_bounds.clone(),
-            stale_days: self.pr.stale_days,
             reruns: self.reruns,
-            check_reruns: self.pr.check_reruns,
-            unstall: self.pr.unstall,
-            owner_branches: self.pr.owner_branches,
-            own_space_only: self.pr.own_space_only,
-            fold_rounds: self.pr.fold_rounds,
-            review_pools: self.pr.review_pools.clone(),
-            review_dispatch_repositories: self.pr.review_dispatch_repositories.clone(),
-            draft_review_repositories: self.pr.draft_review_repositories.clone(),
             ..PollPolicy::default()
         };
+        self.pr.poll.apply(&mut policy);
         poll::Config {
             operator: self.operator.clone(),
             bot: self.bot.clone(),
@@ -3203,7 +3096,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
-        if !config.pr.review_pools.is_empty() {
+        if !config.pr.poll.review_pools.is_empty() {
             let (wip, ranks) = self.review_bounds(git_ref, earlier);
             poll.policy.review_wip = wip;
             poll.policy.review_caller_workflow = Some(config.dispatch_workflow.clone());

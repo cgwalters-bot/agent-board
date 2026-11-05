@@ -123,7 +123,7 @@ fn check(
     let mut failures = 0;
     for repository in targets {
         let workflow = board_forge::poll::routed_review_workflow(
-            &config.pr.review_dispatch_repositories,
+            &config.pr.poll.review_dispatch_repositories,
             config.pr.review_workflow.as_deref(),
             repository,
         )

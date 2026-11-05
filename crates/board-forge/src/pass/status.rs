@@ -213,7 +213,7 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
                 "status: {pulls}, so no open issue goes back to Todo"
             ));
         }
-        let days = config.pr.stale_days;
+        let days = config.pr.poll.stale_days;
         let ours = Ours {
             operator: &config.operator,
             bot: &config.bot,

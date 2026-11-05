@@ -48,7 +48,7 @@ A queue write after a reset records `queue_reset_from`, clearing only that
 stop's state without changing the identity a concurrent reset claim names.
 
 With the pass's [`pr.foldRounds: true`](pass.md#one-configuration-file) (off
-by default; not a standalone poll option), routine progress leaves one current
+by default; a standalone poll's `foldRounds`), routine progress leaves one current
 comment on the thread rather than one per event (agent-board#691). Once a
 pass writes a marker over its claim, for a fix, rebase, continuation or
 operator-comment round, a refund, a check rerun or a review start, the bot's
@@ -227,7 +227,7 @@ the classifier never starts fix work to make a draft quick.
 
 A transient CI or infrastructure failure can spend both paid fix rounds on
 work the agent cannot repair, then leave the PR at `needs-human`. The pass's
-[`pr.checkReruns: true`](pass.md#reruns) (off by default; not a standalone poll option)
+[`pr.checkReruns: true`](pass.md#reruns) (off by default; a standalone poll's `checkReruns`)
 offers the failed Actions checks one rerun before a fix round or stop. This
 extends the existing rerun path, not a new workflow dispatch or failure classifier.
 It enables only check retries and their recovery wait, not failed agent or
@@ -276,7 +276,7 @@ failure; it does not start fresh CI or weaken the egress policy.
 
 `poll --config PATH` reads the caller's repository-owned `agent-board.json`:
 `operator`, `bot`, `dispatchRepo`, `follow`, `dispatchWorkflow`, `reviewWorkflow`, `fixPools`, and
-optional `maintainerReport`, `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`. File settings override the
+optional `maintainerReport`, `mergeAuthors`, `toilFixPool`, `conflictFixPool`, `kindPools`, `mergeQueue`, `continuation`, `diagnosticPool`, `operatorComments`, `notifications`, `brokerOutage`, `operatorAnswers`, `rebaseRounds`, `pace`, `lockCollaboratorItems`, `repositoriesPerPass`, `generatedBy`, and the pass's `pr` keys below. File settings override the
 corresponding flags. Every reader of the file (poll, supervisor, `ask`,
 `--board-config`, `reconcile plan --config`) refuses a top-level key that is none
 of these and none of the other commands' sections (`board`, `statusReconcile`,
@@ -300,6 +300,21 @@ A repository whose events or open pull requests answer 404, as one a merged
 configuration change named by mistake (agent-board#683), is not an error: the
 pass prints `warning: OWNER/REPO was not found (404); fix its entry in the
 configuration`, decides nothing there, and goes on.
+
+The file's top level also takes the keys of the pass's
+[`pr`](pass.md) that change what the poll decides, read by the same code with
+the same names, types, defaults, bounds and meaning, so one `pr` block gives one
+policy either way: `checkReruns`, `unstall`, `ownerBranches`, `ownSpaceOnly`,
+`foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
+`draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths` and
+`staleDays`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,
+`mergeQueue` and `rebaseRounds` above. As in the pass, `reviewPools` needs
+`reviewWorkflow`, and `reviewDispatchRepositories` names only followed
+repositories. Under the pass, `unstall` also refuses a configuration that
+leaves a work repository unfollowed, so no work repository's pull requests go
+unseen. A standalone poll has no work repositories, so it checks nothing of the
+kind: `unstall` acts on the pull requests of its `follow` list only, and those of
+a repository left out of it are still never seen.
 
 ### Maintainer report
 
@@ -363,8 +378,8 @@ withheld-review, promotion and needs-human waits, not only the literal label.
 not instructions or authority for a consumer to act; backticks are JSON-escaped
 so a PR-controlled reason cannot close the fence.
 
-The pass's `pr.noMerge` (default `[]`, not a standalone poll option) is passed
-into the poll policy. It prevents an operator approval meant for upstream
+The pass's `pr.noMerge`, a standalone poll's `noMerge` (default `[]`), is
+passed into the poll policy. It prevents an operator approval meant for upstream
 promotion from merging staged work into a midstream fork. Each entry is an
 exact `OWNER/REPO` base repository, validated using the existing repository
 validator and compared case-insensitively; globs are refused. It never matches
@@ -379,8 +394,8 @@ Already queued PRs and externally enabled auto-merge are not revoked. This
 only prevents new merge admissions; it does not implement upstream promotion
 (#308). An absent or empty list leaves existing behavior unchanged.
 
-The pass's `pr.operatorPaths` (default `[]`, not a standalone poll option)
-names files, or with a trailing `/` directories, that only the operator
+The pass's `pr.operatorPaths`, a standalone poll's `operatorPaths` (default
+`[]`), names files, or with a trailing `/` directories, that only the operator
 changes: what agents may target and what the pass follows. tracker#1314,
 merged on the review job's approval, added a followed repository that did not
 exist, and every pass failed on it (agent-board#683). A pull request that
@@ -499,7 +514,7 @@ names the repository where no file admits it, and otherwise the head branch.
 The pass's direction check refuses a repository that any of the files admits.
 
 With the pass's [`pr.ownerBranches: true`](pass.md#one-configuration-file) (off by
-default; not a standalone poll option), a round is also skipped where
+default; a standalone poll's `ownerBranches`), a round is also skipped where
 agentic-job's apply step would refuse its push (agent-board#598). Apply pushes
 to a head other than the bot's own fork only where that head repository's
 default branch has `.github/agentic-job/accept-owner-branches` naming it
@@ -519,7 +534,7 @@ the file is the head repository's own decision, made in a commit to its
 default branch; the poll never writes it.
 
 With the pass's [`pr.ownSpaceOnly: true`](pass.md#one-configuration-file) (off
-by default; not a standalone poll option), the poll writes nothing in a
+by default; a standalone poll's `ownSpaceOnly`), the poll writes nothing in a
 followed repository outside our own space, the organization of `dispatchRepo`
 and the bot's own account (agent-board#675). The bot has no say in an upstream
 repository such as `bootc-dev/bootc`: creating `needs-human` there was refused

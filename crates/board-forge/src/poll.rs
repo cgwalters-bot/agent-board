@@ -471,6 +471,19 @@ pub const POLL_OPTIONS: &[&str] = &[
     "dispatchWorkflow",
     "generatedBy",
     "maintainerReport",
+    // The pass's `pr` keys of [`PrOptions`].
+    "checkReruns",
+    "unstall",
+    "ownerBranches",
+    "ownSpaceOnly",
+    "foldRounds",
+    "reviewPools",
+    "reviewDispatchRepositories",
+    "draftReviewRepositories",
+    "headOwners",
+    "noMerge",
+    "operatorPaths",
+    "staleDays",
 ];
 
 /// `key` of a config object, refused unless `table` lists it.
@@ -880,10 +893,173 @@ impl Continuation {
     }
 }
 
+/// The most `operatorPaths` entries: a few bounds and pass files.
+pub const OPERATOR_PATHS_LIMIT: usize = 50;
+
+/// The keys of the pass's `pr` that agent-board.json takes at its top level
+/// too, read by the same code into the same [`PollPolicy`] fields, so that
+/// one `pr` block gives one policy either way. Each is a [`POLL_OPTIONS`]
+/// entry; the field docs are [`PollPolicy`]'s.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrOptions {
+    #[serde(default)]
+    pub check_reruns: bool,
+    #[serde(default)]
+    pub unstall: bool,
+    #[serde(default)]
+    pub owner_branches: bool,
+    #[serde(default)]
+    pub own_space_only: bool,
+    #[serde(default)]
+    pub fold_rounds: bool,
+    #[serde(default)]
+    pub review_pools: Vec<String>,
+    #[serde(default)]
+    pub review_dispatch_repositories: Vec<String>,
+    #[serde(default)]
+    pub draft_review_repositories: Vec<String>,
+    #[serde(default)]
+    pub head_owners: Vec<String>,
+    #[serde(default)]
+    pub no_merge: Vec<String>,
+    #[serde(default)]
+    pub operator_paths: Vec<String>,
+    #[serde(default)]
+    pub stale_days: u64,
+}
+
+impl PrOptions {
+    /// The keys, as JSON names them.
+    fn keys() -> Vec<String> {
+        match serde_json::to_value(Self::default()) {
+            Ok(Value::Object(map)) => map.into_iter().map(|(key, _)| key).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Reads them from agent-board.json's top level.
+    fn from_config(value: &Value) -> Result<Self> {
+        let mut keys = serde_json::Map::new();
+        for key in Self::keys() {
+            if let Some(setting) = option(value, &key)? {
+                // One at a time, for an error that names the key.
+                serde_json::from_value::<Self>(json!({ &key: setting }))
+                    .with_context(|| format!("config {key}"))?;
+                keys.insert(key, setting.clone());
+            }
+        }
+        Ok(serde_json::from_value(Value::Object(keys))?)
+    }
+
+    /// Refuses settings out of bounds or missing what they need: `follow`,
+    /// the followed repositories, and whether a review workflow is set.
+    /// `at` starts each error, as `pr ` for the pass.
+    pub fn check(&self, at: &str, follow: &[String], review_workflow: bool) -> Result<()> {
+        let names = |list: &[String], repo: &str| list.iter().any(|r| r.eq_ignore_ascii_case(repo));
+        ensure!(
+            self.review_dispatch_repositories.len() <= POLL_REPOSITORY_LIMIT,
+            "{at}reviewDispatchRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
+        );
+        for repo in &self.review_dispatch_repositories {
+            validate_repository(repo)?;
+            ensure!(
+                names(follow, repo),
+                "{at}reviewDispatchRepositories repository {repo} is not followed"
+            );
+        }
+        ensure!(
+            self.review_dispatch_repositories.is_empty() || !self.review_pools.is_empty(),
+            "{at}reviewDispatchRepositories needs {at}reviewPools"
+        );
+        ensure!(
+            self.draft_review_repositories.len() <= POLL_REPOSITORY_LIMIT,
+            "{at}draftReviewRepositories exceeds {POLL_REPOSITORY_LIMIT} repositories"
+        );
+        for repo in &self.draft_review_repositories {
+            validate_repository(repo)?;
+            ensure!(
+                names(&self.review_dispatch_repositories, repo),
+                "{at}draftReviewRepositories repository {repo} needs reviewDispatchRepositories"
+            );
+            ensure!(
+                names(&self.no_merge, repo),
+                "{at}draftReviewRepositories repository {repo} needs noMerge"
+            );
+        }
+        ensure!(
+            self.review_pools.is_empty() || review_workflow,
+            "{at}reviewPools needs {at}reviewWorkflow, the workflow it starts"
+        );
+        for owner in &self.head_owners {
+            ensure!(
+                is_github_login(owner),
+                "{at}headOwners names {owner:?}, not a login"
+            );
+        }
+        for repository in &self.no_merge {
+            validate_repository(repository).with_context(|| format!("{at}noMerge repository"))?;
+        }
+        ensure!(
+            self.operator_paths.len() <= OPERATOR_PATHS_LIMIT,
+            "{at}operatorPaths has more than {OPERATOR_PATHS_LIMIT} entries"
+        );
+        // As the API names a changed file: relative, no globs, no dot segments.
+        for path in &self.operator_paths {
+            let mut segments = path.strip_suffix('/').unwrap_or(path).split('/');
+            ensure!(
+                !path.contains('*') && segments.all(|s| !s.is_empty() && s != "." && s != ".."),
+                "{at}operatorPaths entry {path:?} is not a relative path, or a directory ending in /"
+            );
+        }
+        ensure!(
+            self.stale_days <= stale::STALE_DAYS_LIMIT,
+            "{at}staleDays is not 0 to {}",
+            stale::STALE_DAYS_LIMIT
+        );
+        Ok(())
+    }
+
+    /// Sets these in `policy`.
+    pub fn apply(&self, policy: &mut PollPolicy) {
+        let Self {
+            check_reruns,
+            unstall,
+            owner_branches,
+            own_space_only,
+            fold_rounds,
+            review_pools,
+            review_dispatch_repositories,
+            draft_review_repositories,
+            head_owners,
+            no_merge,
+            operator_paths,
+            stale_days,
+        } = self.clone();
+        policy.check_reruns = check_reruns;
+        policy.unstall = unstall;
+        policy.owner_branches = owner_branches;
+        policy.own_space_only = own_space_only;
+        policy.fold_rounds = fold_rounds;
+        policy.review_pools = review_pools;
+        policy.review_dispatch_repositories = review_dispatch_repositories;
+        policy.draft_review_repositories = draft_review_repositories;
+        policy.head_owners = head_owners;
+        policy.no_merge = no_merge;
+        policy.operator_paths = operator_paths;
+        policy.stale_days = stale_days;
+    }
+}
+
 impl PollPolicy {
     pub fn from_json(value: &Value) -> Result<Self> {
         check_config(value)?;
         let get = |key: &str| option(value, key);
+        let pr = PrOptions::from_config(value)?;
+        let follow: Vec<String> =
+            serde_json::from_value(value.get("follow").cloned().unwrap_or(json!([])))
+                .context("config follow")?;
+        pr.check("", &follow, get("reviewWorkflow")?.is_some())?;
         let continuation = Continuation::from_json(get("continuation")?)?;
         let merge_queue = match get("mergeQueue")? {
             None => None,
@@ -905,7 +1081,7 @@ impl PollPolicy {
                 Some(tries.unwrap_or(QUEUE_TRIES))
             }
         };
-        Ok(Self {
+        let mut policy = Self {
             maintainer_report: report::Destination::from_json(get("maintainerReport")?)?,
             merge_queue,
             continuation,
@@ -967,12 +1143,11 @@ impl PollPolicy {
             tiers: pace::Tiers::new(),
             // The CLI's `--fix-bounds`, never the config's.
             fix_bounds: bounds::FixBoundsSet::default(),
-            // The pass's only.
+            // [`PrOptions::apply`]'s, below.
             head_owners: Vec::new(),
             no_merge: Vec::new(),
             operator_paths: Vec::new(),
             stale_days: 0,
-            reruns: false,
             check_reruns: false,
             unstall: false,
             owner_branches: false,
@@ -981,10 +1156,14 @@ impl PollPolicy {
             review_pools: Vec::new(),
             review_dispatch_repositories: Vec::new(),
             draft_review_repositories: Vec::new(),
+            // The pass's only.
+            reruns: false,
             review_caller_workflow: None,
             review_wip: None,
             review_ranks: BTreeMap::new(),
-        })
+        };
+        pr.apply(&mut policy);
+        Ok(policy)
     }
 
     /// Reads the tiers that `fix_pools` (the rounds' `fixPools`) and
