@@ -267,6 +267,10 @@ only the operator's head approval counts.
 Unfollowed authors are reported as skips, including when the pull request query
 disagrees with the open-list author; they do not count as pass errors. API and
 repository failures still count as errors, without stopping other repositories.
+A repository whose events or open pull requests answer 404, as one a merged
+configuration change named by mistake (agent-board#683), is not an error: the
+pass prints `warning: OWNER/REPO was not found (404); fix its entry in the
+configuration`, decides nothing there, and goes on.
 
 The pass's `pr.noMerge` (default `[]`, not a standalone poll option) is passed
 into the poll policy. It prevents an operator approval meant for upstream
@@ -283,6 +287,21 @@ not add a `needs-human` label, since that would block fix rounds.
 Already queued PRs and externally enabled auto-merge are not revoked. This
 only prevents new merge admissions; it does not implement upstream promotion
 (#308). An absent or empty list leaves existing behavior unchanged.
+
+The pass's `pr.operatorPaths` (default `[]`, not a standalone poll option)
+names files, or with a trailing `/` directories, that only the operator
+changes: what agents may target and what the pass follows. tracker#1314,
+merged on the review job's approval, added a followed repository that did not
+exist, and every pass failed on it (agent-board#683). A pull request that
+changes a listed path, or whose changed files were not all read, merges or is
+enqueued only on the operator's approval of its head, as under
+`needs-operator-approval`; until then it waits with `pr.operatorPaths: it
+changes PATHS; it needs OPERATOR's approval of the head`, one `approve` row on
+the needs-you list. Paths are relative, without globs or dot segments, at most
+50. Since GraphQL does not report a rename's previous filename, any rename
+also waits for that approval, even if its destination is not protected.
+Unread or unknown file change types likewise hold the pull request.
+Rounds and reviews are unchanged.
 
 An absent/empty `toilFixPool` leaves normal fix-round pool selection unchanged.
 When set, only a first round with no failed check and either no rejected review

@@ -10375,6 +10375,31 @@ fn config_table() {
             "{repositories}"
         );
     }
+    assert!(parsed.poll(None).policy.operator_paths.is_empty());
+    let many: Vec<String> = (0..=50).map(|n| format!("f{n}")).collect();
+    for (paths, ok) in [
+        (json!([".github/pass.json", ".github/agentic-job/"]), true),
+        (json!([]), true),
+        (json!(many), false),
+        (json!(["/etc/passwd"]), false),
+        (json!([".github/*.toml"]), false),
+        (json!(["a/../b"]), false),
+        (json!(["./a"]), false),
+        (json!(["a//b"]), false),
+        (json!([""]), false),
+        (json!(["/"]), false),
+        (json!("a"), false),
+    ] {
+        let mut settings = minimal.clone();
+        settings["pr"] = json!({"operatorPaths": paths});
+        match Config::parse(&settings.to_string()) {
+            Ok(parsed) => {
+                assert!(ok, "{paths}");
+                assert_eq!(json!(parsed.poll(None).policy.operator_paths), paths);
+            }
+            Err(error) => assert!(!ok, "{paths}: {error:#}"),
+        }
+    }
     assert!(parsed.pools.0.is_empty() && parsed.dispatch_ref.is_none());
     assert_eq!(parsed.wip, 0);
     assert!(!parsed.reruns && !parsed.leases && !parsed.body_plans && !parsed.triage_close);

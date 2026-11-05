@@ -257,6 +257,7 @@
     "pr.mergeAuthors": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.headOwners": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.noMerge": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "pr.operatorPaths": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.rebaseRounds": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.mergeQueue.tries": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.staleDays": {"verdict": "refused", "reason": "PR follow-up (stage 2)"}
