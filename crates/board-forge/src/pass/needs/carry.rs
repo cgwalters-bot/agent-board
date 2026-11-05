@@ -238,6 +238,7 @@ mod tests {
         let waits = (1..=3)
             .map(|number| poll::Wait {
                 review_bucket: None,
+                approval: None,
                 repository: "a/work".into(),
                 number,
                 head: "a".repeat(40),

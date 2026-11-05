@@ -17,7 +17,7 @@
 
 use super::lease::Held;
 use crate::github::DEFAULT_HOST;
-use crate::poll::validate_repository;
+use crate::poll::{approval, validate_repository};
 use crate::supervise::health::json_block;
 use anyhow::{Result, ensure};
 use board_core::ItemRef;
@@ -1253,6 +1253,64 @@ pub struct NeedsYou {
     /// Per-target cheap carry check; unknown retains the last check clock.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub carry_validation: BTreeMap<String, Value>,
+    /// Optional extension with `holds.approvalEvidence`: absent where it is
+    /// off or stage 2 was not read this pass.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_evidence: Option<ApprovalEvidence>,
+}
+
+/// The most approval rows [`ApprovalEvidence`] describes, highest ranked
+/// first; the rest are counted in its `omitted`.
+pub const MAX_APPROVAL_EVIDENCE: usize = 50;
+
+/// Evidence for the uncarried approval rows of the list, by their `key`,
+/// each at the head its row asks to approve; only this pass's reads, never
+/// a previous list's. A row without an entry has unknown evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ApprovalEvidence {
+    /// [`approval::EVIDENCE_SCHEMA`].
+    pub schema: &'static str,
+    /// The pass clock it was read at, which alone is no change.
+    pub observed_at: String,
+    /// Rows whose evidence was read but left out: past
+    /// [`MAX_APPROVAL_EVIDENCE`], or by [`fit`] for size.
+    pub omitted: usize,
+    pub items: BTreeMap<String, approval::Evidence>,
+}
+
+impl ApprovalEvidence {
+    /// The evidence `fresh` read for `items`' approval rows: a row carried
+    /// from an earlier list, grouped, or at another head than the evidence
+    /// has none.
+    fn of(items: &[Ask], fresh: &BTreeMap<String, approval::Evidence>, at: &str) -> Self {
+        let mut evidence = Self {
+            schema: approval::EVIDENCE_SCHEMA,
+            observed_at: at.to_owned(),
+            omitted: 0,
+            items: BTreeMap::new(),
+        };
+        for ask in items {
+            let Some(read) = fresh.get(&ask.key).filter(|e| bound(ask, e)) else {
+                continue;
+            };
+            if evidence.items.len() < MAX_APPROVAL_EVIDENCE {
+                evidence.items.insert(ask.key.clone(), read.clone());
+            } else {
+                evidence.omitted += 1;
+            }
+        }
+        evidence
+    }
+}
+
+/// Whether `evidence` may describe `ask`: an uncarried, ungrouped approval
+/// row of stage 2 at the evidence's head.
+fn bound(ask: &Ask, evidence: &approval::Evidence) -> bool {
+    !ask.carried
+        && ask.group.is_none()
+        && ask.source == REVIEWS
+        && ask.action.kind == RefKind::ApprovePullRequest
+        && ask.head.as_deref() == Some(evidence.assessed_head.as_str())
 }
 
 /// One decision of the inventory, published in its compact form
@@ -1536,6 +1594,11 @@ impl NeedsYou {
         for number in numbers {
             self.review_buckets.remove(&format!("{repo}#{number}"));
         }
+        if let Some(evidence) = &mut self.approval_evidence
+            && evidence.items.remove(&ask.key).is_some()
+        {
+            evidence.omitted += 1;
+        }
         self.requests.retain(|r| r.key != ask.key);
         self.request_sources.retain(|r| r.key != ask.key);
         self.summary_cache.remove(&ask.key);
@@ -1546,12 +1609,49 @@ impl NeedsYou {
             .count();
         Some(ask)
     }
+
+    /// Leaves out the lowest ranked row's approval evidence, counted in its
+    /// `omitted`, before [`fit`] leaves out any hold or detail card: it is
+    /// detail of a row, never a decision. False where none is left.
+    pub(super) fn evict_evidence(&mut self) -> bool {
+        let Some(evidence) = self.approval_evidence.as_mut() else {
+            return false;
+        };
+        let lowest = (self.items.iter().rev())
+            .map(|a| &a.key)
+            .find(|k| evidence.items.contains_key(*k))
+            .or_else(|| evidence.items.keys().next_back())
+            .cloned();
+        let Some(key) = lowest else {
+            return false;
+        };
+        evidence.items.remove(&key);
+        evidence.omitted += 1;
+        true
+    }
+
+    /// Drops the approval evidence of rows that are no longer listed as
+    /// they were read, as by [`ApprovalEvidence::of`].
+    pub(super) fn retain_evidence(&mut self) {
+        let Some(evidence) = self.approval_evidence.as_mut() else {
+            return;
+        };
+        let items = &self.items;
+        (evidence.items).retain(|key, e| items.iter().any(|ask| &ask.key == key && bound(ask, e)));
+    }
+
+    fn evidence_len(&self) -> usize {
+        self.approval_evidence.as_ref().map_or(0, |e| e.items.len())
+    }
 }
 
 /// What one of the needs-you list's own sources read this pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collected {
     pub review_buckets: BTreeMap<String, crate::poll::drafts::Assessment>,
+    /// Stage 2's evidence for its approval waits, by key: none where it
+    /// read none, or `holds.approvalEvidence` is off.
+    pub approval_evidence: Option<BTreeMap<String, approval::Evidence>>,
     pub read: Read,
     pub asks: Vec<Ask>,
     /// Where `read` is partial, the repositories (`owner/repo`) and items
@@ -1569,6 +1669,7 @@ impl Collected {
         Self {
             read,
             review_buckets: BTreeMap::new(),
+            approval_evidence: None,
             asks: Vec::new(),
             unread: BTreeSet::new(),
         }
@@ -2364,6 +2465,8 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         .iter()
         .filter(|i| !items.iter().any(|a| a.key == i.detail_key))
         .count();
+    let approval_evidence = (reading.reviews.approval_evidence.as_ref())
+        .map(|fresh| ApprovalEvidence::of(&items, fresh, at));
     let mut list = NeedsYou {
         review_buckets: reading.reviews.review_buckets.clone(),
         schema: NEEDS_YOU_SCHEMA,
@@ -2389,6 +2492,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         request_sources,
         summary_cache,
         carry_validation: BTreeMap::new(),
+        approval_evidence,
     };
     preserve_changed_at(&mut list, previous);
     list
@@ -2409,10 +2513,12 @@ pub(super) fn preserve_changed_at(list: &mut NeedsYou, previous: Option<&Value>)
         list
     };
     // Where [`fit`] cut the published list's tail, the same list is this
-    // one cut as far.
+    // one cut as far: its approval evidence first, then its cards.
     let same = previous.filter(|p| {
         let mut cut = list.clone();
         let published = p["items"].as_array().map_or(0, Vec::len);
+        let evidence = (p["approval_evidence"]["items"].as_object()).map_or(0, |e| e.len());
+        while cut.evidence_len() > evidence && cut.evict_evidence() {}
         while cut.items.len() > published && cut.cut().is_some() {}
         serde_json::to_value(&cut).is_ok_and(|now| content(p) == content(&now))
     });
@@ -2497,7 +2603,8 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 }
 
 /// `snapshot` within [`MAX_COMMENT_CHARS`] and its comment: where the whole
-/// is longer, the needs-you list's summary cache goes first, then
+/// is longer, the needs-you list's summary cache goes first, then its
+/// context and approval evidence (lowest ranked first, counted), then
 /// the item holds that do not wait on the operator are left out,
 /// in [`left_out_first`] order, then the holds a stall alarm watches
 /// ([`Published::watched`]), then the stall alarms, each with the hold it
@@ -2575,6 +2682,10 @@ pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
         if let Some(list) = needs_you.as_mut().filter(|l| !l.context.items.is_empty()) {
             list.context.items.pop();
             list.context.omitted += 1;
+            continue;
+        }
+        // So is approval evidence, which only describes a decision.
+        if needs_you.as_mut().is_some_and(NeedsYou::evict_evidence) {
             continue;
         }
         // Each entry is its JSON and a ",\n"; the count may grow a digit,
@@ -4277,6 +4388,7 @@ mod tests {
             asks,
             unread,
             review_buckets: BTreeMap::new(),
+            approval_evidence: None,
         }
     }
 
@@ -4827,6 +4939,157 @@ mod tests {
     /// `list` as a published snapshot's JSON, as the next pass reads it.
     fn as_published(list: &NeedsYou) -> Value {
         json!({"schema": HOLDS_SCHEMA, "needs_you": list})
+    }
+
+    fn green(head: &str) -> approval::Evidence {
+        approval::Evidence {
+            assessed_head: head.into(),
+            diff: approval::Diff::Lines {
+                additions: 1,
+                deletions: 1,
+            },
+            ci: approval::Ci {
+                state: approval::CiState::Green,
+                complete: true,
+            },
+            review: None,
+        }
+    }
+
+    /// Stage 2's approval rows `numbers` of `o/a` at [`HEAD_A`], each with
+    /// green evidence at `head`.
+    fn approvals(numbers: std::ops::RangeInclusive<u64>, head: &str) -> Collected {
+        let asks = numbers
+            .clone()
+            .map(|n| {
+                own(
+                    REVIEWS,
+                    ("o/a", n),
+                    RefKind::ApprovePullRequest,
+                    Some(HEAD_A),
+                )
+            })
+            .collect();
+        let mut reviews = collected(Read::Complete, asks, &[]);
+        reviews.approval_evidence =
+            Some(numbers.map(|n| (format!("o/a#{n}"), green(head))).collect());
+        reviews
+    }
+
+    /// Evidence describes only a fresh approval row at the head it was read
+    /// at: never another head's, another kind's, a missing row's or a row
+    /// carried from the published list. Off, the field is absent.
+    #[test]
+    fn approval_evidence_binds_only_fresh_rows_at_their_head() {
+        let at = "2026-11-05T12:00:00Z";
+        let mut reviews = approvals(1..=2, HEAD_A);
+        reviews
+            .asks
+            .push(own(REVIEWS, ("o/a", 3), RefKind::PullRequest, Some(HEAD_A)));
+        let fresh = reviews.approval_evidence.as_mut().unwrap();
+        fresh.insert("o/a#2".into(), green(HEAD_B));
+        fresh.insert("o/a#3".into(), green(HEAD_A));
+        fresh.insert("o/a#4".into(), green(HEAD_A));
+        let list = own_listed(&[], at, (reviews, Collected::off()), None);
+        let evidence = list.approval_evidence.as_ref().unwrap();
+        assert_eq!(
+            (
+                evidence.schema,
+                evidence.observed_at.as_str(),
+                evidence.omitted
+            ),
+            (approval::EVIDENCE_SCHEMA, at, 0)
+        );
+        assert_eq!(evidence.items.keys().collect::<Vec<_>>(), ["o/a#1"]);
+        // Off: no field at all, not an empty one.
+        let mut off = approvals(1..=1, HEAD_A);
+        off.approval_evidence = None;
+        let off = own_listed(&[], at, (off, Collected::off()), None);
+        assert!(
+            serde_json::to_value(&off)
+                .unwrap()
+                .get("approval_evidence")
+                .is_none()
+        );
+        // The next pass did not read o/a: its row is carried, and evidence
+        // that claims to be fresh for it is not published as current.
+        let previous = as_published(&list);
+        let mut partial = collected(Read::Partial, Vec::new(), &["o/a"]);
+        partial.approval_evidence = approvals(1..=1, HEAD_A).approval_evidence;
+        let later = "2026-11-05T13:00:00Z";
+        let carried = own_listed(&[], later, (partial, Collected::off()), Some(&previous));
+        assert!(carried.items.iter().any(|a| a.key == "o/a#1" && a.carried));
+        assert!(carried.approval_evidence.unwrap().items.is_empty());
+        let unread = collected(Read::Unread, Vec::new(), &[]);
+        let unread = own_listed(&[], later, (unread, Collected::off()), Some(&previous));
+        assert!(unread.approval_evidence.is_none());
+    }
+
+    /// Past [`MAX_APPROVAL_EVIDENCE`] rows, the lowest ranked are counted,
+    /// not described; every row and identity is still listed.
+    #[test]
+    fn approval_evidence_is_capped_and_counted() {
+        let over = MAX_APPROVAL_EVIDENCE as u64 + 2;
+        let mut reviews = approvals(1..=over, HEAD_A);
+        reviews.asks[0].waiting_since = "2026-10-01T00:00:00Z".into();
+        let list = own_listed(
+            &[],
+            "2026-11-05T12:00:00Z",
+            (reviews, Collected::off()),
+            None,
+        );
+        let evidence = list.approval_evidence.as_ref().unwrap();
+        assert_eq!(
+            (evidence.items.len(), evidence.omitted),
+            (MAX_APPROVAL_EVIDENCE, 2)
+        );
+        assert!(evidence.items.contains_key("o/a#1"), "the longest waiting");
+        assert_eq!(
+            (list.count, list.items.len()),
+            (over as usize, over as usize)
+        );
+    }
+
+    /// Over the comment limit, evidence goes before any hold or card,
+    /// lowest ranked first and counted; the next pass's same list keeps
+    /// its `changed_at`, whose evidence clock alone is no change either.
+    #[test]
+    fn approval_evidence_goes_first_for_size_and_its_clock_is_no_change() {
+        // Within NEEDS_YOU_REFRESH_HOURS, after which a write is due anyway.
+        let (first, later) = ("2026-11-05T12:00:00Z", "2026-11-05T12:30:00Z");
+        let with_list = |pad, at: &str| {
+            let mut snapshot = bare(&board(40, pad));
+            snapshot.at = at.into();
+            let mut reviews = approvals(1..=3, HEAD_A);
+            reviews.asks[0].waiting_since = "2026-10-01T00:00:00Z".into();
+            snapshot.needs_you = Some(own_listed(&[], at, (reviews, Collected::off()), None));
+            snapshot
+        };
+        let pad = MAX_COMMENT_CHARS - chars(&render(&with_list(0, first)).unwrap()) + 1;
+        let (fitted, body) = fit(with_list(pad, first)).unwrap();
+        assert!(chars(&body) <= MAX_COMMENT_CHARS);
+        assert_eq!(fitted.truncated, 0);
+        let list = fitted.needs_you.as_ref().unwrap();
+        let evidence = list.approval_evidence.as_ref().unwrap();
+        assert_eq!((list.items.len(), list.count, list.omitted), (3, 3, 0));
+        assert_eq!(evidence.omitted, 1);
+        assert_eq!(evidence.items.len(), 2);
+        assert!(evidence.items.contains_key("o/a#1"));
+        let published = parse(&body).unwrap();
+        let mut next = with_list(pad, later);
+        let list = next.needs_you.as_mut().unwrap();
+        preserve_changed_at(list, Some(&published));
+        assert_eq!(list.changed_at, first);
+        assert_eq!(list.approval_evidence.as_ref().unwrap().observed_at, later);
+        let (next, _) = fit(next).unwrap();
+        assert!(!changed(Some(&body), &next).unwrap());
+        // A changed reading is a change.
+        let mut moved = with_list(pad, later);
+        let list = moved.needs_you.as_mut().unwrap();
+        let evidence = list.approval_evidence.as_mut().unwrap();
+        evidence.items.get_mut("o/a#1").unwrap().ci.state = approval::CiState::Pending;
+        preserve_changed_at(list, Some(&published));
+        assert_eq!(list.changed_at, later);
     }
 
     #[test]

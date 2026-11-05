@@ -728,6 +728,11 @@ pub struct HoldsAt {
     pub proposals: Option<needs::ProposalsAt>,
     /// Repository containing review-draft issues. Read-only, off unless set.
     pub drafts: Option<String>,
+    /// Off unless set: adds stage 2's head-bound evidence for its approval
+    /// rows to the needs-you list ([`holds::ApprovalEvidence`]); needs
+    /// `needsYou`.
+    #[serde(default, rename = "approvalEvidence")]
+    pub approval_evidence: bool,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -1116,6 +1121,16 @@ impl Config {
                     "holds drafts supports only GitHub"
                 );
                 validate_repository(repository).context("holds drafts repository")?;
+            }
+            if holds.approval_evidence {
+                ensure!(
+                    holds.needs_you,
+                    "holds approvalEvidence needs holds needsYou"
+                );
+                ensure!(
+                    self.forgejo_board().is_none(),
+                    "holds approvalEvidence supports only GitHub"
+                );
             }
             if let Some(proposals) = &holds.proposals {
                 ensure!(holds.needs_you, "holds proposals needs holds needsYou");

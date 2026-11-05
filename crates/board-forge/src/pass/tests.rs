@@ -10636,6 +10636,14 @@ fn config_table() {
             "holds drafts needs holds needsYou",
         ),
         (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "approvalEvidence": true}}),
+            "holds approvalEvidence needs holds needsYou",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "approvalEvidence": 1}}),
+            "invalid type",
+        ),
+        (
             json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true, "drafts": "../other"}}),
             "holds drafts repository",
         ),

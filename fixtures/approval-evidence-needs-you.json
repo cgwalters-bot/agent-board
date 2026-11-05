@@ -1,0 +1,28 @@
+{
+  "schema": "agent-board/needs-you/v2",
+  "rows": [
+    {"key": "cgwalters-forge/tracker#1261", "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "shown": "current approval: green, reviewed"},
+    {"key": "cgwalters-forge/tracker#1262", "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "shown": "current, but not green or reviewed: checks partly read, no line counts"},
+    {"key": "cgwalters-forge/tracker#1263", "head": "cccccccccccccccccccccccccccccccccccccccc", "read_at": "dddddddddddddddddddddddddddddddddddddddd", "shown": "unknown: the evidence was read at another head"},
+    {"key": "cgwalters-forge/tracker#1264", "head": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "shown": "unknown: its evidence was left out for size, counted in omitted"}
+  ],
+  "approval_evidence": {
+    "schema": "agent-board/approval-evidence/v1",
+    "observed_at": "2026-11-05T12:00:00Z",
+    "omitted": 1,
+    "items": {
+      "cgwalters-forge/tracker#1261": {
+        "assessed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "diff": {"additions": 12, "deletions": 3},
+        "ci": {"state": "green", "complete": true},
+        "review": {"verdict": "approved", "at": "2026-11-05T11:00:00Z"}
+      },
+      "cgwalters-forge/tracker#1262": {
+        "assessed_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "diff": "unavailable",
+        "ci": {"state": "unknown", "complete": false},
+        "review": null
+      }
+    }
+  }
+}

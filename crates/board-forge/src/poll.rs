@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry as MapEntry};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub mod approval;
 pub mod bounds;
 pub mod comments;
 pub mod drafts;
@@ -301,7 +302,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number url title body state isDraft mergeable mergeStateStatus headRefOid headRefName baseRefName isCrossRepository
+      id number url title body state isDraft mergeable mergeStateStatus headRefOid headRefName baseRefName isCrossRepository additions deletions
       baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
       headRepository { nameWithOwner }
       author { __typename login }
@@ -3624,6 +3625,8 @@ pub struct Wait {
     /// The step's reason.
     pub reason: String,
     pub review_bucket: Option<drafts::Assessment>,
+    /// For an `approve` wait, what the pass read of it at `head`.
+    pub approval: Option<approval::Evidence>,
 }
 
 /// The step a pass decided for a followed pull request of the bot, at the
@@ -6248,6 +6251,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             kind: "needs-human",
             reason: needs_you_reason(listed, &reason),
             review_bucket: None,
+            approval: None,
         };
         let stepped = (!merge_only).then(|| Stepped {
             repository: repo.to_owned(),
@@ -6919,6 +6923,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .or_else(|| approval_only.then_some("approve"))
             .map(|kind| Wait {
                 review_bucket: None,
+                approval: (kind == "approve").then(|| {
+                    let run = review_run.as_ref().or(display_run.as_ref());
+                    approval::evidence(&pull, base_required, run, self.config)
+                }),
                 repository: repo.to_owned(),
                 number,
                 head: head.to_owned(),
@@ -10950,6 +10958,136 @@ mod tests {
                 .any(|line| line.contains(" merge:") || line.starts_with("merge ")),
             "{:?}",
             outcome.lines
+        );
+    }
+
+    /// An approve wait carries what the pass read of it at the wait's head:
+    /// its line counts where the read gave them, its checks, and the review
+    /// job's verdict only where its run is verified. Labels say nothing.
+    #[test]
+    fn approve_waits_carry_head_bound_evidence() {
+        use approval::{CiState, Diff, Unavailable, Verdict};
+        let labelled = |change: Value| {
+            let mut change = change;
+            change["labels"] = json!({"nodes": [{"name": OPERATOR_APPROVAL_LABEL}]});
+            change
+        };
+        let lines = Diff::Lines {
+            additions: 12,
+            deletions: 3,
+        };
+        let unavailable = Diff::Unavailable(Unavailable::Unavailable);
+        let reviewed = Some((Verdict::Approved, "2026-10-12T01:00:00Z"));
+        let cases = [
+            (
+                "controller approved and green",
+                json!({"isCrossRepository": false, "additions": 12, "deletions": 3}),
+                (lines.clone(), CiState::Green, true, reviewed),
+            ),
+            (
+                "labelled, with the job's verified approval",
+                labelled(json!({})),
+                (unavailable.clone(), CiState::Green, true, reviewed),
+            ),
+            (
+                "labelled, a check still running",
+                labelled(json!({"additions": 12, "deletions": 3,
+                    "contexts": {"ci": {"status": "IN_PROGRESS", "conclusion": null}}})),
+                (lines.clone(), CiState::Pending, true, reviewed),
+            ),
+        ];
+        for (name, change, (diff, state, complete, review)) in cases {
+            let mut fake = github();
+            fake.pulls.insert(470, pull("pull-470", change));
+            let outcome = pass(&fake, State::default(), &[], &[REPO]);
+            assert_eq!(outcome.waits.len(), 1, "{name}: {:?}", outcome.lines);
+            let wait = &outcome.waits[0];
+            assert_eq!(wait.kind, "approve", "{name}");
+            let evidence = wait.approval.as_ref().expect(name);
+            assert_eq!(evidence.assessed_head, wait.head, "{name}");
+            assert_eq!(evidence.diff, diff, "{name}");
+            assert_eq!(
+                (evidence.ci.state, evidence.ci.complete),
+                (state, complete),
+                "{name}"
+            );
+            let got = (evidence.review.as_ref()).map(|r| (r.verdict, r.at.as_str()));
+            assert_eq!(got, review, "{name}");
+        }
+        // Other waits carry none.
+        let mut fake = github();
+        let stopped = json!({"labels": {"nodes": [{"name": LABEL}]}});
+        fake.pulls.insert(470, pull("pull-470", stopped));
+        let outcome = pass(&fake, State::default(), &[], &[REPO]);
+        assert_eq!(outcome.waits[0].kind, "needs-human");
+        assert!(outcome.waits[0].approval.is_none());
+    }
+
+    /// Checks not read whole, or of another commit than the head, are no
+    /// green: a failure seen still fails.
+    #[test]
+    fn approval_evidence_never_calls_partial_checks_green() {
+        use approval::CiState;
+        let contexts = "/commits/nodes/0/commit/statusCheckRollup/contexts";
+        let failing = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
+        let partial = |change: Value| {
+            let mut p = pull("pull-470", change);
+            p.pointer_mut(contexts).unwrap()["pageInfo"] =
+                json!({"hasNextPage": true, "endCursor": "c"});
+            p
+        };
+        let moved = |change: Value| {
+            let mut p = pull("pull-470", change);
+            p["commits"]["nodes"][0]["commit"]["oid"] = "f".repeat(40).into();
+            p
+        };
+        for (name, p, state, complete) in [
+            ("whole", pull("pull-470", json!({})), CiState::Green, true),
+            (
+                "past the pages read",
+                partial(json!({})),
+                CiState::Unknown,
+                false,
+            ),
+            (
+                "another commit's",
+                moved(json!({})),
+                CiState::Unknown,
+                false,
+            ),
+            (
+                "another commit's failure",
+                moved(failing.clone()),
+                CiState::Unknown,
+                false,
+            ),
+            (
+                "failing",
+                pull("pull-470", failing.clone()),
+                CiState::Failing,
+                true,
+            ),
+            (
+                "failing, partly read",
+                partial(failing),
+                CiState::Failing,
+                false,
+            ),
+        ] {
+            let ci = approval::evidence(&p, &[], Some(&job_run(&p["headRefOid"])), &config()).ci;
+            assert_eq!((ci.state, ci.complete), (state, complete), "{name}");
+        }
+        // Without the run its marker names, the job's verdict is unverified.
+        let p = pull("pull-470", json!({}));
+        assert!(
+            approval::evidence(&p, &[], None, &config())
+                .review
+                .is_none()
+        );
+        assert!(
+            approval::evidence(&p, &[], Some(&job_run(&p["headRefOid"])), &config())
+                .review
+                .is_some()
         );
     }
 
