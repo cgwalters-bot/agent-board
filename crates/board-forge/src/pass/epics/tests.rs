@@ -2257,6 +2257,21 @@ fn idle_pass_plans_a_waiting_epic_early() {
     };
     // tracker#596 held by a person, so that stage 3 plans nothing.
     let quiet = |r: &mut Replay| label_596(r, &["needs-human"]);
+    // tracker#890's last plan had nothing to do, so it waits out the backoff.
+    let empty = |r: &mut Replay| {
+        let comments = r#""after":null,"name":"tracker","number":890,"#;
+        let nodes = &mut crate::pass::tests::answer(r, comments)["data"]["repository"]["issue"]["comments"]
+            ["nodes"];
+        let nodes = nodes.as_array_mut().unwrap();
+        let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
+            "outcome": "applied", "actions": []});
+        let mut node = nodes.last().unwrap().clone();
+        node["url"] =
+            "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098".into();
+        node["author"] = json!({"login": "cgwalters-bot"});
+        node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
+        nodes.push(node);
+    };
     type Case = (
         &'static str,
         Box<dyn Fn(&mut Replay, &mut Value)>,
@@ -2277,19 +2292,17 @@ fn idle_pass_plans_a_waiting_epic_early() {
             Box::new(move |r, c| {
                 quiet(r);
                 idle(r, c);
-                let comments = r#""after":null,"name":"tracker","number":890,"#;
-                let nodes = &mut crate::pass::tests::answer(r, comments)["data"]["repository"]["issue"]
-                    ["comments"]["nodes"];
-                let nodes = nodes.as_array_mut().unwrap();
-                let detail = json!({"schema": epic_apply::RECEIPT_SCHEMA, "plan": PLAN_890,
-                    "outcome": "applied", "actions": []});
-                let mut node = nodes.last().unwrap().clone();
-                node["url"] =
-                    "https://github.com/cgwalters-forge/tracker/issues/890#issuecomment-7000000098"
-                        .into();
-                node["author"] = json!({"login": "cgwalters-bot"});
-                node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
-                nodes.push(node);
+                empty(r);
+            }),
+            vec![WAIT_890, IDLE],
+        ),
+        (
+            "its last plan had nothing to do, and a candidate is unread: not no ready work",
+            Box::new(move |r, c| {
+                quiet(r);
+                idle(r, c);
+                crate::pass::tests::unread(r);
+                empty(r);
             }),
             vec![WAIT_890, IDLE],
         ),
@@ -2356,11 +2369,11 @@ fn idle_pass_plans_a_waiting_epic_early() {
         }
         if name.starts_with("its last plan had nothing") {
             assert!(lines[0].ends_with(NOT_EARLY), "{}", lines[0]);
-            assert!(
-                report
-                    .lines
-                    .iter()
-                    .any(|l| l.starts_with("pools: no ready work;"))
+            assert_eq!(
+                (report.lines.iter()).any(|l| l.starts_with("pools: no ready work;")),
+                !name.contains("unread"),
+                "{name}: {:#?}",
+                report.lines
             );
         }
         // The early start's hold is taken back; a waiting one stays.
@@ -2429,6 +2442,27 @@ fn idle_replan_requires_fixed_underused_window_near_reset() {
     assert!(!underused(Some(&baseline), "missing", now));
 }
 
+/// The recording with tracker#890 and tracker#766 both changed and waiting,
+/// tracker#596 held by a person, and claude's fixed window under pace a day
+/// before its reset, its entry edited by `edit`.
+fn idle_board(edit: &Value) -> Replay {
+    let mut replay = replay();
+    unfinished(&mut replay);
+    label_596(&mut replay, &["needs-human"]);
+    waiting_766(&mut replay);
+    let mut snapshot = usage(&mut replay);
+    snapshot["pools"]["claude"] = json!({"source": "praxis", "hold": false,
+        "used_percent": 40, "allowed_percent": 100, "window_minutes": 10080,
+        "observed_at": replay.now.format(&Rfc3339).unwrap(),
+        "resets_at": (replay.now + time::Duration::hours(24)).format(&Rfc3339).unwrap()});
+    snapshot["pools"]["claude"]
+        .as_object_mut()
+        .unwrap()
+        .extend(edit.as_object().unwrap().clone());
+    set_usage(&mut replay, &snapshot);
+    replay
+}
+
 #[test]
 fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
     for (name, enabled, edit, count) in [
@@ -2460,15 +2494,27 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
         ("busy", true, json!({}), 0),
         ("one slot", true, json!({}), 1),
         ("budget", true, json!({}), 0),
+        ("unreadable", true, json!({}), 1),
+        ("unread labels", true, json!({}), 1),
     ] {
-        let mut replay = replay();
-        unfinished(&mut replay);
-        label_596(&mut replay, &["needs-human"]);
-        waiting_766(&mut replay);
+        let mut replay = idle_board(&edit);
         if name != "busy" {
             crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
         }
-        if name == "human hold" {
+        if name == "unreadable" {
+            crate::pass::tests::unread(&mut replay);
+        } else if name == "unread labels" {
+            // More labels than the board's page: screened out unread.
+            let nodes = (replay.requests.iter_mut())
+                .filter_map(|e| {
+                    e["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                })
+                .filter_map(Value::as_array_mut)
+                .flatten();
+            for node in nodes.filter(|n| n["content"]["number"] == 446) {
+                node["content"]["labels"]["totalCount"] = 999.into();
+            }
+        } else if name == "human hold" {
             label(&mut replay, 890, &["needs-human"]);
         } else if name == "design hold" {
             label(&mut replay, 890, &["needs-design"]);
@@ -2483,16 +2529,6 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
             node["body"] = format!("```{}\n{detail}\n```", epic_apply::APPLY_MARKER).into();
             comments(&mut replay, COMMENTS_890).push(node);
         }
-        let mut snapshot = usage(&mut replay);
-        snapshot["pools"]["claude"] = json!({"source": "praxis", "hold": false,
-            "used_percent": 40, "allowed_percent": 100, "window_minutes": 10080,
-            "observed_at": replay.now.format(&Rfc3339).unwrap(),
-            "resets_at": (replay.now + time::Duration::hours(24)).format(&Rfc3339).unwrap()});
-        snapshot["pools"]["claude"]
-            .as_object_mut()
-            .unwrap()
-            .extend(edit.as_object().unwrap().clone());
-        set_usage(&mut replay, &snapshot);
         let mut settings = config(
             json!({"idleReplan": enabled, "triage": name == "busy", "planPools": ["claude"]}),
         );
@@ -2509,6 +2545,25 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
             .filter(|l| l.starts_with("start planning"))
             .collect();
         assert_eq!(starts.len(), count, "{name}: {:#?}", report.lines);
+        if name.starts_with("unread") {
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("hold cgwalters-forge/tracker#446: ")
+                        && l.contains(" could not all be read")),
+                "{name}: {:#?}",
+                report.lines
+            );
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("under pace near reset") || l.contains("no ready work")),
+                "{:#?}",
+                report.lines
+            );
+        }
         assert!(
             report
                 .holds
@@ -2559,6 +2614,105 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
                     capped.lines
                 );
             }
+        }
+    }
+}
+
+/// An applying pass's idle replans: both epics planned, each with its
+/// dispatch record and its hold taken back, unless `--max-dispatch` or a
+/// hold that appears when tracker#766 is read again before its start stops
+/// the second. A start's comments are its dispatch step's, which
+/// `--max-dispatch` bounds and `--max-writes` does not.
+#[test]
+fn idle_replan_applies_two_bounded_starts() {
+    use crate::pass::tests::{Forge, Late, apply_limited};
+    const SECOND: &str = "start planning cgwalters-forge/tracker#766 pool=claude: ";
+    let limits = |dispatch, writes| Limits {
+        dispatch,
+        writes,
+        ..Limits::default()
+    };
+    let human: fn() -> Option<Late> = || {
+        Some(Box::new(|request, data| {
+            if request.contains(r#""number":766"#) {
+                let labels = &mut data["repository"]["issue"]["labels"];
+                labels["nodes"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name": NEEDS_HUMAN}));
+                labels["totalCount"] = labels["nodes"].as_array().unwrap().len().into();
+            }
+        }))
+    };
+    let none: fn() -> Option<Late> = || None;
+    // Name, limits, the edit after the first dispatch, and the second's line.
+    let cases = [
+        ("both", limits(None, None), none, SECOND),
+        (
+            "--max-dispatch 1",
+            limits(Some(1), None),
+            none,
+            "held by --max-dispatch: ",
+        ),
+        ("--max-writes 0", limits(None, Some(0)), none, SECOND),
+        (
+            "needs-human on the reread",
+            limits(None, None),
+            human,
+            "hold epic cgwalters-forge/tracker#766: labelled needs-human",
+        ),
+    ];
+    for (name, limits, late, second) in cases {
+        let mut forge = Forge::new(None, false);
+        let mut replay = idle_board(&json!({}));
+        crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        // tracker#766 on the board as tracker#890 is, for the recheck before its start.
+        let items = (replay.requests.iter_mut())
+            .filter_map(|e| e["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes"))
+            .filter_map(Value::as_array_mut);
+        for nodes in items {
+            let copies: Vec<Value> = (nodes.iter())
+                .filter(|n| n["content"]["number"] == 890)
+                .map(|n| {
+                    let mut node = n.clone();
+                    node["content"]["number"] = 766.into();
+                    node
+                })
+                .collect();
+            nodes.extend(copies);
+        }
+        forge.replay = replay;
+        forge.late = late();
+        let settings =
+            config(json!({"idleReplan": true, "triage": false, "planPools": ["claude"]}));
+        let report = apply_limited(&forge, &settings, limits);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        let both = second == SECOND;
+        let mut expected = vec!["cgwalters-forge/tracker#890".to_owned()];
+        if both {
+            expected.push("cgwalters-forge/tracker#766".to_owned());
+        }
+        assert_eq!(forge.dispatches(), expected, "{name}: {:#?}", report.lines);
+        assert!(
+            (report.lines.iter()).any(|l| l
+                .starts_with("start planning cgwalters-forge/tracker#890 pool=claude: ")
+                && l.contains(" record=")),
+            "{name}: {:#?}",
+            report.lines
+        );
+        assert!(
+            (report.lines.iter()).any(|l| l.starts_with(second)),
+            "{name}: {second} in {:#?}",
+            report.lines
+        );
+        for (number, started) in [(890, true), (766, both)] {
+            let records = (forge.comments_on("cgwalters-forge/tracker", number).iter())
+                .filter(|b| b.starts_with("<!-- agent-board-dispatch"))
+                .count();
+            assert_eq!(records, usize::from(started), "{name}: #{number}");
+            let held = (report.holds.iter())
+                .any(|e| matches!(&e.scope, Scope::Epic(i) if i.number == number));
+            assert!(!(started && held), "{name}: #{number} {:#?}", report.holds);
         }
     }
 }
