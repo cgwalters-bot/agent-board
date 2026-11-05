@@ -2899,7 +2899,30 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
         .success()
         .get_output()
         .clone();
-    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented"));
+    assert!(String::from_utf8(output.stdout).unwrap().contains("would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy bot-ok); preview only; publication revalidates approval and all gates"));
+    // Apply cannot reuse credential-free replay as write authority.
+    command()
+        .args([
+            "promote",
+            "--config",
+            "fixtures/promote/config.json",
+            "--apply",
+            "--max-writes",
+            "3",
+            "--replay",
+        ])
+        .arg(&path)
+        .assert()
+        .failure();
+    command()
+        .args([
+            "promote",
+            "--config",
+            "fixtures/promote/config.json",
+            "--apply",
+        ])
+        .assert()
+        .failure();
     // Hypothetical human-text scenarios, not recorded operator authorization.
     use base64::{Engine, engine::general_purpose::STANDARD};
     for e in &mut replay.requests {
@@ -2986,7 +3009,7 @@ fn promote_would_promote_is_an_offline_scenario_not_public_authorization() {
         let expected = if hold {
             "hold promote cgwalters-forge/composefs-rs#34 head=866b6ce9050782c50eb0fec1c08b37cebec93dc6: needs-text: last body editor is not the operator or is missing".to_owned()
         } else {
-            "would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy human-text; provenance verified); remaining gates: publication, first-write revalidation, unchanged-text publication; no writes implemented; stack=none (no plan); dco=required; head=866b6ce9050782c50eb0fec1c08b37cebec93dc6 command=https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-1 at=2026-10-23T00:00:00Z human-text=true push=2026-10-22T03:25:48Z; staging verification required for bot-fork head".to_owned()
+            "would promote cgwalters-forge/composefs-rs#34 -> composefs/composefs-rs (sign-off on 1 of 1 commits) (policy human-text; provenance verified); preview only; publication revalidates approval and all gates; stack=none (no plan); dco=required; head=866b6ce9050782c50eb0fec1c08b37cebec93dc6 command=https://github.com/cgwalters-forge/composefs-rs/pull/34#issuecomment-1 at=2026-10-23T00:00:00Z human-text=true push=2026-10-22T03:25:48Z; staging verification required for bot-fork head".to_owned()
         };
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
@@ -3034,7 +3057,12 @@ fn promote_offline_preview_and_cli_refusals() {
     assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
     assert!(output.stderr.is_empty());
     for (extra, code, reason) in [
-        (vec!["--apply"], 1, "unexpected argument '--apply'"),
+        (vec!["--apply"], 1, "--max-writes"),
+        (
+            vec!["--apply", "--max-writes", "3"],
+            1,
+            "promote.publish must be true",
+        ),
         (
             vec!["--record", "unused.json", "--replay", fixture],
             1,

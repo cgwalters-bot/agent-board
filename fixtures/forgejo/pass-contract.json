@@ -171,6 +171,7 @@
     "dispatchRef": {"verdict": "native", "forgejo": "the dispatch ref"},
     "follow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "promote.forks": {"verdict": "refused", "reason": "promotion needs GitHub pull request approvals and fork heads; no reviewed Forgejo equivalent"},
+    "promote.publish": {"verdict": "refused", "reason": "standalone publication requires GitHub evidence and pull request APIs"},
     "promote.signoff.name": {"verdict": "refused", "reason": "part of promotion, which has no reviewed Forgejo equivalent"},
     "promote.signoff.email": {"verdict": "refused", "reason": "part of promotion, which has no reviewed Forgejo equivalent"},
     "promote.policyRepository": {"verdict": "refused", "reason": "part of promotion, which has no reviewed Forgejo equivalent"},
