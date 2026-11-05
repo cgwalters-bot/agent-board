@@ -39,6 +39,24 @@
         }
       }
     },
+    "merge_queues": {
+      "description": "Optional. Each followed repository's default-branch merge queue in order, empty without one, or null where it could not be read (counted in errors).",
+      "type": "object",
+      "additionalProperties": {
+        "type": ["array", "null"],
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["number", "head", "position", "state"],
+          "properties": {
+            "number": {"type": ["integer", "null"], "minimum": 1},
+            "head": {"type": ["string", "null"]},
+            "position": {"type": ["integer", "null"]},
+            "state": {"type": ["string", "null"]}
+          }
+        }
+      }
+    },
     "needs_human": {
       "type": "array",
       "items": {

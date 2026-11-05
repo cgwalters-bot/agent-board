@@ -10978,6 +10978,9 @@ mod tests {
         /// on, if one does.
         hold_after: Option<usize>,
         pull_reads: RefCell<usize>,
+        /// The `mergeQueue` the report's query gives, null for a read that
+        /// fails; none gives a repository without a merge queue.
+        report_queue: Option<Value>,
     }
 
     impl Fake {
@@ -11127,6 +11130,14 @@ mod tests {
                 });
                 ensure!(!pull.is_null(), "GraphQL: unavailable");
                 return Ok(json!({"repository": {"pullRequest": pull}}));
+            }
+            if query == report::QUEUE_QUERY {
+                let queue = self.report_queue.clone().unwrap_or_default();
+                ensure!(
+                    self.report_queue.is_none() || !queue.is_null(),
+                    "GraphQL: unavailable"
+                );
+                return Ok(json!({"repository": {"mergeQueue": queue}}));
             }
             assert_eq!(query, PULL_QUERY);
             let number = variables["number"].as_u64().unwrap();
