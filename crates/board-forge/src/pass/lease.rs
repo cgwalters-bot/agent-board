@@ -507,6 +507,7 @@ impl<C: Rest, D: Rest> Rest for Dispatch<'_, C, D> {
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         if !self.config.leases {
+            self.sent.set(true);
             return self.dispatcher.send(method, url, body);
         }
         if self.reserved.borrow().is_none() {

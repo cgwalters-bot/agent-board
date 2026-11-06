@@ -39,9 +39,11 @@ pub const DIRECTION_MARKER: &str = "agent-board-direction";
 pub const TRIAGE_FENCE: &str = "schedule-triage";
 /// Characters of a failed dispatch's error kept in its record.
 const ERROR_LIMIT: usize = 200;
-/// Profiles a plan may ask for. dispatch.yml also has review and fix, which
-/// take a pull request and belong to the poll, not to an issue's plan.
-pub const PLAN_KINDS: &[&str] = &["implement", "triage", "research"];
+/// Profiles a plan may ask for. dispatch.yml also has review, which takes a
+/// pull request and belongs to the poll. A fix plan names the pull request
+/// whose branch it rewrites, such as a promoted one's upstream; the pass
+/// starts one only with `fixPlans` (agent-board#735).
+pub const PLAN_KINDS: &[&str] = &["implement", "triage", "research", "fix"];
 /// Runners the caller can provide. dispatch.yml has no devspace runner yet;
 /// a plan asking for one is refused here rather than run on a hosted one.
 pub const PLAN_RUNNERS: &[&str] = &["hosted"];
@@ -1364,7 +1366,7 @@ mod tests {
             ("item", json!(-1), "positive issue number"),
             ("item", json!("3665"), "positive issue number"),
             ("item", json!(1.5), "positive issue number"),
-            ("kind", json!("fix"), "is not one of"),
+            ("kind", json!("review"), "is not one of"),
             ("kind", json!("Implement"), "is not one of"),
             ("runner", json!("devspace"), "only hosted"),
             (
@@ -1407,9 +1409,11 @@ mod tests {
         let mut stacked = plan();
         stacked["stacks_on"] = json!(3664);
         assert_eq!(JobPlan::from_json(&stacked).unwrap().stacks_on, Some(3664));
-        stacked["kind"] = json!("research");
-        let message = JobPlan::from_json(&stacked).unwrap_err().to_string();
-        assert!(message.contains("needs kind implement"), "{message}");
+        for kind in ["research", "fix"] {
+            stacked["kind"] = json!(kind);
+            let message = JobPlan::from_json(&stacked).unwrap_err().to_string();
+            assert!(message.contains("needs kind implement"), "{message}");
+        }
         for key in ["schema", "repo", "item", "kind", "runner", "brief"] {
             let mut missing = plan();
             missing.as_object_mut().unwrap().remove(key);

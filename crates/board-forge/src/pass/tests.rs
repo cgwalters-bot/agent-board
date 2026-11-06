@@ -2595,6 +2595,7 @@ struct LeasedForge {
     reads: Cell<usize>,
     appear_on: usize,
     item: &'static str,
+    appear_after_charge: Option<(&'static str, u64)>,
 }
 
 impl Rest for LeasedForge {
@@ -2606,7 +2607,13 @@ impl Rest for LeasedForge {
             if url.contains("/matching-refs/") {
                 let n = self.reads.get() + 1;
                 self.reads.set(n);
-                if n == self.appear_on {
+                let charged = self.appear_after_charge.is_some_and(|(repo, number)| {
+                    self.pass
+                        .comments_on(repo, number)
+                        .iter()
+                        .any(|c| c.contains(poll::MARKER))
+                });
+                if n == self.appear_on || charged {
                     self.leases.raw(
                         "agent-board/leases/0",
                         &json!({
@@ -2672,6 +2679,7 @@ fn foreign_leases_hold_capacity_and_normalized_candidate_items() {
             reads: Cell::new(0),
             appear_on,
             item,
+            appear_after_charge: None,
         };
         let config = config(json!({"leases": true, "wip": wip}));
         let report = block(run(
@@ -5125,6 +5133,16 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "",
         ),
         (
+            // With `fixPlans`, the briefs ask for a fix plan on the upstream
+            // pull request instead (agent-board#735).
+            "done, a rebase remains on a promoted pull request: follow-through is planned as its fix",
+            vec![(bot, None, "follow-through", 0)],
+            (false, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
+        (
             "follow-through on a follow-through plan waits twice as long, not looping",
             vec![
                 (bot, None, "follow-through-plan", 0),
@@ -5228,7 +5246,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         ),
     ];
     for (name, answers, (close, writes), expected, again, held) in cases {
-        let config = config(json!({"triageFollowUpDays": 3, "triageClose": close}));
+        let promoted = name.contains("promoted");
+        let config =
+            config(json!({"triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted}));
         let mut forge = Forge::new(None, false);
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
@@ -5238,6 +5258,8 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "{name}"
         );
         assert!(comments[0].contains(MECHANICAL.trim()), "{name}");
+        let fix_plan = format!("{PROMOTED}{NO_UPSTREAM_COMMENT}");
+        assert_eq!(comments[0].contains(&fix_plan), promoted, "{name}");
         assert!(
             comments[0].contains("\n\n<!-- agent-board-inputs: "),
             "{name}"
@@ -5417,6 +5439,20 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         let followed = (forge.comments_on("cgwalters-forge/tracker", 446).iter())
             .any(|c| c.starts_with(FOLLOW_THROUGH) && c.contains("post one implement job plan"));
         assert_eq!(followed, again && name.contains("follow-through"), "{name}");
+        // A fix plan goes on this issue, where the pass reads plans, never
+        // on the upstream pull request it names.
+        let briefs = forge.comments_on("cgwalters-forge/tracker", 446);
+        let here = briefs.iter().any(|c| {
+            c.starts_with(FOLLOW_THROUGH)
+                && c.contains("fix job plan for that upstream pull request on this issue")
+        });
+        assert_eq!(here, again && promoted, "{name}");
+        assert!(
+            !briefs
+                .iter()
+                .any(|c| c.contains("on that upstream pull request")),
+            "{name}"
+        );
         let issue = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446");
         assert_eq!(
             verdict_writes(&forge, &issue),
@@ -10531,6 +10567,417 @@ fn accepted_triage_plans_start_once() {
                 second.lines
             );
         }
+    }
+}
+
+/// With `fixPlans`, an accepted fix plan on tracker#446 for upstream
+/// composefs-rs#429, a promoted pull request whose head is the midstream
+/// organization's `bot/` branch, starts as a fix run on that pull request
+/// (agent-board#735). Without the option, `--fix-bounds` or the brief's
+/// [`NO_UPSTREAM_COMMENT`], or on a pull request the bot may not push to,
+/// that is closed or outside the bounds, it is held for the operator. It
+/// is charged as stage 2's next fix round in the poll's marker, which
+/// stage 2 then reads, and held where those rounds are used.
+#[test]
+fn accepted_fix_plans_start_on_the_bots_pull_request() {
+    const UPSTREAM: &str = "containers/composefs-rs";
+    const CONTROL: &str = "cgwalters-forge/composefs-rs";
+    const HEAD: &str = "1111111111111111111111111111111111111111";
+    let plan = "plan=9@2026-10-23T00:00:00Z";
+    let start = format!(
+        "start fix cgwalters-forge/tracker#446 {plan} target={UPSTREAM}#429 pool=claude record="
+    );
+    let held = |why: &str| {
+        format!(
+            "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z's fix of {UPSTREAM}#429: {why}"
+        )
+    };
+    let bounds = |repo: &str| {
+        let text = format!(
+            "repos = [\"{repo}\"]\n[github.outputs.push_to_pull_request_branch]\nbranches = [\"bot/**\"]\n"
+        );
+        poll::bounds::FixBoundsSet::new(vec![poll::bounds::FixBounds::parse(&text).unwrap()])
+    };
+    let brief = format!("Rebase it onto main. {NO_UPSTREAM_COMMENT}");
+    let pull = json!({"state": "OPEN", "isCrossRepository": true, "headRefName": "bot/rebase-erofs",
+        "headRefOid": HEAD, "author": {"login": "cgwalters-bot"}, "headRepositoryOwner": {"login": "cgwalters-forge"},
+        "headRepository": {"nameWithOwner": CONTROL},
+        "labels": {"nodes": [{"name": "rebase"}], "pageInfo": {"hasNextPage": false}}});
+    let labelled = |name: &str| json!({"labels": {"nodes": [{"name": "rebase"}, {"name": name}], "pageInfo": {"hasNextPage": false}}});
+    // The bot's comment `id` on the pull request: a poll marker, or a claim.
+    let poll_comment = |id: u64, tag: &str, state: Value| {
+        json!({"id": id, "node_id": format!("IC_{id}"), "user": {"login": "cgwalters-bot"},
+            "created_at": "2026-10-22T00:00:00Z", "body": format!("<!-- {tag}: {state} -->\nFix round.")})
+    };
+    let marker = |id: u64, state: Value| poll_comment(id, poll::MARKER, state);
+    let earlier = json!({"rounds": 1, "sha": "2222222222222222222222222222222222222222"});
+    // Name, `fixPlans`, the bounds' repository, the brief, an edit of the
+    // pull request (none unread), the poll's comments on it and the fix
+    // round the start is charged as, and the issue's line.
+    type Case<'a> = (
+        &'a str,
+        bool,
+        Option<&'a str>,
+        &'a str,
+        Option<Value>,
+        (Vec<Value>, u64),
+        String,
+    );
+    let edit = |change: Value| {
+        let mut edited = pull.clone();
+        edited
+            .as_object_mut()
+            .unwrap()
+            .extend(change.as_object().unwrap().clone());
+        Some(edited)
+    };
+    #[rustfmt::skip]
+    let cases: Vec<Case> = vec![
+        ("off", false, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z is for fix, which is dispatched by hand".into()),
+        ("no --fix-bounds", true, None, &brief, Some(pull.clone()), (vec![], 0), held("a fix plan needs --fix-bounds")),
+        ("a brief that allows comments", true, Some(UPSTREAM), "Rebase it onto main.", Some(pull.clone()), (vec![], 0),
+            held(&format!("its brief lacks {NO_UPSTREAM_COMMENT:?}"))),
+        ("unread", true, Some(UPSTREAM), &brief, None, (vec![], 0), String::new()),
+        ("not a pull request", true, Some(UPSTREAM), &brief, Some(Value::Null), (vec![], 0), held("it is not a pull request")),
+        ("closed", true, Some(UPSTREAM), &brief, edit(json!({"state": "CLOSED"})), (vec![], 0), held("it is closed")),
+        ("someone else's", true, Some(UPSTREAM), &brief, edit(json!({"author": {"login": "visitor"}})), (vec![], 0),
+            held("it is not cgwalters-bot's pull request from a head it may push to")),
+        ("a head outside headOwners", true, Some(UPSTREAM), &brief, edit(json!({"headRepositoryOwner": {"login": "visitor"}})), (vec![], 0),
+            held("it is not cgwalters-bot's pull request from a head it may push to")),
+        ("held", true, Some(UPSTREAM), &brief, edit(labelled("Hold")), (vec![], 0), held("it is labelled hold")),
+        ("needs-human", true, Some(UPSTREAM), &brief, edit(labelled("needs-human")), (vec![], 0), held("it is labelled needs-human")),
+        // Admitted, then labelled before the start's first write.
+        ("held at the recheck", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), held("it is labelled hold")),
+        ("labels past a page", true, Some(UPSTREAM), &brief,
+            edit(json!({"labels": {"nodes": [], "pageInfo": {"hasNextPage": true}}})), (vec![], 0), held("its labels could not all be read")),
+        ("labels unread", true, Some(UPSTREAM), &brief, edit(json!({"labels": null})), (vec![], 0), held("its labels could not all be read")),
+        ("a run in flight on it", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            format!("hold cgwalters-forge/tracker#446: a run is in flight on {UPSTREAM}#429, https://github.com/cgwalters-forge/tracker/actions/runs/7")),
+        ("a branch outside the bounds", true, Some(UPSTREAM), &brief, edit(json!({"headRefName": "main"})), (vec![], 0),
+            held("head branch \"main\" is outside the fix bounds")),
+        ("a repository outside the bounds", true, Some("cgwalters-forge/composefs-rs"), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("repository {UPSTREAM} is outside the fix bounds"))),
+        ("the promoted pull request", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), start.clone()),
+        ("lease refused after charge", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), String::new()),
+        ("ambiguous dispatch", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), String::new()),
+        ("plan edited before send", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), String::new()),
+        ("operator token", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("planned fixes write round accounting only as cgwalters-bot")),
+        ("an unfollowed shared head", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("its head is also the head of elsewhere/upstream#88, which this pass does not follow")),
+        ("shared heads unread", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("the pull requests that share its head could not be read")),
+        ("shared heads truncated", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("more than the 20 pull requests read share its head")),
+        ("no midstream ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("it needs exactly one same-head midstream pull request for round accounting")),
+        ("frozen midstream ledger", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("its midstream round ledger is unreadable, frozen, or not the same bot head")),
+        ("legacy upstream accounting", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held("its upstream round accounting needs operator migration to the midstream pull request")),
+        ("ownerBranches missing", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0),
+            held(&format!("its head is a branch of {CONTROL}, not the bot's fork, and apply pushes there only once {CONTROL}'s default branch has .github/agentic-job/accept-owner-branches naming it"))),
+        // Stage 2's rounds and the plan's share MAX_FIX_ROUNDS.
+        ("after stage 2's first fix round", true, Some(UPSTREAM), &brief, Some(pull.clone()),
+            (vec![marker(5, earlier.clone())], 2), start.clone()),
+        ("after both fix rounds", true, Some(UPSTREAM), &brief, Some(pull.clone()),
+            (vec![marker(5, json!({"rounds": 2, "sha": "2222222222222222222222222222222222222222"}))], 0),
+            held("its 2 fix rounds are used")),
+        ("a round already on this head", true, Some(UPSTREAM), &brief, Some(pull.clone()),
+            (vec![marker(5, json!({"rounds": 1, "sha": HEAD}))], 0), held("fix round 1 already started on 111111111111")),
+        ("stage 2 claimed the round first", true, Some(UPSTREAM), &brief, Some(pull.clone()),
+            (vec![marker(5, earlier.clone()), poll_comment(6, "agent-board-fix-claim", json!({"from": "5", "round": 2, "sha": HEAD}))], 0),
+            held("another pass went first with fix round 2, in comment 6")),
+        ("a stop whose label was taken off", true, Some(UPSTREAM), &brief, Some(pull.clone()),
+            (vec![marker(5, json!({"rounds": 2, "sha": "2222222222222222222222222222222222222222", "stopped": true}))], 1),
+            start.clone()),
+    ];
+    for (name, on, repo, brief, read, (markers, round), expected) in cases {
+        let mut config = config(json!({"wip": 5, "pr": {"headOwners": ["cgwalters-forge"]}}));
+        config.fix_plans = on;
+        config.follow = vec![UPSTREAM.into(), CONTROL.into()];
+        config.pr.poll.owner_branches = name == "ownerBranches missing";
+        if let Some(repo) = repo {
+            config.fix_bounds = bounds(repo);
+        }
+        let mut forge = Forge::new(None, false);
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}user")},
+            "answer": {"status": 200, "link": null, "body": {"login": if name == "operator token" {"cgwalters"} else {"cgwalters-bot"}}}}));
+        if name == "operator token" {
+            forge.login = "cgwalters";
+        }
+        for repo in [UPSTREAM, CONTROL] {
+            forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100")},
+                "answer": {"status": 200, "link": null, "body": []}}));
+            forge.replay.requests.push(
+                json!({"request": {"get": format!("{API_ROOT}repos/{repo}/events?per_page=100")},
+                "answer": {"status": 200, "link": null, "body": []}}),
+            );
+        }
+        let mut shared = json!({"repository": {"pullRequest": {"headRef": {"associatedPullRequests": {
+            "nodes": [{"number": 429, "repository": {"nameWithOwner": UPSTREAM}},
+                {"number": 70, "repository": {"nameWithOwner": CONTROL}}],
+            "pageInfo": {"hasNextPage": false}}}}}});
+        match name {
+            "an unfollowed shared head" => shared["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]["nodes"].as_array_mut().unwrap()
+                .push(json!({"number": 88, "repository": {"nameWithOwner": "elsewhere/upstream"}})),
+            "shared heads unread" => shared = Value::Null,
+            "shared heads truncated" => shared["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]["pageInfo"]["hasNextPage"] = true.into(),
+            "no midstream ledger" => { shared["repository"]["pullRequest"]["headRef"]["associatedPullRequests"]["nodes"].as_array_mut().unwrap().pop(); },
+            _ => {},
+        }
+        forge.replay.requests.push(json!({"request": graphql_key(poll::SHARED_HEAD_QUERY,
+            &json!({"owner": "containers", "name": "composefs-rs", "number": 429, "pulls": poll::SHARED_HEAD_READS})),
+            "answer": {"data": shared}}));
+        forge.replay.requests.push(json!({"request": graphql_key(poll::CONTROL_HEAD_QUERY,
+            &json!({"owner": "containers", "name": "composefs-rs", "number": 429, "pulls": poll::SHARED_HEAD_READS})),
+            "answer": {"data": shared}}));
+        let mut control_pull = pull.clone();
+        control_pull["isCrossRepository"] = false.into();
+        control_pull["state"] = "CLOSED".into();
+        if name == "frozen midstream ledger" {
+            control_pull["labels"]["nodes"] = json!([{"name": "hold"}]);
+        }
+        forge
+            .replay
+            .requests
+            .push(json!({"request": graphql_key(FIX_PULL_QUERY,
+            &json!({"owner": "cgwalters-forge", "name": "composefs-rs", "number": 70})),
+            "answer": {"data": {"repository": {"pullRequest": control_pull}}}}));
+        if name == "ownerBranches missing" {
+            forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/{CONTROL}/contents/.github/agentic-job/accept-owner-branches")},
+                "answer": {"status": 200, "link": null, "body": {}}}));
+        }
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        if name == "a run in flight on it" {
+            let run = json!({"id": 7, "display_title": format!("fix {UPSTREAM}#429 (claude)"),
+                "html_url": "https://github.com/cgwalters-forge/tracker/actions/runs/7"});
+            in_flight(&mut forge.replay, vec![run]);
+        }
+        let comments = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]["repository"]
+            ["issue"]["comments"]["nodes"];
+        let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": UPSTREAM, "item": 429,
+            "kind": "fix", "runner": "hosted", "brief": brief});
+        comments.as_array_mut().unwrap().push(json!({
+            "url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-9",
+            "body": format!("```{PLAN_FENCE}\n{job}\n```"),
+            "createdAt": "2026-10-23T00:00:00Z", "lastEditedAt": null,
+            "author": {"login": "cgwalters-bot"}, "editor": null,
+        }));
+        let variables = json!({"owner": "containers", "name": "composefs-rs", "number": 429});
+        let answered = match &read {
+            Some(pull) => json!({"data": {"repository": {"pullRequest": pull}}}),
+            None => json!({"error": "GitHub GraphQL: connection reset"}),
+        };
+        forge.replay.requests.push(json!({
+            "request": graphql_key(FIX_PULL_QUERY, &variables), "answer": answered}));
+        let url = format!("{API_ROOT}repos/{UPSTREAM}/issues/429/comments?per_page=100");
+        forge.replay.requests.push(json!({"request": {"get": url},
+            "answer": {"status": 200, "link": null, "body": if name == "legacy upstream accounting" { vec![marker(4, earlier.clone())] } else { vec![] }}}));
+        let url = format!("{API_ROOT}repos/{CONTROL}/issues/70/comments?per_page=100");
+        forge.replay.requests.push(json!({"request": {"get": url},
+            "answer": {"status": 200, "link": null, "body": markers}}));
+        if name == "held at the recheck" {
+            let reads = Cell::new(0);
+            forge.racing = Some(Box::new(move |query, data| {
+                if query == FIX_PULL_QUERY
+                    && data["repository"]["pullRequest"]["isCrossRepository"] == true
+                {
+                    reads.set(reads.get() + 1);
+                    if reads.get() > 1 {
+                        data["repository"]["pullRequest"]["labels"]["nodes"] =
+                            json!([{"name": "hold"}]);
+                    }
+                }
+            }));
+        }
+        if name == "plan edited before send" {
+            let reads = Cell::new(0);
+            forge.racing = Some(Box::new(move |query, data| {
+                if query == FIX_PULL_QUERY
+                    && data["repository"]["pullRequest"]["isCrossRepository"] == true
+                {
+                    reads.set(reads.get() + 1);
+                }
+                if query == plan::COMMENTS_QUERY && reads.get() >= 2 {
+                    for comment in data["repository"]["issue"]["comments"]["nodes"]
+                        .as_array_mut()
+                        .unwrap()
+                    {
+                        if text(comment, "/url").ends_with("issuecomment-9") {
+                            comment["lastEditedAt"] = "2026-10-23T01:00:00Z".into();
+                        }
+                    }
+                }
+            }));
+        }
+        let expected = match read {
+            None => format!(
+                "hold cgwalters-forge/tracker#446: plan 9@2026-10-23T00:00:00Z's fix of {UPSTREAM}#429 could not be read: "
+            ),
+            Some(_) => expected,
+        };
+        if name == "lease refused after charge" {
+            config.leases = true;
+            config.wip = 1;
+            for status in ACTIVE_RUNS {
+                let body = &mut answer(&mut forge.replay, &format!("status={status}"))["body"];
+                body["total_count"] = json!(0);
+                body["workflow_runs"] = json!([]);
+            }
+            let leased = LeasedForge {
+                pass: forge,
+                leases: lease::tests::forge("cgwalters-bot", &[]),
+                reads: Cell::new(0),
+                appear_on: usize::MAX,
+                item: "o/r#1",
+                appear_after_charge: Some((CONTROL, 70)),
+            };
+            let report = block(run(
+                &leased,
+                &leased,
+                &config,
+                State::default(),
+                (Mode::Actions(&own()), Limits::default()),
+                leased.pass.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(report.failures, 0, "{:#?}", report.lines);
+            assert!(
+                report.lines.iter().any(|l| l.contains("lease admission:")),
+                "{:#?}",
+                report.lines
+            );
+            assert!(leased.pass.dispatches().is_empty());
+            assert!(leased.pass.comments_on(UPSTREAM, 429).is_empty());
+            let control_comments: Vec<_> = leased.pass.added.borrow()[&(CONTROL.to_owned(), 70)].iter().map(|c| {
+                json!({"id": c["id"], "body": c["body"], "user": {"login": "cgwalters-bot"}})
+            }).collect();
+            let refunded = poll::find_marker(&control_comments, "cgwalters-bot");
+            assert_eq!((refunded.rounds, refunded.sha), (0, None));
+            assert!(
+                poll::charge_planned_fix(
+                    &leased.pass,
+                    &leased.pass,
+                    &config.poll(None),
+                    (CONTROL, 70, HEAD, "claude"),
+                    leased.pass.replay.now
+                )
+                .unwrap()
+                .is_ok()
+            );
+            continue;
+        }
+        if name == "ambiguous dispatch" {
+            forge.dispatch_status = Some(503);
+        }
+        if matches!(
+            name,
+            "after both fix rounds"
+                | "a round already on this head"
+                | "stage 2 claimed the round first"
+        ) {
+            let report = preview(&config, &forge.replay);
+            assert!(
+                report.lines.iter().any(|l| l.starts_with(&expected)),
+                "{name} preview: {:#?}",
+                report.lines
+            );
+        }
+        let report = apply(&forge, &config);
+        if name == "operator token" {
+            assert!(
+                report.lines.iter().any(|l| l.starts_with(&expected)),
+                "{:#?}",
+                report.lines
+            );
+            assert!(forge.comments_on(CONTROL, 70).is_empty());
+            assert!(forge.comments_on(UPSTREAM, 429).is_empty());
+            assert!(forge.dispatches().is_empty());
+            let nodes = &mut answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]
+                ["repository"]["issue"]["comments"]["nodes"];
+            nodes.as_array_mut().unwrap().push(json!({
+                "url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-10",
+                "body": format!("```{PLAN_FENCE}\n{job}\n```"),
+                "createdAt": "2026-10-23T02:00:00Z", "lastEditedAt": null,
+                "author": {"login": "cgwalters-bot"}, "editor": null,
+            }));
+            let second = apply(&forge, &config);
+            assert!(
+                second
+                    .lines
+                    .iter()
+                    .any(|l| l
+                        .contains("planned fixes write round accounting only as cgwalters-bot")),
+                "{:#?}",
+                second.lines
+            );
+            assert!(forge.comments_on(CONTROL, 70).is_empty());
+            assert!(forge.dispatches().is_empty());
+            continue;
+        }
+        if name == "plan edited before send" {
+            assert_eq!(report.failures, 1, "{:#?}", report.lines);
+            assert!(forge.dispatches().is_empty());
+            let comments: Vec<_> = forge.added.borrow()[&(CONTROL.to_owned(), 70)].iter().map(|c| {
+                json!({"id": c["id"], "body": c["body"], "user": {"login": "cgwalters-bot"}})
+            }).collect();
+            assert_eq!(poll::find_marker(&comments, "cgwalters-bot").rounds, 0);
+            continue;
+        }
+        if name == "ambiguous dispatch" {
+            assert_eq!(report.failures, 1, "{:#?}", report.lines);
+            assert!(forge.comments_on(UPSTREAM, 429).is_empty());
+            let control_comments: Vec<_> = forge.added.borrow()[&(CONTROL.to_owned(), 70)].iter().map(|c| {
+                json!({"id": c["id"], "body": c["body"], "user": {"login": "cgwalters-bot"}})
+            }).collect();
+            assert_eq!(
+                poll::find_marker(&control_comments, "cgwalters-bot").rounds,
+                1
+            );
+            continue;
+        }
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(&expected)),
+            "{name}: no line {expected:?} in {:#?}",
+            report.lines
+        );
+        assert!(
+            forge.comments_on(UPSTREAM, 429).is_empty(),
+            "{name}: wrote upstream"
+        );
+        if !expected.starts_with("start ") {
+            assert!(forge.dispatches().is_empty(), "{name}");
+            assert!(
+                forge.comments_on(UPSTREAM, 429).is_empty(),
+                "{name}: charged"
+            );
+            continue;
+        }
+        assert_eq!(forge.dispatches(), [format!("{UPSTREAM}#429")], "{name}");
+        // One comment, the claim recorded as the marker stage 2 reads next.
+        let added = forge.added.borrow();
+        let posted = &added[&(CONTROL.to_owned(), 70)];
+        assert_eq!(posted.len(), 1, "{name}: {posted:#?}");
+        let posted = json!({"id": posted[0]["id"], "body": posted[0]["body"],
+            "user": {"login": "cgwalters-bot"}});
+        let charged = poll::find_marker(&[markers, vec![posted]].concat(), "cgwalters-bot");
+        assert_eq!(
+            (charged.rounds, charged.sha.as_deref(), charged.stopped),
+            (round, Some(HEAD), false),
+            "{name}"
+        );
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = (writes.iter())
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap();
+        assert_eq!(sent["inputs"]["kind"], "fix", "{name}");
+        assert_eq!(sent["inputs"]["task"], *brief, "{name}");
     }
 }
 

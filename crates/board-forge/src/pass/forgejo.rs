@@ -580,6 +580,10 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             "stacked plans are not wired on Forgejo; held"
         );
         ensure!(!revisit || plan.kind == "triage", "revisit is not triage");
+        ensure!(
+            plan.kind != "fix",
+            "fix plans are only built for GitHub; held"
+        );
         let intake = self.intake_source(issue, comment, &plan)?;
         Ok(Some(Accepted {
             id,

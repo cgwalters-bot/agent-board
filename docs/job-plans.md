@@ -34,8 +34,8 @@ start of a line, holding one JSON object:
 |---|---|---|
 | `schema` | yes | `agent-board/job-plan/v1` |
 | `repo` | yes | Target repository, `OWNER/NAME`; the caller's bounds must allow it |
-| `item` | yes | Positive issue number in `repo` |
-| `kind` | yes | `implement`, `triage` or `research`: the profile the run gets |
+| `item` | yes | Positive issue number in `repo`; for `fix`, the pull request whose branch it rewrites |
+| `kind` | yes | `implement`, `triage`, `research` or `fix`: the profile the run gets; the pass starts `fix` only with [`fixPlans`](pass.md#scheduling) |
 | `runner` | yes | `hosted`, the only runner the caller has |
 | `pool` | no | Inference pool named in the caller's `pools.json`: lowercase letters, digits, `-` and `_`, starting with a letter or digit, at most 32 bytes (`gpt5`, `claude-opus`), and not a `tier-` name; absent leaves it to the caller's variables |
 | `effort` | no | Only `"heavy"`: request the selected pool's optional heavy model; omit for the existing default model. Null, empty, `"default"` and other values are refused |
