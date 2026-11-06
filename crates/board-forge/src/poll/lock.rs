@@ -496,6 +496,7 @@ mod tests {
             envelope: None,
             followed: BTreeSet::new(),
             caps: None,
+            intaking: false,
             writes: 0,
             review_runs: BTreeMap::new(),
             review_intake: Default::default(),

@@ -11998,6 +11998,12 @@ fn config_table() {
     assert_eq!(config(json!({})).poll(None).policy.stale_days, 0);
     assert_eq!(poll.policy.continuation, poll::Continuation::default());
     assert!(poll.policy.operator_comments.is_empty() && poll.policy.notifications.is_none());
+    let intake = config(json!({"notifications": true})).poll(None);
+    assert!(intake.policy.notification_intake.is_some());
+    assert_eq!(
+        intake.policy.notifications.unwrap().reasons.len(),
+        poll::notify::NOTIFY_REASONS.len()
+    );
     let pace = poll.policy.pace.unwrap();
     assert_eq!(
         (pace.repository.as_str(), pace.issue, pace.bot.as_str()),
@@ -13081,6 +13087,76 @@ fn no_merge_preserves_followed_rounds_and_holds() {
             );
         }
     }
+}
+
+#[test]
+fn notifications_run_without_followed_repositories_and_report_denied_reads() {
+    for status in [200, 403] {
+        let mut recorded = replay();
+        recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}notifications?all=false&participating=false&since=1970-01-01T00:00:00Z&per_page=20")},
+            "answer": {"status": status, "link": null, "body": if status == 200 { json!([]) } else { json!({"message": "Resource not accessible by integration"}) }}}));
+        let report = preview(&config(json!({"wip": 0, "notifications": true})), &recorded);
+        assert_eq!(
+            report.failures,
+            usize::from(status != 200),
+            "{:?}",
+            report.lines
+        );
+        assert_eq!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("notifications error:")),
+            status != 200,
+            "{:?}",
+            report.lines
+        );
+        assert!(!report.lines.iter().any(|l| l == "follow: no repositories"));
+    }
+}
+
+#[test]
+fn notification_routes_require_verified_unambiguous_fork_parents() {
+    for (status, body, valid) in [
+        (
+            200,
+            json!({"full_name": "o/fork", "fork": true, "parent": {"full_name": "upstream/project"}}),
+            true,
+        ),
+        (200, json!({"full_name": "o/fork", "fork": false}), true),
+        (403, json!({}), false),
+        (
+            200,
+            json!({"full_name": "other/fork", "fork": true, "parent": {"full_name": "upstream/project"}}),
+            false,
+        ),
+        (
+            200,
+            json!({"full_name": "o/fork", "fork": true, "parent": {"full_name": "upstream/../project"}}),
+            false,
+        ),
+        (200, json!({"full_name": "o/fork", "fork": true}), false),
+    ] {
+        let mut recorded = replay();
+        recorded.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/o/fork")},
+            "answer": {"status": status, "body": body}}),
+        );
+        let routes = midstream::routes(&recorded, &["o/fork".into()]);
+        assert_eq!(routes.is_ok(), valid, "{status} {body}: {routes:?}");
+        if valid && body["fork"] == true {
+            assert_eq!(routes.unwrap()["upstream/project"], "o/fork");
+        }
+    }
+    let mut recorded = replay();
+    for repo in ["o/fork", "o/another"] {
+        recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/{repo}")},
+            "answer": {"status": 200, "body": {"full_name": repo, "fork": true, "parent": {"full_name": "upstream/project"}}}}));
+    }
+    assert!(midstream::routes(&recorded, &["o/fork".into(), "o/another".into()]).is_err());
+    assert!(
+        midstream::routes(&recorded, &vec!["o/fork".into(); POLL_REPOSITORY_LIMIT + 1]).is_err()
+    );
 }
 
 /// A midstream listing that fails or is incomplete stops stage 2, here

@@ -593,6 +593,9 @@ pub struct PollPolicy {
     /// are routed to the operator's handling, a peer's research run or a
     /// line for a person ([`notify`]); none (the default) reads none.
     pub notifications: Option<notify::Notifications>,
+    /// Pass-only notification intake: upstream repository to topic-admitted
+    /// fork. None preserves standalone poll routing; empty admits only ours.
+    pub notification_intake: Option<BTreeMap<String, String>>,
     /// `brokerOutage`: where the inference broker's outages are recorded, so
     /// that a run they failed is not charged; none (the default) charges it.
     pub broker_outage: Option<BrokerOutage>,
@@ -1147,6 +1150,7 @@ impl PollPolicy {
             .context("diagnosticPool is not a string")?,
             operator_comments: comments::scopes(get("operatorComments")?)?,
             notifications: notify::Notifications::from_json(get("notifications")?)?,
+            notification_intake: None,
             broker_outage: BrokerOutage::from_json(get("brokerOutage")?)?,
             operator_answers: get("operatorAnswers")?
                 .map(|a| a.as_bool().context("operatorAnswers is not a boolean"))
@@ -4207,6 +4211,8 @@ struct Pass<'a, R, G> {
     followed: BTreeSet<String>,
     /// The pass's caps on its steps ([`caps`]); none is uncapped.
     caps: Option<&'a caps::Caps>,
+    /// Notification intake counts its individual attempted writes, not PR steps.
+    intaking: bool,
     /// Writes sent, or tried, so far: whether a step wrote anything.
     writes: usize,
     /// The review job's runs the pass started, by repository, read once a
@@ -4358,6 +4364,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         allowed: u16,
     ) -> Result<(u16, Value)> {
         self.writable(path)?;
+        if self.intaking
+            && let Some(caps) = self.caps
+        {
+            if let Some(held) = caps.check(Kind::Write) {
+                bail!("{held}");
+            }
+            caps.count(Kind::Write);
+        }
         self.spend()?;
         self.writes += 1;
         let (status, response) = client.send(method, &format!("{API_ROOT}{path}"), &body)?;
@@ -4695,6 +4709,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             run_details: true,
         };
         let admit = || {
+            if self.intaking
+                && let Some(caps) = self.caps
+            {
+                if let Some(held) = caps.check(Kind::Dispatch) {
+                    bail!("{held}");
+                }
+                caps.count(Kind::Dispatch);
+            }
             self.spend()?;
             self.writes += 1;
             Ok(())
@@ -7676,7 +7698,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     ensure!(
         !caps.is_some_and(caps::Caps::limited)
             || (policy.operator_comments.is_empty()
-                && policy.notifications.is_none()
+                && (policy.notifications.is_none() || policy.notification_intake.is_some())
                 && !policy.operator_answers
                 && policy.lock_items.is_none()),
         "caps cover pull request steps only; operator comments, notifications, answers and locking would write uncapped"
@@ -7739,6 +7761,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         envelope: None,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
+        intaking: false,
         writes: 0,
         review_runs: BTreeMap::new(),
         review_intake: reviews::Intake::default(),
@@ -7873,6 +7896,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     };
     if let Some(settings) = &config.policy.notifications {
         let at = (notify_since.as_deref(), notify_before.as_deref());
+        pass.intaking = config.policy.notification_intake.is_some();
         match pass.notifications(settings, &follow, at, &mut outcome) {
             Ok((since, before)) if pass.apply.is_some() => {
                 notify_since = Some(since);
@@ -7886,6 +7910,7 @@ pub fn run_capped<R: Rest, G: Transport>(
                     .push(format!("notifications error: {error:#}"));
             }
         }
+        pass.intaking = false;
     }
     if let Some(line) = pass.pace_line() {
         outcome.lines.push(line);
@@ -18846,6 +18871,7 @@ mod tests {
             envelope: Some(admission::admit(["cgwalters-forge/zzz"], 1, None).unwrap()),
             followed: BTreeSet::new(),
             caps: None,
+            intaking: false,
             writes: 0,
             review_runs: BTreeMap::new(),
             review_intake: reviews::Intake::default(),
