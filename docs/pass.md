@@ -2600,9 +2600,11 @@ mergeability not known yet, ahead in the merge queue, a broker outage, a
 check rerun, the review job's run, or a pull request already queued or set
 to auto-merge) counts as moving only for `overlap.staleHours` since the later
 of the head's last movement (commit or review) and the wait's start, where
-known. A round uses its dispatch marker or run creation time, a check rerun
-or review reservation uses its claim/receipt time, a listed review run uses
-its creation time, and an outage uses its window's start. Checks pending,
+known. A round uses the latest of its dispatch marker, run creation and current
+attempt's start time; a check rerun or review reservation uses its claim/receipt
+time, and a listed review run uses its creation or current attempt's start time.
+An outage uses the later of its window's start and the round/run start, so an
+old outage does not make fresh work immediately stale. Checks pending,
 mergeability and queue waits have no separate start and keep the head's
 clock. Wait kinds come from the poll's decision, not its reason text. After
 that interval the line is `… stage 2's step has not moved it in
