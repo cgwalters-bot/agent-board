@@ -23,15 +23,18 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const ISSUE_PAGE: usize = 100;
 const KEYS: &[&str] = &["url", "repository", "label"];
 
-/// The probe's configuration file, from the caller's default branch.
+/// The probe's configuration file, from the caller's trusted default branch.
+/// All fields are required nonempty strings; unknown keys are refused.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Any address on the broker; only whether it answers is read.
+    /// Any HTTP(S) address on the broker, with a host and without credentials;
+    /// only whether it answers is read.
     pub url: Url,
-    /// Where the outage issue is.
+    /// OWNER/REPO where the outage issue is.
     pub repository: String,
     /// The outage issue's label, created if missing. Poll's `brokerOutage`
     /// reads `outage`.
+    /// At most 50 bytes, without a comma.
     pub label: String,
 }
 

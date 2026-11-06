@@ -79,6 +79,10 @@ fn command(out: &mut String, cmd: &Command, root: bool) {
         &options,
     );
 
+    if let Some(help) = cmd.get_after_long_help().or(cmd.get_after_help()) {
+        let _ = writeln!(out, "\n```text\n{}\n```", help.to_string().trim_end());
+    }
+
     for sub in subcommands {
         command(out, sub, false);
     }
@@ -169,6 +173,20 @@ fn anchor(heading: &str) -> String {
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn broker_examples_are_rendered_and_parse() {
+        let reference = super::markdown(crate::Cli::command());
+        for example in [
+            "agent-board broker probe --config broker.json",
+            "agent-board broker probe --config broker.json --apply",
+        ] {
+            assert!(reference.contains(example), "missing example: {example}");
+            assert!(crate::Cli::try_parse_from(example.split_whitespace()).is_ok());
+        }
+        assert!(reference.contains("\n```text\nExamples:\n"));
+        assert_eq!(reference, include_str!("../../../docs/cli.md"));
+    }
 
     #[test]
     fn tidy_option_contracts() {

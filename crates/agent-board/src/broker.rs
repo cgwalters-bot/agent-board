@@ -6,7 +6,18 @@ use board_forge::release_train::Api;
 use clap::Args;
 use std::io::Write;
 
+pub const PROBE_ABOUT: &str = "Probe the inference broker and keep one outage issue open while it is unreachable.
+
+Run from a scheduled workflow that can reach the broker, for example every 15 minutes from the tailnet. GH_TOKEN (the bot's) is required even for preview: it reads the token's login and the open outage issues. Without --apply, each intended write is printed as 'would: ...'; with --apply, open or refresh an outage issue while unreachable, or close it and comment on recovery.
+
+The probe tries TCP, then one unauthenticated HTTP GET, without redirects or an environment proxy. Each TCP connection attempt and the HTTP request have a 10-second timeout. Any HTTP response, including 401, 404, 500 or a redirect, counts as reachable. The first line is 'broker: reachable' or 'broker: unreachable'. An unreachable broker exits 1 after any writes; other errors also fail the command.
+
+Read configuration from the caller's trusted default branch. All three JSON keys are required and unknown keys are refused: url is an HTTP(S) address without credentials; repository is OWNER/REPO for the outage issue; label is its label (created if missing), normally outage for poll's brokerOutage. Read the broker address from the deployment environment when preparing this file, rather than copying a production address into code.";
+
 #[derive(Args)]
+#[command(
+    after_long_help = "Examples:\n  Preview using the caller's trusted configuration (still reads GitHub):\n    agent-board broker probe --config broker.json\n\n  Publish outage or recovery updates from the scheduled workflow:\n    agent-board broker probe --config broker.json --apply\n\n  Configuration shape (replace the example address for your deployment):\n    {\"url\":\"http://broker.example:8080/\",\"repository\":\"OWNER/REPO\",\"label\":\"outage\"}"
+)]
 pub struct Probe {
     /// The probe's configuration from a trusted default-branch checkout: the broker's url, and the outage issue's repository and label.
     #[arg(long, value_name = "FILE")]
