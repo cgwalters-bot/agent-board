@@ -344,7 +344,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             && read["owner"]["visibility"] == "public")
     }
 
-    /// After stage 4's starts left `free` slots: files this week's sweep
+    /// After stage 4's starts and revisits left `free` slots: files this week's sweep
     /// issue where it is due and `candidates` were read, starts its run
     /// where slots and pools are spare, or applies its reply. Where stage 4
     /// starts nothing, `candidates` is None and `free` none: an open sweep
@@ -444,11 +444,12 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             .map(|f| format!("- {}\n", self.web(&f.issue)))
             .collect();
         let body = format!(
-            "{}\nThese open issues are outside every live epic, so no triage run looks at them on its own. \
+            "{}\n{} \
              One triage run sweeps them when capacity is spare: the board pass attaches those it says belong to a live epic, \
              and lists the rest here for {}, who closes this issue once they are settled. \
              The board pass's first comment here is its record of this list.\n\n{links}\n{}",
             shared::SWEEP_MARKER,
+            shared::Sweep::opening(self.config),
             self.config.operator,
             crate::Footer::default()
         );

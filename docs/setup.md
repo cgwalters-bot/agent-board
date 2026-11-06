@@ -294,6 +294,10 @@ dispatch caller (step 2) and the review caller (step 4); each says so.
    agent-board pass --config pass.json --max-dispatch 0 --max-writes 0 --max-status-changes 5
    ```
 
+   `agent-board pass --config pass.json --check-config` checks the file
+   alone, as a pass would, with no token or forge read; run it in the
+   caller's pull request CI with the pinned agent-board, so a change the
+   pass refuses fails review rather than every pass after merge.
    No `--apply`, no `--record`, no scheduled caller and no dispatch token yet.
    Zero caps also bound proposals; Status changes over five refuse the stage
    whole rather than silently applying a subset. Inspect errors and held lines,

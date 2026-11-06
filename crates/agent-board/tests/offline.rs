@@ -2640,6 +2640,77 @@ fn pass_replay_previews_without_credentials() {
     assert!(error.starts_with("error: fixtures/board.json: "), "{error}");
 }
 
+/// `pass --check-config` checks the configuration as a pass would, with no
+/// token or forge read, and refuses to be mixed with a pass's own options.
+#[test]
+fn pass_check_config_table() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let dir = std::env::temp_dir().join(format!("agent-board-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    let sweep = serde_json::json!({"weekday": "friday", "hourUtc": 9});
+    let with = |triage: Value| {
+        let mut config = base.clone();
+        config["triage"] = triage;
+        config["sweep"] = sweep.clone();
+        config
+    };
+    for (name, config, extra, code, expected) in [
+        ("base", base.clone(), &[][..], 0, "pass: configuration ok"),
+        // tracker#1403's change (agent-board#755).
+        (
+            "all",
+            with(Value::Bool(true)),
+            &[],
+            0,
+            "pass: configuration ok",
+        ),
+        (
+            "off",
+            with(Value::Bool(false)),
+            &[],
+            1,
+            "sweep needs triage",
+        ),
+        (
+            "apply",
+            base.clone(),
+            &["--apply"],
+            1,
+            "cannot be used with",
+        ),
+        (
+            "replay",
+            base.clone(),
+            &["--replay", "fixtures/pass/board-2026-10-23.json"],
+            1,
+            "cannot be used with",
+        ),
+    ] {
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, config.to_string()).unwrap();
+        let output = command()
+            .args(["pass", "--check-config", "--config"])
+            .arg(&path)
+            .args(extra)
+            .current_dir(root)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .assert()
+            .code(code)
+            .get_output()
+            .clone();
+        let said = match code {
+            0 => output.stdout,
+            _ => output.stderr,
+        };
+        let said = String::from_utf8(said).unwrap();
+        assert!(said.contains(expected), "{name}: {said}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// `--fix-bounds` parses twice on pass and poll, and every path it names is
 /// read: two good files get past reading them, and a missing second fails.
 #[test]

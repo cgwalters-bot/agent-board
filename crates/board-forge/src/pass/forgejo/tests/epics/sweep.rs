@@ -536,6 +536,35 @@ fn run_starts_with_spare_capacity_through_the_claim_path() {
     assert_eq!(instance.writes(DISPATCH), 1);
 }
 
+/// Under the scope `all` (agent-board#755) revisits run beside the sweep:
+/// with one slot free, a revisit takes it and the sweep's run waits, as on
+/// GitHub, rather than both starting past `wip`.
+#[test]
+fn revisits_and_the_sweep_share_the_free_slots() {
+    let instance = Instance::sweeping();
+    // Only #8 is due for a revisit.
+    instance.issues.borrow_mut().get_mut(&at(WORK, 8)).unwrap()["updated_at"] =
+        "2026-09-01T10:00:00Z".into();
+    let n = instance.swept(30, Some(&["example/work#8"]));
+    let mut config = sweep_config(1);
+    config.triage = Some(TriageScope::All);
+    config.revisit = Some(
+        serde_json::from_value(json!({"perPass": 1, "afterDays": 1, "pools": ["claude"]})).unwrap(),
+    );
+    let report = pass(&instance, &config, Mode::Local);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(has(&report, "start example/work#8: "), "{:?}", report.lines);
+    assert!(
+        has(
+            &report,
+            &format!("sweep {URL}/example/work/issues/{n}: no slot free; it waits")
+        ),
+        "{:?}",
+        sweep_lines(&report)
+    );
+    assert_eq!(instance.writes(DISPATCH), 1);
+}
+
 #[test]
 fn reply_attaches_to_a_live_epic_once_and_leaves_the_rest() {
     let instance = Instance::sweeping();

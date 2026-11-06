@@ -1592,11 +1592,14 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             self.report.tally.1.started += 1;
             self.line(line);
         }
-        self.report.tally.1.started += self.sweep(Some(&candidates), free, &busy, snapshot);
+        // As on GitHub, the sweep takes only the slots revisits leave: under
+        // the scope `all` both may start in one pass (agent-board#755).
         let started = self.report.tally.1.started;
         let revisited = self.revisits(&candidates, snapshot, &mut busy, free, &recovered)?;
-        self.report.tally.1.started = started + revisited;
-        self.report.tally.0.in_flight = Some(active + started + revisited);
+        let left = free.saturating_sub(revisited);
+        let swept = self.sweep(Some(&candidates), left, &busy, snapshot);
+        self.report.tally.1.started = started + revisited + swept;
+        self.report.tally.0.in_flight = Some(active + started + revisited + swept);
         self.busy = Some(Some(busy));
         Ok(())
     }

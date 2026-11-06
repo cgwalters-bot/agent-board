@@ -526,8 +526,8 @@ WIP, leases, pacing and caps. Plan plus normal start needs five write slots;
 an interrupted unclaimed plan waits for a person, and an ambiguous start is
 never dispatched again. There is no new dispatch implementation, deployment,
 secret or caller activation. PR follow-up remains refused. The
-[weekly sweep](#the-weekly-sweep) requires triage scope `epics`, in which
-revisits do not run.
+[weekly sweep](#the-weekly-sweep) requires `triage`, either scope; revisits
+run only under the scope `all`.
 
 ### Labels and Status
 

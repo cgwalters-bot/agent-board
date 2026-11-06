@@ -676,6 +676,7 @@ Options:
 - `--max-status-changes <N>`: Refuse the board Status stage whole when it would change more than N items' Status [default: 50]: the first pass over a board that drifted is looked at first. Pass a higher N once to let it through
 - `--replay <FILE>`: Preview a recorded pass (a replay fixture) at its clock instead of reading the forge; needs no token. A Forgejo fixture replays only on the instance it was recorded on. On GitHub, with --record, it seeds the recording instead: its answers stand in for live reads, such as a usage snapshot the token cannot read or the broker's /usage
 - `--record <FILE>`: Preview live, and save every read and its answer to FILE as a replay fixture
+- `--check-config`: Only check --config and --fix-bounds as a pass would, and exit: no token, no read of the forge. For a caller's pull request CI, so a configuration the pass refuses fails review instead of every pass after merge
 
 ## agent-board pass next
 
