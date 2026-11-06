@@ -383,6 +383,19 @@ fn snapshot_file() -> Value {
     value
 }
 
+/// The pass view is built from GitHub's runs and dispatches alone, which
+/// the Forgejo contract says.
+#[test]
+fn pass_view_is_refused() {
+    let mut value = snapshot_file();
+    value["holds"]["passView"] = true.into();
+    let error = format!("{:#}", Config::parse(&value.to_string()).unwrap_err());
+    assert!(
+        error.contains("unsupported_capability: holds.passView"),
+        "{error}"
+    );
+}
+
 fn snapshot_lines(report: &Report) -> Vec<&str> {
     let lines = report.lines.iter().map(String::as_str);
     lines

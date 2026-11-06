@@ -523,6 +523,9 @@ pub struct Snapshot {
     /// Per-repository observed work; absent means unavailable, not empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatchable_work: Option<Value>,
+    /// The pass view ([`super::view`]); absent unless `holds.passView`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_view: Option<Value>,
     pub schema: &'static str,
     /// The clock of the pass that wrote it.
     pub at: String,
@@ -673,6 +676,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
         .collect();
     Snapshot {
         dispatchable_work: None,
+        pass_view: None,
         schema: HOLDS_SCHEMA,
         at,
         truncated: 0,
@@ -2570,7 +2574,8 @@ pub(super) fn preserve_changed_at(list: &mut NeedsYou, previous: Option<&Value>)
 /// Whether `snapshot` says something other than the published comment
 /// `body`, if any: its time alone is no change, nor the needs-you list's
 /// `validated_at` until [`NEEDS_YOU_REFRESH_HOURS`] after the published one,
-/// so that a list nothing changes is written again that often.
+/// so that a list nothing changes is written again that often; the pass
+/// view's likewise ([`super::view::comparable`], [`super::view::due`]).
 pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
     let mut now = serde_json::to_value(snapshot)?;
     let validated = |s: &mut Value| {
@@ -2585,8 +2590,15 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
             let last = last.unwrap_or_default();
             parse_time(&last).is_none() || over(&last, at, NEEDS_YOU_REFRESH_HOURS)
         });
+        let due = due || super::view::due(s.get("pass_view"), now.get("pass_view"));
         s["at"] = Value::Null;
         now["at"] = Value::Null;
+        for view in [&mut s, &mut now]
+            .into_iter()
+            .filter_map(|s| s.get_mut("pass_view"))
+        {
+            super::view::comparable(view);
+        }
         // A pass count or UTC rollover alone must not cause a comment write.
         if let Some(pass) = s["pass"].as_object_mut() {
             pass.remove("overhead");
@@ -2620,8 +2632,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         Some(work) => format!(",\"dispatchable_work\":{}", serde_json::to_string(work)?),
         None => String::new(),
     };
+    let view = match &snapshot.pass_view {
+        Some(view) => format!(",\"pass_view\":{}", serde_json::to_string(view)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work}{view},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -2647,7 +2663,8 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 }
 
 /// `snapshot` within [`MAX_COMMENT_CHARS`] and its comment: where the whole
-/// is longer, the needs-you list's summary cache goes first, then its
+/// is longer, the work inventory and then the pass view go whole, then the
+/// needs-you list's summary cache, then its
 /// context and approval evidence (lowest ranked first, counted), then
 /// the item holds that do not wait on the operator are left out,
 /// in [`left_out_first`] order, then the holds a stall alarm watches
@@ -2669,6 +2686,9 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
         && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS
     {
         snapshot.dispatchable_work = None;
+    }
+    if snapshot.pass_view.is_some() && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS {
+        snapshot.pass_view = None;
     }
     let holds = &snapshot.holds;
     let on = |h: &Published| (h.item.clone(), h.epic);
@@ -2705,6 +2725,7 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
     let mut needs_you = snapshot.needs_you.clone();
     let without = |dropped: &BTreeSet<usize>, needs_you: &Option<NeedsYou>| Snapshot {
         dispatchable_work: snapshot.dispatchable_work.clone(),
+        pass_view: snapshot.pass_view.clone(),
         schema: snapshot.schema,
         at: snapshot.at.clone(),
         truncated: dropped.len(),
