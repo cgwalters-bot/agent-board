@@ -137,6 +137,12 @@ pub(crate) fn status_end(run: u64) -> String {
     format!("\n\n<!-- agentic-job-run: {run} -->\n\n{STATUS_MARKER}")
 }
 const STATUS_REASON: &str = " Its reason:";
+
+/// Whether `body` is agentic-job's status comment without a hand-back
+/// reason, which the run's agent wrote: it says only how a run ended.
+pub(crate) fn is_bare_status(body: &str) -> bool {
+    body.ends_with(STATUS_MARKER) && !body.contains(STATUS_REASON)
+}
 /// agentic-job's policy step refusing a request outside the caller's bounds,
 /// such as a fix on a branch its fix bounds do not name: misdirected work.
 const BOUNDS_REFUSAL: &str = "is not within the bounds";

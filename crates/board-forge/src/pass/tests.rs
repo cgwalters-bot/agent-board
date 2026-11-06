@@ -4959,6 +4959,53 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "completed",
         ),
         (
+            "nor the bot's status comments and dispatch records of other runs",
+            vec![
+                (bot, None, "done", 0),
+                (bot, None, "other-status", 0),
+                (bot, None, "other-dispatch", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; close as completed",
+            false,
+            "completed",
+        ),
+        (
+            "but a visitor's copy of a status comment keeps it open",
+            vec![(bot, None, "done", 0), ("visitor", None, "other-status", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "so does another run's status comment the operator edited",
+            vec![
+                (bot, None, "done", 0),
+                (bot, Some("cgwalters"), "other-status", 0),
+            ],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "or one with its agent's hand-back reason",
+            vec![(bot, None, "done", 0), (bot, None, "other-reason", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
+            "or a bot comment quoting a dispatch marker",
+            vec![(bot, None, "done", 0), (bot, None, "quoted-dispatch", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict done, {answer}; label needs-human, not closed: a comment was posted or edited after this verdict",
+            false,
+            LABEL,
+        ),
+        (
             "needs-operator still asks the operator",
             vec![(bot, None, "needs-operator", 0)],
             (true, None),
@@ -5186,6 +5233,20 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                     let run = epics::record_run(&record).unwrap();
                     format!("Done.{}", crate::supervise::health::status_end(run))
                 }
+                // Another run's, which says only that it ended or started.
+                "other-status" => format!("Done.{}", crate::supervise::health::status_end(99)),
+                "other-dispatch" => format!(
+                    "<!-- {}: 99@abc -->\nThe board pass dispatched another run.",
+                    plan::DISPATCH_MARKER
+                ),
+                "other-reason" => format!(
+                    "Handed back. Its reason: not done, see #9.{}",
+                    crate::supervise::health::status_end(99)
+                ),
+                "quoted-dispatch" => format!(
+                    "Not done yet.\n\n<!-- {}: 99@abc -->",
+                    plan::DISPATCH_MARKER
+                ),
                 text if text.contains(' ') => text.to_owned(),
                 said => verdict(said),
             };
@@ -5264,6 +5325,19 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             wrote(&issue, &answer, held),
             "{name}"
         );
+        // A refused close says why in its hold comment too.
+        if let Some((_, why)) = expected.split_once(", not closed: ") {
+            let hold = (forge.writes.borrow().iter()).find_map(|(_, url, b)| {
+                let body = b["body"].as_str()?;
+                (url.starts_with(&issue) && body.starts_with("<!-- agent-board-hold"))
+                    .then(|| body.to_owned())
+            });
+            assert!(
+                (hold.as_deref())
+                    .is_some_and(|h| h.contains(&format!(" It was not closed: {why}."))),
+                "{name}: {hold:?}"
+            );
+        }
     }
 }
 
