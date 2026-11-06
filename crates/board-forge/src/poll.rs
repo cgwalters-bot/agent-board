@@ -75,7 +75,7 @@ const REVIEW_TEXT_LIMIT: usize = 6000;
 /// A finished fix run's push may not be visible yet.
 const FIX_RUN_GRACE_SECONDS: i64 = 5 * 60;
 /// Longer than a dispatch run may take, for a fix whose run id is unknown.
-const FIX_RUN_TIMEOUT_SECONDS: i64 = 7 * 60 * 60;
+const FIX_RUN_TIMEOUT_SECONDS: i64 = crate::pass::RUN_TIMEOUT_SECONDS;
 /// agentic-job's review status; the review it submits is what is read.
 const REVIEW_CONTEXT: &str = "review";
 /// The user id of `github-actions[bot]`, which submits agentic-job's reviews

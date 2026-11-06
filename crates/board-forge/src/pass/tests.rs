@@ -1016,6 +1016,117 @@ fn runs(n: u64) -> Vec<Value> {
         .collect()
 }
 
+#[test]
+fn overdue_requires_an_active_attempt_with_a_known_old_clock() {
+    let now = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(RUN_TIMEOUT_SECONDS + 1);
+    for (status, start, created, expected) in [
+        ("in_progress", Some("1970-01-01T00:00:00Z"), None, true),
+        ("queued", None, Some("1970-01-01T00:00:00Z"), true),
+        ("completed", Some("1970-01-01T00:00:00Z"), None, false),
+        ("in_progress", None, Some("1970-01-01T00:00:00Z"), false),
+        ("in_progress", Some("bad"), None, false),
+        ("in_progress", Some("1970-01-02T00:00:00Z"), None, false),
+        ("in_progress", Some("1970-01-01T00:00:01Z"), None, false),
+    ] {
+        assert_eq!(
+            overdue(
+                &json!({"status": status, "run_started_at": start, "created_at": created}),
+                now
+            ),
+            expected
+        );
+    }
+}
+
+#[test]
+fn overdue_cleanup_is_opt_in_capped_rechecked_and_does_not_invent_capacity() {
+    for (name, enabled, apply_mode, cap, changed, failure, expected) in [
+        ("off", false, true, 10, false, false, 0),
+        ("preview", true, false, 10, false, false, 0),
+        ("apply", true, true, 10, false, false, 3),
+        ("capped", true, true, 1, false, false, 1),
+        ("zero", true, true, 0, false, false, 0),
+        ("restarted", true, true, 10, true, false, 0),
+        ("completed", true, true, 10, false, false, 0),
+        ("wrong-workflow", true, true, 10, false, false, 0),
+        ("missing-clock", true, true, 10, false, false, 0),
+        ("failed", true, true, 10, false, true, 1),
+    ] {
+        let mut forge = Forge::new(None, false);
+        forge.replay = without_epics(replay());
+        let old = "2026-10-01T00:00:00Z";
+        let active: Vec<_> = (1..=4)
+            .map(|id| {
+                json!({"id": id, "workflow_id": 9,
+            "status": "queued", "created_at": old, "display_title": format!("implement o/r#{id}")})
+            })
+            .collect();
+        in_flight(&mut forge.replay, active.clone());
+        for mut run in active {
+            let id = run["id"].as_u64().unwrap();
+            if changed {
+                run["created_at"] = forge.replay.now.format(&Rfc3339).unwrap().into();
+            }
+            match name {
+                "completed" => run["status"] = "completed".into(),
+                "wrong-workflow" => run["workflow_id"] = 10.into(),
+                "missing-clock" => run["created_at"] = Value::Null,
+                _ => {}
+            }
+            forge.replay.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/{id}")},
+                "answer": {"status": 200, "body": run}}));
+        }
+        if failure {
+            *forge.fail.borrow_mut() = Some("/cancel".into());
+        }
+        let config = config(json!({"reapOverdueRuns": enabled, "wip": 4}));
+        let limits = Limits {
+            writes: Some(cap),
+            dispatch: Some(0),
+            ..Limits::default()
+        };
+        let report = if apply_mode {
+            apply_limited(&forge, &config, limits)
+        } else {
+            preview(&config, &forge.replay)
+        };
+        let writes = forge.writes.borrow();
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(_, url, _)| url.ends_with("/cancel"))
+                .count(),
+            expected,
+            "{name}: {:?}",
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l == "hold wip: 6 of 4 runs active"),
+            "{name}: {:?}",
+            report.lines
+        );
+        assert_eq!(
+            report.failures,
+            usize::from(failure || name == "wrong-workflow"),
+            "{name}: {:?}",
+            report.lines
+        );
+        if enabled && !changed && !failure && name != "wrong-workflow" {
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("1 overdue run(s) deferred")),
+                "{name}: {:?}",
+                report.lines
+            );
+        }
+    }
+}
+
 /// Leases on claude in the dispatch repository of runs `ids`, queued, and
 /// after them an expired one of run 7, with [`Config::leases`] on.
 fn leased(replay: &mut Replay, settings: &mut Value, ids: &[u64]) {
@@ -2318,6 +2429,9 @@ impl Forge {
                 }
             }
             return Ok((200, json!({"html_url": html_url})));
+        }
+        if method == "POST" && path.ends_with("/cancel") {
+            return Ok((202, json!({})));
         }
         if path.ends_with("/dispatches") {
             if let Some(status) = self.dispatch_status {

@@ -243,6 +243,7 @@
     "stall.idleHours": {"verdict": "same"},
     "leases": {"verdict": "native", "forgejo": "contents API blob-sha compare and swap"},
     "reruns": {"verdict": "native", "forgejo": "stage 4's one rerun only; stage 2's are refused with it"},
+    "reapOverdueRuns": {"verdict": "refused", "reason": "overdue dispatch cancellation is only built for GitHub"},
     "starts.breakerRuns": {"verdict": "refused", "reason": "start failures are classified from GitHub job data"},
     "starts.stallAfterMinutes": {"verdict": "refused", "reason": "part of the start breaker"},
     "budget.weeklyUsd": {"verdict": "same"},

@@ -125,6 +125,10 @@ const EXCLUDED_LABELS: &[&str] = &[EPIC_LABEL, "question"];
 const BLOCKED_STATUS: &str = "Blocked";
 /// The run statuses that hold a slot, as the Actions API names them.
 const ACTIVE_RUNS: &[&str] = &["queued", "in_progress", "waiting", "requested", "pending"];
+/// Dispatch runs past this bound are overdue, matching the poll's fix-run timeout.
+pub const RUN_TIMEOUT_SECONDS: i64 = 7 * 60 * 60;
+/// Cleanup must leave request and write headroom for ordinary follow-up.
+const REAP_LIMIT: usize = 3;
 /// How long a run may say `in_progress` before the pass reads its jobs:
 /// GitHub can leave a run so after every job has completed (agent-board#376).
 const STUCK_CHECK_SECONDS: i64 = 60 * 60;
@@ -554,6 +558,9 @@ pub struct Config {
     /// and stage 4's triage and implement runs ([`Scheduler::rerun`]).
     #[serde(default)]
     pub reruns: bool,
+    /// Off unless set: cancel overdue runs of the configured GitHub dispatch workflow.
+    #[serde(default)]
+    pub reap_overdue_runs: bool,
     /// Off unless set: a stage 4 run that failed before its agent started is
     /// re-run once and leaves its plan unspent, a run of such failures stops
     /// stage 4's starts, and a stall raises an alarm ([`starts`]).
@@ -2799,6 +2806,10 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // requests' included, and the next pass if it cannot read the broker.
     bounds.enter(Stage::Usage);
     scheduler.refresh();
+    if let Err(error) = scheduler.reap_overdue(&git_ref) {
+        scheduler.report.failures += 1;
+        scheduler.line(format!("reap error: {error:#}"));
+    }
     // The maintain digest, planned while it is due, which the later stages
     // leave its share for.
     let mut state = state;
@@ -2941,6 +2952,20 @@ fn jobs_ended(client: &impl Rest, repo: &str, run: &Value, now: OffsetDateTime) 
                 && since(last).is_some_and(|s| s > JOBS_SETTLED_SECONDS)
         }
     }
+}
+
+/// A running attempt is timed from its start, queued work from creation.
+/// Missing, malformed or future clocks never authorize cancellation.
+pub(crate) fn overdue(run: &Value, now: OffsetDateTime) -> bool {
+    if !ACTIVE_RUNS.contains(&text(run, "/status")) {
+        return false;
+    }
+    let clock = if run["status"] == "in_progress" {
+        &run["run_started_at"]
+    } else {
+        &run["created_at"]
+    };
+    at(clock).is_some_and(|started| (now - started).whole_seconds() > RUN_TIMEOUT_SECONDS)
 }
 
 /// What one candidate came to.
@@ -3927,6 +3952,75 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// names, by key. A list cut short is an error ([`Self::workflow_runs`]).
     fn runs(&self, target: &Target) -> Result<(BTreeSet<u64>, BTreeMap<String, String>)> {
         self.listed(target).map(|(ids, busy, _)| (ids, busy))
+    }
+
+    /// A stale Actions run must not monopolize WIP forever. Cancellation is
+    /// asynchronous: neither its acknowledgement nor a preview releases a slot.
+    fn reap_overdue(&mut self, git_ref: &str) -> Result<()> {
+        if !self.config.reap_overdue_runs {
+            return Ok(());
+        }
+        let target = self.config.target(git_ref);
+        let mut candidates = BTreeMap::new();
+        for status in ACTIVE_RUNS {
+            let url = format!(
+                "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page={RUNS_PER_PAGE}",
+                target.caller, target.workflow
+            );
+            for run in self.workflow_runs(&url, "overdue dispatch runs")? {
+                if overdue(&run, self.now) {
+                    let id = run["id"].as_u64().context("overdue run has no id")?;
+                    candidates.insert(id, run);
+                }
+            }
+        }
+        let deferred = candidates.len().saturating_sub(REAP_LIMIT);
+        for (id, listed) in candidates.into_iter().take(REAP_LIMIT) {
+            let url = format!("{API_ROOT}repos/{}/actions/runs/{id}", target.caller);
+            let response = self.client.get(&url, None)?;
+            ensure!(
+                response.status == 200,
+                "rechecking overdue run {id}: HTTP {}",
+                response.status
+            );
+            let run = response.body;
+            ensure!(
+                run["id"].as_u64() == Some(id)
+                    && listed["workflow_id"]
+                        .as_u64()
+                        .is_some_and(|workflow| workflow > 0
+                            && run["workflow_id"].as_u64() == Some(workflow)),
+                "overdue run {id}: workflow identity changed or missing"
+            );
+            if !overdue(&run, self.now) {
+                self.line(format!("reap: run {id} is no longer overdue"));
+                continue;
+            }
+            if let Some(why) = self.caps.check(Kind::Write) {
+                self.line(format!("reap: run {id}: {why}"));
+                continue;
+            }
+            self.caps.count(Kind::Write);
+            if !self.apply {
+                self.line(format!(
+                    "reap: would cancel overdue run {id}; a preview does not free its slot"
+                ));
+                continue;
+            }
+            let (status, _) = self
+                .client
+                .send("POST", &format!("{url}/cancel"), &json!({}))?;
+            ensure!(status == 202, "cancelling overdue run {id}: HTTP {status}");
+            self.line(format!(
+                "reap: cancellation requested for overdue run {id}; its slot waits for completion"
+            ));
+        }
+        if deferred > 0 {
+            self.line(format!(
+                "reap: {deferred} overdue run(s) deferred by the {REAP_LIMIT}-run cleanup bound"
+            ));
+        }
+        Ok(())
     }
 
     /// [`Self::runs`], and the pools they name (`KIND OWNER/REPO#N (POOL)`).
