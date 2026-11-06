@@ -1405,6 +1405,7 @@ impl Config {
     /// or without one by the published snapshot.
     pub fn poll(&self, snapshot: Option<&Value>) -> poll::Config {
         let mut policy = PollPolicy {
+            assign_holds: self.assign_holds,
             merge_authors: self.pr.merge_authors.clone(),
             toil_fix_pool: self.pr.toil_fix_pool.clone().unwrap_or_default(),
             conflict_fix_pool: self.pr.conflict_fix_pool.clone().unwrap_or_default(),

@@ -956,9 +956,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let why: String = format!("{error:#}").chars().take(200).collect();
                 self.needs_human(
                     repo,
-                    number,
+                    pull,
                     &marker,
-                    &head,
                     &format!("the run {on} could not be started ({why})"),
                     None,
                 )?;

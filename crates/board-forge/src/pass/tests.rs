@@ -2421,7 +2421,7 @@ impl crate::github::GraphQl for Forge {
 impl Transport for Forge {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         self.failing(&format!("graphql {query}"))?;
-        if query.contains("viewer {") {
+        if query.contains(" viewer {") {
             return Ok(json!({"viewer": {"login": self.login}}));
         }
         if query.starts_with(FRESH_QUERY) {
@@ -5874,6 +5874,7 @@ fn assign_holds_wait_on_the_operator() {
         for board_triage in [true, false] {
             let name = format!("{name} (triaged first: {board_triage})");
             let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true}));
+            assert!(config.poll(None).policy.assign_holds);
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
             if board_triage {
@@ -12941,6 +12942,7 @@ fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, com
         "author": {"__typename": "User", "login": "cgwalters-bot"},
         "headRepositoryOwner": {"login": "cgwalters-bot"},
         "labels": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+        "reviewRequests": {"nodes": [], "pageInfo": {"hasNextPage": false}},
         "closingIssuesReferences": {"nodes": [], "pageInfo": {"hasNextPage": false}},
         "autoMergeRequest": null, "mergeQueueEntry": null,
         "files": {"nodes": [{"path": "README.md"}], "pageInfo": {"hasNextPage": false}},

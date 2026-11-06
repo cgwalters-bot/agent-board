@@ -316,6 +316,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
       author { __typename login }
       headRepositoryOwner { login }
       labels(first: 50) { nodes { name } pageInfo { hasNextPage } }
+      reviewRequests(first: 100) { nodes { requestedReviewer { ... on User { login } } } pageInfo { hasNextPage } }
       comments(last: 100) { nodes { id fullDatabaseId author { __typename login } body createdAt updatedAt } pageInfo { hasPreviousPage } }
       closingIssuesReferences(first: 10) { nodes { number repository { nameWithOwner } labels(first: 50) { nodes { name } pageInfo { hasNextPage } } } pageInfo { hasNextPage } }
       autoMergeRequest { enabledAt }
@@ -608,8 +609,11 @@ pub struct PollPolicy {
     /// it off and starts a round on them ([`comments`]). Off (the default),
     /// only a person taking the label off starts the rounds again.
     pub operator_answers: bool,
-    /// `rebaseRounds`: the rebase rounds of a pull request whose head the
-    /// review approved and whose only failure is a conflict with its base,
+    /// The pass's existing `assignHolds`: request the operator's review instead
+    /// of labelling a stop. Off by default; no standalone poll setting.
+    pub assign_holds: bool,
+    /// `rebaseRounds`: the rebase rounds of a pull request whose
+    /// only failure is a conflict with its base,
     /// counted apart from its fix rounds: a moved base is not the change's
     /// failure (agent-board#109). 0 (the default) charges them as fix rounds.
     pub rebase_rounds: u64,
@@ -1217,6 +1221,7 @@ impl PollPolicy {
             review_dispatch_repositories: Vec::new(),
             draft_review_repositories: Vec::new(),
             // The pass's only.
+            assign_holds: false,
             reruns: false,
             review_caller_workflow: None,
             review_wip: None,
@@ -3077,15 +3082,14 @@ fn conflict_text(base: &str) -> String {
 }
 
 /// The task of a rebase round ([`PollPolicy::rebase_rounds`]): only the
-/// conflict, as the review approved the change, or it is a midstream draft
-/// the review job never reviews, and nothing else failed.
+/// conflict, without claiming approval where there was none.
 pub fn rebase_task(repo: &str, pull: &Value, approved: bool, round: u64, rounds: u64) -> String {
     let head = text(pull, "/headRefOid");
     let number = pull["number"].as_u64().unwrap_or_default();
     let state = if approved {
         "was approved but"
     } else {
-        "is a draft, not approved, and"
+        "is not approved and"
     };
     format!(
         "Pull request {repo}#{number} at head {head} {state} cannot merge as it is. Change nothing but what rebasing it needs. This is rebase round {round} of {rounds}.\n\n{}",
@@ -3405,26 +3409,21 @@ fn started(
         if conclusion != "success"
             || older_than(now, run["updated_at"].as_str(), FIX_RUN_GRACE_SECONDS)
         {
-            // A rebase handback can succeed without publishing its replacement
-            // series. Give it one fresh run, then use the normal bounded fix
-            // budget rather than asking a person to repair the handback.
-            if config.policy.unstall && marker.rebasing && !marker.answering {
-                let (action, round) = if marker.rebased == 1 {
-                    ("rebase", 2)
-                } else if marker.rounds < MAX_FIX_ROUNDS {
-                    ("fix", marker.rounds + 1)
-                } else {
-                    ("needs-human", 0)
+            // A missing replacement is still rebase work, not a review fix.
+            // Retry only within the same configured rebase budget.
+            if config.policy.unstall
+                && marker.rebasing
+                && !marker.answering
+                && marker.rebased < config.policy.rebase_rounds
+            {
+                let round = marker.rebased + 1;
+                return Decision {
+                    round: Some(round),
+                    ..step(
+                        "rebase",
+                        format!("{round} after {url} pushed no new head; fresh rebase run"),
+                    )
                 };
-                if round > 0 {
-                    return Decision {
-                        round: Some(round),
-                        ..step(
-                            action,
-                            format!("{round} after {url} pushed no new head; fresh {action} run"),
-                        )
-                    };
-                }
             }
             let again = match run["run_attempt"].as_u64() {
                 Some(attempt) if attempt > 1 => " again after a rerun",
@@ -3488,6 +3487,9 @@ pub fn decide(
                 partial.join(", ")
             ),
         );
+    }
+    if let Some(reason) = review_hold(config, pull) {
+        return step("skip", reason);
     }
     // `stopped` is what needs-human wrote next to the label, so with the label
     // gone someone took it off: that asks for fresh rounds, on this head too.
@@ -3640,21 +3642,27 @@ pub fn decide(
         if marker.sha.as_deref() == Some(head) {
             return started(config, marker, (fix_run, outages), head, &why, now);
         }
-        // Only a conflict, on a head the review approved: the base moved, and
-        // the change did not fail. Past its own rounds it is a fix as before.
-        // A midstream draft is finished work the review job never reviews
-        // (it skips drafts), so its conflict is rebased unapproved.
+        // A conflict alone is mechanical, even before review. Keep it out of
+        // the review-fix budget, but never retry beyond its own bounded budget.
         let rebases = config.policy.rebase_rounds;
         let conflict_only = failing.len() == 1 && pull["mergeable"] == CONFLICTING;
         let approved = if review == Some(Review::Approved) {
             "approved"
-        } else {
+        } else if midstream {
             "a midstream draft"
+        } else {
+            "not approved"
         };
-        if conflict_only
-            && (midstream || review == Some(Review::Approved))
-            && marker.rebased < rebases
-        {
+        if conflict_only && rebases > 0 {
+            if marker.rebased >= rebases {
+                return step(
+                    "needs-human",
+                    format!(
+                        "{rebases} rebase rounds used and {} still conflicts with {base}",
+                        short(head)
+                    ),
+                );
+            }
             let round = marker.rebased + 1;
             return Decision {
                 action: "rebase",
@@ -3692,7 +3700,11 @@ pub fn decide(
         return Decision {
             action: "fix",
             reason: if reset {
-                format!("{why}; {LABEL} was removed, so the rounds start again")
+                if config.policy.assign_holds {
+                    format!("{why}; the operator hold was released, so the rounds start again")
+                } else {
+                    format!("{why}; {LABEL} was removed, so the rounds start again")
+                }
             } else {
                 why
             },
@@ -4123,7 +4135,11 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
     let approval = format!("labelled {OPERATOR_APPROVAL_LABEL} ");
     match decision.action {
         "needs-human" => Some("needs-human"),
-        "skip" if labelled(pull) || decision.reason.starts_with(LEFT_TO_OPERATOR) => {
+        "skip"
+            if labelled(pull)
+                || decision.reason.starts_with(LEFT_TO_OPERATOR)
+                || decision.reason == "operator review requested" =>
+        {
             Some("needs-human")
         }
         "wait" if decision.reason == WITHHELD_WAIT => Some("withheld"),
@@ -4136,6 +4152,28 @@ fn operator_wait(pull: &Value, decision: &Decision) -> Option<&'static str> {
         "wait" if decision.reason == PROMOTE_WAIT => Some("promote"),
         _ => None,
     }
+}
+
+/// A review request holds all poll paths, including queue and stack recovery.
+/// Missing or partial reads cannot release it and reset the fix budget.
+fn review_hold(config: &Config, pull: &Value) -> Option<&'static str> {
+    if !config.policy.assign_holds {
+        return None;
+    }
+    if pull.pointer("/reviewRequests/pageInfo/hasNextPage") != Some(&Value::Bool(false))
+        || pull
+            .pointer("/reviewRequests/nodes")
+            .and_then(Value::as_array)
+            .is_none()
+    {
+        return Some("operator review requests not read whole");
+    }
+    nodes(pull, "/reviewRequests/nodes")
+        .iter()
+        .any(|request| {
+            text(request, "/requestedReviewer/login").eq_ignore_ascii_case(&config.operator)
+        })
+        .then_some("operator review requested")
 }
 
 fn approval_only(pull: &Value, checks: &Checks, run: Option<&Value>, config: &Config) -> bool {
@@ -4574,35 +4612,51 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         Ok(())
     }
 
-    /// The label, then a stopped marker. In that order a pass that dies
-    /// between them leaves the label without the stop, which a human's removal
-    /// does not take as a reset (the next pass stops it again); the other way
-    /// round, a stop without the label would read as a reset nobody asked for.
+    /// The label or review request, then a stopped marker. A pass that dies
+    /// between them leaves a hold without a stop; releasing that hold does
+    /// not reset the rounds. A stop without its hold would instead read as a
+    /// reset nobody asked for.
     fn needs_human(
         &mut self,
         repo: &str,
-        number: u64,
+        pull: &Value,
         marker: &Marker,
-        head: &str,
         reason: &str,
         excerpt: Option<&str>,
     ) -> Result<()> {
+        let number = pull["number"]
+            .as_u64()
+            .context("pull request has no number")?;
+        let head = text(pull, "/headRefOid");
         let rest = self.rest;
-        // 422: the label exists already.
-        self.send(
+        // GitHub rejects review requests on drafts. Keep their existing label
+        // hold rather than marking unfinished work ready or losing the stop.
+        let request_review = self.config.policy.assign_holds && pull["isDraft"] != true;
+        if request_review {
+            self.send(
+                rest,
+                "POST",
+                &format!("repos/{repo}/pulls/{number}/requested_reviewers"),
+                json!({"reviewers": [self.config.operator]}),
+                0,
+            )?;
+        } else {
+            // 422: the label exists already.
+            self.send(
             rest,
             "POST",
             &format!("repos/{repo}/labels"),
             json!({"name": LABEL, "color": "d93f0b", "description": "The poll stopped here; a person decides what is next"}),
             422,
         )?;
-        self.send(
-            rest,
-            "POST",
-            &format!("repos/{repo}/issues/{number}/labels"),
-            json!({"labels": [LABEL]}),
-            0,
-        )?;
+            self.send(
+                rest,
+                "POST",
+                &format!("repos/{repo}/issues/{number}/labels"),
+                json!({"labels": [LABEL]}),
+                0,
+            )?;
+        }
         // A reset starts afresh. Keep the stopped head as evidence for the
         // supervisor's conflict-only hold removal, not as a running round.
         // Of the queue keep only the removal, which a reset does not redo.
@@ -4621,9 +4675,17 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }),
             ..Marker::default()
         };
-        let mut text = format!(
-            "The poll stopped following this pull request: {reason}. It is labelled `{LABEL}`; remove the label to have the poll start again on it, with fresh fix rounds."
-        );
+        let release = if request_review {
+            format!(
+                "{}'s review is requested; submit a review or remove the request to have the poll start again on it, with fresh fix rounds.",
+                self.config.operator
+            )
+        } else {
+            format!(
+                "It is labelled `{LABEL}`; remove the label to have the poll start again on it, with fresh fix rounds."
+            )
+        };
+        let mut text = format!("The poll stopped following this pull request: {reason}. {release}");
         // CI output, fenced so that nothing in it renders, mentions or links;
         // without its backticks, it cannot close the fence either, and
         // without `<!--`, it cannot carry a marker or claim of the bot's.
@@ -4634,6 +4696,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             ));
         }
         self.post_marker(repo, number, &mut stop, &text, None)
+    }
+
+    fn human_wait(&self, pull: &Value) -> String {
+        if self.config.policy.assign_holds && pull["isDraft"] != true {
+            format!("requested {}'s review", self.config.operator)
+        } else {
+            format!("labelled {LABEL}")
+        }
     }
 
     /// A claim on starting fix round `round` from a marker comment: this
@@ -4911,13 +4981,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             Err((id, at)) if older_than(self.now, at.as_deref(), FIX_RUN_TIMEOUT_SECONDS) => {
                 self.needs_human(
                     repo,
-                    number,
+                    pull,
                     marker,
-                    head,
                     &format!("{name} was claimed in comment {id} and never recorded"),
                     None,
                 )?;
-                return Ok(format!("labelled {LABEL}"));
+                return Ok(self.human_wait(pull));
             }
             Err((id, _)) => {
                 return Ok(format!(
@@ -5001,9 +5070,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 let why: String = format!("{error:#}").chars().take(200).collect();
                 self.needs_human(
                     repo,
-                    number,
+                    pull,
                     &marker,
-                    head,
                     &format!("the fix run could not be started ({why})"),
                     None,
                 )?;
@@ -5138,13 +5206,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     {
                         self.needs_human(
                             repo,
-                            number,
+                            pull,
                             marker,
-                            head,
                             &format!("the refund of {round} lost to comment {id}'s claim, which was never recorded"),
                             None,
                         )?;
-                        return Ok(Some(format!("labelled {LABEL}")));
+                        return Ok(Some(self.human_wait(pull)));
                     }
                     Err((id, _)) => {
                         return Ok(Some(format!(
@@ -5165,8 +5232,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "update" => self.update(repo, pull, "not rebased: ").map(Some),
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
-                self.needs_human(repo, number, marker, head, &decision.reason, excerpt)?;
-                Ok(Some(format!("labelled {LABEL}")))
+                self.needs_human(repo, pull, marker, &decision.reason, excerpt)?;
+                Ok(Some(self.human_wait(pull)))
             }
             // The bot's own pull request, so its token may edit it. Not pinned
             // to the head, which an edit cannot be: a push after the read
@@ -6802,14 +6869,25 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         merge_only: bool,
         (listed, label): (&Value, &str),
     ) -> (String, bool, Option<Wait>, Option<Stepped>) {
-        let head = text(listed, "/headRefOid");
         let reason = format!("labelled {label}");
+        self.person_skip(repo, number, merge_only, listed, &reason)
+    }
+
+    fn person_skip(
+        &self,
+        repo: &str,
+        number: u64,
+        merge_only: bool,
+        listed: &Value,
+        reason: &str,
+    ) -> (String, bool, Option<Wait>, Option<Stepped>) {
+        let head = text(listed, "/headRefOid");
         let wait = Wait {
             repository: repo.to_owned(),
             number,
             head: head.to_owned(),
             kind: "needs-human",
-            reason: needs_you_reason(listed, &reason),
+            reason: needs_you_reason(listed, reason),
             review_bucket: None,
             approval: None,
         };
@@ -6818,7 +6896,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             number,
             head: head.to_owned(),
             action: "skip",
-            reason: reason.clone(),
+            reason: reason.to_owned(),
             ran: self.apply.is_none(),
             moved_at: moved_at(listed),
             waiting: WaitReason::Person,
@@ -6974,6 +7052,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 None,
                 None,
             ));
+        }
+        if text(&pull, "/author/login") == self.config.bot
+            && let Some(reason) = review_hold(self.config, &pull)
+        {
+            return Ok(self.person_skip(repo, number, merge_only, &pull, reason));
         }
         if drafts::eligible(self.config, repo, &pull) {
             return self.draft_review(repo, &mut pull, &comments, &marker, intake);
@@ -7341,14 +7424,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // The hold is read again just before the step's first write: one put
         // on since the read above stops it too.
         let hold = if self.apply.is_some() && kind.is_some() && !capped && !deferred {
-            self.read_pull(owner, name, number).map(|p| is_held(&p))
+            self.read_pull(owner, name, number).map(|p| {
+                if is_held(&p) {
+                    Some(format!("labelled {HOLD_LABEL}"))
+                } else {
+                    review_hold(self.config, &p).map(str::to_owned)
+                }
+            })
         } else {
-            Ok(false)
+            Ok(None)
         };
         let done = match (&self.apply, &retarget, &stale) {
             _ if capped || deferred => Ok(held),
-            _ if !matches!(hold, Ok(false)) => {
-                hold.map(|_| Some(format!("not taken: labelled {HOLD_LABEL}")))
+            _ if !matches!(hold, Ok(None)) => {
+                hold.map(|reason| reason.map(|reason| format!("not taken: {reason}")))
             }
             (Some(_), _, _) if !answer.is_empty() => self
                 .answer_round(repo, &pull, (&marker, &comments), (&answer, &labelled_by))
@@ -8098,6 +8187,7 @@ mod tests {
         p["baseRefName"] = "main".into();
         // And `state`: they were recorded open.
         p["state"] = "OPEN".into();
+        p["reviewRequests"] = json!({"nodes": [], "pageInfo": {"hasNextPage": false}});
         let mut change = change.as_object().cloned().unwrap_or_default();
         let contexts = change.remove("contexts");
         let truncated = change.remove("truncated");
@@ -8397,13 +8487,13 @@ mod tests {
                 Some(2),
             ),
             (
-                "rebase rounds used, an approved conflict is a fix round",
+                "rebase rounds used, an approved conflict stops without spending fix rounds",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "policy": rebase.clone()}),
                 json!({"rounds": 0, "rebased": 2, "sha": "older"}),
                 none.clone(),
-                "fix",
-                Some(1),
+                "needs-human",
+                None,
             ),
             (
                 "a marker's rebase count past the cap reads as the cap",
@@ -8424,12 +8514,12 @@ mod tests {
                 None,
             ),
             (
-                "a conflict with no verdict is not a rebase round",
+                "a conflict with no verdict is a rebase round",
                 "pull-470",
                 json!({"mergeable": CONFLICTING, "contexts": {"review": null}, "policy": rebase.clone()}),
                 json!({"rounds": 0}),
                 none.clone(),
-                "fix",
+                "rebase",
                 Some(1),
             ),
             (
@@ -11217,6 +11307,7 @@ mod tests {
         /// How many reads of `PULL_QUERY` come before a person puts the hold
         /// on, if one does.
         hold_after: Option<usize>,
+        late_review_requests: Option<Value>,
         pull_reads: RefCell<usize>,
         /// The `mergeQueue` the report's query gives, null for a read that
         /// fails; none gives a repository without a merge queue.
@@ -11392,6 +11483,11 @@ mod tests {
                 && let Some(labels) = pull["labels"]["nodes"].as_array_mut()
             {
                 labels.push(json!({"name": "Hold"}));
+            }
+            if *self.pull_reads.borrow() > 1
+                && let Some(requests) = &self.late_review_requests
+            {
+                pull["reviewRequests"] = requests.clone();
             }
             Ok(json!({"repository": {"pullRequest": pull}}))
         }
@@ -12574,7 +12670,7 @@ mod tests {
     }
 
     /// The review job skips drafts, so a midstream one's conflict is rebased
-    /// unapproved, within the rebase rounds; elsewhere it is a fix round.
+    /// unapproved, within the rebase rounds, as elsewhere.
     #[test]
     fn a_conflicting_midstream_draft_is_rebased_unapproved() {
         let p = pull(
@@ -12582,7 +12678,14 @@ mod tests {
             json!({"isDraft": true, "mergeable": CONFLICTING, "contexts": {"review": null}}),
         );
         for (repositories, rebased, want) in [
-            (vec![], 0, ("fix", "conflicts with main")),
+            (
+                vec![],
+                0,
+                (
+                    "rebase",
+                    "conflicts with main; not approved, so rebase round 1 of 2",
+                ),
+            ),
             (
                 vec![REPO.to_owned()],
                 0,
@@ -12591,7 +12694,14 @@ mod tests {
                     "conflicts with main; a midstream draft, so rebase round 1 of 2",
                 ),
             ),
-            (vec![REPO.to_owned()], 2, ("fix", "conflicts with main")),
+            (
+                vec![REPO.to_owned()],
+                2,
+                (
+                    "needs-human",
+                    "2 rebase rounds used and 488f45ebacd0 still conflicts with main",
+                ),
+            ),
         ] {
             let mut cfg = config();
             cfg.policy.rebase_rounds = 2;
@@ -12635,10 +12745,7 @@ mod tests {
             .first()
             .and_then(|(_, request)| request["inputs"]["task"].as_str())
             .unwrap_or_else(|| panic!("no dispatch: {:?}", outcome.lines));
-        assert!(
-            task.contains("is a draft, not approved, and cannot merge"),
-            "{task}"
-        );
+        assert!(task.contains("is not approved and cannot merge"), "{task}");
         assert!(!task.contains("was approved"), "{task}");
         assert!(task.contains("This is rebase round 1 of 2."), "{task}");
     }
@@ -13234,35 +13341,45 @@ mod tests {
         // it wrote: the pull request as that pass reads it, the step it takes,
         // and the count its marker records (a retitle writes the title, not
         // a marker, and ends the case).
-        for (name, start, passes) in [
+        for (name, start, rebases, passes) in [
             (
                 "placeholder",
                 json!({}),
+                2,
                 vec![(placeholder, "continue", ("continued", 1))],
             ),
             (
                 "partial",
                 json!({}),
+                2,
                 vec![(
                     json!({"title":"[partial: timeout] first half"}),
                     "continue",
                     ("continued", 1),
                 )],
             ),
-            // A rebase run that pushed no head: one fresh rebase run, and when
-            // that pushes none either, a fix round, not a person.
+            // A missing head retries only within the rebase budget, never as
+            // a review fix, including when the configured cap is just one.
             (
                 "no-head rebase retried then escalated",
                 json!({"rebased":1,"rebasing":true,"sha":HEAD,"run":7}),
+                2,
                 vec![
                     (conflicting.clone(), "rebase", ("rebased", 2)),
-                    (conflicting, "fix", ("rounds", 1)),
+                    (conflicting.clone(), "needs-human", ("rounds", 0)),
                 ],
+            ),
+            (
+                "no-head rebase stops at cap one",
+                json!({"rebased":1,"rebasing":true,"sha":HEAD,"run":7}),
+                1,
+                vec![(conflicting, "needs-human", ("rounds", 0))],
             ),
             // A continuation, then its finished head retitled from its commit.
             (
                 "continued to its retitle",
                 json!({}),
+                2,
                 vec![
                     (unfinished, "continue", ("continued", 1)),
                     (finished, "retitle", ("", 0)),
@@ -13294,7 +13411,7 @@ mod tests {
                 );
                 let mut cfg = config();
                 cfg.policy.unstall = true;
-                cfg.policy.rebase_rounds = 1;
+                cfg.policy.rebase_rounds = rebases;
                 let dispatcher = Fake::default();
                 dispatcher.answers.borrow_mut().insert(
                     DISPATCHES.into(),
@@ -13328,14 +13445,22 @@ mod tests {
                     );
                     continue;
                 }
-                assert_eq!(dispatcher.writes.borrow().len(), 1, "{name}");
+                assert_eq!(
+                    dispatcher.writes.borrow().len(),
+                    usize::from(action != "needs-human"),
+                    "{name}"
+                );
                 state = writes
                     .iter()
                     .filter_map(|(_, b)| parse_marker(MARKER, b["body"].as_str()?))
                     .next_back()
                     .unwrap_or_else(|| panic!("{name}: no marker in {writes:?}"));
                 assert_eq!(state[key], count, "{name}: {state}");
-                assert_eq!(state["run"], run_id + 1, "{name}: {state}");
+                if action == "needs-human" {
+                    assert_eq!(state["stopped"], true, "{name}: {state}");
+                } else {
+                    assert_eq!(state["run"], run_id + 1, "{name}: {state}");
+                }
             }
         }
     }
@@ -16296,6 +16421,219 @@ mod tests {
                 .any(|(url, _)| url.contains("/actions/jobs/")),
             "a job was read"
         );
+    }
+
+    #[test]
+    fn conflict_only_rebases_do_not_need_approval_or_spend_fix_rounds() {
+        for rounds in [0, MAX_FIX_ROUNDS] {
+            let (line, fake, dispatcher) = applied_with(
+                json!({"rebaseRounds": 2}),
+                json!({"mergeable": CONFLICTING, "contexts": {"review": null}}),
+                json!({"rounds": rounds, "rebased": 1, "sha": "older"}),
+            );
+            assert!(
+                line.contains("rebase: conflicts with main; not approved, so rebase round 2 of 2"),
+                "{line}"
+            );
+            let writes = fake.writes.borrow();
+            let next = find_marker(
+                &[json!({"id": 99, "user": {"login": BOT}, "body": writes[1].1["body"]})],
+                BOT,
+            );
+            assert_eq!(
+                (next.rounds, next.rebased, next.rebasing),
+                (rounds, 2, true)
+            );
+            let task = dispatcher.writes.borrow()[0].1["inputs"]["task"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(task.contains("is not approved and cannot merge"), "{task}");
+            assert!(!task.contains("was approved"), "{task}");
+        }
+    }
+
+    #[test]
+    fn assign_holds_keeps_a_supported_hold_on_exhausted_drafts() {
+        let fake = github();
+        // Model GitHub's draft restriction; the producer must not call it.
+        fake.answers.borrow_mut().insert(
+            format!("{API_ROOT}repos/{REPO}/pulls/470/requested_reviewers"),
+            vec![(
+                422,
+                json!({"message": "draft pull requests cannot request reviews"}),
+            )],
+        );
+        let (outcome, fake, dispatcher) = applied_policy(
+            fake,
+            PollPolicy {
+                assign_holds: true,
+                ..PollPolicy::default()
+            },
+            json!({"isDraft": true, "body": checkpointed("budget"), "contexts": {"review": null}}),
+            json!({"rounds": 0, "continued": CONTINUATION_ROUNDS, "sha": "older"}),
+        );
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome
+                .lines
+                .last()
+                .unwrap()
+                .ends_with("-> labelled needs-human"),
+            "{:?}",
+            outcome.lines
+        );
+        assert!(dispatcher.writes.borrow().is_empty());
+        let writes = fake.writes.borrow();
+        assert_eq!(writes.len(), 3);
+        assert!(
+            !writes
+                .iter()
+                .any(|(url, _)| url.ends_with("/requested_reviewers"))
+        );
+        assert_eq!(
+            parse_marker(MARKER, text(&writes[2].1, "/body")).unwrap()["stopped"],
+            true
+        );
+    }
+
+    #[test]
+    fn review_requests_added_before_a_write_hold_the_step() {
+        for requests in [
+            json!({"nodes": [{"requestedReviewer": {"login": "cgwalters"}}], "pageInfo": {"hasNextPage": false}}),
+            json!({"nodes": [], "pageInfo": {"hasNextPage": true}}),
+            Value::Null,
+        ] {
+            for (change, state) in [
+                (json!({}), json!({})),
+                (
+                    json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                    json!({"rounds": 0}),
+                ),
+                (
+                    json!({"contexts": {"ci": {"conclusion": "FAILURE"}}}),
+                    json!({"rounds": 2}),
+                ),
+            ] {
+                let fake = Fake {
+                    late_review_requests: Some(requests.clone()),
+                    ..github()
+                };
+                let policy = PollPolicy {
+                    assign_holds: true,
+                    ..PollPolicy::default()
+                };
+                let (outcome, fake, dispatcher) = applied_policy(fake, policy, change, state);
+                assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+                assert!(
+                    outcome
+                        .lines
+                        .last()
+                        .unwrap()
+                        .contains("-> not taken: operator review"),
+                    "{:?}",
+                    outcome.lines
+                );
+                assert!(fake.writes.borrow().is_empty());
+                assert!(dispatcher.writes.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn assign_holds_requests_review_and_waits_until_it_is_released() {
+        let policy = PollPolicy {
+            assign_holds: true,
+            ..PollPolicy::default()
+        };
+        let state = json!({"rounds": 2, "sha": "older"});
+        let failed = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
+        let (outcome, fake, dispatcher) =
+            applied_policy(github(), policy.clone(), failed.clone(), state);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome
+                .lines
+                .last()
+                .unwrap()
+                .ends_with("-> requested cgwalters's review"),
+            "{:?}",
+            outcome.lines
+        );
+        assert!(dispatcher.writes.borrow().is_empty());
+        let writes = fake.writes.borrow();
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        assert!(writes[0].0.ends_with("/pulls/470/requested_reviewers"));
+        assert_eq!(writes[0].1, json!({"reviewers": ["cgwalters"]}));
+        let stop = text(&writes[1].1, "/body");
+        assert!(
+            stop.contains("submit a review or remove the request"),
+            "{stop}"
+        );
+        let stopped = parse_marker(MARKER, stop).unwrap();
+        assert_eq!(stopped["stopped"], true);
+        assert!(!stop.contains("It is labelled"), "{stop}");
+        drop(writes);
+
+        for (requests, held) in [
+            (
+                json!({"nodes": [{"requestedReviewer": {"login": "CGWalters"}}], "pageInfo": {"hasNextPage": false}}),
+                true,
+            ),
+            (
+                json!({"nodes": [], "pageInfo": {"hasNextPage": true}}),
+                true,
+            ),
+            (Value::Null, true),
+            (json!({"pageInfo": {"hasNextPage": false}}), true),
+            (
+                json!({"nodes": [], "pageInfo": {"hasNextPage": false}}),
+                false,
+            ),
+            (
+                json!({"nodes": [{"requestedReviewer": {"login": "someone-else"}}], "pageInfo": {"hasNextPage": false}}),
+                false,
+            ),
+        ] {
+            let mut change = failed.clone();
+            change["reviewRequests"] = requests;
+            let (outcome, fake, dispatcher) =
+                applied_policy(github(), policy.clone(), change, stopped.clone());
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            if held {
+                assert!(
+                    outcome
+                        .lines
+                        .last()
+                        .unwrap()
+                        .contains(" skip: operator review"),
+                    "{:?}",
+                    outcome.lines
+                );
+                assert!(fake.writes.borrow().is_empty());
+                assert!(dispatcher.writes.borrow().is_empty());
+                assert_eq!(outcome.waits.len(), 1);
+            } else {
+                assert_eq!(dispatcher.writes.borrow().len(), 1, "{:?}", outcome.lines);
+                assert!(
+                    outcome.lines.last().unwrap().contains(" fix:"),
+                    "{:?}",
+                    outcome.lines
+                );
+            }
+        }
+
+        // A refused request must not publish a stop that looks released.
+        let fake = github();
+        fake.answers.borrow_mut().insert(
+            format!("{API_ROOT}repos/{REPO}/pulls/470/requested_reviewers"),
+            vec![(403, json!({"message": "forbidden"}))],
+        );
+        let (outcome, fake, dispatcher) =
+            applied_policy(fake, policy, failed, json!({"rounds": 2, "sha": "older"}));
+        assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+        assert_eq!(fake.writes.borrow().len(), 1);
+        assert!(dispatcher.writes.borrow().is_empty());
     }
 
     #[test]
