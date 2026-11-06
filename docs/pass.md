@@ -308,13 +308,18 @@ Every followed or work repository has a section. PR kinds are `fix`,
 `held`. `taken` distinguishes decisions executed (or previewed) this pass
 from work left by caps or admission. `head` binds PR observations to the
 head read. `accepted-plan` entries have `plan_kind`; issue and epic holds
-have `hold_kind`, `reason`, `operator` and `carried`. Global holds remain in
+have `hold_kind`, `reason`, `operator` and `carried`. A held issue whose plan
+stage 4 accepted stays one `held` entry that keeps `plan_kind`, and is
+counted under both `held` and `accepted-plan`, so `counts` can sum past
+`count`. Global holds remain in
 the enclosing `holds` array. Counts include every observed entry before
 the limit; at most 200 entries total are included, with each repository's
 `omitted` count. Reasons are clipped to 500 characters. Repositories and
 item identities sort deterministically.
 
-`reviews_complete` is false for an unread or partly decided repository.
+`reviews_complete` is true only for a followed repository that stage 2 read
+and decided; it is false for an unread or partly decided one, and for a work
+repository that is not followed, whose pull requests stage 2 does not read.
 `issues_complete` is currently always false: stage 4 can stop before reading
 plans at WIP, pool or request limits. Accepted plans are those the existing
 schedule reads and admits by scope, not a census of every issue with a plan.

@@ -46,7 +46,10 @@ marker job/step signatures and a fix PR in the same repository:
 
 At most 20 declarations, each with at most the existing queue job bound, are
 accepted. Only recorded repeated failures or exhausted retries qualify; all
-recorded failed signatures must match one declaration. An open fix holds as
+recorded failed signatures must match one declaration, and a recorded list
+that fills the queue job bound (20) is not matched: it may have been cut, in
+this pass or in a marker written before, and the job left out may be a real
+failure, so the removal keeps normal handling. An open fix holds as
 machine work. Its merge must be read from GitHub, onto this PR's base branch,
 after the removal. Then the head gets one recovery, recorded before enqueue
 in `queue.flake_retried`; it cannot reset again at that head. Unknown jobs,

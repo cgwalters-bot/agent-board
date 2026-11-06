@@ -6125,8 +6125,12 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         state: &mut QueueState,
     ) -> Result<Option<Removal>> {
         let latest = nodes(pull, "/timelineItems/nodes").last();
+        // A full list may have been cut at its bound, now or in a marker
+        // written before; a failed job left out of it is not known to be
+        // the flake.
         if state.flake_retried
             || state.jobs.is_empty()
+            || state.jobs.len() >= QUEUE_JOBS_LIMIT
             || (state.failed.is_none()
                 && state.tries < self.config.policy.merge_queue.unwrap_or(QUEUE_TRIES))
             || !latest.is_some_and(|e| {
@@ -13046,6 +13050,15 @@ mod tests {
                 "fix",
             ),
             ("already recovered", json!({}), true, "failed_checks", "fix"),
+            // The recorded failures fill their bound, so a failed job may
+            // have been cut from them: not known to be the flake.
+            (
+                "truncated",
+                json!({"merged":true,"merged_at":"2026-10-12T01:45:00Z","base":{"ref":"main"}}),
+                false,
+                "failed_checks",
+                "fix",
+            ),
             (
                 "human removal",
                 json!({}),
@@ -13079,7 +13092,14 @@ mod tests {
                 edit["title"] = "Agent run 123".into();
             }
             fake.pulls.insert(470, pull("pull-470", edit));
-            let state = json!({"rounds":0,"queue":{"head":HEAD,"seen":"R1","tries":3,"jobs":[JOB],"failed":format!("merge queue {JOB}"),"since":"2026-10-12T01:30:00Z","flake_retried":consumed,"queued":HEAD}});
+            // Every job named is declared, as the marker would read.
+            let jobs = match name {
+                "truncated" => (0..QUEUE_JOBS_LIMIT)
+                    .map(|n| format!("{JOB} {n}"))
+                    .collect::<Vec<_>>(),
+                _ => vec![JOB.into()],
+            };
+            let state = json!({"rounds":0,"queue":{"head":HEAD,"seen":"R1","tries":3,"jobs":jobs,"failed":format!("merge queue {}", jobs[0]),"since":"2026-10-12T01:30:00Z","flake_retried":consumed,"queued":HEAD}});
             fake.page(
                 &format!("repos/{REPO}/issues/470/comments?per_page=100"),
                 None,
@@ -13093,7 +13113,7 @@ mod tests {
             cfg.policy.fixed_flakes = vec![FlakeFix {
                 repository: REPO.into(),
                 number: 99,
-                jobs: vec![JOB.into()],
+                jobs: jobs.clone(),
             }];
             let dispatcher = Fake::default();
             let out = run(
@@ -13141,83 +13161,129 @@ mod tests {
 
     #[test]
     fn unstall_dispatches_unfinished_work_and_no_head_rebases() {
-        for (name, edit, mut state, action, round) in [
+        let conflicting = json!({"mergeable":"CONFLICTING"});
+        let placeholder = json!({"title":"Agent run 123"});
+        // The placeholder at an older head, then the head its continuation
+        // pushed, whose commit says what the whole pull request does,
+        // approved and green.
+        let at_head = |head: &str, message: &str| {
+            let mut commits = pull("pull-470", json!({}))["commits"].clone();
+            commits["nodes"][0]["commit"]["oid"] = head.into();
+            commits["nodes"][0]["commit"]["message"] = message.into();
+            json!({"title": "Agent run 123", "headRefOid": head, "commits": commits})
+        };
+        let unfinished = at_head(&"1".repeat(40), "wip");
+        let finished = at_head(
+            HEAD,
+            "docs: Explain the exemption\n\nThe review relies on it.\n",
+        );
+        // Each case is passes in turn, each reading the marker the pass before
+        // it wrote: the pull request as that pass reads it, the step it takes,
+        // and the count its marker records (a retitle writes the title, not
+        // a marker, and ends the case).
+        for (name, start, passes) in [
             (
                 "placeholder",
-                json!({"title":"Agent run 123"}),
                 json!({}),
-                "continue",
-                1,
+                vec![(placeholder, "continue", ("continued", 1))],
             ),
             (
                 "partial",
-                json!({"title":"[partial: timeout] first half"}),
                 json!({}),
-                "continue",
-                1,
+                vec![(
+                    json!({"title":"[partial: timeout] first half"}),
+                    "continue",
+                    ("continued", 1),
+                )],
             ),
+            // A rebase run that pushed no head: one fresh rebase run, and when
+            // that pushes none either, a fix round, not a person.
             (
-                "retry rebase",
-                json!({"mergeable":"CONFLICTING"}),
+                "no-head rebase retried then escalated",
                 json!({"rebased":1,"rebasing":true,"sha":HEAD,"run":7}),
-                "rebase",
-                2,
+                vec![
+                    (conflicting.clone(), "rebase", ("rebased", 2)),
+                    (conflicting, "fix", ("rounds", 1)),
+                ],
             ),
+            // A continuation, then its finished head retitled from its commit.
             (
-                "escalate rebase",
-                json!({"mergeable":"CONFLICTING"}),
-                json!({"rebased":2,"rebasing":true,"sha":HEAD,"run":7}),
-                "fix",
-                1,
+                "continued to its retitle",
+                json!({}),
+                vec![
+                    (unfinished, "continue", ("continued", 1)),
+                    (finished, "retitle", ("", 0)),
+                ],
             ),
         ] {
-            state["rounds"] = 0.into();
-            let mut fake = github();
-            fake.pulls.insert(470, pull("pull-470", edit));
-            fake.page(
-                &format!("repos/{REPO}/issues/470/comments?per_page=100"),
-                None,
-                None,
-                json!([{"id":5,"user":{"login":BOT},"body":marker_body(&state,"old")} ]),
-            );
-            fake.page("repos/cgwalters-forge/tracker/actions/runs/7", None, None,
-                json!({"status":"completed","conclusion":"success","run_attempt":1,"updated_at":"2026-10-12T01:00:00Z"}));
-            let mut cfg = config();
-            cfg.policy.unstall = true;
-            cfg.policy.rebase_rounds = 1;
-            let dispatcher = Fake::default();
-            let out = run(
-                &fake,
-                &fake,
-                &cfg,
-                State::default(),
-                &[],
-                &[REPO.into()],
-                applying(&dispatcher),
-                now(),
-            )
-            .unwrap();
-            assert_eq!(out.errors, 0, "{name}: {:?}", out.lines);
-            assert!(
-                out.steps.iter().any(|s| s.action == action && s.ran),
-                "{name}: {:?}",
-                out.steps
-            );
-            assert_eq!(dispatcher.writes.borrow().len(), 1, "{name}");
-            let key = match action {
-                "continue" => "continued",
-                "rebase" => "rebased",
-                _ => "rounds",
-            };
-            assert!(
-                fake.writes
-                    .borrow()
+            let mut state = start;
+            state["rounds"] = state["rounds"].as_u64().unwrap_or(0).into();
+            for (pass, (edit, action, (key, count))) in passes.into_iter().enumerate() {
+                let name = format!("{name}, pass {}", pass + 1);
+                let at = now() + time::Duration::hours(pass as i64);
+                let mut fake = github();
+                fake.pulls.insert(470, pull("pull-470", edit.clone()));
+                fake.page(
+                    &format!("repos/{REPO}/issues/470/comments?per_page=100"),
+                    None,
+                    None,
+                    json!([{"id":5,"user":{"login":BOT},"body":marker_body(&state,"old")} ]),
+                );
+                // The run the marker names ended, well past the grace for its
+                // push to show, without pushing.
+                let run_id = state["run"].as_u64().unwrap_or(7);
+                fake.page(
+                    &format!("repos/cgwalters-forge/tracker/actions/runs/{run_id}"),
+                    None,
+                    None,
+                    json!({"status":"completed","conclusion":"success","run_attempt":1,
+                        "updated_at":(at - time::Duration::hours(1)).format(&Rfc3339).unwrap()}),
+                );
+                let mut cfg = config();
+                cfg.policy.unstall = true;
+                cfg.policy.rebase_rounds = 1;
+                let dispatcher = Fake::default();
+                dispatcher.answers.borrow_mut().insert(
+                    DISPATCHES.into(),
+                    vec![(200, json!({"workflow_run_id": run_id + 1}))],
+                );
+                let out = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    applying(&dispatcher),
+                    at,
+                )
+                .unwrap();
+                assert_eq!(out.errors, 0, "{name}: {:?}", out.lines);
+                assert!(
+                    out.steps.iter().any(|s| s.action == action && s.ran),
+                    "{name}: {:?}",
+                    out.steps
+                );
+                let writes = fake.writes.borrow();
+                if action == "retitle" {
+                    assert!(dispatcher.writes.borrow().is_empty(), "{name}");
+                    assert!(
+                        writes.iter().any(|(w, b)| w.starts_with("PATCH")
+                            && w.ends_with("/pulls/470")
+                            && b["title"] == "docs: Explain the exemption"),
+                        "{name}: {writes:?}"
+                    );
+                    continue;
+                }
+                assert_eq!(dispatcher.writes.borrow().len(), 1, "{name}");
+                state = writes
                     .iter()
                     .filter_map(|(_, b)| parse_marker(MARKER, b["body"].as_str()?))
-                    .any(|m| m[key] == round),
-                "{name}: {:?}",
-                fake.writes.borrow()
-            );
+                    .next_back()
+                    .unwrap_or_else(|| panic!("{name}: no marker in {writes:?}"));
+                assert_eq!(state[key], count, "{name}: {state}");
+                assert_eq!(state["run"], run_id + 1, "{name}: {state}");
+            }
         }
     }
 
