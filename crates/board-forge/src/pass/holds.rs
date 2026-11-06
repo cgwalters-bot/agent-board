@@ -1586,9 +1586,29 @@ fn context(snapshot: &Snapshot, previous: Option<&Value>, observed: &Observed) -
 }
 
 impl NeedsYou {
+    /// Whether the card `ask` is an actionable approval: a descriptor of its
+    /// own offers the supported review at its full head. Only the descriptor
+    /// says so, never the card's path or kind alone.
+    fn actionable_approval(&self, ask: &Ask) -> bool {
+        ask.action.kind == RefKind::ApprovePullRequest
+            && (ask.action.head.as_deref()).is_some_and(full_head)
+            && ask.head == ask.action.head
+            && self.requests.iter().any(|r| {
+                r.key == ask.key
+                    && r.target == ask.action
+                    && (r.actions.iter()).any(|a| a.kind == requests::REVIEW_AT_HEAD && a.supported)
+            })
+    }
+
     /// Evicts detail only; the complete identity inventory stays intact.
+    /// The lowest ranked card goes, actionable approvals
+    /// ([`Self::actionable_approval`]) only once no other card is left, so
+    /// that the rest keep Priority, then age, order.
     fn cut(&mut self) -> Option<Ask> {
-        let ask = self.items.pop()?;
+        let at = (self.items.iter())
+            .rposition(|a| !self.actionable_approval(a))
+            .or_else(|| self.items.len().checked_sub(1))?;
+        let ask = self.items.remove(at);
         let repo = ask.action.repository.to_ascii_lowercase();
         let numbers = ask
             .group
@@ -1606,11 +1626,11 @@ impl NeedsYou {
         self.requests.retain(|r| r.key != ask.key);
         self.request_sources.retain(|r| r.key != ask.key);
         self.summary_cache.remove(&ask.key);
-        self.details_omitted = self
-            .identities
-            .iter()
-            .filter(|i| !self.items.iter().any(|a| a.key == i.detail_key))
-            .count();
+        self.details_omitted = self.omitted
+            + (self.identities)
+                .iter()
+                .filter(|i| !self.items.iter().any(|a| a.key == i.detail_key))
+                .count();
         Some(ask)
     }
 
@@ -2131,6 +2151,13 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
             }
         }
     }
+    let evicted: Vec<Identity> = (published_list(previous))
+        .and_then(|n| n["identities"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|i| serde_json::from_value::<Identity>(i.clone()).ok())
+        .filter(|i| i.source == REVIEWS && !published.iter().any(|p| p.key == i.detail_key))
+        .collect();
     // A carried ask is joined with its hold as a live one is.
     for mut ask in asks {
         // A labelled-list shortcut cannot recover why the poll originally
@@ -2155,9 +2182,20 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         {
             ask.ask = group.reason.clone();
         }
+        // A review wait whose card [`fit`] left out published no head: its
+        // identity keeps its age, or each pass would restart it and so
+        // change the list.
         let seen = (published.iter())
             .find(|p| p.key == ask.key && p.kind == ask.kind && p.head == ask.head)
-            .and_then(|p| not_after(&Value::from(p.waiting_since.as_str()), at));
+            .map(|p| p.waiting_since.as_str())
+            .or_else(|| {
+                let source = |i: &&Identity| i.key == ask.key && i.kind == ask.kind;
+                (ask.source == REVIEWS && ask.group.is_none())
+                    .then(|| evicted.iter().find(source))
+                    .flatten()
+                    .map(|i| i.waiting_since.as_str())
+            })
+            .and_then(|since| not_after(&Value::from(since), at));
         if let Some(since) = seen.filter(|s| earlier(s, &ask.waiting_since)) {
             ask.waiting_since = since;
         }
@@ -2620,8 +2658,9 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// the `since` the next pass carries over ([`carry`]), outlasts the other
 /// holds: no alarm is kept without its hold. The operator's own holds and
 /// the holds of every new run are kept ahead of needs-you detail cards,
-/// which go lowest ranked first. Should the inventory and protected holds
-/// still not fit, [`cap`] leaves out more, honestly counted, so that size
+/// which go lowest ranked first, actionable approvals last
+/// ([`NeedsYou::cut`]). Should the inventory and protected holds still not
+/// fit, [`cap`] leaves out more, honestly counted, so that size
 /// never keeps the inbox from being published: the body is always at most
 /// [`MAX_COMMENT_CHARS`].
 pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
