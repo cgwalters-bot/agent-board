@@ -677,7 +677,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let on = on_github(&maintain.digest.repository, maintain.digest.issue);
         let read = match (scope, self.room()) {
             (Some(scope), true) => plan::issue_comments(&self.client, &on).map(|c| (c, scope)),
-            (None, _) => Err(anyhow::anyhow!("no maintain day is known")),
+            // Maintain already reported the failure. With no known scope,
+            // keep all previously published digest asks until we can read it.
+            (None, _) => return Collected::of(Read::Unread),
             (_, false) => Err(anyhow::anyhow!(
                 "the pass's request budget or time is spent"
             )),
