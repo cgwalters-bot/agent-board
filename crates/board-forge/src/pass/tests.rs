@@ -7759,6 +7759,74 @@ fn maintain_refuses_a_partial_search() {
     }
 }
 
+/// A failed maintain read leaves no day, but needs-you still publishes an
+/// unread digest without counting the same failure a second time or losing
+/// previously published asks and their waiting history.
+#[test]
+fn needs_you_publishes_after_maintain_fails() {
+    let digest = comment_node(90, "cgwalters-bot", &digest_of(&[], &["up/a#1"]));
+    let (mut config, mut replay) = maintained(9, vec![digest], 40.0);
+    config.holds = Some(
+        serde_json::from_value(json!({
+            "repository": "cgwalters-forge/bot-ops", "issue": 1, "needsYou": true
+        }))
+        .unwrap(),
+    );
+    inventory_on(&mut replay, "up/a", 1, "");
+    let bot_ops = format!("{API_ROOT}repos/cgwalters-forge/bot-ops");
+    for (url, body) in [
+        (bot_ops.clone(), json!({"private": true})),
+        (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+    ] {
+        replay.requests.push(json!({"request": {"get": url},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    let mut forge = Forge::new(None, false);
+    forge.replay = replay;
+    let report = apply(&forge, &config);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let (_, prior) = forge.published_holds().unwrap();
+    let previous = holds::parse(&prior).unwrap();
+    let previous_list = &previous["needs_you"];
+    let digest_row = |list: &Value, field: &str| {
+        list[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["source"] == "digest")
+            .unwrap_or_else(|| panic!("no digest {field}: {list}"))
+            .clone()
+    };
+    let card = digest_row(previous_list, "items");
+    let identity = digest_row(previous_list, "identities");
+    assert_eq!(card["item"], "up/a#1");
+    assert_eq!(card["waiting_since"], "2026-10-20T00:00:00Z");
+    forge.previous_holds(prior);
+    forge.writes.borrow_mut().clear();
+    forge.replay.now += time::Duration::hours(1);
+    answer(&mut forge.replay, &operator_search("author"))["status"] = json!(504);
+    let report = apply(&forge, &config);
+    assert_eq!(report.maintain, None);
+    assert_eq!(report.failures, 1, "{:#?}", report.lines);
+    assert!(maintain_lines(&report)[0].contains("GitHub HTTP status 504"));
+    assert!(
+        !report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("needs-you digest error:")),
+        "{:#?}",
+        report.lines
+    );
+    let (_, body) = forge.published_holds().unwrap();
+    let snapshot = holds::parse(&body).unwrap();
+    for (field, mut old) in [("items", card), ("identities", identity)] {
+        old["carried"] = json!(true);
+        assert_eq!(digest_row(&snapshot["needs_you"], field), old);
+    }
+    assert_eq!(snapshot["needs_you"]["sources"]["digest"], "unread");
+    assert_eq!(snapshot["needs_you"]["complete"], false);
+}
+
 /// Its lines that start with `maintain`.
 fn maintain_lines(report: &Report) -> Vec<&str> {
     let lines = report.lines.iter().map(String::as_str);
