@@ -52,6 +52,7 @@ fn facts(
         open,
         merged: false,
         needs_human: labels.iter().any(|l| l.eq_ignore_ascii_case(NEEDS_HUMAN)),
+        assigned: false,
         run,
         runs_read,
         pulls,

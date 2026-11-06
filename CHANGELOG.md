@@ -11,6 +11,11 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's `assignHolds` (off by default) makes stage 4 wait on the
+  operator by assigning them instead of labelling `needs-human`, and moves
+  existing labels to assignments. Any response of theirs releases the wait,
+  and the pass takes the assignment off (docs/pass.md#scheduling).
+
 - Disposable Forgejo live coverage for opt-in Status labels and private
   append-only usage/hold snapshots, with preview, write/status caps, human
   holds, unchanged readings and public-publication refusal checked against
