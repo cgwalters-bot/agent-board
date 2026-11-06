@@ -744,6 +744,10 @@ pub struct HoldsAt {
     /// `needsYou`.
     #[serde(default, rename = "approvalEvidence")]
     pub approval_evidence: bool,
+    /// Off unless set: adds the pass view ([`view::SCHEMA`]), the last
+    /// passes, the pools' pace and the runs in flight, to the snapshot.
+    #[serde(default, rename = "passView")]
+    pub pass_view: bool,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -2007,6 +2011,8 @@ type ByStage = [usize; Stage::ALL.len()];
 struct Bounds {
     effects: RefCell<Effects>,
     start_kind: RefCell<String>,
+    /// The runs started whose dispatch named them, for the pass view.
+    started: RefCell<Vec<view::Run>>,
     limit: usize,
     left: Cell<usize>,
     /// No request is admitted after this, but those [`FINISH_SECONDS`] lets
@@ -2039,6 +2045,7 @@ impl Bounds {
         Self {
             effects: RefCell::default(),
             start_kind: RefCell::default(),
+            started: RefCell::default(),
             limit,
             left: Cell::new(limit),
             admit_by,
@@ -2281,6 +2288,21 @@ impl<C: Rest> Rest for Budget<'_, C> {
                     context.as_str()
                 };
                 *effects.starts.entry(kind.to_owned()).or_default() += 1;
+                // `repos/OWNER/REPO/actions/workflows/WORKFLOW/dispatches`.
+                let path = url.strip_prefix(API_ROOT).unwrap_or(url);
+                let caller = path.strip_prefix("repos/").and_then(|p| {
+                    let (caller, _) = p.split_once("/actions/")?;
+                    Some(caller)
+                });
+                let inputs = &body["inputs"];
+                let number = text(inputs, "/item").parse().ok();
+                let run = response.1["workflow_run_id"].as_u64();
+                if let (Some(caller), Some(number), Some(id)) = (caller, number, run) {
+                    let item = (text(inputs, "/repo"), number);
+                    let pool = inputs["pool"].as_str();
+                    let start = view::Run::new(item, kind, pool, (caller, id), None);
+                    self.bounds.started.borrow_mut().extend(start);
+                }
             }
         }
         Ok(response)
@@ -2645,6 +2667,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         stepped: Vec::new(),
         blocking: RefCell::default(),
         blocked: BTreeSet::new(),
+        flights: RefCell::default(),
     };
     match scheduler.direction() {
         Ok(direction) => scheduler.direction = direction,
@@ -2991,6 +3014,9 @@ struct Scheduler<'a, C> {
     /// The items of the blockers [`Self::blockers`] saw move or wait on a
     /// person, `OWNER/REPO#N`, which raise no stall alarm of their own.
     blocked: BTreeSet<String>,
+    /// The agent runs in flight the last listing found ([`Self::listed`]),
+    /// for the pass view; `None` where none was listed.
+    flights: RefCell<Option<Vec<view::Run>>>,
 }
 
 impl<'a, C: Rest + Transport> Scheduler<'a, C> {
@@ -3650,6 +3676,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut ids = BTreeSet::new();
         let mut busy = BTreeMap::new();
         let mut pools = BTreeSet::new();
+        let mut flights = Vec::new();
         for status in ACTIVE_RUNS {
             let url = format!(
                 "{API_ROOT}repos/{}/actions/workflows/{}/runs?status={status}&per_page={RUNS_PER_PAGE}",
@@ -3659,19 +3686,29 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 if self.ended(&target.caller, &run) {
                     continue;
                 }
-                ids.insert(run["id"].as_u64().context("run has no id")?);
+                let id = run["id"].as_u64().context("run has no id")?;
+                ids.insert(id);
                 let title = run["display_title"].as_str().unwrap_or_default();
-                if let Some((_, repo, number)) = run_title(title) {
-                    let url = text(&run, "/html_url").to_owned();
-                    busy.entry(format!("{repo}#{number}").to_ascii_lowercase())
-                        .or_insert(url);
-                }
                 let pool = title
                     .rsplit_once(" (")
                     .and_then(|(_, pool)| pool.strip_suffix(')'));
+                if let Some((kind, repo, number)) = run_title(title) {
+                    let url = text(&run, "/html_url").to_owned();
+                    busy.entry(format!("{repo}#{number}").to_ascii_lowercase())
+                        .or_insert(url);
+                    let started = run["run_started_at"].as_str();
+                    flights.extend(view::Run::new(
+                        (repo, number),
+                        kind,
+                        pool,
+                        (&target.caller, id),
+                        started,
+                    ));
+                }
                 pools.extend(pool.map(str::to_owned));
             }
         }
+        *self.flights.borrow_mut() = Some(flights);
         Ok((ids, busy, pools))
     }
 
@@ -6159,6 +6196,7 @@ pub mod starts;
 mod status;
 pub mod sweep;
 mod usage;
+mod view;
 mod work;
 
 pub mod forgejo;

@@ -757,11 +757,17 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let published = comment.as_ref().map(|c| text(c, "/body"));
             let previous = published.and_then(holds::published);
             let snapshot = self.hold_snapshot(previous.as_ref(), comment.as_ref());
+            let asked = snapshot.pass_view.is_some();
             let (snapshot, body) = holds::fit(snapshot)?;
-            Ok((holds::changed(published, &snapshot)?, body, comment))
+            let view = match (asked, snapshot.pass_view.is_some()) {
+                (true, true) => ", with the pass view",
+                (true, false) => ", without the pass view, over the comment's size",
+                (false, _) => "",
+            };
+            Ok((holds::changed(published, &snapshot)?, body, comment, view))
         });
-        let (body, comment) = match changed {
-            Ok((true, body, comment)) => (body, comment),
+        let (body, comment, view) = match changed {
+            Ok((true, body, comment, view)) => (body, comment, view),
             Ok((false, ..)) => {
                 self.line("holds: unchanged".into());
                 return;
@@ -787,12 +793,14 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
         if !self.apply {
             self.caps.count(Kind::Write);
-            self.line(format!("{said}{past_cap}; a preview does not write it"));
+            self.line(format!(
+                "{said}{view}{past_cap}; a preview does not write it"
+            ));
             return;
         }
         let published = self.publish(on, comment.as_ref(), "hold", body);
         match published {
-            Ok(url) => self.line(format!("holds: published {url}{past_cap}")),
+            Ok(url) => self.line(format!("holds: published {url}{view}{past_cap}")),
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("holds error: {said}: {error:#}"));
@@ -879,6 +887,16 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                 &self.report.accepted_plans.borrow(),
                 &snapshot.holds,
             ));
+        }
+        if self.config.holds.as_ref().is_some_and(|h| h.pass_view) {
+            let started = self.client.bounds.started.borrow();
+            let at = &snapshot.at;
+            let pass = view::record(at, self.report.failures, &started, &self.report.holds);
+            // The usage snapshot only where stage 1 or pacing read it.
+            let usage = self.snapshot.clone().flatten();
+            let flights = self.flights.borrow();
+            let view = view::snapshot(at, pass, previous, usage.as_ref(), flights.as_deref());
+            snapshot.pass_view = Some(view);
         }
         snapshot
     }

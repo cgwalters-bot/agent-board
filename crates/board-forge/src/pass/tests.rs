@@ -3143,6 +3143,58 @@ fn apply_publishes_the_holds() {
     );
 }
 
+/// With `holds.passView`, the hold snapshot has the pass view the review
+/// app reads, and the pass says it published it: at WIP 8 the runs it
+/// started, each with its run, and the runs in flight it listed; at WIP 2
+/// nothing started, and the WIP hold of every new run is its reason. Off,
+/// there is none.
+#[test]
+fn apply_publishes_the_pass_view() {
+    for (wip, view) in [(8, true), (2, true), (8, false)] {
+        let mut forge = Forge::new(None, false);
+        let at = forge.holds_destination(true);
+        let mut settings = json!({"wip": wip, "holds": at});
+        settings["holds"]["passView"] = view.into();
+        let now = forge.replay.now;
+        let mode = (Mode::Actions(&own()), Limits::default());
+        let config = config(settings);
+        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        let (_, body) = forge.published_holds().unwrap();
+        let published = holds::published(&body).unwrap();
+        let said = (report.lines.iter()).any(|l| l.contains(", with the pass view"));
+        assert_eq!(said, view, "{wip}: {:#?}", report.lines);
+        let Some(pass_view) = published.get("pass_view").filter(|_| view) else {
+            assert!(published.get("pass_view").is_none(), "{wip}");
+            continue;
+        };
+        assert!(view::tests::accepted(pass_view), "{wip}: {pass_view}");
+        assert_eq!(pass_view["observed_at"], now.format(&Rfc3339).unwrap());
+        let pass = &pass_view["passes"][0];
+        let started = pass["started"].as_array().unwrap();
+        assert_eq!(started.len(), report.tally.1.started, "{wip}: {pass}");
+        assert_eq!(pass_view["complete"], true);
+        let in_flight = pass_view["in_flight"].as_array().unwrap();
+        assert_eq!(
+            in_flight.len(),
+            report.tally.0.in_flight.unwrap() - started.len()
+        );
+        match wip {
+            8 => {
+                assert!(!started.is_empty());
+                assert!(
+                    started.iter().all(|s| s["run"]["id"].as_u64() > Some(0)),
+                    "{pass}"
+                );
+                assert_eq!(pass["reasons"], json!([]));
+            }
+            _ => assert_eq!(
+                pass["reasons"],
+                json!([{"item": null, "kind": "capped", "reason": "new runs held: wip", "until": null}])
+            ),
+        }
+    }
+}
+
 /// The accounting boundary sees one final response, never the client's
 /// intermediate retries, failed writes or capped operations not sent to it.
 #[test]

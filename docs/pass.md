@@ -371,6 +371,41 @@ reporter fills those gaps. Counts and rollover alone never make an idle pass
 write; otherwise unchanged holds still say `holds: unchanged`. Previews have no
 `overhead` and never add to it.
 
+#### Pass view
+
+With `holds.passView` set (off unless set; GitHub only; agent-board#726), the snapshot
+also has `pass_view`, what the review app's pass view reads (review
+`src/github/passview.ts`), so the operator can see what the poller is doing:
+
+```json
+"pass_view":{"schema":"agent-board/pass-view/v1","observed_at":"2026-11-05T12:00:00Z","complete":true,"omitted":0,
+"passes":[{"at":"2026-11-05T12:00:00Z","result":"success","sections":[],"started":[{"item":"o/work#11","kind":"implement","pool":"claude","run":{"repository":"o/runner","id":42}}],"reasons":[],"omitted":0}],
+"pools":[{"name":"claude","used_percent":45,"allowed_percent":50,"resets_at":"2026-11-05T13:00:00Z","ready":null,"under_pace":true}],
+"in_flight":[{"state":"running","item":"o/work#9","kind":"fix","pool":"openai","run":{"repository":"o/runner","id":41},"started_at":"2026-11-05T11:40:00Z"}]}
+```
+
+It is built from what the pass already read, with no read of its own.
+`passes` has this pass first, then up to four of the published view's.
+A pass's `started` lists the runs whose dispatch named its run, at most 8.
+Where it started nothing, `reasons` counts the pass's holds by kind, most
+first, at most 8: `held` with `N held as KIND`, and `capped` with
+`new runs held: wip|pools|budget`, never the hold's reason, so no spend
+amount appears. `omitted` counts what was left out. `result` is `partial`
+where the pass had a failure; `sections` is empty.
+`pools` gives the usage snapshot's percentages, rounded, where the pass read
+it, and no address; a pool is under pace where it has used less than it is
+allowed, and `ready` is null, as ready work is not known by pool.
+`in_flight` lists at most 32 of the caller's active runs that the pass listed
+and whose title names an item; `complete` is false where it listed none,
+and the view's `omitted` counts the rest. Kinds and pools the reader would
+refuse are left out or `unknown`.
+
+A view whose newest pass, pools and runs are as published is no change for
+30 minutes, so an idle pass does not write every time; a pass not written
+is not in `passes`. Past the comment's size the view is left out whole,
+after the work inventory and before any hold. The pass's line says
+`holds: published URL, with the pass view`.
+
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
 on the operator, for review's needs-you view, so that review need not work
@@ -3404,6 +3439,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.proposals` | `{"repository", "label", "repositories", "org"?}`: list in the needs-you list the operator-action proposals on that repository's open issues with that label, checked as `action check` would with those `repositories` and `org`; needs `holds.needsYou`; absent (off) |
 | `holds.drafts` | Repository whose open `review-draft` issues the needs-you list reads with review-send's source rules; needs `holds.needsYou`, GitHub only; absent (off) |
 | `holds.approvalEvidence` | Add stage 2's head-bound [approval evidence](#approval-evidence-optional-v2-extension) to the needs-you list; needs `holds.needsYou`, GitHub only; `false` |
+| `holds.passView` | Add the [pass view](#pass-view) (`agent-board/pass-view/v1`): the last passes, pool pace and runs in flight; needs `holds`, GitHub only; `false` |
 | `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |
