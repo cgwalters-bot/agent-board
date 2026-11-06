@@ -879,9 +879,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let previous = previous.filter(|_| own);
             snapshot.needs_you = Some(self.needs_you(&mut snapshot, previous, &on));
         }
-        if !self.config.follow.is_empty() {
+        if self.config.follows() {
             snapshot.dispatchable_work = Some(super::work::snapshot(
-                (&self.config.follow, &self.config.work_repositories),
+                (&self.follows, &self.config.work_repositories),
                 self.followed.as_ref(),
                 &self.stepped,
                 &self.report.accepted_plans.borrow(),

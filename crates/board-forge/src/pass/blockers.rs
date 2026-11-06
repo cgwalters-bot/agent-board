@@ -229,8 +229,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
     /// What `pull` does this pass: stage 2's step where it follows its
     /// repository, else its own read, which spends one of `reads`.
     fn seen(&self, pull: &ItemRef, reads: &mut usize) -> Seen {
-        let followed =
-            (self.config.follow.iter()).any(|r| r.eq_ignore_ascii_case(&pull.repository));
+        let followed = (self.follows.iter()).any(|r| r.eq_ignore_ascii_case(&pull.repository));
         if followed {
             let step = self.stepped.iter().find(|s| {
                 s.number == pull.number && s.repository.eq_ignore_ascii_case(&pull.repository)

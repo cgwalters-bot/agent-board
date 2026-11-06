@@ -170,6 +170,8 @@
     "dispatchWorkflow": {"verdict": "native", "forgejo": "the caller's Forgejo Actions workflow file"},
     "dispatchRef": {"verdict": "native", "forgejo": "the dispatch ref"},
     "follow": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "midstream.owner": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
+    "midstream.topic": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "promote.forks": {"verdict": "refused", "reason": "promotion needs GitHub pull request approvals and fork heads; no reviewed Forgejo equivalent"},
     "promote.publish": {"verdict": "refused", "reason": "standalone publication requires GitHub evidence and pull request APIs"},
     "promote.signoff.name": {"verdict": "refused", "reason": "part of promotion, which has no reviewed Forgejo equivalent"},
