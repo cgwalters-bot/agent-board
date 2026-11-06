@@ -11,6 +11,40 @@ pub const MIDSTREAM_PAGES: usize = 5;
 /// GitHub's longest topic.
 const TOPIC_LIMIT: usize = 50;
 
+/// Resolve only topic-admitted forks, never a target named in thread text.
+/// Ambiguous forks fail closed rather than putting work in the wrong tree.
+pub(super) fn routes(
+    client: &impl Rest,
+    repositories: &[String],
+) -> Result<BTreeMap<String, String>> {
+    ensure!(
+        repositories.len() <= POLL_REPOSITORY_LIMIT,
+        "too many midstream routes"
+    );
+    let mut routes = BTreeMap::new();
+    for repository in repositories {
+        let response = client.get(&format!("{API_ROOT}repos/{repository}"), None)?;
+        ensure!(response.status == 200, "cannot read midstream {repository}");
+        let fork = response.body;
+        ensure!(
+            text(&fork, "/full_name").eq_ignore_ascii_case(repository),
+            "midstream identity changed"
+        );
+        if fork["fork"] != true {
+            continue;
+        }
+        let parent = text(&fork, "/parent/full_name");
+        validate_repository(parent).context("midstream parent")?;
+        ensure!(
+            routes
+                .insert(parent.to_ascii_lowercase(), repository.clone())
+                .is_none(),
+            "multiple midstreams for {parent}"
+        );
+    }
+    Ok(routes)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Midstream {

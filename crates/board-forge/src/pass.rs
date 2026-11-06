@@ -440,6 +440,10 @@ pub struct Config {
     /// Off unless set: stage 2 also follows the repositories with this topic,
     /// and never merges in them, as if in `pr.noMerge` ([`midstream`]).
     pub midstream: Option<midstream::Midstream>,
+    /// Off unless set: route the bot's GitHub notifications through operator
+    /// intake, staging external work in a topic-selected midstream fork.
+    #[serde(default)]
+    pub notifications: bool,
     #[serde(default)]
     pub work_repositories: Vec<String>,
     pub board: Option<BoardConfig>,
@@ -1071,6 +1075,14 @@ impl Config {
                 "forgejoIntake requires board.intake"
             );
         }
+        ensure!(
+            !self.notifications || self.forgejo_board().is_none(),
+            "notifications supports only GitHub"
+        );
+        ensure!(
+            !self.notifications || !self.triage_pools().is_empty(),
+            "notifications needs triagePools or planPools"
+        );
         if let Some(sweep) = &self.sweep {
             sweep.check(self)?;
         }
@@ -1402,6 +1414,27 @@ impl Config {
             }),
             fix_bounds: self.fix_bounds.clone(),
             reruns: self.reruns,
+            notifications: self.notifications.then(|| poll::notify::Notifications {
+                reasons: poll::notify::NOTIFY_REASONS
+                    .iter()
+                    .map(|r| (*r).into())
+                    .collect(),
+                peers: Vec::new(),
+            }),
+            notification_intake: self.notifications.then(BTreeMap::new),
+            kind_pools: if self.notifications {
+                self.triage_pools()
+                    .first()
+                    .map(|pool| {
+                        ["triage", "research"]
+                            .into_iter()
+                            .map(|kind| (kind.into(), pool.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                BTreeMap::new()
+            },
             ..PollPolicy::default()
         };
         self.pr.poll.apply(&mut policy);
@@ -3229,7 +3262,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return 0;
             }
         }
-        if self.follows.is_empty() {
+        if self.follows.is_empty() && !config.notifications {
             self.line("follow: no repositories".into());
             return 0;
         }
@@ -3246,6 +3279,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
+        if config.notifications {
+            match midstream::routes(&self.client, &midstreams) {
+                Ok(routes) => poll.policy.notification_intake = Some(routes),
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("notifications error: midstream routes: {error:#}"));
+                    return 0;
+                }
+            }
+        }
         poll.policy.no_merge.extend(midstreams);
         if !config.pr.poll.review_pools.is_empty() {
             let (wip, ranks) = self.review_bounds(git_ref, earlier);

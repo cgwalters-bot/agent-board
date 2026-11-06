@@ -68,6 +68,31 @@ const BUCKET_PAGES: usize = 10;
 /// only threads left unread, which are routed without a request.
 const LAG_SECONDS: i64 = 10 * 60;
 
+const INTAKE_REPLY: &str = "agent-board-notification";
+/// Leave room for staging, claim/record, acknowledgement and marking read;
+/// stopping at a write cap between a claim and its record strands work.
+pub(super) const INTAKE_WRITES: usize = 8;
+
+/// A conservative natural-language ask goes to a planner, not an implement
+/// run. A third party mentioning the bot must not activate unrelated operator
+/// conversation on the same thread.
+pub(super) fn direction(body: &str, bot: &str) -> bool {
+    comments::explicit(body, bot)
+        || body.lines().any(|line| {
+            let line = line.trim().to_ascii_lowercase();
+            [
+                "let's ",
+                "let’s ",
+                "please ",
+                "can you ",
+                "could you ",
+                "would you ",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+}
+
 /// `notifications`: the reasons that count, and the peers.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Notifications {
@@ -230,7 +255,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         (since, before): (Option<&str>, Option<&str>),
         outcome: &mut Outcome,
     ) -> Result<(String, Option<String>)> {
-        let floor = self.now - Duration::seconds(comments::LOOKBACK_SECONDS);
+        let floor = if self.config.policy.notification_intake.is_some() {
+            OffsetDateTime::UNIX_EPOCH
+        } else {
+            self.now - Duration::seconds(comments::LOOKBACK_SECONDS)
+        };
         let since = timestamp(since)
             .map_or(floor, |c| c.clamp(floor, self.now))
             .replace_nanosecond(0)?;
@@ -303,14 +332,20 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 };
                 let reason = text(thread, "/reason");
                 if !settings.reasons.contains(reason)
-                    || follow.iter().any(|f| f.eq_ignore_ascii_case(&repo))
+                    || (self.config.policy.notification_intake.is_none()
+                        && follow.iter().any(|f| f.eq_ignore_ascii_case(&repo)))
                 {
                     // Left to the rest of the poll: read, so that it does
                     // not fill the pages of every later pass.
                     done_with.push((id.into(), thread.clone(), format!("{repo}#{number}")));
                     continue;
                 }
-                let done = match self.notified(settings, (&repo, number), reason) {
+                let done = match self.notified(
+                    settings,
+                    (&repo, number),
+                    reason,
+                    timestamp(thread["last_read_at"].as_str()),
+                ) {
                     Ok((done, line)) => {
                         outcome.activity += 1;
                         outcome.lines.push(format!("{repo}#{number} {line}"));
@@ -430,6 +465,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         settings: &Notifications,
         (repo, number): (&str, u64),
         reason: &str,
+        last_read: Option<OffsetDateTime>,
     ) -> Result<(bool, String)> {
         let issue = match self.get(&format!("repos/{repo}/issues/{number}")) {
             Ok(issue) => issue,
@@ -444,6 +480,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             Err(error) => return Err(error),
         };
         let comments = self.thread_comments(repo, number)?;
+        if self.config.policy.notification_intake.is_some() {
+            return self.notification_direction(repo, &issue, &comments, last_read);
+        }
         // The operator's, as `operatorComments` takes them, with its claims.
         let scoped = comments::in_scope(&self.config.policy.operator_comments, repo);
         if let Some((done, line)) = self.thread_read(repo, &issue, &comments, !scoped)? {
@@ -519,6 +558,141 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             true,
             format!("notification ({reason}) from {sender}: left to a person, {url}"),
         ))
+    }
+
+    fn notification_direction(
+        &mut self,
+        repo: &str,
+        issue: &Value,
+        comments: &[Value],
+        last_read: Option<OffsetDateTime>,
+    ) -> Result<(bool, String)> {
+        let number = issue["number"]
+            .as_u64()
+            .context("notification issue has no number")?;
+        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        let since = last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let bot = self.config.bot.clone();
+        let said: Vec<_> = self
+            .said(repo, number, comments, pull, since)?
+            .into_iter()
+            .filter(|s| direction(&s.body, &bot))
+            .collect();
+        if said.is_empty() {
+            return Ok((
+                true,
+                "notification: left to a person; no new operator direction".into(),
+            ));
+        }
+        let mine = pull && text(issue, "/user/login") == bot;
+        // A fix brief also copies comments to the dispatch repository. Natural
+        // asks must not bypass the legacy notification path's public check.
+        if !self.config.ours(repo)
+            && let Some(why) = self.not_public(repo)?
+        {
+            return Ok((true, format!("notification: {why}")));
+        }
+        let external = !(self.config.ours(repo) || mine);
+        if external
+            && !self
+                .config
+                .policy
+                .notification_intake
+                .as_ref()
+                .is_some_and(|routes| routes.contains_key(&repo.to_ascii_lowercase()))
+        {
+            return Ok((
+                false,
+                "notification: waiting for a matching topic-selected midstream fork".into(),
+            ));
+        }
+        let result = self.thread_read_from(repo, issue, comments, false, (since, true))?;
+        if result.as_ref().is_some_and(|(done, _)| !done) {
+            return Ok(result.unwrap_or_else(|| (false, String::new())));
+        }
+        // Only settled claims prove planning started; a failed or capped pass
+        // must not acknowledge work it has not admitted. The same claims recover
+        // a failed acknowledgement without starting a second planner.
+        let (target, records) = if external {
+            let tracked = self.tracked(repo, number, true)?;
+            match tracked.open() {
+                Some((issue, records)) => (
+                    format!(
+                        "https://github.com/{}/issues/{}",
+                        self.tracking_repository(repo),
+                        issue["number"]
+                    ),
+                    records.clone(),
+                ),
+                None => {
+                    return Ok(
+                        result.unwrap_or((false, "notification: planning not recorded".into()))
+                    );
+                }
+            }
+        } else {
+            let records = self.thread_comments(repo, number)?;
+            let tracking = records
+                .iter()
+                .rev()
+                .filter(|c| text(c, "/user/login") == bot)
+                .filter_map(|c| parse_marker(CLAIM, text(c, "/body")))
+                .find(|state| {
+                    nodes(state, "/comments")
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|key| said.iter().any(|s| s.key == key))
+                })
+                .and_then(|state| state["issue"].as_u64());
+            let target = if pull && !mine && self.apply.is_some() {
+                let tracking = tracking.context("notification: no recorded tracking issue")?;
+                let tracker = self.tracking_repository(repo);
+                let target = self.get(&format!("repos/{tracker}/issues/{tracking}"))?;
+                ensure!(
+                    text(&target, "/repository_url") == format!("{API_ROOT}repos/{tracker}")
+                        && text(&target, "/user/login") == bot
+                        && text(&target, "/title") == comments::tracking_title(repo, number)
+                        && target.get("pull_request").is_none_or(Value::is_null),
+                    "notification: tracking issue identity changed"
+                );
+                format!("https://github.com/{tracker}/issues/{tracking}")
+            } else {
+                format!("https://github.com/{repo}/issues/{number}")
+            };
+            (target, records)
+        };
+        let (done, _) = handled(&records, &bot, self.now);
+        if self.apply.is_some() && said.iter().any(|s| !done.contains(&s.key)) {
+            return Ok(result.unwrap_or((false, "notification: planning not recorded".into())));
+        }
+        if self.apply.is_some() && self.config.writes_in(repo) {
+            let acknowledged: BTreeSet<String> = comments
+                .iter()
+                .filter(|c| text(c, "/user/login") == bot)
+                .filter_map(|c| parse_marker(INTAKE_REPLY, text(c, "/body")))
+                .flat_map(|state| {
+                    nodes(&state, "/comments")
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let keys: Vec<_> = said
+                .iter()
+                .filter(|s| !acknowledged.contains(&s.key))
+                .map(|s| &s.key)
+                .collect();
+            if !keys.is_empty() {
+                let state = json!({"comments": keys});
+                self.send(self.rest, "POST", &format!("repos/{repo}/issues/{number}/comments"),
+                    json!({"body": format!("<!-- {INTAKE_REPLY}: {state} -->\nTracking the operator's request in {target}.\n\n{}", self.config.policy.footer)}), 0)?;
+            }
+        }
+        Ok(result.unwrap_or((
+            true,
+            "notification: operator direction already handled".into(),
+        )))
     }
 }
 
@@ -708,6 +882,291 @@ mod tests {
 
     /// Where the operator's comment did not address the bot.
     const UNADDRESSED: &str = "op@other";
+
+    fn intake_config() -> Config {
+        let mut config = config(json!({}));
+        config.policy.notification_intake = Some(BTreeMap::from([(
+            OTHER.into(),
+            "upstream/midstream".into(),
+        )]));
+        config
+    }
+
+    const INTAKE_FIRST: &str = "1970-01-01T00:00:00Z";
+
+    fn intake_github(repo: &str, pull: bool, reason: &str, sender: &str) -> Fake {
+        let fake = github(repo, pull, reason, sender);
+        fake.page(
+            &listing(INTAKE_FIRST),
+            json!([thread("9001", repo, 2, pull, reason)]),
+        );
+        fake
+    }
+
+    fn replies(fake: &Fake) -> Vec<Value> {
+        fake.writes
+            .borrow()
+            .iter()
+            .filter(|(_, body)| text(body, "/body").contains(INTAKE_REPLY))
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
+    #[test]
+    fn pass_intake_stages_natural_direction_in_the_matching_fork_and_replies_once() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        reword(&fake, OTHER, "let's get a draft of the fix");
+        let config = intake_config();
+        let preview = pass(&fake, &config, State::default(), false);
+        assert_eq!(preview.errors, 0, "{:?}", preview.lines);
+        assert!(fake.writes.borrow().is_empty());
+        let applied = pass(&fake, &config, State::default(), true);
+        assert_eq!(applied.errors, 0, "{:?}", applied.lines);
+        let inputs = dispatches(&fake);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["repo"], "upstream/midstream");
+        assert_eq!(inputs[0]["kind"], "triage");
+        assert!(text(&inputs[0], "/task").contains("let's get a draft of the fix"));
+        assert_eq!(replies(&fake).len(), 1);
+        assert!(
+            text(&replies(&fake)[0], "/body")
+                .contains("https://github.com/upstream/midstream/issues/")
+        );
+        assert_eq!(marked(&fake), ["9001"]);
+        // Lose local state and redeliver the notification after a pass crash.
+        fake.page(
+            &listing(INTAKE_FIRST),
+            json!([thread("9001", OTHER, 2, false, "mention")]),
+        );
+        let again = pass(&fake, &config, State::default(), true);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert_eq!(replies(&fake).len(), 1);
+    }
+
+    #[test]
+    fn pass_intake_requires_operator_direction_and_unread_comments_and_a_matching_fork() {
+        for (sender, body, last_read, routed, expected, read) in [
+            (OPERATOR, "@worker fix this", None, true, 1, true),
+            (OPERATOR, "can you investigate this?", None, true, 1, true),
+            (OPERATOR, "Thanks, author", None, true, 0, true),
+            ("someone", "@worker fix this", None, true, 0, true),
+            (
+                OPERATOR,
+                "@worker fix this",
+                Some("2026-10-16T11:00:00Z"),
+                true,
+                0,
+                true,
+            ),
+            (OPERATOR, "@worker fix this", None, false, 0, false),
+        ] {
+            let fake = intake_github(OTHER, false, "mention", sender);
+            reword(&fake, OTHER, body);
+            let mut listed = thread("9001", OTHER, 2, false, "mention");
+            listed["last_read_at"] = json!(last_read);
+            fake.page(&listing(INTAKE_FIRST), json!([listed]));
+            let mut config = intake_config();
+            if !routed {
+                config.policy.notification_intake = Some(BTreeMap::new());
+            }
+            let outcome = pass(&fake, &config, State::default(), true);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(
+                dispatches(&fake).len(),
+                expected,
+                "{sender} {body} {last_read:?}"
+            );
+            assert_eq!(!marked(&fake).is_empty(), read);
+        }
+    }
+
+    #[test]
+    fn pass_intake_recovers_a_failed_reply_without_replanning() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let config = intake_config();
+        // Refuse only the acknowledgement, after dispatch has been recorded.
+        *fake.broken_notification_reply.borrow_mut() = true;
+        let first = pass(&fake, &config, State::default(), true);
+        assert_eq!(first.errors, 1);
+        assert!(marked(&fake).is_empty());
+        *fake.broken_notification_reply.borrow_mut() = false;
+        // Recovery must still find an older tracking issue through search,
+        // even with no dispatch capacity and just enough writes for reply/read.
+        *fake.hidden_from_newest.borrow_mut() = true;
+        let caps = caps::Caps::new(caps::Limits {
+            dispatch: Some(0),
+            writes: Some(2),
+            ..Default::default()
+        });
+        let second = run_capped(
+            &fake,
+            &fake,
+            &config,
+            State::default(),
+            (&[], &[]),
+            Some(Apply {
+                dispatcher: &fake,
+                workflow: "dispatch.yml".into(),
+                pools: vec![],
+                git_ref: None,
+            }),
+            Some(&caps),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(second.errors, 0, "{:?}", second.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert_eq!(replies(&fake).len(), 2);
+        assert_eq!(marked(&fake), ["9001"]);
+    }
+
+    #[test]
+    fn pass_intake_never_copies_a_private_upstream_bot_pull_request() {
+        let fake = intake_github(OTHER, true, "mention", OPERATOR);
+        fake.rest
+            .borrow_mut()
+            .get_mut(&format!("{API_ROOT}repos/{OTHER}/issues/2"))
+            .unwrap()["user"]["login"] = BOT.into();
+        fake.page(
+            &format!("repos/{OTHER}"),
+            json!({"private": true, "visibility": "private"}),
+        );
+        let outcome = pass(&fake, &intake_config(), State::default(), true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(dispatches(&fake).is_empty());
+        assert!(replies(&fake).is_empty());
+        assert!(
+            fake.writes
+                .borrow()
+                .iter()
+                .all(|(path, _)| path.contains("notifications/threads/"))
+        );
+    }
+
+    #[test]
+    fn pass_intake_links_the_tracking_issue_for_someone_elses_pull_in_our_space() {
+        let repo = "upstream/app";
+        let fake = intake_github(repo, true, "comment", OPERATOR);
+        let config = intake_config();
+        let preview = pass(&fake, &config, State::default(), false);
+        assert_eq!(preview.errors, 0, "{:?}", preview.lines);
+        assert!(fake.writes.borrow().is_empty());
+        let outcome = pass(&fake, &config, State::default(), true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        let inputs = dispatches(&fake);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["repo"], DISPATCH);
+        let item = inputs[0]["item"].as_str().unwrap();
+        assert!(
+            text(&replies(&fake)[0], "/body")
+                .contains(&format!("https://github.com/{DISPATCH}/issues/{item}"))
+        );
+        fake.page(
+            &listing(INTAKE_FIRST),
+            json!([thread("9001", repo, 2, true, "comment")]),
+        );
+        let again = pass(&fake, &config, State::default(), true);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert_eq!(replies(&fake).len(), 1);
+    }
+
+    #[test]
+    fn pass_intake_never_restarts_an_ambiguous_dispatch_after_timeout() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        *fake.broken.borrow_mut() = true;
+        let config = intake_config();
+        let first = pass(&fake, &config, State::default(), true);
+        assert_eq!(first.errors, 1);
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert!(marked(&fake).is_empty());
+        *fake.broken.borrow_mut() = false;
+        // Age the pending claim past the ordinary comment retry timeout.
+        for values in fake.rest.borrow_mut().values_mut() {
+            for comment in values.as_array_mut().into_iter().flatten() {
+                if parse_marker(CLAIM, text(comment, "/body")).is_some() {
+                    comment["created_at"] = json!("2026-10-15T00:00:00Z");
+                }
+            }
+        }
+        let second = pass(&fake, &config, State::default(), true);
+        assert_eq!(second.errors, 0, "{:?}", second.lines);
+        assert!(
+            second
+                .lines
+                .iter()
+                .any(|l| l.contains("reconcile its claim"))
+        );
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert!(marked(&fake).is_empty());
+        assert!(replies(&fake).is_empty());
+    }
+
+    #[test]
+    fn pass_intake_respects_caps_before_staging_and_counts_its_effects() {
+        for (dispatch, writes, started) in [(0, 20, false), (1, 0, false), (1, 8, true)] {
+            let fake = intake_github(OTHER, false, "mention", OPERATOR);
+            let config = intake_config();
+            let caps = caps::Caps::new(caps::Limits {
+                dispatch: Some(dispatch),
+                writes: Some(writes),
+                ..Default::default()
+            });
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &config,
+                State::default(),
+                (&[], &[]),
+                Some(Apply {
+                    dispatcher: &fake,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec![],
+                    git_ref: None,
+                }),
+                Some(&caps),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(dispatches(&fake).len(), usize::from(started));
+            if started {
+                assert!(
+                    caps.summary().contains("dispatched 1/1, writes 5/8"),
+                    "{}",
+                    caps.summary()
+                );
+            } else {
+                assert!(fake.writes.borrow().is_empty());
+                assert!(marked(&fake).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn pass_intake_acts_in_our_issue_directly_and_preserves_own_space_only() {
+        let repo = "upstream/app";
+        let fake = intake_github(repo, false, "comment", OPERATOR);
+        let outcome = pass(&fake, &intake_config(), State::default(), true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(dispatches(&fake)[0]["repo"], repo);
+        assert_eq!(dispatches(&fake)[0]["item"], "2");
+        assert_eq!(replies(&fake).len(), 1);
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let mut config = intake_config();
+        config.policy.own_space_only = true;
+        let outcome = pass(&fake, &config, State::default(), true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert!(
+            fake.writes
+                .borrow()
+                .iter()
+                .all(|(url, _)| !url.contains("repos/other/"))
+        );
+        assert!(replies(&fake).is_empty());
+    }
 
     #[test]
     fn each_reason_and_sender_is_routed_once() {
@@ -1263,6 +1722,7 @@ mod tests {
                 envelope: None,
                 followed: BTreeSet::new(),
                 caps: None,
+                intaking: false,
                 writes: 0,
                 review_runs: BTreeMap::new(),
                 review_intake: Default::default(),
