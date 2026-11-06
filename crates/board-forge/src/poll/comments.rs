@@ -46,6 +46,9 @@ const THREADS_PAGE: usize = 20;
 const SEARCH_PAGES: u64 = 3;
 /// The last page a search gives: it finds at most 1000 results.
 pub const OPERATOR_PAGE_LIMIT: u64 = (1000 / THREADS_PAGE) as u64;
+/// The most threads the pass's intake search keeps to retry while their
+/// direction waits for a midstream fork: each costs requests every pass.
+pub const INTAKE_WAITING_LIMIT: usize = THREADS_PAGE;
 /// How old a comment may be and still start a run: the first pass, or one
 /// after the state was lost, does not act on what the operator said long ago.
 pub(super) const LOOKBACK_SECONDS: i64 = 2 * 24 * 60 * 60;
@@ -307,19 +310,26 @@ fn addressed<'a>(body: &'a str, bot: &str) -> impl Iterator<Item = &'a str> {
                 .next()
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
         };
-        line.strip_prefix("/bot").is_some_and(addressed)
-            || line.match_indices('@').any(|(at, _)| {
-                let after_word = line[..at]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                let login = &line[at + 1..];
-                !after_word
-                    && login
-                        .get(..bot.len())
-                        .is_some_and(|name| name.eq_ignore_ascii_case(bot))
-                    && addressed(&login[bot.len()..])
-            })
+        line.strip_prefix("/bot").is_some_and(addressed) || mentions(line, bot)
+    })
+}
+
+/// Recheck a mention on the operator's own comment, not just on its thread.
+pub(super) fn mentions(body: &str, bot: &str) -> bool {
+    body.match_indices('@').any(|(at, _)| {
+        let after_word = body[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        let login = &body[at + 1..];
+        !after_word
+            && login
+                .get(..bot.len())
+                .is_some_and(|name| name.eq_ignore_ascii_case(bot))
+            && !login[bot.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '-')
     })
 }
 
@@ -477,6 +487,49 @@ fn peer_brief(repo: &str, number: u64, url: &str, said: &[Said], peer: &str) -> 
 /// What became of a thread: whether the cursor may pass it, and the line.
 type Handled = (bool, String);
 
+/// A thread's key in the intake's `waiting`.
+fn waiting_key(repo: &str, number: u64) -> String {
+    format!("{repo}#{number}")
+}
+
+/// Keep a searched thread not done with, `key` updated `at`, to retry; where
+/// `waiting` is full, the thread updated longest ago of those that wait for a
+/// fork (`forked`) is left to a person to make room. Whether the cursor may
+/// pass it, and what to add to its line. With no room, one that waits for a
+/// fork is left to a person too; any other holds the cursor, so that nothing
+/// stuck for another reason (an ambiguous dispatch, an error) is dropped.
+fn keep_waiting(
+    (waiting, forked): (&mut BTreeMap<String, String>, &mut BTreeSet<String>),
+    (key, at, fork): (String, &str, bool),
+    outcome: &mut Outcome,
+) -> (bool, String) {
+    if waiting.len() >= INTAKE_WAITING_LIMIT && !waiting.contains_key(&key) {
+        let oldest = (waiting.iter())
+            .filter(|(key, _)| forked.contains(*key))
+            .min_by_key(|(key, at)| (timestamp(Some(at)), *key))
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            return match fork {
+                true => (
+                    true,
+                    format!("; left to a person: {INTAKE_WAITING_LIMIT} threads wait already"),
+                ),
+                false => (false, String::new()),
+            };
+        };
+        waiting.remove(&oldest);
+        forked.remove(&oldest);
+        outcome.lines.push(format!(
+            "{oldest} notification: left to a person: {INTAKE_WAITING_LIMIT} newer threads wait"
+        ));
+    }
+    if fork {
+        forked.insert(key.clone());
+    }
+    waiting.insert(key, at.to_owned());
+    (true, "; retried each pass".into())
+}
+
 impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// The operator's new comments in `operatorComments`, each thread's turned
     /// into one run; where the next pass's search resumes, `at` a cursor and
@@ -487,17 +540,69 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// next resumes at the first thread it is not done with, or the first it
     /// did not read: by the time of that thread where this pass read the
     /// search from its start, and by the page it is on, so that no number of
-    /// threads updated within the lag, or at the same time, holds it in place.
+    /// threads updated within the lag holds it in place unless a single second
+    /// overflows GitHub's search cap; that is retained and reported unresolved.
     /// A resumed search read to its end may be read once more from its start,
     /// where threads updated meanwhile can have moved one not yet read before
     /// the page it resumed at.
+    ///
+    /// With the pass's intake, which has no lookback to end a stuck search, a
+    /// thread not done with does not hold the cursor, which would keep the
+    /// search on its oldest results: it goes into `waiting`, `OWNER/REPO#N` to
+    /// the time it was updated, up to [`INTAKE_WAITING_LIMIT`], each retried
+    /// at the start of every pass until it is done ([`keep_waiting`]).
     pub(super) fn operator_comments(
         &mut self,
         follow: &BTreeSet<&String>,
         (cursor, page): (Option<&str>, u64),
+        waiting: &mut BTreeMap<String, String>,
         outcome: &mut Outcome,
     ) -> Result<(String, u64)> {
-        let floor = self.now - Duration::seconds(LOOKBACK_SECONDS);
+        let intake = self.config.policy.notification_intake.is_some();
+        let retried: Vec<String> = waiting.keys().cloned().collect();
+        // Share at most half the remaining requests among *all* waiting
+        // threads. A long history must neither starve discovery nor prevent
+        // the later waiting entries from getting their turn; what one leaves
+        // unused goes to those after it. Incomplete reads fail closed; the
+        // thread remains waiting, never partially admitted.
+        let discovery_reserve = self.remaining.div_ceil(2);
+        self.remaining -= discovery_reserve;
+        // Those that wait for a fork: the ones that may make room.
+        let mut forked = BTreeSet::new();
+        for (index, key) in retried.iter().enumerate() {
+            let retry_budget = self.remaining / (retried.len() - index);
+            let Some((repo, number)) = key
+                .split_once('#')
+                .and_then(|(repo, n)| Some((repo, n.parse::<u64>().ok()?)))
+            else {
+                waiting.remove(key);
+                continue;
+            };
+            let result = self.searched_direction(repo, number, retry_budget);
+            match result {
+                Ok((done, line, fork)) => {
+                    outcome.activity += 1;
+                    outcome.lines.push(format!("{key} {line}"));
+                    if done {
+                        waiting.remove(key);
+                    } else if fork {
+                        forked.insert(key.clone());
+                    }
+                }
+                Err(error) => {
+                    outcome.errors += 1;
+                    outcome
+                        .lines
+                        .push(format!("{key} operator comments error: {error:#}"));
+                }
+            }
+        }
+        self.remaining += discovery_reserve;
+        let floor = if intake {
+            OffsetDateTime::UNIX_EPOCH
+        } else {
+            self.now - Duration::seconds(LOOKBACK_SECONDS)
+        };
         let lag = Duration::seconds(SEARCH_LAG_SECONDS);
         let saved = timestamp(cursor);
         let cursor = saved
@@ -518,6 +623,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             self.config.operator,
             stamp(cursor - lag)?
         );
+        if intake {
+            query.push_str(&format!(" mentions:{}", self.config.bot));
+        }
         for scope in scopes {
             match scope.strip_suffix("/*") {
                 Some(owner) => query.push_str(&format!(" org:{owner}")),
@@ -533,7 +641,9 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             let found = self.get(&format!(
                 "search/issues?q={query}&sort=updated&order=asc&per_page={THREADS_PAGE}&page={page}"
             ))?;
-            let hits = nodes(&found, "/items");
+            let hits = found["items"]
+                .as_array()
+                .context("search items is not a list")?;
             for hit in hits {
                 let updated = OffsetDateTime::parse(text(hit, "/updated_at"), &Rfc3339).ok();
                 let repo = text(hit, "/repository_url")
@@ -541,14 +651,51 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     .unwrap_or("")
                     .to_owned();
                 // The search found it; its scope is checked here all the same.
-                let done = if validate_repository(&repo).is_err() || !in_scope(scopes, &repo) {
+                let done = if validate_repository(&repo).is_err()
+                    || (!intake && !in_scope(scopes, &repo))
+                {
                     outcome.lines.push(format!(
                         "operator comments: ignored {repo:?}, outside the scope"
                     ));
                     true
-                } else if follow.contains(&repo) {
+                } else if !intake && follow.contains(&repo) {
                     // The poll's own steps cover its followed pull requests.
                     true
+                } else if intake
+                    && retried.contains(&waiting_key(&repo, hit["number"].as_u64().unwrap_or(0)))
+                {
+                    // Retried above, and still waiting where not done.
+                    true
+                } else if intake {
+                    let number = hit["number"].as_u64().unwrap_or_default();
+                    // An oversized new history, or the routing and recovery
+                    // reads after it, must leave requests to finish the
+                    // listing and save the threads that need retries.
+                    let listing = self.remaining.min(SEARCH_PAGES as usize);
+                    self.remaining -= listing;
+                    let found = self.searched_direction(&repo, number, self.remaining);
+                    self.remaining += listing;
+                    let (done, line, fork) = match found {
+                        Ok(found) => {
+                            outcome.activity += 1;
+                            found
+                        }
+                        Err(error) => {
+                            outcome.errors += 1;
+                            let line = format!("operator comments error: {error:#}");
+                            (false, line, false)
+                        }
+                    };
+                    let (done, kept) = match done {
+                        true => (true, String::new()),
+                        false => keep_waiting(
+                            (waiting, &mut forked),
+                            (waiting_key(&repo, number), text(hit, "/updated_at"), fork),
+                            outcome,
+                        ),
+                    };
+                    outcome.lines.push(format!("{repo}#{number} {line}{kept}"));
+                    done
                 } else {
                     let number = hit["number"].as_u64().unwrap_or_default();
                     match self.thread(&repo, hit) {
@@ -599,11 +746,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
             None => return Ok((stamp(cursor)?, 1)),
         };
-        let anchor = read
-            .get(open)
-            .or(read.last())
-            .and_then(|(at, _)| *at)
-            .map_or(cursor, |at| at.clamp(cursor, self.now));
+        let at = read.get(open).or(read.last()).and_then(|(at, _)| *at);
+        let anchor = at.map_or(cursor, |at| at.clamp(cursor, self.now));
         // Where that thread is in the next search. Read from its start, the
         // search may start at its time instead, and the threads before it
         // still in it are counted; else it is counted from the first page read.
@@ -621,8 +765,24 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // of the order, and those after it one forward.
         let page = (before / THREADS_PAGE).max(1) as u64;
         if page >= OPERATOR_PAGE_LIMIT {
-            // Past the results a search gives: by the time alone.
-            return Ok((stamp(anchor)?, 1));
+            // Past the results a search gives: narrow to the last timestamp,
+            // inclusively. Never step over that second: GitHub may have hidden
+            // more hits in it beyond the 1000-result cap. If narrowing cannot
+            // progress, retain the query and report an unresolved overflow
+            // rather than falsely completing discovery and losing direction.
+            let next = match (anchor > cursor, at) {
+                (true, _) => anchor,
+                (false, Some(at)) if at > cursor - lag => at + lag,
+                _ => {
+                    outcome.errors += 1;
+                    outcome.lines.push(format!(
+                        "operator comments: unresolved search overflow at {}; hidden hits may remain; discovery cursor retained, human intervention required",
+                        stamp(cursor - lag)?
+                    ));
+                    return Ok((stamp(cursor)?, start));
+                }
+            };
+            return Ok((stamp(next)?, 1));
         }
         Ok((stamp(next)?, page))
     }
@@ -4052,17 +4212,29 @@ pub(super) mod tests {
 
     #[test]
     fn the_cursor_is_kept_only_as_a_time() {
+        const UPDATED: &str = "2026-10-16T11:00:00Z";
         let state = State {
             interval_seconds: MIN_INTERVAL_SECONDS,
             operator_cursor: Some("2026-10-16T12:00:00Z".into()),
             operator_page: Some(3),
+            intake_waiting: BTreeMap::from([("other/place#2".into(), UPDATED.into())]),
             ..State::default()
         };
         assert_eq!(State::from_json(&state.to_json()).unwrap(), state);
+        let too_many: BTreeMap<String, &str> = (1..=INTAKE_WAITING_LIMIT + 1)
+            .map(|n| (format!("other/place#{n}"), UPDATED))
+            .collect();
         for (field, value) in [
             ("operator_cursor", json!("yesterday")),
             ("operator_page", json!(1)),
             ("operator_page", json!(OPERATOR_PAGE_LIMIT + 1)),
+            ("intake_waiting", json!({"other/place": UPDATED})),
+            ("intake_waiting", json!({"other#2": UPDATED})),
+            ("intake_waiting", json!({"other/place#0": UPDATED})),
+            ("intake_waiting", json!({"other/place#+2": UPDATED})),
+            ("intake_waiting", json!({"other/place#2": "yesterday"})),
+            ("intake_waiting", json!(["other/place#2"])),
+            ("intake_waiting", json!(too_many)),
         ] {
             let mut bad = state.to_json();
             bad[field] = value;

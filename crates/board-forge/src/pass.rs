@@ -457,8 +457,8 @@ pub struct Config {
     /// Off unless set: stage 2 also follows the repositories with this topic,
     /// and never merges in them, as if in `pr.noMerge` ([`midstream`]).
     pub midstream: Option<midstream::Midstream>,
-    /// Off unless set: route the bot's GitHub notifications through operator
-    /// intake, staging external work in a topic-selected midstream fork.
+    /// Off unless set: search GitHub for operator comments mentioning the bot,
+    /// staging external work in a topic-selected midstream fork.
     #[serde(default)]
     pub notifications: bool,
     /// Off unless set: stage 2 also follows up to this many repositories a
@@ -1450,13 +1450,6 @@ impl Config {
             fix_bounds: self.fix_bounds.clone(),
             fix_plans: self.fix_plans,
             reruns: self.reruns,
-            notifications: self.notifications.then(|| poll::notify::Notifications {
-                reasons: poll::notify::NOTIFY_REASONS
-                    .iter()
-                    .map(|r| (*r).into())
-                    .collect(),
-                peers: Vec::new(),
-            }),
             notification_intake: self.notifications.then(BTreeMap::new),
             kind_pools: if self.notifications {
                 self.triage_pools()
