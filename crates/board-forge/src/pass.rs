@@ -195,6 +195,14 @@ const FOLLOW_THROUGH: &str =
 /// What a triage brief that asks for a verdict says about follow-through
 /// and the operator ([`Scheduler::verdict_ask`]).
 const MECHANICAL: &str = " Mechanical follow-through (rebasing, re-running CI, fixing conflicts or refreshing a stale branch) is work, not a decision: plan it as an implement job; a rebase keeps existing Signed-off-by trailers and adds none. Only a real decision goes to the operator: a design choice, posting upstream for the first time, credentials, bounds or budget.";
+/// What a triage brief adds to [`MECHANICAL`] with [`Config::fix_plans`]:
+/// a promoted pull request's midstream one is closed, and only a `fix` run
+/// on the upstream one rewrites its branch in place, where an implement
+/// run would open another midstream pull request (agent-board#735).
+const PROMOTED: &str = " Follow-through on work promoted upstream (its midstream pull request closed, an open upstream pull request whose head is a bot/ branch of our fork) is a fix job plan, not an implement one, posted on this issue like any plan: its repo and item are that upstream pull request's, and its brief ends with this sentence: ";
+/// The sentence a [`PROMOTED`] fix plan's brief must carry: the operator
+/// alone speaks on an upstream pull request ([`Scheduler::fix_plan_head`]).
+const NO_UPSTREAM_COMMENT: &str = "Do not comment on the pull request or anywhere else upstream.";
 /// The hidden line a triage plan comment carries after its intro, with
 /// `triageFollowUpDays` or `revisit`: the [`fingerprint`] of what its run
 /// read, `<!-- agent-board-inputs: HASH -->` (agent-board#383).
@@ -326,6 +334,15 @@ const NOT_FOUND: &str = "NOT_FOUND";
 /// Whether a number is an issue's or a pull request's.
 const KIND_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issueOrPullRequest(number: $number) { __typename } }
+}"#;
+/// A `fix` plan's pull request, as far as [`Scheduler::fix_plan_head`]
+/// and [`poll::is_harness`] read it.
+const FIX_PULL_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    state isCrossRepository headRefName headRefOid author { login } headRepositoryOwner { login }
+    headRepository { nameWithOwner }
+    labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
+  } }
 }"#;
 /// An issue's own text, as a comment's is read ([`plan::comment`]), for the
 /// plan in its body ([`Config::body_plans`]).
@@ -480,6 +497,11 @@ pub struct Config {
     /// Avoid spending on previously manual research plans without caller consent.
     #[serde(default)]
     pub research_plans: bool,
+    /// Off unless set: start an accepted `fix` plan on the bot's open
+    /// pull request upstream, such as a promoted one's rebase, within
+    /// `--fix-bounds` ([`Scheduler::fix_plan_head`], agent-board#735).
+    #[serde(default)]
+    pub fix_plans: bool,
     /// Off unless set: a triage verdict of [`CLOSE_VERDICTS`] closes the
     /// issue rather than asking the operator; needs `triageFollowUpDays`.
     #[serde(default)]
@@ -1426,6 +1448,7 @@ impl Config {
                 snapshot: snapshot.cloned(),
             }),
             fix_bounds: self.fix_bounds.clone(),
+            fix_plans: self.fix_plans,
             reruns: self.reruns,
             notifications: self.notifications.then(|| poll::notify::Notifications {
                 reasons: poll::notify::NOTIFY_REASONS
@@ -1926,6 +1949,16 @@ fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) ->
     }
     busy.get(&key(&facts.issue))
         .map(|run| Hold::new(HoldKind::InFlight, format!("a run is in flight, {run}")))
+}
+
+/// A run in flight on a `fix` plan's pull request `dest`, such as stage 2's
+/// fix round or another issue's fix plan: a second would push to its head
+/// branch too.
+fn fix_in_flight(dest: &ItemRef, busy: &BTreeMap<String, String>) -> Option<Hold> {
+    busy.get(&key(dest)).map(|run| {
+        let why = format!("a run is in flight on {}, {run}", dest.display());
+        Hold::new(HoldKind::InFlight, why)
+    })
 }
 
 /// A merged Part of slice must not unstack past the next slice's run,
@@ -4248,6 +4281,197 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         })
     }
 
+    /// The head of `dest`, for plan `id`, an accepted `fix` plan
+    /// ([`Config::fix_plans`]), to start on; else why it cannot. Its run
+    /// rewrites a pull request's head branch, so `dest` must be the bot's
+    /// open pull request whose head the bot may push to
+    /// ([`poll::is_harness`]), not anyone's a plan names, inside
+    /// `--fix-bounds`, which must be given: agentic-job's policy step would
+    /// refuse anything else. Its brief must carry [`NO_UPSTREAM_COMMENT`],
+    /// as only the operator speaks upstream; that is a check of the plan,
+    /// not of what the run does. A person's [`poll::HOLD_LABEL`] or
+    /// [`NEEDS_HUMAN`] on the pull request holds it as it holds stage 2's
+    /// rounds, and a run in flight on it (`busy`) as it holds any start
+    /// ([`fix_in_flight`]). Asked again before a start's first write, as a
+    /// label may have come since.
+    fn fix_plan_head(
+        &self,
+        id: &str,
+        plan: &plan::JobPlan,
+        dest: &ItemRef,
+        busy: &BTreeMap<String, String>,
+    ) -> std::result::Result<(String, ItemRef), Hold> {
+        let config = self.config;
+        let held = |why: String| {
+            Hold::new(
+                HoldKind::NeedsOperator,
+                format!("plan {id}'s fix of {}: {why}", dest.display()),
+            )
+        };
+        if config.fix_bounds == poll::bounds::FixBoundsSet::default() {
+            return Err(held("a fix plan needs --fix-bounds".into()));
+        }
+        if !plan.brief.contains(NO_UPSTREAM_COMMENT) {
+            return Err(held(format!("its brief lacks {NO_UPSTREAM_COMMENT:?}")));
+        }
+        if let Some(held) = fix_in_flight(dest, busy) {
+            return Err(held);
+        }
+        let Some((owner, name)) = dest.repository.split_once('/') else {
+            return Err(held("its repository has no owner".into()));
+        };
+        let variables = json!({"owner": owner, "name": name, "number": dest.number});
+        let pull = match self.client.graphql(FIX_PULL_QUERY, variables) {
+            Ok(data) => data["repository"]["pullRequest"].clone(),
+            Err(error) => {
+                let why = format!(
+                    "plan {id}'s fix of {} could not be read: {error:#}",
+                    dest.display()
+                );
+                return Err(Hold::new(HoldKind::Unreadable, why));
+            }
+        };
+        if pull.is_null() {
+            return Err(held("it is not a pull request".into()));
+        }
+        if pull["state"] != "OPEN" {
+            return Err(held(format!(
+                "it is {}",
+                text(&pull, "/state").to_lowercase()
+            )));
+        }
+        // A label not read could be either.
+        let labels = pull.pointer("/labels/nodes").and_then(Value::as_array);
+        let (Some(labels), Some(false)) =
+            (labels, pull["labels"]["pageInfo"]["hasNextPage"].as_bool())
+        else {
+            return Err(held("its labels could not all be read".into()));
+        };
+        if let Some(label) = [poll::HOLD_LABEL, NEEDS_HUMAN].into_iter().find(|l| {
+            labels
+                .iter()
+                .any(|n| text(n, "/name").eq_ignore_ascii_case(l))
+        }) {
+            return Err(held(format!("it is labelled {label}")));
+        }
+        if !poll::is_harness(&pull, &config.poll(None)) {
+            return Err(held(format!(
+                "it is not {}'s pull request from a head it may push to",
+                config.bot
+            )));
+        }
+        let branch = text(&pull, "/headRefName");
+        if let Some(refused) = config.fix_bounds.refusal(&dest.repository, branch) {
+            return Err(held(refused));
+        }
+        let poll = config.poll(None);
+        let (repository, number) = poll::planned_fix_control(
+            &self.client,
+            &self.client,
+            &poll,
+            &self.follows,
+            (&dest.repository, dest.number, &pull),
+            self.now,
+        )
+        .map_err(held)?;
+        let control = ItemRef {
+            host: dest.host.clone(),
+            repository,
+            number,
+        };
+        if control != *dest {
+            if let Some(held) = fix_in_flight(&control, busy) {
+                return Err(held);
+            }
+            let (owner, name) = control
+                .repository
+                .split_once('/')
+                .ok_or_else(|| held("its control repository has no owner".into()))?;
+            let data = self
+                .client
+                .graphql(
+                    FIX_PULL_QUERY,
+                    json!({"owner": owner, "name": name, "number": control.number}),
+                )
+                .map_err(|e| {
+                    held(format!(
+                        "its midstream pull request could not be read: {e:#}"
+                    ))
+                })?;
+            let midstream = &data["repository"]["pullRequest"];
+            let labels = midstream.pointer("/labels/nodes").and_then(Value::as_array);
+            if !matches!(text(midstream, "/state"), "OPEN" | "CLOSED" | "MERGED")
+                || !poll::is_harness(midstream, &poll)
+                || text(midstream, "/headRefOid") != text(&pull, "/headRefOid")
+                || text(midstream, "/headRefName") != branch
+                || text(midstream, "/headRepository/nameWithOwner") != control.repository
+                || labels.is_none()
+                || midstream["labels"]["pageInfo"]["hasNextPage"] != false
+                || labels.is_some_and(|ls| {
+                    ls.iter().any(|l| {
+                        [poll::HOLD_LABEL, NEEDS_HUMAN]
+                            .iter()
+                            .any(|name| text(l, "/name").eq_ignore_ascii_case(name))
+                    })
+                })
+            {
+                return Err(held(
+                    "its midstream round ledger is unreadable, frozen, or not the same bot head"
+                        .into(),
+                ));
+            }
+        }
+        match text(&pull, "/headRefOid") {
+            "" => Err(held("its head could not be read".into())),
+            head => {
+                let refusal = poll::planned_fix_hold(
+                    &self.client,
+                    &self.client,
+                    &poll,
+                    (&control.repository, control.number, head),
+                    self.now,
+                )
+                .map_err(|e| held(format!("its round ledger could not be read: {e:#}")))?;
+                if let Some(why) = refusal {
+                    return Err(held(why));
+                }
+                Ok((head.to_owned(), control))
+            }
+        }
+    }
+
+    /// Plan `id`'s fix of `dest` at `head` charged as stage 2's next fix
+    /// round on it ([`poll::charge_planned_fix`]), just before its start
+    /// `line`: the step instead where it is not, the round claim and marker
+    /// two writes under `--max-writes`.
+    fn charge_fix(
+        &self,
+        id: &str,
+        dest: &ItemRef,
+        (control, head, pool): (&ItemRef, &str, &str),
+        (line, holds): (&str, &[ItemRef]),
+    ) -> std::result::Result<poll::PlannedCharge, Step> {
+        // Reserve a third write for a possible confirmed-unsent refund.
+        const CHARGE_WRITES: usize = 3;
+        if let Some(held) = self.caps.check_many(Kind::Write, CHARGE_WRITES) {
+            return Err(Step::Capped(format!("{held}: {line}")));
+        }
+        self.caps.count_many(Kind::Write, CHARGE_WRITES);
+        let at = (control.repository.as_str(), control.number, head, pool);
+        let poll = self.config.poll(None);
+        match poll::charge_planned_fix(&self.client, &self.client, &poll, at, self.now) {
+            Ok(Ok(charge)) => Ok(charge),
+            Ok(Err(why)) => Err(Step::Hold(Hold::new(
+                HoldKind::NeedsOperator,
+                format!("plan {id}'s fix of {}: {why}", dest.display()),
+            ))),
+            Err(error) => Err(Step::Failed(
+                format!("{line} failed: {error:#}"),
+                holds.to_vec(),
+            )),
+        }
+    }
+
     fn issue(&self, query: &str, issue: &ItemRef) -> Result<Value> {
         let (owner, name) = issue.repository.split_once('/').context("repository")?;
         let data = self.client.graphql(
@@ -4544,7 +4768,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // Research uses the same admission and dispatch path, but only when
         // the caller explicitly opts into spending on previously manual plans.
         if !(PASS_PLAN_KINDS.contains(&plan.kind.as_str())
-            || plan.kind == "research" && config.research_plans)
+            || plan.kind == "research" && config.research_plans
+            || plan.kind == "fix" && config.fix_plans)
             && failed.is_none()
         {
             let why = format!(
@@ -4554,6 +4779,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
         let implement = plan.kind == "implement";
+        // A fix run pushes to its pull request's head, wherever that is,
+        // never to the issue's repository.
+        let fix = plan.kind == "fix";
         let dest = ItemRef {
             repository: plan.repo.clone(),
             number: plan.item,
@@ -4588,7 +4816,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // Its verdict or plan would land on the other issue, where this
         // issue's follow-up does not look.
-        if !implement && dest != *issue {
+        if !implement && !fix && dest != *issue {
             let why = format!(
                 "plan {id} {} {}, not this issue; it is dispatched by hand",
                 if plan.kind == "research" {
@@ -4600,7 +4828,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
-        if !config.works_in(&dest.repository) {
+        let control = if fix {
+            match self.fix_plan_head(&id, &plan, &dest, busy) {
+                Ok((_, control)) => Some(control),
+                Err(held) => return Ok(Step::Hold(held)),
+            }
+        } else {
+            None
+        };
+        if !fix && !config.works_in(&dest.repository) {
             let dest = dest.display();
             let why = format!("its plan's {dest} is not in a work repository");
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
@@ -4615,7 +4851,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             );
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
-        if dest != *issue {
+        if !fix && dest != *issue {
             let target_facts = match self.facts(&dest, board) {
                 Ok(facts) => facts,
                 // A plan names the issue it implements, never a pull
@@ -4656,9 +4892,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 (snapshot, target, &waiver),
             );
         }
-        // A triage plan without a pool runs where the pass's own triage would.
+        // A triage plan without a pool runs where the pass's own triage
+        // would, a fix plan where stage 2's fix rounds would.
         let names: Vec<String> = match plan.pool.is_empty() {
-            true if !implement && !config.triage_pools().is_empty() => {
+            true if fix && !config.pr.fix_pools.is_empty() => config.pr.fix_pools.clone(),
+            true if !implement && !fix && !config.triage_pools().is_empty() => {
                 config.triage_pools().clone()
             }
             true => config.pools.0.iter().map(|(n, _)| n.clone()).collect(),
@@ -4725,10 +4963,20 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             hold(facts, busy, writers)
                 .or_else(|| stack_hold(&dest, lower, busy))
                 .or_else(|| self.assignment_hold(facts))
+                .or_else(|| fix.then(|| fix_in_flight(&dest, busy)).flatten())
+                .or_else(|| control.as_ref().and_then(|at| fix_in_flight(at, busy)))
         };
-        if let Some(step) = self.recheck(slots, (issue, &dest), target, rule)? {
+        // A fix plan's pull request has no issue facts to read again.
+        let again = if fix { issue } else { &dest };
+        if let Some(step) = self.recheck(slots, (issue, again), target, rule)? {
             return Ok(step);
         }
+        // The rule checked the runs in flight on it just now.
+        let head = match fix.then(|| self.fix_plan_head(&id, &plan, &dest, &BTreeMap::new())) {
+            Some(Err(held)) => return Ok(Step::Hold(held)),
+            Some(Ok(head)) => Some(head),
+            None => None,
+        };
         // A body plan is dispatched as the copy just posted, and only while
         // that copy is the issue's newest plan.
         let chosen = match &body {
@@ -4744,6 +4992,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     }
                 }
             }
+        };
+        let charge = match head {
+            Some((head, control)) => {
+                match self.charge_fix(&chosen, &dest, (&control, &head, &pool), (&line, &holds)) {
+                    Ok(charge) => Some(charge),
+                    Err(step) => return Ok(step),
+                }
+            }
+            None => None,
         };
         let ended = self.ended_runs();
         let scheduled = Scheduled {
@@ -4763,6 +5020,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let dispatcher = self.lease_dispatch(&dest, &pool);
         self.dispatcher.start_kind(start_line_kind(&line));
         let done = plan::dispatch_with(&self.client, &dispatcher, issue, &writers, target, options);
+        if !dispatcher.sent.get()
+            && let Some(charge) = charge
+        {
+            charge.refund(&self.client, &self.client, &config.poll(None), self.now)?;
+        }
         Ok(self.dispatched(line, holds, done))
     }
 
@@ -5089,6 +5351,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         brief.push_str(&self.verdict_ask());
         if intro == FOLLOW_THROUGH {
             brief.push_str(" Its last triage found that only mechanical follow-through remains: post one implement job plan for that, unless it is already in an open pull request.");
+            if self.config.fix_plans {
+                brief.push_str(" Work promoted upstream is in one: post a fix job plan for that upstream pull request on this issue instead.");
+            }
         }
         if let Some(answer) = answer {
             let released = match self.config.assign_holds {
@@ -5123,8 +5388,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if self.config.triage_follow_up_days == 0 {
             return active.to_owned();
         }
+        let promoted = match self.config.fix_plans {
+            true => format!("{PROMOTED}{NO_UPSTREAM_COMMENT}"),
+            false => String::new(),
+        };
         format!(
-            "{MECHANICAL} If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
+            "{MECHANICAL}{promoted} If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
              {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
              obsolete (no longer wanted: close as not planned), needs-design, needs-operator, \
              partly, not-done or {FOLLOW_THROUGH_VERDICT} (only mechanical follow-through \

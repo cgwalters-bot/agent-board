@@ -199,6 +199,7 @@
     "skipActiveWork": {"verdict": "refused", "reason": "active work suppression is only built for GitHub"},
     "idleReplan": {"verdict": "refused", "reason": "bounded idle epic replanning is only built for GitHub"},
     "researchPlans": {"verdict": "refused", "reason": "accepted research plan starts are only built for GitHub"},
+    "fixPlans": {"verdict": "refused", "reason": "accepted fix plan starts on a pull request are only built for GitHub"},
     "replanAfterDays": {"verdict": "refused", "reason": "needs a merged pull request's closing issues, which Forgejo's API does not name"},
     "bodyPlans": {"verdict": "refused", "reason": "an issue body's last editor cannot be read"},
     "revisit.perPass": {"verdict": "native", "forgejo": "issue updated_at"},

@@ -1683,6 +1683,41 @@ cannot loop. An earlier `follow-through` verdict on an issue without the
 pass's plan also waits. A run that still answers `done` for such work is
 closed or held as before: only the brief steers it.
 
+Work already promoted upstream is the exception (agent-board#735). Its
+midstream pull request is closed, and an implement run can only open another
+one from a new `dispatch/` branch, as composefs-rs#56's did. With `fixPlans`
+(GitHub only, off by default), both briefs instead ask for a `fix` job plan,
+posted on the issue as any plan is, naming the open upstream pull request
+whose head is our fork's `bot/` branch, its brief ending with "Do not comment
+on the pull request or anywhere else upstream." A fix run rewrites that
+branch in place. The pass starts an
+accepted fix plan as it starts an implement plan, without the overlap,
+stacking and work-repository checks, which are about issues. It holds the
+plan for the operator unless `--fix-bounds` is given and admits the pull
+request's repository and head branch, the pull request is open and the bot's
+from a head it may push to (its fork, or a `pr.headOwners` repository),
+labelled neither `hold` nor `needs-human`, with no run in flight on it, and
+the brief carries that sentence (a check of the plan, not of what the run
+does). It reads the pull request again just before its first write, and then
+checks `pr.ownerBranches` and the same fail-closed associated-PR guard as
+stage 2: every open PR sharing the head must be in a followed repository.
+It charges the next stage 2 fix round in our own space. For upstream work,
+the ledger is the unique same-head midstream PR (including one closed by
+promotion), verified as the bot's and not frozen. Both repositories must be
+followed. With `fixPlans`, stage 2 leaves upstream PRs read-only; its midstream
+rounds and planned fixes share that ledger's two fix rounds. Missing or
+ambiguous ledgers, unread facts, and legacy upstream markers or claims hold
+the plan for operator migration rather than resetting the allowance. Neither
+the claim nor the marker is posted upstream. A confirmed-unsent lease refusal
+restores only its own charged comment; ambiguous sends keep their charge.
+The plan is held where rounds are used or a round already started on the
+head. `pr.ownSpaceOnly` holds it as
+it holds any other write upstream.
+Without a pool of its own the plan runs on `pr.fixPools`. Its dispatch record
+keeps it from starting twice; a failed run is re-run by hand, and after the
+run the issue stays held as dispatched until the operator closes it or
+posts another plan.
+
 With `assignHolds` (off by default; agent-board#727), stage 4 waits on the
 operator by assignment instead of the `needs-human` label, so that the wait
 shows in GitHub's own assignment lists and notifications and the operator
@@ -3578,6 +3613,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
+| `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling); `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |

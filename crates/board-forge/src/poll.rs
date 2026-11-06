@@ -364,6 +364,15 @@ pub(crate) const SHARED_HEAD_QUERY: &str = r#"query($owner: String!, $name: Stri
     }
   }
 }"#;
+/// Promotion closes the midstream PR; its comments remain the round ledger.
+pub(crate) const CONTROL_HEAD_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $pulls: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRef { associatedPullRequests(first: $pulls) {
+        nodes { number repository { nameWithOwner } } pageInfo { hasNextPage } } }
+    }
+  }
+}"#;
 /// Pull requests read that share one head; past them no round starts.
 pub(crate) const SHARED_HEAD_READS: u64 = 20;
 /// How far a stop's comment may be from the label written before it: another
@@ -644,6 +653,9 @@ pub struct PollPolicy {
     /// file of which a pull request must be inside for the poll to start a
     /// fix-kind run on it ([`bounds`]); none (the default) checks nothing.
     pub fix_bounds: bounds::FixBoundsSet,
+    /// The pass's `fixPlans`: upstream branch fixes are planned on the tracker
+    /// and accounted on their same-head midstream PR, never by upstream writes.
+    pub fix_plans: bool,
     /// The pass's `pr.staleDays`: a stopped pull request of the bot's that
     /// conflicts or has changes requested, untouched by the operator for this
     /// many days, gets a fix round or is closed ([`stale`]). 0 (the default)
@@ -1224,6 +1236,7 @@ impl PollPolicy {
             check_reruns: false,
             unstall: false,
             owner_branches: false,
+            fix_plans: false,
             own_space_only: false,
             fold_rounds: false,
             review_pools: Vec::new(),
@@ -4429,7 +4442,42 @@ struct FailedJob {
     url: Option<String>,
 }
 
-impl<R: Rest, G: Transport> Pass<'_, R, G> {
+impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
+    /// A pass that has read and written nothing, with no cache, applies
+    /// nothing and follows no repository.
+    fn new(rest: &'a R, graphql: &'a G, config: &'a Config, now: OffsetDateTime) -> Self {
+        Pass {
+            rest,
+            graphql,
+            config,
+            now,
+            previous: BTreeMap::new(),
+            used: BTreeMap::new(),
+            remaining: POLL_REQUEST_LIMIT,
+            apply: None,
+            dispatched: 0,
+            merged: 0,
+            queues: BTreeMap::new(),
+            updated: BTreeSet::new(),
+            outages: None,
+            paces: None,
+            envelope: None,
+            followed: BTreeSet::new(),
+            caps: None,
+            intaking: false,
+            writes: 0,
+            review_runs: BTreeMap::new(),
+            review_intake: reviews::Intake::default(),
+            reviewing: 0,
+            review_unread: None,
+            deferred: Vec::new(),
+            deferring: None,
+            planned: 0,
+            folds: Vec::new(),
+            report_pulls: BTreeMap::new(),
+        }
+    }
+
     /// A marker comment's body, signed with the configured attribution.
     fn marker_body(&self, state: &Value, text: &str) -> String {
         marker_body(state, text, &self.config.policy.footer)
@@ -6983,28 +7031,10 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
     /// approved promote may push to (agent-board#562); or if those could not
     /// all be read, which counts the same.
     fn shared_head(&mut self, owner: &str, name: &str, number: u64) -> Option<String> {
-        let variables =
-            json!({"owner": owner, "name": name, "number": number, "pulls": SHARED_HEAD_READS});
-        let read = self
-            .spend()
-            .and_then(|()| self.graphql.graphql(SHARED_HEAD_QUERY, variables));
-        let data = match read {
-            Ok(data) => data,
-            Err(error) => {
-                return Some(format!(
-                    "the pull requests that share its head could not be read ({error:#})"
-                ));
-            }
+        let pulls = match self.shared_pulls(owner, name, number) {
+            Ok(pulls) => pulls,
+            Err(why) => return Some(why),
         };
-        let list = data.pointer("/repository/pullRequest/headRef/associatedPullRequests");
-        let Some(pulls) = list.and_then(|l| l["nodes"].as_array()) else {
-            return Some("the pull requests that share its head could not be read".into());
-        };
-        if list.and_then(|l| l.pointer("/pageInfo/hasNextPage")) != Some(&Value::Bool(false)) {
-            return Some(format!(
-                "more than the {SHARED_HEAD_READS} pull requests read share its head"
-            ));
-        }
         pulls
             .iter()
             .map(|p| (text(p, "/repository/nameWithOwner"), p["number"].as_u64()))
@@ -7015,6 +7045,47 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     n.unwrap_or_default()
                 )
             })
+    }
+
+    fn shared_pulls(
+        &mut self,
+        owner: &str,
+        name: &str,
+        number: u64,
+    ) -> std::result::Result<Vec<Value>, String> {
+        self.associated_pulls(owner, name, number, SHARED_HEAD_QUERY)
+    }
+
+    fn associated_pulls(
+        &mut self,
+        owner: &str,
+        name: &str,
+        number: u64,
+        query: &str,
+    ) -> std::result::Result<Vec<Value>, String> {
+        let variables =
+            json!({"owner": owner, "name": name, "number": number, "pulls": SHARED_HEAD_READS});
+        let read = self
+            .spend()
+            .and_then(|()| self.graphql.graphql(query, variables));
+        let data = match read {
+            Ok(data) => data,
+            Err(error) => {
+                return Err(format!(
+                    "the pull requests that share its head could not be read ({error:#})"
+                ));
+            }
+        };
+        let list = data.pointer("/repository/pullRequest/headRef/associatedPullRequests");
+        let Some(pulls) = list.and_then(|l| l["nodes"].as_array()) else {
+            return Err("the pull requests that share its head could not be read".into());
+        };
+        if list.and_then(|l| l.pointer("/pageInfo/hasNextPage")) != Some(&Value::Bool(false)) {
+            return Err(format!(
+                "more than the {SHARED_HEAD_READS} pull requests read share its head"
+            ));
+        }
+        Ok(pulls.clone())
     }
 
     /// One pull request's decision line, and whether it is in flight.
@@ -7035,6 +7106,16 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
+        if self.config.policy.fix_plans && !self.config.ours(repo) {
+            return Ok((
+                format!(
+                    "{repo}#{number} skip: fixPlans follows upstream fixes through the midstream pull request"
+                ),
+                false,
+                None,
+                None,
+            ));
+        }
         let mut intake =
             ordinary_reviews(self.config, repo) && self.review_intake.pulls < reviews::INTAKE_PULLS;
         if intake {
@@ -7884,34 +7965,11 @@ pub fn run_capped<R: Rest, G: Transport>(
         validate_repository(repo)?;
     }
     let mut pass = Pass {
-        rest,
-        graphql,
-        config,
-        now,
         previous: state.responses,
-        used: BTreeMap::new(),
-        remaining: POLL_REQUEST_LIMIT,
         apply,
-        dispatched: 0,
-        merged: 0,
-        queues: BTreeMap::new(),
-        updated: BTreeSet::new(),
-        outages: None,
-        paces: None,
-        envelope: None,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
-        intaking: false,
-        writes: 0,
-        review_runs: BTreeMap::new(),
-        review_intake: reviews::Intake::default(),
-        reviewing: 0,
-        review_unread: None,
-        deferred: Vec::new(),
-        deferring: None,
-        planned: 0,
-        folds: Vec::new(),
-        report_pulls: BTreeMap::new(),
+        ..Pass::new(rest, graphql, config, now)
     };
     // Markers and claims count only as the bot's: written by another
     // identity, the pass would never read back its own, and every pass would
@@ -8087,6 +8145,231 @@ pub fn run_capped<R: Rest, G: Transport>(
         authored_cursor: None,
     };
     Ok(outcome)
+}
+
+/// Reuse stage 2's push preflights, then locate the authorized round ledger.
+/// Upstream plans need exactly one same-head PR in the head repository,
+/// in our space and followed by stage 2. Legacy upstream accounting is held
+/// for a human rather than silently resetting its allowance during migration.
+pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
+    follow: &[String],
+    (repo, number, pull): (&str, u64, &Value),
+    now: OffsetDateTime,
+) -> std::result::Result<(String, u64), String> {
+    let mut pass = Pass::new(rest, graphql, config, now);
+    pass.followed = follow.iter().map(|r| r.to_ascii_lowercase()).collect();
+    let (owner, name) = repo.split_once('/').ok_or("its repository has no owner")?;
+    if config.policy.owner_branches {
+        let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
+        let own =
+            cross && text(pull, "/headRepositoryOwner/login").eq_ignore_ascii_case(&config.bot);
+        let head = if cross {
+            text(pull, "/headRepository/nameWithOwner")
+        } else {
+            repo
+        };
+        if let Some(why) = pass.owner_branches(head, own) {
+            return Err(why);
+        }
+    }
+    if let Some(why) = pass.shared_head(owner, name, number) {
+        return Err(why);
+    }
+    if config.ours(repo) {
+        return Ok((repo.to_owned(), number));
+    }
+    let head_repo = text(pull, "/headRepository/nameWithOwner");
+    if !config.ours(head_repo) {
+        return Err("its head has no round ledger in our own space".into());
+    }
+    let shared = pass.associated_pulls(owner, name, number, CONTROL_HEAD_QUERY)?;
+    let controls: Vec<_> = shared
+        .iter()
+        .filter(|p| text(p, "/repository/nameWithOwner").eq_ignore_ascii_case(head_repo))
+        .collect();
+    let [control] = controls.as_slice() else {
+        return Err(
+            "it needs exactly one same-head midstream pull request for round accounting".into(),
+        );
+    };
+    let control_number = control["number"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or("its midstream pull request number could not be read")?;
+    if !pass.followed.contains(&head_repo.to_ascii_lowercase()) {
+        return Err("its midstream round ledger is not in a followed repository".into());
+    }
+    let comments = pass
+        .paged(
+            &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+            true,
+        )
+        .map_err(|e| format!("its earlier round accounting could not be read: {e:#}"))?;
+    if find_marker(&comments, &config.bot).id.is_some()
+        || comments.iter().any(|c| {
+            text(c, "/user/login") == config.bot && parse_marker(CLAIM, text(c, "/body")).is_some()
+        })
+    {
+        return Err(
+            "its upstream round accounting needs operator migration to the midstream pull request"
+                .into(),
+        );
+    }
+    Ok((head_repo.to_owned(), control_number))
+}
+
+/// The exact comment a planned start charged; a confirmed-unsent dispatch
+/// restores only this comment, never a newer marker or a competing claim.
+pub(crate) struct PlannedCharge {
+    repo: String,
+    id: u64,
+    before: Marker,
+}
+
+impl PlannedCharge {
+    pub(crate) fn refund<R: Rest, G: Transport>(
+        self,
+        rest: &R,
+        graphql: &G,
+        config: &Config,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let mut pass = Pass::new(rest, graphql, config, now);
+        pass.record_run(
+            &self.repo,
+            &Marker {
+                id: Some(self.id),
+                ..self.before
+            },
+            "The planned dispatch was refused before sending; its round was not used.",
+        )
+    }
+}
+
+fn planned_round(
+    marker: &Marker,
+    read: &[Value],
+    bot: &str,
+    head: &str,
+) -> std::result::Result<Marker, String> {
+    let carried = if marker.stopped {
+        Marker::default()
+    } else {
+        marker.clone()
+    };
+    if carried.sha.as_deref() == Some(head) {
+        return Err(format!(
+            "{} already started on {}",
+            carried.round_name(),
+            short(head)
+        ));
+    }
+    if carried.rounds >= MAX_FIX_ROUNDS {
+        return Err(format!("its {MAX_FIX_ROUNDS} fix rounds are used"));
+    }
+    if let Some((id, _)) = earliest_claim(read, bot, &claim_from(marker)) {
+        return Err(format!(
+            "another pass went first with fix round {}, in comment {id}",
+            carried.rounds + 1
+        ));
+    }
+    Ok(carried)
+}
+
+/// Read-only round admission, also used for previews and capped starts.
+pub(crate) fn planned_fix_hold<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
+    (repo, number, head): (&str, u64, &str),
+    now: OffsetDateTime,
+) -> Result<Option<String>> {
+    let mut pass = Pass::new(rest, graphql, config, now);
+    let read = pass.paged(
+        &format!("repos/{repo}/issues/{number}/comments?per_page=100"),
+        true,
+    )?;
+    Ok(planned_round(&find_marker(&read, &config.bot), &read, &config.bot, head).err())
+}
+
+/// Charge the next fix round of pull request `number` in `repo` at `head`
+/// to a fix the pass starts from an issue's plan (agent-board#735), as
+/// [`Pass::start_fix`] charges its own: claimed from the bot's newest marker
+/// and recorded over the claim, so that planned fixes and stage 2's share
+/// [`MAX_FIX_ROUNDS`]. The run is not recorded in the marker, so stage 2
+/// waits on its head as on any round whose run it cannot name. Why not,
+/// where the rounds are used, a round already started on `head`, or another
+/// pass claimed first; a stop whose label was taken off starts them again.
+pub(crate) fn charge_planned_fix<R: Rest, G: Transport>(
+    rest: &R,
+    graphql: &G,
+    config: &Config,
+    (repo, number, head, pool): (&str, u64, &str, &str),
+    now: OffsetDateTime,
+) -> Result<std::result::Result<PlannedCharge, String>> {
+    let mut pass = Pass::new(rest, graphql, config, now);
+    let user = pass.get("user")?;
+    if text(&user, "/login") != config.bot {
+        return Ok(Err(format!(
+            "planned fixes write round accounting only as {}",
+            config.bot
+        )));
+    }
+    let comments = format!("repos/{repo}/issues/{number}/comments?per_page=100");
+    let read = pass.paged(&comments, true)?;
+    let marker = find_marker(&read, &config.bot);
+    let carried = match planned_round(&marker, &read, &config.bot, head) {
+        Ok(carried) => carried,
+        Err(why) => return Ok(Err(why)),
+    };
+    let round = carried.rounds + 1;
+    let of = format!(
+        "Planned fix round {round} of {MAX_FIX_ROUNDS} for `{}`",
+        short(head)
+    );
+    let state = json!({"from": claim_from(&marker), "round": round, "sha": head});
+    let claim = match pass.claim(repo, number, &marker, &read, (state, &of))? {
+        Ok(claim) => claim,
+        Err((id, _)) => {
+            return Ok(Err(format!(
+                "another pass went first with fix round {round}, in comment {id}"
+            )));
+        }
+    };
+    let mut charged = Marker {
+        id: None,
+        rounds: round,
+        sha: Some(head.to_owned()),
+        run: None,
+        at: Some(now.replace_nanosecond(0)?.format(&Rfc3339)?),
+        stopped: false,
+        pool: Some(pool.to_owned()),
+        queue: marker.queue.clone(),
+        continuing: false,
+        rebasing: false,
+        raising: false,
+        comments: Vec::new(),
+        pending: Vec::new(),
+        answering: false,
+        review_head: None,
+        review_at: None,
+        ..carried
+    };
+    pass.mark_claim(
+        repo,
+        claim,
+        &mut charged,
+        &format!("{of}: starting."),
+        (&marker, &read),
+    )?;
+    Ok(Ok(PlannedCharge {
+        repo: repo.to_owned(),
+        id: claim,
+        before: marker,
+    }))
 }
 
 #[cfg(test)]
@@ -16553,6 +16836,46 @@ mod tests {
             assert!(fake.writes.borrow().is_empty(), "{step}: {line}");
             assert!(dispatcher.writes.borrow().is_empty(), "{step}: {line}");
         }
+    }
+
+    #[test]
+    fn fix_plans_leave_upstream_stage_two_read_only() {
+        let fake = github();
+        let mut config = config();
+        config.policy.fix_plans = true;
+        let mut pass = Pass::new(&fake, &fake, &config, now());
+        let (line, _, _, _) = pass
+            .pull("containers/composefs-rs", 470, false, &mut BTreeMap::new())
+            .unwrap();
+        assert!(
+            line.contains("fixPlans follows upstream fixes through the midstream pull request"),
+            "{line}"
+        );
+        assert!(fake.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_planned_own_space_fix_cannot_rewrite_an_unfollowed_upstream() {
+        let mut fake = github();
+        fake.shared_head = Some(json!({"headRef": {"associatedPullRequests": {
+            "nodes": [{"number": 470, "repository": {"nameWithOwner": REPO}},
+                {"number": 55, "repository": {"nameWithOwner": "bootc-dev/bootc"}}],
+            "pageInfo": {"hasNextPage": false}}}}));
+        let config = config();
+        let held = planned_fix_control(
+            &fake,
+            &fake,
+            &config,
+            &[REPO.into()],
+            (REPO, 470, &json!({})),
+            now(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            held,
+            "its head is also the head of bootc-dev/bootc#55, which this pass does not follow"
+        );
+        assert!(fake.writes.borrow().is_empty());
     }
 
     /// A round pushes to the head, so none starts where an open pull request
