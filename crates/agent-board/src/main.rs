@@ -216,6 +216,7 @@ enum Command {
 #[derive(Subcommand)]
 enum Broker {
     /// Probe the broker (TCP, then one HTTP request) and open, refresh or close the outage issue; prints unless --apply, and fails while the broker is unreachable.
+    #[command(long_about = broker::PROBE_ABOUT)]
     Probe(broker::Probe),
 }
 
@@ -1677,6 +1678,50 @@ fn render(mut value: Value, cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+
+    #[test]
+    fn help_renders_for_every_subcommand() {
+        fn walk(command: &clap::Command, path: &[String]) {
+            for flag in ["-h", "--help"] {
+                let mut argv = path.to_vec();
+                argv.push(flag.to_owned());
+                let error = super::Cli::command()
+                    .try_get_matches_from(&argv)
+                    .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp,
+                    "{argv:?}"
+                );
+                let help = error.to_string();
+                assert!(help.contains("Usage:"), "{argv:?}: {help}");
+                if path
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["agent-board", "broker", "probe"])
+                    && flag == "--help"
+                {
+                    for text in [
+                        "GH_TOKEN",
+                        "unreachable broker exits 1",
+                        "agent-board broker probe --config broker.json --apply",
+                        "\"url\":\"http://broker.example:8080/\"",
+                    ] {
+                        assert!(help.contains(text), "missing {text}: {help}");
+                    }
+                }
+            }
+            for sub in command
+                .get_subcommands()
+                .filter(|sub| sub.get_name() != "help")
+            {
+                let mut path = path.to_vec();
+                path.push(sub.get_name().to_owned());
+                walk(sub, &path);
+            }
+        }
+        walk(&super::Cli::command(), &["agent-board".to_owned()]);
+    }
 
     /// Every visible command and argument must say what it does in --help;
     /// unimplemented commands stay hidden instead.
