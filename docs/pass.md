@@ -1395,7 +1395,9 @@ A pass captures one clock and performs these stages in order:
    requests included (this stage reads those, which earlier stages skip),
    from this pass's facts and its own starts, and write each one that differs:
    * closed issue, or merged or closed pull request: **Done**;
-   * otherwise, the `needs-human` label on the item: **Needs human**;
+   * otherwise, the `needs-human` label on the item, or with `assignHolds`
+     an open issue assigned to the operator ([scheduling](#scheduling)):
+     **Needs human**;
    * otherwise, our work moving on it: a run in flight for it, or an open
      pull request of ours for it (the item itself, or one that says it closes
      the issue, in any repository; draft or not): **In Progress**. Ours means
@@ -1587,6 +1589,58 @@ for that follow-through. A `follow-through` verdict on such a plan waits as
 cannot loop. An earlier `follow-through` verdict on an issue without the
 pass's plan also waits. A run that still answers `done` for such work is
 closed or held as before: only the brief steers it.
+
+With `assignHolds` (off by default; agent-board#727), stage 4 waits on the
+operator by assignment instead of the `needs-human` label, so that the wait
+shows in GitHub's own assignment lists and notifications and the operator
+never edits a label. An asking verdict assigns the operator in place of the
+label (`assign OPERATOR`), with the same hold comment, three writes under
+`--max-writes`: the pass unassigns the operator before it assigns them,
+since GitHub records no event for a login already assigned and only the
+bot's assignment is a wait. The assignment's response must name the
+operator, or the step fails rather than leave a wait no one sees. A
+candidate waits while the bot's newest assignment of the operator stands:
+the operator is still assigned and no one has assigned or unassigned them
+since, with no comment of theirs created after it, unedited or edited by a
+writer only (`hold OWNER/REPO#N: assigned to OPERATOR since T; any response
+of theirs releases it`, kind `needs-human`). Any response releases it: such
+a comment, a close by the operator (a closed issue is no candidate, so a
+close counts once the issue is open again; an issue's author may close and
+reopen it, which does not count), or an unassignment by anyone but the bot,
+which takes triage access.
+While the assignment stands, the pass takes it off itself, one write under
+`--max-writes` (`…; URL answered its assignment (assigned T), so unassigned
+OPERATOR`), and considers the issue as before; an asking verdict is then
+answered by that comment, as by a removal above, or triaged again with no
+answer on an unassignment or close. An assignment that is not the bot's,
+such as the operator's own, is no wait, but an ask replaces it with the
+bot's, which their response then takes off. A candidate
+labelled `needs-human` is moved over: the operator assigned, then the label
+taken off, three writes (`hold OWNER/REPO#N: labelled needs-human; assign
+OPERATOR in its place and take it off`); should the removal fail, the next
+pass moves it again. A write that fails is the candidate's `fail` line, a
+read that fails an `unreadable` hold. Everything is read from GitHub: one
+more GraphQL read per candidate considered, for its assignees and its newest
+100 assignment, unassignment and close events, and for an assigned
+candidate its comments, which its consideration reads again, as it reads
+the events again to follow up an asking verdict. Where the bot's assignment
+is not among those events, more of them exist and the operator is assigned,
+the wait cannot be told, so that a flood of events (an author closing and
+reopening their issue) cannot release it: the candidate is held
+`unreadable` until the operator is unassigned. A plan's destination, and
+each issue a plan's start reads again just before it, is held by an unanswered
+assignment as by the label, read only: its assignment is taken off when it
+is itself a candidate. The operator must be assignable in
+the work repositories. Stage 5 shows an open issue assigned to the operator
+as Needs human (`assigned to the operator`), whoever assigned them: the
+board read has no timeline. Only stage 4's candidates move to assignments:
+epics, the sweep issue and the poll's pull request stops still use the
+label. The needs-you list's carried `needs-human` waits are still retired by
+the label's removal, so a moved wait stage 4 did not reach in a pass drops
+from it until stage 4 holds it again; and the supervisor's `/release` and
+`release_listed` find nothing to release on a moved item, which only the
+operator's response releases. These are left for follow-ups. GitHub only: a
+Forgejo pass refuses the option.
 
 With `triageClose` (agent-board#428), `done` instead closes the issue as
 completed and `obsolete` as not planned, and the pass posts one line
@@ -3426,6 +3480,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
 | `triageFollowUpDays` | Act on an ended triage's verdict and triage again once its inputs changed; the most (0–30 days) the wait after a run that had nothing to do doubles to, for epic planning too, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
+| `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling); GitHub only; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |

@@ -14,7 +14,12 @@ answers on the labelled item and takes the label off, or on the `question`
 issue `ask create` opens, which `ask resolve` closes and unlabels. The
 [pass](pass.md#order-and-effects) derives the Needs human status from the
 label, never set by hand, and holds labelled work. This replaces the decisions
-document used by `ask add` and `ask read`.
+document used by `ask add` and `ask read`. With the pass's `assignHolds`
+(off by default), a stage 4 candidate waits on the operator by assignment
+instead, and an open issue assigned to the operator is Needs human. Any
+response of theirs releases the bot's assignment, which the pass then takes
+off; one the operator made themselves stays theirs to remove
+([scheduling](pass.md#scheduling)).
 
 The [pass](pass.md)'s hold snapshot marks `needs-human`,
 `needs-operator` and unplanned-epic holds as the operator's. A `needs-design`

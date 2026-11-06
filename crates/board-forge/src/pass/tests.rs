@@ -2328,6 +2328,14 @@ impl Forge {
         if method == "POST" && path.ends_with("/labels") {
             return Ok((200, json!([])));
         }
+        if method == "POST" && path.ends_with("/assignees") {
+            let logins = body["assignees"].as_array().cloned().unwrap_or_default();
+            let assignees: Vec<_> = logins.iter().map(|l| json!({"login": l})).collect();
+            return Ok((201, json!({"assignees": assignees})));
+        }
+        if method == "DELETE" && (path.ends_with("/assignees") || path.contains("/labels/")) {
+            return Ok((200, json!({})));
+        }
         if method == "POST" && path.ends_with("/rerun-failed-jobs") {
             return Ok((201, json!({})));
         }
@@ -2499,6 +2507,8 @@ impl Transport for Forge {
             Err(_) if query == VERDICT_REMOVALS_QUERY => {
                 json!({"repository": {"issue": {"removals": {"nodes": []}}}})
             }
+            Err(_) if query == wait::WAIT_QUERY => json!({"repository": {"issue": {
+                "assignees": {"nodes": [], "totalCount": 0}, "assignments": {"nodes": []}}}}),
             // A comment whose edits were not recorded: the bot's, unedited.
             Err(_) if query == needs::EDITS_QUERY => {
                 json!({"node": {"author": {"login": "cgwalters-bot"}, "lastEditedAt": null, "editor": null}})
@@ -5677,6 +5687,272 @@ fn answered_verdict_release_rules() {
     }
 }
 
+/// The assignment events and assignees [`wait::WAIT_QUERY`] reads of
+/// tracker#`number`: each event `(kind, actor, hours after the pass's
+/// clock)`, a full page of 100 with older ones before it.
+fn assignments(replay: &mut Replay, number: u64, events: &[(&str, &str, i64)], assignees: &[&str]) {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": number});
+    let nodes: Vec<_> = (events.iter())
+        .map(|(kind, actor, hours)| {
+            let at = replay.now + time::Duration::hours(*hours);
+            json!({"__typename": kind, "createdAt": at.format(&Rfc3339).unwrap(),
+                "actor": {"login": actor}, "assignee": {"login": "cgwalters"}})
+        })
+        .collect();
+    let logins: Vec<_> = assignees.iter().map(|l| json!({"login": l})).collect();
+    replay.requests.push(json!({
+        "request": graphql_key(wait::WAIT_QUERY, &variables),
+        "answer": {"data": {"repository": {"issue": {
+            "assignees": {"nodes": logins, "totalCount": assignees.len()},
+            "assignments": {"pageInfo": {"hasPreviousPage": events.len() >= 100},
+                "nodes": nodes}}}}}
+    }));
+}
+
+/// agent-board#727: with `assignHolds`, an asking verdict assigns the
+/// operator, who waits until any response: a comment or a close of theirs,
+/// or an unassignment; the pass then unassigns them where they still are,
+/// and triages again, with the comment where there is one. A `needs-human`
+/// label moves to an assignment. Each case: the
+/// assignment events and assignees, whether the operator commented after
+/// the bot's assignment (or before it), whether the issue is labelled, the
+/// write limit, what tracker#446's line contains, the hold writes and
+/// whether it was triaged again.
+#[test]
+fn assign_holds_wait_on_the_operator() {
+    let assigned = ("AssignedEvent", "cgwalters-bot", 1);
+    let asks = (
+        "assign cgwalters; rule unanswered-verdict: no later response of cgwalters to its assignment",
+        vec!["DELETE /assignees", "POST /assignees", "POST hold"],
+        false,
+    );
+    type Case<'a> = (
+        &'a str,
+        Vec<(&'a str, &'a str, i64)>,
+        &'a [&'a str],
+        Option<i64>,
+        bool,
+        Option<usize>,
+        (&'a str, Vec<&'a str>, bool),
+    );
+    let cases: Vec<Case> = vec![
+        ("asks", vec![], &[], None, false, None, asks.clone()),
+        (
+            "waits",
+            vec![assigned],
+            &["cgwalters"],
+            None,
+            false,
+            None,
+            ("assigned to cgwalters since ", vec![], false),
+        ),
+        (
+            "an answer before the assignment",
+            vec![("AssignedEvent", "cgwalters-bot", 30)],
+            &["cgwalters"],
+            Some(0),
+            false,
+            None,
+            ("assigned to cgwalters since ", vec![], false),
+        ),
+        (
+            "answered",
+            vec![assigned],
+            &["cgwalters"],
+            Some(1),
+            false,
+            None,
+            (
+                "answered its assignment; old verdict hold released; https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-",
+                vec!["DELETE /assignees"],
+                true,
+            ),
+        ),
+        (
+            "closed and reopened",
+            vec![assigned, ("ClosedEvent", "cgwalters", 2)],
+            &["cgwalters"],
+            None,
+            false,
+            None,
+            (
+                "rule answered-verdict: it was closed; old verdict hold released; it was closed (assigned ",
+                vec!["DELETE /assignees"],
+                true,
+            ),
+        ),
+        (
+            "closed and reopened by its author",
+            vec![assigned, ("ClosedEvent", "visitor", 2)],
+            &["cgwalters"],
+            None,
+            false,
+            None,
+            ("assigned to cgwalters since ", vec![], false),
+        ),
+        (
+            "asks, capped short of the unassignment before it",
+            vec![],
+            &[],
+            None,
+            false,
+            Some(2),
+            ("held by --max-writes", vec![], false),
+        ),
+        (
+            "answered, capped",
+            vec![assigned],
+            &["cgwalters"],
+            Some(1),
+            false,
+            Some(0),
+            ("held by --max-writes", vec![], false),
+        ),
+        (
+            "unassigned",
+            vec![assigned, ("UnassignedEvent", "cgwalters", 2)],
+            &[],
+            None,
+            false,
+            None,
+            (
+                "rule answered-verdict: cgwalters was unassigned",
+                vec![],
+                true,
+            ),
+        ),
+        (
+            "the operator's own assignment",
+            vec![("AssignedEvent", "cgwalters", 1)],
+            &["cgwalters"],
+            None,
+            false,
+            None,
+            asks.clone(),
+        ),
+        (
+            "an assignment before the verdict",
+            vec![
+                ("AssignedEvent", "cgwalters-bot", -48),
+                ("UnassignedEvent", "cgwalters", -24),
+            ],
+            &[],
+            None,
+            false,
+            None,
+            asks.clone(),
+        ),
+        (
+            "the bot's assignment past the events read",
+            vec![("ClosedEvent", "visitor", 2); 100],
+            &["cgwalters"],
+            None,
+            false,
+            None,
+            ("its assignments could not be read", vec![], false),
+        ),
+        (
+            "labelled",
+            vec![],
+            &[],
+            None,
+            true,
+            None,
+            (
+                "labelled needs-human; assign cgwalters in its place and take it off",
+                vec![
+                    "DELETE /assignees",
+                    "POST /assignees",
+                    "DELETE /labels/needs-human",
+                ],
+                false,
+            ),
+        ),
+    ];
+    for (name, events, assignees, answer, labelled, writes, expected) in cases {
+        let (line, held, again) = expected;
+        for board_triage in [true, false] {
+            let name = format!("{name} (triaged first: {board_triage})");
+            let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true}));
+            let mut forge = Forge::new(None, false);
+            only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+            if board_triage {
+                assert_eq!(apply(&forge, &config).failures, 0, "{name}");
+            }
+            answered(
+                &forge,
+                ("cgwalters-bot", None),
+                &format!("```{TRIAGE_FENCE}\n{{\"verdict\":\"needs-operator\"}}\n```"),
+                0,
+            );
+            if let Some(days) = answer {
+                answered(&forge, ("cgwalters", None), "Go ahead.", days);
+            }
+            assignments(&mut forge.replay, 446, &events, assignees);
+            if labelled {
+                for entry in &mut forge.replay.requests {
+                    let nodes =
+                        entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+                    for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+                        let labels = &mut node["content"]["labels"];
+                        labels["nodes"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"name": "needs-human"}));
+                        labels["totalCount"] = json!(labels["nodes"].as_array().unwrap().len());
+                    }
+                }
+            }
+            let triaged = || {
+                (forge.dispatches().iter())
+                    .filter(|d| d.ends_with("tracker#446"))
+                    .count()
+            };
+            let (before, dispatched) = (forge.writes.borrow().len(), triaged());
+            let limits = Limits {
+                writes,
+                ..Limits::default()
+            };
+            let preview = block(run(
+                &forge,
+                &forge,
+                &config,
+                State::default(),
+                (Mode::Preview, limits),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert_eq!(forge.writes.borrow().len(), before, "{name}: preview wrote");
+            let report = apply_limited(&forge, &config, limits);
+            assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+            for report in [&preview, &report] {
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("tracker#446") && l.contains(line)),
+                    "{name}: no {line:?} in {:#?}",
+                    report.lines
+                );
+            }
+            let issue = "repos/cgwalters-forge/tracker/issues/446";
+            let wrote: Vec<String> = forge.writes.borrow()[before..]
+                .iter()
+                .filter_map(|(method, url, body)| {
+                    let path = url.trim_start_matches(API_ROOT).strip_prefix(issue)?;
+                    if text(body, "/body").starts_with("<!-- agent-board-hold") {
+                        return Some(format!("{method} hold"));
+                    }
+                    let held = path.ends_with("/assignees") || path.starts_with("/labels");
+                    held.then(|| format!("{method} {path}"))
+                })
+                .collect();
+            assert_eq!(wrote, held, "{name}");
+            assert_eq!(triaged() - dispatched, usize::from(again), "{name}");
+        }
+    }
+}
+
 /// Before a first triage, the bot's earlier verdict with nothing after it
 /// but the bot's comments, and the issue's body and title not edited since,
 /// is acted on as a follow-up's would be, rather than triaged again. Each
@@ -6529,8 +6805,9 @@ fn apply_reruns_a_failed_run_once() {
     );
     let other = json!({"id": 1, "display_title": "implement cgwalters-forge/tracker#468 (claude)",
         "conclusion": "failure", "run_attempt": 1});
-    // Since the run failed: its plan moved to #469, which a person held.
-    let held_469: Edit = |r| {
+    // Since the run failed: its plan moved to #469, which a person held,
+    // by the label where `labelled`.
+    fn target_469(r: &mut Replay, labelled: bool) {
         replan_468(r, r#""item":468,"#, r#""item":469,"#);
         let pages = (r.requests.iter())
             .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
@@ -6539,16 +6816,38 @@ fn apply_reruns_a_failed_run_once() {
         let node = pages.flatten().find(|n| n["content"]["number"] == 468);
         let mut issue = node.unwrap()["content"].clone();
         issue["number"] = 469.into();
-        let labels = &mut issue["labels"];
-        labels["nodes"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({"name": "needs-human"}));
-        labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+        if labelled {
+            let labels = &mut issue["labels"];
+            labels["nodes"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"name": "needs-human"}));
+            labels["totalCount"] = (labels["totalCount"].as_u64().unwrap() + 1).into();
+        }
         let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "number": 469});
         r.requests.push(json!({
             "request": graphql_key(&format!("{ISSUE_QUERY}{FACTS}"), &variables),
             "answer": {"data": {"repository": {"issue": issue}}},
+        }));
+    }
+    let held_469: Edit = |r| target_469(r, true);
+    // agent-board#727: with `assignHolds`, #469's label moved to the
+    // operator's assignment, which they have not answered.
+    let assigned_469: Edit = |r| {
+        target_469(r, false);
+        assignments(r, 468, &[], &[]);
+        assignments(
+            r,
+            469,
+            &[("AssignedEvent", "cgwalters-bot", -1)],
+            &["cgwalters"],
+        );
+        let variables =
+            json!({"owner": "cgwalters-forge", "name": "tracker", "number": 469, "after": null});
+        r.requests.push(json!({
+            "request": graphql_key(plan::COMMENTS_QUERY, &variables),
+            "answer": {"data": {"repository": {"issue": {"comments": {"nodes": [],
+                "pageInfo": {"hasNextPage": false, "endCursor": null}}}}}},
         }));
     };
     let elsewhere: Edit = |r| {
@@ -6657,6 +6956,14 @@ fn apply_reruns_a_failed_run_once() {
             vec![run(1)],
             held_469,
             "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#469: labelled needs-human",
+            0,
+        ),
+        (
+            "so does its operator's assignment",
+            json!({"reruns": true, "assignHolds": true}),
+            vec![run(1)],
+            assigned_469,
+            "hold cgwalters-forge/tracker#468: its plan's cgwalters-forge/tracker#469: assigned to cgwalters since ",
             0,
         ),
         (

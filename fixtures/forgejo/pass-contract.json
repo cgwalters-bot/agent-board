@@ -191,6 +191,7 @@
     "triagePools": {"verdict": "same"},
     "triageFollowUpDays": {"verdict": "native", "forgejo": "verdict blocks in unedited bot comments"},
     "triageClose": {"verdict": "native", "forgejo": "close with a comment naming the verdict; no close reason"},
+    "assignHolds": {"verdict": "refused", "reason": "the operator's wait is read from GitHub's assignment timeline"},
     "skipActiveWork": {"verdict": "refused", "reason": "active work suppression is only built for GitHub"},
     "idleReplan": {"verdict": "refused", "reason": "bounded idle epic replanning is only built for GitHub"},
     "researchPlans": {"verdict": "refused", "reason": "accepted research plan starts are only built for GitHub"},

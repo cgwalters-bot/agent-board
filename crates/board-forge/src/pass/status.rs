@@ -50,6 +50,9 @@ pub struct ItemFacts {
     /// A pull request's: merged, rather than closed unmerged.
     pub merged: bool,
     pub needs_human: bool,
+    /// With [`Config::assign_holds`], an open issue assigned to the
+    /// operator ([`waits_by_assignment`]), Needs human as the label is.
+    pub assigned: bool,
     /// A run in flight for it: its URL, or that this pass started it.
     pub run: Option<String>,
     /// Whether every run in flight was listed.
@@ -111,7 +114,7 @@ pub fn derive(facts: &ItemFacts) -> Option<Change> {
     };
     let signals = StatusSignals {
         terminal: !facts.open,
-        human_ask: facts.needs_human,
+        human_ask: facts.needs_human || facts.assigned,
         active,
     };
     let (_, to) = derive_status(facts.status.as_ref(), &signals, &PASS_STATUS_RULES)?;
@@ -121,7 +124,8 @@ pub fn derive(facts: &ItemFacts) -> Option<Change> {
     let reason = match &to {
         Status::Done if facts.merged => "merged".into(),
         Status::Done => "closed".into(),
-        Status::NeedsHuman => format!("labelled {NEEDS_HUMAN}"),
+        Status::NeedsHuman if facts.needs_human => format!("labelled {NEEDS_HUMAN}"),
+        Status::NeedsHuman => "assigned to the operator".into(),
         Status::InProgress => match (&facts.run, &facts.pulls[..]) {
             (Some(run), _) => format!("run in flight, {run}"),
             (None, _) if open_pull => "open pull request".into(),
@@ -219,10 +223,12 @@ impl<'a, C: Rest + Transport + crate::github::GraphQl> Scheduler<'a, C> {
             bot: &config.bot,
             stale_before: (days > 0).then(|| self.now - time::Duration::days(days as i64)),
         };
+        let assigned = config.assign_holds.then_some(config.operator.as_str());
         let mut changes: Vec<(&Item, Change)> = Vec::new();
         let mut kept = 0;
         for item in &snapshot.items {
-            let facts = item_facts(item, busy.as_ref(), open.as_ref(), &ours);
+            let mut facts = item_facts(item, busy.as_ref(), open.as_ref(), &ours);
+            facts.assigned = waits_by_assignment(item, assigned);
             kept += usize::from(!facts.complete);
             if let Some(change) = derive(&facts) {
                 changes.push((item, change));
@@ -395,11 +401,28 @@ fn item_facts(
             .labels
             .iter()
             .any(|l| l.eq_ignore_ascii_case(NEEDS_HUMAN)),
+        // Set by the caller, which knows the setting.
+        assigned: false,
         run: busy.and_then(|b| b.get(&at).cloned()),
         runs_read: busy.is_some(),
         pulls,
         pulls_read,
     }
+}
+
+/// With [`Config::assign_holds`], whether `item` is an open issue assigned
+/// to the `operator`, which waits on them as a [`NEEDS_HUMAN`] label does.
+/// The operator's own assignment counts too: stage 4 takes the bot's off
+/// once they respond, and the snapshot has no timeline to tell them apart.
+fn waits_by_assignment(item: &Item, operator: Option<&str>) -> bool {
+    operator.is_some_and(|operator| {
+        item.content_kind == "issue"
+            && item.state == "open"
+            && item
+                .assignees
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(operator))
+    })
 }
 
 /// When `item` last changed, where the snapshot read it.
@@ -861,6 +884,18 @@ mod tests {
                 Some((NeedsHuman, "labelled needs-human")),
             ),
             (
+                "assigned to the operator (assignHolds)",
+                Some(Todo),
+                |f| f.assigned = true,
+                Some((NeedsHuman, "assigned to the operator")),
+            ),
+            (
+                "Done wins over an assignment",
+                Some(NeedsHuman),
+                |f| (f.open, f.assigned) = (false, true),
+                Some((Done, "closed")),
+            ),
+            (
                 "needs-human wins over a run",
                 Some(InProgress),
                 |f| {
@@ -1206,6 +1241,30 @@ mod tests {
             let facts = item_facts(&item, Some(&busy), Some(&read), &ours);
             let got = derive(&facts).map(|c| c.to);
             assert_eq!(got, expected, "{case}");
+        }
+    }
+
+    /// Each case: the item's kind, state and assignees, whether
+    /// `assignHolds` is on and whether it waits on the operator.
+    #[test]
+    fn an_open_issue_assigned_to_the_operator_waits_with_assign_holds() {
+        for (kind, state, assignees, on, expected) in [
+            ("issue", "open", vec!["Op"], true, true),
+            ("issue", "open", vec!["other", "op"], true, true),
+            ("issue", "open", vec!["op"], false, false),
+            ("issue", "open", vec!["other"], true, false),
+            ("issue", "closed", vec!["op"], true, false),
+            ("pull_request", "open", vec!["op"], true, false),
+        ] {
+            let item: Item = serde_json::from_value(json!({
+                "identity": {"host": DEFAULT_HOST, "repository": "o/r", "number": 1},
+                "title": "t", "state": state, "status": null, "priority": null, "turn": null,
+                "fields_complete": true, "content_kind": kind, "assignees": assignees,
+            }))
+            .unwrap();
+            let operator = on.then_some("op");
+            let got = waits_by_assignment(&item, operator);
+            assert_eq!(got, expected, "{kind} {state} {assignees:?} {on}");
         }
     }
 }
