@@ -297,7 +297,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             (Some(_), _) => (Read::Unread, None),
         };
         holds::Observed {
-            steps: step_facts(!config.follow.is_empty(), followed, &self.stepped, at),
+            steps: step_facts(config.follows(), followed, &self.stepped, at),
             runs: run_facts(reruns, self.failed_listed.then_some(&self.failed), at),
             usage,
         }
@@ -505,11 +505,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             _ => Vec::new(),
         };
         let config = self.config;
-        let mut reviews = review_asks(
-            !config.follow.is_empty(),
-            self.followed.as_ref(),
-            &snapshot.at,
-        );
+        let mut reviews = review_asks(config.follows(), self.followed.as_ref(), &snapshot.at);
         if !config.holds.as_ref().is_some_and(|h| h.approval_evidence) {
             reviews.approval_evidence = None;
         }

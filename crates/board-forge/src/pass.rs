@@ -426,6 +426,9 @@ pub struct Config {
     pub dispatch_ref: Option<String>,
     #[serde(default)]
     pub follow: Vec<String>,
+    /// Off unless set: stage 2 also follows the repositories with this topic,
+    /// and never merges in them, as if in `pr.noMerge` ([`midstream`]).
+    pub midstream: Option<midstream::Midstream>,
     #[serde(default)]
     pub work_repositories: Vec<String>,
     pub board: Option<BoardConfig>,
@@ -1229,10 +1232,18 @@ impl Config {
         self.pr
             .poll
             .check("pr ", &self.follow, self.pr.review_workflow.is_some())?;
+        if let Some(midstream) = &self.midstream {
+            midstream.check(self)?;
+        }
         // A work repository's pull requests, unfollowed, are never merged,
         // fixed or surfaced, and their failed reviews never seen (#666).
+        // Where it may be a midstream, stage 2 checks it once it has read them.
         if self.pr.poll.unstall {
-            for repo in &self.work_repositories {
+            for repo in self
+                .work_repositories
+                .iter()
+                .filter(|r| !self.midstream_owns(r))
+            {
                 ensure!(
                     self.follow.iter().any(|r| r.eq_ignore_ascii_case(repo)),
                     "pr unstall needs every work repository followed, and {repo} is not in follow"
@@ -1273,7 +1284,7 @@ impl Config {
         // The poll paces only the pools a fix round names: with none, the
         // caller's default would run unpaced, on a cold start too.
         ensure!(
-            self.follow.is_empty() || self.usage.is_none() || !self.pr.fix_pools.is_empty(),
+            !self.follows() || self.usage.is_none() || !self.pr.fix_pools.is_empty(),
             "pr fixPools is required to pace followed pull requests' fix runs by usage"
         );
         Ok(())
@@ -1282,6 +1293,18 @@ impl Config {
     /// `budget.harnessRepositories`, where set.
     pub fn harness_repositories(&self) -> Option<&[String]> {
         self.budget.as_ref()?.harness_repositories.as_deref()
+    }
+
+    /// Whether stage 2 follows any repository: `follow`'s or `midstream`'s.
+    fn follows(&self) -> bool {
+        !self.follow.is_empty() || self.midstream.is_some()
+    }
+
+    /// Whether `repository` is in `midstream`'s organization, so may be one.
+    fn midstream_owns(&self, repository: &str) -> bool {
+        self.midstream.as_ref().is_some_and(|m| {
+            (repository.split_once('/')).is_some_and(|(o, _)| o.eq_ignore_ascii_case(&m.owner))
+        })
     }
 
     /// Whether the pass starts new work at all.
@@ -2615,9 +2638,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     // Every stage that starts runs starts them from the same ref.
     let git_ref = match &config.dispatch_ref {
         Some(git_ref) => git_ref.clone(),
-        None if config.follow.is_empty() && !config.work() && config.maintain.is_none() => {
-            String::new()
-        }
+        None if !config.follows() && !config.work() && config.maintain.is_none() => String::new(),
         None => match default_branch(&client, &config.dispatch_repo) {
             Ok(branch) => branch,
             Err(error) => {
@@ -2663,6 +2684,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         not_started: 0,
         free: None,
         top: None,
+        follows: config.follow.clone(),
         followed: None,
         stepped: Vec::new(),
         blocking: RefCell::default(),
@@ -3003,6 +3025,9 @@ struct Scheduler<'a, C> {
     /// The board's first [`TOP_PRIORITIES`] Priority options, once stage 4
     /// read the board.
     top: Option<Vec<String>>,
+    /// The repositories stage 2 follows: `follow`, and the midstreams it
+    /// read where `midstream` is set.
+    follows: Vec<String>,
     /// Stage 2's review waits and the repositories it left undecided
     /// ([`poll::Outcome::waits`]), once it ran.
     followed: Option<(Vec<poll::Wait>, BTreeSet<String>)>,
@@ -3119,7 +3144,62 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// it started.
     fn follow(&mut self, state: State, git_ref: &str, earlier: usize) -> usize {
         let config = self.config;
-        if config.follow.is_empty() {
+        let mut midstreams = Vec::new();
+        if let Some(midstream) = &config.midstream {
+            let (owner, topic) = (&midstream.owner, &midstream.topic);
+            // Unread, a midstream also in `follow` would be merged in.
+            match midstream.read(&self.client) {
+                Ok(read) => midstreams = read,
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("follow error: midstream topic {topic}: {error:#}"));
+                    return 0;
+                }
+            }
+            self.line(format!(
+                "midstream: {} with topic {topic} in {owner}",
+                midstreams.len()
+            ));
+            // [`Config::check`]'s refusals of these in `follow`: a run on the
+            // direction would steer every brief, and a fork promote reads
+            // moves only by sync.
+            let direction = config.direction.as_ref().map(|d| &d.repository);
+            let promoted = config.promote.as_ref().map(|p| &p.forks);
+            let refused = midstreams.iter().find(|repo| {
+                direction.is_some_and(|d| d.eq_ignore_ascii_case(repo))
+                    || promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
+            });
+            if let Some(repo) = refused {
+                self.report.failures += 1;
+                self.line(format!(
+                    "follow error: midstream {repo} is the direction repository or a promote fork, which the pass never follows"
+                ));
+                return 0;
+            }
+            for repo in &midstreams {
+                if !self.follows.iter().any(|r| r.eq_ignore_ascii_case(repo)) {
+                    self.follows.push(repo.clone());
+                }
+            }
+            if self.follows.len() > POLL_REPOSITORY_LIMIT {
+                self.report.failures += 1;
+                self.line(format!(
+                    "follow error: follow and midstream name more than {POLL_REPOSITORY_LIMIT} repositories"
+                ));
+                return 0;
+            }
+            // [`Config::check`]'s, for the work repositories it left to here.
+            let unfollowed = (config.work_repositories.iter())
+                .find(|w| !self.follows.iter().any(|r| r.eq_ignore_ascii_case(w)));
+            if let Some(repo) = unfollowed.filter(|_| config.pr.poll.unstall) {
+                self.report.failures += 1;
+                self.line(format!(
+                    "follow error: pr unstall needs every work repository followed, and {repo} is neither in follow nor has topic {topic}"
+                ));
+                return 0;
+            }
+        }
+        if self.follows.is_empty() {
             self.line("follow: no repositories".into());
             return 0;
         }
@@ -3136,6 +3216,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
+        poll.policy.no_merge.extend(midstreams);
         if !config.pr.poll.review_pools.is_empty() {
             let (wip, ranks) = self.review_bounds(git_ref, earlier);
             poll.policy.review_wip = wip;
@@ -3148,7 +3229,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             pools: config.pr.fix_pools.clone(),
             git_ref: Some(git_ref.to_owned()),
         });
-        let follow = &config.follow;
+        let follow = &self.follows;
         match poll::run_capped(
             &self.client,
             &self.client,
@@ -6188,6 +6269,7 @@ pub mod holds;
 
 pub mod lease;
 pub mod maintain;
+pub mod midstream;
 pub mod needs;
 pub mod next;
 pub mod promote;

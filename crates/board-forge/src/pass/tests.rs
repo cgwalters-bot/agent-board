@@ -10894,6 +10894,11 @@ fn config_table() {
             ),
             (got, _) => panic!("{follow} {work}: {got:?}"),
         }
+        // A work repository in the midstream organization may be one: stage
+        // 2 checks it once it has read them.
+        let mut midstream = settings.clone();
+        midstream["midstream"] = json!({"owner": "O", "topic": "bot-midstream"});
+        assert!(Config::parse(&midstream.to_string()).is_ok(), "{work}");
         // Without it, an unfollowed work repository is allowed, as before.
         settings["pr"] = json!({});
         assert!(Config::parse(&settings.to_string()).is_ok(), "{work}");
@@ -11338,6 +11343,31 @@ fn config_table() {
         ),
         (json!({"dispatchWorkflow": "../x.yml"}), "invalid workflow"),
         (json!({"follow": ["not a repo"]}), "invalid repository"),
+        (
+            json!({"midstream": {"owner": "elsewhere", "topic": "bot-midstream"}}),
+            "midstream owner elsewhere is not dispatchRepo's owner",
+        ),
+        (
+            json!({"midstream": {"owner": "not a login", "topic": "bot-midstream"}}),
+            "midstream owner \"not a login\" is not a login",
+        ),
+        (
+            json!({"midstream": {"owner": "O", "topic": "Bot_Midstream"}}),
+            "midstream topic \"Bot_Midstream\" is not a GitHub topic",
+        ),
+        (
+            json!({"midstream": {"owner": "o", "topic": ""}}),
+            "midstream topic \"\" is not a GitHub topic",
+        ),
+        (
+            json!({"midstream": {"owner": "o", "topic": "bot-midstream"},
+                "usage": {"repository": "o/ops", "issue": 1}}),
+            "pr fixPools is required to pace",
+        ),
+        (
+            json!({"midstream": {"owner": "o"}}),
+            "missing field `topic`",
+        ),
         (json!({"bot": "-bad-"}), "invalid login"),
         (
             json!({"follow": ["o/r"], "usage": {"repository": "o/ops", "issue": 1}}),
@@ -12602,7 +12632,7 @@ fn no_merge_preserves_followed_rounds_and_holds() {
     let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
         "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
         "pageInfo": {"hasPreviousPage": false}});
-    for queued in [false, true] {
+    for (queued, topic) in [(false, false), (true, false), (false, true), (true, true)] {
         for (name, change, action) in [
             ("ready", json!({}), "wait: pr.noMerge:"),
             ("conflict", json!({"mergeable": "CONFLICTING"}), "rebase:"),
@@ -12630,8 +12660,34 @@ fn no_merge_preserves_followed_rounds_and_holds() {
             ),
         ] {
             let mut forge = Forge::new(None, false);
-            let settings = json!({"wip": 0, "follow": [REPO], "pr": {"fixPools": ["claude"],
+            let mut settings = json!({"wip": 0, "follow": [REPO], "pr": {"fixPools": ["claude"],
                 "headOwners": ["cgwalters-forge"], "noMerge": [REPO], "rebaseRounds": 1}});
+            // The same, with REPO a midstream by its topic, on the second
+            // page of the organization's repositories, rather than listed.
+            if topic {
+                settings["follow"] = json!([]);
+                settings["pr"]["noMerge"] = json!([]);
+                settings["midstream"] =
+                    json!({"owner": "cgwalters-forge", "topic": "bot-midstream"});
+                let first = format!("{API_ROOT}orgs/cgwalters-forge/repos?per_page=100");
+                let second = format!("{first}&page=2");
+                for (url, link, body) in [
+                    (
+                        &first,
+                        json!(format!(r#"<{second}>; rel="next""#)),
+                        json!([{"full_name": "cgwalters-forge/tracker", "topics": []},
+                            {"full_name": "cgwalters-forge/notes", "topics": ["bot-midstream-old"]}]),
+                    ),
+                    (
+                        &second,
+                        json!(null),
+                        json!([{"full_name": REPO, "topics": ["rust", "bot-midstream"]}]),
+                    ),
+                ] {
+                    forge.replay.requests.push(json!({"request": {"get": url},
+                        "answer": {"status": 200, "link": link, "body": body}}));
+                }
+            }
             let mut fields = json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"},
                 "headRefName": "bot/midstream", "reviews": approval});
             fields
@@ -12670,6 +12726,8 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                     "{name} queue={queued}: {:?}",
                     report.lines
                 );
+                let listed = "midstream: 1 with topic bot-midstream in cgwalters-forge";
+                assert_eq!(report.lines.iter().any(|l| l == listed), topic, "{name}");
             }
             assert!(
                 forge.writes.borrow().iter().all(|(_, _, body)| {
@@ -12679,6 +12737,151 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 "{name} queue={queued}"
             );
         }
+    }
+}
+
+/// A midstream listing that fails or is incomplete stops stage 2, here
+/// following an approved, green pull request that would otherwise merge.
+#[test]
+fn midstream_listing_failures_stop_stage_2() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    let first = format!("{API_ROOT}orgs/cgwalters-forge/repos?per_page=100");
+    let page = |n: usize| format!("{first}&page={n}");
+    let next = |n: usize| json!(format!(r#"<{}>; rel="next""#, page(n)));
+    let tagged = |name: &str| json!([{"full_name": name, "topics": ["bot-midstream"]}]);
+    let pages = (1..=midstream::MIDSTREAM_PAGES)
+        .map(|n| match n {
+            1 => (first.clone(), 200, next(2), json!([])),
+            n => (page(n), 200, next(n + 1), json!([])),
+        })
+        .collect::<Vec<_>>();
+    for (name, answers, error) in [
+        (
+            "status",
+            vec![(first.clone(), 502, json!(null), json!({}))],
+            "GitHub HTTP status 502",
+        ),
+        (
+            "pages",
+            pages,
+            "cgwalters-forge has more than 5 pages of repositories",
+        ),
+        (
+            "owner",
+            vec![(first.clone(), 200, json!(null), tagged("other/agentic-job"))],
+            "other/agentic-job is listed as cgwalters-forge's",
+        ),
+        (
+            "topics",
+            vec![(
+                first.clone(),
+                200,
+                json!(null),
+                json!([{"full_name": REPO}]),
+            )],
+            "cgwalters-forge/agentic-job has no topics",
+        ),
+        (
+            "link",
+            vec![(
+                first.clone(),
+                200,
+                json!(r#"<https://elsewhere.example/repos?page=2>; rel="next""#),
+                json!([]),
+            )],
+            "the next page https://elsewhere.example/repos?page=2 is outside https://api.github.com/",
+        ),
+        // Read, but naming what `follow` may not, or leaving out a work
+        // repository `pr.unstall` needs.
+        (
+            "promote",
+            vec![(
+                first.clone(),
+                200,
+                json!(null),
+                tagged("cgwalters-forge/ostree"),
+            )],
+            "midstream cgwalters-forge/ostree is the direction repository or a promote fork",
+        ),
+        (
+            "direction",
+            vec![(
+                first.clone(),
+                200,
+                json!(null),
+                tagged("cgwalters-forge/operator"),
+            )],
+            "midstream cgwalters-forge/operator is the direction repository or a promote fork",
+        ),
+        (
+            "unstall",
+            vec![(first.clone(), 200, json!(null), json!([]))],
+            "pr unstall needs every work repository followed, and cgwalters-forge/bootc is neither in follow nor has topic bot-midstream",
+        ),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+            "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+            "pageInfo": {"hasPreviousPage": false}});
+        followed(
+            &mut forge.replay,
+            (REPO, 9),
+            json!({"reviews": approval}),
+            json!([]),
+        );
+        for (url, status, link, body) in answers {
+            forge.replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": status, "link": link, "body": body}}));
+        }
+        let mut settings = json!({"wip": 0, "follow": [REPO], "pr": {"fixPools": ["claude"]},
+            "midstream": {"owner": "cgwalters-forge", "topic": "bot-midstream"}});
+        match name {
+            "unstall" => {
+                settings["pr"]["unstall"] = json!(true);
+                settings["workRepositories"] = json!([REPO, "cgwalters-forge/bootc"]);
+            }
+            "promote" => {
+                settings["promote"] = json!({"forks": {"cgwalters-forge/ostree":
+                    {"upstream": "ostreedev/ostree", "base": "main"}},
+                    "signoff": {"name": "Op", "email": "op@example.com"},
+                    "policyRepository": "cgwalters-forge/policy"});
+            }
+            // Its own read fails here too, unrecorded, as a second failure.
+            "direction" => {
+                settings["direction"] =
+                    json!({"repository": "cgwalters-forge/operator", "issue": 1});
+            }
+            _ => {}
+        }
+        let failures = if name == "direction" { 2 } else { 1 };
+        let cfg = config(settings);
+        for report in [preview(&cfg, &forge.replay), apply(&forge, &cfg)] {
+            assert_eq!(report.failures, failures, "{name}: {:?}", report.lines);
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("follow error: ") && l.contains(error)),
+                "{name}: {:?}",
+                report.lines
+            );
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(&format!("{REPO}#9"))),
+                "{name}: {:?}",
+                report.lines
+            );
+        }
+        assert!(
+            forge
+                .writes
+                .borrow()
+                .iter()
+                .all(|(_, _, body)| !body.to_string().contains("mergePullRequest")),
+            "{name}"
+        );
     }
 }
 

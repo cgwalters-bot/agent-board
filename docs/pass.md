@@ -1355,6 +1355,18 @@ A pass captures one clock and performs these stages in order:
     Already queued PRs and externally enabled auto-merge are not revoked;
     this option prevents new merge admissions only. Upstream promotion (#308)
     remains unbuilt.
+    With `midstream: {"owner": "ORG", "topic": "TOPIC"}`, absent by default,
+    the midstreams come from the repositories rather than these lists
+    (#731): stage 2 lists ORG's repositories once, and each with TOPIC is
+    followed and treated as in `pr.noMerge`. ORG must be `dispatchRepo`'s
+    owner, as whoever can set a topic there chooses what the pass follows.
+    A listing that fails, or runs past 5 pages of 100, fails stage 2 rather
+    than follow without it: a midstream also in `follow` would otherwise be
+    merged in. Its line is `midstream: N repositories with topic TOPIC in ORG`.
+    `pr.unstall`'s need for every work repository to be followed is then
+    checked there for ORG's, once they are read, as are the refusals of the
+    direction repository and `promote.forks` entries. The listing holds only
+    the repositories the pass's token can read.
    Retain its claim and head-recheck rules, but follow the
    [bookkeeping rule](architecture.md#bookkeeping): in an external repository
    the claims and markers become one hidden comment the bot edits in place, and
@@ -3399,6 +3411,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `operator`, `bot` | Direction/plan writer and applying bot logins; required |
 | `dispatchRepo`, `dispatchWorkflow`, `dispatchRef` | Caller repository/workflow/ref; required, required, caller default branch |
 | `follow` | Exact repositories for existing PR follow-up; `[]` |
+| `midstream.owner`, `midstream.topic` | The organization, `dispatchRepo`'s owner, whose repositories with the GitHub topic stage 2 follows and never merges in, as if in `follow` and `pr.noMerge`, read with one listing of at most 5 pages a pass; absent is off with no reads |
 | `workRepositories` | Exact allowed planning/implementation repositories; `[]` |
 | `board.owner`, `board.project` | Project owner and positive project number; required when work is enabled |
 | `board.priorityField` | Priority single-select field; `"Priority"` |
