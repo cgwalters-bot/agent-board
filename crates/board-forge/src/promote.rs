@@ -803,7 +803,8 @@ fn evaluate(
     )?;
     let metadata = crate::plan::comment_metadata(client, &item, true)?;
     let reviews = pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))?;
-    ensure!(pull["draft"] == false, "draft");
+    let on_approval = config.promote.as_ref().is_some_and(|p| p.on_approval);
+    ensure!(on_approval || pull["draft"] == false, "draft");
     let labels = pull["labels"].as_array().context("missing labels")?;
     for label in labels {
         ensure!(label["name"].is_string(), "missing label name");
@@ -868,7 +869,11 @@ fn evaluate(
                     command.as_ref().is_none_or(|(_, t, _)| *t != created),
                     "ambiguous command ordering"
                 );
-                command = Some((id, created, human_text));
+                command = Some((
+                    format!("https://github.com/{repo}/pull/{number}#issuecomment-{id}"),
+                    created,
+                    human_text,
+                ));
             } else {
                 stale = Some(format!(
                     "stale command=https://github.com/{repo}/pull/{number}#issuecomment-{id} at={} push={}",
@@ -878,11 +883,22 @@ fn evaluate(
             }
         }
     }
-    let (id, created, human_text) = command.with_context(|| {
-        stale.unwrap_or_else(|| "no operator command after observed push".into())
+    // Only on a draft: approving a ready fork PR may mean merging it into the
+    // fork alone, and must not post it upstream.
+    if command.is_none() && on_approval && pull["draft"] == true {
+        command = approval(client, &reviews, config, (repo, number), head, pushed)?;
+    }
+    let (url, created, human_text) = command.with_context(|| {
+        stale.unwrap_or_else(|| {
+            if on_approval {
+                "no operator command or approval after observed push".into()
+            } else {
+                "no operator command after observed push".into()
+            }
+        })
     })?;
     let evidence = format!(
-        "command=https://github.com/{repo}/pull/{number}#issuecomment-{id} at={} human-text={human_text} push={}",
+        "command={url} at={} human-text={human_text} push={}",
         created.format(&Rfc3339)?,
         pushed.format(&Rfc3339)?
     );
@@ -921,7 +937,7 @@ fn evaluate(
             );
         }
         Ok(Command {
-            url: format!("https://github.com/{repo}/pull/{number}#issuecomment-{id}"),
+            url,
             author: config.operator.clone(),
             created,
             head: head.into(),
@@ -931,6 +947,65 @@ fn evaluate(
         })
     })()
     .with_context(|| evidence)
+}
+
+/// With `promote.onApproval`, on a draft, the operator's latest deciding review,
+/// when it approves this head after the push establishing it. The commit id
+/// alone cannot bind it: a force-push back to an approved old oid needs a new
+/// one. Nor can the current draft flag: an approval of the ready PR, meant for
+/// the fork alone, must not count after a later conversion to draft, so it has
+/// to follow the timeline's latest `convert_to_draft`. Review order, duplicates
+/// and dismissals are checked with the command evidence afterwards, which fails
+/// closed.
+fn approval(
+    client: &impl Rest,
+    reviews: &[Value],
+    config: &Config,
+    (repo, number): (&str, u64),
+    head: &str,
+    pushed: OffsetDateTime,
+) -> Result<Option<(String, OffsetDateTime, bool)>> {
+    let Some(review) = reviews.iter().rev().find(|r| {
+        r["user"]["login"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(&config.operator))
+            && r["state"] != "COMMENTED"
+    }) else {
+        return Ok(None);
+    };
+    if review["state"] != "APPROVED" || review["commit_id"] != head {
+        return Ok(None);
+    }
+    let id = review["id"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .context("missing review id")?;
+    let submitted = at(&review["submitted_at"])?;
+    ensure!(
+        submitted != pushed,
+        "approval and push have ambiguous ordering"
+    );
+    if submitted < pushed {
+        return Ok(None);
+    }
+    let timeline = pages(client, &format!("repos/{repo}/issues/{number}/timeline"))?;
+    let mut drafted = None;
+    for event in &timeline {
+        if event["event"] == "convert_to_draft" {
+            drafted = drafted.max(Some(at(&event["created_at"])?));
+        }
+    }
+    ensure!(
+        drafted != Some(submitted),
+        "approval and draft conversion have ambiguous ordering"
+    );
+    Ok(drafted.is_none_or(|d| submitted > d).then(|| {
+        (
+            format!("https://github.com/{repo}/pull/{number}#pullrequestreview-{id}"),
+            submitted,
+            false,
+        )
+    }))
 }
 
 /// Complete authenticated chain, including force-pushes back to an old oid.

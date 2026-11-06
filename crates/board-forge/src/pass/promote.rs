@@ -15,6 +15,13 @@ pub struct Promote {
     #[serde(default)]
     pub publish: bool,
 
+    /// Accept drafts as candidates, as a midstream's pull requests stay drafts,
+    /// and on a draft the operator's approving review of the current head,
+    /// submitted after its push, as the trigger. Off by default; `/promote`
+    /// still triggers.
+    #[serde(default)]
+    pub on_approval: bool,
+
     /// Each fork repository to its upstream and base branch; empty is off.
     #[serde(default)]
     pub forks: BTreeMap<String, Fork>,
