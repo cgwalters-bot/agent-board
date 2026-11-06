@@ -2620,8 +2620,9 @@ fn idle_replan_is_opt_in_and_bounded_without_releasing_other_holds() {
 
 /// An applying pass's idle replans: both epics planned, each with its
 /// dispatch record and its hold taken back, unless `--max-dispatch` or a
-/// hold that appears when tracker#766 is read again before its start stops
-/// the second. A start's comments are its dispatch step's, which
+/// hold that appears on a fresh read stops them. Stops and pre-start errors
+/// restore the wait, unlike a failed start that may have sent a dispatch.
+/// A start's comments are its dispatch step's, which
 /// `--max-dispatch` bounds and `--max-writes` does not.
 #[test]
 fn idle_replan_applies_two_bounded_starts() {
@@ -2671,9 +2672,39 @@ fn idle_replan_applies_two_bounded_starts() {
             "hold epic cgwalters-forge/tracker#766: labelled needs-human",
             1,
         ),
+        (
+            "stop at fresh WIP check",
+            limits(None, None),
+            none,
+            "hold wip: 10 of 8 runs active",
+            0,
+        ),
+        (
+            "pre-start error",
+            limits(None, None),
+            none,
+            "fail epic cgwalters-forge/tracker#890: connection reset during graphql",
+            1,
+        ),
+        (
+            "dispatch response lost",
+            limits(None, None),
+            none,
+            "start planning cgwalters-forge/tracker#890 pool=claude: ",
+            1,
+        ),
     ];
     for (name, limits, late, line, starts) in cases {
-        let mut forge = Forge::new(None, false);
+        let failed = name == "dispatch response lost";
+        let error = name == "pre-start error";
+        let fail = if error {
+            Some(crate::pass::FRESH_QUERY)
+        } else if failed {
+            Some("/dispatches")
+        } else {
+            None
+        };
+        let mut forge = Forge::new(fail, false);
         let mut replay = idle_board(&json!({}));
         crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
         // tracker#766 on the board as tracker#890 is, for the recheck before its start.
@@ -2693,12 +2724,50 @@ fn idle_replan_applies_two_bounded_starts() {
         }
         forge.replay = replay;
         forge.late = late();
-        let settings =
-            config(json!({"idleReplan": true, "triage": false, "planPools": ["claude"]}));
+        if name == "stop at fresh WIP check" {
+            let reads = Cell::new(0);
+            forge.on_get = Some(Box::new(move |url, body| {
+                if url.contains("status=queued") {
+                    reads.set(reads.get() + 1);
+                    // Stage 3 and stage 4 each list before idle replanning.
+                    // Only the start's recheck sees the newly queued runs.
+                    if reads.get() > 2 {
+                        let runs: Vec<_> = (100..108).map(|id| json!({"id": id,
+                            "status": "queued", "display_title": "triage cgwalters-forge/tracker#999 (claude)"})).collect();
+                        *body = json!({"total_count": runs.len(), "workflow_runs": runs});
+                    }
+                }
+            }));
+        }
+        let publish = name != "--max-writes 0";
+        let previous_at = (forge.replay.now - time::Duration::hours(1))
+            .format(&Rfc3339)
+            .unwrap();
+        let mut settings = json!({"idleReplan": true, "triage": false, "planPools": ["claude"]});
+        if failed || error {
+            // One free slot distinguishes a pre-start error from a possibly
+            // dispatched failure: only the latter keeps that slot taken.
+            settings["wip"] = 3.into();
+        }
+        if publish {
+            settings["holds"] = forge.holds_destination(true);
+            let previous =
+                crate::pass::holds::snapshot(&[], previous_at.clone(), Default::default());
+            forge.previous_holds(crate::pass::holds::render(&previous).unwrap());
+        }
+        let settings = config(settings);
         let report = apply_limited(&forge, &settings, limits);
-        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert_eq!(
+            report.failures,
+            usize::from(error || failed),
+            "{name}: {:#?}",
+            report.lines
+        );
         let epics = [890, 766];
-        let expected: Vec<String> = (epics[..starts].iter())
+        let started_at = |at| if error { at == 1 } else { at < starts };
+        let expected: Vec<String> = (epics.iter().enumerate())
+            .filter(|(at, _)| started_at(*at))
+            .map(|(_, n)| n)
             .map(|n| format!("cgwalters-forge/tracker#{n}"))
             .collect();
         assert_eq!(forge.dispatches(), expected, "{name}: {:#?}", report.lines);
@@ -2706,7 +2775,7 @@ fn idle_replan_applies_two_bounded_starts() {
             (report.lines.iter()).any(|l| l
                 .starts_with("start planning cgwalters-forge/tracker#890 pool=claude: ")
                 && l.contains(" record=")),
-            starts > 0,
+            starts > 0 && !failed && !error,
             "{name}: {:#?}",
             report.lines
         );
@@ -2715,9 +2784,47 @@ fn idle_replan_applies_two_bounded_starts() {
             "{name}: {line} in {:#?}",
             report.lines
         );
+        if failed {
+            assert!(
+                report.lines.iter().any(
+                    |l| l.contains("connection reset during POST") && l.contains("/dispatches")
+                ),
+                "{:#?}",
+                report.lines
+            );
+        }
+        let snapshot = if publish {
+            let (_, body) = forge.published_holds().expect("holds were published");
+            Some(crate::pass::holds::parse(&body).unwrap())
+        } else {
+            None
+        };
+        if let Some(snapshot) = &snapshot {
+            let progress = starts - usize::from(failed);
+            assert_eq!(snapshot["pass"]["started"], starts, "{name}: {snapshot:#}");
+            assert_eq!(
+                snapshot["wip"]["in_flight"],
+                2 + starts,
+                "{name}: {snapshot:#}"
+            );
+            assert_eq!(
+                report.effects.starts.values().sum::<u64>(),
+                progress as u64,
+                "{name}"
+            );
+            let progress_at = if progress == 0 {
+                previous_at.clone()
+            } else {
+                forge.replay.now.format(&Rfc3339).unwrap()
+            };
+            assert_eq!(
+                snapshot["pass"]["progress_at"], progress_at,
+                "{name}: {snapshot:#}"
+            );
+        }
         // Each epic ends the pass started or held, exactly once.
         for (at, number) in epics.into_iter().enumerate() {
-            let started = at < starts;
+            let started = started_at(at);
             let records = (forge.comments_on("cgwalters-forge/tracker", number).iter())
                 .filter(|b| b.starts_with("<!-- agent-board-dispatch"))
                 .count();
@@ -2731,6 +2838,64 @@ fn idle_replan_applies_two_bounded_starts() {
                 "{name}: #{number} {:#?}",
                 report.holds
             );
+            let hold = report
+                .holds
+                .iter()
+                .find(|e| matches!(&e.scope, Scope::Epic(i) if i.number == number));
+            if let Some(hold) = hold {
+                let fresh = name == "needs-human on the reread" && number == 766;
+                if fresh {
+                    assert_eq!(hold.hold.reason, "labelled needs-human");
+                    assert_eq!(hold.hold.kind, HoldKind::NeedsHuman);
+                } else {
+                    // Stage 3 logs the original wait before stage 4 attempts
+                    // replanning. Read that first line independently of the
+                    // final hold, so a replacement cannot validate itself.
+                    let prefix = format!("hold epic cgwalters-forge/tracker#{number}: ");
+                    let original = report
+                        .lines
+                        .iter()
+                        .find(|l| l.starts_with(&prefix))
+                        .unwrap();
+                    assert_eq!(
+                        hold.hold.reason,
+                        original.strip_prefix(&prefix).unwrap(),
+                        "{name}: #{number}"
+                    );
+                    assert_eq!(hold.hold.kind, HoldKind::TriageCooldown);
+                    assert_eq!(
+                        report.lines.iter().filter(|l| *l == original).count(),
+                        1,
+                        "{name}: {:#?}",
+                        report.lines
+                    );
+                }
+            }
+            if let Some(snapshot) = &snapshot {
+                let item = format!("cgwalters-forge/tracker#{number}");
+                let published: Vec<_> = snapshot["holds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|h| h["epic"] == true && h["item"] == item)
+                    .collect();
+                assert_eq!(
+                    published.len() + usize::from(started),
+                    1,
+                    "{name}: #{number} {snapshot:#}"
+                );
+                if let Some(hold) = hold {
+                    assert_eq!(
+                        published[0]["reason"], hold.hold.reason,
+                        "{name}: #{number}"
+                    );
+                    assert_eq!(
+                        published[0]["kind"],
+                        hold.hold.kind.name(),
+                        "{name}: #{number}"
+                    );
+                }
+            }
         }
     }
 }

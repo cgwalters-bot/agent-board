@@ -2105,7 +2105,7 @@ pub(super) struct Forge {
     pub(super) late: Option<Late>,
     racing: Option<Late>,
     /// Edits REST reads, including before any dispatch has been made.
-    on_get: Option<Late>,
+    pub(super) on_get: Option<Late>,
     /// Other runs of the pass's own workflow in progress ([`own`]).
     passes: Vec<Value>,
     /// A confirmed response to workflow dispatch, instead of a successful start.
@@ -2228,6 +2228,43 @@ impl Forge {
             .cloned()
             .unwrap_or_default();
         nodes.iter().map(|n| text(n, "/body").to_owned()).collect()
+    }
+
+    /// The private publication destination used by holds replay tests.
+    pub(super) fn holds_destination(&mut self, private: bool) -> Value {
+        for (url, body) in [
+            (
+                format!("{API_ROOT}repos/cgwalters-forge/bot-ops"),
+                json!({"private": private}),
+            ),
+            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
+        ] {
+            self.replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+        json!({"repository": "cgwalters-forge/bot-ops", "issue": 1})
+    }
+
+    pub(super) fn previous_holds(&mut self, body: String) {
+        let comments = &mut answer(&mut self.replay, "bot-ops/issues/1/comments")["body"];
+        comments
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": 7, "node_id": "IC_7",
+            "user": {"login": "cgwalters-bot"}, "body": body}));
+    }
+
+    /// The actual emitted holds comment, not a reconstruction from the report.
+    pub(super) fn published_holds(&self) -> Option<(String, String)> {
+        self.writes
+            .borrow()
+            .iter()
+            .find(|(method, url, body)| {
+                url.starts_with(&format!("{API_ROOT}repos/cgwalters-forge/bot-ops/"))
+                    && method != "GET"
+                    && text(body, "/body").starts_with(holds::HOLDS_MARKER)
+            })
+            .map(|(method, url, body)| (format!("{method} {url}"), text(body, "/body").to_owned()))
     }
 
     fn write(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
@@ -2877,19 +2914,9 @@ fn apply_publishes_the_holds() {
             None => None,
         };
         if let Some(body) = comment {
-            let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
-            let comment = json!({"id": 7, "node_id": "IC_7", "user": {"login": "cgwalters-bot"},
-                "body": body});
-            comments.as_array_mut().unwrap().push(comment);
+            forge.previous_holds(body);
         }
-        let reply = |body| json!({"status": 200, "link": null, "body": body});
-        for (url, body) in [
-            (bot_ops.clone(), json!({"private": private})),
-            (format!("{API_ROOT}user"), json!({"login": "cgwalters-bot"})),
-        ] {
-            let request = json!({"request": {"get": url}, "answer": reply(body)});
-            forge.replay.requests.push(request);
-        }
+        assert_eq!(forge.holds_destination(private), at);
         let mut settings = json!({"wip": wip, "holds": at});
         if writes == Some(1) {
             let broker = json!({"body": usage::tests::broker()});
@@ -2942,15 +2969,7 @@ fn apply_publishes_the_holds() {
             .count();
         assert_eq!(report.effects.comments_created, created as u64, "{line}");
         assert_eq!(report.effects.comments_edited, edited as u64, "{line}");
-        let holds = writes
-            .iter()
-            // Not the usage snapshot's, which a budget reads from a broker.
-            .find(|(m, url, body)| {
-                url.starts_with(&bot_ops)
-                    && m != "GET"
-                    && text(body, "/body").starts_with(holds::HOLDS_MARKER)
-            })
-            .map(|(m, url, body)| (format!("{m} {url}"), text(body, "/body").to_owned()));
+        let holds = forge.published_holds();
         assert_eq!(holds.as_ref().map(|(w, _)| w), wrote, "{line}");
         let Some((_, body)) = holds else {
             continue;
