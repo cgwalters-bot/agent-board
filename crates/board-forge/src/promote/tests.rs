@@ -69,6 +69,14 @@ fn reviews(replay: &mut Replay) -> &mut Value {
     body(replay, "/pulls/34/reviews?")
 }
 
+/// The PR's issue timeline, read only for an approval trigger.
+fn timeline(replay: &mut Replay, events: Value) {
+    replay.requests.push(json!({
+        "request": {"get": format!("https://api.github.com/repos/{REPO}/issues/34/timeline?per_page=100&page=1")},
+        "answer": {"status": 200, "link": null, "body": events}
+    }));
+}
+
 fn scenario() -> Replay {
     let mut replay = Replay::from_json(&serde_json::from_str(FIXTURE).unwrap()).unwrap();
     // Keep one observed bot-fork PR; readiness and command are scenario edits.
@@ -1720,6 +1728,144 @@ fn recorded_scenarios() {
             [hold(&format!("{evidence}: {reason}")), REMAINING.into()]
         );
     }
+}
+
+#[test]
+fn on_approval_accepts_a_current_head_approval_after_the_push() {
+    type Case = (&'static str, fn(&mut Replay), Option<&'static str>);
+    let none = "no operator command or approval after observed push";
+    let approve = |r: &mut Replay| {
+        *comments(r) = json!([]);
+        *reviews(r) = json!([{"id":5,"user":{"login":"cgwalters"},"state":"APPROVED","submitted_at":COMMAND,"commit_id":HEAD}]);
+        pull(r)["draft"] = json!(true);
+        timeline(r, json!([{"event": "labeled", "created_at": PUSH}]));
+    };
+    // Draft, ready at the push, and converted to draft again at `at`.
+    fn drafted(r: &mut Replay, at: &str) {
+        r.requests.pop();
+        timeline(
+            r,
+            json!([{"event": "convert_to_draft", "created_at": "2026-10-22T00:00:00Z"}, {"event": "ready_for_review", "created_at": PUSH}, {"event": "convert_to_draft", "created_at": at}]),
+        );
+    }
+    let cases: Vec<Case> = vec![
+        ("approved draft", |_| {}, None),
+        // Approving a ready fork PR may mean merging it into the fork alone.
+        ("ready", |r| pull(r)["draft"] = json!(false), Some(none)),
+        // ... and must not count once the PR is converted to draft later.
+        (
+            "ready, approved, then draft",
+            |r| drafted(r, "2026-10-24T00:00:00Z"),
+            Some(none),
+        ),
+        (
+            "draft before approval",
+            |r| drafted(r, "2026-10-22T12:00:00Z"),
+            None,
+        ),
+        (
+            "simultaneous draft",
+            |r| drafted(r, COMMAND),
+            Some("approval and draft conversion have ambiguous ordering"),
+        ),
+        (
+            "stale command",
+            |r| {
+                *comments(r) = json!([{"id": 1, "user": {"login": "cgwalters"}, "created_at": "2026-10-21T00:00:00Z", "updated_at": "2026-10-21T00:00:00Z", "body": "/promote"}]);
+            },
+            None,
+        ),
+        (
+            "comment-only review after",
+            |r| {
+                reviews(r).as_array_mut().unwrap().push(json!({"id":6,"user":{"login":"cgwalters"},"state":"COMMENTED","submitted_at":"2026-10-24T00:00:00Z","commit_id":HEAD}));
+            },
+            None,
+        ),
+        (
+            "command wins",
+            |r| {
+                *comments(r) = json!([{"id": 1, "user": {"login": "cgwalters"}, "created_at": COMMAND, "updated_at": COMMAND, "body": "/promote"}]);
+            },
+            Some("command"),
+        ),
+        (
+            "before push",
+            |r| reviews(r)[0]["submitted_at"] = json!("2026-10-21T00:00:00Z"),
+            Some(none),
+        ),
+        (
+            "simultaneous push",
+            |r| reviews(r)[0]["submitted_at"] = json!(PUSH),
+            Some("approval and push have ambiguous ordering"),
+        ),
+        (
+            "old head",
+            |r| reviews(r)[0]["commit_id"] = json!("a".repeat(40)),
+            Some(none),
+        ),
+        (
+            "other reviewer",
+            |r| reviews(r)[0]["user"]["login"] = json!("visitor"),
+            Some(none),
+        ),
+        (
+            "later change request",
+            |r| {
+                reviews(r).as_array_mut().unwrap().push(json!({"id":6,"user":{"login":"cgwalters"},"state":"CHANGES_REQUESTED","submitted_at":"2026-10-24T00:00:00Z","commit_id":HEAD}));
+            },
+            Some(none),
+        ),
+    ];
+    let mut config = Config::parse(CONFIG).unwrap();
+    config.promote.as_mut().unwrap().on_approval = true;
+    let review = format!("https://github.com/{REPO}/pull/34#pullrequestreview-5");
+    for (name, edit, held) in cases {
+        let mut replay = scenario();
+        approve(&mut replay);
+        edit(&mut replay);
+        sync_metadata(&mut replay);
+        let (result, _) = run(replay, &config);
+        let expected = match held {
+            None => candidate(false).replace(
+                &format!("https://github.com/{REPO}/pull/34#issuecomment-1"),
+                &review,
+            ),
+            Some("command") => candidate(false),
+            Some(reason) => hold(reason),
+        };
+        assert_eq!(result.unwrap(), [expected, REMAINING.into()], "{name}");
+    }
+    // Off, the same approval is no trigger and a draft still holds.
+    let config = Config::parse(CONFIG).unwrap();
+    let mut replay = scenario();
+    approve(&mut replay);
+    sync_metadata(&mut replay);
+    assert_eq!(
+        run(replay, &config).0.unwrap(),
+        [hold("draft"), REMAINING.into()]
+    );
+    // Publication of an approved draft without a command, still as a draft.
+    let (mut forge, mut config) = publication();
+    config.promote.as_mut().unwrap().on_approval = true;
+    *comments(&mut forge.replay) = json!([]);
+    sync_metadata(&mut forge.replay);
+    pull(&mut forge.replay)["draft"] = json!(true);
+    forge.fresh["draft"] = json!(true);
+    timeline(&mut forge.replay, json!([]));
+    let lines = apply(&forge, &config, forge.replay.now, 3).unwrap();
+    assert_eq!(
+        lines,
+        [format!(
+            "promoted {REPO}#34 -> https://github.com/composefs/composefs-rs/pull/70 head={HEAD}"
+        )]
+    );
+    let writes = forge.writes.borrow();
+    let created = writes
+        .iter()
+        .find(|(method, url, _)| method == "POST" && url.ends_with("composefs-rs/pulls"))
+        .unwrap();
+    assert_eq!(created.2["draft"], true);
 }
 
 #[test]

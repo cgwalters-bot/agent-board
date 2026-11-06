@@ -110,16 +110,25 @@ command/head evidence and candidate read gates by default. Explicit publication
 uses no inference pool or dispatch slot. The pass retains an inert compatibility line, with no
 promotion reads or writes.
 
-* **Permission.** Only an exact operator-authored `/promote` or
+* **Permission.** An exact operator-authored `/promote` or
   `/promote --human-text` conversation command after the observed push
   establishing the current head is a trigger. This preview accepts only a
   complete plain command comment, with optional surrounding newlines, not prose
   containing a command. REST comment identity/creation must agree with GraphQL
   metadata; missing edit metadata or any operator-comment edit holds, even when
-  REST creation/update timestamps match to the second. An APPROVED review is never a trigger.
+  REST creation/update timestamps match to the second. The only other trigger
+  is opt-in: with `promote.onApproval` (default `false`), drafts are candidates,
+  since a midstream's pull requests stay drafts, and on a draft with no such
+  command the operator's latest deciding review, approving the current head
+  and submitted after the push establishing it, is the trigger (never
+  `--human-text`; agent-board#743). Its URL stands in the `command=` evidence.
+  Approving a ready fork PR never triggers: that may mean merging it into the
+  fork alone. So the approval must also follow the PR timeline's latest
+  `convert_to_draft`, or a later conversion to draft would turn it into one.
   Quoted examples, another author's command and a command before the latest
   push grant nothing. Later operator change requests or dismissals cancel the
-  command; approvals and comment-only reviews cannot restore it. The concrete
+  command; approvals and comment-only reviews cannot restore it, as a cancelled
+  command stays the one selected. The concrete
   threat is publishing a changed head using stale permission, including after a
   force-push back to an old oid. Complete authenticated branch activity, not
   commit author/committer dates, proves the push. Missing, truncated, edited
@@ -274,7 +283,8 @@ The answers to the brief's open questions:
    never written.
 4. **Stacks.** The plan's `stacks_on` is the source; a pull request with none
    is not stacked.
-5. **Drafts.** A draft fork pull request is never promoted.
+5. **Drafts.** A draft fork pull request is never promoted, unless
+   `promote.onApproval` is set; it is then published as an upstream draft.
 6. **Behind upstream.** Refused, with one notice, even where it would merge
    cleanly: the command-bound head would go upstream untested against the new
    base, and rebasing needs `git`.
