@@ -5015,11 +5015,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .find(|(v, _)| *v == verdict)
             .filter(|_| self.config.triage_close);
         let mut label = format!("label {NEEDS_HUMAN}");
+        let mut refused = None;
         if close.is_some()
             && let Some(why) = self.close_refused(issue, (c, comments), triage)?
         {
             close = None;
             label = format!("{label}, not closed: {why}");
+            refused = Some(why);
         }
         let (kind, act) = match close {
             Some((_, reason)) => (HoldKind::Closed, format!("close as {reason}")),
@@ -5075,9 +5077,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     )?;
                     // After the label: should this fail, the hold has no
                     // marker and waits for the operator, rather than a
-                    // second marker being posted by the next pass.
+                    // second marker being posted by the next pass. A
+                    // refused close says why on the issue, not only in the
+                    // pass's log, so that the operator and the supervisor
+                    // see why.
+                    let why = refused
+                        .map(|why| format!(" It was not closed: {why}."))
+                        .unwrap_or_default();
                     post(format!(
-                        "{}\nThe board pass held [this triage verdict]({}) for the operator with the label {NEEDS_HUMAN}.",
+                        "{}\nThe board pass held [this triage verdict]({}) for the operator with the label {NEEDS_HUMAN}.{why}",
                         hold_marker(id),
                         c.url
                     ))?;
@@ -5163,8 +5171,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// close failed, and any reopen since `c` was the operator's call. The
     /// verdict is about the issue as triage read it, so neither its body
     /// nor its title may have changed since, nor any comment been posted or
-    /// edited since but the triage's own dispatch record and its run's
-    /// status comment. And no review follows a close,
+    /// edited since but run bookkeeping: the triage's own dispatch record
+    /// and status comment, and the bot's other dispatch records and status
+    /// comments without a reason. And no review follows a close,
     /// so as with the supervisor's `close` (agent-board#111) only writers'
     /// text may have steered its triage: the issue locked from before its
     /// triage plan of `triage` was posted, unedited, to now, so that no one
@@ -5196,14 +5205,24 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // posted or edited since, an ask's hold or a person's word alike,
         // is news it did not weigh. Only the triage's own comments may be
         // newer: its dispatch record, and its run's status comment, which
-        // agentic-job updates as the run ends.
+        // agentic-job updates as the run ends. So may the bookkeeping of any
+        // other run, which says only that it started or ended
+        // (agent-board#724): the bot's dispatch records, and its status
+        // comments without a reason, which an agent wrote, edited by no one
+        // else.
         let run = epics::record_run(&record.body);
+        let dispatch = format!("<!-- {}: ", plan::DISPATCH_MARKER);
         let own = |x: &plan::Comment| {
+            let by_bot = is(x.author.as_deref(), &bot);
+            let bookkeeping =
+                x.body.starts_with(&dispatch) || crate::supervise::health::is_bare_status(&x.body);
+            let unedited = (!x.edited && x.editor.is_none()) || is(x.editor.as_deref(), &bot);
             x.url == record.url
-                || run.is_some_and(|run| {
-                    is(x.author.as_deref(), &bot)
-                        && x.body.ends_with(&crate::supervise::health::status_end(run))
-                })
+                || (by_bot
+                    && run.is_some_and(|run| {
+                        x.body.ends_with(&crate::supervise::health::status_end(run))
+                    }))
+                || (by_bot && bookkeeping && unedited)
         };
         if (comments.iter()).any(|x| x.url != c.url && x.changed > c.changed && !own(x)) {
             return Ok(Some("a comment was posted or edited after this verdict"));

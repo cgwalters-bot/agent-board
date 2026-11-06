@@ -1554,16 +1554,21 @@ way, nor is one on an earlier verdict (below), whose run start the pass does
 not know. Neither is one whose body or title was edited after the verdict,
 nor one with any comment posted or edited after it, an earlier comment the
 operator edited, a later word or an `ask create` hold alike, but for the
-triage's own dispatch record and its run's agentic-job status comment: the
+triage's own dispatch record and its run's agentic-job status comment, and
+the bookkeeping of any other run, which says only that it started or ended
+(agent-board#724): the bot's dispatch records, and its status comments
+without a hand-back reason (an agent wrote that), edited by no one else. The
 verdict was about the issue as triage read it. The newest lock, unlock,
 title edit and reopen are each read on their own, so that no number of other
 events hides one. It also closes once:
 reopened after the verdict, whoever closed it, or left open by a failed
 close, which leaves the pass's line for that verdict, the verdict then labels
-it as above, as does one any of these checks refuses, the line saying why. Without
+it as above, as does one any of these checks refuses, the line and the hold
+comment saying why. Without
 `triageClose` the pass never closes an issue on a verdict; the
 supervisor's `close` may, and takes the label as the pass's hold of a
-`done` verdict only with that comment. Before opening a question,
+`done` verdict only with that comment, and refuses any bot comment after its
+triage run ended, other runs' bookkeeping included. Before opening a question,
 `ask create --apply` comments on the
 blocked item to invalidate any earlier verdict, even if its additive labeling
 leaves the pass's existing label and event unchanged
