@@ -4871,11 +4871,12 @@ fn add_event(data: &mut Value, kind: &str, at: &str) {
 /// by its verdict, read only from the bot's answer after the run's record:
 /// one for the operator labels the issue, any other waits a day and then
 /// triages it again only if something but the bot's comments changed, and
-/// the operator's comment triages it again at once; with `triageClose`, a
+/// the operator's comment triages it again at once, as `follow-through`
+/// does once; with `triageClose`, a
 /// `done` or `obsolete` one closes the issue instead. Each case: its answers
 /// (author, editor, verdict or body, days from now), `triageClose` and
-/// `--max-writes`, the line for tracker#446 (`{record}`, `{answer}` and
-/// `{due}` filled in), whether it was triaged again and what the pass
+/// `--max-writes`, the line for tracker#446 (`{record}`, `{answer}`,
+/// `{due}` and `{due2}`, two days, filled in), whether it was triaged again and what the pass
 /// wrote for the verdict: [`LABEL`], a close's `state_reason`, or nothing.
 #[test]
 fn apply_follows_up_a_triage_by_its_verdict() {
@@ -5106,6 +5107,25 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "",
         ),
         (
+            "done, a rebase remains: follow-through is planned at once, unlabelled",
+            vec![(bot, None, "follow-through", 0)],
+            (false, None),
+            "start triage cgwalters-forge/tracker#446 pool=claude record=",
+            true,
+            "",
+        ),
+        (
+            "follow-through on a follow-through plan waits twice as long, not looping",
+            vec![
+                (bot, None, "follow-through-plan", 0),
+                (bot, None, "follow-through", 0),
+            ],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: triage verdict follow-through, {answer}; triaged again from {due2} if anything changed, or once cgwalters comments",
+            false,
+            "",
+        ),
+        (
             "partly waits a day",
             vec![(bot, None, "partly", 0)],
             (false, None),
@@ -5207,6 +5227,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             comments[0].contains("schedule-triage fenced JSON block"),
             "{name}"
         );
+        assert!(comments[0].contains(MECHANICAL.trim()), "{name}");
         assert!(
             comments[0].contains("\n\n<!-- agent-board-inputs: "),
             "{name}"
@@ -5226,6 +5247,14 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                     .filter(|l| !l.starts_with("<!-- agent-board-inputs: "))
                     .collect();
                 *plan = body.into();
+                continue;
+            }
+            // A plan posted for an earlier follow-through verdict.
+            if said == "follow-through-plan" {
+                let key = ("cgwalters-forge/tracker".to_owned(), 446);
+                let mut added = forge.added.borrow_mut();
+                let plan = &mut added.get_mut(&key).unwrap()[0]["body"];
+                *plan = format!("{FOLLOW_THROUGH}\n\n{}", plan.as_str().unwrap()).into();
                 continue;
             }
             // The operator's edit, `days` from now, of their first answer.
@@ -5313,13 +5342,16 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             .find(|c| text(c, "/body").contains(TRIAGE_FENCE))
             .unwrap_or(&added[2]);
         let answer = text(first, "/url").to_owned();
-        let due = (at(text(first, "/createdAt")) + time::Duration::days(1))
-            .format(&Rfc3339)
-            .unwrap();
+        let due = |days| {
+            (at(text(first, "/createdAt")) + time::Duration::days(days))
+                .format(&Rfc3339)
+                .unwrap()
+        };
         let expected = expected
             .replace("{record}", &record)
             .replace("{answer}", &answer)
-            .replace("{due}", &due);
+            .replace("{due}", &due(1))
+            .replace("{due2}", &due(2));
         let limits = Limits {
             writes,
             ..Limits::default()
@@ -5371,6 +5403,10 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             .filter(|d| d.ends_with("tracker#446"))
             .count();
         assert_eq!(triaged, 1 + usize::from(again), "{name}");
+        // The pass's own follow-through plan, not one a case posted.
+        let followed = (forge.comments_on("cgwalters-forge/tracker", 446).iter())
+            .any(|c| c.starts_with(FOLLOW_THROUGH) && c.contains("post one implement job plan"));
+        assert_eq!(followed, again && name.contains("follow-through"), "{name}");
         let issue = format!("{API_ROOT}repos/cgwalters-forge/tracker/issues/446");
         assert_eq!(
             verdict_writes(&forge, &issue),
