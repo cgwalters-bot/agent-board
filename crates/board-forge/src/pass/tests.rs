@@ -11278,11 +11278,25 @@ fn config_table() {
     let many: Vec<String> = (0..=50).map(|n| format!("f{n}")).collect();
     for (paths, ok) in [
         (json!([".github/pass.json", ".github/agentic-job/"]), true),
+        (
+            json!([
+                ".github/pass.json#/budget",
+                ".github/pass.json#/pr/operatorPaths",
+                "config.json#/a~1b/~0key"
+            ]),
+            true,
+        ),
+        (json!([".github/pass.json#budget"]), false),
+        (json!([".github/pass.json#"]), false),
+        (json!([".github/pass.json#/bad~2escape"]), false),
+        (json!([".github/pass.json#/bad~"]), false),
+        (json!([".github/#/budget"]), false),
         (json!([]), true),
         (json!(many), false),
         (json!(["/etc/passwd"]), false),
         (json!([".github/*.toml"]), false),
         (json!(["a/../b"]), false),
+        (json!(["a/../b#/budget"]), false),
         (json!(["./a"]), false),
         (json!(["a//b"]), false),
         (json!([""]), false),
