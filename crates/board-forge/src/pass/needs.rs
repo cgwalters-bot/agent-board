@@ -1385,6 +1385,331 @@ mod tests {
         }
     }
 
+    /// The `pr.operatorPaths` approval wait [`approval_board`] ranks last.
+    const LATE_APPROVAL: &str = "o/zeta#174";
+
+    /// A derived board, not a recording: the shape of tracker#976's inbox
+    /// of 174 decisions at `at`. 40 operator holds with long questions and
+    /// mixed Priorities, 121 operator-action proposals with long asks and
+    /// recommendations, two groups of stranded pull requests (30 members),
+    /// ten labelled approvals and, ranked after the other 173 decisions as
+    /// it has no Priority and the latest key, a `pr.operatorPaths` approval
+    /// wait; beside them 30 holds that wait on no one. Its list is read
+    /// from stage 2's waits as a pass reads them, after `previous`.
+    fn approval_board(at: &str, previous: Option<&Value>) -> holds::Snapshot {
+        let head = |n: u64| format!("{n:040x}");
+        let wait = |repository: &str, n: u64, kind, reason: &str| poll::Wait {
+            repository: repository.into(),
+            number: n,
+            head: head(n),
+            kind,
+            reason: reason.into(),
+            review_bucket: None,
+            approval: None,
+        };
+        let mut waits: Vec<_> = (1..=20)
+            .map(|n| wait("o/stranded", n, "needs-human", "fix rounds 2 of 2 used"))
+            .chain(
+                (21..=30)
+                    .map(|n| wait("o/drafts", n, "needs-human", "a stranded draft; inspect it")),
+            )
+            .chain((1..=3).map(|n| {
+                let reason = "labelled operator-approval; it needs operator's approval of the head";
+                wait("o/app", n, "approve", reason)
+            }))
+            .collect();
+        let (repository, number) = pull_ref(LATE_APPROVAL).unwrap();
+        waits.push(wait(
+            &repository,
+            number,
+            "approve",
+            "pr.operatorPaths: .github/pass.json; it needs operator's approval of the head",
+        ));
+        let proposals = (1..=128)
+            .map(|n| Ask {
+                waiting_since: format!("2026-11-04T{:02}:{:02}:00Z", n / 60, n % 60),
+                ask: format!(
+                    "Apply proposal {n}: {}",
+                    "move the bounded label ".repeat(18)
+                ),
+                recommendation: Some("Apply it after action check. ".repeat(15)),
+                ..own_proposal(n)
+            })
+            .collect();
+        let mut snapshot = holds::snapshot(&[], at.into(), Default::default());
+        snapshot.pass.candidates = Some(30);
+        // As [`holds::carry`] keeps it from the published snapshot.
+        snapshot.pass.progress_at = "2026-11-05T11:00:00Z".into();
+        let hold = |n: u64, operator: bool| holds::Published {
+            item: Some(format!(
+                "o/{}#{n}",
+                if operator { "tracker" } else { "work" }
+            )),
+            url: None,
+            epic: false,
+            kind: match operator {
+                true => holds::HoldKind::NeedsHuman,
+                false => holds::HoldKind::InFlight,
+            },
+            reason: "labelled needs-human".into(),
+            operator,
+            priority: operator.then(|| format!("P{}", n % 4)),
+            question: operator
+                .then(|| format!("Decide {n}: {}?", "which bound to keep ".repeat(4))),
+            since: format!("2026-11-0{}T08:00:00Z", 1 + n % 4),
+            carried: false,
+            watched: false,
+        };
+        snapshot.holds = (1..=40)
+            .map(|n| hold(n, true))
+            .chain((1..=30).map(|n| hold(n, false)))
+            .collect();
+        let on = on_github("o/ops", 1);
+        let options: Vec<String> = ["P0", "P1", "P2", "P3"].map(Into::into).into();
+        let reading = holds::Reading {
+            operator: "operator",
+            epics: false,
+            considered: true,
+            options: &options,
+            on: &on,
+            reviews: review_asks(true, Some(&(waits, BTreeSet::new())), at),
+            proposals: holds::Collected {
+                asks: proposals,
+                ..Collected::of(Read::Complete)
+            },
+            digest: Collected::off(),
+            inbox: BTreeMap::new(),
+            observed: holds::Observed::off(),
+            summaries: (Read::Complete, BTreeMap::new()),
+        };
+        snapshot.needs_you = Some(holds::needs_you(&snapshot, previous, &reading));
+        snapshot
+    }
+
+    /// Whether `list` publishes `key`'s card whole, with its full head, and
+    /// a matching descriptor that offers the review at that head and the
+    /// source record it was read from.
+    fn approval_kept(list: &NeedsYou, key: &str) -> bool {
+        let Some(card) = list.items.iter().find(|a| a.key == key) else {
+            return false;
+        };
+        let headed = card.head.as_deref().is_some_and(holds::full_head);
+        let offered = list.requests.iter().any(|r| {
+            r.key == key
+                && r.target == card.action
+                && (r.actions.iter())
+                    .any(|a| a.kind == holds::requests::REVIEW_AT_HEAD && a.supported)
+        });
+        let source = (list.request_sources.iter()).any(|s| s.key == key && s.ask.head == card.head);
+        headed && card.action.head == card.head && offered && source
+    }
+
+    /// The board of [`approval_board`] past the comment limit keeps every
+    /// actionable approval, the late `pr.operatorPaths` one included, whole,
+    /// and cuts the lowest ranked other cards instead; the rest keep their
+    /// order, the totals and inventory stay, and the next pass's same list
+    /// writes nothing. Its publication is the shared fixture review replays.
+    #[test]
+    fn approvals_survive_fitting_the_174_decision_board() {
+        let at = "2026-11-05T12:00:00Z";
+        let board = approval_board(at, None);
+        let full = board.needs_you.clone().unwrap();
+        assert_eq!((full.counts.decisions, full.counts.groups), (174, 2));
+        assert_eq!(full.counts.members, 202);
+        assert!(full.complete);
+        let keys: Vec<_> = full.items.iter().map(|a| a.key.as_str()).collect();
+        assert_eq!(keys.last(), Some(&LATE_APPROVAL), "ranked last");
+        let approvals: Vec<_> = (full.items.iter())
+            .filter(|a| a.action.kind == RefKind::ApprovePullRequest)
+            .map(|a| a.key.clone())
+            .collect();
+        assert_eq!(approvals.len(), 4);
+        assert!(approvals.iter().all(|k| approval_kept(&full, k)));
+        let (fitted, body) = holds::fit(board.clone()).unwrap();
+        assert!(body.chars().count() <= holds::MAX_COMMENT_CHARS);
+        let list = fitted.needs_you.as_ref().unwrap();
+        assert!(
+            list.items.len() < full.items.len(),
+            "the board must not fit whole"
+        );
+        for key in &approvals {
+            assert!(approval_kept(list, key), "{key}");
+        }
+        // The operator's holds stay; the others go before any card.
+        let operator = fitted.holds.iter().filter(|h| h.operator).count();
+        assert_eq!((operator, fitted.truncated), (40, 30));
+        // The other cards are the highest ranked of theirs, in rank order,
+        // and the approvals keep their places among them.
+        let kept: Vec<_> = list.items.iter().map(|a| a.key.as_str()).collect();
+        let others = |keys: &[&str]| -> Vec<String> {
+            (keys.iter())
+                .filter(|k| !approvals.iter().any(|a| a == *k))
+                .map(|k| k.to_string())
+                .collect()
+        };
+        assert_eq!(others(&kept), others(&keys)[..kept.len() - approvals.len()]);
+        let mut order = keys.clone();
+        order.retain(|k| kept.contains(k));
+        assert_eq!(kept, order);
+        // Canonical totals and the inventory stay; detail is counted.
+        assert_eq!(
+            (list.counts.clone(), list.count),
+            (full.counts.clone(), full.count)
+        );
+        assert_eq!(list.identities, full.identities);
+        assert_eq!((list.omitted, list.complete), (0, true));
+        assert!(list.omitted_sources.is_empty());
+        let carded = |i: &&holds::Identity| list.items.iter().any(|a| a.key == i.detail_key);
+        let uncarded = list.identities.iter().filter(|i| !carded(i)).count();
+        assert_eq!(list.details_omitted, uncarded);
+        assert!(uncarded > 0);
+        // Each kept descriptor's card is kept, each request distinct.
+        assert!(list.requests.iter().all(|r| kept.contains(&r.key.as_str())));
+        let identities: BTreeSet<_> = list.requests.iter().map(|r| &r.identity).collect();
+        assert_eq!(identities.len(), list.requests.len());
+        // As serialized: strict v2 cards read back with their heads.
+        let published = holds::parse(&body).unwrap();
+        let cards: Vec<Ask> =
+            serde_json::from_value(published["needs_you"]["items"].clone()).unwrap();
+        assert_eq!(cards, list.items);
+        let late = &published["needs_you"]["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["key"] == LATE_APPROVAL)
+            .unwrap();
+        assert_eq!(late["target"]["head"], json!(format!("{:040x}", 174)));
+        assert_eq!(late["quality"], "decision");
+        // The fixture review replays with its parser (agent-board#722).
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/needs-you-approval-fit-174.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            published, fixture,
+            "fixtures/needs-you-approval-fit-174.json"
+        );
+        // The same board next pass keeps `changed_at` and writes nothing.
+        let later = "2026-11-05T12:30:00Z";
+        let (again, _) = holds::fit(approval_board(later, Some(&published))).unwrap();
+        let list = again.needs_you.as_ref().unwrap();
+        assert_eq!(
+            (list.changed_at.as_str(), list.validated_at.as_str()),
+            (at, later)
+        );
+        assert!(!holds::changed(Some(&body), &again).unwrap());
+        // Without a descriptor offering the review at its head, an approval
+        // is not protected: fail closed, it ranks and goes as any card.
+        for strip in [true, false] {
+            let mut board = board.clone();
+            let list = board.needs_you.as_mut().unwrap();
+            for request in list.requests.iter_mut().filter(|r| r.key == LATE_APPROVAL) {
+                match strip {
+                    true => request.actions.clear(),
+                    false => request.target.head = None,
+                }
+            }
+            let (fitted, _) = holds::fit(board).unwrap();
+            let list = fitted.needs_you.unwrap();
+            assert!(
+                !list.items.iter().any(|a| a.key == LATE_APPROVAL),
+                "{strip}"
+            );
+            assert_eq!(list.identities, full.identities);
+        }
+    }
+
+    /// Protected approvals alone past the limit: the highest ranked keep
+    /// their cards, the rest are counted in `details_omitted` and keep
+    /// their identities, and the body is still published within the limit.
+    /// A non-approval ranked first goes before any of them.
+    #[test]
+    fn approvals_alone_past_the_limit_still_publish() {
+        let (at, later) = ("2026-11-05T12:00:00Z", "2026-11-05T12:30:00Z");
+        let board = |at: &str, previous: Option<&Value>| {
+            let waits: Vec<_> = (1..=200)
+                .map(|n| poll::Wait {
+                    repository: "o/app".into(),
+                    number: n,
+                    head: format!("{n:040x}"),
+                    kind: "approve",
+                    reason: format!("pr.operatorPaths: {}", ".github/pass.json ".repeat(30)),
+                    review_bucket: None,
+                    approval: None,
+                })
+                .collect();
+            let mut first = own_proposal(1);
+            first.waiting_since = "2026-10-01T00:00:00Z".into();
+            let on = on_github("o/ops", 1);
+            let reading = holds::Reading {
+                operator: "operator",
+                epics: false,
+                considered: true,
+                options: &[],
+                on: &on,
+                reviews: review_asks(true, Some(&(waits, BTreeSet::new())), at),
+                proposals: holds::Collected {
+                    asks: vec![first],
+                    ..Collected::of(Read::Complete)
+                },
+                digest: Collected::off(),
+                inbox: BTreeMap::new(),
+                observed: holds::Observed::off(),
+                summaries: (Read::Complete, BTreeMap::new()),
+            };
+            let mut snapshot = holds::snapshot(&[], at.into(), Default::default());
+            (snapshot.pass.candidates, snapshot.pass.progress_at) = (Some(0), "".into());
+            snapshot.needs_you = Some(holds::needs_you(&snapshot, previous, &reading));
+            snapshot
+        };
+        let full = board(at, None).needs_you.unwrap();
+        assert_eq!(full.items[0].source, PROPOSALS, "ranked first");
+        let (fitted, body) = holds::fit(board(at, None)).unwrap();
+        assert!(body.chars().count() <= holds::MAX_COMMENT_CHARS);
+        let list = fitted.needs_you.unwrap();
+        assert!(list.items.iter().all(|a| a.source == REVIEWS));
+        let kept = list.items.len();
+        assert!(kept > 0 && kept < 200);
+        assert_eq!(list.items, full.items[1..=kept]);
+        assert!(list.items.iter().all(|a| approval_kept(&list, &a.key)));
+        assert_eq!(list.details_omitted, 201 - kept);
+        assert_eq!((list.identities.len(), list.omitted), (201, 0));
+        assert_eq!(list.counts, full.counts);
+        // The evicted approvals keep their age: the next pass writes nothing.
+        let published = holds::parse(&body).unwrap();
+        let (again, _) = holds::fit(board(later, Some(&published))).unwrap();
+        assert_eq!(again.needs_you.as_ref().unwrap().changed_at, at);
+        assert!(!holds::changed(Some(&body), &again).unwrap());
+    }
+
+    /// An operator-action proposal on `o/ops#n` as [`approval_board`]'s.
+    fn own_proposal(n: u64) -> Ask {
+        let action = Reference {
+            comment: Some(n),
+            ..Reference::new(RefKind::OperatorAction, "o/ops", n)
+        };
+        Ask {
+            key: format!("o/ops#{n}/comment-{n}"),
+            item: format!("o/ops#{n}"),
+            source: PROPOSALS.into(),
+            kind: "operator-action".into(),
+            priority: None,
+            waiting_since: "2026-11-04T00:00:00Z".into(),
+            ask: "Apply the proposal?".into(),
+            recommendation: None,
+            target: action.url(),
+            head: None,
+            source_ref: Reference {
+                comment: Some(n),
+                ..Reference::new(RefKind::Comment, "o/ops", n)
+            },
+            action,
+            carried: false,
+            group: None,
+            chain: holds::EpicChain::default(),
+        }
+    }
+
     #[test]
     fn draft_buckets_survive_grouping_but_never_carry_as_quick() {
         let fixture: Value = serde_json::from_str(include_str!(

@@ -1,0 +1,2679 @@
+{
+  "schema": "agent-board/holds/v1",
+  "at": "2026-11-05T12:00:00Z",
+  "truncated": 30,
+  "wip": {
+    "limit": 0,
+    "in_flight": null
+  },
+  "pass": {
+    "mode": "",
+    "candidates": 30,
+    "started": 0,
+    "live_epics": null,
+    "progress_at": "2026-11-05T11:00:00Z"
+  },
+  "needs_you": {
+    "schema": "agent-board/needs-you/v2",
+    "complete": true,
+    "validated_at": "2026-11-05T12:00:00Z",
+    "changed_at": "2026-11-05T12:00:00Z",
+    "sources": {
+      "epics": "off",
+      "items": "complete",
+      "reviews": "complete",
+      "proposals": "complete",
+      "digest": "off"
+    },
+    "summaries": "complete",
+    "omitted": 0,
+    "count": 202,
+    "counts": {
+      "decisions": 174,
+      "groups": 2,
+      "members": 202
+    },
+    "context": {
+      "wip": {
+        "limit": 0,
+        "in_flight": null
+      },
+      "observed_at": "2026-11-05T12:00:00Z",
+      "sources": {
+        "run": "off",
+        "step": "off",
+        "usage": "off"
+      },
+      "omitted": 30,
+      "items": []
+    },
+    "items": [
+      {
+        "key": "o/tracker#12",
+        "item": "o/tracker#12",
+        "source": "items",
+        "kind": "needs-human",
+        "priority": "P0",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "ask": "Decide 12: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+        "recommendation": null,
+        "target": "https://github.com/o/tracker/issues/12",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/tracker",
+          "number": 12
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/tracker",
+          "number": 12
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/app#1",
+        "item": "o/app#1",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "ask": "labelled operator-approval; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": "https://github.com/o/app/pull/1",
+        "head": "0000000000000000000000000000000000000001",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/app",
+          "number": 1,
+          "head": "0000000000000000000000000000000000000001"
+        },
+        "source_ref": {
+          "type": "pull_request",
+          "repository": "o/app",
+          "number": 1,
+          "head": "0000000000000000000000000000000000000001"
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/app#2",
+        "item": "o/app#2",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "ask": "labelled operator-approval; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": "https://github.com/o/app/pull/2",
+        "head": "0000000000000000000000000000000000000002",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/app",
+          "number": 2,
+          "head": "0000000000000000000000000000000000000002"
+        },
+        "source_ref": {
+          "type": "pull_request",
+          "repository": "o/app",
+          "number": 2,
+          "head": "0000000000000000000000000000000000000002"
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/app#3",
+        "item": "o/app#3",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "ask": "labelled operator-approval; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": "https://github.com/o/app/pull/3",
+        "head": "0000000000000000000000000000000000000003",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/app",
+          "number": 3,
+          "head": "0000000000000000000000000000000000000003"
+        },
+        "source_ref": {
+          "type": "pull_request",
+          "repository": "o/app",
+          "number": 3,
+          "head": "0000000000000000000000000000000000000003"
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/zeta#174",
+        "item": "o/zeta#174",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "ask": "pr.operatorPaths: .github/pass.json; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": "https://github.com/o/zeta/pull/174",
+        "head": "00000000000000000000000000000000000000ae",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/zeta",
+          "number": 174,
+          "head": "00000000000000000000000000000000000000ae"
+        },
+        "source_ref": {
+          "type": "pull_request",
+          "repository": "o/zeta",
+          "number": 174,
+          "head": "00000000000000000000000000000000000000ae"
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      }
+    ],
+    "identities": [
+      {
+        "item": "o/tracker#12",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#16",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#20",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#24",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#28",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#32",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#36",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#4",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#40",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#8",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-01T08:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#1",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#13",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#17",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#21",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#25",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#29",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#33",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#37",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#5",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#9",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-02T08:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#10",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#14",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#18",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#2",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#22",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#26",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#30",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#34",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#38",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#6",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-03T08:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#11",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#15",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#19",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#23",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#27",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#3",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#31",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#35",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#39",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/tracker#7",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-04T08:00:00Z",
+        "priority": "P3",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#1/comment-1",
+        "item": "o/ops#1",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:01:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#2/comment-2",
+        "item": "o/ops#2",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:02:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#3/comment-3",
+        "item": "o/ops#3",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:03:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#4/comment-4",
+        "item": "o/ops#4",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:04:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#5/comment-5",
+        "item": "o/ops#5",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:05:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#6/comment-6",
+        "item": "o/ops#6",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:06:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#7/comment-7",
+        "item": "o/ops#7",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:07:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#8/comment-8",
+        "item": "o/ops#8",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:08:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#9/comment-9",
+        "item": "o/ops#9",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:09:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#10/comment-10",
+        "item": "o/ops#10",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:10:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#11/comment-11",
+        "item": "o/ops#11",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:11:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#12/comment-12",
+        "item": "o/ops#12",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:12:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#13/comment-13",
+        "item": "o/ops#13",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:13:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#14/comment-14",
+        "item": "o/ops#14",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:14:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#15/comment-15",
+        "item": "o/ops#15",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:15:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#16/comment-16",
+        "item": "o/ops#16",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:16:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#17/comment-17",
+        "item": "o/ops#17",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:17:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#18/comment-18",
+        "item": "o/ops#18",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:18:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#19/comment-19",
+        "item": "o/ops#19",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:19:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#20/comment-20",
+        "item": "o/ops#20",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:20:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#21/comment-21",
+        "item": "o/ops#21",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:21:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#22/comment-22",
+        "item": "o/ops#22",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:22:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#23/comment-23",
+        "item": "o/ops#23",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:23:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#24/comment-24",
+        "item": "o/ops#24",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:24:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#25/comment-25",
+        "item": "o/ops#25",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:25:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#26/comment-26",
+        "item": "o/ops#26",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:26:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#27/comment-27",
+        "item": "o/ops#27",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:27:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#28/comment-28",
+        "item": "o/ops#28",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:28:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#29/comment-29",
+        "item": "o/ops#29",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:29:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#30/comment-30",
+        "item": "o/ops#30",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:30:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#31/comment-31",
+        "item": "o/ops#31",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:31:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#32/comment-32",
+        "item": "o/ops#32",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:32:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#33/comment-33",
+        "item": "o/ops#33",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:33:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#34/comment-34",
+        "item": "o/ops#34",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:34:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#35/comment-35",
+        "item": "o/ops#35",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:35:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#36/comment-36",
+        "item": "o/ops#36",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:36:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#37/comment-37",
+        "item": "o/ops#37",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:37:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#38/comment-38",
+        "item": "o/ops#38",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:38:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#39/comment-39",
+        "item": "o/ops#39",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:39:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#40/comment-40",
+        "item": "o/ops#40",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:40:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#41/comment-41",
+        "item": "o/ops#41",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:41:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#42/comment-42",
+        "item": "o/ops#42",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:42:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#43/comment-43",
+        "item": "o/ops#43",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:43:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#44/comment-44",
+        "item": "o/ops#44",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:44:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#45/comment-45",
+        "item": "o/ops#45",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:45:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#46/comment-46",
+        "item": "o/ops#46",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:46:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#47/comment-47",
+        "item": "o/ops#47",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:47:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#48/comment-48",
+        "item": "o/ops#48",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:48:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#49/comment-49",
+        "item": "o/ops#49",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:49:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#50/comment-50",
+        "item": "o/ops#50",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:50:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#51/comment-51",
+        "item": "o/ops#51",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:51:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#52/comment-52",
+        "item": "o/ops#52",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:52:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#53/comment-53",
+        "item": "o/ops#53",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:53:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#54/comment-54",
+        "item": "o/ops#54",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:54:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#55/comment-55",
+        "item": "o/ops#55",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:55:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#56/comment-56",
+        "item": "o/ops#56",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:56:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#57/comment-57",
+        "item": "o/ops#57",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:57:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#58/comment-58",
+        "item": "o/ops#58",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:58:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#59/comment-59",
+        "item": "o/ops#59",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T00:59:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#60/comment-60",
+        "item": "o/ops#60",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#61/comment-61",
+        "item": "o/ops#61",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:01:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#62/comment-62",
+        "item": "o/ops#62",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:02:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#63/comment-63",
+        "item": "o/ops#63",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:03:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#64/comment-64",
+        "item": "o/ops#64",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:04:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#65/comment-65",
+        "item": "o/ops#65",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:05:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#66/comment-66",
+        "item": "o/ops#66",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:06:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#67/comment-67",
+        "item": "o/ops#67",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:07:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#68/comment-68",
+        "item": "o/ops#68",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:08:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#69/comment-69",
+        "item": "o/ops#69",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:09:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#70/comment-70",
+        "item": "o/ops#70",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:10:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#71/comment-71",
+        "item": "o/ops#71",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:11:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#72/comment-72",
+        "item": "o/ops#72",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:12:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#73/comment-73",
+        "item": "o/ops#73",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:13:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#74/comment-74",
+        "item": "o/ops#74",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:14:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#75/comment-75",
+        "item": "o/ops#75",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:15:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#76/comment-76",
+        "item": "o/ops#76",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:16:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#77/comment-77",
+        "item": "o/ops#77",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:17:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#78/comment-78",
+        "item": "o/ops#78",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:18:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#79/comment-79",
+        "item": "o/ops#79",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:19:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#80/comment-80",
+        "item": "o/ops#80",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:20:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#81/comment-81",
+        "item": "o/ops#81",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:21:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#82/comment-82",
+        "item": "o/ops#82",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:22:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#83/comment-83",
+        "item": "o/ops#83",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:23:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#84/comment-84",
+        "item": "o/ops#84",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:24:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#85/comment-85",
+        "item": "o/ops#85",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:25:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#86/comment-86",
+        "item": "o/ops#86",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:26:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#87/comment-87",
+        "item": "o/ops#87",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:27:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#88/comment-88",
+        "item": "o/ops#88",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:28:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#89/comment-89",
+        "item": "o/ops#89",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:29:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#90/comment-90",
+        "item": "o/ops#90",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:30:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#91/comment-91",
+        "item": "o/ops#91",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:31:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#92/comment-92",
+        "item": "o/ops#92",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:32:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#93/comment-93",
+        "item": "o/ops#93",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:33:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#94/comment-94",
+        "item": "o/ops#94",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:34:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#95/comment-95",
+        "item": "o/ops#95",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:35:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#96/comment-96",
+        "item": "o/ops#96",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:36:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#97/comment-97",
+        "item": "o/ops#97",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:37:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#98/comment-98",
+        "item": "o/ops#98",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:38:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#99/comment-99",
+        "item": "o/ops#99",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:39:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#100/comment-100",
+        "item": "o/ops#100",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:40:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#101/comment-101",
+        "item": "o/ops#101",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:41:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#102/comment-102",
+        "item": "o/ops#102",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:42:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#103/comment-103",
+        "item": "o/ops#103",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:43:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#104/comment-104",
+        "item": "o/ops#104",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:44:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#105/comment-105",
+        "item": "o/ops#105",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:45:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#106/comment-106",
+        "item": "o/ops#106",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:46:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#107/comment-107",
+        "item": "o/ops#107",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:47:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#108/comment-108",
+        "item": "o/ops#108",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:48:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#109/comment-109",
+        "item": "o/ops#109",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:49:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#110/comment-110",
+        "item": "o/ops#110",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:50:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#111/comment-111",
+        "item": "o/ops#111",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:51:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#112/comment-112",
+        "item": "o/ops#112",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:52:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#113/comment-113",
+        "item": "o/ops#113",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:53:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#114/comment-114",
+        "item": "o/ops#114",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:54:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#115/comment-115",
+        "item": "o/ops#115",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:55:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#116/comment-116",
+        "item": "o/ops#116",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:56:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#117/comment-117",
+        "item": "o/ops#117",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:57:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#118/comment-118",
+        "item": "o/ops#118",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:58:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#119/comment-119",
+        "item": "o/ops#119",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T01:59:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#120/comment-120",
+        "item": "o/ops#120",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#121/comment-121",
+        "item": "o/ops#121",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:01:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#122/comment-122",
+        "item": "o/ops#122",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:02:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#123/comment-123",
+        "item": "o/ops#123",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:03:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#124/comment-124",
+        "item": "o/ops#124",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:04:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#125/comment-125",
+        "item": "o/ops#125",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:05:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#126/comment-126",
+        "item": "o/ops#126",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:06:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#127/comment-127",
+        "item": "o/ops#127",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:07:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/ops#128/comment-128",
+        "item": "o/ops#128",
+        "kind": "operator-action",
+        "source": "proposals",
+        "waiting_since": "2026-11-04T02:08:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/app#1",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/app#2",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/app#3",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/drafts#21",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#22",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#23",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#24",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#25",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#26",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#27",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#28",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#29",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/drafts#21",
+        "item": "o/drafts#30",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "item": "o/stranded#1",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#10",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#11",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#12",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#13",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#14",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#15",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#16",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#17",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#18",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#19",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#2",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#20",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#3",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#4",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#5",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#6",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#7",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#8",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "detail_key": "o/stranded#1",
+        "item": "o/stranded#9",
+        "kind": "review-needs-human",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "label_backed": true,
+        "epic": "unknown"
+      },
+      {
+        "item": "o/zeta#174",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-11-05T12:00:00Z",
+        "epic": "unknown"
+      }
+    ],
+    "epics": {},
+    "details_omitted": 197,
+    "requests": [
+      {
+        "key": "o/tracker#12",
+        "identity": "github.com/o/tracker#12/question/c0b52891e2d8ede26b512c2684ba66b0c134cca7fa7e26e556c3f589dbed1525",
+        "forge": "github.com",
+        "question": "Decide 12: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/tracker",
+          "number": 12
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/tracker",
+            "number": 12
+          }
+        ],
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null,
+        "facts": "labelled needs-human",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/app#1",
+        "identity": "github.com/o/app#1/approve",
+        "forge": "github.com",
+        "question": "labelled operator-approval; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/app",
+          "number": 1,
+          "head": "0000000000000000000000000000000000000001"
+        },
+        "revision": "0000000000000000000000000000000000000001",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "pull_request",
+            "repository": "o/app",
+            "number": 1,
+            "head": "0000000000000000000000000000000000000001"
+          }
+        ],
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null,
+        "facts": "labelled operator-approval; it needs operator's approval of the head",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/app#2",
+        "identity": "github.com/o/app#2/approve",
+        "forge": "github.com",
+        "question": "labelled operator-approval; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/app",
+          "number": 2,
+          "head": "0000000000000000000000000000000000000002"
+        },
+        "revision": "0000000000000000000000000000000000000002",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "pull_request",
+            "repository": "o/app",
+            "number": 2,
+            "head": "0000000000000000000000000000000000000002"
+          }
+        ],
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null,
+        "facts": "labelled operator-approval; it needs operator's approval of the head",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/app#3",
+        "identity": "github.com/o/app#3/approve",
+        "forge": "github.com",
+        "question": "labelled operator-approval; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/app",
+          "number": 3,
+          "head": "0000000000000000000000000000000000000003"
+        },
+        "revision": "0000000000000000000000000000000000000003",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "pull_request",
+            "repository": "o/app",
+            "number": 3,
+            "head": "0000000000000000000000000000000000000003"
+          }
+        ],
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null,
+        "facts": "labelled operator-approval; it needs operator's approval of the head",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/zeta#174",
+        "identity": "github.com/o/zeta#174/approve",
+        "forge": "github.com",
+        "question": "pr.operatorPaths: .github/pass.json; it needs operator's approval of the head",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/zeta",
+          "number": 174,
+          "head": "00000000000000000000000000000000000000ae"
+        },
+        "revision": "00000000000000000000000000000000000000ae",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "pull_request",
+            "repository": "o/zeta",
+            "number": 174,
+            "head": "00000000000000000000000000000000000000ae"
+          }
+        ],
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null,
+        "facts": "pr.operatorPaths: .github/pass.json; it needs operator's approval of the head",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      }
+    ],
+    "request_sources": [
+      {
+        "key": "o/app#1",
+        "ask": {
+          "key": "o/app#1",
+          "item": "o/app#1",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-11-05T12:00:00Z",
+          "ask": "labelled operator-approval; it needs operator's approval of the head",
+          "recommendation": null,
+          "target": "https://github.com/o/app/pull/1",
+          "head": "0000000000000000000000000000000000000001",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/app",
+            "number": 1,
+            "head": "0000000000000000000000000000000000000001"
+          },
+          "source_ref": {
+            "type": "pull_request",
+            "repository": "o/app",
+            "number": 1,
+            "head": "0000000000000000000000000000000000000001"
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null
+      },
+      {
+        "key": "o/app#2",
+        "ask": {
+          "key": "o/app#2",
+          "item": "o/app#2",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-11-05T12:00:00Z",
+          "ask": "labelled operator-approval; it needs operator's approval of the head",
+          "recommendation": null,
+          "target": "https://github.com/o/app/pull/2",
+          "head": "0000000000000000000000000000000000000002",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/app",
+            "number": 2,
+            "head": "0000000000000000000000000000000000000002"
+          },
+          "source_ref": {
+            "type": "pull_request",
+            "repository": "o/app",
+            "number": 2,
+            "head": "0000000000000000000000000000000000000002"
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null
+      },
+      {
+        "key": "o/app#3",
+        "ask": {
+          "key": "o/app#3",
+          "item": "o/app#3",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-11-05T12:00:00Z",
+          "ask": "labelled operator-approval; it needs operator's approval of the head",
+          "recommendation": null,
+          "target": "https://github.com/o/app/pull/3",
+          "head": "0000000000000000000000000000000000000003",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/app",
+            "number": 3,
+            "head": "0000000000000000000000000000000000000003"
+          },
+          "source_ref": {
+            "type": "pull_request",
+            "repository": "o/app",
+            "number": 3,
+            "head": "0000000000000000000000000000000000000003"
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null
+      },
+      {
+        "key": "o/zeta#174",
+        "ask": {
+          "key": "o/zeta#174",
+          "item": "o/zeta#174",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-11-05T12:00:00Z",
+          "ask": "pr.operatorPaths: .github/pass.json; it needs operator's approval of the head",
+          "recommendation": null,
+          "target": "https://github.com/o/zeta/pull/174",
+          "head": "00000000000000000000000000000000000000ae",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/zeta",
+            "number": 174,
+            "head": "00000000000000000000000000000000000000ae"
+          },
+          "source_ref": {
+            "type": "pull_request",
+            "repository": "o/zeta",
+            "number": 174,
+            "head": "00000000000000000000000000000000000000ae"
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-05T12:00:00Z",
+        "source_time": null
+      }
+    ],
+    "approval_evidence": {
+      "schema": "agent-board/approval-evidence/v1",
+      "observed_at": "2026-11-05T12:00:00Z",
+      "omitted": 0,
+      "items": {}
+    }
+  },
+  "holds": [
+    {
+      "item": "o/tracker#1",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 1: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#2",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 2: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#3",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 3: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#4",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 4: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#5",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 5: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#6",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 6: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#7",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 7: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#8",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 8: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#9",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 9: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#10",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 10: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#11",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 11: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#12",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 12: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#13",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 13: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#14",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 14: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#15",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 15: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#16",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 16: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#17",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 17: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#18",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 18: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#19",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 19: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#20",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 20: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#21",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 21: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#22",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 22: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#23",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 23: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#24",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 24: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#25",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 25: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#26",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 26: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#27",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 27: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#28",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 28: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#29",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 29: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#30",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 30: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#31",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 31: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#32",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 32: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#33",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 33: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#34",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 34: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#35",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 35: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#36",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 36: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#37",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P1",
+      "question": "Decide 37: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-02T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#38",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P2",
+      "question": "Decide 38: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-03T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#39",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P3",
+      "question": "Decide 39: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-04T08:00:00Z"
+    },
+    {
+      "item": "o/tracker#40",
+      "url": null,
+      "epic": false,
+      "kind": "needs-human",
+      "reason": "labelled needs-human",
+      "operator": true,
+      "priority": "P0",
+      "question": "Decide 40: which bound to keep which bound to keep which bound to keep which bound to keep ?",
+      "since": "2026-11-01T08:00:00Z"
+    }
+  ]
+}

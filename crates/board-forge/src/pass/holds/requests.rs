@@ -66,6 +66,9 @@ pub struct Request {
     pub resolution: String,
 }
 
+/// The [`Action`] kind of a forge review bound to the target's head.
+pub const REVIEW_AT_HEAD: &str = "review-at-head";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Action {
     pub kind: String,
@@ -265,7 +268,7 @@ pub(super) fn describe(
         RefKind::ApprovePullRequest | RefKind::ReviewPullRequest
     ) {
         actions.push(Action {
-            kind: "review-at-head".into(),
+            kind: REVIEW_AT_HEAD.into(),
             supported: quality == "decision" && headed,
             reason: "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy.".into(),
         });

@@ -735,6 +735,15 @@ For #668, the private `bot-ops` comments endpoint again returned HTTP 404;
 the 4 November snapshot and complete historical state/label/parent responses
 were not accessible. The 3 November fixture above has no complete parent
 evidence and cannot establish an epic-unknown percentage.
+`fixtures/needs-you-approval-fit-174.json` is derived, not recorded: the
+published snapshot of a public, synthetic board shaped like tracker#976's
+inbox, 174 decisions with mixed Priorities, two groups, large holds and
+descriptors, and a `pr.operatorPaths` approval ranked last. The test
+`approvals_survive_fitting_the_174_decision_board` builds it from stage 2's
+waits, fits it past the cap and checks that every approval keeps its card,
+head, descriptor and source record, that the totals stay, and that the same
+board next pass writes nothing. Review can replay the fixture with its parser;
+this repository does not run review's parser.
 `fixtures/needs-you-chains-sanitized.json` is an explicitly representative
 model, not a historical API recording. It asserts the reported
 `composefs-rs#33` → `tracker#160` assignment and synthetic cross-repository
@@ -838,11 +847,28 @@ counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
 are left out only after the rest, then the alarms, each together with its
 hold, and the alarms on the holds issue last. The operator's holds and the holds of every new
 run are kept ahead of the needs-you list's detail cards. The lowest ranked detail
-records are then left out and counted in `details_omitted`. Their identities,
-kinds, priorities and epic context remain published and can be carried when
-their source is unread on a later pass. Detail eviction alone does not make
-the inventory incomplete, and the compact inventory keeps a few hundred
-decisions within the cap. Should the inventory and protected holds still not
+records are then left out and counted in `details_omitted`, each card with its
+descriptors and source records. Actionable approvals go last
+(agent-board#722): a card whose own descriptor offers a supported
+`review-at-head` at the card's full head is left out only once no other card
+is left, lowest ranked first. Only that descriptor marks it, never a path or
+kind, so a card without one, or carried, ranks and goes as any other. The
+cards left keep their Priority, then age, order. Where approvals alone do
+not fit, the highest ranked keep their cards and the rest are counted in
+`details_omitted` as any card; an approval without its card is no action.
+The identities, kinds, priorities and epic context of the decisions whose
+cards were left out remain published and can be carried when their source
+is unread on a later pass. A fresh review wait whose card was left out keeps
+the age its identity published, as its head was not published: otherwise
+each pass would restart it and so change the list. It keeps that age even if
+its head moves while it has no card. Detail eviction alone does not make the
+inventory incomplete, and the compact inventory keeps a few hundred
+decisions within the cap. Each card costs about 3,000 characters with its
+descriptor and source record, about 1,000 of them the descriptor's fixed
+action reasons and resolution text, so that few cards fit beside a large
+inventory and many operator holds. Sharing that text between descriptors
+would need a new contract with review, so it is not done here.
+Should the inventory and protected holds still not
 fit once every detail card is gone, a last resort leaves out, in order, the
 source carry records no card is left for, then the lowest ranked identities,
 counted in `needs_you.omitted` (`count` stays every decision), each batch
