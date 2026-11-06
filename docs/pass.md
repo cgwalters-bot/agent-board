@@ -1539,6 +1539,20 @@ and posts the hold comment again. The decision line names `rule answered-verdict
 when released for triage or `rule unanswered-verdict` when held again. This
 uses the existing off-by-default `triageFollowUpDays`; it adds no option.
 
+Mechanical follow-through (rebasing, re-running CI, fixing conflicts or
+refreshing a stale branch) is the pass's work, never the operator's
+(agent-board#728). The brief that asks for a verdict says to plan it as an
+implement job, a rebase keeping existing `Signed-off-by` trailers and adding
+none, and that only a real decision goes to the operator: a design choice,
+posting upstream for the first time, credentials, bounds or budget. A
+`follow-through` verdict, for such work the run did not plan, labels
+nothing: the issue is triaged again at once, the plan and brief saying it is
+for that follow-through. A `follow-through` verdict on such a plan waits as
+`partly` does, the two counting as one streak for its doubling wait, so they
+cannot loop. An earlier `follow-through` verdict on an issue without the
+pass's plan also waits. A run that still answers `done` for such work is
+closed or held as before: only the brief steers it.
+
 With `triageClose` (agent-board#428), `done` instead closes the issue as
 completed and `obsolete` as not planned, and the pass posts one line
 linking the verdict, so the operator can reopen it: the line, then the
