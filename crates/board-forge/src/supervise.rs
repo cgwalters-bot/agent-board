@@ -15,6 +15,7 @@ pub mod agent;
 pub mod health;
 pub mod pace;
 pub mod profile;
+pub mod restart;
 
 const HOUR_MS: i64 = 3_600_000;
 
@@ -333,6 +334,7 @@ pub const SUPERVISOR_OPTIONS: &[&str] = &[
     "schedulerJob",
     "releaseRepository",
     CAPACITY_MARGIN,
+    restart::OPTION,
 ];
 
 /// The limit without a default: set, the capacity check runs.
@@ -421,6 +423,9 @@ pub struct Settings {
     pub release_train_workflow: Option<String>,
     pub usage: Option<Usage>,
     pub agent: Option<AgentSettings>,
+    /// `restartPass`: whether and how `supervise restart` starts a stalled
+    /// pass ([`restart`]); absent, it never does.
+    pub restart_pass: Option<restart::RestartPass>,
     /// The known options the files leave unset ([`unset`]).
     pub unset: Vec<String>,
 }
@@ -577,6 +582,17 @@ impl Settings {
                 Ok(Usage { issue, bot })
             })
             .transpose()?;
+        let agent = agent_settings(known(SUPERVISOR_OPTIONS, supervisor, "agent")?)?;
+        let restart_pass = restart::RestartPass::from_json(known(
+            SUPERVISOR_OPTIONS,
+            supervisor,
+            restart::OPTION,
+        )?)?;
+        ensure!(
+            restart_pass.is_none() || agent.is_some(),
+            "{what}: {} needs the agent's log issue, where it records and escalates",
+            restart::OPTION
+        );
         Ok(Self {
             follow: repositories(board.get("follow"), "config follow")?,
             schedule_repositories: repositories(
@@ -604,7 +620,8 @@ impl Settings {
             release,
             release_train_workflow,
             usage,
-            agent: agent_settings(known(SUPERVISOR_OPTIONS, supervisor, "agent")?)?,
+            agent,
+            restart_pass,
             unset: unset(board, supervisor),
         })
     }
@@ -1217,6 +1234,7 @@ pub(crate) mod tests {
             .map(|k| (*k).to_owned())
             .collect();
         expected.push(CAPACITY_MARGIN.to_owned());
+        expected.push(restart::OPTION.to_owned());
         expected.push("pr.draftReviewRepositories".into());
         expected.extend(
             [

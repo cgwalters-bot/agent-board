@@ -824,6 +824,7 @@ Commands:
 - [`compose`](#agent-board-supervise-compose): Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads)
 - [`preview`](#agent-board-supervise-preview): Print the agent's result comment without applying it (GH_TOKEN reads)
 - [`session`](#agent-board-supervise-session): Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads)
+- [`restart`](#agent-board-supervise-restart): Start the poll workflow once when its chain has stopped, and tell the operator once if that does not take; off unless the supervisor's file sets restartPass (writes with GH_TOKEN, the bot's: actions on dispatchRepo, comments on the log issue)
 
 ## agent-board supervise health
 
@@ -963,6 +964,20 @@ Options:
 - `--pool <POOL>`: The pool, of the pools file, the session runs on
 - `--idle-minutes <IDLE_MINUTES>`: The idle timeout, 1 to 60 minutes; empty uses the session settings'
 - `--prompt <PROMPT>`: The opening prompt, task data
+
+## agent-board supervise restart
+
+Start the poll workflow once when its chain has stopped, and tell the operator once if that does not take; off unless the supervisor's file sets restartPass (writes with GH_TOKEN, the bot's: actions on dispatchRepo, comments on the log issue)
+
+```text
+agent-board supervise restart [OPTIONS] --config <FILE> --supervisor-config <FILE>
+```
+
+Options:
+
+- `--config <FILE>`: The poll's agent-board.json: operator, bot, dispatch repository and workflow, follow
+- `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
+- `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
 
 ## agent-board status
 

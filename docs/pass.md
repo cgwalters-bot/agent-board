@@ -3212,15 +3212,19 @@ has a default. In order, it:
    or in the same second with a higher ID. The listing, its newest 200 runs,
    must reach back to this run, else a newer one may be unseen and it fails.
    A dispatch that failed may still have started a run, so it lists the runs
-   again before each of four tries; that narrows, but cannot rule out, a
+   again before each of ten tries; that narrows, but cannot rule out, a
    second chain, as can a run arriving between the listing and the dispatch.
+   A listing that fails is one failed try, and the tries wait 2, 4, 8 and so
+   on seconds apart, at most two minutes, about eight minutes in all: a
+   GitHub incident of a few minutes does not end the chain (agent-board#715).
+   A longer one is the [supervisor's restart](supervisor-requests.md#pass-restart)
+   to catch.
 
-Each GitHub call gets four tries, 2, 4 and 8 seconds apart, and each request
+Each other GitHub call gets four tries, 2, 4 and 8 seconds apart, and each request
 at most 30 seconds, so one server error does not end the chain; it waits out
 no rate limit beyond those tries, and `--wait-minutes` is at most six hours,
 a hosted job's limit, so the caller's job timeout bounds it. It fails when
-it cannot read this run's start or the pass workflow's runs, or cannot start
-the pass. `--dry-run` reads as above but waits for and starts nothing,
+it cannot read this run's start, or cannot start the pass in its ten tries. `--dry-run` reads as above but waits for and starts nothing,
 printing what it would wait and start. Only the caller's job conditions
 decide that a pass applied and the chain should go on; cancelling the waiting
 job ends the chain. Dry-run skips retry waits too, even on failed reads, and

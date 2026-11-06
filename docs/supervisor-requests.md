@@ -281,6 +281,36 @@ changes only with a reviewed config edit. `compose` and `session` read
 `.github/agentic-job/profiles/supervisor.md` and `skills/supervisor/SKILL.md`
 there through the contents API with `GH_TOKEN`, each at most 64 KiB.
 
+### Pass restart
+
+`supervise restart` restarts the pass chain when it has stopped. GitHub drops
+most runs of a frequent cron, so the chain lives on each applying pass's
+[`pass next`](pass.md#the-next-pass); when a GitHub incident outlasted that
+step's tries, nothing started the next pass for 90 minutes (agent-board#715).
+Off unless the supervisor's file sets `restartPass`. It reads the newest 100
+runs of `pollWorkflow` on the default branch (`DEFAULT_BRANCH`) and the bot's
+records on `agent.log` from the last day, then:
+
+- While any listed run is unfinished, or the newest started less than
+  `staleMinutes` ago, it does nothing.
+- Otherwise, without a record, it posts its record on the log issue, then
+  dispatches `pollWorkflow` once on the default branch with `restartPass`'s
+  `inputs` (such as `apply=true`). A dispatch that fails is escalated at once.
+- With a record, the restart has not taken unless a run after it succeeded
+  and another started after that one. Then it posts one escalation on the log
+  issue, mentioning the `operator`, with the error: the failed dispatch, the
+  restarted run's conclusion, or that none started. With an escalation
+  recorded, it does nothing more.
+
+So it starts at most one pass per stall and tells the operator at most once;
+a chain that came back clears the record, and a record older than a day is
+forgotten, so a stall left that long is restarted once more. Its record is its
+comments, starting `<!-- agent-board-pass-restart restarted after=ID -->` or
+`... escalated after=ID -->` (ID the stalled run), by `bot` only. GH_TOKEN, the
+bot's, needs `actions: write` on `dispatchRepo` and to comment on the log
+issue; run it in the serialized execute job, as two at once may both restart.
+It prints what it did on stdout; a failed read fails it without a write.
+
 ### Hand-back
 
 By default the agent's comment is posted on the requests issue, and the
@@ -576,6 +606,12 @@ while it is left out, so a dropped or misspelled key is seen:
   The health pass reads `passConfig` too: the `held` check leaves out a draft
   pull request whose base repository is in its `pr.noMerge`, the operator's
   promote queue; a file that does not read leaves `held` unavailable.
+- `restartPass`: `{"staleMinutes": 25, "inputs": {"apply": "true"}}`, the
+  [pass restart](#pass-restart). `staleMinutes` is an integer from 20 to
+  1440; `inputs`, at most 10 string inputs of at most 256 bytes, defaults to
+  none. Other keys are refused. It needs `agent`, whose log issue holds its
+  record. Absent or null, `supervise restart` reads and writes nothing, and
+  `unset` names it.
 
 Two checks leave out what nothing can change. The `runs` check leaves out a
 run still listed as unfinished seven days after it started: GitHub has

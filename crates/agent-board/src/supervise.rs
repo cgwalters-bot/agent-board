@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use board_forge::supervise::{self, Api, Bounded, Settings, agent, health, pace, profile};
+use board_forge::supervise::{self, Api, Bounded, Settings, agent, health, pace, profile, restart};
 use serde_json::Value;
 use std::{
     io::Write,
@@ -30,6 +30,14 @@ enum Command {
     Preview(Preview),
     /// Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads).
     Session(Session),
+    /// Start the poll workflow once when its chain has stopped, and tell the operator once if that does not take; off unless the supervisor's file sets restartPass (writes with GH_TOKEN, the bot's: actions on dispatchRepo, comments on the log issue).
+    Restart(Restart),
+}
+
+#[derive(clap::Args)]
+struct Restart {
+    #[command(flatten)]
+    files: Files,
 }
 
 /// Repository-owned settings from a trusted default-branch checkout, never a
@@ -537,6 +545,24 @@ pub fn run(args: &Supervise) -> Result<()> {
             std::io::stdout()
                 .lock()
                 .write_all(session_output(&outputs, &delimiter("session")?)?.as_bytes())?;
+            Ok(())
+        }
+        Command::Restart(args) => {
+            let s = settings(&args.files)?;
+            // Off, it needs neither a token nor a run.
+            let line = if s.restart_pass.is_none() {
+                format!("{} is not configured; nothing to do", restart::OPTION)
+            } else {
+                let client = board_forge::github::Client::from_env()?;
+                let run_url = format!(
+                    "{}/{}/actions/runs/{}",
+                    env("GITHUB_SERVER_URL")?,
+                    env("GITHUB_REPOSITORY")?,
+                    env("GITHUB_RUN_ID")?
+                );
+                restart::run(&client, &s, &env("DEFAULT_BRANCH")?, &run_url, now())?
+            };
+            writeln!(std::io::stdout().lock(), "{line}")?;
             Ok(())
         }
     }
