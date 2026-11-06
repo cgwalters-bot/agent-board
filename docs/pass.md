@@ -312,7 +312,9 @@ children, a reason that counts them and names up to three at the board's
 first two Priority options (P0 and P1), and `operator` true only where there
 is one, so that the review app asks the operator once to label the epic.
 The other kinds are `closed`, `needs-design` (labelled so: a parked design,
-which still blocks dispatch but asks the operator nothing), `blocked`
+which still blocks dispatch but asks the operator nothing), `needs-issue`
+(a triage verdict waiting on the controller for a follow-up issue, see
+[Scheduling](#scheduling)), `blocked`
 (board Blocked), `waiting-on` (open
 dependencies, or a lower stacked slice not yet open), `pr-open` (the bot's or
 the operator's; on an issue labelled `needs-operator-approval`, read
@@ -1698,6 +1700,26 @@ and posts the hold comment again. The decision line names `rule answered-verdict
 when released for triage or `rule unanswered-verdict` when held again. This
 uses the existing off-by-default `triageFollowUpDays`; it adds no option.
 
+A `needs-issue` verdict means a plan needs a follow-up issue number, not a
+human decision (agent-board#647). The brief asks for its repository, title
+and body in the triage comment, without inventing a number. The pass
+publishes a `needs-issue` hold with `operator: false` for the controller,
+even after the cooldown; it neither labels nor assigns the source, including
+with `assignHolds`. Supervisor health reports the hold as a problem, so the
+supervisor sees it although the operator's queue does not. A subsequent
+writer response releases the wait for triage, without a label removal. Run
+bookkeeping and run output do not: status and cost lines, an agent's safe
+output and a supervisor note. Its brief names that
+response rather than a label removal or assignment. A newer accepted plan
+takes precedence as usual. This is a
+fallback only: it does not create an issue, enroll one on the board, or
+resolve a temporary ID in a plan. A triage run cannot do that either:
+tracker's triage bounds allow no `create_issue`, and agentic-job holds
+`create_issue` to the run's own repository and refuses temporary IDs
+(`#aw_`), so a plan cannot name an issue the same run creates. The pass must
+not bypass that boundary by executing an agent's proposed issue creation
+itself.
+
 Mechanical follow-through (rebasing, re-running CI, fixing conflicts or
 refreshing a stale branch) is the pass's work, never the operator's
 (agent-board#728). The brief that asks for a verdict says to plan it as an
@@ -2528,8 +2550,8 @@ operator's, and a `stall …` line in the pass's log:
   since T: REASON`, the reason with its times as `<time>` and cut to 300
   characters. Past ten such alarms, one more entry on the holds issue
   counts and names the rest, which have their lines. Holds that wait by design are exempt: every hold that
-  already waits on the operator, and `needs-human`, `needs-design`,
-  `blocked`, `closed`, `waiting-on`, `pr-open`, `in-flight`, `dispatched`,
+  already waits on the operator, and `needs-human`, `needs-issue`,
+  `needs-design`, `blocked`, `closed`, `waiting-on`, `pr-open`, `in-flight`, `dispatched`,
   `triage-cooldown`, `epic-not-live`, `outside-epics` and
   `overlap-ignored`. So is an `overlap` hold whose every pull request this
   pass saw move, or wait on a person ([blockers](#blockers)): the pull

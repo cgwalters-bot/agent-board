@@ -353,12 +353,15 @@ impl Collector<'_> {
                 let target = hold["url"].as_str().unwrap_or(&url);
                 // Normal scheduling waits are observations, not bugs. Reuse
                 // the pass's explicit alarms rather than inventing timeouts.
+                // A needs-issue wait is the controller's, not the operator's
+                // queue's, so it is raised here for the supervisor.
                 let problem = matches!(
                     kind,
                     HoldKind::Stalled
                         | HoldKind::Blocking
                         | HoldKind::Unreadable
                         | HoldKind::NeedsOperator
+                        | HoldKind::NeedsIssue
                 ) || (kind == HoldKind::NeedsHuman && pull_urls.contains(target));
                 events.push(json!({"kind": format!("hold/{}", kind.name()), "text": reason, "url": target, "at": snap["at"], "first_at": hold["since"], "problem": problem}));
                 if hold["kind"] == "needs-human" {
@@ -589,7 +592,8 @@ mod tests {
         let fields = json!({
             "holds":[
                 {"kind":"needs-human","reason":"a draft with no checkpoint","since":iso(0),"url":"https://github.com/example/project/issues/3"},
-                {"kind":"needs-human","reason":"a draft with no checkpoint","since":iso(HOUR_MS),"url":"https://github.com/example/project/issues/4"}
+                {"kind":"needs-human","reason":"a draft with no checkpoint","since":iso(HOUR_MS),"url":"https://github.com/example/project/issues/4"},
+                {"kind":"needs-issue","reason":"triage verdict needs-issue","since":iso(0),"url":"https://github.com/example/project/issues/5"}
             ],
             "needs_you":{"complete":false,"omitted":5,"items":[
                 {"key":"one","target":"https://github.com/example/project/issues/3","ask":"labelled needs-human"},
@@ -634,6 +638,10 @@ mod tests {
         assert_eq!(draft["count"], 1);
         assert_eq!(draft["first_seen"], iso(0));
         assert!(holds.iter().any(|g| g["text"] == "stranded pull request"));
+        assert!(
+            (holds.iter()).any(|g| g["kind"] == "hold/needs-issue" && g["problem"] == true),
+            "{holds:#?}"
+        );
         let quality = c.hold_signatures(true).unwrap();
         assert!(
             quality

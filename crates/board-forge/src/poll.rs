@@ -84,7 +84,7 @@ const REVIEW_CONTEXT: &str = "review";
 pub(crate) const ACTIONS_BOT_ID: u64 = 41898282;
 /// Where the review job's marker comment opens in its review (gh-aw's safe
 /// outputs footer), naming the run that wrote it.
-const RUN_MARKER: &str = "<!-- gh-aw-agentic-workflow: ";
+pub(crate) const RUN_MARKER: &str = "<!-- gh-aw-agentic-workflow: ";
 /// The event the review job's verdict must come from; see [`review_run_matches`].
 const REVIEW_EVENT: &str = "pull_request_target";
 /// The event of the review job's runs the pass starts itself, with

@@ -4919,6 +4919,62 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             LABEL,
         ),
         (
+            "needs-issue waits for the controller, even without a write budget",
+            vec![(bot, None, "needs-issue", 0)],
+            (true, Some(0)),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-issue, {answer}; controller: create the follow-up issue before planning it",
+            false,
+            "",
+        ),
+        (
+            "needs-issue does not assign the operator with assignHolds",
+            vec![(bot, None, "needs-issue", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-issue, {answer}; controller: create the follow-up issue before planning it",
+            false,
+            "",
+        ),
+        (
+            "a visitor cannot request an issue through a verdict",
+            vec![("visitor", None, "needs-issue", 0)],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: its triage, {record}, gave no verdict; triaged again from",
+            false,
+            "",
+        ),
+        (
+            "the controller's answer releases an issue-number wait without a label removal",
+            vec![
+                (bot, None, "needs-issue", 0),
+                (bot, None, "Created the follow-up: #84.", 1),
+            ],
+            (false, None),
+            "start triage cgwalters-forge/tracker#446 ",
+            true,
+            "",
+        ),
+        (
+            "run status does not release an issue-number wait",
+            vec![(bot, None, "needs-issue", 0), (bot, None, "status", 1)],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-issue, {answer}; controller: create the follow-up issue before planning it",
+            false,
+            "",
+        ),
+        (
+            "nor does a cost line, an agent's output or a supervisor note",
+            vec![
+                (bot, None, "needs-issue", 0),
+                (bot, None, "cost", 1),
+                (bot, None, "run-output", 2),
+                (bot, None, "note", 3),
+            ],
+            (false, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-issue, {answer}; controller: create the follow-up issue before planning it",
+            false,
+            "",
+        ),
+        (
             "so does obsolete",
             vec![(bot, None, "obsolete", 0)],
             (false, None),
@@ -5247,11 +5303,15 @@ fn apply_follows_up_a_triage_by_its_verdict() {
     ];
     for (name, answers, (close, writes), expected, again, held) in cases {
         let promoted = name.contains("promoted");
-        let config =
+        let mut config =
             config(json!({"triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted}));
         let mut forge = Forge::new(None, false);
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
+        config.assign_holds = name.contains("with assignHolds");
+        if config.assign_holds {
+            assignments(&mut forge.replay, 446, &[], &[]);
+        }
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
         assert!(
             comments[0].contains("schedule-triage fenced JSON block"),
@@ -5260,6 +5320,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         assert!(comments[0].contains(MECHANICAL.trim()), "{name}");
         let fix_plan = format!("{PROMOTED}{NO_UPSTREAM_COMMENT}");
         assert_eq!(comments[0].contains(&fix_plan), promoted, "{name}");
+        assert!(comments[0].contains("needs-issue"), "{name}");
         assert!(
             comments[0].contains("\n\n<!-- agent-board-inputs: "),
             "{name}"
@@ -5337,6 +5398,11 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                     line.as_str().unwrap().to_owned()
                 }
                 "note" => format!("Close it.\n\n{}", crate::input::SUPERVISOR_NOTE),
+                // A run's cost line and an agent's safe output.
+                "cost" => format!("Finished.\n\n<!-- {}: 7 -->", crate::budget::RUN_MARKER),
+                "run-output" => {
+                    format!("Created #84.\n\n{}dispatch, id: 7 -->", crate::poll::RUN_MARKER)
+                }
                 // `ask create --apply`'s hold, crates/agent-board/src/ask.rs.
                 "ask" => "An operator question is being opened for this item; any earlier triage verdict no longer authorizes closure.".to_owned(),
                 // agentic-job's status comment for the run the record names.
@@ -5423,6 +5489,18 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         ))
         .unwrap();
         assert_eq!(second.failures, 0, "{name}: {:#?}", second.lines);
+        if name.starts_with("needs-issue") {
+            let entry = second
+                .holds
+                .iter()
+                .find(|e| e.hold.kind == HoldKind::NeedsIssue)
+                .unwrap();
+            assert!(
+                !entry.hold.operator,
+                "{name}: must not enter the operator queue"
+            );
+            assert_eq!(HoldKind::NeedsIssue.name(), "needs-issue");
+        }
         let line = second.lines.iter().find(|l| l.contains("tracker#446"));
         assert!(
             line.is_some_and(|l| l.starts_with(&expected)),
@@ -5435,6 +5513,18 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             .filter(|d| d.ends_with("tracker#446"))
             .count();
         assert_eq!(triaged, 1 + usize::from(again), "{name}");
+        if name.contains("releases an issue-number wait") {
+            let writes = forge.writes.borrow();
+            let (_, _, sent) = (writes.iter().rev())
+                .find(|(_, url, _)| url.ends_with("/dispatches"))
+                .unwrap();
+            let task = text(sent, "/inputs/task");
+            assert!(
+                task.contains(", a response to its needs-issue wait.")
+                    && !task.contains("needs-human was removed"),
+                "{name}: {task}"
+            );
+        }
         // The pass's own follow-through plan, not one a case posted.
         let followed = (forge.comments_on("cgwalters-forge/tracker", 446).iter())
             .any(|c| c.starts_with(FOLLOW_THROUGH) && c.contains("post one implement job plan"));
@@ -6015,6 +6105,36 @@ fn apply_takes_an_earlier_triage_verdict() {
     let close = json!({"triageFollowUpDays": 3, "triageClose": true});
     let cases: Vec<Case> = vec![
         (
+            "needs-issue stays with the controller after the cooldown too",
+            &on,
+            vec![(bot, None, "needs-issue", -4)],
+            "",
+            Some((
+                "earlier triage verdict needs-issue, {answer}; controller: create the follow-up issue before planning it",
+                "",
+            )),
+        ),
+        (
+            "a supervisor note does not end an earlier needs-issue wait",
+            &on,
+            vec![(bot, None, "needs-issue", -4), (bot, None, "note", -3)],
+            "",
+            Some((
+                "earlier triage verdict needs-issue, {answer}; controller: create the follow-up issue before planning it",
+                "",
+            )),
+        ),
+        (
+            "a person's comment does",
+            &on,
+            vec![
+                (bot, None, "needs-issue", -4),
+                ("cgwalters", None, "Filed #84.", -3),
+            ],
+            "",
+            None,
+        ),
+        (
             "done asks the operator even with triageClose: no lock is known to cover its run",
             &close,
             vec![(bot, None, "done", -4)],
@@ -6174,8 +6294,9 @@ fn apply_takes_an_earlier_triage_verdict() {
                 continue;
             }
             let body = match said {
-                "done" | "obsolete" | "partly" => verdict(said),
+                "done" | "obsolete" | "partly" | "needs-issue" => verdict(said),
                 "status" => format!("Done.{}", crate::supervise::health::status_end(7)),
+                "note" => format!("Create it.\n\n{}", crate::input::SUPERVISOR_NOTE),
                 text => text.to_owned(),
             };
             answered(&forge, (author, editor), &body, days);
