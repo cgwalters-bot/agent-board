@@ -392,11 +392,19 @@ fn chain() {
             fails(&[]),
             None,
         ),
+        // agent-board#715: one listing's tries failing is one failed start.
         (
             "run list fails four times",
             vec![me()],
-            Want::Fail,
+            Want::Dispatch,
             fails(&[("list", 4)]),
+            None,
+        ),
+        (
+            "run list keeps failing",
+            vec![me()],
+            Want::Fail,
+            fails(&[("list", (TRIES * START_TRIES) as usize)]),
             None,
         ),
         (
@@ -430,8 +438,15 @@ fn chain() {
         (
             "dispatch fails four times",
             vec![me()],
-            Want::Fail,
+            Want::Dispatch,
             fails(&[("dispatch", 4)]),
+            None,
+        ),
+        (
+            "dispatch keeps failing",
+            vec![me()],
+            Want::Fail,
+            fails(&[("dispatch", START_TRIES as usize)]),
             None,
         ),
         // tracker#1033: the failed dispatch started the next pass.
@@ -488,9 +503,9 @@ fn chain() {
             expected.push(format!("sleep {}", 540 - retried));
         }
         assert_eq!(log[..expected.len()], expected[..], "{detail}");
-        assert!(fake.count("dispatch") <= TRIES as usize, "{detail}");
+        assert!(fake.count("dispatch") <= START_TRIES as usize, "{detail}");
         assert!(
-            fake.count("list") <= (TRIES * TRIES) as usize * RUN_PAGES,
+            fake.count("list") <= (TRIES * START_TRIES) as usize * RUN_PAGES,
             "{detail}"
         );
         // A dispatch is only ever tried right after the runs were listed.
@@ -516,6 +531,19 @@ fn chain() {
             assert_eq!(body, &json!({"ref": "main", "inputs": inputs}), "{detail}");
         }
     }
+}
+
+/// The 23:12Z pass of agent-board#715 gave up after 14 seconds of a GitHub
+/// incident; starting the next pass now keeps trying for minutes.
+#[test]
+fn start_retries_outlast_a_short_outage() {
+    let waits: Vec<Duration> = (2..=START_TRIES).map(retry_wait).collect();
+    assert!(waits.iter().all(|w| *w <= MAX_RETRY_WAIT), "{waits:?}");
+    let total: Duration = waits.iter().sum();
+    assert!(
+        (Duration::from_secs(5 * 60)..=Duration::from_secs(15 * 60)).contains(&total),
+        "{total:?}"
+    );
 }
 
 #[test]

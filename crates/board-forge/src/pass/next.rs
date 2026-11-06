@@ -15,8 +15,16 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 /// Tries of each GitHub call: one 5xx must not end the chain.
 pub const TRIES: u32 = 4;
 
+/// Tries of starting the next pass, each listing its runs again: Actions
+/// degraded for some minutes must not end the chain (agent-board#715).
+pub const START_TRIES: u32 = 10;
+
 /// The wait before the second try, doubled before each one after it.
 pub const FIRST_RETRY_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest wait between two tries, so [`START_TRIES`] span about eight
+/// minutes, within the pass interval's order rather than hours.
+pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
 
 /// Runs a page of the run listing holds, GitHub's most.
 pub const RUN_PAGE: usize = 100;
@@ -143,7 +151,9 @@ pub fn wait_for(started: OffsetDateTime, now: OffsetDateTime, interval: Duration
 
 /// The wait before try `next` (2 or more) of a call.
 fn retry_wait(next: u32) -> Duration {
-    FIRST_RETRY_WAIT.saturating_mul(1 << (next - 2).min(16))
+    FIRST_RETRY_WAIT
+        .saturating_mul(1 << (next - 2).min(16))
+        .min(MAX_RETRY_WAIT)
 }
 
 /// Whether the supervisor is due at `now`, given its newest run that counts:
@@ -268,15 +278,26 @@ pub fn run(
     }
     // A dispatch that failed may still have started a run, so the runs are
     // listed again before each try. That narrows, but cannot rule out, a
-    // second chain.
+    // second chain. A listing that fails is a failed try too.
     let file = &settings.pass.file;
-    for attempt in 1..=TRIES {
+    for attempt in 1..=START_TRIES {
         if attempt > 1 {
             clock.sleep(retry_wait(attempt));
         }
-        if let Some(id) = newer_run(&next.pass_runs(err)?, settings)? {
-            writeln!(out, "run {id} continues the chain; not starting another")?;
-            return Ok(());
+        match next
+            .pass_runs(err)
+            .and_then(|runs| newer_run(&runs, settings))
+        {
+            Ok(Some(id)) => {
+                writeln!(out, "run {id} continues the chain; not starting another")?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(e) if settings.dry_run => return Err(e),
+            Err(e) => {
+                writeln!(err, "attempt {attempt} of starting {file} failed: {e:#}")?;
+                continue;
+            }
         }
         if settings.dry_run {
             return writeln!(out, "would start {file}").map_err(Into::into);
@@ -286,7 +307,7 @@ pub fn run(
             Err(e) => writeln!(err, "attempt {attempt} of starting {file} failed: {e:#}")?,
         }
     }
-    bail!("starting {file} failed {TRIES} times")
+    bail!("starting {file} failed {START_TRIES} times")
 }
 
 struct Next<'a, R, C> {
