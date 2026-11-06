@@ -73,24 +73,10 @@ const INTAKE_REPLY: &str = "agent-board-notification";
 /// stopping at a write cap between a claim and its record strands work.
 pub(super) const INTAKE_WRITES: usize = 8;
 
-/// A conservative natural-language ask goes to a planner, not an implement
-/// run. A third party mentioning the bot must not activate unrelated operator
-/// conversation on the same thread.
+/// A third party mentioning the bot must not activate unrelated operator
+/// conversation on the same thread. Recheck the operator's own mention.
 pub(super) fn direction(body: &str, bot: &str) -> bool {
-    comments::explicit(body, bot)
-        || body.lines().any(|line| {
-            let line = line.trim().to_ascii_lowercase();
-            [
-                "let's ",
-                "let’s ",
-                "please ",
-                "can you ",
-                "could you ",
-                "would you ",
-            ]
-            .iter()
-            .any(|prefix| line.starts_with(prefix))
-        })
+    comments::mentions(body, bot)
 }
 
 /// `notifications`: the reasons that count, and the peers.
@@ -229,7 +215,71 @@ fn subject(thread: &Value) -> Option<(String, u64)> {
     Some((repo.to_owned(), number.parse().ok()?))
 }
 
+/// A complete searched thread, before admitting any direction or writes.
+struct SearchedHistory {
+    issue: Value,
+    comments: Vec<Value>,
+    said: Vec<Said>,
+}
+
 impl<R: Rest, G: Transport> Pass<'_, R, G> {
+    /// Search is discovery only: load the thread and its complete comments
+    /// before admitting work through the existing comment-ID claims. Also
+    /// whether its direction waits for a topic-selected midstream fork.
+    pub(super) fn searched_direction(
+        &mut self,
+        repo: &str,
+        number: u64,
+        read_budget: usize,
+    ) -> Result<(bool, String, bool)> {
+        // Bound only discovery reads, not the writes and recovery requests
+        // needed to settle a claim once a complete history admits direction.
+        let reserve = self.remaining.saturating_sub(read_budget);
+        self.remaining -= reserve;
+        let history = self.searched_history(repo, number);
+        self.remaining += reserve;
+        let Some(SearchedHistory {
+            issue,
+            comments,
+            said,
+        }) = history?
+        else {
+            return Ok((true, "notification: left: the thread is gone".into(), false));
+        };
+        let (done, line) = self.notification_direction_said(repo, &issue, &comments, said, None)?;
+        let waiting = !done && self.awaits_fork(repo, &issue);
+        Ok((done, line, waiting))
+    }
+
+    fn searched_history(&mut self, repo: &str, number: u64) -> Result<Option<SearchedHistory>> {
+        ensure!(number > 0, "search hit has no number");
+        let issue = match self.get(&format!("repos/{repo}/issues/{number}")) {
+            Ok(issue) => issue,
+            Err(error) if error.is::<crate::github::NotFound>() => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let comments = self.thread_comments(repo, number)?;
+        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        let said = self.said(repo, number, &comments, pull, OffsetDateTime::UNIX_EPOCH)?;
+        Ok(Some(SearchedHistory {
+            issue,
+            comments,
+            said,
+        }))
+    }
+
+    /// Whether direction on `issue` is outside our space with no
+    /// topic-selected midstream fork to stage it in.
+    fn awaits_fork(&self, repo: &str, issue: &Value) -> bool {
+        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        let mine = pull && text(issue, "/user/login") == self.config.bot;
+        let routed = (self.config.policy.notification_intake.as_ref())
+            .is_some_and(|routes| routes.contains_key(&repo.to_ascii_lowercase()));
+        !(self.config.ours(repo) || mine || routed)
+    }
+
     /// One pass over the bot's unread notifications from `since` on, and
     /// before `before` where the last pass left pages; where the next pass
     /// reads from, and before what.
@@ -571,10 +621,31 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .as_u64()
             .context("notification issue has no number")?;
         let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        let said = self.said(
+            repo,
+            number,
+            comments,
+            pull,
+            last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+        )?;
+        self.notification_direction_said(repo, issue, comments, said, last_read)
+    }
+
+    fn notification_direction_said(
+        &mut self,
+        repo: &str,
+        issue: &Value,
+        comments: &[Value],
+        said: Vec<Said>,
+        last_read: Option<OffsetDateTime>,
+    ) -> Result<(bool, String)> {
+        let number = issue["number"]
+            .as_u64()
+            .context("notification issue has no number")?;
+        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
         let since = last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let bot = self.config.bot.clone();
-        let said: Vec<_> = self
-            .said(repo, number, comments, pull, since)?
+        let said: Vec<_> = said
             .into_iter()
             .filter(|s| direction(&s.body, &bot))
             .collect();
@@ -593,14 +664,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             return Ok((true, format!("notification: {why}")));
         }
         let external = !(self.config.ours(repo) || mine);
-        if external
-            && !self
-                .config
-                .policy
-                .notification_intake
-                .as_ref()
-                .is_some_and(|routes| routes.contains_key(&repo.to_ascii_lowercase()))
-        {
+        if self.awaits_fork(repo, issue) {
             return Ok((
                 false,
                 "notification: waiting for a matching topic-selected midstream fork".into(),
@@ -903,6 +967,19 @@ mod tests {
         fake
     }
 
+    fn search_intake(fake: &Fake, repo: &str) -> Config {
+        let mut config = intake_config();
+        config.policy.notifications = None;
+        let mut issue = fake.rest.borrow()[&format!("{API_ROOT}repos/{repo}/issues/2")].clone();
+        issue["repository_url"] = format!("{API_ROOT}repos/{repo}").into();
+        issue["updated_at"] = UPDATED.into();
+        fake.page(
+            "search",
+            json!({"items": [issue], "incomplete_results": false}),
+        );
+        config
+    }
+
     fn replies(fake: &Fake) -> Vec<Value> {
         fake.writes
             .borrow()
@@ -915,8 +992,8 @@ mod tests {
     #[test]
     fn pass_intake_stages_natural_direction_in_the_matching_fork_and_replies_once() {
         let fake = intake_github(OTHER, false, "mention", OPERATOR);
-        reword(&fake, OTHER, "let's get a draft of the fix");
-        let config = intake_config();
+        reword(&fake, OTHER, "@worker let's get a draft of the fix");
+        let config = search_intake(&fake, OTHER);
         let preview = pass(&fake, &config, State::default(), false);
         assert_eq!(preview.errors, 0, "{:?}", preview.lines);
         assert!(fake.writes.borrow().is_empty());
@@ -932,23 +1009,480 @@ mod tests {
             text(&replies(&fake)[0], "/body")
                 .contains("https://github.com/upstream/midstream/issues/")
         );
-        assert_eq!(marked(&fake), ["9001"]);
-        // Lose local state and redeliver the notification after a pass crash.
-        fake.page(
-            &listing(INTAKE_FIRST),
-            json!([thread("9001", OTHER, 2, false, "mention")]),
+        assert!(marked(&fake).is_empty());
+        assert!(
+            !fake
+                .log
+                .borrow()
+                .iter()
+                .any(|url| url.contains("/notifications"))
         );
+        assert!(
+            fake.log
+                .borrow()
+                .iter()
+                .filter_map(|line| line.strip_prefix("GET "))
+                .any(|url| {
+                    let parsed = url::Url::parse(url).unwrap();
+                    let Some(query) = parsed
+                        .query_pairs()
+                        .find(|(k, _)| k == "q")
+                        .map(|(_, v)| v.into_owned())
+                    else {
+                        return false;
+                    };
+                    query.contains("commenter:op") && query.contains("mentions:worker")
+                })
+        );
+        // Lose local state and redeliver the search hit after a pass crash.
         let again = pass(&fake, &config, State::default(), true);
         assert_eq!(again.errors, 0, "{:?}", again.lines);
         assert_eq!(dispatches(&fake).len(), 1);
         assert_eq!(replies(&fake).len(), 1);
+        // The optional classic-token source shares those durable claims too.
+        let notified = pass(&fake, &intake_config(), State::default(), true);
+        assert_eq!(notified.errors, 0, "{:?}", notified.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
+        assert_eq!(replies(&fake).len(), 1);
+    }
+
+    #[test]
+    fn search_intake_checks_each_comments_author_and_mention() {
+        for (sender, body, expected) in [
+            (OPERATOR, "@worker please plan this", 1),
+            (OPERATOR, "Could @WORKER look at this?", 1),
+            (OPERATOR, "please plan this", 0),
+            (OPERATOR, "/bot plan this", 0),
+            (OPERATOR, "email foo@worker.org", 0),
+            (OPERATOR, "@worker-other plan this", 0),
+            ("someone", "@worker please plan this", 0),
+        ] {
+            let fake = intake_github(OTHER, false, "mention", sender);
+            reword(&fake, OTHER, body);
+            // Search can match the operator and mention in different comments.
+            fake.rest
+                .borrow_mut()
+                .get_mut(&format!(
+                    "{API_ROOT}repos/{OTHER}/issues/2/comments?per_page=100"
+                ))
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(said(12, "someone", UPDATED, "@worker please implement"));
+            let config = search_intake(&fake, OTHER);
+            let outcome = pass(&fake, &config, State::default(), true);
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            assert_eq!(dispatches(&fake).len(), expected, "{sender}: {body}");
+        }
+    }
+
+    #[test]
+    fn search_intake_keeps_incomplete_failed_and_preview_cursors() {
+        for mode in ["preview", "incomplete", "missing-fork", "complete"] {
+            let fake = intake_github(OTHER, false, "mention", OPERATOR);
+            let mut config = search_intake(&fake, OTHER);
+            if mode == "incomplete" {
+                fake.rest
+                    .borrow_mut()
+                    .get_mut(&format!("{API_ROOT}search"))
+                    .unwrap()["incomplete_results"] = true.into();
+            }
+            if mode == "missing-fork" {
+                config.policy.notification_intake = Some(BTreeMap::new());
+            }
+            let outcome = pass(&fake, &config, State::default(), mode != "preview");
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let cursor = outcome.state.operator_cursor.as_deref();
+            match mode {
+                "preview" => assert_eq!(cursor, None),
+                "incomplete" => assert_eq!(cursor, Some(INTAKE_FIRST)),
+                _ => assert_eq!(cursor, Some("2026-10-16T12:00:00Z")),
+            }
+            // A thread waiting for its fork is retried, not held by the cursor.
+            assert_eq!(
+                outcome
+                    .state
+                    .intake_waiting
+                    .contains_key(&format!("{OTHER}#2")),
+                mode == "missing-fork",
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_intake_moves_past_the_search_cap_and_retries_waiting_threads() {
+        let repo = "upstream/app";
+        let fake = intake_github(repo, false, "mention", OPERATOR);
+        let mut config = search_intake(&fake, repo);
+        config.policy.notification_intake = Some(BTreeMap::new());
+        fake.page(
+            &format!("repos/{OTHER}"),
+            json!({"private": false, "visibility": "public"}),
+        );
+        let template = fake.rest.borrow()[&format!("{API_ROOT}repos/{repo}/issues/2")].clone();
+        let mut hits = Vec::new();
+        // More old operator mentions without a fork than one search gives.
+        let old = OffsetDateTime::parse("2026-10-01T00:00:00Z", &Rfc3339).unwrap();
+        // A search gives at most 1000 results, and these are all within the
+        // search lag of each other.
+        let count = 1030;
+        for number in 1..=count {
+            let at = stamp(old + Duration::seconds(number as i64 / 2)).unwrap();
+            let mut issue = template.clone();
+            issue["number"] = number.into();
+            issue["repository_url"] = format!("{API_ROOT}repos/{OTHER}").into();
+            issue["updated_at"] = at.as_str().into();
+            fake.page(&format!("repos/{OTHER}/issues/{number}"), issue.clone());
+            // Clear of the ids the fake gives what the pass writes.
+            let id = 100_000 + number;
+            fake.page(
+                &format!("repos/{OTHER}/issues/{number}/comments?per_page=100"),
+                json!([said(id, OPERATOR, &at, "@worker please plan this")]),
+            );
+            hits.push(issue);
+        }
+        let mut eligible = template;
+        eligible["repository_url"] = format!("{API_ROOT}repos/{repo}").into();
+        eligible["updated_at"] = "2026-10-16T11:30:00Z".into();
+        hits.push(eligible);
+        fake.page(
+            "search",
+            json!({"items": hits, "incomplete_results": false}),
+        );
+
+        // The oldest fails every pass: kept to retry, it holds nothing up.
+        let broken = format!("{OTHER}#1");
+        fake.unavailable
+            .borrow_mut()
+            .insert(format!("{API_ROOT}repos/{OTHER}/issues/1"));
+
+        let mut state = State::default();
+        // Each pass reads three pages; the search is read to its cap once from
+        // the start, and once more from the last time it read, less the lag.
+        for _ in 0..2 * comments::OPERATOR_PAGE_LIMIT {
+            let outcome = pass(&fake, &config, state, true);
+            assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+            state = outcome.state;
+            if !dispatches(&fake).is_empty() {
+                break;
+            }
+        }
+        assert_eq!(dispatches(&fake).len(), 1, "{state:?}");
+        assert_eq!(state.intake_waiting.len(), comments::INTAKE_WAITING_LIMIT);
+        // The newest are kept, and those they push out are left to a person;
+        // the failing one is not, as it does not wait for a fork.
+        let newest: BTreeSet<String> = (count - comments::INTAKE_WAITING_LIMIT as u64 + 2..=count)
+            .map(|n| format!("{OTHER}#{n}"))
+            .chain([broken.clone()])
+            .collect();
+        assert_eq!(
+            state
+                .intake_waiting
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            newest
+        );
+        let state = State::from_json(&state.to_json()).unwrap();
+
+        // Once the fork exists, each waiting thread is retried and done.
+        config.policy.notification_intake = Some(BTreeMap::from([(
+            OTHER.into(),
+            "upstream/midstream".into(),
+        )]));
+        // A capped one stays to retry, a few runs each pass.
+        let mut state = state;
+        let mut passes = 0;
+        while state.intake_waiting.len() > 1 && passes < comments::INTAKE_WAITING_LIMIT {
+            let retried = pass(&fake, &config, state, true);
+            assert_eq!(retried.errors, 1, "{:?}", retried.lines);
+            state = retried.state;
+            passes += 1;
+        }
+        assert_eq!(
+            state.intake_waiting.keys().collect::<Vec<_>>(),
+            [&broken],
+            "{state:?}"
+        );
+        assert_eq!(dispatches(&fake).len(), comments::INTAKE_WAITING_LIMIT);
+    }
+
+    #[test]
+    fn search_intake_retains_an_overflowing_second() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let config = search_intake(&fake, OTHER);
+        let template = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        let at = "2026-10-01T00:00:00Z";
+        let mut hits = Vec::new();
+        for number in 1..=1001 {
+            let mut issue = template.clone();
+            issue["number"] = number.into();
+            issue["repository_url"] = format!("{API_ROOT}repos/{OTHER}").into();
+            issue["updated_at"] = at.into();
+            fake.page(&format!("repos/{OTHER}/issues/{number}"), issue.clone());
+            // Only the hit hidden by GitHub's cap has actual direction.
+            let comments = if number == 1001 {
+                json!([said(101001, OPERATOR, at, "@worker please plan this")])
+            } else {
+                json!([])
+            };
+            fake.page(
+                &format!("repos/{OTHER}/issues/{number}/comments?per_page=100"),
+                comments,
+            );
+            hits.push(issue);
+        }
+        let hidden = hits.last().unwrap().clone();
+        fake.page(
+            "search",
+            json!({"items": hits, "incomplete_results": false}),
+        );
+        let mut state = State::default();
+        let mut overflows = 0;
+        for _ in 0..2 * comments::OPERATOR_PAGE_LIMIT {
+            let outcome = pass(&fake, &config, state, true);
+            overflows += outcome
+                .lines
+                .iter()
+                .filter(|l| l.contains("unresolved search overflow"))
+                .count();
+            assert_eq!(
+                outcome.errors,
+                usize::from(
+                    outcome
+                        .lines
+                        .iter()
+                        .any(|l| l.contains("unresolved search overflow"))
+                )
+            );
+            state = State::from_json(&outcome.state.to_json()).unwrap();
+            let floor =
+                timestamp(state.operator_cursor.as_deref()).unwrap() - Duration::minutes(10);
+            assert!(floor <= timestamp(Some(at)).unwrap(), "{state:?}");
+        }
+        assert!(
+            overflows > 1,
+            "overflow must stay visible on subsequent passes"
+        );
+        assert!(dispatches(&fake).is_empty());
+        // After a person resolves the oversized bucket, the retained floor
+        // still discovers the previously hidden request.
+        fake.page(
+            "search",
+            json!({"items": [hidden], "incomplete_results": false}),
+        );
+        for _ in 0..2 {
+            state = pass(&fake, &config, state, true).state;
+        }
+        assert_eq!(dispatches(&fake).len(), 1);
+    }
+
+    #[test]
+    fn search_intake_reserves_discovery_requests_during_waiting_retries() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let config = search_intake(&fake, OTHER);
+        let path = format!("repos/{OTHER}/issues/1");
+        let issue = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        fake.page(&path, issue);
+        let comments = format!("{API_ROOT}{path}/comments?per_page=100");
+        fake.page(&format!("{path}/comments?per_page=100"), json!([]));
+        // This unresolved history would consume every available request.
+        fake.links
+            .borrow_mut()
+            .insert(comments.clone(), format!("<{comments}>; rel=\"next\""));
+        let gone = format!("{OTHER}#3");
+        fake.gone
+            .borrow_mut()
+            .insert(format!("{API_ROOT}repos/{OTHER}/issues/3"));
+        let expensive = format!("{OTHER}#1");
+        let state = State {
+            intake_waiting: BTreeMap::from([
+                (expensive.clone(), UPDATED.into()),
+                (gone.clone(), UPDATED.into()),
+            ]),
+            ..State::default()
+        };
+        let outcome = pass(&fake, &config, state, true);
+        assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+        assert!(outcome.state.intake_waiting.contains_key(&expensive));
+        assert!(!outcome.state.intake_waiting.contains_key(&gone));
+        assert_eq!(dispatches(&fake).len(), 1, "{:?}", outcome.lines);
+        assert_eq!(
+            outcome.state.operator_cursor.as_deref(),
+            Some("2026-10-16T12:00:00Z")
+        );
+        let again = pass(&fake, &config, outcome.state, true);
+        assert_eq!(again.errors, 1, "{:?}", again.lines);
+        assert!(again.state.intake_waiting.contains_key(&expensive));
+        assert_eq!(dispatches(&fake).len(), 1);
+    }
+
+    /// Make `path`'s list `pages` long, the pages after its first empty.
+    fn paginate(fake: &Fake, path: &str, pages: usize) {
+        let first = format!("{API_ROOT}{path}");
+        let mut url = first.clone();
+        for page in 2..=pages {
+            let next = format!("{first}&page={page}");
+            fake.links
+                .borrow_mut()
+                .insert(url, format!("<{next}>; rel=\"next\""));
+            fake.rest.borrow_mut().insert(next.clone(), json!([]));
+            url = next;
+        }
+    }
+
+    #[test]
+    fn search_intake_gives_a_waiting_history_the_shares_others_leave() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let config = search_intake(&fake, OTHER);
+        // Over half the retries' requests, but within all of them.
+        let path = format!("repos/{OTHER}/issues/2/comments?per_page=100");
+        paginate(&fake, &path, 150);
+        fake.gone
+            .borrow_mut()
+            .insert(format!("{API_ROOT}repos/{OTHER}/issues/1"));
+        let state = State {
+            intake_waiting: BTreeMap::from([
+                (format!("{OTHER}#1"), UPDATED.into()),
+                (format!("{OTHER}#2"), UPDATED.into()),
+            ]),
+            ..State::default()
+        };
+        let outcome = pass(&fake, &config, state, true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(outcome.state.intake_waiting.is_empty());
+        assert_eq!(dispatches(&fake).len(), 1);
+    }
+
+    #[test]
+    fn search_intake_keeps_the_listing_reserve_through_handled_rereads() {
+        let repo = "upstream/app";
+        let fake = intake_github(repo, false, "mention", OPERATOR);
+        let config = search_intake(&fake, repo);
+        let first = pass(&fake, &config, State::default(), true);
+        assert_eq!(first.errors, 0, "{:?}", first.lines);
+        assert_eq!(dispatches(&fake).len(), 1);
+        // Handled now, a finite history is read whole, then read again to
+        // find its claim, which outlasts the requests left after it.
+        paginate(
+            &fake,
+            &format!("repos/{repo}/issues/2/comments?per_page=100"),
+            250,
+        );
+        let handled = fake.rest.borrow()[&format!("{API_ROOT}search")]["items"][0].clone();
+        let mut ignored = handled.clone();
+        ignored["repository_url"] = "".into();
+        // On the next page of the search: kept to retry, not lost.
+        let mut later = handled.clone();
+        later["number"] = 3.into();
+        fake.page(&format!("repos/{repo}/issues/3"), later.clone());
+        fake.page(
+            &format!("repos/{repo}/issues/3/comments?per_page=100"),
+            json!([said(13, OPERATOR, UPDATED, "@worker please plan this")]),
+        );
+        let mut hits = vec![handled];
+        hits.extend(vec![ignored; THREADS_PAGE - 1]);
+        hits.push(later);
+        fake.page(
+            "search",
+            json!({"items": hits, "incomplete_results": false}),
+        );
+        let outcome = pass(&fake, &config, State::default(), true);
+        assert!(
+            !outcome
+                .lines
+                .iter()
+                .any(|line| line.starts_with("operator comments error")),
+            "{:?}",
+            outcome.lines
+        );
+        assert_eq!(
+            outcome
+                .state
+                .intake_waiting
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [format!("{repo}#2"), format!("{repo}#3")]
+        );
+        assert!(outcome.state.operator_cursor.is_some());
+        assert_eq!(dispatches(&fake).len(), 1);
+    }
+
+    #[test]
+    fn search_intake_checkpoints_exhausted_discovery_histories() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let config = search_intake(&fake, OTHER);
+        let mut issue = fake.rest.borrow()[&format!("{API_ROOT}repos/{OTHER}/issues/2")].clone();
+        issue["repository_url"] = format!("{API_ROOT}repos/{OTHER}").into();
+        issue["updated_at"] = UPDATED.into();
+        let eligible = issue.clone();
+        issue["number"] = 1.into();
+        fake.page(&format!("repos/{OTHER}/issues/1"), issue.clone());
+        let path = format!("repos/{OTHER}/issues/1/comments?per_page=100");
+        fake.page(&path, json!([]));
+        fake.links.borrow_mut().insert(
+            format!("{API_ROOT}{path}"),
+            format!("<{API_ROOT}{path}>; rel=\"next\""),
+        );
+        let mut hits = vec![issue; 20];
+        hits.push(eligible);
+        fake.page(
+            "search",
+            json!({"items": hits, "incomplete_results": false}),
+        );
+        let first = pass(&fake, &config, State::default(), true);
+        assert!(first.errors > 0);
+        assert!(
+            first
+                .state
+                .intake_waiting
+                .contains_key(&format!("{OTHER}#1"))
+        );
+        assert!(
+            first
+                .state
+                .intake_waiting
+                .contains_key(&format!("{OTHER}#2"))
+        );
+        let next = pass(&fake, &config, first.state, true);
+        assert_eq!(dispatches(&fake).len(), 1, "{:?}", next.lines);
+        assert!(
+            !next
+                .state
+                .intake_waiting
+                .contains_key(&format!("{OTHER}#2"))
+        );
+    }
+
+    #[test]
+    fn search_intake_retires_a_vanished_thread() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        let config = search_intake(&fake, OTHER);
+        fake.gone
+            .borrow_mut()
+            .insert(format!("{API_ROOT}repos/{OTHER}/issues/2"));
+        let outcome = pass(&fake, &config, State::default(), true);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|line| line.contains("thread is gone"))
+        );
+        assert_eq!(
+            outcome.state.operator_cursor.as_deref(),
+            Some("2026-10-16T12:00:00Z")
+        );
+        assert!(fake.writes.borrow().is_empty());
     }
 
     #[test]
     fn pass_intake_requires_operator_direction_and_unread_comments_and_a_matching_fork() {
         for (sender, body, last_read, routed, expected, read) in [
             (OPERATOR, "@worker fix this", None, true, 1, true),
-            (OPERATOR, "can you investigate this?", None, true, 1, true),
+            (OPERATOR, "can you investigate this?", None, true, 0, true),
             (OPERATOR, "Thanks, author", None, true, 0, true),
             ("someone", "@worker fix this", None, true, 0, true),
             (
@@ -984,7 +1518,7 @@ mod tests {
     #[test]
     fn pass_intake_recovers_a_failed_reply_without_replanning() {
         let fake = intake_github(OTHER, false, "mention", OPERATOR);
-        let config = intake_config();
+        let config = search_intake(&fake, OTHER);
         // Refuse only the acknowledgement, after dispatch has been recorded.
         *fake.broken_notification_reply.borrow_mut() = true;
         let first = pass(&fake, &config, State::default(), true);
@@ -1018,7 +1552,7 @@ mod tests {
         assert_eq!(second.errors, 0, "{:?}", second.lines);
         assert_eq!(dispatches(&fake).len(), 1);
         assert_eq!(replies(&fake).len(), 2);
-        assert_eq!(marked(&fake), ["9001"]);
+        assert!(marked(&fake).is_empty());
     }
 
     #[test]

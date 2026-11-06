@@ -12013,10 +12013,7 @@ fn config_table() {
     assert!(poll.policy.operator_comments.is_empty() && poll.policy.notifications.is_none());
     let intake = config(json!({"notifications": true})).poll(None);
     assert!(intake.policy.notification_intake.is_some());
-    assert_eq!(
-        intake.policy.notifications.unwrap().reasons.len(),
-        poll::notify::NOTIFY_REASONS.len()
-    );
+    assert!(intake.policy.notifications.is_none());
     let pace = poll.policy.pace.unwrap();
     assert_eq!(
         (pace.repository.as_str(), pace.issue, pace.bot.as_str()),
@@ -13368,8 +13365,12 @@ fn no_merge_preserves_followed_rounds_and_holds() {
 fn notifications_run_without_followed_repositories_and_report_denied_reads() {
     for status in [200, 403] {
         let mut recorded = replay();
-        recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}notifications?all=false&participating=false&since=1970-01-01T00:00:00Z&per_page=20")},
-            "answer": {"status": status, "link": null, "body": if status == 200 { json!([]) } else { json!({"message": "Resource not accessible by integration"}) }}}));
+        let query: String = url::form_urlencoded::byte_serialize(
+            b"commenter:cgwalters updated:>=1969-12-31T23:50:00Z mentions:cgwalters-bot",
+        )
+        .collect();
+        recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
+            "answer": {"status": status, "link": null, "body": if status == 200 { json!({"items": [], "total_count": 0, "incomplete_results": false}) } else { json!({"message": "Resource not accessible by integration"}) }}}));
         let report = preview(&config(json!({"wip": 0, "notifications": true})), &recorded);
         assert_eq!(
             report.failures,
@@ -13381,7 +13382,7 @@ fn notifications_run_without_followed_repositories_and_report_denied_reads() {
             report
                 .lines
                 .iter()
-                .any(|l| l.contains("notifications error:")),
+                .any(|l| l.contains("operator comments error:")),
             status != 200,
             "{:?}",
             report.lines

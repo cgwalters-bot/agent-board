@@ -40,23 +40,29 @@ and any failed target makes the command exit nonzero. It creates no forge commen
 dispatches or local state. Adoption in tracker's trusted config-test workflow with
 a Variables-read token is separate from merging this command.
 
-## GitHub notification intake
+## GitHub operator-direction intake
 
 The concrete threat is a stranger mentioning the bot to turn unrelated operator
 conversation into work, or thread text choosing a repository the bot may write.
-`notifications: true` opts the GitHub pass into the existing bounded
-[`GET /notifications` reader](poll.md) in stage 2, even with no `follow` entries.
+`notifications: true` opts the GitHub pass into bounded search-backed intake
+in stage 2, even with no `follow` entries. The historical setting name is retained.
 It is off by default, needs `triagePools` or `planPools`, and uses the pass token;
-it neither borrows another credential nor falls back to comment search on denial.
-GitHub requires a classic user token with `notifications` or `repo` scope; App
-and fine-grained tokens cannot read this endpoint. A denied read is a pass failure.
+it needs no new credential or notifications scope. The query is
+`commenter:OPERATOR updated:>=LAST mentions:BOT`, sorted by update oldest first.
+Search is discovery, not authority: the pass loads each thread and its complete
+comment history before routing it. Search/API denial is a pass failure, not an
+empty inbox. The standalone poll's optional [`notifications` source](poll.md)
+still uses `/notifications` for callers with a classic token; the pass never
+calls that endpoint or marks threads read.
 
 Only comments, reviews and inline review comments authored by the configured
-operator supply direction. A bot mention or `/bot` command counts, as do lines
-starting with `let's`, `let’s`, `please`, `can you`, `could you` or `would you`
-(case-insensitive). These natural-language asks start a **triage planner**, not
+operator **and mentioning the bot** supply direction. A thread-level search hit
+is insufficient: another author's mention cannot activate an unrelated operator
+comment, including a natural-language ask or a bare `/bot` command. Mentions are
+case-insensitive whole logins, not email addresses or longer login prefixes.
+These asks start a **triage planner**, not
 an implement run; its brief quotes the comment as data and asks it to plan or
-answer. Other notifications, including review requests and replies without an
+answer. Other search hits, including review requests and replies without an
 operator ask, produce a decision line without authorizing work. The standalone
 poll's optional peer-research behavior is not enabled by this pass setting.
 
@@ -65,38 +71,61 @@ rounds. Other public upstream threads are staged as issues in the matching
 `midstream` topic-selected fork. Matching uses GitHub's verified fork `parent`,
 not the thread body, title or a guessed repository name. One metadata read per
 selected repository (at most 50) resolves those routes; ambiguity or unreadable
-metadata fails stage 2. A missing matching fork leaves the notification unread
-with a diagnostic. Private upstream threads are never copied into a fork.
+metadata fails stage 2. A thread with no matching fork waits for one; see
+below. Private upstream threads are never copied into a fork.
 There is no new fork-creation or direct agent mutation path. The triage's plan
 still needs the normal checked plan/scheduling path; its fork must also be in
 `workRepositories` for stage 4 to schedule that plan.
 
-The reader retains its pagination/request/time bounds, but this pass intake has
-no two-day cutoff: old unread operator direction is not silently dropped.
-`last_read_at` excludes earlier comments; durable comment-ID claims suppress
-redelivery even after local cursor state is lost. A successful dispatch followed
-by a failed acknowledgement is recovered without replanning. An ambiguous pending
-dispatch is **not retried on timeout**: it remains unread and asks for its claim
-to be reconciled, rather than risk starting the same work twice. Explicit dispatch
+The reader reuses the operator-comment search's bounds (three pages of 20 per
+pass, at most 1,000 searchable hits), request/time budget and resumable page cursor.
+It overlaps the cursor by ten minutes for search-index lag and has no two-day
+cutoff: first use searches from the Unix epoch. The time cursor moves past the
+threads each pass is done with, so GitHub's 1,000-result cap only bounds one
+search, not how far back the history reaches. Where more than 1,000 threads
+fall within one overlap, so that reading the search to its cap leaves the
+cursor where it was, the next search starts at the last thread read, without
+the overlap, but still including that last timestamp. If that timestamp alone
+overflows the cap, discovery retains its cursor and reports an unresolved search
+overflow requiring human intervention; it never skips the hidden hits and
+reports completion.
+Search is still not a complete inventory: lag beyond the overlap, or within
+such a skipped overlap, can hide direction.
+
+A thread the pass is not done with (no matching fork, a cap, an error, a
+pending claim) does not hold the time cursor: it is kept in the poll state, up
+to 20 threads, and retried at the start of each pass until it is done. Waiting
+retries share at most half the remaining request budget, with history reads divided
+equally among the waiting threads not yet retried, so one that needs less leaves
+the rest to those after it; incomplete histories remain waiting without admitting
+partial direction, leaving requests for discovery and other retries. A newly
+found thread may use what is left but the listing's remaining pages. Past 20,
+the one updated longest ago of those waiting for a fork is left to a person
+with a diagnostic, until that thread is updated again; where none waits for a
+fork, the new thread holds the cursor instead, so that nothing stuck for another
+reason is dropped. Incomplete search responses retain the cursor; vanished
+threads are retired. Durable comment-ID claims suppress redelivery even after
+local cursor state is lost. A successful dispatch followed by a failed
+acknowledgement is recovered without replanning. An ambiguous pending dispatch
+is **not retried on timeout**: it waits and asks for its claim to be reconciled,
+rather than risk starting the same work twice. Explicit dispatch
 refusals retain the existing bounded retry policy. Preview writes nothing and
 does not advance cursors.
 
 Each attempted intake write, including claim receipts, one link reply per new
-batch of operator comment IDs, and marking a thread read, consumes `--max-writes`;
+batch of operator comment IDs, consumes `--max-writes`;
 each dispatch POST consumes `--max-dispatch`. Admission reserves room for eight
 writes before staging, and the existing poll limit is three starts per pass.
 Acknowledgements are bot-authored comment-ID receipts on the source thread;
 `pr.ownSpaceOnly` still suppresses upstream replies, without suppressing fork
-staging. Only handled notifications are marked read, after listing pages and
-rechecking that the thread has not changed. An interrupted claim, exhausted cap,
+staging. An interrupted claim, exhausted cap,
 failed reply or missing fork leaves it for a later pass. GitHub has no atomic
-conditional mark-read or comment POST: concurrent updates or an ambiguous reply
+conditional comment POST: concurrent updates or an ambiguous reply
 POST remain subject to the existing API race window.
 
 Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
-and use the bot's notification-capable classic token. No deployed config or token
-is changed here.
+and keep the existing pass token. No deployed config or token is changed here.
 
 ## What is built
 

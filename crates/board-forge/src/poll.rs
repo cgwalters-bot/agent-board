@@ -597,8 +597,9 @@ pub struct PollPolicy {
     /// are routed to the operator's handling, a peer's research run or a
     /// line for a person ([`notify`]); none (the default) reads none.
     pub notifications: Option<notify::Notifications>,
-    /// Pass-only notification intake: upstream repository to topic-admitted
+    /// Pass-only operator-direction search: upstream repository to topic-admitted
     /// fork. None preserves standalone poll routing; empty admits only ours.
+    /// Reuses the operator search cursor; `notifications` stays optional.
     pub notification_intake: Option<BTreeMap<String, String>>,
     /// `brokerOutage`: where the inference broker's outages are recorded, so
     /// that a run they failed is not charged; none (the default) charges it.
@@ -1373,6 +1374,12 @@ pub struct State {
     /// The page of the cursor's search that the next pass reads from, past
     /// the first; none for the first.
     pub operator_page: Option<u64>,
+    /// The pass's intake: searched threads whose operator direction waits
+    /// for a midstream fork, `OWNER/REPO#N` to the `updated_at` it read,
+    /// retried each pass ([`comments::INTAKE_WAITING_LIMIT`]). Losing them
+    /// loses the retry until the thread is updated again; the claims still
+    /// keep a comment from being acted on twice.
+    pub intake_waiting: BTreeMap<String, String>,
     /// `lockCollaboratorItems` ([`lock`]): the open, unlocked items whose
     /// input check refused them, `OWNER/REPO#N` to the `updated_at` it read,
     /// which go to the back of the next pass's queue until they change.
@@ -1415,6 +1422,7 @@ impl State {
                     "responses",
                     "operator_cursor",
                     "operator_page",
+                    "intake_waiting",
                     "lock_refused",
                     "follow_cursor",
                     "notify_since",
@@ -1465,6 +1473,28 @@ impl State {
                     .context("poll state operator_page is out of bounds")
             })
             .transpose()?;
+        let intake_waiting: BTreeMap<String, String> = match object.get("intake_waiting") {
+            None => BTreeMap::new(),
+            Some(waiting) => serde_json::from_value(waiting.clone())
+                .context("poll state intake_waiting is not an object of strings")?,
+        };
+        ensure!(
+            intake_waiting.len() <= comments::INTAKE_WAITING_LIMIT,
+            "poll state intake_waiting holds over {} threads",
+            comments::INTAKE_WAITING_LIMIT
+        );
+        for (item, updated) in &intake_waiting {
+            let valid = item.split_once('#').is_some_and(|(repo, number)| {
+                validate_repository(repo).is_ok()
+                    && number.bytes().all(|b| b.is_ascii_digit())
+                    && number.parse::<u64>().is_ok_and(|n| n > 0)
+            });
+            ensure!(valid, "poll state intake_waiting item {item:?}");
+            ensure!(
+                OffsetDateTime::parse(updated, &Rfc3339).is_ok(),
+                "poll state intake_waiting time for {item}"
+            );
+        }
         let lock_refused = match object.get("lock_refused") {
             None => BTreeMap::new(),
             Some(refused) => refused
@@ -1507,6 +1537,7 @@ impl State {
             responses,
             operator_cursor,
             operator_page,
+            intake_waiting,
             lock_refused,
             follow_cursor,
             notify_since,
@@ -1527,6 +1558,9 @@ impl State {
         }
         if let Some(page) = self.operator_page {
             state["operator_page"] = page.into();
+        }
+        if !self.intake_waiting.is_empty() {
+            state["intake_waiting"] = json!(self.intake_waiting);
         }
         if !self.lock_refused.is_empty() {
             state["lock_refused"] = json!(self.lock_refused);
@@ -7745,7 +7779,8 @@ pub fn run_capped<R: Rest, G: Transport>(
     ensure!(
         !repositories.is_empty()
             || !config.policy.operator_comments.is_empty()
-            || config.policy.notifications.is_some(),
+            || config.policy.notifications.is_some()
+            || config.policy.notification_intake.is_some(),
         "poll needs at least one repository"
     );
     if let Some(settings) = &config.policy.notifications {
@@ -7896,12 +7931,22 @@ pub fn run_capped<R: Rest, G: Transport>(
     // may start. A preview keeps the cursor, so that it hides nothing from the
     // next pass that applies.
     let (mut operator_cursor, mut operator_page) = (state.operator_cursor, state.operator_page);
-    if !config.policy.operator_comments.is_empty() {
+    // As the cursor; without the pass's intake it is dropped.
+    let mut intake_waiting = match &config.policy.notification_intake {
+        Some(_) => state.intake_waiting,
+        None => BTreeMap::new(),
+    };
+    if !config.policy.operator_comments.is_empty()
+        || (config.policy.notification_intake.is_some() && config.policy.notifications.is_none())
+    {
         let at = (operator_cursor.as_deref(), operator_page.unwrap_or(1));
-        match pass.operator_comments(&follow, at, &mut outcome) {
+        pass.intaking = config.policy.notification_intake.is_some();
+        let mut waiting = intake_waiting.clone();
+        match pass.operator_comments(&follow, at, &mut waiting, &mut outcome) {
             Ok((cursor, page)) if pass.apply.is_some() => {
                 operator_cursor = Some(cursor);
                 operator_page = Some(page).filter(|p| *p > 1);
+                intake_waiting = waiting;
             }
             Ok(_) => {}
             Err(error) => {
@@ -7911,6 +7956,7 @@ pub fn run_capped<R: Rest, G: Transport>(
                     .push(format!("operator comments error: {error:#}"));
             }
         }
+        pass.intaking = false;
     }
     // After the search, so that a comment it claimed is seen claimed here.
     // As there, a preview keeps the cursor; without the option it is dropped.
@@ -7963,6 +8009,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         responses: pass.used,
         operator_cursor,
         operator_page,
+        intake_waiting,
         lock_refused,
         follow_cursor,
         notify_since,
