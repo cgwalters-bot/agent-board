@@ -10781,6 +10781,11 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         ("a repository outside the bounds", true, Some("cgwalters-forge/composefs-rs"), &brief, Some(pull.clone()), (vec![], 0),
             held(&format!("repository {UPSTREAM} is outside the fix bounds"))),
         ("the promoted pull request", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), start.clone()),
+        // The bot may act on its own pull request in any repository, so
+        // `pr.ownSpaceOnly` holds no fix of it (agent-board#675).
+        ("ownSpaceOnly", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), start.clone()),
+        ("ownSpaceOnly, someone else's", true, Some(UPSTREAM), &brief, edit(json!({"author": {"login": "visitor"}})), (vec![], 0),
+            held("it is not cgwalters-bot's pull request from a head it may push to")),
         ("lease refused after charge", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), String::new()),
         ("ambiguous dispatch", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 1), String::new()),
         ("plan edited before send", true, Some(UPSTREAM), &brief, Some(pull.clone()), (vec![], 0), String::new()),
@@ -10820,6 +10825,7 @@ fn accepted_fix_plans_start_on_the_bots_pull_request() {
         config.fix_plans = on;
         config.follow = vec![UPSTREAM.into(), CONTROL.into()];
         config.pr.poll.owner_branches = name == "ownerBranches missing";
+        config.pr.poll.own_space_only = name.starts_with("ownSpaceOnly");
         if let Some(repo) = repo {
             config.fix_bounds = bounds(repo);
         }

@@ -1464,8 +1464,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         if nodes(&pull, "/labels").iter().any(|l| l["name"] == LABEL) {
             return Ok((true, format!("left to a person: labelled {LABEL}")));
         }
+        // A fix round on the bot's own pull request, as only it gets here,
+        // is its own to start anywhere ([`super::AUTHORED_STEPS`]).
         if !self.config.writes_in(repo) {
-            return Ok((true, format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS}")));
+            if !self.config.authored(text(hit, "/user/login")) {
+                return Ok((true, format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS}")));
+            }
+            self.authored.insert((repo.to_ascii_lowercase(), number));
         }
         // As on a followed pull request: the policy step would refuse the run.
         if let Some(why) = self
@@ -2895,6 +2900,48 @@ pub(super) mod tests {
         }
     }
 
+    /// With `pr.ownSpaceOnly`, the operator's direction on the bot's own
+    /// pull request outside our own space still starts its fix round, as
+    /// the bot may act on what it authored anywhere: written only on that
+    /// pull request.
+    #[test]
+    fn a_fix_round_on_the_bots_own_pull_request_ignores_own_space_only() {
+        let fake = github();
+        // Outside our own space, where the issue's triage reads this.
+        fake.page(
+            "repos/upstream/operator",
+            json!({"private": false, "visibility": "public"}),
+        );
+        let mut config = config();
+        config.policy.own_space_only = true;
+        config.dispatch_repo = "elsewhere/tracker".into();
+        assert!(!config.writes_in("upstream/app"));
+        let outcome = pass_configured(&fake, &config, (None, None), true, now());
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome.lines[0].starts_with(
+                "upstream/app#7 operator comments issuecomment-100, discussion_r200: fix round 1 -> "
+            ),
+            "{:?}",
+            outcome.lines
+        );
+        assert_eq!(
+            (dispatches(&fake).iter())
+                .filter(|i| i["kind"] == "fix")
+                .count(),
+            1
+        );
+        for (write, _) in fake.writes.borrow().iter() {
+            let upstream = write.contains("repos/upstream/");
+            assert!(
+                !upstream
+                    || write.contains("repos/upstream/app/issues/7/")
+                    || write.contains("repos/upstream/app/issues/comments/"),
+                "{write}"
+            );
+        }
+    }
+
     /// GitHub where upstream/app#7 is someone's, and the issue and #9 are
     /// left out of the search.
     fn someones_pull() -> Fake {
@@ -3932,6 +3979,7 @@ pub(super) mod tests {
                 git_ref: None,
             };
             let mut pass = Pass {
+                authored: Default::default(),
                 rest: &fake,
                 graphql: &fake,
                 config: &config,

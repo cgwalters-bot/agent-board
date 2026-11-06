@@ -133,7 +133,8 @@ The GitHub pass implements the configuration below and stages 1 to 5, except
 that the one rerun is the plain [`reruns`](#reruns) rather than one only of
 infrastructure failures, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included,
-unless `pr.ownSpaceOnly` keeps every write out of them.
+unless `pr.ownSpaceOnly` keeps every write out of them but those on the bot's
+own pull requests ([the poll](poll.md)).
 The old stage 4b promote line is compatibility scaffolding only: it evaluates
 no fork pull request, reads nothing and writes nothing. The shared `promote`
 configuration now serves the separate read-only
@@ -1473,7 +1474,8 @@ A pass captures one clock and performs these stages in order:
     bot's own pull requests are followed there, not `pr.mergeAuthors`'; and
     outside our own space it is written in as with `pr.ownSpaceOnly`, set
     or not, so a step there waits on the operator with nothing written
-    upstream. The direction repository and `promote.forks` entries are never
+    upstream, but for the rounds and edits the bot may make on its own pull
+    requests anywhere ([the poll](poll.md)). The direction repository and `promote.forks` entries are never
     added, nor more than the poll's limit of 50 repositories in all. A
     search that fails, is incomplete or runs past 3 pages fails stage 2
     (`follow error: authored pull requests: …`), as a midstream listing
@@ -1762,8 +1764,8 @@ the plan for operator migration rather than resetting the allowance. Neither
 the claim nor the marker is posted upstream. A confirmed-unsent lease refusal
 restores only its own charged comment; ambiguous sends keep their charge.
 The plan is held where rounds are used or a round already started on the
-head. `pr.ownSpaceOnly` holds it as
-it holds any other write upstream.
+head. `pr.ownSpaceOnly` does not hold it: its pull request is the bot's own,
+which the bot may act on in any repository.
 Without a pool of its own the plan runs on `pr.fixPools`. Its dispatch record
 keeps it from starting twice; a failed run is re-run by hand, and after the
 run the issue stays held as dispatched until the operator closes it or
@@ -3721,7 +3723,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.operatorPaths` | Files, directories ending in `/`, or a JSON file's values other than its `FILE#/json/pointer` exemptions, a pull request changing any of which merges or is enqueued only on the operator's approval of its head, waiting as an approve row naming them, see [the poll](poll.md#configuration); relative, no globs, at most 50; `[]` |
 | `pr.rebaseRounds` | Separate conflict-only round cap, 0–3; `0` charges normal fixes |
 | `pr.ownerBranches` | Skip a round, leaving it to the operator, on a head other than the bot's fork whose repository's default branch has no `.github/agentic-job/accept-owner-branches` naming it, which agentic-job's apply would refuse to push to; one contents read per such round, see [the poll](poll.md); `false` |
-| `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit; `false` |
+| `pr.ownSpaceOnly` | Write nothing in a followed repository outside our own space (the organization of the dispatch repository and the bot's own account): no label, claim, marker, merge, rerun, update or lock there; each step that would write, a stop included, is skipped and left to the operator as a `needs-human` wait the inbox lists, decided again each pass; see [the poll](poll.md). Stage 4 likewise starts no plan whose item is outside our own space: its candidate waits on the operator (`needs-operator`, `hold OWNER/REPO#N: its plan's OWNER/REPO#N is outside our own space …`) and draws no revisit. The bot's own pull requests are exempt: on them stage 2 takes its rounds, rebases and edits of them, and stage 4 starts `fixPlans`' fix runs, writing only on that pull request; a merge or stop there stays held; `false` |
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |

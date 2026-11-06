@@ -4844,8 +4844,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
         }
         // Its run would change a repository the pass may not write in, so
-        // the pass never starts it: the operator's, not a candidate.
-        if !config.writes_in(&dest.repository) {
+        // the pass never starts it: the operator's, not a candidate. A fix
+        // run's is the bot's own pull request ([`Self::fix_plan_head`]),
+        // which the bot may act on anywhere ([`poll::AUTHORED_STEPS`]).
+        if !fix && !config.writes_in(&dest.repository) {
             let dest = dest.display();
             let why = format!(
                 "its plan's {dest} {}; it is dispatched by hand",

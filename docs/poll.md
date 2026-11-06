@@ -656,9 +656,21 @@ its line saying `skip: left to the operator: OWNER/REPO is outside our own space
 `needs-human` wait, which the pass's inbox lists: the hold lives in the pass's
 own state, decided again each pass, not in a label. An operator's comment there
 starts no round, and `lockCollaboratorItems` locks nothing there. Every REST
-write the poll makes is checked once more before it is sent. Fix rounds on such
-a pull request need their claims and markers kept off the thread first, which
-this does not do.
+write the poll makes is checked once more before it is sent.
+
+The bot's own pull requests are the exception: the bot may always act on what
+it authored, in any repository. On a pull request whose author is the bot, a
+fix, continuation, rebase or answer round (with its claim and marker
+comments), a rerun of the caller's run, a round given back, bringing it up to
+date with its base, a retarget, and retitling it from its head are taken as in
+our own space, as is a round on the operator's comments there. Their writes are
+let through only on that pull request (its issue's comments and labels, the
+pull request itself, and the edit of a comment), never elsewhere in the
+repository. A merge, a stop's label or review request, a close, and a rerun of
+the repository's own checks or review stay the operator's, as does every step
+on someone else's pull request there. Where such a round cannot start, the
+stop it would label is left to the operator with nothing written for it. The
+same holds in a repository only the pass's `authored` sweep added.
 
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more

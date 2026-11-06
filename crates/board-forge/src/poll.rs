@@ -268,6 +268,19 @@ pub(crate) const LEFT_TO_OPERATOR: &str = "left to the operator: ";
 /// [`PollPolicy::own_space_only`].
 pub(crate) const NOT_OURS: &str =
     "is outside our own space (pr.ownSpaceOnly), so the pass writes nothing there";
+/// The steps the pass takes on the bot's own pull request outside our own
+/// space, where [`Config::writes_in`] would hold every write: the operator
+/// lets the bot act on what it authored in any repository. They are its
+/// runs (a fix, continuation, rebase or answer round, or a rerun of the
+/// caller's run) with their markers, a round given back, bringing it up to
+/// date with its base and retitling it from its head, each written only on
+/// that pull request ([`Pass::authored`]). A merge, a stop's label or review
+/// request, a close, or a rerun of the repository's own checks or review
+/// stays the operator's: it needs a maintainer's permissions there, or is
+/// theirs to decide.
+pub(crate) const AUTHORED_STEPS: &[&str] = &[
+    "fix", "continue", "rebase", "answer", RUN_RERUN, "refund", "update", "retitle",
+];
 
 /// agentic-job's apply pushes a round's commit to a head repository other
 /// than the bot's own fork only where that repository's default branch has
@@ -458,6 +471,12 @@ impl Config {
     pub(crate) fn writes_in(&self, repo: &str) -> bool {
         let swept = (self.policy.bot_only.iter()).any(|r| r.eq_ignore_ascii_case(repo));
         !(self.policy.own_space_only || swept) || self.ours(repo)
+    }
+
+    /// Whether `author` is the bot, whose own pull requests the pass may
+    /// take [`AUTHORED_STEPS`] on where [`Self::writes_in`] holds the rest.
+    pub(crate) fn authored(&self, author: &str) -> bool {
+        !author.is_empty() && author.eq_ignore_ascii_case(&self.bot)
     }
 }
 
@@ -683,8 +702,9 @@ pub struct PollPolicy {
     /// The pass's `pr.ownSpaceOnly` (agent-board#675): the pass writes only
     /// in our own space ([`Config::ours`]). A step in any other followed
     /// repository is left to the operator, a `needs-human` wait the inbox
-    /// lists, with nothing written there ([`Config::writes_in`]). Off by
-    /// default.
+    /// lists, with nothing written there ([`Config::writes_in`]), but on the
+    /// bot's own pull requests, whose [`AUTHORED_STEPS`] it takes anywhere.
+    /// Off by default.
     pub own_space_only: bool,
     /// The pass's `pr.foldRounds` (agent-board#691): once a routine marker
     /// (a round, a refund, a check rerun or review start reservation) is
@@ -4320,6 +4340,11 @@ fn needs_you_reason(pull: &Value, reason: &str) -> String {
 }
 
 struct Pass<'a, R, G> {
+    /// The bot's own pull requests outside the space [`Config::writes_in`]
+    /// allows, `(owner/repo lower case, number)`, on which this pass decided
+    /// one of [`AUTHORED_STEPS`]: [`Pass::writable`] lets their writes, and
+    /// only theirs, through.
+    authored: BTreeSet<(String, u64)>,
     rest: &'a R,
     graphql: &'a G,
     config: &'a Config,
@@ -4485,6 +4510,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// nothing and follows no repository.
     fn new(rest: &'a R, graphql: &'a G, config: &'a Config, now: OffsetDateTime) -> Self {
         Pass {
+            authored: BTreeSet::new(),
             rest,
             graphql,
             config,
@@ -4563,15 +4589,42 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
 
     /// The backstop to the steps' own [`Config::writes_in`]: no REST write
     /// reaches a repository outside our own space with `pr.ownSpaceOnly`,
-    /// whichever path asks for it. GraphQL mutations name nodes, not
-    /// repositories, and are only the merge and update steps, which the
-    /// step's skip already holds.
+    /// whichever path asks for it, but on the bot's own pull request a step
+    /// was let take there ([`Self::authored`]): its issue's comments and
+    /// labels, the pull request itself, and a comment edit, as a marker's.
+    /// GraphQL mutations name nodes, not repositories, and are only the merge
+    /// and update steps, which the step's skip already holds.
     fn writable(&self, path: &str) -> Result<()> {
         if let Some(rest) = path.strip_prefix("repos/") {
-            let repo = rest.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
-            ensure!(self.config.writes_in(&repo), "{path}: {repo} {NOT_OURS}");
+            let mut parts = rest.splitn(3, '/');
+            let repo = parts.by_ref().take(2).collect::<Vec<_>>().join("/");
+            let tail = parts.next().unwrap_or_default();
+            ensure!(
+                self.config.writes_in(&repo) || self.authored_path(&repo, tail),
+                "{path}: {repo} {NOT_OURS}"
+            );
         }
         Ok(())
+    }
+
+    /// Whether `tail`, a REST path in `repo` after `repos/OWNER/REPO/`, is
+    /// a write on one of [`Self::authored`]: its issue's comments or labels
+    /// or the pull request itself, or the edit of a comment, as of a marker,
+    /// in a repository with one. Not its lock, assignees or issue state.
+    fn authored_path(&self, repo: &str, tail: &str) -> bool {
+        let repo = repo.to_ascii_lowercase();
+        let on = |number: &str| {
+            number
+                .parse()
+                .is_ok_and(|n| self.authored.contains(&(repo.clone(), n)))
+        };
+        match tail.split('/').collect::<Vec<_>>().as_slice() {
+            ["issues", "comments", _] => self.authored.iter().any(|(r, _)| *r == repo),
+            ["issues", number, "comments"]
+            | ["issues", number, "labels", ..]
+            | ["pulls", number] => on(number),
+            _ => false,
+        }
     }
 
     fn mutate(&mut self, mutation: &str, variables: Value) -> Result<()> {
@@ -4736,6 +4789,14 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         reason: &str,
         excerpt: Option<&str>,
     ) -> Result<()> {
+        // Only on the bot's own pull request outside our own space, where a
+        // round it may take there could not start ([`AUTHORED_STEPS`]): its
+        // label or review request needs a maintainer's permissions, and a
+        // stop without one would read as reset. Nothing is written; the
+        // operator takes it, as any stop there ([`Self::human_wait`]).
+        if !self.config.writes_in(repo) {
+            return Ok(());
+        }
         let number = pull["number"]
             .as_u64()
             .context("pull request has no number")?;
@@ -4810,8 +4871,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         self.post_marker(repo, number, &mut stop, &text, None)
     }
 
-    fn human_wait(&self, pull: &Value) -> String {
-        if self.config.policy.assign_holds && pull["isDraft"] != true {
+    fn human_wait(&self, repo: &str, pull: &Value) -> String {
+        if !self.config.writes_in(repo) {
+            format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS} (needs-human)")
+        } else if self.config.policy.assign_holds && pull["isDraft"] != true {
             format!("requested {}'s review", self.config.operator)
         } else {
             format!("labelled {LABEL}")
@@ -5098,7 +5161,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     &format!("{name} was claimed in comment {id} and never recorded"),
                     None,
                 )?;
-                return Ok(self.human_wait(pull));
+                return Ok(self.human_wait(repo, pull));
             }
             Err((id, _)) => {
                 return Ok(format!(
@@ -5323,7 +5386,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                             &format!("the refund of {round} lost to comment {id}'s claim, which was never recorded"),
                             None,
                         )?;
-                        return Ok(Some(self.human_wait(pull)));
+                        return Ok(Some(self.human_wait(repo, pull)));
                     }
                     Err((id, _)) => {
                         return Ok(Some(format!(
@@ -5345,7 +5408,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             "needs-human" => {
                 let excerpt = checks.diagnosis.as_deref();
                 self.needs_human(repo, pull, marker, &decision.reason, excerpt)?;
-                Ok(Some(self.human_wait(pull)))
+                Ok(Some(self.human_wait(repo, pull)))
             }
             // The bot's own pull request, so its token may edit it. Not pinned
             // to the head, which an edit cannot be: a push after the read
@@ -7518,8 +7581,18 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // With `ownSpaceOnly`, every step that writes outside our own space,
         // a stop included, is the operator's. Its `needs-human` wait is the
         // hold, in the pass's own state and inbox, decided again each pass.
+        // But on the bot's own pull request, its runs, their markers and its
+        // edits of what it authored are its own to make ([`AUTHORED_STEPS`]).
         let writes = step_kind(decision.action).is_some() || !answer.is_empty();
-        if (writes || retarget.is_some()) && !self.config.writes_in(repo) {
+        let action = match answer.is_empty() {
+            true => decision.action,
+            false => "answer",
+        };
+        let authored = self.config.authored(text(&pull, "/author/login"))
+            && (!writes || AUTHORED_STEPS.contains(&action));
+        if (writes || retarget.is_some()) && !self.config.writes_in(repo) && authored {
+            self.authored.insert((repo.to_ascii_lowercase(), number));
+        } else if (writes || retarget.is_some()) && !self.config.writes_in(repo) {
             answer.clear();
             retarget = None;
             decision = step(
@@ -16310,7 +16383,10 @@ mod tests {
     /// With `pr.ownSpaceOnly`, a followed repository outside our own space,
     /// as bootc-dev/bootc is (agent-board#675), gets no write: a step that
     /// would write there is the operator's wait instead, and the pass does
-    /// not fail. Off, or in our own space, the stop labels as it did.
+    /// not fail. Off, or in our own space, the stop labels as it did. On the
+    /// bot's own pull request its runs are its own to start anywhere
+    /// ([`AUTHORED_STEPS`]), written only on that pull request; a merge or a
+    /// stop there, and any step on someone else's, are still held.
     #[test]
     fn own_space_only_writes_nothing_upstream() {
         const UPSTREAM: &str = "bootc-dev/bootc";
@@ -16318,12 +16394,19 @@ mod tests {
         let used_up = json!({"rounds": 2, "sha": "older"});
         // The recorded pull request and its reads, moved to `repo`; GraphQL
         // reads go by number.
-        let moved = |repo: &str, change: Value, marker: &Value| {
+        let moved = |repo: &str, mut change: Value, marker: &Value, author: &str| {
+            change["author"] = json!({"login": author});
             let at = |v: &Value| -> Value {
                 serde_json::from_str(&v.to_string().replace(REPO, repo)).unwrap()
             };
             let mut fake = github();
             fake.pulls.insert(470, pull("pull-470", change));
+            // Someone else's, a `mergeAuthors` one, is the only one listed.
+            if author != BOT {
+                let open = format!("{API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
+                fake.rest.get_mut(&open).unwrap().3 =
+                    json!([{"number": 470, "user": {"login": author}}]);
+            }
             if !marker.is_null() {
                 let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
                 fake.rest.get_mut(&comments).unwrap().3 = json!([
@@ -16345,19 +16428,52 @@ mod tests {
             );
             fake
         };
-        // The step decided, the repository followed, `ownSpaceOnly`, and
-        // whether the stop labels and posts its marker.
-        for (action, change, marker, repo, own_space_only, stops) in [
-            ("needs-human", &changes, &used_up, UPSTREAM, true, false),
-            ("fix", &changes, &Value::Null, UPSTREAM, true, false),
-            ("merge", &json!({}), &Value::Null, UPSTREAM, true, false),
-            ("needs-human", &changes, &used_up, UPSTREAM, false, true),
-            ("needs-human", &changes, &used_up, REPO, true, true),
+        #[derive(Debug, PartialEq)]
+        enum Expect {
+            /// The stop labels and posts its marker.
+            Stops,
+            /// The round starts, written only on the pull request.
+            Runs,
+            /// The operator's wait; nothing written.
+            Held,
+        }
+        use Expect::*;
+        const OTHER: &str = "someone";
+        let approved =
+            json!({"reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}});
+        // The step decided, the pull request's author, the repository
+        // followed, `ownSpaceOnly`, and what the pass does.
+        for (action, change, marker, author, repo, own_space_only, expect) in [
+            ("needs-human", &changes, &used_up, BOT, UPSTREAM, true, Held),
+            ("fix", &changes, &Value::Null, BOT, UPSTREAM, true, Runs),
+            ("merge", &json!({}), &Value::Null, BOT, UPSTREAM, true, Held),
+            (
+                "merge",
+                &approved,
+                &Value::Null,
+                OTHER,
+                UPSTREAM,
+                true,
+                Held,
+            ),
+            (
+                "needs-human",
+                &changes,
+                &used_up,
+                BOT,
+                UPSTREAM,
+                false,
+                Stops,
+            ),
+            ("needs-human", &changes, &used_up, BOT, REPO, true, Stops),
         ] {
-            let name = format!("{action} in {repo}, ownSpaceOnly {own_space_only}");
-            let fake = moved(repo, change.clone(), marker);
+            let name = format!("{action} by {author} in {repo}, ownSpaceOnly {own_space_only}");
+            let fake = moved(repo, change.clone(), marker, author);
             let mut cfg = config();
             cfg.policy.own_space_only = own_space_only;
+            if author == OTHER {
+                cfg.policy.merge_authors = vec![OTHER.into()];
+            }
             let dispatcher = Fake::default();
             let outcome = run(
                 &fake,
@@ -16372,8 +16488,27 @@ mod tests {
             .unwrap();
             let got = outcome.lines.last().unwrap();
             assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
-            assert!(dispatcher.writes.borrow().is_empty(), "{name}");
-            if stops {
+            assert_eq!(
+                dispatcher.writes.borrow().is_empty(),
+                expect != Runs,
+                "{name}: {got}"
+            );
+            if expect == Runs {
+                assert!(got.contains(&format!("{action}: ")), "{name}: {got}");
+                assert!(!got.contains(NOT_OURS), "{name}: {got}");
+                let writes = written(&fake.writes);
+                assert!(!writes.is_empty(), "{name}: {got}");
+                for write in writes {
+                    assert!(
+                        write.starts_with(&format!("POST repos/{repo}/issues/470/comments"))
+                            || write.starts_with(&format!("PATCH repos/{repo}/issues/comments/")),
+                        "{name}: {write}"
+                    );
+                }
+                assert!(outcome.waits.is_empty(), "{name}: {:?}", outcome.waits);
+                continue;
+            }
+            if expect == Stops {
                 let writes = [
                     format!("POST repos/{repo}/labels"),
                     format!("POST repos/{repo}/issues/470/labels"),
@@ -16414,6 +16549,99 @@ mod tests {
             cfg.policy.own_space_only = true;
             assert_eq!(cfg.writes_in(repo), ours, "{repo}");
         }
+    }
+
+    /// A round the bot may take on its own pull request upstream that cannot
+    /// start would stop it, but its label is a maintainer's to put on there:
+    /// the stop is left to the operator with nothing written for it, and the
+    /// dispatch's own error is the one reported, not the backstop's.
+    #[test]
+    fn an_authored_round_that_cannot_start_upstream_labels_nothing() {
+        const UPSTREAM: &str = "bootc-dev/bootc";
+        let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
+        let mut fake = github();
+        fake.pulls.insert(470, pull("pull-470", changes));
+        let at = |v: &Value| -> Value {
+            serde_json::from_str(&v.to_string().replace(REPO, UPSTREAM)).unwrap()
+        };
+        fake.rest = std::mem::take(&mut fake.rest)
+            .into_iter()
+            .map(|(url, (etag, modified, next, body))| {
+                let next = next.map(|n| n.replace(REPO, UPSTREAM));
+                (
+                    url.replace(REPO, UPSTREAM),
+                    (etag, modified, next, at(&body)),
+                )
+            })
+            .collect();
+        fake.pulls = (fake.pulls.iter()).map(|(n, p)| (*n, at(p))).collect();
+        let mut cfg = config();
+        cfg.policy.own_space_only = true;
+        let dispatcher = Fake::default();
+        dispatcher.answers.borrow_mut().insert(
+            "https://api.github.com/repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches".into(),
+            vec![(500, json!({"message": "boom"}))],
+        );
+        let outcome = run(
+            &fake,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &[UPSTREAM.into()],
+            applying(&dispatcher),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+        let got = outcome.lines.last().unwrap();
+        assert!(got.contains("GitHub HTTP status 500: boom"), "{got}");
+        assert!(!got.contains(NOT_OURS), "{got}");
+        for write in written(&fake.writes) {
+            assert!(
+                write.starts_with(&format!("POST repos/{UPSTREAM}/issues/470/comments"))
+                    || write.starts_with(&format!("PATCH repos/{UPSTREAM}/issues/comments/")),
+                "{write}"
+            );
+        }
+    }
+
+    /// With `pr.ownSpaceOnly`, the backstop lets through upstream only the
+    /// writes on the bot's own pull request a step was let take there.
+    #[test]
+    fn authored_writes_stay_on_their_pull_request() {
+        const UPSTREAM: &str = "bootc-dev/bootc";
+        let fake = github();
+        let mut cfg = config();
+        cfg.policy.own_space_only = true;
+        let mut pass = Pass::new(&fake, &fake, &cfg, now());
+        assert!(cfg.authored(BOT) && cfg.authored(&BOT.to_ascii_uppercase()));
+        assert!(!cfg.authored("someone") && !cfg.authored(""));
+        pass.authored.insert((UPSTREAM.into(), 470));
+        for (path, allowed) in [
+            ("repos/bootc-dev/bootc/issues/470/comments", true),
+            ("repos/Bootc-Dev/Bootc/issues/470/comments", true),
+            ("repos/bootc-dev/bootc/issues/comments/5", true),
+            ("repos/bootc-dev/bootc/pulls/470", true),
+            ("repos/bootc-dev/bootc/issues/470/labels/needs-human", true),
+            ("repos/bootc-dev/bootc/issues/470/lock", false),
+            ("repos/bootc-dev/bootc/issues/470", false),
+            ("repos/bootc-dev/bootc/issues/471/comments", false),
+            ("repos/bootc-dev/bootc/pulls/471", false),
+            ("repos/bootc-dev/bootc/pulls/470/requested_reviewers", false),
+            ("repos/bootc-dev/bootc/labels", false),
+            ("repos/bootc-dev/bootc/actions/runs/1/rerun", false),
+            ("repos/composefs/composefs-rs/issues/470/comments", false),
+            ("repos/composefs/composefs-rs/issues/comments/5", false),
+            ("repos/cgwalters-forge/tracker/labels", true),
+        ] {
+            assert_eq!(pass.writable(path).is_ok(), allowed, "{path}");
+        }
+        pass.authored.clear();
+        assert!(
+            pass.writable("repos/bootc-dev/bootc/issues/470/comments")
+                .is_err()
+        );
     }
 
     #[test]
@@ -19930,6 +20158,7 @@ mod tests {
         let fake = github();
         let cfg = config();
         let mut pass = Pass {
+            authored: Default::default(),
             rest: &fake,
             graphql: &fake,
             config: &cfg,

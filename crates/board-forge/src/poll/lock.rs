@@ -479,6 +479,7 @@ mod tests {
         };
         // The list, then enough for #1 and not for #2 after it.
         let mut pass = Pass {
+            authored: Default::default(),
             rest: &forge,
             graphql: &forge,
             config: &config,
