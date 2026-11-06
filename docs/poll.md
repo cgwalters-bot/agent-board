@@ -13,10 +13,10 @@ the caller's dispatch workflow ([dispatch](dispatch.md)).
 ### Dispatching machine work
 
 With `unstall: true` (the pass's `pr.unstall`, still off by default), a
-completed rebase run that published no new head gets one fresh rebase run
-after the successful-push grace period, then a fix round within the existing
-fix budget. Its durable rebase count records the retry even when
-`rebaseRounds` is one. Running and ambiguously dispatched runs still wait;
+completed rebase run that published no new head gets a fresh rebase run
+after the successful-push grace period only while `rebaseRounds` has room.
+Exhausting that budget stops for the operator without spending fix rounds.
+Running and ambiguously dispatched runs still wait;
 outage refunds and operator-answer gates are unchanged.
 
 The same setting continues a harness-placeholder or partial PR even without a
@@ -111,7 +111,19 @@ run-status comment are not folded; agentic-job keeps that one comment per item
 edited in place (cgwalters-forge/agentic-job#3057). gh-aw's
 `hide-older-comments` hides older comments the same way.
 
-A stop is added after its label, and
+A pass with `assignHolds: true` (off by default) requests the operator's PR
+review instead of adding `needs-human` when it stops on a ready PR. GitHub
+rejects review requests on drafts, so draft stops keep their existing label
+hold; the poll never marks unfinished work ready to request review. The request precedes the
+stop marker, so an interrupted write still holds the PR. While that review is
+requested, no poll work runs on the PR; a missing or truncated reviewer list
+also holds it. Submitting a review or removing the request releases the stop
+and permits fresh rounds. Comments alone do not release a review-request hold;
+`operatorAnswers` and `staleDays` still apply only to labelled stops. Existing
+labels remain holds and are not automatically migrated. This uses the pass's
+existing top-level setting, not a new standalone poll option.
+
+A stop is added after its label or review request, and
 `--apply` reads the comments before the label and without the response cache,
 so a stop another pass is still writing is not taken for a reset. Steps are taken in `--follow`
 repositories only, besides the runs `operatorComments` starts (below); the board widens what is read, not what is changed. The
@@ -664,18 +676,19 @@ its backticks and `<!--` defused.
 Setting it lets the poll start three runs for a pull request instead of two.
 
 `rebaseRounds` (0 to 3; absent or 0 by default, which charges a conflict to the
-fix rounds as any failure) gives a pull request of the bot's whose head the
-review approved, and whose only failure is a conflict with its base, that many
+fix rounds as any failure) gives a pull request of the bot's whose
+only failure is a conflict with its base that many
 rebase rounds apart from its fix rounds (agent-board#109): a base that moved
 is not the change's failure, and an approved pull request that used its fix
 rounds on review changes went to `needs-human` for a rebase alone. A rebase
 round is a fix-kind run whose task asks only for the rebase, counted in the
 marker as `rebased`, claimed, recorded, waited for, refunded after an outage
 and stopped like a fix round; its pool is picked as a first fix round's is.
-The rebased head needs the review's approval again before it merges, so a
-base that moves again before that approval is a fix round. With a
-failed check, a requested change or no verdict, or once the rebase rounds
-are used, a conflict is a fix round as before. Setting it lets the poll start
+The rebased head needs approval before it merges. A conflict-only head gets a
+rebase round even without a verdict: resolving a moved base does not spend a
+review-fix round. Once the rebase budget is exhausted, a conflict-only head
+stops for the operator rather than consuming fix rounds. A conflict alongside
+a failed check or requested changes still uses the fix budget. Setting it lets the poll start
 up to that many more runs for a pull request; the cap bounds runs on a base
 that keeps moving under it or a rebase that never lands.
 
