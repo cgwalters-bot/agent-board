@@ -27,6 +27,7 @@ pub mod comments;
 pub mod drafts;
 pub mod lock;
 pub mod notify;
+mod operator_keys;
 pub mod pace;
 pub mod report;
 mod reviews;
@@ -310,7 +311,7 @@ pub(crate) const PULL_QUERY: &str = concat!(
     r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      id number url title body state isDraft mergeable mergeStateStatus headRefOid headRefName baseRefName isCrossRepository additions deletions
+      id number url title body state isDraft mergeable mergeStateStatus headRefOid headRefName baseRefOid baseRefName isCrossRepository additions deletions
       baseRepository { nameWithOwner isPrivate defaultBranchRef { name } }
       headRepository { nameWithOwner }
       author { __typename login }
@@ -563,7 +564,8 @@ pub struct PollPolicy {
     /// enqueued by the poll. Empty leaves merge decisions unchanged.
     pub no_merge: Vec<String>,
     /// The pass's `pr.operatorPaths` (agent-board#683): paths, or with a
-    /// trailing `/` directories, a pull request changing any of which merges
+    /// trailing `/` directories, or a JSON file's values other than its
+    /// `FILE#/json/pointer` exemptions, a pull request changing any of which merges
     /// or is enqueued only on the operator's approval of its head, as under
     /// [`OPERATOR_APPROVAL_LABEL`]: what agents may target or the pass
     /// follows is the operator's to change, not the review job's. Empty (the
@@ -1053,11 +1055,18 @@ impl PrOptions {
         );
         // As the API names a changed file: relative, no globs, no dot segments.
         for path in &self.operator_paths {
-            let mut segments = path.strip_suffix('/').unwrap_or(path).split('/');
+            let (file, pointer) = operator_keys::selector(path);
+            let mut segments = file.strip_suffix('/').unwrap_or(file).split('/');
             ensure!(
-                !path.contains('*') && segments.all(|s| !s.is_empty() && s != "." && s != ".."),
+                !file.contains('*') && segments.all(|s| !s.is_empty() && s != "." && s != ".."),
                 "{at}operatorPaths entry {path:?} is not a relative path, or a directory ending in /"
             );
+            if let Some(pointer) = pointer {
+                ensure!(
+                    !file.ends_with('/') && operator_keys::valid_pointer(pointer),
+                    "{at}operatorPaths entry {path:?} needs a file and a JSON pointer starting with / (only ~0 and ~1 escapes)"
+                );
+            }
         }
         ensure!(
             self.stale_days <= stale::STALE_DAYS_LIMIT,
@@ -4183,16 +4192,33 @@ fn operator_paths(config: &Config, pull: &Value) -> Option<String> {
             _ => return Some("its file change types were not all read".into()),
         }
     }
-    let touched: Vec<&str> = (changed.iter())
-        .filter(|path| {
-            protected.iter().any(|p| match p.strip_suffix('/') {
-                Some(dir) => path.strip_prefix(dir).is_some_and(|r| r.starts_with('/')),
-                None => *path == p,
-            })
-        })
-        .map(String::as_str)
-        .collect();
-    (!touched.is_empty()).then(|| format!("it changes {}", touched.join(", ")))
+    let covers = |gate: &str, path: &str| match gate.strip_suffix('/') {
+        Some(dir) => path.strip_prefix(dir).is_some_and(|r| r.starts_with('/')),
+        None => path == gate,
+    };
+    let mut touched = BTreeSet::new();
+    for path in &changed {
+        for entry in protected {
+            // Every entry keeps its literal path meaning, so a gate on a path
+            // containing `#/` that predates exemptions only gains a gate.
+            if covers(entry, path) {
+                touched.insert(path.as_str());
+            }
+            let (file, pointer) = operator_keys::selector(entry);
+            if pointer.is_some()
+                && covers(file, path)
+                && pull[operator_keys::UNCHANGED][file] != true
+            {
+                touched.insert(path.as_str());
+            }
+        }
+    }
+    (!touched.is_empty()).then(|| {
+        format!(
+            "it changes {}",
+            touched.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
 }
 
 /// Keep draft housekeeping distinct even on the labelled-list shortcut.
@@ -7005,6 +7031,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             marker = Marker::default();
         }
         self.more_checks(owner, name, number, &mut pull)?;
+        self.operator_keys(&mut pull);
         let stacked = if merge_only {
             None
         } else {
@@ -11779,6 +11806,254 @@ mod tests {
             let got = merges(&outcome);
             assert_eq!(got, merged, "{name}: {:?}", outcome.lines);
             assert_eq!(outcome.waits.len(), usize::from(!merged), "{name}");
+        }
+    }
+
+    #[test]
+    fn operator_key_exemptions_compare_pinned_json_and_keep_the_rest_held() {
+        const BASE: &str = "1111111111111111111111111111111111111111";
+        let mut cfg = config();
+        cfg.policy.operator_paths = ["/assignHolds", "/midstream/topic", "/pr/unstall"]
+            .iter()
+            .map(|pointer| format!(".github/pass.json#{pointer}"))
+            .collect();
+        cfg.policy
+            .operator_paths
+            .push(".github/agentic-job/".into());
+        let base = json!({"operator": "cgwalters", "budget": {"weeklyUsd": 100}, "follow": [REPO],
+            "pr": {"noMerge": ["o/r"], "operatorPaths": cfg.policy.operator_paths},
+            "midstream": {"owner": "cgwalters", "topic": "agentic"}});
+        let mut variants = Vec::new();
+        // `/operator` names who may approve everything else.
+        for pointer in [
+            "/operator",
+            "/budget",
+            "/follow",
+            "/pr/operatorPaths",
+            "/midstream/owner",
+        ] {
+            let mut head = base.clone();
+            *head.pointer_mut(pointer).unwrap() = json!(null);
+            variants.push((pointer.to_owned(), head, false));
+        }
+        let mut switches = base.clone();
+        switches["assignHolds"] = true.into();
+        switches["midstream"]["topic"] = "new-topic".into();
+        switches["pr"]["unstall"] = true.into();
+        variants.push(("feature switches".into(), switches, true));
+        variants.push(("formatting only".into(), base.clone(), true));
+        let mut deleted = base.clone();
+        deleted.as_object_mut().unwrap().remove("budget");
+        variants.push(("removed budget".into(), deleted, false));
+        let mut added = base.clone();
+        added["notifications"] = true.into();
+        variants.push(("unlisted new key".into(), added, false));
+        for (name, head, allowed) in variants {
+            for (approval, queued) in [
+                (None, false),
+                (Some("older"), false),
+                (Some(HEAD), false),
+                (None, true),
+                (Some("older"), true),
+                (Some(HEAD), true),
+            ] {
+                let mut fake = github();
+                if queued {
+                    fake.rest
+                        .get_mut(&format!("{API_ROOT}repos/{REPO}/rules/branches/main"))
+                        .unwrap()
+                        .3
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"type": "merge_queue"}));
+                }
+                let mut reviews = vec![review("APPROVED", job(), HEAD, "approved")];
+                if let Some(sha) = approval {
+                    reviews.push(later(review(
+                        "APPROVED",
+                        user("cgwalters"),
+                        sha,
+                        "approved",
+                    )));
+                }
+                fake.pulls.insert(470, pull("pull-470", json!({"baseRefOid": BASE,
+                    "headRepository": {"nameWithOwner": "cgwalters-bot/agentic-job"},
+                    "files": {"nodes": [{"path": ".github/pass.json", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}},
+                    "reviews": {"nodes": reviews}})));
+                let head_repo = text(&fake.pulls[&470], "/headRepository/nameWithOwner").to_owned();
+                for (repo, sha, doc) in [(REPO, BASE, &base), (head_repo.as_str(), HEAD, &head)] {
+                    let content = serde_json::to_string_pretty(doc).unwrap();
+                    fake.page(
+                        &format!("repos/{repo}/contents/.github%2Fpass.json?ref={sha}"),
+                        None,
+                        None,
+                        json!({"type": "file", "encoding": "base64", "size": content.len(),
+                            "content": crate::supervise::tests::base64(&content)}),
+                    );
+                }
+                let dispatcher = Fake::default();
+                let outcome = run(
+                    &fake,
+                    &fake,
+                    &cfg,
+                    State::default(),
+                    &[],
+                    &[REPO.into()],
+                    applying(&dispatcher),
+                    now(),
+                )
+                .unwrap();
+                assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+                let merged = outcome
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(" merge:") || l.starts_with("merge "));
+                assert_eq!(
+                    merged,
+                    allowed || approval == Some(HEAD),
+                    "{name}, {approval:?}: {:?}",
+                    outcome.lines
+                );
+                let merge_writes = fake
+                    .writes
+                    .borrow()
+                    .iter()
+                    .filter(|(query, _)| query == ENQUEUE || query.contains("mergePullRequest"))
+                    .count();
+                assert_eq!(
+                    merge_writes,
+                    usize::from(allowed || approval == Some(HEAD)),
+                    "{name}, queued={queued}: {:?}",
+                    outcome.lines
+                );
+                let reads = fake
+                    .sent
+                    .borrow()
+                    .iter()
+                    .filter(|(url, _)| url.contains("/contents/"))
+                    .count();
+                assert_eq!(reads, 2, "{name}: one pair of reads per file");
+                if !merged {
+                    assert_eq!(outcome.waits.len(), 1);
+                    assert!(outcome.waits[0].reason.contains(".github/pass.json"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn operator_key_exemptions_do_not_confuse_spaces_with_literal_pluses() {
+        const BASE: &str = "1111111111111111111111111111111111111111";
+        let mut cfg = config();
+        cfg.policy.operator_paths = vec!["config file.json#/assignHolds".into()];
+        let mut fake = github();
+        fake.pulls.insert(470, pull("pull-470", json!({"baseRefOid": BASE,
+            "headRepository": {"nameWithOwner": REPO},
+            "files": {"nodes": [{"path": "config file.json", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}}})));
+        for (path, sha, budget) in [
+            ("config%20file.json", BASE, 1),
+            ("config%20file.json", HEAD, 2),
+            // The wrong URL names an unchanged file, which must not release
+            // the gate on the protected file whose name contains a space.
+            ("config+file.json", BASE, 1),
+            ("config+file.json", HEAD, 1),
+        ] {
+            let content = json!({"budget": budget}).to_string();
+            fake.page(
+                &format!("repos/{REPO}/contents/{path}?ref={sha}"),
+                None,
+                None,
+                json!({"type": "file", "encoding": "base64", "size": content.len(),
+                    "content": crate::supervise::tests::base64(&content)}),
+            );
+        }
+        let outcome = configured_pass(&fake, &cfg, State::default(), &[], &[REPO]);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert_eq!(outcome.waits.len(), 1, "{:?}", outcome.lines);
+        assert_eq!(outcome.waits[0].kind, "approve");
+        assert!(outcome.waits[0].reason.contains("config file.json"));
+        assert!(
+            fake.sent
+                .borrow()
+                .iter()
+                .all(|(url, _)| !url.contains("config+file.json"))
+        );
+    }
+
+    #[test]
+    fn operator_key_exemptions_fail_closed_and_preserve_whole_file_entries() {
+        let mut cfg = config();
+        cfg.policy.operator_paths = vec![
+            ".github/pass.json#/assignHolds".into(),
+            ".github/agentic-job/".into(),
+        ];
+        for (name, patch) in [
+            ("unread content", json!({})),
+            ("missing oid", json!({"baseRefOid": null})),
+            (
+                "deleted",
+                json!({"files": {"nodes": [{"path": ".github/pass.json", "changeType": "DELETED"}], "pageInfo": {"hasNextPage": false}}}),
+            ),
+            (
+                "added",
+                json!({"files": {"nodes": [{"path": ".github/pass.json", "changeType": "ADDED"}], "pageInfo": {"hasNextPage": false}}}),
+            ),
+            (
+                "renamed",
+                json!({"files": {"nodes": [{"path": "elsewhere", "changeType": "RENAMED"}], "pageInfo": {"hasNextPage": false}}}),
+            ),
+            (
+                "truncated",
+                json!({"files": {"nodes": [], "pageInfo": {"hasNextPage": true}}}),
+            ),
+            (
+                "toml bounds",
+                json!({"files": {"nodes": [{"path": ".github/agentic-job/fix.toml", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}}}),
+            ),
+        ] {
+            let mut fake = github();
+            let mut p = pull(
+                "pull-470",
+                json!({"baseRefOid": "1111111111111111111111111111111111111111",
+                "files": {"nodes": [{"path": ".github/pass.json", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}}}),
+            );
+            for (key, value) in patch.as_object().unwrap() {
+                p[key] = value.clone();
+            }
+            fake.pulls.insert(470, p);
+            let outcome = configured_pass(&fake, &cfg, State::default(), &[], &[REPO]);
+            assert_eq!(outcome.errors, 0, "{name}: {:?}", outcome.lines);
+            assert_eq!(outcome.waits.len(), 1, "{name}: {:?}", outcome.lines);
+            assert_eq!(outcome.waits[0].kind, "approve", "{name}");
+        }
+        // An overlapping whole-file entry is not weakened by exemptions.
+        cfg.policy.operator_paths.push(".github/pass.json".into());
+        let mut p = pull(
+            "pull-470",
+            json!({"files": {"nodes": [{"path": ".github/pass.json", "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}}}),
+        );
+        p[operator_keys::UNCHANGED] = json!({".github/pass.json": true});
+        assert_eq!(
+            operator_paths(&cfg, &p).as_deref(),
+            Some("it changes .github/pass.json")
+        );
+        // Entries accepted before exemptions keep their literal path gate,
+        // even where their file compares unchanged.
+        for (entry, path) in [
+            ("config#/budget", "config#/budget"),
+            ("config#/", "config#/fix.toml"),
+        ] {
+            cfg.policy.operator_paths = vec![entry.into()];
+            let mut p = pull(
+                "pull-470",
+                json!({"files": {"nodes": [{"path": path, "changeType": "MODIFIED"}], "pageInfo": {"hasNextPage": false}}}),
+            );
+            p[operator_keys::UNCHANGED] = json!({"config": true});
+            assert_eq!(
+                operator_paths(&cfg, &p),
+                Some(format!("it changes {path}")),
+                "{entry}"
+            );
         }
     }
 

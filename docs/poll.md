@@ -469,6 +469,44 @@ also waits for that approval, even if its destination is not protected.
 Unread or unknown file change types likewise hold the pull request.
 Rounds and reviews are unchanged.
 
+An entry `FILE#/json/pointer` instead gates the JSON file `FILE` except the
+value it names, including that value's whole subtree (agent-board#745). This
+lets ordinary review change listed feature switches while every other value,
+including one a later release adds, still waits on the operator. It is opt-in:
+entries without `#` keep their meaning, and `[]` performs no reads or checks.
+Use JSON Pointer escapes `~0` for `~` and `~1` for `/`; a pointer must start
+with `/` and name an object member. The `#` separates the filename and pointer,
+not a glob or URL fragment. Every entry also keeps its literal path meaning, so
+an entry such as `config#/budget` that once gated a file of that name still
+does, and only adds a gate on `config`. A whole-file entry for the same file
+leaves nothing exempt. Never exempt `/operator` or `/pr/operatorPaths`: they
+decide who approves and what is gated.
+
+The poll compares parsed JSON at the exact base and head commit OIDs, less the
+exempt values, reading each changed file at most twice, regardless of its number
+of exemptions. Files must be regular JSON objects of at most 64 KiB; these reads
+also count toward the poll's 500-request limit. Formatting and object-key order
+do not matter; array order does. Missing and `null` differ. Added/deleted files,
+unreadable or invalid JSON, missing commits and incomplete file information
+still wait for operator approval; no patch-text inference releases a gate.
+Review, current-head operator approval, and merge-queue admission otherwise
+work as for whole-file entries.
+
+For tracker `.github/pass.json`, replace only its whole-file entry in
+`pr.operatorPaths` with exemptions for the switches ordinary review may change,
+retaining the other entries (in particular the bounds TOML files):
+
+```json
+[
+  ".github/pass.json#/assignHolds",
+  ".github/pass.json#/pr/unstall",
+  ".github/pass.json#/pr/foldRounds"
+]
+```
+
+The caller-side setting is in `cgwalters-forge/tracker`, not this repository;
+until it changes, tracker continues to gate the entire pass file.
+
 An absent/empty `toilFixPool` leaves normal fix-round pool selection unchanged.
 When set, only a first round with no failed check and either no rejected review
 or wholly toil findings uses it. Review classification conservatively accepts
