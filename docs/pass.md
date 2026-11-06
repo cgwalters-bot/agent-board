@@ -1425,6 +1425,29 @@ A pass captures one clock and performs these stages in order:
     checked there for ORG's, once they are read, as are the refusals of the
     direction repository and `promote.forks` entries. The listing holds only
     the repositories the pass's token can read.
+    With `authored: N`, absent by default, stage 2 also follows up to N
+    (1 to 10) more repositories a pass where the bot has an open pull
+    request (#737), so its pull requests upstream and in forks no list
+    names get the same rebase, fix, answer, promotion wait and stale close
+    as those in `follow`. Each pass searches `author:BOT is:pr is:open`, up
+    to 3 pages of 100, leaving out archived repositories. N bounds what they
+    spend of the poll's one request budget, which `follow` needs too: the
+    repositories not already followed take turns, N a pass, in sorted order
+    from a cursor (`authored_cursor`) that only an applying pass moves, as
+    with `repositoriesPerPass`. One out of its turn counts as undecided, so
+    what the last pass held there is kept. Its line is `authored: F
+    repositories with the bot's open pull requests, M not followed, K of
+    them this pass`. A repository only the search added is treated as in
+    `pr.noMerge`, as no one chose to let the pass merge there; only the
+    bot's own pull requests are followed there, not `pr.mergeAuthors`'; and
+    outside our own space it is written in as with `pr.ownSpaceOnly`, set
+    or not, so a step there waits on the operator with nothing written
+    upstream. The direction repository and `promote.forks` entries are never
+    added, nor more than the poll's limit of 50 repositories in all. A
+    search that fails, is incomplete or runs past 3 pages fails stage 2
+    (`follow error: authored pull requests: …`), as a midstream listing
+    does: followed without it, the repositories it added would be decided
+    as gone.
    Retain its claim and head-recheck rules, but follow the
    [bookkeeping rule](architecture.md#bookkeeping): in an external repository
    the claims and markers become one hidden comment the bot edits in place, and
@@ -3538,6 +3561,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `dispatchRepo`, `dispatchWorkflow`, `dispatchRef` | Caller repository/workflow/ref; required, required, caller default branch |
 | `follow` | Exact repositories for existing PR follow-up; `[]` |
 | `midstream.owner`, `midstream.topic` | The organization, `dispatchRepo`'s owner, whose repositories with the GitHub topic stage 2 follows and never merges in, as if in `follow` and `pr.noMerge`, read with one listing of at most 5 pages a pass; absent is off with no reads |
+| `authored` | The most repositories, 1–10, a pass adds to `follow` from the search for the bot's open pull requests (at most 3 pages a pass), taking turns from a cursor in the state, never merging in them, following only the bot's pull requests there and writing nothing there outside our own space; absent is off with no reads |
 | `workRepositories` | Exact allowed planning/implementation repositories; `[]` |
 | `board.owner`, `board.project` | Project owner and positive project number; required when work is enabled |
 | `board.priorityField` | Priority single-select field; `"Priority"` |

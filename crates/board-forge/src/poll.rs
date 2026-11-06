@@ -440,9 +440,13 @@ impl Config {
 
     /// Whether the pass may write in `repo` ([`PollPolicy::own_space_only`]):
     /// a write where the bot does not maintain would at best be refused, and
-    /// at worst a label or comment no one there asked for.
+    /// at worst a label or comment no one there asked for. A repository only
+    /// the pass's `authored` sweep added ([`PollPolicy::bot_only`]) is
+    /// written in only in our own space, with or without the option: no one
+    /// chose to follow it.
     pub(crate) fn writes_in(&self, repo: &str) -> bool {
-        !self.policy.own_space_only || self.ours(repo)
+        let swept = (self.policy.bot_only.iter()).any(|r| r.eq_ignore_ascii_case(repo));
+        !(self.policy.own_space_only || swept) || self.ours(repo)
     }
 }
 
@@ -690,6 +694,13 @@ pub struct PollPolicy {
     /// best rank of the issues it closes, unranked last
     /// ([`Pass::start_reviews`]). Empty orders by repository and number.
     pub review_ranks: BTreeMap<String, usize>,
+    /// The repositories the pass's `authored` sweep added, where only the
+    /// bot's own pull requests are followed: `mergeAuthors` names whom the
+    /// operator lets the pass merge, and update, in the repositories they
+    /// chose, not in every one the bot has a pull request in. Outside our own
+    /// space nothing is written in them ([`Config::writes_in`]). Empty (the
+    /// default) follows `mergeAuthors` everywhere.
+    pub bot_only: Vec<String>,
 }
 
 /// The pass's `wip` for stage 2's review starts and reruns, read before it.
@@ -1210,6 +1221,7 @@ impl PollPolicy {
             review_caller_workflow: None,
             review_wip: None,
             review_ranks: BTreeMap::new(),
+            bot_only: Vec::new(),
         };
         pr.apply(&mut policy);
         Ok(policy)
@@ -1381,6 +1393,11 @@ pub struct State {
     /// which the pass, not the poll, keeps. Losing it costs a day's
     /// searches and listings again.
     pub maintain: Option<crate::pass::maintain::Day>,
+    /// The pass's `authored` ([`crate::pass::authored`]): the repository the
+    /// next pass's turn of those the search added starts from, which the
+    /// pass, not the poll, keeps, as `follow_cursor` is kept. Losing it only
+    /// starts their round again.
+    pub authored_cursor: Option<String>,
 }
 
 impl State {
@@ -1402,7 +1419,8 @@ impl State {
                     "follow_cursor",
                     "notify_since",
                     "notify_before",
-                    "maintain"
+                    "maintain",
+                    "authored_cursor"
                 ]
                 .contains(&key.as_str()),
                 "unknown poll state field {key}"
@@ -1466,15 +1484,19 @@ impl State {
                 })
                 .collect::<Result<_>>()?,
         };
-        let follow_cursor = object
-            .get("follow_cursor")
-            .map(|c| {
-                c.as_str()
-                    .filter(|c| validate_repository(c).is_ok())
-                    .map(str::to_owned)
-                    .context("poll state follow_cursor is not a repository")
-            })
-            .transpose()?;
+        let cursor = |key: &str| {
+            object
+                .get(key)
+                .map(|c| {
+                    c.as_str()
+                        .filter(|c| validate_repository(c).is_ok())
+                        .map(str::to_owned)
+                        .with_context(|| format!("poll state {key} is not a repository"))
+                })
+                .transpose()
+        };
+        let follow_cursor = cursor("follow_cursor")?;
+        let authored_cursor = cursor("authored_cursor")?;
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
         let maintain = (object.get("maintain"))
@@ -1490,6 +1512,7 @@ impl State {
             notify_since,
             notify_before,
             maintain,
+            authored_cursor,
         })
     }
 
@@ -1519,6 +1542,9 @@ impl State {
         }
         if let Some(day) = &self.maintain {
             state["maintain"] = json!(day);
+        }
+        if let Some(cursor) = &self.authored_cursor {
+            state["authored_cursor"] = cursor.as_str().into();
         }
         state
     }
@@ -7555,16 +7581,14 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 }
             }
         }
+        let policy = &self.config.policy;
+        let bot_only = (policy.bot_only.iter()).any(|r| r.eq_ignore_ascii_case(repo));
         let mut numbers: Vec<(u64, bool)> = open
             .iter()
             .filter(|p| {
                 let managed = text(p, "/user/login") == self.config.bot
-                    || self
-                        .config
-                        .policy
-                        .merge_authors
-                        .iter()
-                        .any(|a| a == text(p, "/user/login"));
+                    || !bot_only
+                        && (policy.merge_authors.iter()).any(|a| a == text(p, "/user/login"));
                 let extra = !managed
                     && ordinary_reviews(self.config, repo)
                     && self.review_intake.extra_pulls < reviews::INTAKE_PULLS;
@@ -7944,6 +7968,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         notify_since,
         notify_before,
         maintain: None,
+        authored_cursor: None,
     };
     Ok(outcome)
 }
@@ -11069,8 +11094,10 @@ mod tests {
         assert_eq!(state.follow_cursor, None);
         let mut with_cursor = good.clone();
         with_cursor["follow_cursor"] = json!("o/r");
+        with_cursor["authored_cursor"] = json!("u/r");
         let state = State::from_json(&with_cursor).unwrap();
         assert_eq!(state.follow_cursor.as_deref(), Some("o/r"));
+        assert_eq!(state.authored_cursor.as_deref(), Some("u/r"));
         assert_eq!(state.to_json(), with_cursor);
         let mut with_notify = good.clone();
         with_notify["notify_since"] = json!("2026-10-16T11:50:00Z");
@@ -11094,6 +11121,7 @@ mod tests {
             ("schema", json!("agent-board/poll-state/v0")),
             ("follow_cursor", json!("not a repository")),
             ("follow_cursor", json!(1)),
+            ("authored_cursor", json!("not a repository")),
             ("notify_since", json!("yesterday")),
             ("notify_since", json!(1)),
             ("notify_before", json!(true)),
@@ -15644,6 +15672,11 @@ mod tests {
         ] {
             let mut cfg = config();
             assert!(cfg.writes_in(repo), "{repo}: off writes everywhere");
+            // One the pass's `authored` sweep added, in another case, is
+            // written in only in our own space even without the option.
+            cfg.policy.bot_only = vec![repo.to_ascii_uppercase()];
+            assert_eq!(cfg.writes_in(repo), ours, "{repo} swept");
+            cfg.policy.bot_only.clear();
             cfg.policy.own_space_only = true;
             assert_eq!(cfg.writes_in(repo), ours, "{repo}");
         }

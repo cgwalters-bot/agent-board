@@ -11711,6 +11711,19 @@ fn config_table() {
             json!({"midstream": {"owner": "o"}}),
             "missing field `topic`",
         ),
+        (json!({"authored": 0}), "authored is not 1 to 10"),
+        (json!({"authored": 11}), "authored is not 1 to 10"),
+        (json!({"authored": true}), "invalid type: boolean `true`"),
+        (json!({"authored": -1}), "invalid value: integer `-1`"),
+        (
+            json!({"authored": 1, "usage": {"repository": "o/ops", "issue": 1}}),
+            "pr fixPools is required to pace",
+        ),
+        // The authored round is stage 2's only one ([`authored`]).
+        (
+            json!({"authored": 1, "pr": {"repositoriesPerPass": 1}}),
+            "unknown field `repositoriesPerPass`",
+        ),
         (json!({"bot": "-bad-"}), "invalid login"),
         (
             json!({"follow": ["o/r"], "usage": {"repository": "o/ops", "issue": 1}}),
@@ -12975,13 +12988,245 @@ fn followed(replay: &mut Replay, (repo, number): (&str, u64), change: Value, com
     }
 }
 
+/// The search for the bot's open pull requests (`authored`): its pages, each
+/// URL with the link to the next and the pull requests found, by repository
+/// and number.
+fn authored_search(pages: &[&[(&str, u64)]]) -> Vec<(String, Value, Value)> {
+    let first = format!(
+        "{API_ROOT}search/issues?q=author%3Acgwalters-bot+is%3Apr+is%3Aopen+archived%3Afalse&per_page=100"
+    );
+    let page = |n: usize| match n {
+        1 => first.clone(),
+        n => format!("{first}&page={n}"),
+    };
+    (1..=pages.len())
+        .zip(pages)
+        .map(|(n, found)| {
+            let link = (n < pages.len()).then(|| format!(r#"<{}>; rel="next""#, page(n + 1)));
+            let items: Vec<Value> = (found.iter())
+                .map(|(repo, number)| {
+                    json!({"number": number, "repository_url": format!("{API_ROOT}repos/{repo}"),
+                        "pull_request": {}, "user": {"login": "cgwalters-bot"}})
+                })
+                .collect();
+            let body = json!({"incomplete_results": false, "items": items});
+            (page(n), json!(link), body)
+        })
+        .collect()
+}
+
+/// A search for the bot's pull requests that fails, is incomplete or names
+/// what it may not fails stage 2, as a midstream listing does, here
+/// following an approved, green pull request that would otherwise merge:
+/// followed without it, the repositories it added last pass would be decided
+/// as gone. One that names the direction repository leaves it unfollowed.
+#[test]
+fn authored_search_failures_stop_stage_2() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    let pages = |n: usize| {
+        let empty: Vec<&[(&str, u64)]> = vec![&[]; n];
+        authored_search(&empty)
+    };
+    let first = pages(1).remove(0).0;
+    let item = |change: Value| {
+        let mut item = json!({"number": 1, "repository_url": format!("{API_ROOT}repos/o/r"),
+            "pull_request": {}, "user": {"login": "cgwalters-bot"}});
+        for (key, value) in change.as_object().unwrap() {
+            item[key] = value.clone();
+        }
+        vec![(
+            first.clone(),
+            json!(null),
+            json!({"incomplete_results": false, "items": [item]}),
+        )]
+    };
+    for (name, answers, error) in [
+        (
+            "status",
+            vec![(first.clone(), json!(null), json!({}))],
+            Some("GitHub HTTP status 502"),
+        ),
+        (
+            "incomplete",
+            vec![(
+                first.clone(),
+                json!(null),
+                json!({"incomplete_results": true, "items": []}),
+            )],
+            Some("the search for cgwalters-bot's pull requests is incomplete"),
+        ),
+        (
+            "pages",
+            pages(authored::AUTHORED_PAGES + 1),
+            Some("cgwalters-bot has more than 3 pages of open pull requests"),
+        ),
+        (
+            "author",
+            item(json!({"user": {"login": "someone"}})),
+            Some("o/r#1 is not a pull request of cgwalters-bot's"),
+        ),
+        (
+            "issue",
+            item(json!({"pull_request": null})),
+            Some("o/r#1 is not a pull request of cgwalters-bot's"),
+        ),
+        (
+            "repository",
+            item(json!({"repository_url": "https://elsewhere.example/repos/o/r"})),
+            Some(
+                "repository https://elsewhere.example/repos/o/r is outside https://api.github.com/",
+            ),
+        ),
+        (
+            "link",
+            vec![(
+                first.clone(),
+                json!(r#"<https://elsewhere.example/search?page=2>; rel="next""#),
+                json!({"incomplete_results": false, "items": []}),
+            )],
+            Some(
+                "the next page https://elsewhere.example/search?page=2 is outside https://api.github.com/",
+            ),
+        ),
+        (
+            "direction",
+            item(json!({"repository_url": format!("{API_ROOT}repos/cgwalters-forge/operator")})),
+            None,
+        ),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
+            "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
+            "pageInfo": {"hasPreviousPage": false}});
+        followed(
+            &mut forge.replay,
+            (REPO, 9),
+            json!({"reviews": approval}),
+            json!([]),
+        );
+        for (url, link, body) in answers {
+            let status = if name == "status" { 502 } else { 200 };
+            forge.replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": status, "link": link, "body": body}}));
+        }
+        let mut settings = json!({"wip": 0, "follow": [REPO], "pr": {"fixPools": ["claude"]},
+            "authored": 2});
+        if name == "direction" {
+            settings["direction"] = json!({"repository": "cgwalters-forge/operator", "issue": 1});
+        }
+        let report = preview(&config(settings), &forge.replay);
+        let lines = &report.lines;
+        let merged = format!("merge {REPO}#9: approved by the operator at abc");
+        assert_eq!(
+            lines.contains(&merged),
+            error.is_none(),
+            "{name}: {lines:?}"
+        );
+        match error {
+            Some(error) => {
+                assert_eq!(report.failures, 1, "{name}: {lines:?}");
+                assert!(report.state.is_none(), "{name}");
+                assert!(
+                    (lines.iter()).any(|l| l.starts_with("follow error: authored pull requests: ")
+                        && l.contains(error)),
+                    "{name}: {lines:?}"
+                );
+            }
+            None => {
+                let line = "authored: 1 repositories with the bot's open pull requests, 0 not followed, 0 of them this pass";
+                assert!(lines.iter().any(|l| l == line), "{name}: {lines:?}");
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|l| l.starts_with("cgwalters-forge/operator")),
+                    "{name}: {lines:?}"
+                );
+            }
+        }
+    }
+}
+
+/// With `authored: 1` and two repositories found, a pass follows the first
+/// and an applying one leaves the cursor at the second, which a pass from
+/// that cursor follows instead; a preview leaves the cursor where it was.
+#[test]
+fn authored_repositories_take_turns() {
+    const REPO: &str = "cgwalters-forge/agentic-job";
+    const NEXT: &str = "cgwalters-forge/zzz";
+    let mut forge = Forge::new(None, false);
+    for (url, link, body) in authored_search(&[&[(NEXT, 1), (REPO, 9)]]) {
+        forge.replay.requests.push(json!({"request": {"get": url},
+            "answer": {"status": 200, "link": link, "body": body}}));
+    }
+    followed(&mut forge.replay, (REPO, 9), json!({}), json!([]));
+    for (path, body) in [
+        ("user".to_owned(), json!({"login": "cgwalters-bot"})),
+        (
+            "repos/cgwalters-forge/bot-ops".into(),
+            json!({"private": true}),
+        ),
+        (format!("repos/{NEXT}/events?per_page=100"), json!([])),
+        (
+            format!("repos/{NEXT}/pulls?state=open&per_page=100"),
+            json!([]),
+        ),
+    ] {
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+            "answer": {"status": 200, "link": null, "body": body}}));
+    }
+    let cfg = config(json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1}));
+    let line = "authored: 2 repositories with the bot's open pull requests, 2 not followed, 1 of them this pass";
+    let at = |cursor: Option<&str>| State {
+        authored_cursor: cursor.map(str::to_owned),
+        ..State::default()
+    };
+    let own = own();
+    for (cursor, applies, followed, next) in [
+        (None, false, true, None),
+        (None, true, true, Some(NEXT)),
+        (Some(NEXT), false, false, Some(NEXT)),
+        (Some(NEXT), true, false, None),
+    ] {
+        let mode = if applies {
+            Mode::Actions(&own)
+        } else {
+            Mode::Preview
+        };
+        let report = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            at(cursor),
+            (mode, Limits::default()),
+            forge.replay.now,
+        ))
+        .unwrap();
+        let lines = &report.lines;
+        let name = format!("{cursor:?} applies={applies}");
+        assert_eq!(report.failures, 0, "{name}: {lines:?}");
+        assert!(lines.iter().any(|l| l == line), "{name}: {lines:?}");
+        let decided = lines.iter().any(|l| l.starts_with(&format!("{REPO}#9 ")));
+        assert_eq!(decided, followed, "{name}: {lines:?}");
+        let state = report.state.unwrap();
+        assert_eq!(state.authored_cursor.as_deref(), next, "{name}");
+    }
+}
+
 #[test]
 fn no_merge_preserves_followed_rounds_and_holds() {
     const REPO: &str = "cgwalters-forge/agentic-job";
     let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
         "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
         "pageInfo": {"hasPreviousPage": false}});
-    for (queued, topic) in [(false, false), (true, false), (false, true), (true, true)] {
+    let sources = ["listed", "topic", "authored"];
+    for (queued, source) in [false, true]
+        .into_iter()
+        .flat_map(|q| sources.map(|s| (q, s)))
+    {
+        let topic = source == "topic";
         for (name, change, action) in [
             ("ready", json!({}), "wait: pr.noMerge:"),
             ("conflict", json!({"mergeable": "CONFLICTING"}), "rebase:"),
@@ -13037,6 +13282,19 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                         "answer": {"status": 200, "link": link, "body": body}}));
                 }
             }
+            // The same, with REPO neither listed nor tagged but found by the
+            // search for the bot's open pull requests, over two pages. There
+            // `mergeAuthors` is not followed.
+            if source == "authored" {
+                settings["follow"] = json!([]);
+                settings["pr"]["noMerge"] = json!([]);
+                settings["pr"]["mergeAuthors"] = json!(["dependabot[bot]"]);
+                settings["authored"] = json!(2);
+                for (url, link, body) in authored_search(&[&[(REPO, 9)], &[(REPO, 11)]]) {
+                    forge.replay.requests.push(json!({"request": {"get": url},
+                        "answer": {"status": 200, "link": link, "body": body}}));
+                }
+            }
             let mut fields = json!({"isCrossRepository": false, "headRepositoryOwner": {"login": "cgwalters-forge"},
                 "headRefName": "bot/midstream", "reviews": approval});
             fields
@@ -13044,6 +13302,11 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 .unwrap()
                 .extend(change.as_object().unwrap().clone());
             followed(&mut forge.replay, (REPO, 9), fields, json!([]));
+            if source == "authored" {
+                answer(&mut forge.replay, "pulls?state=open")["body"] = json!([
+                    {"number": 9, "user": {"login": "cgwalters-bot"}},
+                    {"number": 10, "user": {"login": "dependabot[bot]"}}]);
+            }
             if queued {
                 answer(
                     &mut forge.replay,
@@ -13062,28 +13325,40 @@ fn no_merge_preserves_followed_rounds_and_holds() {
             }
             let cfg = config(settings);
             for report in [preview(&cfg, &forge.replay), apply(&forge, &cfg)] {
+                let lines = &report.lines;
                 assert_eq!(
                     report.failures, 0,
-                    "{name} queue={queued}: {:?}",
-                    report.lines
+                    "{name} {source} queue={queued}: {lines:?}"
                 );
                 assert!(
-                    report
-                        .lines
-                        .iter()
-                        .any(|l| l.contains(&format!("{REPO}#9 abc {action}"))),
-                    "{name} queue={queued}: {:?}",
-                    report.lines
+                    (lines.iter()).any(|l| l.contains(&format!("{REPO}#9 abc {action}"))),
+                    "{name} {source} queue={queued}: {lines:?}"
                 );
                 let listed = "midstream: 1 with topic bot-midstream in cgwalters-forge";
-                assert_eq!(report.lines.iter().any(|l| l == listed), topic, "{name}");
+                assert_eq!(lines.iter().any(|l| l == listed), topic, "{name}");
+                for (line, from) in [
+                    (
+                        "authored: 1 repositories with the bot's open pull requests, 1 not followed, 1 of them this pass",
+                        "authored",
+                    ),
+                    (
+                        "cgwalters-forge/agentic-job#10 skip: pull request author is not followed",
+                        "authored",
+                    ),
+                ] {
+                    assert_eq!(
+                        lines.iter().any(|l| l == line),
+                        source == from,
+                        "{name} {source}: {lines:?}"
+                    );
+                }
             }
             assert!(
                 forge.writes.borrow().iter().all(|(_, _, body)| {
                     let body = body.to_string();
                     !body.contains("mergePullRequest") && !body.contains("enqueuePullRequest")
                 }),
-                "{name} queue={queued}"
+                "{name} {source} queue={queued}"
             );
         }
     }
