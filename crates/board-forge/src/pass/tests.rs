@@ -14114,6 +14114,23 @@ fn blockers_move_or_are_carded() {
             false,
         ),
         (
+            "a fresh rerun attempt on an old run is not already stuck",
+            follow.clone(),
+            Read::Followed(
+                stuck.clone(),
+                marker.clone(),
+                Some((
+                    fix_run.clone(),
+                    json!({"id": 7, "status": "in_progress", "run_attempt": 2,
+                        "created_at": ago(30), "run_started_at": ago(1)}),
+                )),
+            ),
+            None,
+            vec![moves("wait: fix round 1 is running for abc")],
+            0,
+            false,
+        ),
+        (
             "a followed wait becomes stuck at exactly staleHours",
             follow.clone(),
             Read::Followed(

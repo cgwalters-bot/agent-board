@@ -3332,6 +3332,12 @@ pub fn queue_step(
     }
 }
 
+/// A rerun keeps its creation time but starts a new attempt. Missing or invalid
+/// attempt timestamps fall back to creation, never to this pass's clock.
+fn run_wait_since(run: &Value) -> Option<OffsetDateTime> {
+    timestamp(run["created_at"].as_str()).max(timestamp(run["run_started_at"].as_str()))
+}
+
 /// The step for a head the marker's run was started for, fix or continuation:
 /// wait for it, or hand a run that is over and left the head as it was to a
 /// human. Only one that succeeded gets the grace for its push to show.
@@ -3350,6 +3356,7 @@ fn started(
     now: OffsetDateTime,
 ) -> Decision {
     let round = marker.round_name();
+    let since = timestamp(marker.at.as_deref()).max(fix_run.and_then(run_wait_since));
     if let Some(run) = fix_run.filter(|r| r["status"] == "completed") {
         let conclusion = run["conclusion"].as_str().unwrap_or("null");
         let url = format!(
@@ -3382,7 +3389,7 @@ fn started(
                         );
                         return match window.to {
                             None => step("wait", format!("{ended}{OUTAGE_OPEN}"))
-                                .followed(Some(window.from)),
+                                .followed(since.max(Some(window.from))),
                             Some(_) => {
                                 step("refund", format!("{ended}, so the round is given back"))
                             }
@@ -3457,10 +3464,7 @@ fn started(
             ),
         );
     }
-    step("wait", format!("{round}{RUNNING}{}", short(head))).followed(
-        timestamp(marker.at.as_deref())
-            .max(fix_run.and_then(|run| timestamp(run["created_at"].as_str()))),
-    )
+    step("wait", format!("{round}{RUNNING}{}", short(head))).followed(since)
 }
 
 /// The one step for a pull request, as poll.cjs's `decide`, except that the
@@ -5645,7 +5649,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 "the review job's run https://github.com/{repo}/actions/runs/{id}{REVIEWS_THE_HEAD}"
             );
             return Ok(Some((
-                step("wait", why).followed(timestamp(newest["created_at"].as_str())),
+                step("wait", why).followed(run_wait_since(newest)),
                 None,
             )));
         }
@@ -18754,13 +18758,31 @@ mod tests {
         let recent = now() - time::Duration::hours(1);
         let older = now() - time::Duration::hours(2);
         let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
-        for (marker_at, run_at, expected) in [
-            (Some(stamp(recent)), None, Some(recent)),
-            (None, Some(stamp(recent)), Some(recent)),
-            (Some(stamp(older)), Some(stamp(recent)), Some(recent)),
-            (Some(stamp(recent)), Some(stamp(older)), Some(recent)),
-            (Some("invalid".into()), Some(stamp(recent)), Some(recent)),
-            (None, None, None),
+        for (marker_at, run_at, attempt_at, expected) in [
+            (Some(stamp(recent)), None, None, Some(recent)),
+            (None, Some(stamp(recent)), None, Some(recent)),
+            (Some(stamp(older)), Some(stamp(recent)), None, Some(recent)),
+            (Some(stamp(recent)), Some(stamp(older)), None, Some(recent)),
+            (
+                Some("invalid".into()),
+                Some(stamp(recent)),
+                None,
+                Some(recent),
+            ),
+            (
+                Some(stamp(older)),
+                Some(stamp(older)),
+                Some(stamp(recent)),
+                Some(recent),
+            ),
+            (
+                None,
+                Some(stamp(older)),
+                Some("invalid".into()),
+                Some(older),
+            ),
+            (None, None, Some(stamp(recent)), Some(recent)),
+            (None, None, None, None),
         ] {
             // A named run can still be unlisted, so the dispatch marker is
             // sufficient, and missing timestamps never become the pass clock.
@@ -18769,7 +18791,8 @@ mod tests {
                 at: marker_at,
                 ..Marker::default()
             };
-            let run = json!({"status": "in_progress", "created_at": run_at});
+            let run = json!({"status": "in_progress", "created_at": run_at,
+                "run_started_at": attempt_at});
             let decision = started(
                 &cfg,
                 &marker,
@@ -18815,6 +18838,43 @@ mod tests {
                     Progress::Waiting
                 } else {
                     Progress::Moving
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn outage_wait_keeps_the_latest_round_clock() {
+        let cfg = config();
+        let older = now() - time::Duration::hours(30);
+        let recent = now() - time::Duration::hours(1);
+        let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+        for (marker_at, run_at, attempt_at, outage_at, expected) in [
+            (Some(recent), None, None, older, recent),
+            (None, Some(recent), None, older, recent),
+            (Some(older), Some(older), Some(recent), older, recent),
+            (Some(older), Some(older), None, recent, recent),
+            (None, None, None, older, older),
+        ] {
+            let marker = Marker {
+                run: Some(7),
+                at: marker_at.map(stamp),
+                ..Marker::default()
+            };
+            let run = json!({"status": "completed", "conclusion": "failure",
+                "created_at": run_at.map(stamp), "run_started_at": attempt_at.map(stamp),
+                "updated_at": stamp(now())});
+            let outages = Outages::Read(vec![Window {
+                issue: "o/r#9".into(),
+                from: outage_at,
+                to: None,
+            }]);
+            let decision = started(&cfg, &marker, (Some(&run), &outages), HEAD, "test", now());
+            assert_eq!(decision.action, "wait");
+            assert_eq!(
+                decision.waiting,
+                WaitReason::Followed {
+                    since: Some(expected)
                 }
             );
         }
@@ -19294,6 +19354,84 @@ mod tests {
                 (rounds, continued, None, None, false)
             );
             assert_eq!((refunded.pool, refunded.queue), (from.pool, from.queue));
+        }
+    }
+
+    #[test]
+    fn open_outage_wait_retains_fresh_round_start() {
+        let recent = now() - time::Duration::hours(1);
+        let older = now() - time::Duration::hours(30);
+        let stamp = |at: OffsetDateTime| at.format(&Rfc3339).unwrap();
+        for (marker_at, created_at, attempt_at) in [
+            (Some(recent), Some(older), None),
+            (Some(older), Some(recent), None),
+            (Some(older), Some(older), Some(recent)),
+        ] {
+            let mut fake = github();
+            fake.pulls
+                .insert(470, pull("pull-470", json!({"mergeable": "CONFLICTING"})));
+            let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+            fake.rest.get_mut(&comments).unwrap().3 = json!([
+                {"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({
+                    "rounds": 1, "sha": HEAD, "run": 7, "at": marker_at.map(stamp)
+                }), "Fix round.")}
+            ]);
+            fake.page(
+                "repos/cgwalters-forge/tracker/actions/runs/7",
+                None,
+                None,
+                json!({"status": "completed", "conclusion": "failure",
+                    "created_at": created_at.map(stamp), "run_started_at": attempt_at.map(stamp),
+                    "updated_at": stamp(now())}),
+            );
+            let issues = "repos/cgwalters-forge/tracker/issues?labels=outage&per_page=30";
+            fake.page(
+                &format!("{issues}&state=open"),
+                None,
+                None,
+                json!([{
+                    "number": 9, "state": "open", "created_at": stamp(older),
+                    "user": {"login": BOT}, "body": OUTAGE_MARKER
+                }]),
+            );
+            fake.page(
+                &format!("{issues}&state=closed&since=2026-10-10T02:00:00Z"),
+                None,
+                None,
+                json!([]),
+            );
+            let mut cfg = config();
+            cfg.policy = PollPolicy::from_json(&json!({"brokerOutage": {
+                "repository": "cgwalters-forge/tracker", "author": BOT, "leadSeconds": 0
+            }}))
+            .unwrap();
+            let dispatcher = Fake::default();
+            let outcome = run(
+                &fake,
+                &fake,
+                &cfg,
+                State::default(),
+                &[],
+                &[REPO.into()],
+                applying(&dispatcher),
+                now(),
+            )
+            .unwrap();
+            assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+            let step = outcome
+                .steps
+                .iter()
+                .find(|step| step.number == 470)
+                .unwrap();
+            assert_eq!(step.progress(), Progress::Waiting);
+            assert_eq!(
+                step.waiting,
+                WaitReason::Followed {
+                    since: Some(recent)
+                }
+            );
+            assert!(fake.writes.borrow().is_empty());
+            assert!(dispatcher.writes.borrow().is_empty());
         }
     }
 
