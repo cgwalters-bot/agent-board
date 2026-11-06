@@ -34,7 +34,7 @@ jobs:
         with:
           persist-credentials: false
       # Pinned as in the lint job.
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: just@1.58.0
       # Format, clippy and tests, as agents run them before handing back.
@@ -93,7 +93,7 @@ jobs:
           persist-credentials: false
       # Pinned as the shared lint action pins it when this was written;
       # Dependabot updates this copy separately.
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: just@1.58.0
       - run: just lint
