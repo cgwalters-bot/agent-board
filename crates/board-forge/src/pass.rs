@@ -26,7 +26,7 @@ use crate::stack;
 use crate::supervise::health::{USAGE_MARKER, USAGE_SCHEMA, usage_snapshot};
 use crate::supervise::run_title;
 use anyhow::{Context, Result, bail, ensure};
-use board_core::{ItemRef, NEEDS_HUMAN_LABEL as NEEDS_HUMAN};
+use board_core::{ItemRef, NEEDS_HUMAN_LABEL as NEEDS_HUMAN, admission};
 use holds::{Entry, Hold, HoldKind, PassSummary, Scope, Wip};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -444,6 +444,10 @@ pub struct Config {
     /// intake, staging external work in a topic-selected midstream fork.
     #[serde(default)]
     pub notifications: bool,
+    /// Off unless set: stage 2 also follows up to this many repositories a
+    /// pass where the bot has an open pull request, and never merges in
+    /// those it adds ([`authored`]).
+    pub authored: Option<usize>,
     #[serde(default)]
     pub work_repositories: Vec<String>,
     pub board: Option<BoardConfig>,
@@ -1263,6 +1267,13 @@ impl Config {
         if let Some(midstream) = &self.midstream {
             midstream.check(self)?;
         }
+        if let Some(per_pass) = self.authored {
+            ensure!(
+                (1..=authored::AUTHORED_LIMIT).contains(&per_pass),
+                "authored is not 1 to {}",
+                authored::AUTHORED_LIMIT
+            );
+        }
         // A work repository's pull requests, unfollowed, are never merged,
         // fixed or surfaced, and their failed reviews never seen (#666).
         // Where it may be a midstream, stage 2 checks it once it has read them.
@@ -1323,9 +1334,10 @@ impl Config {
         self.budget.as_ref()?.harness_repositories.as_deref()
     }
 
-    /// Whether stage 2 follows any repository: `follow`'s or `midstream`'s.
+    /// Whether stage 2 follows any repository: `follow`'s, `midstream`'s or
+    /// `authored`'s.
     fn follows(&self) -> bool {
-        !self.follow.is_empty() || self.midstream.is_some()
+        !self.follow.is_empty() || self.midstream.is_some() || self.authored.is_some()
     }
 
     /// Whether `repository` is in `midstream`'s organization, so may be one.
@@ -3207,6 +3219,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// it started.
     fn follow(&mut self, state: State, git_ref: &str, earlier: usize) -> usize {
         let config = self.config;
+        // [`Config::check`]'s refusals of these in `follow`: a run on the
+        // direction would steer every brief, and a fork promote reads moves
+        // only by sync.
+        let direction = config.direction.as_ref().map(|d| &d.repository);
+        let promoted = config.promote.as_ref().map(|p| &p.forks);
+        let never = |repo: &str| {
+            direction.is_some_and(|d| d.eq_ignore_ascii_case(repo))
+                || promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
+        };
         let mut midstreams = Vec::new();
         if let Some(midstream) = &config.midstream {
             let (owner, topic) = (&midstream.owner, &midstream.topic);
@@ -3223,16 +3244,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 "midstream: {} with topic {topic} in {owner}",
                 midstreams.len()
             ));
-            // [`Config::check`]'s refusals of these in `follow`: a run on the
-            // direction would steer every brief, and a fork promote reads
-            // moves only by sync.
-            let direction = config.direction.as_ref().map(|d| &d.repository);
-            let promoted = config.promote.as_ref().map(|p| &p.forks);
-            let refused = midstreams.iter().find(|repo| {
-                direction.is_some_and(|d| d.eq_ignore_ascii_case(repo))
-                    || promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
-            });
-            if let Some(repo) = refused {
+            if let Some(repo) = midstreams.iter().find(|repo| never(repo)) {
                 self.report.failures += 1;
                 self.line(format!(
                     "follow error: midstream {repo} is the direction repository or a promote fork, which the pass never follows"
@@ -3262,6 +3274,55 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return 0;
             }
         }
+        // Unread, the repositories it added last pass would be decided as
+        // gone, and what was held there dropped.
+        let (mut swept, mut waiting) = (Vec::new(), Vec::new());
+        // Without the option there is no round to keep a place in.
+        let mut cursor = config.authored.and(state.authored_cursor.clone());
+        if let Some(per_pass) = config.authored {
+            let read = match authored::read(&config.bot, &self.client) {
+                Ok(read) => read,
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("follow error: authored pull requests: {error:#}"));
+                    return 0;
+                }
+            };
+            let found = read.len();
+            let new: Vec<String> = (read.into_iter())
+                .filter(|repo| {
+                    !never(repo) && !self.follows.iter().any(|r| r.eq_ignore_ascii_case(repo))
+                })
+                .collect();
+            let room = per_pass.min(POLL_REPOSITORY_LIMIT.saturating_sub(self.follows.len()));
+            if room > 0 {
+                let names = new.iter().map(String::as_str);
+                let turn = match admission::admit(names, room, cursor.as_deref()) {
+                    Ok(turn) => turn,
+                    Err(error) => {
+                        self.report.failures += 1;
+                        self.line(format!("follow error: authored turn: {error:#}"));
+                        return 0;
+                    }
+                };
+                // As with `repositoriesPerPass`, only a pass that applies
+                // moves the cursor, so that a preview hides nothing.
+                if self.apply {
+                    cursor = turn.next;
+                }
+                swept = turn.admitted;
+            }
+            self.line(format!(
+                "authored: {found} repositories with the bot's open pull requests, {} not followed, {} of them this pass",
+                new.len(),
+                swept.len()
+            ));
+            waiting = (new.iter())
+                .filter(|r| !swept.contains(r))
+                .map(|r| r.to_ascii_lowercase())
+                .collect();
+            self.follows.extend(swept.iter().cloned());
+        }
         if self.follows.is_empty() && !config.notifications {
             self.line("follow: no repositories".into());
             return 0;
@@ -3290,6 +3351,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
         }
         poll.policy.no_merge.extend(midstreams);
+        poll.policy.no_merge.extend(swept.iter().cloned());
+        poll.policy.bot_only = swept;
         if !config.pr.poll.review_pools.is_empty() {
             let (wip, ranks) = self.review_bounds(git_ref, earlier);
             poll.policy.review_wip = wip;
@@ -3313,7 +3376,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             Some(self.caps),
             self.now,
         ) {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                // Out of its turn, as outside the envelope: what the last
+                // pass held there is kept.
+                outcome.undecided.extend(waiting);
+                outcome.state.authored_cursor = cursor;
                 if !self.apply {
                     for step in &outcome.steps {
                         if step.ran
@@ -6417,6 +6484,7 @@ impl crate::github::GraphQl for Replay {
 }
 
 mod active;
+pub mod authored;
 mod blockers;
 mod cost;
 pub(crate) mod epics;
