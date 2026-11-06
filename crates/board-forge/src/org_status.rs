@@ -304,6 +304,7 @@ fn agents(api: &dyn Api, s: &Settings, now_ms: i64) -> Result<Value> {
                 "item": run_title(title).map(|(_, repo, number)| format!("{repo}#{number}")),
                 "pool": pool,
                 "status": status,
+                "overdue": crate::pass::overdue(&run, OffsetDateTime::from_unix_timestamp(now_ms / 1000)?),
                 "age_seconds": seconds_since(&run["created_at"], now_ms),
                 "html_url": run["html_url"],
             }));
@@ -622,9 +623,14 @@ pub fn text(report: &Value) -> String {
                 .as_str()
                 .map_or("(no item)".into(), |i| clean(&i.into()));
             line(format!(
-                "  {} {item} {status}, {age}, pool {}",
+                "  {} {item} {status}, {age}, pool {}{}",
                 clean(&run["kind"]),
-                clean(&run["pool"])
+                clean(&run["pool"]),
+                if run["overdue"] == true {
+                    ", OVERDUE (>7h timeout)"
+                } else {
+                    ""
+                }
             ));
         }
         let n = |k: &str| a["last_hour"][k].as_u64().unwrap_or(0);
@@ -1131,10 +1137,39 @@ board: Done 1, In Progress 1, No status 2, Todo 2, Triage 1
         }
     }
 
+    /// Status uses the same timeout decision as cleanup, without reading jobs.
+    #[test]
+    fn overdue_status_uses_attempt_start_without_any_extra_reads() {
+        let path = "/repos/example/control/actions/workflows/dispatch.yml/runs?status=in_progress&per_page=100&page=1";
+        for (start, expected) in [("2026-10-01T00:00:00Z", true), (NOW, false), ("bad", false)] {
+            let fake = Fake::new().with(path, |v| {
+                for run in v["workflow_runs"].as_array_mut().unwrap() {
+                    run["status"] = "in_progress".into();
+                    run["run_started_at"] = start.into();
+                }
+            });
+            let report = agents(&fake, &settings(), crate::supervise::now_millis(now())).unwrap();
+            let running: Vec<_> = report["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["status"] == "in_progress")
+                .collect();
+            assert!(!running.is_empty());
+            assert!(running.iter().all(|r| r["overdue"] == expected));
+            assert_eq!(fake.paths.borrow().len(), 3);
+        }
+    }
+
     /// Each agent run in flight is a line: kind, item, status, age and pool.
     #[test]
     fn run_lines() {
         for (run, expected) in [
+            (
+                json!({"kind": "implement", "item": "o/r#7", "pool": "default", "status": "in_progress",
+                    "age_seconds": 1377360, "overdue": true}),
+                "  implement o/r#7 running, 382h36m old, pool default, OVERDUE (>7h timeout)",
+            ),
             (
                 json!({"kind": "fix", "item": "o/r#7", "pool": "default", "status": "in_progress",
                     "age_seconds": 7300}),

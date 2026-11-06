@@ -1647,6 +1647,41 @@ conclusion. A younger run costs no extra request, an older one's jobs are read
 once a pass, and a jobs read that fails or does not fit one page leaves the
 run in flight.
 
+### Overdue dispatch runs
+
+The concrete failure is an orphaned Actions run keeping a WIP slot forever,
+even while provider quota is available. `reapOverdueRuns: true` opts the GitHub
+pass into cancelling runs older than the existing seven-hour dispatch timeout;
+it is off by default and refused on Forgejo. Use it only when the configured
+dispatch workflow's legitimate attempts fit that timeout. `agent-board status`
+always flags these runs as `OVERDUE (>7h timeout)` and includes `overdue` in each
+agent run's JSON record; this diagnostic itself authorizes no cancellation.
+
+After refreshing usage, cleanup lists only `dispatchRepo`'s `dispatchWorkflow`,
+using the existing complete-list, request and time bounds. It rechecks at most
+three overdue runs per pass, oldest run ID first, verifying the run and workflow
+IDs before acting. Running attempts are timed from `run_started_at`; queued,
+waiting, requested and pending runs from `created_at`. Unknown, malformed and
+future clocks do not authorize cancellation. A completed or restarted young
+attempt on the recheck is left alone. Each attempted cancel, including a failed
+or ambiguous request, consumes one `--max-writes` step, not a dispatch. Preview
+prints what it would cancel without writing. A cancellation request does not
+free capacity: normal run/lease checks still hold the slot until completion
+(or the existing all-jobs-ended proof above). Failures are reported, not counted
+as reclaimed slots; more overdue runs wait for another pass.
+
+PR follow-up remains the existing stage 2 mechanism: approved eligible clean
+heads are enqueued when branch rules require a merge queue, with an expected-head
+guard; conflicts use bounded rebase/fix rounds and failing checks use bounded
+fix rounds. Stage 2 prints per-PR decisions or errors for the PRs it considers,
+including approval, author, review, pacing, cap and exhausted-round holds;
+unread or capped work waits. Status's `APPROVED` rollup
+alone is not authorization to bypass those gates. Spare quota does not release
+issue holds either; stage 4's `idle:` line names why capacity was unused.
+
+Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set
+`reapOverdueRuns` to `true`. No deployed caller configuration changes here.
+
 Respect `needs-human`, `needs-design`, board Blocked, open dependencies, an open
 PR for the issue or plan target, a run in flight, and the existing bot-PR/path
 overlap hold, including draft rescue PRs. Keep explicit stacking semantics;
@@ -3729,6 +3764,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |
 | `leases` | Reap the [leases](#leases) in `dispatchRepo` and count the rest toward `wip`, listed in the hold snapshot; `false` |
 | `reruns` | Re-run failed required checks once per head, or a failed review job, round, triage or implement run once ([reruns](#reruns)); `false` |
+| `reapOverdueRuns` | Cancel up to three overdue caller-workflow runs within write caps ([overdue dispatch runs](#overdue-dispatch-runs)); GitHub only, `false` |
 | `starts.breakerRuns`, `starts.stallAfterMinutes` | Re-run a stage 4 run that failed before its agent started and leave its plan unspent; stop starting where this many (2–10) of the newest ended runs failed so with the same first error line; raise an alarm where nothing started for this many minutes (10–10080) with slots free, see [start failures](#start-failures); needs `epics.repository` to be `dispatchRepo`; `3`, `60`; section absent (off) |
 | `budget.weeklyUsd` | Weekly spend at API list prices, in dollars, at which new runs wait (0 < budget ≤ 100000); needs `usage`, and without `usage.url` holds on the published snapshot's spend; absent holds nothing on spend |
 | `budget.source`, `budget.url`, `budget.pools` | `"broker"` takes the budget from the broker's grant at `url` instead, each pool on the grant pool `pools` maps it to; every pool needs one; refuses `weeklyUsd` and pools' `target`/`burst`; needs `usage.url`; absent (off) |
