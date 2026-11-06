@@ -598,15 +598,21 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             }
         }
         self.remaining += discovery_reserve;
-        let floor = if intake {
-            OffsetDateTime::UNIX_EPOCH
-        } else {
-            self.now - Duration::seconds(LOOKBACK_SECONDS)
-        };
         let lag = Duration::seconds(SEARCH_LAG_SECONDS);
+        let lookback = self.now - Duration::seconds(LOOKBACK_SECONDS);
+        // The intake has no lookback to clamp a saved cursor to, but GitHub's
+        // search refuses a date before 1970 (HTTP 422), so the lag below may
+        // not reach past the epoch. With no cursor saved yet, it starts at the
+        // lookback, as the first pass without the intake does: what the
+        // operator said long ago is not direction for today.
+        let floor = if intake {
+            OffsetDateTime::UNIX_EPOCH + lag
+        } else {
+            lookback
+        };
         let saved = timestamp(cursor);
         let cursor = saved
-            .map_or(floor, |c| c.clamp(floor, self.now))
+            .map_or(lookback, |c| c.clamp(floor, self.now))
             .replace_nanosecond(0)?;
         // A page is one of the search of the cursor it was saved with: a
         // cursor clamped to the lookback or now is another search, read from
@@ -2278,6 +2284,14 @@ pub(super) mod tests {
                 Value::Array(issues)
             } else if url.starts_with(&format!("{API_ROOT}search/issues?")) {
                 self.searched.borrow_mut().push(url.into());
+                // `search` unavailable: every search fails.
+                if self
+                    .unavailable
+                    .borrow()
+                    .contains(&format!("{API_ROOT}search"))
+                {
+                    bail!("GET {url}: GitHub HTTP status 422");
+                }
                 // The recorded results updated since the query's time, a page
                 // of them as the URL asks.
                 let mut found = self.rest.borrow()[&format!("{API_ROOT}search")].clone();
@@ -2622,6 +2636,53 @@ pub(super) mod tests {
             }
         }
         assert!(PollPolicy::from_json(&json!({"generatedBy": "two\nlines"})).is_err());
+    }
+
+    /// The intake's search, which keeps an old cursor where the lookback
+    /// would move it, still never asks for a date GitHub's search refuses
+    /// (before 1970), and first reaches back over the lookback as without it.
+    #[test]
+    fn intake_search_starts_at_the_lookback_and_never_before_1970() {
+        let mut config = config();
+        config.policy.notification_intake = Some(BTreeMap::new());
+        for (cursor, since) in [
+            (None, "2026-10-14T11:50:00Z"),
+            (Some("1969-12-31T23:50:00Z"), "1970-01-01T00:00:00Z"),
+            (Some("1970-01-01T00:00:00Z"), "1970-01-01T00:00:00Z"),
+            (Some("2026-09-01T00:10:00Z"), "2026-09-01T00:00:00Z"),
+        ] {
+            let fake = github();
+            pass_configured(&fake, &config, (cursor, None), false, now());
+            let searched = fake.searched.borrow();
+            let since: String = url::form_urlencoded::byte_serialize(
+                format!("updated:>={since} mentions:{BOT}").as_bytes(),
+            )
+            .collect();
+            assert!(searched[0].contains(&since), "{cursor:?}: {searched:?}");
+        }
+    }
+
+    /// A failed search is a warning where it is only the pass's intake,
+    /// and the error of `operatorComments` where it is that search too.
+    #[test]
+    fn a_failed_intake_search_is_an_error_only_with_operator_comments() {
+        for scoped in [false, true] {
+            let fake = github();
+            fake.unavailable
+                .borrow_mut()
+                .insert(format!("{API_ROOT}search"));
+            let mut config = config();
+            config.policy.notification_intake = Some(BTreeMap::new());
+            if !scoped {
+                config.policy.operator_comments.clear();
+            }
+            let outcome = pass_configured(&fake, &config, (None, None), true, now());
+            assert_eq!(outcome.errors, usize::from(scoped), "{:?}", outcome.lines);
+            let warned = (outcome.lines.iter())
+                .any(|l| l.starts_with("warning: operator direction search failed"));
+            assert_eq!(warned, !scoped, "{:?}", outcome.lines);
+            assert_eq!(outcome.state.operator_cursor, None);
+        }
     }
 
     #[test]

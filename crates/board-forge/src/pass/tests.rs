@@ -13951,30 +13951,37 @@ fn no_merge_preserves_followed_rounds_and_holds() {
     }
 }
 
+/// The first intake search reaches back the lookback and its lag, never
+/// to before 1970, which GitHub's search refuses with HTTP 422; a search
+/// that fails is a warning, retried next pass, not a failure of the pass.
 #[test]
 fn notifications_run_without_followed_repositories_and_report_denied_reads() {
-    for status in [200, 403] {
+    for status in [200, 403, 422] {
         let mut recorded = replay();
+        let since = (recorded.now - time::Duration::days(2) - time::Duration::minutes(10))
+            .replace_nanosecond(0)
+            .unwrap()
+            .format(&Rfc3339)
+            .unwrap();
         let query: String = url::form_urlencoded::byte_serialize(
-            b"commenter:cgwalters updated:>=1969-12-31T23:50:00Z mentions:cgwalters-bot",
+            format!("commenter:cgwalters updated:>={since} mentions:cgwalters-bot").as_bytes(),
         )
         .collect();
+        let body = match status {
+            200 => json!({"items": [], "total_count": 0, "incomplete_results": false}),
+            403 => json!({"message": "Resource not accessible by integration"}),
+            _ => json!({"message": "Validation Failed"}),
+        };
         recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}search/issues?q={query}&sort=updated&order=asc&per_page=20&page=1")},
-            "answer": {"status": status, "link": null, "body": if status == 200 { json!({"items": [], "total_count": 0, "incomplete_results": false}) } else { json!({"message": "Resource not accessible by integration"}) }}}));
+            "answer": {"status": status, "link": null, "body": body}}));
         let report = preview(&config(json!({"wip": 0, "notifications": true})), &recorded);
+        assert_eq!(report.failures, 0, "{status}: {:?}", report.lines);
         assert_eq!(
-            report.failures,
-            usize::from(status != 200),
-            "{:?}",
-            report.lines
-        );
-        assert_eq!(
-            report
-                .lines
-                .iter()
-                .any(|l| l.contains("operator comments error:")),
+            report.lines.iter().any(|l| {
+                l.starts_with("warning: operator direction search failed, retried next pass:")
+            }),
             status != 200,
-            "{:?}",
+            "{status}: {:?}",
             report.lines
         );
         assert!(!report.lines.iter().any(|l| l == "follow: no repositories"));

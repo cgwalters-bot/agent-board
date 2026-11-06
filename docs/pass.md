@@ -79,8 +79,13 @@ still needs the normal checked plan/scheduling path; its fork must also be in
 
 The reader reuses the operator-comment search's bounds (three pages of 20 per
 pass, at most 1,000 searchable hits), request/time budget and resumable page cursor.
-It overlaps the cursor by ten minutes for search-index lag and has no two-day
-cutoff: first use searches from the Unix epoch. The time cursor moves past the
+It overlaps the cursor by ten minutes for search-index lag. First use, with
+no cursor saved, searches from two days back, as the operator-comment search
+does; after that there is no two-day cutoff, and a saved cursor is kept however
+old (but never searched before 1970, which GitHub's search refuses). A failed
+search is a `warning:` line, not a failure of the pass, and keeps the cursor
+for the next pass; with `operatorComments`, whose search it shares, it is
+that step's error. The time cursor moves past the
 threads each pass is done with, so GitHub's 1,000-result cap only bounds one
 search, not how far back the history reaches. Where more than 1,000 threads
 fall within one overlap, so that reading the search to its cap leaves the

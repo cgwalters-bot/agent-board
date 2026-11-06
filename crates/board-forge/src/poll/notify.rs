@@ -958,6 +958,16 @@ mod tests {
 
     const INTAKE_FIRST: &str = "1970-01-01T00:00:00Z";
 
+    /// A search intake's state that has read as far as before these tests'
+    /// old histories; with none, its first search reaches back only the
+    /// lookback.
+    fn searched_since_september() -> State {
+        State {
+            operator_cursor: Some("2026-09-30T00:00:00Z".into()),
+            ..State::default()
+        }
+    }
+
     fn intake_github(repo: &str, pull: bool, reason: &str, sender: &str) -> Fake {
         let fake = github(repo, pull, reason, sender);
         fake.page(
@@ -1095,7 +1105,10 @@ mod tests {
             let cursor = outcome.state.operator_cursor.as_deref();
             match mode {
                 "preview" => assert_eq!(cursor, None),
-                "incomplete" => assert_eq!(cursor, Some(INTAKE_FIRST)),
+                "incomplete" => assert_eq!(
+                    cursor.map(str::to_owned),
+                    Some(stamp(now() - Duration::seconds(comments::LOOKBACK_SECONDS)).unwrap())
+                ),
                 _ => assert_eq!(cursor, Some("2026-10-16T12:00:00Z")),
             }
             // A thread waiting for its fork is retried, not held by the cursor.
@@ -1157,7 +1170,7 @@ mod tests {
             .borrow_mut()
             .insert(format!("{API_ROOT}repos/{OTHER}/issues/1"));
 
-        let mut state = State::default();
+        let mut state = searched_since_september();
         // Each pass reads three pages; the search is read to its cap once from
         // the start, and once more from the last time it read, less the lag.
         for _ in 0..2 * comments::OPERATOR_PAGE_LIMIT {
@@ -1238,7 +1251,7 @@ mod tests {
             "search",
             json!({"items": hits, "incomplete_results": false}),
         );
-        let mut state = State::default();
+        let mut state = searched_since_september();
         let mut overflows = 0;
         for _ in 0..2 * comments::OPERATOR_PAGE_LIMIT {
             let outcome = pass(&fake, &config, state, true);

@@ -8200,6 +8200,16 @@ pub fn run_capped<R: Rest, G: Transport>(
                 intake_waiting = waiting;
             }
             Ok(_) => {}
+            // The pass's intake is a side channel of direction, which the
+            // search's cursor keeps for the next pass: its failure must not
+            // fail the pass's own steps along with it. Where the search is
+            // also `operatorComments`', which a caller turned on as a step,
+            // its failure stays an error.
+            Err(error) if pass.intaking && config.policy.operator_comments.is_empty() => {
+                outcome.lines.push(format!(
+                    "warning: operator direction search failed, retried next pass: {error:#}"
+                ));
+            }
             Err(error) => {
                 outcome.errors += 1;
                 outcome
