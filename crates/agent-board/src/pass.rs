@@ -38,7 +38,13 @@ pub struct Pass {
     /// Preview live, and save every read and its answer to FILE as a replay fixture.
     #[arg(long, value_name = "FILE", conflicts_with = "apply")]
     pub record: Option<PathBuf>,
+    /// Only check --config and --fix-bounds as a pass would, and exit: no token, no read of the forge. For a caller's pull request CI, so a configuration the pass refuses fails review instead of every pass after merge.
+    #[arg(long, conflicts_with_all = ["apply", "replay", "record"])]
+    pub check_config: bool,
 }
+
+/// What `pass --check-config` prints for a configuration the pass accepts.
+const CONFIG_OK: &str = "pass: configuration ok";
 
 #[derive(clap::Subcommand)]
 pub enum PassCommand {
@@ -262,6 +268,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         ] {
             ensure!(!supplied, "unsupported_capability: {option}: {reason}");
         }
+        if args.check_config {
+            writeln!(out, "{CONFIG_OK}")?;
+            return Ok(());
+        }
         let limits = Limits {
             dispatch: args.max_dispatch,
             writes: args.max_writes,
@@ -321,6 +331,10 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
         return print_report(&report, out);
     }
     config.fix_bounds = FixBoundsSet::read(&args.fix_bounds)?;
+    if args.check_config {
+        writeln!(out, "{CONFIG_OK}")?;
+        return Ok(());
+    }
     let limits = Limits {
         dispatch: args.max_dispatch,
         writes: args.max_writes,

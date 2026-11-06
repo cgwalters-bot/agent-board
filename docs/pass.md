@@ -2134,7 +2134,10 @@ plan is then followed up as any triage plan is.
 
 Under the triage scope `epics` no issue outside every live epic is triaged
 on its own (see [scheduling](#scheduling)), so one sweep a week looks at
-them together (agent-board#431). With `sweep` set (off unless set), stage 4
+them together (agent-board#431). Under the scope `all` the sweep runs too
+(agent-board#755): those issues are triaged on their own as well, and its
+batch still offers each a live epic to attach to. Without `triage` the
+configuration is refused (`sweep needs triage`). With `sweep` set (off unless set), stage 4
 ends, after its starts and revisits, with the sweep. Where stage 4 starts
 nothing (every slot taken, no pool, the weekly budget reached), an open
 sweep is still applied, finished or labelled (step 4), which takes
@@ -3650,7 +3653,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
 | `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
-| `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs the triage scope `epics`; section absent (off) |
+| `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
 | `maintain.repos.sinceDays`, `maintain.repos.min`, `maintain.repos.max` | The repositories whose incoming pull requests a daily digest assesses: those with at least `min` (≥ 1) of the operator's opened or reviewed pull requests updated in `sinceDays` (1–365) days, the `max` (1–20) most active, derived once a day, see [maintain](#maintain); required |

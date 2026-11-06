@@ -15864,11 +15864,9 @@ fn sweep_config_table() {
         section
     };
     for (triage, section, error) in [
-        (
-            json!(true),
-            sweep(json!({})),
-            Some("sweep needs triage scope epics"),
-        ),
+        (json!(false), sweep(json!({})), Some("sweep needs triage")),
+        // Scope all (agent-board#755).
+        (json!(true), sweep(json!({})), None),
         (epics.clone(), sweep(json!({})), None),
         (
             epics.clone(),

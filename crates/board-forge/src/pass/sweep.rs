@@ -1,6 +1,7 @@
 //! The weekly sweep (agent-board#431, docs/pass.md#the-weekly-sweep): under
 //! the triage scope `epics`, no issue outside every live epic is triaged on
-//! its own. Once a week the pass files one issue listing them instead, which
+//! its own. Once a week the pass files one issue listing them instead (under
+//! `all`, beside their own triage, to offer each a live epic), which
 //! one triage run takes as a batch when slots and pools are spare, and whose
 //! one reply the pass applies: an issue that belongs to a live epic is
 //! attached to it, and the rest is left in the sweep issue for the operator.
@@ -71,10 +72,9 @@ fn weekday(name: &str) -> Result<time::Weekday> {
 
 impl Sweep {
     pub(super) fn check(&self, config: &Config) -> Result<()> {
-        ensure!(
-            config.triage == Some(TriageScope::Epics),
-            "sweep needs triage scope epics"
-        );
+        // Its run is a triage run; under scope `all` the issues it lists
+        // may also be triaged on their own (agent-board#755).
+        ensure!(config.triage.is_some(), "sweep needs triage");
         weekday(&self.weekday)?;
         ensure!(self.hour_utc < 24, "sweep hourUtc is not 0 to 23");
         ensure!(
@@ -94,6 +94,19 @@ impl Sweep {
         (self.repository.as_deref())
             .or(config.epics.as_ref().map(|e| e.repository.as_str()))
             .context("sweep needs a repository or epics.repository")
+    }
+
+    /// The first sentence of a sweep issue's body, after its marker: why
+    /// its issues are listed, by the triage scope.
+    pub(super) fn opening(config: &Config) -> &'static str {
+        match config.triage {
+            Some(TriageScope::All) => {
+                "These open issues are outside every live epic, and each may also be triaged on its own."
+            }
+            _ => {
+                "These open issues are outside every live epic, so no triage run looks at them on its own."
+            }
+        }
     }
 
     /// When the newest week's sweep was due, at or before `now`.
@@ -546,9 +559,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             .collect();
         let list = json!({"schema": LIST_SCHEMA, "due": stamp(due), "issues": issues});
         let body = format!(
-            "{SWEEP_MARKER}\nThese open issues are outside every live epic, so no triage run looks at them on its own. \
+            "{SWEEP_MARKER}\n{} \
              One triage run sweeps them when capacity is spare: the board pass attaches those it says belong to a live epic, \
              and lists the rest here for {}, who closes this issue once they are settled.\n\n{links}\n```{LIST_FENCE}\n{list:#}\n```\n\n{}",
+            Sweep::opening(self.config),
             self.config.operator,
             crate::Footer::default()
         );
