@@ -11,6 +11,14 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's `notifications` intake no longer fails every pass on one
+  thread: a midstream fork with issues disabled has its upstream's direction
+  staged in `dispatchRepo`, a write GitHub always refuses (404, 410) leaves
+  its direction to a person with a `warning:` receipt, recorded in the poll
+  state's `intake_refused` so it is not tried again, other errors are
+  warnings retried next pass, and direction the bot already answered by hand
+  on the thread starts nothing (docs/pass.md).
+
 - The pass's `assignHolds` (off by default) makes stage 4 wait on the
   operator by assigning them instead of labelling `needs-human`, and moves
   existing labels to assignments. Any response of theirs releases the wait,

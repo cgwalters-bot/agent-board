@@ -13,9 +13,13 @@ const TOPIC_LIMIT: usize = 50;
 
 /// Resolve only topic-admitted forks, never a target named in thread text.
 /// Ambiguous forks fail closed rather than putting work in the wrong tree.
+/// A fork with issues disabled cannot hold the tracking issue staged there,
+/// and GitHub refuses that write every pass (HTTP 410): its parent's
+/// direction is staged in `fallback`, the dispatch repository, instead.
 pub(super) fn routes(
     client: &impl Rest,
     repositories: &[String],
+    fallback: &str,
 ) -> Result<BTreeMap<String, String>> {
     ensure!(
         repositories.len() <= POLL_REPOSITORY_LIMIT,
@@ -35,9 +39,13 @@ pub(super) fn routes(
         }
         let parent = text(&fork, "/parent/full_name");
         validate_repository(parent).context("midstream parent")?;
+        let staging = match fork["has_issues"] == false {
+            true => fallback,
+            false => repository,
+        };
         ensure!(
             routes
-                .insert(parent.to_ascii_lowercase(), repository.clone())
+                .insert(parent.to_ascii_lowercase(), staging.to_owned())
                 .is_none(),
             "multiple midstreams for {parent}"
         );

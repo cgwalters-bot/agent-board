@@ -49,6 +49,11 @@ pub const OPERATOR_PAGE_LIMIT: u64 = (1000 / THREADS_PAGE) as u64;
 /// The most threads the pass's intake search keeps to retry while their
 /// direction waits for a midstream fork: each costs requests every pass.
 pub const INTAKE_WAITING_LIMIT: usize = THREADS_PAGE;
+/// The most operator comments the intake remembers as refused for good
+/// ([`State::intake_refused`]); past it the oldest is forgotten.
+pub const INTAKE_REFUSED_LIMIT: usize = 100;
+/// The anchors that name the operator's comments ([`Said::key`]).
+const ANCHORS: &[&str] = &["issuecomment-", "discussion_r", "pullrequestreview-"];
 /// How old a comment may be and still start a run: the first pass, or one
 /// after the state was lost, does not act on what the operator said long ago.
 pub(super) const LOOKBACK_SECONDS: i64 = 2 * 24 * 60 * 60;
@@ -488,7 +493,7 @@ fn peer_brief(repo: &str, number: u64, url: &str, said: &[Said], peer: &str) -> 
 type Handled = (bool, String);
 
 /// A thread's key in the intake's `waiting`.
-fn waiting_key(repo: &str, number: u64) -> String {
+pub(super) fn waiting_key(repo: &str, number: u64) -> String {
     format!("{repo}#{number}")
 }
 
@@ -530,7 +535,76 @@ fn keep_waiting(
     (true, "; retried each pass".into())
 }
 
+/// An entry of [`State::intake_refused`]: `OWNER/REPO#N/ANCHOR-ID`.
+pub(super) fn refused_entry(entry: &str) -> bool {
+    let Some((thread, anchor)) = entry.split_once('/').and_then(|(owner, rest)| {
+        let (repo, anchor) = rest.split_once('/')?;
+        Some((format!("{owner}/{repo}"), anchor))
+    }) else {
+        return false;
+    };
+    let thread_ok = thread.split_once('#').is_some_and(|(repo, number)| {
+        validate_repository(repo).is_ok() && number.parse::<u64>().is_ok_and(|n| n > 0)
+    });
+    let anchor_ok = ANCHORS.iter().any(|prefix| {
+        anchor
+            .strip_prefix(prefix)
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+    });
+    thread_ok && anchor_ok
+}
+
+/// The operator's direction on a thread that a failed write was for: an
+/// error's context, so that a permanent refusal can be recorded against it.
+#[derive(Debug)]
+pub(super) struct Direction {
+    pub(super) thread: String,
+    pub(super) keys: Vec<String>,
+}
+
+impl std::fmt::Display for Direction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "operator direction {}", self.keys.join(", "))
+    }
+}
+
 impl<R: Rest, G: Transport> Pass<'_, R, G> {
+    /// One thread's intake failed: whether it is done with, and its line.
+    /// The intake is a side channel of direction, so one thread's failure is
+    /// a warning, never the pass's. A write GitHub will always refuse, such as
+    /// a staging issue in a fork with issues disabled (HTTP 410), records the
+    /// direction it was for in [`State::intake_refused`] and leaves it to a
+    /// person, the line its receipt, rather than retrying it every pass;
+    /// anything else (an outage, the budget, a 422) waits to be retried.
+    pub(super) fn intake_failed(&mut self, error: &anyhow::Error) -> (bool, String) {
+        let direction = error.downcast_ref::<Direction>();
+        match direction.filter(|_| Refused::permanent(error)) {
+            Some(Direction { thread, keys }) => {
+                for key in keys {
+                    let entry = format!("{thread}/{key}");
+                    if !self.intake_refused.contains(&entry) {
+                        self.intake_refused.push(entry);
+                    }
+                }
+                let excess = self
+                    .intake_refused
+                    .len()
+                    .saturating_sub(INTAKE_REFUSED_LIMIT);
+                self.intake_refused.drain(..excess);
+                (
+                    true,
+                    format!(
+                        "warning: left to a person, as GitHub refuses its write for good: {error:#}"
+                    ),
+                )
+            }
+            None => (
+                false,
+                format!("warning: operator comments error: {error:#}"),
+            ),
+        }
+    }
+
     /// The operator's new comments in `operatorComments`, each thread's turned
     /// into one run; where the next pass's search resumes, `at` a cursor and
     /// a page of its search.
@@ -590,10 +664,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                     }
                 }
                 Err(error) => {
-                    outcome.errors += 1;
-                    outcome
-                        .lines
-                        .push(format!("{key} operator comments error: {error:#}"));
+                    let (done, line) = self.intake_failed(&error);
+                    outcome.lines.push(format!("{key} {line}"));
+                    if done {
+                        waiting.remove(key);
+                    }
                 }
             }
         }
@@ -687,9 +762,8 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                             found
                         }
                         Err(error) => {
-                            outcome.errors += 1;
-                            let line = format!("operator comments error: {error:#}");
-                            (false, line, false)
+                            let (done, line) = self.intake_failed(&error);
+                            (done, line, false)
                         }
                     };
                     let (done, kept) = match done {
@@ -1306,6 +1380,7 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             .said(repo, number, comments, pull, floor)?
             .into_iter()
             .filter(|s| !directed || super::notify::direction(&s.body, &bot))
+            .filter(|s| !directed || !self.intake_skip.contains(&s.key))
             .filter(|s| !done.contains(&s.key))
             .collect();
         // Outside our own space, a fix round on the bot's pull request is
@@ -2177,6 +2252,8 @@ pub(super) mod tests {
         broken_stop: RefCell<bool>,
         /// Whether a POST of a claim answers 502.
         pub(in crate::poll) broken_claim: RefCell<bool>,
+        /// The status a POST of a claim answers, where not a success.
+        pub(in crate::poll) claim_status: RefCell<Option<u16>>,
         pub(in crate::poll) links: RefCell<BTreeMap<String, String>>,
         /// URLs that answer with this `Last-Modified`, and 304 to it.
         pub(in crate::poll) modified: RefCell<BTreeMap<String, String>>,
@@ -2184,6 +2261,8 @@ pub(super) mod tests {
         pub(in crate::poll) validated: RefCell<Vec<String>>,
         /// URLs that answer 404.
         pub(in crate::poll) gone: RefCell<BTreeSet<String>>,
+        /// Repositories whose issues are disabled: opening one answers 410.
+        pub(in crate::poll) issues_disabled: RefCell<BTreeSet<String>>,
         /// Every request, in order, as `METHOD URL`.
         pub(in crate::poll) log: RefCell<Vec<String>>,
         /// Whether a search for a tracking issue finds none, as a search
@@ -2375,10 +2454,26 @@ pub(super) mod tests {
                 return Ok((502, json!({"message": "unavailable"})));
             }
             if method == "POST"
+                && let Some(status) = *self.claim_status.borrow()
+                && parse_marker(CLAIM, text(body, "/body")).is_some()
+            {
+                return Ok((status, json!({"message": "refused"})));
+            }
+            if method == "POST"
                 && *self.broken_notification_reply.borrow()
                 && text(body, "/body").contains("<!-- agent-board-notification:")
             {
                 return Ok((502, json!({"message": "unavailable"})));
+            }
+            if method == "POST"
+                && let Some(repo) = (url.strip_prefix(&format!("{API_ROOT}repos/")))
+                    .and_then(|path| path.strip_suffix("/issues"))
+                && self.issues_disabled.borrow().contains(repo)
+            {
+                return Ok((
+                    410,
+                    json!({"message": "Issues has been disabled in this repository."}),
+                ));
             }
             let id = 1000 + self.writes.borrow().len() as u64;
             // A new issue, numbered as its id, with an empty thread.
@@ -4058,6 +4153,8 @@ pub(super) mod tests {
                 followed: BTreeSet::new(),
                 caps: None,
                 intaking: false,
+                intake_refused: Vec::new(),
+                intake_skip: BTreeSet::new(),
                 writes: 0,
                 review_runs: BTreeMap::new(),
                 review_intake: Default::default(),

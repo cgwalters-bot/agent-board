@@ -71,8 +71,14 @@ rounds. Other public upstream threads are staged as issues in the matching
 `midstream` topic-selected fork. Matching uses GitHub's verified fork `parent`,
 not the thread body, title or a guessed repository name. One metadata read per
 selected repository (at most 50) resolves those routes; ambiguity or unreadable
-metadata fails stage 2. A thread with no matching fork waits for one; see
-below. Private upstream threads are never copied into a fork.
+metadata fails stage 2. A matching fork with issues disabled cannot hold the
+staging issue, so its upstream's direction is staged in `dispatchRepo` instead,
+with a `notifications:` line saying so. A thread with no matching fork waits
+for one; see below. Private upstream threads are never copied into a fork.
+Direction the bot already answered by hand on the thread (a later comment of
+the bot's that carries no marker, so neither the poll's nor a run's) starts
+nothing; within one second, issue comment ids order them, and direction that
+cannot be ordered is kept.
 There is no new fork-creation or direct agent mutation path. The triage's plan
 still needs the normal checked plan/scheduling path; its fork must also be in
 `workRepositories` for stage 4 to schedule that plan.
@@ -97,8 +103,15 @@ reports completion.
 Search is still not a complete inventory: lag beyond the overlap, or within
 such a skipped overlap, can hide direction.
 
-A thread the pass is not done with (no matching fork, a cap, an error, a
-pending claim) does not hold the time cursor: it is kept in the poll state, up
+One thread's error is a `warning:` line, never a failure of the pass. A write
+GitHub will always refuse (HTTP 404 or 410, such as an issue in a repository
+whose issues are disabled) leaves the direction it was for to a person, the
+line its receipt: the poll state's `intake_refused` records those comment IDs
+(the newest 100), so neither the search's overlap nor a later unrelated update
+of the thread tries them again, while new direction there still is. A thread
+the pass is not done with (no matching fork, a cap, any other error, including
+a 422, which GitHub also answers for a temporary spam restriction, a pending
+claim) does not hold the time cursor: it is kept in the poll state, up
 to 20 threads, and retried at the start of each pass until it is done. Waiting
 retries share at most half the remaining request budget, with history reads divided
 equally among the waiting threads not yet retried, so one that needs less leaves

@@ -1436,6 +1436,33 @@ pub fn next_link(link: &str) -> Option<String> {
     })
 }
 
+/// A REST write GitHub answered with a status its step does not allow.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: u16,
+    message: String,
+}
+
+impl Refused {
+    /// Whether sending the same write again cannot succeed: what it writes
+    /// to is gone or disabled (an issue tracker turned off answers 410). A
+    /// rate limit, an outage or a 422, which GitHub also answers for a
+    /// temporary spam restriction, is not.
+    pub fn permanent(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<Self>()
+            .is_some_and(|refused| matches!(refused.status, 404 | 410))
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// What a pass keeps for the next one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct State {
@@ -1455,6 +1482,12 @@ pub struct State {
     /// loses the retry until the thread is updated again; the claims still
     /// keep a comment from being acted on twice.
     pub intake_waiting: BTreeMap<String, String>,
+    /// The pass's intake: operator direction whose write GitHub refused for
+    /// good ([`Refused::permanent`]), `OWNER/REPO#N/ANCHOR-ID`, oldest first,
+    /// at most [`comments::INTAKE_REFUSED_LIMIT`]: left to a person, never
+    /// tried again, however often the thread is found. Losing it costs one
+    /// more refused write a comment.
+    pub intake_refused: Vec<String>,
     /// `lockCollaboratorItems` ([`lock`]): the open, unlocked items whose
     /// input check refused them, `OWNER/REPO#N` to the `updated_at` it read,
     /// which go to the back of the next pass's queue until they change.
@@ -1504,6 +1537,7 @@ impl State {
                     "operator_cursor",
                     "operator_page",
                     "intake_waiting",
+                    "intake_refused",
                     "lock_refused",
                     "follow_cursor",
                     "notify_since",
@@ -1577,6 +1611,22 @@ impl State {
                 "poll state intake_waiting time for {item}"
             );
         }
+        let intake_refused: Vec<String> = match object.get("intake_refused") {
+            None => Vec::new(),
+            Some(refused) => serde_json::from_value(refused.clone())
+                .context("poll state intake_refused is not a list of strings")?,
+        };
+        ensure!(
+            intake_refused.len() <= comments::INTAKE_REFUSED_LIMIT,
+            "poll state intake_refused holds over {} comments",
+            comments::INTAKE_REFUSED_LIMIT
+        );
+        for entry in &intake_refused {
+            ensure!(
+                comments::refused_entry(entry),
+                "poll state intake_refused entry {entry:?}"
+            );
+        }
         let lock_refused = match object.get("lock_refused") {
             None => BTreeMap::new(),
             Some(refused) => refused
@@ -1633,6 +1683,7 @@ impl State {
             operator_cursor,
             operator_page,
             intake_waiting,
+            intake_refused,
             lock_refused,
             follow_cursor,
             notify_since,
@@ -1657,6 +1708,9 @@ impl State {
         }
         if !self.intake_waiting.is_empty() {
             state["intake_waiting"] = json!(self.intake_waiting);
+        }
+        if !self.intake_refused.is_empty() {
+            state["intake_refused"] = json!(self.intake_refused);
         }
         if !self.lock_refused.is_empty() {
             state["lock_refused"] = json!(self.lock_refused);
@@ -4431,6 +4485,11 @@ struct Pass<'a, R, G> {
     caps: Option<&'a caps::Caps>,
     /// Notification intake counts its individual attempted writes, not PR steps.
     intaking: bool,
+    /// [`State::intake_refused`], as this pass goes on.
+    intake_refused: Vec<String>,
+    /// The anchors of the thread at hand whose direction is settled without
+    /// a run (answered by hand, refused for good): kept out of its claims.
+    intake_skip: BTreeSet<String>,
     /// Writes sent, or tried, so far: whether a step wrote anything.
     writes: usize,
     /// The review job's runs the pass started, by repository, read once a
@@ -4581,6 +4640,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             followed: BTreeSet::new(),
             caps: None,
             intaking: false,
+            intake_refused: Vec::new(),
+            intake_skip: BTreeSet::new(),
             writes: 0,
             review_runs: BTreeMap::new(),
             review_intake: reviews::Intake::default(),
@@ -4629,13 +4690,15 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         self.spend()?;
         self.writes += 1;
         let (status, response) = client.send(method, &format!("{API_ROOT}{path}"), &body)?;
-        ensure!(
-            (200..300).contains(&status) || status == allowed,
-            "{method} {path}: GitHub HTTP status {status}: {}",
-            response["message"]
-                .as_str()
-                .unwrap_or("message unavailable")
-        );
+        if !((200..300).contains(&status) || status == allowed) {
+            let message = format!(
+                "{method} {path}: GitHub HTTP status {status}: {}",
+                response["message"]
+                    .as_str()
+                    .unwrap_or("message unavailable")
+            );
+            return Err(Refused { status, message }.into());
+        }
         Ok((status, response))
     }
 
@@ -8293,6 +8356,10 @@ pub fn run_capped<R: Rest, G: Transport>(
         Some(_) => state.intake_waiting,
         None => BTreeMap::new(),
     };
+    // Only an applying pass writes, so only it records refusals.
+    if config.policy.notification_intake.is_some() {
+        pass.intake_refused = state.intake_refused;
+    }
     if !config.policy.operator_comments.is_empty()
         || (config.policy.notification_intake.is_some() && config.policy.notifications.is_none())
     {
@@ -8377,6 +8444,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         operator_cursor,
         operator_page,
         intake_waiting,
+        intake_refused: pass.intake_refused,
         lock_refused,
         follow_cursor,
         notify_since,
@@ -20354,6 +20422,8 @@ mod tests {
             followed: BTreeSet::new(),
             caps: None,
             intaking: false,
+            intake_refused: Vec::new(),
+            intake_skip: BTreeSet::new(),
             writes: 0,
             review_runs: BTreeMap::new(),
             review_intake: reviews::Intake::default(),

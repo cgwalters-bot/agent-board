@@ -3376,8 +3376,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // first.
         let mut routes = None;
         if config.notifications {
-            match midstream::routes(&self.client, &midstreams) {
-                Ok(read) => routes = Some(read),
+            match midstream::routes(&self.client, &midstreams, &config.dispatch_repo) {
+                Ok(read) => {
+                    for parent in (read.iter()).filter(|(_, r)| **r == config.dispatch_repo) {
+                        self.line(format!(
+                            "notifications: the midstream fork of {} has issues disabled; its direction is staged in {}",
+                            parent.0, config.dispatch_repo
+                        ));
+                    }
+                    routes = Some(read);
+                }
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("notifications error: midstream routes: {error:#}"));

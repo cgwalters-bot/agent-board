@@ -14312,16 +14312,26 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
             false,
         ),
         (200, json!({"full_name": "o/fork", "fork": true}), false),
+        // Issues disabled: staged in the dispatch repository instead.
+        (
+            200,
+            json!({"full_name": "o/fork", "fork": true, "has_issues": false, "parent": {"full_name": "upstream/project"}}),
+            true,
+        ),
     ] {
         let mut recorded = replay();
         recorded.requests.push(
             json!({"request": {"get": format!("{API_ROOT}repos/o/fork")},
             "answer": {"status": status, "body": body}}),
         );
-        let routes = midstream::routes(&recorded, &["o/fork".into()]);
+        let routes = midstream::routes(&recorded, &["o/fork".into()], "o/tracker");
         assert_eq!(routes.is_ok(), valid, "{status} {body}: {routes:?}");
         if valid && body["fork"] == true {
-            assert_eq!(routes.unwrap()["upstream/project"], "o/fork");
+            let staging = match body["has_issues"] == false {
+                true => "o/tracker",
+                false => "o/fork",
+            };
+            assert_eq!(routes.unwrap()["upstream/project"], staging);
         }
     }
     let mut recorded = replay();
@@ -14329,9 +14339,21 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
         recorded.requests.push(json!({"request": {"get": format!("{API_ROOT}repos/{repo}")},
             "answer": {"status": 200, "body": {"full_name": repo, "fork": true, "parent": {"full_name": "upstream/project"}}}}));
     }
-    assert!(midstream::routes(&recorded, &["o/fork".into(), "o/another".into()]).is_err());
     assert!(
-        midstream::routes(&recorded, &vec!["o/fork".into(); POLL_REPOSITORY_LIMIT + 1]).is_err()
+        midstream::routes(
+            &recorded,
+            &["o/fork".into(), "o/another".into()],
+            "o/tracker"
+        )
+        .is_err()
+    );
+    assert!(
+        midstream::routes(
+            &recorded,
+            &vec!["o/fork".into(); POLL_REPOSITORY_LIMIT + 1],
+            "o/tracker"
+        )
+        .is_err()
     );
 }
 

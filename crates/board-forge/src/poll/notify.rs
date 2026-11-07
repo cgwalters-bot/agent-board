@@ -401,6 +401,13 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                         outcome.lines.push(format!("{repo}#{number} {line}"));
                         done
                     }
+                    // As the search's intake: one thread's failure is not
+                    // the pass's ([`comments::intake_failed`]).
+                    Err(error) if self.config.policy.notification_intake.is_some() => {
+                        let (done, line) = self.intake_failed(&error);
+                        outcome.lines.push(format!("{repo}#{number} {line}"));
+                        done
+                    }
                     Err(error) => {
                         outcome.errors += 1;
                         outcome
@@ -642,8 +649,6 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
         let number = issue["number"]
             .as_u64()
             .context("notification issue has no number")?;
-        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
-        let since = last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let bot = self.config.bot.clone();
         let said: Vec<_> = said
             .into_iter()
@@ -655,6 +660,44 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
                 "notification: left to a person; no new operator direction".into(),
             ));
         }
+        // Only what the operator said after the bot's last reply by hand,
+        // and not refused for good before, is still open, here and in the
+        // claims below.
+        let thread = comments::waiting_key(repo, number);
+        let answered = answered_by_hand(comments, &bot);
+        let (skip, said): (Vec<_>, Vec<_>) = said.into_iter().partition(|s| {
+            answered.is_some_and(|reply| before(s, reply))
+                || (self.intake_refused).contains(&format!("{thread}/{}", s.key))
+        });
+        if said.is_empty() {
+            let why = match skip.iter().any(|s| answered.is_some_and(|r| before(s, r))) {
+                true => "the bot already answered the operator's direction on the thread",
+                false => "GitHub refused its write for good before; left to a person",
+            };
+            return Ok((true, format!("notification: left; {why}")));
+        }
+        self.intake_skip = skip.into_iter().map(|s| s.key).collect();
+        let keys = said.iter().map(|s| s.key.clone()).collect();
+        let since = last_read.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let result = self.notification_direction_admit(repo, issue, comments, said, since);
+        self.intake_skip.clear();
+        result.map_err(|error| error.context(comments::Direction { thread, keys }))
+    }
+
+    /// [`Self::notification_direction_said`] for the direction still open.
+    fn notification_direction_admit(
+        &mut self,
+        repo: &str,
+        issue: &Value,
+        comments: &[Value],
+        said: Vec<Said>,
+        since: OffsetDateTime,
+    ) -> Result<(bool, String)> {
+        let number = issue["number"]
+            .as_u64()
+            .context("notification issue has no number")?;
+        let pull = issue.get("pull_request").is_some_and(|p| !p.is_null());
+        let bot = self.config.bot.clone();
         let mine = pull && text(issue, "/user/login") == bot;
         // A fix brief also copies comments to the dispatch repository. Natural
         // asks must not bypass the legacy notification path's public check.
@@ -758,6 +801,33 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             "notification: operator direction already handled".into(),
         )))
     }
+}
+
+/// The time and id of the newest of the bot's comments on a thread that
+/// carries no marker: one written by hand (a person posting as the bot), not
+/// by the poll or a run, which mark all of theirs. The operator's direction
+/// before it was answered there, and starting a run on it would do the work
+/// twice.
+fn answered_by_hand(comments: &[Value], bot: &str) -> Option<(OffsetDateTime, u64)> {
+    comments
+        .iter()
+        .filter(|c| text(c, "/user/login") == bot && !text(c, "/body").contains("<!--"))
+        .filter_map(|c| {
+            let at = OffsetDateTime::parse(text(c, "/created_at"), &Rfc3339).ok()?;
+            Some((at, c["id"].as_u64()?))
+        })
+        .max()
+}
+
+/// Whether `said` came before the bot's `reply`. Comments are dated to the
+/// second; within one, issue comments' ids give their order, and anything
+/// else is taken as after, so that no direction is dropped on a guess.
+fn before(said: &Said, (at, id): (OffsetDateTime, u64)) -> bool {
+    said.at < at
+        || (said.at == at
+            && (said.key.strip_prefix("issuecomment-"))
+                .and_then(|n| n.parse::<u64>().ok())
+                .is_some_and(|n| n < id))
 }
 
 /// The runs comments may have started on a thread: the bot's triage claims
@@ -938,6 +1008,17 @@ mod tests {
 
     const RUN: &str = "https://github.com/upstream/tracker/actions/runs/1234";
 
+    /// A thread's intake failed for a reason that may pass: a warning, kept
+    /// to retry, and the pass itself does not fail.
+    fn assert_retried(outcome: &Outcome) {
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(
+            (outcome.lines.iter()).any(|l| l.contains("warning: operator comments error")),
+            "{:?}",
+            outcome.lines
+        );
+    }
+
     /// The thread's one comment, `repo#2`'s, says this instead.
     fn reword(fake: &Fake, repo: &str, body: &str) {
         let url = format!("{API_ROOT}repos/{repo}/issues/2/comments?per_page=100");
@@ -997,6 +1078,178 @@ mod tests {
             .filter(|(_, body)| text(body, "/body").contains(INTAKE_REPLY))
             .map(|(_, body)| body.clone())
             .collect()
+    }
+
+    /// cgwalters-forge/tracker: a midstream fork with issues disabled refused
+    /// its staging issue (HTTP 410) every pass, and failed every pass. Now
+    /// the direction is left to a person with a receipt, once, and the pass
+    /// is not failed: not when the overlapping search finds the thread again,
+    /// nor once an unrelated comment updates it; new direction is still
+    /// tried.
+    #[test]
+    fn pass_intake_leaves_direction_a_fork_refuses_to_a_person_once() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        reword(&fake, OTHER, "@worker let's get a draft of the fix");
+        let config = search_intake(&fake, OTHER);
+        // Within the search's overlap of every later pass.
+        let search = format!("{API_ROOT}search");
+        let bump = |at: &str| {
+            fake.rest.borrow_mut().get_mut(&search).unwrap()["items"][0]["updated_at"] = at.into()
+        };
+        bump("2026-10-16T11:59:00Z");
+        fake.issues_disabled
+            .borrow_mut()
+            .insert("upstream/midstream".into());
+        let staged = || {
+            (fake.writes.borrow().iter())
+                .filter(|(w, _)| w == &format!("POST {API_ROOT}repos/upstream/midstream/issues"))
+                .count()
+        };
+        let first = pass(&fake, &config, searched_since_september(), true);
+        assert_eq!(first.errors, 0, "{:?}", first.lines);
+        assert!(
+            (first.lines.iter()).any(|l| l.starts_with(&format!("{OTHER}#2 warning:"))
+                && l.contains("left to a person")
+                && l.contains("issuecomment-11")
+                && l.contains("410")
+                && !l.contains("retried")),
+            "{:?}",
+            first.lines
+        );
+        assert!(first.state.intake_waiting.is_empty(), "{:?}", first.state);
+        assert_eq!(
+            first.state.intake_refused,
+            [format!("{OTHER}#2/issuecomment-11")]
+        );
+        assert!(dispatches(&fake).is_empty());
+        assert_eq!(staged(), 1);
+        // The state round-trips through its file.
+        let state = State::from_json(&first.state.to_json()).unwrap();
+        let again = pass(&fake, &config, state, true);
+        assert_eq!(again.errors, 0, "{:?}", again.lines);
+        assert!(
+            (again.lines.iter()).any(|l| l.contains("refused its write for good before")),
+            "{:?}",
+            again.lines
+        );
+        // Someone else comments: the thread is updated, its direction not.
+        let thread = format!("{API_ROOT}repos/{OTHER}/issues/2/comments?per_page=100");
+        (fake
+            .rest
+            .borrow_mut()
+            .get_mut(&thread)
+            .unwrap()
+            .as_array_mut()
+            .unwrap())
+        .push(said(12, "visitor", "2026-10-16T11:59:30Z", "+1"));
+        bump("2026-10-16T11:59:30Z");
+        let updated = pass(&fake, &config, again.state, true);
+        assert_eq!(updated.errors, 0, "{:?}", updated.lines);
+        assert_eq!(staged(), 1, "{:?}", updated.lines);
+        // New direction is tried, and refused, on its own.
+        (fake
+            .rest
+            .borrow_mut()
+            .get_mut(&thread)
+            .unwrap()
+            .as_array_mut()
+            .unwrap())
+        .push(said(
+            13,
+            OPERATOR,
+            "2026-10-16T11:59:40Z",
+            "@worker and now?",
+        ));
+        bump("2026-10-16T11:59:40Z");
+        let new = pass(&fake, &config, updated.state, true);
+        assert_eq!(new.errors, 0, "{:?}", new.lines);
+        assert_eq!(staged(), 2, "{:?}", new.lines);
+        assert_eq!(
+            new.state.intake_refused,
+            [
+                format!("{OTHER}#2/issuecomment-11"),
+                format!("{OTHER}#2/issuecomment-13")
+            ]
+        );
+    }
+
+    /// A 422 may be GitHub's temporary spam restriction: the thread waits
+    /// and is retried, and its direction is staged once that passes, even
+    /// when it is older than the search's overlap.
+    #[test]
+    fn pass_intake_retries_direction_after_a_422() {
+        let fake = intake_github(OTHER, false, "mention", OPERATOR);
+        reword(&fake, OTHER, "@worker let's get a draft of the fix");
+        let config = search_intake(&fake, OTHER);
+        *fake.claim_status.borrow_mut() = Some(422);
+        let first = pass(&fake, &config, searched_since_september(), true);
+        assert_retried(&first);
+        assert!(dispatches(&fake).is_empty());
+        assert!(first.state.intake_refused.is_empty(), "{:?}", first.state);
+        assert!(
+            first
+                .state
+                .intake_waiting
+                .contains_key(&format!("{OTHER}#2")),
+            "{:?}",
+            first.state
+        );
+        *fake.claim_status.borrow_mut() = None;
+        let second = pass(&fake, &config, first.state, true);
+        assert_eq!(second.errors, 0, "{:?}", second.lines);
+        assert_eq!(dispatches(&fake).len(), 1, "{:?}", second.lines);
+        assert!(second.state.intake_waiting.is_empty(), "{:?}", second.state);
+    }
+
+    /// The operator's direction that the bot answered by hand on the thread
+    /// (tracker's bootc-dev/cgwalters-devspace-sandbox#36) starts no run;
+    /// a reply of the poll's or a run's, which carry markers, does not count,
+    /// and direction after the reply is still taken.
+    #[test]
+    fn pass_intake_skips_direction_answered_by_hand() {
+        const HAND: &str = "Posted on the gist.";
+        const RUN_REPLY: &str = "<!-- agentic-job-status -->\nThe run ended well.";
+        // The operator's direction is comment 11, at 10:00:00.
+        for (reply, (id, at), again, expected) in [
+            (HAND, (12, "2026-10-16T10:30:00Z"), false, 0),
+            // The same second: the ids order them.
+            (HAND, (12, "2026-10-16T10:00:00Z"), false, 0),
+            (HAND, (10, "2026-10-16T10:00:00Z"), false, 1),
+            (RUN_REPLY, (12, "2026-10-16T10:30:00Z"), false, 1),
+            (HAND, (10, "2026-10-16T09:00:00Z"), false, 1),
+            (HAND, (12, "2026-10-16T10:30:00Z"), true, 1),
+        ] {
+            let fake = intake_github(OTHER, false, "mention", OPERATOR);
+            reword(&fake, OTHER, "@worker comment on the gist");
+            let url = format!("{API_ROOT}repos/{OTHER}/issues/2/comments?per_page=100");
+            {
+                let mut rest = fake.rest.borrow_mut();
+                let thread = rest.get_mut(&url).unwrap().as_array_mut().unwrap();
+                thread.push(said(id, BOT, at, reply));
+                if again {
+                    thread.push(said(
+                        13,
+                        OPERATOR,
+                        "2026-10-16T10:45:00Z",
+                        "@worker and on the issue",
+                    ));
+                }
+                thread.sort_by(|a, b| text(a, "/created_at").cmp(text(b, "/created_at")));
+            }
+            let config = search_intake(&fake, OTHER);
+            let outcome = pass(&fake, &config, searched_since_september(), true);
+            let case = format!("{reply:?} at {at}, again {again}: {:?}", outcome.lines);
+            assert_eq!(outcome.errors, 0, "{case}");
+            assert_eq!(dispatches(&fake).len(), expected, "{case}");
+            if expected == 0 {
+                assert!(fake.writes.borrow().is_empty(), "{case}");
+                assert!(
+                    (outcome.lines.iter()).any(|l| l.contains("already answered")),
+                    "{case}"
+                );
+                assert!(outcome.state.intake_waiting.is_empty(), "{case}");
+            }
+        }
     }
 
     #[test]
@@ -1175,7 +1428,7 @@ mod tests {
         // the start, and once more from the last time it read, less the lag.
         for _ in 0..2 * comments::OPERATOR_PAGE_LIMIT {
             let outcome = pass(&fake, &config, state, true);
-            assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+            assert_retried(&outcome);
             state = outcome.state;
             if !dispatches(&fake).is_empty() {
                 break;
@@ -1209,7 +1462,7 @@ mod tests {
         let mut passes = 0;
         while state.intake_waiting.len() > 1 && passes < comments::INTAKE_WAITING_LIMIT {
             let retried = pass(&fake, &config, state, true);
-            assert_eq!(retried.errors, 1, "{:?}", retried.lines);
+            assert_retried(&retried);
             state = retried.state;
             passes += 1;
         }
@@ -1317,7 +1570,7 @@ mod tests {
             ..State::default()
         };
         let outcome = pass(&fake, &config, state, true);
-        assert_eq!(outcome.errors, 1, "{:?}", outcome.lines);
+        assert_retried(&outcome);
         assert!(outcome.state.intake_waiting.contains_key(&expensive));
         assert!(!outcome.state.intake_waiting.contains_key(&gone));
         assert_eq!(dispatches(&fake).len(), 1, "{:?}", outcome.lines);
@@ -1326,7 +1579,7 @@ mod tests {
             Some("2026-10-16T12:00:00Z")
         );
         let again = pass(&fake, &config, outcome.state, true);
-        assert_eq!(again.errors, 1, "{:?}", again.lines);
+        assert_retried(&again);
         assert!(again.state.intake_waiting.contains_key(&expensive));
         assert_eq!(dispatches(&fake).len(), 1);
     }
@@ -1446,7 +1699,7 @@ mod tests {
             json!({"items": hits, "incomplete_results": false}),
         );
         let first = pass(&fake, &config, State::default(), true);
-        assert!(first.errors > 0);
+        assert_retried(&first);
         assert!(
             first
                 .state
@@ -1535,7 +1788,7 @@ mod tests {
         // Refuse only the acknowledgement, after dispatch has been recorded.
         *fake.broken_notification_reply.borrow_mut() = true;
         let first = pass(&fake, &config, State::default(), true);
-        assert_eq!(first.errors, 1);
+        assert_retried(&first);
         assert!(marked(&fake).is_empty());
         *fake.broken_notification_reply.borrow_mut() = false;
         // Recovery must still find an older tracking issue through search,
@@ -1625,7 +1878,7 @@ mod tests {
         *fake.broken.borrow_mut() = true;
         let config = intake_config();
         let first = pass(&fake, &config, State::default(), true);
-        assert_eq!(first.errors, 1);
+        assert_retried(&first);
         assert_eq!(dispatches(&fake).len(), 1);
         assert!(marked(&fake).is_empty());
         *fake.broken.borrow_mut() = false;
@@ -2271,6 +2524,8 @@ mod tests {
                 followed: BTreeSet::new(),
                 caps: None,
                 intaking: false,
+                intake_refused: Vec::new(),
+                intake_skip: BTreeSet::new(),
                 writes: 0,
                 review_runs: BTreeMap::new(),
                 review_intake: Default::default(),

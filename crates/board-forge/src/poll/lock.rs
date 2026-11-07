@@ -498,6 +498,8 @@ mod tests {
             followed: BTreeSet::new(),
             caps: None,
             intaking: false,
+            intake_refused: Vec::new(),
+            intake_skip: BTreeSet::new(),
             writes: 0,
             review_runs: BTreeMap::new(),
             review_intake: Default::default(),
