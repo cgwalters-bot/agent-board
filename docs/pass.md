@@ -466,6 +466,61 @@ reporter fills those gaps. Counts and rollover alone never make an idle pass
 write; otherwise unchanged holds still say `holds: unchanged`. Previews have no
 `overhead` and never add to it.
 
+#### Today
+
+With `holds.today: true` (off by default; GitHub only), an applying pass adds
+`today` to the existing private holds snapshot, not the public `data` branch.
+The [fixture](../fixtures/today.json) is the `agent-board/today/v1` consumer
+contract. It contains no item titles, links, model names or per-run records.
+The Today UI is a separate change in the review app; this publishes its data.
+
+`day` is the injected pass clock's UTC calendar date and `observed_at` is its
+RFC 3339 time. `changes` counts `landed`, `closed` and `opened` from 00:00 UTC
+through that time, using [changes](digest.md)' board membership and classification:
+each item appears only in its first matching section, issues closed by a landed
+PR are not counted again as closed, and dependency-bot/app PR counts are included.
+Covered repositories are the board's repositories, not all repositories the
+token can read. A failed or incomplete read gives `changes: null`, never zero.
+
+`runs` is the current UTC day's `overhead` start counts as `by_kind` and
+`by_pool`, with overhead's `complete` flag and its coverage limitations above:
+these are confirmed starts by observed applying passes, not all Actions runs
+or completions. Pool accounting is an additive `starts_by_pool` field in overhead;
+old history without it gives `by_pool: null`, not an empty map. Missing kinds
+and pools mean zero only within that observed coverage. Reruns without an
+explicit pool count under `unknown`. At most 15 named pool buckets and one
+`unknown` bucket are carried; additional, invalid or over-64-byte pool names
+are folded into `unknown`. No per-run list is carried.
+
+When `prices` is configured, `cost` summarizes the **previous UTC calendar day**
+using the existing [cost reader](cost.md), without enabling `cost` publication.
+Its `weekly_budget_usd` is `budget.weeklyUsd`, or null when unset: it is a
+comparison target, **not** a daily allowance or a claim of remaining weekly
+budget. `usd` is the list-price total only when every read run is priced and
+no artifact is unread; otherwise it is null and `complete` is false.
+`priced_usd` is the known subtotal, with `unpriced_runs` and `unread_runs`
+making the gaps explicit. A successfully read empty day costs zero. Runs still
+in progress are outside the cost reader's coverage; the next pass re-reads
+yesterday, so late completions can enter it. Without prices, or when the day's
+read fails, `cost` is absent. Diagnostics say which read was unavailable.
+
+Activity reads share one additional bound of 100 requests and 30 seconds,
+inside the pass's request/time bounds, preserving its holds publication reserve.
+This prevents a busy day's project/artifact pagination from consuming the
+requests needed to publish the operator inbox. Existing cost download and
+unpacked-summary limits still apply. The optional section is dropped whole
+**before** other optional detail if the comment would exceed its existing size
+bound; it cannot evict holds or operator actions. Observation time alone does
+not cause a write; changed counts, availability or UTC day do. Previews do no
+activity reads and publish no `today`. An absent or old section is unavailable,
+not a zero-activity day.
+
+Caller activation is separate: in `cgwalters-forge/tracker`, move the
+`AGENT_BOARD_REV` pin to a release containing this producer and set
+`.github/pass.json`'s `holds.today` to `true`; configure `prices` for a cost
+line and `budget.weeklyUsd` for its comparison target. Keep public `cost`
+publication off unless public spend has separately been approved.
+
 #### Pass view
 
 With `holds.passView` set (off unless set; GitHub only; agent-board#726), the snapshot
@@ -3804,6 +3859,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.approvalEvidence` | Add stage 2's head-bound [approval evidence](#approval-evidence-optional-v2-extension) to the needs-you list; needs `holds.needsYou`, GitHub only; `false` |
 | `holds.actNow` | Add the [Act now](#act-now-optional-v2-extension) shortlist to the needs-you list; needs `holds.needsYou` and `holds.approvalEvidence`, GitHub only; `false` |
 | `holds.passView` | Add the [pass view](#pass-view) (`agent-board/pass-view/v1`): the last passes, pool pace and runs in flight; needs `holds`, GitHub only; `false` |
+| `holds.today` | Add [today's activity](#today) (`agent-board/today/v1`): UTC-day changes and starts, yesterday's private cost; needs `holds`, GitHub only; `false` |
 | `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |

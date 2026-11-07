@@ -387,13 +387,15 @@ fn snapshot_file() -> Value {
 /// the Forgejo contract says.
 #[test]
 fn pass_view_is_refused() {
-    let mut value = snapshot_file();
-    value["holds"]["passView"] = true.into();
-    let error = format!("{:#}", Config::parse(&value.to_string()).unwrap_err());
-    assert!(
-        error.contains("unsupported_capability: holds.passView"),
-        "{error}"
-    );
+    for key in ["passView", "today"] {
+        let mut value = snapshot_file();
+        value["holds"][key] = true.into();
+        let error = format!("{:#}", Config::parse(&value.to_string()).unwrap_err());
+        assert!(
+            error.contains(&format!("unsupported_capability: holds.{key}")),
+            "{error}"
+        );
+    }
 }
 
 fn snapshot_lines(report: &Report) -> Vec<&str> {

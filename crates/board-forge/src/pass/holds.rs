@@ -459,6 +459,7 @@ pub fn overhead(
                     || d > day
                     || (day - d).whole_days() > OVERHEAD_HISTORY_DAYS
                     || entry.effects.starts.len() > START_KINDS.len()
+                    || !super::today::valid_pools(entry.effects.starts_by_pool.as_ref())
                     || entry
                         .effects
                         .starts
@@ -512,6 +513,19 @@ pub fn overhead(
     for (kind, count) in &effects.starts {
         add(day.effects.starts.entry(kind.clone()).or_default(), *count);
     }
+    // Older snapshots know the starts but not their pools. Do not turn that
+    // missing history into an apparently complete pool breakdown.
+    match (&mut day.effects.starts_by_pool, &effects.starts_by_pool) {
+        (Some(pools), Some(new)) => {
+            for (pool, count) in new {
+                super::today::add_pool_map(pools, pool, *count);
+            }
+        }
+        (None, Some(new)) if day.effects.starts == effects.starts => {
+            day.effects.starts_by_pool = Some(new.clone());
+        }
+        _ => day.effects.starts_by_pool = None,
+    }
     result
 }
 
@@ -537,6 +551,8 @@ const START_KINDS: &[&str] = &[
 /// The hold snapshot ([`HOLDS_SCHEMA`]).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Snapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub today: Option<Value>,
     /// Per-repository observed work; absent means unavailable, not empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatchable_work: Option<Value>,
@@ -699,6 +715,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
     Snapshot {
         dispatchable_work: None,
         pass_view: None,
+        today: None,
         schema: HOLDS_SCHEMA,
         at,
         truncated: 0,
@@ -2712,6 +2729,12 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
             parse_time(&last).is_none() || over(&last, at, NEEDS_YOU_REFRESH_HOURS)
         });
         let due = due || super::view::due(s.get("pass_view"), now.get("pass_view"));
+        // Observation time alone is not activity. Counts and UTC rollover are.
+        for value in [&mut s, &mut now] {
+            if let Some(today) = value.get_mut("today").and_then(Value::as_object_mut) {
+                today.remove("observed_at");
+            }
+        }
         s["at"] = Value::Null;
         now["at"] = Value::Null;
         for view in [&mut s, &mut now]
@@ -2757,8 +2780,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         Some(view) => format!(",\"pass_view\":{}", serde_json::to_string(view)?),
         None => String::new(),
     };
+    let today = match &snapshot.today {
+        Some(today) => format!(",\"today\":{}", serde_json::to_string(today)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work}{view},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work}{view}{today},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -2804,6 +2831,9 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// never keeps the inbox from being published: the body is always at most
 /// [`MAX_COMMENT_CHARS`].
 pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
+    if snapshot.today.is_some() && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS {
+        snapshot.today = None;
+    }
     // Optional work detail never evicts the operator inbox or stall clocks.
     if snapshot.dispatchable_work.is_some()
         && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS
@@ -2849,6 +2879,7 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
                    pass_view: &Option<Value>| Snapshot {
         dispatchable_work: snapshot.dispatchable_work.clone(),
         pass_view: pass_view.clone(),
+        today: snapshot.today.clone(),
         schema: snapshot.schema,
         at: snapshot.at.clone(),
         truncated: dropped.len(),
@@ -3115,6 +3146,7 @@ mod tests {
             starts: BTreeMap::from([("triage".into(), 2)]),
             comments_created: 3,
             comments_edited: 1,
+            ..Default::default()
         };
         let wrap = |at: OffsetDateTime, overhead: &Overhead| {
             json!({

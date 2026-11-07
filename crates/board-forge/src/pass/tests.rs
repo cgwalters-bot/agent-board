@@ -3327,6 +3327,70 @@ fn apply_publishes_the_pass_view() {
     }
 }
 
+/// Default-off and preview have no activity reads; auxiliary read failure
+/// leaves an explicit unknown without preventing the private holds write.
+#[test]
+fn today_publication_is_opt_in_and_read_failures_are_not_zero() {
+    for (enabled, apply) in [
+        (None, true),
+        (Some(false), true),
+        (Some(true), true),
+        (Some(true), false),
+    ] {
+        let mut forge = Forge::new(None, false);
+        let at = forge.holds_destination(true);
+        let mut settings = json!({"wip": 8, "holds": at});
+        if let Some(enabled) = enabled {
+            settings["holds"]["today"] = enabled.into();
+        }
+        let config = config(settings);
+        let own = own();
+        let mode = if apply {
+            Mode::Actions(&own)
+        } else {
+            Mode::Preview
+        };
+        let report = block(run(
+            &forge,
+            &forge,
+            &config,
+            State::default(),
+            (mode, Limits::default()),
+            forge.replay.now,
+        ))
+        .unwrap();
+        let unavailable = report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("today: changes unavailable:"));
+        assert_eq!(
+            unavailable,
+            apply && enabled == Some(true),
+            "{:?}",
+            report.lines
+        );
+        if !apply {
+            assert!(forge.published_holds().is_none());
+            continue;
+        }
+        let (_, body) = forge.published_holds().unwrap();
+        let snapshot = holds::published(&body).unwrap();
+        assert_eq!(snapshot.get("today").is_some(), enabled == Some(true));
+        if enabled == Some(true) {
+            assert_eq!(snapshot["today"]["changes"], Value::Null);
+            assert!(snapshot["today"].get("cost").is_none());
+            assert_eq!(
+                snapshot["today"]["runs"]["by_kind"],
+                snapshot["pass"]["overhead"]["today"]["starts"]
+            );
+            assert_eq!(
+                snapshot["today"]["runs"]["by_pool"],
+                snapshot["pass"]["overhead"]["today"]["starts_by_pool"]
+            );
+        }
+    }
+}
+
 /// The accounting boundary sees one final response, never the client's
 /// intermediate retries, failed writes or capped operations not sent to it.
 #[test]

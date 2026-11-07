@@ -810,6 +810,9 @@ pub struct HoldsAt {
     /// passes, the pools' pace and the runs in flight, to the snapshot.
     #[serde(default, rename = "passView")]
     pub pass_view: bool,
+    /// Off unless set: private UTC-day activity and yesterday's list-price cost.
+    #[serde(default)]
+    pub today: bool,
 }
 
 /// The issue whose body is the operator's direction: in a private
@@ -2433,6 +2436,8 @@ impl<C: Rest> Rest for Budget<'_, C> {
                     context.as_str()
                 };
                 *effects.starts.entry(kind.to_owned()).or_default() += 1;
+                let pool = body["inputs"]["pool"].as_str().unwrap_or("unknown");
+                today::add_pool(&mut effects.starts_by_pool, pool, 1);
                 // `repos/OWNER/REPO/actions/workflows/WORKFLOW/dispatches`.
                 let path = url.strip_prefix(API_ROOT).unwrap_or(url);
                 let caller = path.strip_prefix("repos/").and_then(|p| {
@@ -2638,11 +2643,25 @@ impl Report {
 }
 
 /// Confirmed, successful effects of one pass, or their daily sum.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Effects {
     pub starts: BTreeMap<String, u64>,
+    /// Added after overhead/v1 shipped; absence means pool accounting was unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starts_by_pool: Option<BTreeMap<String, u64>>,
     pub comments_created: u64,
     pub comments_edited: u64,
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self {
+            starts: BTreeMap::new(),
+            starts_by_pool: Some(BTreeMap::new()),
+            comments_created: 0,
+            comments_edited: 0,
+        }
+    }
 }
 
 /// The workflow run an applying pass runs in. No two passes may start work
@@ -6928,6 +6947,7 @@ pub mod revisit;
 pub mod starts;
 mod status;
 pub mod sweep;
+mod today;
 mod usage;
 mod view;
 mod wait;
