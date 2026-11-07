@@ -175,6 +175,73 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
+    fn every_subcommand_renders_help() {
+        fn visit(mut command: clap::Command, path: Vec<String>) {
+            for flag in ["-h", "--help"] {
+                let error = crate::Cli::command()
+                    .try_get_matches_from(path.iter().map(String::as_str).chain([flag]))
+                    .unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp,
+                    "{path:?}"
+                );
+                let help = error.to_string();
+                assert!(help.contains("Usage:"), "{path:?}: {help}");
+                assert!(help.contains("--help"), "{path:?}: {help}");
+            }
+            // Building also adds clap's synthetic help command; it is not one of ours.
+            command.build();
+            for subcommand in command
+                .get_subcommands()
+                .filter(|sub| sub.get_name() != "help")
+            {
+                let mut path = path.clone();
+                path.push(subcommand.get_name().to_owned());
+                visit(subcommand.clone(), path);
+            }
+        }
+        visit(crate::Cli::command(), vec!["agent-board".to_owned()]);
+    }
+
+    #[test]
+    fn ci_health_examples_are_rendered_and_parse() {
+        let reference = super::markdown(crate::Cli::command());
+        let help = crate::Cli::try_parse_from(["agent-board", "ci-health", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for example in [
+            "agent-board ci-health --config ci-health.json",
+            "agent-board ci-health --config ci-health.json --until 2026-10-28 --format human",
+        ] {
+            assert!(reference.contains(example), "missing example: {example}");
+            assert!(help.contains(example), "missing example: {example}");
+            let cli = crate::Cli::try_parse_from(example.split_whitespace()).unwrap();
+            assert!(matches!(cli.command, crate::Command::CiHealth(_)));
+        }
+        for contract in [
+            "agent-board/ci-health/v1",
+            "not that CI is healthy or coverage complete",
+            "Nothing invokes this command by default",
+            "500 API operations",
+        ] {
+            assert!(help.contains(contract), "missing contract: {contract}");
+        }
+        let config = help
+            .lines()
+            .find(|line| line.trim().starts_with('{'))
+            .unwrap();
+        let until = board_forge::cost::parse_date("2026-10-28")
+            .unwrap()
+            .midnight()
+            .assume_utc()
+            .unix_timestamp()
+            * 1000;
+        board_forge::ci_health::Config::parse(config, until).unwrap();
+    }
+
+    #[test]
     fn cost_examples_are_rendered_and_parse() {
         let reference = super::markdown(crate::Cli::command());
         for example in [
