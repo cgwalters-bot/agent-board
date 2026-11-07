@@ -434,7 +434,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
              answers it.",
             due.silent
         );
-        brief.push_str(&self.verdict_ask());
+        brief.push_str(&self.verdict_ask(due.facts));
         let context = (slots, target, revisit_hold as HoldRule);
         let read = Some((due.facts, comments.as_slice()));
         self.start_triage(issue, (&pool, brief, REVISIT), None, read, line, context)

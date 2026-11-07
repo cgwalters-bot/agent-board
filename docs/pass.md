@@ -1976,6 +1976,25 @@ cannot loop. An earlier `follow-through` verdict on an issue without the
 pass's plan also waits. A run that still answers `done` for such work is
 closed or held as before: only the brief steers it.
 
+Work on our own infrastructure, harness work, never waits on the operator
+for anything but their own decisions (agent-board#778). A harness repository
+is a work repository of `dispatchRepo`'s owner that is neither in
+`pr.noMerge` nor a midstream fork stage 2 read (none where `midstream` is set
+and its read failed); an issue there is harness work unless it is labelled
+one of `operator-action`, `decision`, `question` or `review-draft`, or
+`target:ORG` for another organization than `dispatchRepo`'s. On harness work
+the triage brief adds that it is ours to plan, and that an operator-domain
+decision is answered `needs-operator` with `"operator"` in the same JSON
+block, one of `credentials`, `budget`, `ruleset`, `upstream` (posting
+upstream for the first time) or `bounds`. A `needs-operator` or
+`needs-design` verdict without one, as a follow-up or an earlier verdict,
+labels and assigns nothing: the issue is triaged again at once, its plan
+starting `The board pass asks a triage run to plan this issue again: it is
+our own infrastructure, not an operator decision.`, and a verdict on such a
+plan waits as `partly` does, sharing its doubling wait (`…, harness work held
+for no one; triaged again from …`). `done` and `obsolete`, a close for the
+operator to confirm, and a verdict naming its domain, are asked as before.
+
 Work already promoted upstream is the exception (agent-board#735). Its
 midstream pull request is closed, and an implement run can only open another
 one from a new `dispatch/` branch, as composefs-rs#56's did. With `fixPlans`
@@ -2059,7 +2078,15 @@ the work repositories. Stage 5 shows an open issue assigned to the operator
 as Needs human (`assigned to the operator`), whoever assigned them: the
 board read has no timeline. Only stage 4's candidates move to assignments:
 epics, the sweep issue and the poll's pull request stops still use the
-label. The needs-you list's carried `needs-human` waits are still retired by
+label. On harness work (above), a standing assignment of the bot's
+or a `needs-human` label whose newest verdict is not the operator's (no
+verdict at all included) is released instead: the operator unassigned, or
+the label taken off, and one comment starting `<!-- agent-board-release -->`,
+two writes under `--max-writes`, at most 5 a pass (`…, harness work: unassign
+OPERATOR, released for planning`; past that, `released in a later pass`), and
+the issue considered as above. The bot's own unassignment is no response
+and its comment no answer, so the next pass neither assigns it again nor
+takes the release as the operator's word. The needs-you list's carried `needs-human` waits are still retired by
 the label's removal, so a moved wait stage 4 did not reach in a pass drops
 from it until stage 4 holds it again; and the supervisor's `/release` and
 `release_listed` find nothing to release on a moved item, which only the

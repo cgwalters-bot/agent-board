@@ -223,6 +223,30 @@ const FOLLOW_THROUGH_VERDICT: &str = "follow-through";
 /// starts so is not planned at once again, so that the two cannot loop.
 const FOLLOW_THROUGH: &str =
     "The board pass asks a triage run to plan the mechanical follow-through its last triage found.";
+/// What the triage plan [`Scheduler::follow_up`] posts for an asking
+/// verdict on harness work ([`Scheduler::harness_item`]) says first, in
+/// place of holding it for the operator (agent-board#778); a verdict
+/// answering a plan that starts so waits as `partly` does, so that the two
+/// cannot loop.
+const HARNESS: &str = "The board pass asks a triage run to plan this issue again: it is our own infrastructure, not an operator decision.";
+/// What a triage brief on harness work adds ([`Scheduler::verdict_ask`]).
+const HARNESS_ASK: &str = " This issue is in our own infrastructure, which is always ours to work on: plan it rather than ask. Only an operator-domain decision goes to the operator: then answer needs-operator and add \"operator\" to the same JSON block, one of credentials, budget, ruleset, upstream (posting upstream for the first time) or bounds.";
+/// The `operator` values of a triage verdict that make it an
+/// operator-domain decision ([`plan::triage_operator`]).
+const OPERATOR_DOMAINS: &[&str] = &["credentials", "budget", "ruleset", "upstream", "bounds"];
+/// Labels that make an issue the operator's whatever its repository:
+/// proposed operator actions, consolidated decisions, an ask's question and
+/// a review draft before its first upstream posting.
+const OPERATOR_LABELS: &[&str] = &["operator-action", "decision", "question", "review-draft"];
+/// The prefix of a label naming the organization an issue's work is for:
+/// one naming another than `dispatchRepo`'s is not harness work.
+const TARGET_LABEL_PREFIX: &str = "target:";
+/// The most waits on the operator the pass releases from harness work in
+/// one pass ([`Scheduler::harness_item`]), each two writes.
+const RELEASES_PER_PASS: usize = 5;
+/// The hidden first line of the comment the pass posts as it releases one,
+/// which answers no verdict ([`Scheduler::verdict_answers`]).
+const RELEASE_MARKER: &str = "<!-- agent-board-release -->";
 /// What a triage brief that asks for a verdict says about follow-through
 /// and the operator ([`Scheduler::verdict_ask`]).
 const MECHANICAL: &str = " Mechanical follow-through (rebasing, re-running CI, fixing conflicts or refreshing a stale branch) is work, not a decision: plan it as an implement job; a rebase keeps existing Signed-off-by trailers and adds none. Only a real decision goes to the operator: a design choice, posting upstream for the first time, credentials, bounds or budget.";
@@ -3000,6 +3024,8 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         free: None,
         top: None,
         follows: config.follow.clone(),
+        midstreams: config.midstream.is_none().then(Vec::new),
+        released: Cell::new(0),
         followed: None,
         stepped: Vec::new(),
         blocking: RefCell::default(),
@@ -3406,6 +3432,12 @@ struct Scheduler<'a, C> {
     /// The repositories stage 2 follows: `follow`, and the midstreams it
     /// read where `midstream` is set.
     follows: Vec<String>,
+    /// The midstream forks stage 2 read, none without `midstream`; `None`
+    /// where they were not read, when no repository is harness
+    /// ([`Self::harness_repository`]).
+    midstreams: Option<Vec<String>>,
+    /// The waits released from harness work this pass ([`RELEASES_PER_PASS`]).
+    released: Cell<usize>,
     /// Stage 2's review waits and the repositories it left undecided
     /// ([`poll::Outcome::waits`]), once it ran.
     followed: Option<(Vec<poll::Wait>, BTreeSet<String>)>,
@@ -3457,6 +3489,61 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     fn writers(&self) -> [&'a str; 2] {
         [&self.config.operator, &self.config.bot]
+    }
+
+    /// Whether `repository` is the harness's own (agent-board#778): a work
+    /// repository of `dispatchRepo`'s owner that is neither in
+    /// `pr.noMerge` nor a midstream fork, whose work is always ours. None
+    /// is where the midstreams were not read.
+    fn harness_repository(&self, repository: &str) -> bool {
+        let config = self.config;
+        let named = |list: &[String]| list.iter().any(|r| r.eq_ignore_ascii_case(repository));
+        let owner = |r: &str| {
+            r.split_once('/')
+                .map(|(owner, _)| owner.to_ascii_lowercase())
+        };
+        let Some(midstreams) = &self.midstreams else {
+            return false;
+        };
+        config.works_in(repository)
+            && owner(repository).is_some_and(|o| owner(&config.dispatch_repo) == Some(o))
+            && !named(&config.pr.poll.no_merge)
+            && !named(midstreams)
+    }
+
+    /// Whether `facts` is harness work: in a [`Self::harness_repository`],
+    /// its labels all read, none of [`OPERATOR_LABELS`] and no
+    /// [`TARGET_LABEL_PREFIX`] label naming another organization.
+    fn harness_item(&self, facts: &Facts) -> bool {
+        let ours = (self.config.dispatch_repo.split_once('/')).map_or("", |(owner, _)| owner);
+        let len = TARGET_LABEL_PREFIX.len();
+        let foreign = |label: &str| {
+            (label.get(..len)).is_some_and(|p| p.eq_ignore_ascii_case(TARGET_LABEL_PREFIX))
+                && (label.get(len..))
+                    .is_some_and(|o| !o.is_empty() && !o.eq_ignore_ascii_case(ours))
+        };
+        self.harness_repository(&facts.issue.repository)
+            && facts.labels_complete
+            && !OPERATOR_LABELS.iter().any(|l| facts.labelled(l))
+            && !facts.labels.iter().any(|l| foreign(l))
+    }
+
+    /// Whether the triage verdict `verdict`, in the comment `body`, is the
+    /// operator's to settle on harness work: a close to confirm, or a
+    /// decision naming one of [`OPERATOR_DOMAINS`].
+    fn operator_verdict(verdict: &str, body: &str) -> bool {
+        CLOSE_VERDICTS.iter().any(|(v, _)| *v == verdict)
+            || plan::triage_operator(body).is_some_and(|d| OPERATOR_DOMAINS.contains(&d.as_str()))
+    }
+
+    /// Whether the wait on the operator over `facts`, whose newest triage
+    /// verdict the `comments` hold, is to be released rather than kept:
+    /// harness work, and no verdict the operator's ([`Self::operator_verdict`]).
+    fn releasable(&self, facts: &Facts, comments: &[plan::Comment]) -> bool {
+        self.harness_item(facts)
+            && !self
+                .newest_verdict(comments)
+                .is_some_and(|(_, c, verdict)| Self::operator_verdict(&verdict, &c.body))
     }
 
     /// With `pr.reviewPools`, what stage 2's review starts and reruns go by:
@@ -3536,7 +3623,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let (owner, topic) = (&midstream.owner, &midstream.topic);
             // Unread, a midstream also in `follow` would be merged in.
             match midstream.read(&self.client) {
-                Ok(read) => midstreams = read,
+                Ok(read) => {
+                    self.midstreams = Some(read.clone());
+                    midstreams = read;
+                }
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("follow error: midstream topic {topic}: {error:#}"));
@@ -5734,7 +5824,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              If it can be done, post one accepted implement job plan for it (agent-board's docs/job-plans.md). \
              Otherwise say on the issue what design or decision it needs. Do not close the issue."
         );
-        brief.push_str(&self.verdict_ask());
+        brief.push_str(&self.verdict_ask(read.0));
         if intro == FOLLOW_THROUGH {
             brief.push_str(" Its last triage found that only mechanical follow-through remains: post one implement job plan for that, unless it is already in an open pull request.");
             if self.config.fix_plans {
@@ -5766,7 +5856,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
     /// verdict [`Self::follow_up`] reads, after [`MECHANICAL`]. Nothing
     /// without it.
-    fn verdict_ask(&self) -> String {
+    fn verdict_ask(&self, facts: &Facts) -> String {
         let active = if self.config.skip_active_work {
             " If the work is already in an open pull request, link it and report waiting on that PR, without adding needs-human or posting another implement plan. Use not-done rather than needs-operator for that wait."
         } else {
@@ -5775,6 +5865,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if self.config.triage_follow_up_days == 0 {
             return active.to_owned();
         }
+        let harness = match self.harness_item(facts) {
+            true => HARNESS_ASK,
+            false => "",
+        };
         let promoted = match self.config.fix_plans {
             true => format!("{PROMOTED}{NO_UPSTREAM_COMMENT}"),
             false => String::new(),
@@ -5786,7 +5880,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              needs-issue (a follow-up needs a real issue number: give its repository, title and body \
              in your comment for the controller, not needs-operator; do not invent an issue number), \
              partly, not-done or {FOLLOW_THROUGH_VERDICT} (only mechanical follow-through \
-             remains and you could not plan it; never done or needs-operator for that).{active}"
+             remains and you could not plan it; never done or needs-operator for that).{harness}{active}"
         )
     }
 
@@ -5856,7 +5950,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         {
             return self.triage(read, FOLLOW_THROUGH, (snapshot, target, slots));
         }
-        if let Some((_, c, verdict)) = &verdict
+        // Harness work asks the operator only their own decisions
+        // (agent-board#778): any other ask is planned again, once, and then
+        // waits as `partly` does.
+        let harness = verdict.as_ref().is_some_and(|(_, c, verdict)| {
+            ASK_VERDICTS.contains(&verdict.as_str())
+                && self.harness_item(facts)
+                && !Self::operator_verdict(verdict, &c.body)
+        });
+        if harness && !from.body.starts_with(HARNESS) {
+            return self.triage(read, HARNESS, (snapshot, target, slots));
+        }
+        let said = match harness {
+            true => format!("{said}, harness work held for no one"),
+            false => said,
+        };
+        if let Some((_, c, verdict)) = verdict.as_ref().filter(|_| !harness)
             && let Some(step) = self.act_on_verdict(
                 &facts.issue,
                 (c, comments, Some((from, record))),
@@ -5886,7 +5995,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let again = (comments.iter().rev())
                     .filter(planned)
                     .take_while(|c| {
-                        [AGAIN, FOLLOW_THROUGH]
+                        [AGAIN, FOLLOW_THROUGH, HARNESS]
                             .iter()
                             .any(|s| c.body.starts_with(s))
                     })
@@ -6138,6 +6247,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     && ((!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), &writers))
                     && !c.body.ends_with(crate::supervise::health::STATUS_MARKER)
                     && !c.body.contains(&format!("<!-- {HOLD_MARKER}:"))
+                    && !c.body.starts_with(RELEASE_MARKER)
                     && !c.body.contains(&format!("<!-- {}:", plan::DISPATCH_MARKER))
                     && !plan::has_fence(&c.body, PLAN_FENCE)
             })
@@ -6316,6 +6426,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return self
                 .triage_released((facts, comments), released, context)
                 .map(Some);
+        }
+        if ASK_VERDICTS.contains(&verdict.as_str())
+            && self.harness_item(facts)
+            && !Self::operator_verdict(&verdict, &c.body)
+        {
+            // Harness work, as in a follow-up (agent-board#778).
+            return self.triage((facts, comments), HARNESS, context).map(Some);
         }
         if ASK_VERDICTS.contains(&verdict.as_str()) {
             // A hold marker or an unconfirmed answer is not new direction.

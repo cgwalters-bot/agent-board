@@ -11,6 +11,16 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Harness work, issues in the work repositories of `dispatchRepo`'s owner
+  outside `pr.noMerge` and the midstream forks, no longer waits on the
+  operator but for their own decisions (agent-board#778): an asking triage
+  verdict there is triaged again with a brief to plan it, unless it names
+  `"operator"` (credentials, budget, ruleset, upstream or bounds), is a
+  close to confirm, or the issue carries an operator label. With
+  `assignHolds`, the bot's existing assignments and `needs-human` labels on
+  such work are released, at most 5 a pass, each with one
+  `<!-- agent-board-release -->` comment (docs/pass.md#scheduling).
+
 - The hold snapshot on GitHub is no longer cut to one 65,536-character
   comment, which had left out every needs-you detail card and the pass view
   (agent-board#774): one longer than a comment is gzipped, in base64, across

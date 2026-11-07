@@ -418,6 +418,14 @@ pub(super) fn config(edit: Value) -> Config {
     Config::parse(&value.to_string()).unwrap()
 }
 
+/// `config` with tracker out of the harness, by `pr.noMerge`, so that its
+/// asking verdicts wait on the operator as in any other repository
+/// (agent-board#778).
+pub(super) fn outside_harness(mut config: Config) -> Config {
+    (config.pr.poll.no_merge).push("cgwalters-forge/tracker".into());
+    config
+}
+
 /// A pass run to its end on a current-thread runtime, as the CLI runs it.
 pub(super) fn block<T>(pass: impl Future<Output = T>) -> T {
     let runtime = tokio::runtime::Builder::new_current_thread().build();
@@ -2424,6 +2432,21 @@ impl Forge {
             })
             .with_context(|| format!("{name}#{} is not on the board", variables["number"]))?;
         let mut issue = node["content"].clone();
+        // A label the pass took off since the board read.
+        let removed = format!(
+            "{API_ROOT}repos/{name}/issues/{}/labels/",
+            variables["number"]
+        );
+        let writes = self.writes.borrow();
+        let taken = |label: &Value| {
+            (writes.iter()).any(|(method, url, _)| {
+                method == "DELETE" && url.strip_prefix(&removed) == label["name"].as_str()
+            })
+        };
+        if let Some(labels) = issue["labels"]["nodes"].as_array_mut() {
+            labels.retain(|l| !taken(l));
+            issue["labels"]["totalCount"] = json!(labels.len());
+        }
         issue["projectItems"] = json!({"nodes": [{
             "project": {"number": 1, "owner": {"login": "cgwalters-forge"}},
             "status": node["status"],
@@ -5724,8 +5747,9 @@ fn apply_follows_up_a_triage_by_its_verdict() {
     ];
     for (name, answers, (close, writes), expected, again, held) in cases {
         let promoted = name.contains("promoted");
-        let mut config =
-            config(json!({"triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted}));
+        let mut config = outside_harness(config(
+            json!({"triageFollowUpDays": 3, "triageClose": close, "fixPlans": promoted}),
+        ));
         let mut forge = Forge::new(None, false);
         let first = apply(&forge, &config);
         assert_eq!(first.failures, 0, "{name}: {:#?}", first.lines);
@@ -6099,7 +6123,7 @@ fn answered_verdict_release_rules() {
         ),
     ] {
         for board_triage in [true, false] {
-            let config = config(json!({"triageFollowUpDays": 3}));
+            let config = outside_harness(config(json!({"triageFollowUpDays": 3})));
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
             if board_triage {
@@ -6254,6 +6278,19 @@ fn assignments(replay: &mut Replay, number: u64, events: &[(&str, &str, i64)], a
             "assignments": {"pageInfo": {"hasPreviousPage": events.len() >= 100},
                 "nodes": nodes}}}}}
     }));
+}
+
+/// Every issue on the board read in `replay` labelled `label` as well.
+fn board_labelled(replay: &mut Replay, label: &str) {
+    for entry in &mut replay.requests {
+        let nodes = entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
+            let labels = &mut node["content"]["labels"];
+            let names = labels["nodes"].as_array_mut().unwrap();
+            names.push(json!({"name": label}));
+            labels["totalCount"] = json!(names.len());
+        }
+    }
 }
 
 /// agent-board#727: with `assignHolds`, an asking verdict assigns the
@@ -6420,7 +6457,9 @@ fn assign_holds_wait_on_the_operator() {
         let (line, held, again) = expected;
         for board_triage in [true, false] {
             let name = format!("{name} (triaged first: {board_triage})");
-            let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true}));
+            let config = outside_harness(config(
+                json!({"triageFollowUpDays": 3, "assignHolds": true}),
+            ));
             assert!(config.poll(None).policy.assign_holds);
             let mut forge = Forge::new(None, false);
             only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
@@ -6438,18 +6477,7 @@ fn assign_holds_wait_on_the_operator() {
             }
             assignments(&mut forge.replay, 446, &events, assignees);
             if labelled {
-                for entry in &mut forge.replay.requests {
-                    let nodes =
-                        entry["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
-                    for node in nodes.and_then(Value::as_array_mut).into_iter().flatten() {
-                        let labels = &mut node["content"]["labels"];
-                        labels["nodes"]
-                            .as_array_mut()
-                            .unwrap()
-                            .push(json!({"name": "needs-human"}));
-                        labels["totalCount"] = json!(labels["nodes"].as_array().unwrap().len());
-                    }
-                }
+                board_labelled(&mut forge.replay, "needs-human");
             }
             let triaged = || {
                 (forge.dispatches().iter())
@@ -6497,6 +6525,217 @@ fn assign_holds_wait_on_the_operator() {
                 .collect();
             assert_eq!(wrote, held, "{name}");
             assert_eq!(triaged() - dispatched, usize::from(again), "{name}");
+        }
+    }
+}
+
+/// agent-board#778: on harness work (tracker is a work repository of
+/// dispatchRepo's owner), an asking verdict does not wait on the operator
+/// unless it names an operator-domain decision or the issue carries an
+/// operator label: it is triaged again, once, with [`HARNESS`] first. The
+/// bot's standing assignment, or a `needs-human` label, is released with
+/// one comment and the issue planned, and an assignment the bot took off
+/// itself is not put back. Each case: the verdict's JSON, the assignment
+/// events and assignees, the issue's added labels, the write limit, what
+/// tracker#446's line contains, the writes and whether it was triaged again.
+#[test]
+fn harness_work_is_planned_rather_than_held() {
+    let assigned = ("AssignedEvent", "cgwalters-bot", 1);
+    let asks = r#"{"verdict":"needs-operator"}"#;
+    let credentials = r#"{"verdict":"needs-operator","operator":"credentials"}"#;
+    let planned = ("start triage", vec![], true);
+    let assign = vec!["DELETE /assignees", "POST /assignees", "POST hold"];
+    type Case<'a> = (
+        &'a str,
+        &'a str,
+        Vec<(&'a str, &'a str, i64)>,
+        &'a [&'a str],
+        &'a [&'a str],
+        Option<usize>,
+        (&'a str, Vec<&'a str>, bool),
+    );
+    let cases: Vec<Case> = vec![
+        ("asks", asks, vec![], &[], &[], None, planned.clone()),
+        (
+            "needs-design",
+            r#"{"verdict":"needs-design"}"#,
+            vec![],
+            &[],
+            &[],
+            None,
+            planned.clone(),
+        ),
+        (
+            "an operator-domain verdict",
+            credentials,
+            vec![],
+            &[],
+            &[],
+            None,
+            ("assign cgwalters", assign.clone(), false),
+        ),
+        (
+            "an operator label",
+            asks,
+            vec![],
+            &[],
+            &["operator-action"],
+            None,
+            ("assign cgwalters", assign.clone(), false),
+        ),
+        (
+            "another organization's work",
+            asks,
+            vec![],
+            &[],
+            &["target:bootc-dev"],
+            None,
+            ("assign cgwalters", assign, false),
+        ),
+        (
+            "our own organization's target",
+            asks,
+            vec![],
+            &[],
+            &["target:cgwalters-forge"],
+            None,
+            planned.clone(),
+        ),
+        (
+            "assigned",
+            asks,
+            vec![assigned],
+            &["cgwalters"],
+            &[],
+            None,
+            (
+                "harness work: unassign cgwalters, released for planning",
+                vec!["DELETE /assignees", "POST release"],
+                true,
+            ),
+        ),
+        (
+            "assigned on an operator-domain verdict",
+            credentials,
+            vec![assigned],
+            &["cgwalters"],
+            &[],
+            None,
+            ("assigned to cgwalters since ", vec![], false),
+        ),
+        (
+            "assigned, capped",
+            asks,
+            vec![assigned],
+            &["cgwalters"],
+            &[],
+            Some(1),
+            ("held by --max-writes", vec![], false),
+        ),
+        (
+            "released by the bot last pass",
+            asks,
+            vec![assigned, ("UnassignedEvent", "cgwalters-bot", 2)],
+            &[],
+            &[],
+            None,
+            planned.clone(),
+        ),
+        (
+            "labelled",
+            asks,
+            vec![],
+            &[],
+            &["needs-human"],
+            None,
+            (
+                "labelled needs-human, harness work: take off needs-human, released for planning",
+                vec!["DELETE /labels/needs-human", "POST release"],
+                true,
+            ),
+        ),
+    ];
+    for (name, verdict, events, assignees, labels, writes, expected) in cases {
+        let (line, held, again) = expected;
+        let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true}));
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        assert_eq!(apply(&forge, &config).failures, 0, "{name}");
+        answered(
+            &forge,
+            ("cgwalters-bot", None),
+            &format!("```{TRIAGE_FENCE}\n{verdict}\n```"),
+            0,
+        );
+        assignments(&mut forge.replay, 446, &events, assignees);
+        for label in labels {
+            board_labelled(&mut forge.replay, label);
+        }
+        let triaged = || {
+            (forge.dispatches().iter())
+                .filter(|d| d.ends_with("tracker#446"))
+                .count()
+        };
+        let (before, dispatched) = (forge.writes.borrow().len(), triaged());
+        let limits = Limits {
+            writes,
+            ..Limits::default()
+        };
+        let report = apply_limited(&forge, &config, limits);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert!(
+            (report.lines.iter()).any(|l| l.contains("tracker#446") && l.contains(line)),
+            "{name}: no {line:?} in {:#?}",
+            report.lines
+        );
+        let issue = "repos/cgwalters-forge/tracker/issues/446";
+        let wrote: Vec<String> = forge.writes.borrow()[before..]
+            .iter()
+            .filter_map(|(method, url, body)| {
+                let path = url.trim_start_matches(API_ROOT).strip_prefix(issue)?;
+                let body = text(body, "/body");
+                if body.starts_with("<!-- agent-board-hold") {
+                    return Some(format!("{method} hold"));
+                }
+                if body.starts_with(RELEASE_MARKER) {
+                    return Some(format!("{method} release"));
+                }
+                let held = path.ends_with("/assignees") || path.starts_with("/labels");
+                held.then(|| format!("{method} {path}"))
+            })
+            .collect();
+        assert_eq!(wrote, held, "{name}");
+        assert_eq!(
+            triaged() - dispatched,
+            usize::from(again),
+            "{name}: {:#?}",
+            report.lines
+        );
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        if again {
+            let plan = (comments.iter().rev()).find(|c| c.contains(PLAN_FENCE));
+            let plan = plan.unwrap();
+            assert!(plan.starts_with(HARNESS), "{name}: {plan}");
+            let ask = HARNESS_ASK.split(':').next().unwrap().trim();
+            assert!(plan.contains(ask), "{name}: {plan}");
+        }
+        // The plan again answered as before: it waits, held for no one.
+        if again && held.is_empty() {
+            answered(
+                &forge,
+                ("cgwalters-bot", None),
+                &format!("```{TRIAGE_FENCE}\n{verdict}\n```"),
+                0,
+            );
+            let before = forge.writes.borrow().len();
+            let report = apply(&forge, &config);
+            assert!(
+                (report.lines.iter()).any(|l| l.contains("tracker#446")
+                    && l.contains("harness work held for no one; triaged again from")),
+                "{name}: {:#?}",
+                report.lines
+            );
+            assert_eq!(forge.writes.borrow().len(), before, "{name}");
         }
     }
 }

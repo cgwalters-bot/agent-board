@@ -162,11 +162,27 @@ pub(super) fn response<'c>(
     }
 }
 
+/// The writes of a [`Scheduler::release_harness`]: the unassignment or label
+/// removal, and its comment.
+const RELEASE_WRITES: usize = 2;
+
+/// What the comment of a release says after [`RELEASE_MARKER`].
+const RELEASE_TEXT: &str = "The board pass released this hold: it is our own infrastructure and not an operator decision (credentials, budget, rulesets, first upstream posting or bounds), so the pass plans the work.";
+
+/// The hold a [`Scheduler::release_harness`] takes off.
+#[derive(Clone, Copy)]
+enum Release {
+    Assignment,
+    Label,
+}
+
 /// What [`Scheduler::operator_wait`] made of a candidate.
 enum Waited {
     Held(Hold),
     /// Not waiting: considered as before, its line ending with the note.
     Go(Option<String>),
+    /// [`Go`](Waited::Go), its [`NEEDS_HUMAN`] label taken off.
+    Unlabelled(String),
 }
 
 /// An issue held because what its wait needs could not be read.
@@ -193,12 +209,28 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         snapshot: Option<&Value>,
         target: &Target,
     ) -> Result<Step> {
-        let note = match self.config.assign_holds && facts.open {
-            false => None,
+        let (note, unlabelled) = match self.config.assign_holds && facts.open {
+            false => (None, false),
             true => match self.operator_wait(facts)? {
                 Waited::Held(held) => return Ok(Step::Hold(held)),
-                Waited::Go(note) => note,
+                Waited::Go(note) => (note, false),
+                Waited::Unlabelled(note) => (Some(note), true),
             },
+        };
+        // A label taken off no longer holds it.
+        let released;
+        let facts = match unlabelled {
+            true => {
+                released = Facts {
+                    labels: (facts.labels.iter())
+                        .filter(|l| !l.eq_ignore_ascii_case(NEEDS_HUMAN))
+                        .cloned()
+                        .collect(),
+                    ..facts.clone()
+                };
+                &released
+            }
+            false => facts,
         };
         let mut step = self.consider(facts, board, slots, snapshot, target)?;
         if let Some(note) = note {
@@ -216,6 +248,16 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let operator = config.operator.as_str();
         let issue = &facts.issue;
         if facts.labels_complete && facts.labelled(NEEDS_HUMAN) {
+            if self.harness_item(facts) {
+                let comments = match plan::issue_comments(&self.client, issue) {
+                    Ok(comments) => comments,
+                    Err(error) => return Ok(Waited::Held(unreadable(error))),
+                };
+                if self.releasable(facts, &comments) {
+                    let why = format!("labelled {NEEDS_HUMAN}");
+                    return self.release_harness(issue, why, Release::Label);
+                }
+            }
             return self.migrate(issue).map(Waited::Held);
         }
         let (assigned, comments) = match self.standing(issue) {
@@ -225,6 +267,10 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         };
         let since = assigned.since.format(&Rfc3339).unwrap_or_default();
         let Some(response) = response(&assigned, &comments, (operator, &self.writers())) else {
+            if self.releasable(facts, &comments) {
+                let why = format!("assigned to {operator} since {since}");
+                return self.release_harness(issue, why, Release::Assignment);
+            }
             return Ok(Waited::Held(waiting(operator, &since)));
         };
         let said = response.said(operator);
@@ -239,6 +285,60 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         Ok(Waited::Go(Some(format!(
             "; {said} (assigned {since}), so unassigned {operator}"
         ))))
+    }
+
+    /// The wait `why` on harness work released (agent-board#778): the
+    /// operator unassigned or the label taken off, and one short comment
+    /// saying so, two writes under `--max-writes`, at most
+    /// [`RELEASES_PER_PASS`] a pass. The issue then goes on, its triage
+    /// verdict planned again rather than asked ([`Self::follow_up`]), so that
+    /// the next pass does not hold it again. The bot's own unassignment is
+    /// no response, nor its comment an answer
+    /// ([`Self::verdict_answers`]).
+    fn release_harness(&self, issue: &ItemRef, why: String, what: Release) -> Result<Waited> {
+        let operator = &self.config.operator;
+        let act = match what {
+            Release::Assignment => format!("unassign {operator}"),
+            Release::Label => format!("take off {NEEDS_HUMAN}"),
+        };
+        let held = |reason: String| Ok(Waited::Held(Hold::new(HoldKind::NeedsHuman, reason)));
+        if self.released.get() >= RELEASES_PER_PASS {
+            return held(format!(
+                "{why}; harness work, released in a later pass (at most {RELEASES_PER_PASS} a pass): {act}"
+            ));
+        }
+        if let Some(cap) = self.caps.check_many(Kind::Write, RELEASE_WRITES) {
+            return held(format!("{why}; {cap}: {act}"));
+        }
+        self.caps.count_many(Kind::Write, RELEASE_WRITES);
+        self.released.set(self.released.get() + 1);
+        if self.apply {
+            match what {
+                Release::Assignment => self.unassign(issue)?,
+                Release::Label => {
+                    let url = format!(
+                        "{API_ROOT}repos/{}/issues/{}/labels/{NEEDS_HUMAN}",
+                        issue.repository, issue.number
+                    );
+                    // 404: someone took it off meanwhile.
+                    plan::send(&self.client, "DELETE", &url, &Value::Null, 404)?;
+                }
+            }
+            let body = format!(
+                "{RELEASE_MARKER}\n{RELEASE_TEXT}\n\n{}",
+                crate::Footer::default()
+            );
+            let url = format!(
+                "{API_ROOT}repos/{}/issues/{}/comments",
+                issue.repository, issue.number
+            );
+            plan::send(&self.client, "POST", &url, &json!({"body": body}), 0)?;
+        }
+        let note = format!("; {why}, harness work: {act}, released for planning");
+        Ok(match what {
+            Release::Assignment => Waited::Go(Some(note)),
+            Release::Label => Waited::Unlabelled(note),
+        })
     }
 
     /// The bot's standing assignment of the operator on `issue`, with the

@@ -411,11 +411,22 @@ pub(crate) fn has_fence(body: &str, fence: &str) -> bool {
 /// [`TRIAGE_FENCE`] block in `body`. None for no block, an open one, more
 /// than one, or one that is not JSON with a string verdict.
 pub(crate) fn triage_verdict(body: &str) -> Option<String> {
+    triage_answer(body, "verdict")
+}
+
+/// The `operator` string of the same block as [`triage_verdict`]'s: what
+/// operator-domain decision a verdict on harness work names, if any.
+pub(crate) fn triage_operator(body: &str) -> Option<String> {
+    triage_answer(body, "operator")
+}
+
+/// The string `key` of the one closed [`TRIAGE_FENCE`] block in `body`.
+fn triage_answer(body: &str, key: &str) -> Option<String> {
     let [Some(block)] = &fence_blocks(body, TRIAGE_FENCE)[..] else {
         return None;
     };
     let answer: Value = serde_json::from_str(block).ok()?;
-    answer["verdict"].as_str().map(str::to_owned)
+    answer[key].as_str().map(str::to_owned)
 }
 
 /// The `fence` blocks of a comment body, in order: each one's text, or
