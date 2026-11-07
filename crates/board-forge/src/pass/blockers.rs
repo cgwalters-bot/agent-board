@@ -218,7 +218,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             self.line(card);
             self.report.holds.push(Entry {
                 scope: Scope::Item(pull),
-                hold: Hold::new(HoldKind::Blocking, reason),
+                hold: Hold::new(HoldKind::Blocking, reason).releases(held.len()),
                 priority,
                 why: None,
             });

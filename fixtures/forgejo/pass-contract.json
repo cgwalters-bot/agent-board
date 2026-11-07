@@ -234,6 +234,7 @@
     "holds.proposals": {"verdict": "refused", "reason": "action check validates GitHub repositories and org"},
     "holds.drafts": {"verdict": "refused", "reason": "review-draft source identity and edit attribution use GitHub's review-send reader"},
     "holds.approvalEvidence": {"verdict": "refused", "reason": "evidence comes from stage 2's GitHub pull request reads; the reviews source is off on Forgejo"},
+    "holds.actNow": {"verdict": "refused", "reason": "only the GitHub scheduler's needs-you step ranks it, beside the approval evidence it reads; the Forgejo publisher does not"},
     "holds.passView": {"verdict": "refused", "reason": "starts and runs in flight come from GitHub's dispatch answers and workflow run listings"},
     "decisions.repository": {"verdict": "refused", "reason": "decisions source needs authenticated GitHub body edit attribution"},
     "decisions.issue": {"verdict": "refused", "reason": "decisions source needs authenticated GitHub body edit attribution"},

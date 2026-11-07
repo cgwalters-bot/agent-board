@@ -66,6 +66,9 @@ pub struct Request {
     pub resolution: String,
 }
 
+/// The [`Request::quality`] of a fresh, known, concrete decision.
+pub const DECISION: &str = "decision";
+
 /// The [`Action`] kind of a forge review bound to the target's head.
 pub const REVIEW_AT_HEAD: &str = "review-at-head";
 
@@ -231,7 +234,7 @@ pub(super) fn describe(
     } else if !concrete || generic {
         "missing-concrete-decision"
     } else {
-        "decision"
+        DECISION
     };
     let headed = ask.head.as_deref().is_some_and(full_head);
     let mut actions = Vec::new();
@@ -269,14 +272,14 @@ pub(super) fn describe(
     ) {
         actions.push(Action {
             kind: REVIEW_AT_HEAD.into(),
-            supported: quality == "decision" && headed,
+            supported: quality == DECISION && headed,
             reason: "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy.".into(),
         });
     }
     if ask.action.kind == RefKind::OperatorAction {
         actions.push(Action {
             kind: "check-proposal".into(),
-            supported: quality == "decision",
+            supported: quality == DECISION,
             reason: "Re-read the exact source comment and run action check with caller scope before independently authorized action apply; a listed proposal is not approval.".into(),
         });
     }

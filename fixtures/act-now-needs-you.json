@@ -1,0 +1,1193 @@
+{
+  "needs_you": {
+    "schema": "agent-board/needs-you/v2",
+    "complete": true,
+    "validated_at": "2026-11-06T12:00:00Z",
+    "changed_at": "2026-11-06T12:00:00Z",
+    "sources": {
+      "epics": "off",
+      "items": "complete",
+      "reviews": "complete",
+      "proposals": "off",
+      "digest": "complete"
+    },
+    "summaries": "complete",
+    "omitted": 0,
+    "count": 11,
+    "counts": {
+      "decisions": 11,
+      "groups": 0,
+      "members": 11
+    },
+    "context": {
+      "wip": {
+        "limit": 2,
+        "in_flight": 2
+      },
+      "observed_at": "2026-11-06T12:00:00Z",
+      "sources": {
+        "run": "off",
+        "step": "off",
+        "usage": "off"
+      },
+      "omitted": 0,
+      "items": []
+    },
+    "items": [
+      {
+        "key": "o/t#11",
+        "item": "o/t#11",
+        "source": "items",
+        "kind": "needs-human",
+        "priority": "P0",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "Pick A or B for o/t#11?",
+        "recommendation": null,
+        "target": "https://github.com/o/t/issues/11",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 11
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/t",
+          "number": 11
+        },
+        "carried": true,
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/t#2",
+        "item": "o/t#2",
+        "source": "items",
+        "kind": "needs-operator",
+        "priority": "P0",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "an invalid plan",
+        "recommendation": null,
+        "target": "https://github.com/o/t/issues/2",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 2
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/t",
+          "number": 2
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/t#7",
+        "item": "o/t#7",
+        "source": "items",
+        "kind": "pr-open",
+        "priority": "P0",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "Pick A or B for o/t#7?",
+        "recommendation": null,
+        "target": "https://github.com/o/t/issues/7",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 7
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/t",
+          "number": 7
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/t#10",
+        "item": "o/t#10",
+        "source": "items",
+        "kind": "needs-human",
+        "priority": "P1",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "Pick A or B for o/t#10?",
+        "recommendation": null,
+        "target": "https://github.com/o/t/issues/10",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 10
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/t",
+          "number": 10
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/t#20",
+        "item": "o/t#20",
+        "source": "items",
+        "kind": "epic-not-live",
+        "priority": "P2",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "Label o/t#20 an epic?",
+        "recommendation": null,
+        "target": "https://github.com/o/t/issues/20",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 20
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/t",
+          "number": 20
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/t#30",
+        "item": "o/t#30",
+        "source": "items",
+        "kind": "blocking",
+        "priority": "P2",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "Merge or close o/t#30?",
+        "recommendation": null,
+        "target": "https://github.com/o/t/pull/30",
+        "head": null,
+        "action": {
+          "type": "pull_request",
+          "repository": "o/t",
+          "number": 30
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/t",
+          "number": 30
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/a#1",
+        "item": "o/a#1",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "ask": "Approve o/a#1 at its head?",
+        "recommendation": null,
+        "target": "https://github.com/o/a/pull/1",
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 1,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "source_ref": {
+          "type": "comment",
+          "repository": "o/a",
+          "number": 1
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/a#2",
+        "item": "o/a#2",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "ask": "Approve o/a#2 at its head?",
+        "recommendation": null,
+        "target": "https://github.com/o/a/pull/2",
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 2,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "source_ref": {
+          "type": "comment",
+          "repository": "o/a",
+          "number": 2
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/a#3",
+        "item": "o/a#3",
+        "source": "reviews",
+        "kind": "review-approve",
+        "priority": null,
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "ask": "Approve o/a#3 at its head?",
+        "recommendation": null,
+        "target": "https://github.com/o/a/pull/3",
+        "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 3,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "source_ref": {
+          "type": "comment",
+          "repository": "o/a",
+          "number": 3
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/d#1/digest",
+        "item": "o/d#1",
+        "source": "digest",
+        "kind": "digest-waiting",
+        "priority": null,
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "ask": "Reply to the author?",
+        "recommendation": null,
+        "target": "https://github.com/o/d/pull/1",
+        "head": null,
+        "action": {
+          "type": "reply_pull_request",
+          "repository": "o/d",
+          "number": 1
+        },
+        "source_ref": {
+          "type": "comment",
+          "repository": "o/d",
+          "number": 1
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      },
+      {
+        "key": "o/ops#1",
+        "item": "o/ops#1",
+        "source": "pass",
+        "kind": "stalled",
+        "priority": null,
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "ask": "no apply",
+        "recommendation": null,
+        "target": "https://github.com/o/ops/issues/1",
+        "head": null,
+        "action": {
+          "type": "issue",
+          "repository": "o/ops",
+          "number": 1
+        },
+        "source_ref": {
+          "type": "hold",
+          "repository": "o/ops",
+          "number": 1
+        },
+        "epic": "unknown",
+        "topEpic": "unknown"
+      }
+    ],
+    "identities": [
+      {
+        "item": "o/t#11",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "carried": true,
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/t#2",
+        "kind": "needs-operator",
+        "source": "items",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/t#7",
+        "kind": "pr-open",
+        "source": "items",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "priority": "P0",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/t#10",
+        "kind": "needs-human",
+        "source": "items",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "priority": "P1",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/t#20",
+        "kind": "epic-not-live",
+        "source": "items",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/t#30",
+        "kind": "blocking",
+        "source": "items",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "priority": "P2",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/a#1",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/a#2",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/a#3",
+        "kind": "review-approve",
+        "source": "reviews",
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "key": "o/d#1/digest",
+        "item": "o/d#1",
+        "kind": "digest-waiting",
+        "source": "digest",
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "epic": "unknown"
+      },
+      {
+        "item": "o/ops#1",
+        "kind": "stalled",
+        "source": "pass",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "epic": "unknown"
+      }
+    ],
+    "epics": {},
+    "details_omitted": 0,
+    "requests": [
+      {
+        "key": "o/t#11",
+        "identity": "github.com/o/t#11/question/f4a6332d8f5dd2446fda6cd6c8e99cad9383d9f8ad54ef499d3c652ced0eed36",
+        "forge": "github.com",
+        "question": "Pick A or B for o/t#11?",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 11
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/t",
+            "number": 11
+          }
+        ],
+        "observed_at": null,
+        "source_time": null,
+        "facts": "labelled needs-human",
+        "quality": "unverified-carried",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/t#2",
+        "identity": "github.com/o/t#2/question/10f2f9f9d48b9dfa7cc74de201455d42037823b524779767f080d1b5ea17303d",
+        "forge": "github.com",
+        "question": "an invalid plan",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 2
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/t",
+            "number": 2
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "an invalid plan",
+        "quality": "missing-concrete-decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/t#7",
+        "identity": "github.com/o/t#7/question/6222f9b881144d0316ace941d425a48ceaa84e364b8117847e7a80a018e5a44f",
+        "forge": "github.com",
+        "question": "Pick A or B for o/t#7?",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 7
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/t",
+            "number": 7
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "approve pull request o/z#5 to merge",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/t#10",
+        "identity": "github.com/o/t#10/question/d26198f1e5988d1031ce3701e942a3217b12af3707647421d2df2323c672fd99",
+        "forge": "github.com",
+        "question": "Pick A or B for o/t#10?",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 10
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/t",
+            "number": 10
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "labelled needs-human",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/t#20",
+        "identity": "github.com/o/t#20/question/89d4c68ba9a929574ede3efb79608e885f90b0245015899c34e306471244d4c2",
+        "forge": "github.com",
+        "question": "Label o/t#20 an epic?",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 20
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/t",
+            "number": 20
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "not a live epic, so its 63 open child issue(s) wait until the operator or the bot labels it epic, among them o/t#100 (P2), o/t#101 (P2), o/t#102 (P2) and 60 more",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/t#30",
+        "identity": "github.com/o/t#30/question/48a9983abd6df9c8e20e48dfc7462c2e0c7fd324d821584a0c3444ab7518a5f2",
+        "forge": "github.com",
+        "question": "Merge or close o/t#30?",
+        "recommendation": null,
+        "target": {
+          "type": "pull_request",
+          "repository": "o/t",
+          "number": 30
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/t",
+            "number": 30
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "only a person moves it",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/a#1",
+        "identity": "github.com/o/a#1/approve",
+        "forge": "github.com",
+        "question": "Approve o/a#1 at its head?",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 1,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "comment",
+            "repository": "o/a",
+            "number": 1
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "Approve o/a#1 at its head?",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/a#2",
+        "identity": "github.com/o/a#2/approve",
+        "forge": "github.com",
+        "question": "Approve o/a#2 at its head?",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 2,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "comment",
+            "repository": "o/a",
+            "number": 2
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "Approve o/a#2 at its head?",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/a#3",
+        "identity": "github.com/o/a#3/approve",
+        "forge": "github.com",
+        "question": "Approve o/a#3 at its head?",
+        "recommendation": null,
+        "target": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 3,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Poll decision explicitly waits on the configured operator, not a run, rerun, review job or queue.",
+        "sources": [
+          {
+            "type": "comment",
+            "repository": "o/a",
+            "number": 3
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "Approve o/a#3 at its head?",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          },
+          {
+            "kind": "review-at-head",
+            "supported": true,
+            "reason": "Use a forge review bound to target.head, after re-reading the PR. Only fresh authorized approval at that head can release the poll's approval wait; it does not override checks or merge policy."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/d#1/digest",
+        "identity": "github.com/o/d#1/reply",
+        "forge": "github.com",
+        "question": "Reply to the author?",
+        "recommendation": null,
+        "target": {
+          "type": "reply_pull_request",
+          "repository": "o/d",
+          "number": 1
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "configured bot (authenticated digest)",
+        "ownership_evidence": "Newest digest written and last edited by the configured bot requests operator attention; freshness must be rechecked.",
+        "sources": [
+          {
+            "type": "comment",
+            "repository": "o/d",
+            "number": 1
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": "2026-10-28T08:00:00Z",
+        "facts": "Reply to the author?",
+        "quality": "decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      },
+      {
+        "key": "o/ops#1",
+        "identity": "github.com/o/ops#1/pass-alarm",
+        "forge": "github.com",
+        "question": "no apply",
+        "recommendation": null,
+        "target": {
+          "type": "issue",
+          "repository": "o/ops",
+          "number": 1
+        },
+        "revision": null,
+        "requested_operator": "operator",
+        "requester": "pass policy",
+        "ownership_evidence": "Pass hold has operator=true; a done verdict alone does not release the hold.",
+        "sources": [
+          {
+            "type": "hold",
+            "repository": "o/ops",
+            "number": 1
+          }
+        ],
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null,
+        "facts": "no apply",
+        "quality": "missing-concrete-decision",
+        "actions": [
+          {
+            "kind": "promote",
+            "supported": false,
+            "reason": "Upstream promotion evaluation and writes are not implemented."
+          },
+          {
+            "kind": "merge-or-enqueue",
+            "supported": false,
+            "reason": "Only the poll may merge/enqueue after fresh policy, review and check validation; this publication is not a merge endpoint."
+          },
+          {
+            "kind": "reply",
+            "supported": false,
+            "reason": "No checked reply endpoint or answer acknowledgement is supplied by this publication; open the source and reply manually."
+          },
+          {
+            "kind": "close",
+            "supported": false,
+            "reason": "A digest's stale assessment is not a current-state close precondition; no checked close endpoint is supplied here."
+          }
+        ],
+        "resolution": "Pending, never inferred complete from a bot done verdict or an answer in prose. Re-read the target and source before acting; the next complete source read must remove or change the underlying wait. Holds require label/Why/policy change; already-answered waits the poll can act on are not human requests. Null revision/source_time means unknown, not current."
+      }
+    ],
+    "request_sources": [
+      {
+        "key": "o/a#1",
+        "ask": {
+          "key": "o/a#1",
+          "item": "o/a#1",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-10-28T08:00:00Z",
+          "ask": "Approve o/a#1 at its head?",
+          "recommendation": null,
+          "target": "https://github.com/o/a/pull/1",
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/a",
+            "number": 1,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "source_ref": {
+            "type": "comment",
+            "repository": "o/a",
+            "number": 1
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null
+      },
+      {
+        "key": "o/a#2",
+        "ask": {
+          "key": "o/a#2",
+          "item": "o/a#2",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-10-28T08:00:00Z",
+          "ask": "Approve o/a#2 at its head?",
+          "recommendation": null,
+          "target": "https://github.com/o/a/pull/2",
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/a",
+            "number": 2,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "source_ref": {
+            "type": "comment",
+            "repository": "o/a",
+            "number": 2
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null
+      },
+      {
+        "key": "o/a#3",
+        "ask": {
+          "key": "o/a#3",
+          "item": "o/a#3",
+          "source": "reviews",
+          "kind": "review-approve",
+          "priority": null,
+          "waiting_since": "2026-10-28T08:00:00Z",
+          "ask": "Approve o/a#3 at its head?",
+          "recommendation": null,
+          "target": "https://github.com/o/a/pull/3",
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "action": {
+            "type": "approve_pull_request",
+            "repository": "o/a",
+            "number": 3,
+            "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "source_ref": {
+            "type": "comment",
+            "repository": "o/a",
+            "number": 3
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": null
+      },
+      {
+        "key": "o/d#1/digest",
+        "ask": {
+          "key": "o/d#1/digest",
+          "item": "o/d#1",
+          "source": "digest",
+          "kind": "digest-waiting",
+          "priority": null,
+          "waiting_since": "2026-10-28T08:00:00Z",
+          "ask": "Reply to the author?",
+          "recommendation": null,
+          "target": "https://github.com/o/d/pull/1",
+          "head": null,
+          "action": {
+            "type": "reply_pull_request",
+            "repository": "o/d",
+            "number": 1
+          },
+          "source_ref": {
+            "type": "comment",
+            "repository": "o/d",
+            "number": 1
+          },
+          "epic": "unknown",
+          "topEpic": "unknown"
+        },
+        "observed_at": "2026-11-06T12:00:00Z",
+        "source_time": "2026-10-28T08:00:00Z"
+      }
+    ],
+    "summary_cache": {
+      "o/t#20": {
+        "question": "Label o/t#20 an epic?",
+        "recommendation": null
+      },
+      "o/t#30": {
+        "question": "Merge or close o/t#30?",
+        "recommendation": null
+      }
+    },
+    "approval_evidence": {
+      "schema": "agent-board/approval-evidence/v1",
+      "observed_at": "2026-11-06T12:00:00Z",
+      "omitted": 0,
+      "items": {
+        "o/a#1": {
+          "assessed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "diff": {
+            "additions": 1,
+            "deletions": 1
+          },
+          "ci": {
+            "state": "green",
+            "complete": true
+          },
+          "review": {
+            "verdict": "approved",
+            "at": "2026-10-28T07:00:00Z"
+          }
+        },
+        "o/a#2": {
+          "assessed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "diff": {
+            "additions": 1,
+            "deletions": 1
+          },
+          "ci": {
+            "state": "pending",
+            "complete": true
+          },
+          "review": {
+            "verdict": "approved",
+            "at": "2026-10-28T07:00:00Z"
+          }
+        },
+        "o/a#3": {
+          "assessed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "diff": {
+            "additions": 1,
+            "deletions": 1
+          },
+          "ci": {
+            "state": "green",
+            "complete": true
+          },
+          "review": null
+        }
+      }
+    },
+    "act_now": [
+      {
+        "key": "o/t#20",
+        "unblocks": 63,
+        "priority": "P2",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 20
+        }
+      },
+      {
+        "key": "o/t#30",
+        "unblocks": 3,
+        "priority": "P2",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "action": {
+          "type": "pull_request",
+          "repository": "o/t",
+          "number": 30
+        }
+      },
+      {
+        "key": "o/t#10",
+        "unblocks": 1,
+        "priority": "P1",
+        "waiting_since": "2026-11-06T12:00:00Z",
+        "action": {
+          "type": "issue",
+          "repository": "o/t",
+          "number": 10
+        }
+      },
+      {
+        "key": "o/a#1",
+        "unblocks": 1,
+        "priority": null,
+        "waiting_since": "2026-10-28T08:00:00Z",
+        "action": {
+          "type": "approve_pull_request",
+          "repository": "o/a",
+          "number": 1,
+          "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    ]
+  }
+}

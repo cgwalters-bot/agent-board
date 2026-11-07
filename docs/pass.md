@@ -713,6 +713,50 @@ non-green, moved-head and evicted rows; a producer test binds and serializes
 those entries into exactly its `approval_evidence`, and poll tests build the
 evidence itself from pull request reads.
 
+#### Act now (optional v2 extension)
+
+With `holds.actNow` (off unless set; needs `holds.needsYou` and
+`holds.approvalEvidence`, GitHub only; agent-board#760), the list also has `act_now`, the shortlist review's Act now
+section shows above the rest. The threat it stops is the app showing as the
+operator's to act on what waits on CI, an agent or an upstream author, or
+guessing from prose what one decision unblocks: the pass picks the records
+from its own typed facts, and the app only renders them.
+
+```json
+"act_now":[{"key":"o/t#20","unblocks":63,"priority":"P2","waiting_since":"2026-11-06T12:00:00Z","action":{"type":"issue","repository":"o/t","number":20}},
+{"key":"o/a#1","unblocks":1,"priority":null,"waiting_since":"2026-10-28T08:00:00Z","action":{"type":"approve_pull_request","repository":"o/a","number":1,"head":"aaaa…"}}]
+```
+
+Each record joins the `items` card of the same `key`, which has the question;
+`priority`, `waiting_since` and `action` are that card's, `action` with the
+full `head` where an approval or review is bound to one. A card qualifies
+where it is not carried, its kind is neither `stalled` (the pass is stuck;
+there is no one action) nor `digest-waiting` (the pull request waits on its
+author), and every [request](#semantic-operator-requests-optional-v2-extension)
+it has is of quality `decision` (fresh and concrete, so not a hold's bare
+reason or a generic question). An approval among them also needs this pass's
+[approval evidence](#approval-evidence-optional-v2-extension) for the card,
+with `ci.state` `green` and a `review` verdict: otherwise it may still wait
+on CI, a fix round or the review job, and an approval without evidence (past
+its 50 rows, read at another head, or a digest's) is left out rather than
+guessed at, as is a hold on the operator's approval of a pull request
+(`approve pull request REPO#N to merge`) that stage 2 did not join to that
+pull request's approval wait. `unblocks` is how many items wait on the decision, from what the
+pass decided, never from a reason's text: a group's members, the open
+children held under a parent that is not a live epic, the items a
+[blocker](#blockers) holds by overlap, and 1 otherwise, at most 10,000. Some
+of those may have other holds besides. Records are ranked by `unblocks`,
+most first, then in the list's order (Priority, then the longest waiting),
+and at most 10 are kept. An empty array means nothing qualifies; absent, the
+option is off. A card left out to fit the comment takes its record along,
+and no other takes its place. The records are at most a few
+kilobytes, and are made again each pass from what it read, never carried.
+They are display and ranking data, not authority: the app re-reads the
+target before any write. The [schema](act-now.schema.json) describes the
+array, and the [shared fixture](../fixtures/act-now-needs-you.json) is a
+producer test's publication of a list with a 63-child epic, a blocker, a
+question, a green and reviewed approval and the asks it leaves out.
+
 #### Semantic operator requests (optional v2 extension)
 
 `needs_you.requests` is optional list-level metadata. Each descriptor joins a legacy
@@ -3695,6 +3739,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.proposals` | `{"repository", "label", "repositories", "org"?}`: list in the needs-you list the operator-action proposals on that repository's open issues with that label, checked as `action check` would with those `repositories` and `org`; needs `holds.needsYou`; absent (off) |
 | `holds.drafts` | Repository whose open `review-draft` issues the needs-you list reads with review-send's source rules; needs `holds.needsYou`, GitHub only; absent (off) |
 | `holds.approvalEvidence` | Add stage 2's head-bound [approval evidence](#approval-evidence-optional-v2-extension) to the needs-you list; needs `holds.needsYou`, GitHub only; `false` |
+| `holds.actNow` | Add the [Act now](#act-now-optional-v2-extension) shortlist to the needs-you list; needs `holds.needsYou` and `holds.approvalEvidence`, GitHub only; `false` |
 | `holds.passView` | Add the [pass view](#pass-view) (`agent-board/pass-view/v1`): the last passes, pool pace and runs in flight; needs `holds`, GitHub only; `false` |
 | `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |

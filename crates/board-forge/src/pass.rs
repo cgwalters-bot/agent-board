@@ -793,6 +793,11 @@ pub struct HoldsAt {
     /// `needsYou`.
     #[serde(default, rename = "approvalEvidence")]
     pub approval_evidence: bool,
+    /// Off unless set: adds the shortlist of what the operator can decide
+    /// now, most unblocking first ([`holds::ActNow`]), to the needs-you
+    /// list; needs `needsYou` and `approvalEvidence`.
+    #[serde(default, rename = "actNow")]
+    pub act_now: bool,
     /// Off unless set: adds the pass view ([`view::SCHEMA`]), the last
     /// passes, the pools' pace and the runs in flight, to the snapshot.
     #[serde(default, rename = "passView")]
@@ -1175,6 +1180,18 @@ impl Config {
                 ensure!(
                     self.forgejo_board().is_none(),
                     "holds approvalEvidence supports only GitHub"
+                );
+            }
+            if holds.act_now {
+                ensure!(holds.needs_you, "holds actNow needs holds needsYou");
+                // Without approval evidence no approval could qualify.
+                ensure!(
+                    holds.approval_evidence,
+                    "holds actNow needs holds approvalEvidence"
+                );
+                ensure!(
+                    self.forgejo_board().is_none(),
+                    "holds actNow supports only GitHub"
                 );
             }
             if let Some(proposals) = &holds.proposals {
