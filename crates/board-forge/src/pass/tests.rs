@@ -2488,6 +2488,21 @@ impl Forge {
             "user": {"login": "cgwalters-bot"}, "body": body}));
     }
 
+    /// The plain hold snapshot the last write of its comments published,
+    /// put back together from its parts ([`holds::assemble`]).
+    pub(super) fn holds_publication(&self) -> Option<String> {
+        let writes = self.writes.borrow();
+        let bodies = writes.iter().filter(|(method, ..)| method != "GET");
+        let bodies: Vec<&str> = bodies.map(|(.., body)| text(body, "/body")).collect();
+        let first = bodies
+            .iter()
+            .rfind(|b| b.starts_with(holds::HOLDS_MARKER))?;
+        let parts: Vec<&str> = (bodies.iter().copied())
+            .filter(|b| b.starts_with(holds::PART_MARKER))
+            .collect();
+        holds::assemble(first, &parts)
+    }
+
     /// The actual emitted holds comment, not a reconstruction from the report.
     pub(super) fn published_holds(&self) -> Option<(String, String)> {
         self.writes
@@ -3049,6 +3064,59 @@ fn apply_publishes_the_refreshed_usage() {
             assert_eq!(published, expected);
         }
     }
+}
+
+/// The holds issue's comments are read a page at most, as the review app
+/// reads them, within the reads kept for the publication: past it, the pass
+/// says so rather than spend the reserve or miss a part (agent-board#774).
+#[test]
+fn holds_past_one_page_of_comments_are_not_published() {
+    let mut forge = Forge::new(None, false);
+    let at = forge.holds_destination(true);
+    let page = answer(&mut forge.replay, "bot-ops/issues/1/comments");
+    let next =
+        format!("{API_ROOT}repos/cgwalters-forge/bot-ops/issues/1/comments?per_page=100&page=2");
+    page["link"] = format!("<{next}>; rel=\"next\"").into();
+    let config = config(json!({"wip": 8, "holds": at}));
+    let now = forge.replay.now;
+    let mode = (Mode::Actions(&own()), Limits::default());
+    let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+    let line = "holds error: holds: publish to cgwalters-forge/bot-ops#1: the hold snapshot's issue has more than 1 pages of comments";
+    assert!(
+        report.lines.iter().any(|l| l == line),
+        "{:#?}",
+        report.lines
+    );
+    assert!(forge.published_holds().is_none());
+}
+
+/// Nor is a publication that would add a comment past that page, where
+/// neither the next pass nor the review app would read it: refused before
+/// any write.
+#[test]
+fn holds_that_would_overflow_the_page_are_not_published() {
+    let mut forge = Forge::new(None, false);
+    let at = forge.holds_destination(true);
+    let page = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+    let others = (page.as_array().unwrap().len()..100)
+        .map(|n| json!({"id": 100 + n, "user": {"login": "someone"}, "body": "hi"}));
+    page.as_array_mut().unwrap().extend(others);
+    let config = config(json!({"wip": 8, "holds": at}));
+    let now = forge.replay.now;
+    let mode = (Mode::Actions(&own()), Limits::default());
+    let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+    let line = "holds error: holds: publish to cgwalters-forge/bot-ops#1: 1 new comment(s) would fall past the first 100 the review app reads";
+    assert!(
+        report.lines.iter().any(|l| l == line),
+        "{:#?}",
+        report.lines
+    );
+    let writes = forge.writes.borrow();
+    assert!(
+        !writes
+            .iter()
+            .any(|(m, url, _)| m != "GET" && url.contains("bot-ops"))
+    );
 }
 
 /// With `holds`, an applying pass publishes stages 3 and 4's holds by kind,
@@ -4195,15 +4263,23 @@ fn apply_publishes_what_needs_you() {
     }
     let report = apply_within(&forge, &with_wip(2), PASS_REQUEST_LIMIT);
     assert_eq!(report.failures, 0, "{:?}", report.lines);
-    let capped = forge
-        .writes
-        .borrow()
-        .iter()
-        .find(|(m, url, _)| m == "PATCH" && url.starts_with(&bot_ops))
-        .map(|(_, _, body)| text(body, "/body").to_owned())
-        .unwrap_or_else(|| panic!("{:?}", report.lines));
-    assert!(capped.chars().count() <= holds::MAX_COMMENT_CHARS);
-    let capped = holds::parse(&capped).unwrap();
+    // It is compressed across comments, each within GitHub's size, and
+    // nothing is left out of it (agent-board#774).
+    let writes = forge.writes.borrow();
+    let written: Vec<&str> = (writes.iter())
+        .filter(|(m, url, _)| m != "GET" && url.starts_with(&bot_ops))
+        .map(|(.., body)| text(body, "/body"))
+        .collect();
+    assert!(written.iter().any(|b| b.contains(holds::PARTS_SCHEMA)));
+    assert!(
+        written
+            .iter()
+            .all(|b| b.chars().count() <= holds::MAX_COMMENT_CHARS)
+    );
+    let whole = forge.holds_publication().unwrap();
+    assert!(whole.chars().count() > holds::MAX_COMMENT_CHARS);
+    let whole = holds::parse(&whole).unwrap();
+    drop(writes);
     assert!(
         forge
             .chain_reads
@@ -4222,9 +4298,8 @@ fn apply_publishes_what_needs_you() {
     let ancestor = reads.iter().position(|i| i == "a/ancestors#1").unwrap();
     assert!(ancestor >= 400);
     assert_eq!(reads.iter().filter(|i| *i == "a/ancestors#1").count(), 1);
-    assert_eq!(capped["needs_you"]["complete"], false);
-    assert!(capped["needs_you"]["omitted"].as_u64().unwrap() > 0);
-    assert!(capped["needs_you"]["count"].as_u64().unwrap() >= 400);
+    assert_eq!(whole["needs_you"]["omitted"], 0);
+    assert!(whole["needs_you"]["identities"].as_array().unwrap().len() >= 400);
     let list = &snapshot["needs_you"];
     assert_eq!(list["schema"], holds::NEEDS_YOU_SCHEMA);
     assert_eq!(
@@ -4463,14 +4538,35 @@ fn apply_publishes_what_needs_you() {
             None,
             vec![proposal(21), proposal(22), proposal(23)],
         ),
-        ("edited by another", Some(foreign), vec![]),
+        ("edited by another", Some((7, foreign.clone())), vec![]),
+        // Compressed across comments, each part is checked as the first is
+        // (agent-board#774): one another account edited plants as much.
+        ("a part edited by another", Some((9, foreign)), vec![]),
     ] {
-        let mut forge = forge_with(Some(&body));
+        let at = holds::parse(&body).unwrap()["at"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let split = holds::split(&body, &at, 1_300).unwrap();
+        assert!(split.len() > 2);
+        let parted = name.starts_with("a part");
+        let mut forge = forge_with(Some(if parted { &split[0] } else { &body }));
+        if parted {
+            let comments = &mut answer(&mut forge.replay, "bot-ops/issues/1/comments")["body"];
+            for (n, part) in split[1..].iter().enumerate() {
+                let id = 8 + n as u64;
+                comments
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id": id, "node_id": format!("IC_{id}"),
+                    "user": {"login": "cgwalters-bot"}, "body": part}));
+            }
+        }
         let listing = json!({"get": proposal_issues});
         let entry = (forge.replay.requests.iter_mut()).find(|e| e["request"] == listing);
         entry.unwrap()["answer"]["status"] = json!(502);
-        if let Some(node) = edit {
-            let request = graphql_key(needs::EDITS_QUERY, &json!({"id": "IC_7"}));
+        if let Some((id, node)) = edit {
+            let request = graphql_key(needs::EDITS_QUERY, &json!({"id": format!("IC_{id}")}));
             let answer = json!({"data": {"node": node}});
             forge
                 .replay
@@ -13726,17 +13822,7 @@ fn approval_evidence_combined_transport_replay() {
         forge
     };
     let publication = |forge: &Forge, report: &Report| {
-        forge
-            .writes
-            .borrow()
-            .iter()
-            .find_map(|(_, _, value)| {
-                value["body"]
-                    .as_str()
-                    .filter(|b| holds::parse(b).is_some())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| panic!("{:?}", report.lines))
+        (forge.holds_publication()).unwrap_or_else(|| panic!("{:?}", report.lines))
     };
     // Seed real carried approvals, including evidence at the previous head.
     let seed = prepare(OLD, 1..=2);
@@ -13807,7 +13893,6 @@ fn approval_evidence_combined_transport_replay() {
                     .any(|i| i["item"] == format!("{OLD}#1") && i["carried"] == true)
             );
             assert!(!identities.iter().any(|i| i["item"] == format!("{OLD}#2")));
-            assert!(body.chars().count() <= holds::MAX_COMMENT_CHARS);
             let projection = json!({"identities":list["identities"],"counts":list["counts"],
             "count":list["count"],"complete":list["complete"],"sources":list["sources"]});
             if gate {
@@ -13816,14 +13901,9 @@ fn approval_evidence_combined_transport_replay() {
                 assert_eq!(evidence["schema"], "agent-board/approval-evidence/v1");
                 assert_eq!(evidence["observed_at"], list["validated_at"]);
                 let entries = evidence["items"].as_object().unwrap();
-                // The 52-row replay naturally exceeds the real comment bound:
-                // two observations exceed the cap and all 50 retained entries
-                // are then evicted by fit before any detail-card eviction.
-                let expected = if fresh_count == FRESH_COUNT {
-                    0
-                } else {
-                    fresh_count as usize
-                };
+                // Of the 52-row replay's, two observations exceed the cap;
+                // the 50 retained fit the compressed publication whole.
+                let expected = (fresh_count as usize).min(holds::MAX_APPROVAL_EVIDENCE);
                 assert_eq!(entries.len(), expected);
                 assert_eq!(
                     entries.len() + evidence["omitted"].as_u64().unwrap() as usize,

@@ -530,6 +530,20 @@ fn status_updates_report_the_needs_human_queue_from_the_hold_snapshot() {
         let snap = json!({"schema": HOLDS_SCHEMA, "at": "2026-10-16T11:50:00Z", "truncated": 0, "holds": holds});
         json!([{"user": {"login": author}, "body": format!("{HOLDS_MARKER}\nHolds.\n\n```json\n{snap}\n```\n")}])
     };
+    let compressed = |holds: &Value| {
+        let at = "2026-10-16T11:50:00Z";
+        let pad = "x".repeat(crate::pass::holds::MAX_COMMENT_CHARS);
+        let snap =
+            json!({"schema": HOLDS_SCHEMA, "at": at, "truncated": 0, "holds": holds, "pad": pad});
+        let body = format!("{HOLDS_MARKER}\nHolds.\n\n```json\n{snap}\n```\n");
+        let parts = crate::pass::holds::parts(&body, at).unwrap();
+        assert!(parts[0].len() < body.len());
+        let usage = json!({"user": {"login": "worker"}, "body": "<!-- bot-usage v1 -->"});
+        let parts = parts
+            .into_iter()
+            .map(|b| json!({"user": {"login": "worker"}, "body": b}));
+        Value::Array(std::iter::once(usage).chain(parts).collect())
+    };
     let link =
         |n: u64| format!("[example/project#{n}](https://github.com/example/project/issues/{n})");
     let top = format!(
@@ -589,6 +603,14 @@ fn status_updates_report_the_needs_human_queue_from_the_hold_snapshot() {
                 "**Needs human:** 0, 2 fewer than at the last update, as of 2026-10-16T11:50:00Z."
                     .into(),
             ),
+        ),
+        // Past one comment, as the pass publishes it compressed (agent-board#774).
+        (
+            "compressed",
+            compressed(&holds),
+            "**Needs human:** 7.",
+            since,
+            Some(line(", as at the last update")),
         ),
         ("no snapshot", json!([]), "**Needs human:** 2", since, None),
         (

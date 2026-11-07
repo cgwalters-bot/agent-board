@@ -671,6 +671,13 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         name: &str,
         body: String,
     ) -> Result<String> {
+        self.private(on, name)?;
+        self.write_comment(on, comment, name, body)
+    }
+
+    /// Fails unless the repository `on` is private, where a snapshot of
+    /// `name` may be written.
+    fn private(&self, on: (&str, u64), name: &str) -> Result<()> {
         let repo = on.0;
         let response = self.client.get(&format!("{API_ROOT}repos/{repo}"), None)?;
         ensure!(
@@ -682,11 +689,75 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             response.body["private"] == true,
             "{repo} is not private; the {name} snapshot is not written there"
         );
-        self.write_comment(on, comment, name, body)
+        Ok(())
+    }
+
+    /// [`Self::publish`] of the hold snapshot's `bodies` ([`holds::parts`]),
+    /// one write step: those past the first to the bot's `parts` the
+    /// published header does not use (`used`), or new comments, last to
+    /// first ([`holds::targets`]), then the first to `comment`, so that a
+    /// failed write leaves the published snapshot whole. Refused before any
+    /// write where a new comment would fall past the `room` read. Its URL.
+    fn publish_parts(
+        &self,
+        on: (&str, u64),
+        (comment, parts, used, room): (Option<&Value>, &[Value], &[usize], usize),
+        bodies: Vec<String>,
+    ) -> Result<String> {
+        let targets = holds::targets(parts.len(), used, bodies.len());
+        let added = usize::from(comment.is_none()) + targets.iter().filter(|t| t.is_none()).count();
+        ensure!(
+            added <= room,
+            "{added} new comment(s) would fall past the first {} the review app reads",
+            HOLDS_PAGES * COMMENTS_PER_PAGE
+        );
+        self.private(on, "hold")?;
+        if added > 0 {
+            self.bot_account()?;
+        }
+        self.caps.count(Kind::Write);
+        let mut url = String::new();
+        for (n, body) in bodies.into_iter().enumerate().rev() {
+            let to = match n {
+                0 => comment,
+                n => targets[n - 1].map(|t| &parts[t]),
+            };
+            url = self.send_comment(on, to, "hold", body)?;
+        }
+        Ok(url)
+    }
+
+    /// Fails unless the token is the bot's: only the bot's comment is found
+    /// again, and under another login each pass would add one more.
+    fn bot_account(&self) -> Result<()> {
+        let account = self.client.get(&format!("{API_ROOT}user"), None)?;
+        let login = text(&account.body, "/login");
+        ensure!(
+            login.eq_ignore_ascii_case(&self.config.bot),
+            "the token is {login:?}'s, not {}'s; not adding a comment it would not find again",
+            self.config.bot
+        );
+        Ok(())
     }
 
     /// [`Self::publish`] without the private check, for what may be public.
     pub(in crate::pass) fn write_comment(
+        &self,
+        on: (&str, u64),
+        comment: Option<&Value>,
+        name: &str,
+        body: String,
+    ) -> Result<String> {
+        if comment.is_none() {
+            self.bot_account()?;
+        }
+        self.caps.count(Kind::Write);
+        self.send_comment(on, comment, name, body)
+    }
+
+    /// Writes `body` to `comment`, or a new comment on issue `on`, as is:
+    /// neither counted nor checked. Its URL.
+    fn send_comment(
         &self,
         on: (&str, u64),
         comment: Option<&Value>,
@@ -705,21 +776,11 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
                     format!("{API_ROOT}repos/{repo}/issues/comments/{id}"),
                 )
             }
-            None => {
-                // Only the bot's comment is found again: under another
-                // login, each pass would add one more.
-                let account = self.client.get(&format!("{API_ROOT}user"), None)?;
-                let login = text(&account.body, "/login");
-                ensure!(
-                    login.eq_ignore_ascii_case(&self.config.bot),
-                    "the token is {login:?}'s, not {}'s; not adding a comment it would not find again",
-                    self.config.bot
-                );
-                let url = format!("{API_ROOT}repos/{repo}/issues/{issue}/comments");
-                ("POST", url)
-            }
+            None => (
+                "POST",
+                format!("{API_ROOT}repos/{repo}/issues/{issue}/comments"),
+            ),
         };
-        self.caps.count(Kind::Write);
         let (status, answer) = self.client.send(method, &url, &body)?;
         ensure!(
             (200..300).contains(&status),
@@ -752,22 +813,35 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         let on = (at.repository.as_str(), at.issue);
         let said = format!("holds: publish to {}#{}", at.repository, at.issue);
         // The published snapshot first: its holds' times carry over.
-        let comment = self.bot_comment(on, holds::HOLDS_MARKER, "hold snapshot");
-        let changed = comment.and_then(|comment| {
-            let published = comment.as_ref().map(|c| text(c, "/body"));
-            let previous = published.and_then(holds::published);
-            let snapshot = self.hold_snapshot(previous.as_ref(), comment.as_ref());
+        let comments = self.hold_comments(on);
+        let changed = comments.and_then(|(comment, parts, room)| {
+            // Parts of two snapshots, as when a pass failed part way through
+            // writing them, are none: the next writes them all again.
+            let assembled = comment.as_ref().and_then(|c| {
+                let others: Vec<&str> = parts.iter().map(|p| text(p, "/body")).collect();
+                holds::assemble_from(text(c, "/body"), &others)
+            });
+            let (published, used) = assembled.unzip();
+            let used = used.unwrap_or_default();
+            let previous = published.as_deref().and_then(holds::published);
+            let checked: Vec<&Value> = used.iter().map(|&n| &parts[n]).collect();
+            let snapshot = self.hold_snapshot(previous.as_ref(), (comment.as_ref(), &checked));
             let asked = snapshot.pass_view.is_some();
-            let (snapshot, body) = holds::fit(snapshot)?;
-            let view = match (asked, snapshot.pass_view.is_some()) {
-                (true, true) => ", with the pass view",
-                (true, false) => ", without the pass view, over the comment's size",
-                (false, _) => "",
+            let (snapshot, body) = holds::fit_to(snapshot, holds::Bound::Parts)?;
+            let mut view = match (asked, snapshot.pass_view.is_some()) {
+                (true, true) => ", with the pass view".to_owned(),
+                (true, false) => ", without the pass view, over the comments' size".to_owned(),
+                (false, _) => String::new(),
             };
-            Ok((holds::changed(published, &snapshot)?, body, comment, view))
+            let changed = holds::changed(published.as_deref(), &snapshot)?;
+            let bodies = holds::parts(&body, &snapshot.at)?;
+            if bodies.len() > 1 {
+                view.push_str(&format!(", compressed across {} comments", bodies.len()));
+            }
+            Ok((changed, bodies, (comment, parts, used, room), view))
         });
-        let (body, comment, view) = match changed {
-            Ok((true, body, comment, view)) => (body, comment, view),
+        let (bodies, comments, view) = match changed {
+            Ok((true, bodies, comments, view)) => (bodies, comments, view),
             Ok((false, ..)) => {
                 self.line("holds: unchanged".into());
                 return;
@@ -798,7 +872,8 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             ));
             return;
         }
-        let published = self.publish(on, comment.as_ref(), "hold", body);
+        let (comment, parts, used, room) = &comments;
+        let published = self.publish_parts(on, (comment.as_ref(), parts, used, *room), bodies);
         match published {
             Ok(url) => self.line(format!("holds: published {url}{view}{past_cap}")),
             Err(error) => {
@@ -828,11 +903,11 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
     /// stall alarms, each said in a `stall …` line ([`holds::alarm`]), and
     /// with `holds.needsYou` what waits on the operator, carrying over
     /// from the published list only where the bot last edited its
-    /// `comment`.
+    /// `comment` and each of the `parts` it was assembled from.
     fn hold_snapshot(
         &mut self,
         previous: Option<&Value>,
-        comment: Option<&Value>,
+        (comment, parts): (Option<&Value>, &[&Value]),
     ) -> holds::Snapshot {
         let stamp = self.now.format(&Rfc3339).unwrap_or_default();
         let tally = self.report.tally.clone();
@@ -875,7 +950,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
         if at.needs_you {
             let listed = previous.is_some_and(|p| p.get("needs_you").is_some());
-            let own = listed && comment.is_some_and(|c| self.bot_edited(c));
+            let own = listed
+                && comment.is_some_and(|c| self.bot_edited(c))
+                && parts.iter().all(|c| self.bot_edited(c));
             let previous = previous.filter(|_| own);
             snapshot.needs_you = Some(self.needs_you(&mut snapshot, previous, &on));
         }

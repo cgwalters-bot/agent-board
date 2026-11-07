@@ -20,10 +20,13 @@ use crate::github::DEFAULT_HOST;
 use crate::poll::{approval, validate_repository};
 use crate::supervise::health::json_block;
 use anyhow::{Result, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use board_core::ItemRef;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read as _, Write as _};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// The schema of the hold snapshot ([`super::Config::holds`]).
@@ -38,6 +41,27 @@ const QUESTION_PREFIX: &str = "Q:";
 /// for a comment with room to spare; past it, holds that do not wait on the
 /// operator are left out ([`fit`]).
 pub const MAX_COMMENT_CHARS: usize = 60_000;
+/// The schema of the header of a hold snapshot published compressed,
+/// across comments ([`parts`]).
+pub const PARTS_SCHEMA: &str = "agent-board/holds-parts/v1";
+/// The first line of each of a compressed hold snapshot's comments after
+/// the first, which has [`HOLDS_MARKER`].
+pub const PART_MARKER: &str = "<!-- agent-board-holds part v1 -->";
+/// How a compressed hold snapshot is encoded: its plain comment
+/// ([`render`]), gzipped, in standard base64, cut into [`PART_CHARS`] pieces.
+const PARTS_ENCODING: &str = "gzip+base64";
+/// The most comments a hold snapshot takes on GitHub (agent-board#774); no
+/// more than the writes the pass keeps back ([`super::WRITE_RESERVE`]).
+pub const MAX_PARTS: usize = 4;
+/// The base64 characters each comment of a compressed snapshot carries:
+/// under [`MAX_COMMENT_CHARS`] with room for its marker and header.
+const PART_CHARS: usize = 59_000;
+/// The longest plain snapshot published compressed, in characters, however
+/// well it compresses, so that what a reader inflates is bounded.
+pub const MAX_SNAPSHOT_CHARS: usize = 2_000_000;
+/// The most bytes of a compressed snapshot [`assemble`] inflates: UTF-8 of
+/// [`MAX_SNAPSHOT_CHARS`].
+const MAX_SNAPSHOT_BYTES: usize = 4 * MAX_SNAPSHOT_CHARS;
 /// The most children waiting on the operator a not-live epic's entry names
 /// ([`not_live`]); it counts the rest.
 const MAX_NAMED: usize = 3;
@@ -2830,14 +2854,52 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 /// fit, [`cap`] leaves out more, honestly counted, so that size
 /// never keeps the inbox from being published: the body is always at most
 /// [`MAX_COMMENT_CHARS`].
-pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
-    if snapshot.today.is_some() && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS {
+pub fn fit(snapshot: Snapshot) -> Result<(Snapshot, String)> {
+    fit_to(snapshot, Bound::Comment)
+}
+
+/// Where a hold snapshot is published, which bounds its size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// One plain comment of at most [`MAX_COMMENT_CHARS`], for a reader that
+    /// takes nothing else (Forgejo's pass).
+    Comment,
+    /// One plain comment where it fits, else at most [`MAX_PARTS`]
+    /// compressed ([`parts`]), of a snapshot of at most [`MAX_SNAPSHOT_CHARS`].
+    Parts,
+}
+
+impl Bound {
+    /// How far the [`render`]ed `body` is past this bound: in characters of
+    /// the plain body, or for [`Bound::Parts`] past one comment, the larger
+    /// of that past [`MAX_SNAPSHOT_CHARS`] and its encoding's past what
+    /// [`MAX_PARTS`] comments carry. The latter is in compressed characters,
+    /// so [`fit_to`], which leaves out by plain size, mostly cuts less a
+    /// round than it might and takes more rounds; only text that compresses
+    /// worse than base64's expansion could make a round cut more.
+    fn over(self, body: &str) -> Result<usize> {
+        let chars = body.chars().count();
+        if chars <= MAX_COMMENT_CHARS {
+            return Ok(0);
+        }
+        Ok(match self {
+            Bound::Comment => chars - MAX_COMMENT_CHARS,
+            Bound::Parts => {
+                let encoded = encode(body)?.len();
+                let plain = chars.saturating_sub(MAX_SNAPSHOT_CHARS);
+                plain.max(encoded.saturating_sub(MAX_PARTS * PART_CHARS))
+            }
+        })
+    }
+}
+
+/// [`fit`] within `bound`.
+pub fn fit_to(mut snapshot: Snapshot, bound: Bound) -> Result<(Snapshot, String)> {
+    if snapshot.today.is_some() && bound.over(&render(&snapshot)?)? > 0 {
         snapshot.today = None;
     }
     // Optional work detail never evicts the operator inbox or stall clocks.
-    if snapshot.dispatchable_work.is_some()
-        && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS
-    {
+    if snapshot.dispatchable_work.is_some() && bound.over(&render(&snapshot)?)? > 0 {
         snapshot.dispatchable_work = None;
     }
     let holds = &snapshot.holds;
@@ -2895,7 +2957,7 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
     loop {
         let fitted = without(&dropped, &needs_you, &pass_view);
         let body = render(&fitted)?;
-        let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
+        let mut over = bound.over(&body)?;
         if over == 0 {
             return Ok((fitted, body));
         }
@@ -2934,7 +2996,7 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
                 // card, the cap leaves out what it must and says so. The
                 // holds this round dropped are not in `fitted`.
                 let Some(_) = needs_you.as_mut().and_then(NeedsYou::cut) else {
-                    return cap(without(&dropped, &needs_you, &pass_view));
+                    return cap(without(&dropped, &needs_you, &pass_view), bound);
                 };
                 // A cut removes its descriptor too; re-render before cutting
                 // again so that the additional savings do not overcut asks.
@@ -2955,10 +3017,10 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
 /// number of decisions), after each batch of them the epic activity no kept
 /// identity names, then the protected holds in [`left_out_first`] order, counted in
 /// `truncated`, until it fits.
-fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
+fn cap(mut snapshot: Snapshot, bound: Bound) -> Result<(Snapshot, String)> {
     loop {
         let body = render(&snapshot)?;
-        let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
+        let mut over = bound.over(&body)?;
         if over == 0 {
             return Ok((snapshot, body));
         }
@@ -3049,6 +3111,136 @@ fn cap(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
 /// The JSON of a published hold comment, if it is one of [`HOLDS_SCHEMA`].
 pub fn published(body: &str) -> Option<Value> {
     json_block(body).filter(|s| s["schema"] == HOLDS_SCHEMA)
+}
+
+/// `body` gzipped, in standard base64.
+fn encode(body: &str) -> Result<String> {
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    gzip.write_all(body.as_bytes())?;
+    Ok(STANDARD.encode(gzip.finish()?))
+}
+
+/// The comments that publish `body`, a snapshot at `at` as [`fit_to`]
+/// renders it for [`Bound::Parts`]: itself, where it fits one comment;
+/// else its encoding ([`PARTS_ENCODING`]) cut across at most
+/// [`MAX_PARTS`], the first with [`HOLDS_MARKER`] and a header that counts
+/// them, each other with [`PART_MARKER`], its number and `at`. They are
+/// written last to first, so that a reader never takes parts of two
+/// snapshots for one ([`assemble`]).
+pub fn parts(body: &str, at: &str) -> Result<Vec<String>> {
+    if body.chars().count() <= MAX_COMMENT_CHARS {
+        return Ok(vec![body.to_owned()]);
+    }
+    ensure!(
+        body.chars().count() <= MAX_SNAPSHOT_CHARS,
+        "the hold snapshot is over {MAX_SNAPSHOT_CHARS} characters"
+    );
+    split(body, at, PART_CHARS)
+}
+
+/// [`parts`]'s compressed comments of `body`, in pieces of `chars`; tests
+/// split a small snapshot across several with it.
+pub(crate) fn split(body: &str, at: &str, chars: usize) -> Result<Vec<String>> {
+    let encoded = encode(body)?;
+    // Base64 is ASCII: any byte boundary is a character's.
+    let chunks: Vec<&str> = (encoded.as_bytes().chunks(chars))
+        .map(std::str::from_utf8)
+        .collect::<Result<_, _>>()?;
+    let count = chunks.len();
+    ensure!(
+        count <= MAX_PARTS,
+        "the hold snapshot compresses to {count} comments, over {MAX_PARTS}"
+    );
+    let comments = chunks.iter().enumerate().map(|(n, chunk)| {
+        let (marker, header, said) = match n {
+            0 => (
+                HOLDS_MARKER,
+                serde_json::json!({"schema": PARTS_SCHEMA, "at": at,
+                    "encoding": PARTS_ENCODING, "parts": count}),
+                format!(
+                    "Holds as of {at}, compressed across {count} comments. Written by `agent-board pass`; the review app reads them."
+                ),
+            ),
+            _ => (
+                PART_MARKER,
+                serde_json::json!({"schema": PARTS_SCHEMA, "at": at, "part": n + 1}),
+                format!("Part {} of {count} of the holds as of {at}.", n + 1),
+            ),
+        };
+        format!("{marker}\n{said}\n\n```json\n{header}\n```\n\n```text\n{chunk}\n```\n")
+    });
+    Ok(comments.collect())
+}
+
+/// The snapshot ([`published`]) that `first`, the bot's comment with
+/// [`HOLDS_MARKER`], publishes with the [`PART_MARKER`] comments among the
+/// bot's `bodies` ([`assemble`]): for readers other than the pass.
+pub fn published_among(first: &str, bodies: &[&str]) -> Option<Value> {
+    let parts: Vec<&str> = (bodies.iter().copied())
+        .filter(|b| b.starts_with(PART_MARKER))
+        .collect();
+    published(&assemble(first, &parts)?)
+}
+
+/// Which of the bot's `existing` part comments each part after the first
+/// of a new publication of `count` comments is written to, None for a new
+/// comment: never one of `used`, the parts the published header refers to
+/// ([`assemble_from`]), so that the published snapshot stays whole until
+/// its header is replaced last, should any write fail before it.
+pub fn targets(existing: usize, used: &[usize], count: usize) -> Vec<Option<usize>> {
+    let mut free = (0..existing).filter(|n| !used.contains(n));
+    (1..count).map(|_| free.next()).collect()
+}
+
+/// The base64 of a compressed snapshot comment's ```` ```text ```` block.
+fn text_block(body: &str) -> Option<&str> {
+    let start = body.find("\n```text\n")? + "\n```text\n".len();
+    let rest = &body[start..];
+    Some(&rest[..rest.find("\n```")?])
+}
+
+/// The plain snapshot comment ([`render`]) that a hold snapshot's comments
+/// publish: `first`, the bot's comment with [`HOLDS_MARKER`], where it is
+/// plain, else what [`parts`] encoded, from it and `others`, the bot's
+/// comments with [`PART_MARKER`]. None where a part is missing, is of
+/// another snapshot, or does not decode to one at the header's time, as
+/// while a pass is writing them; a reader then has no snapshot rather
+/// than a mix of two.
+pub fn assemble(first: &str, others: &[&str]) -> Option<String> {
+    assemble_from(first, others).map(|(body, _)| body)
+}
+
+/// [`assemble`], with the indices in `others` of the parts it used, whose
+/// provenance a reader that carries the snapshot over must check as it
+/// does `first`'s: anyone who may edit the bot's comments may edit a part.
+pub fn assemble_from(first: &str, others: &[&str]) -> Option<(String, Vec<usize>)> {
+    let header = match json_block(first) {
+        Some(header) if header["schema"] == PARTS_SCHEMA => header,
+        _ => return Some((first.to_owned(), Vec::new())),
+    };
+    let at = header["at"].as_str()?;
+    let count = header["parts"].as_u64().filter(|&n| n >= 1)?;
+    if header["encoding"] != PARTS_ENCODING || count > MAX_PARTS as u64 {
+        return None;
+    }
+    let mut encoded = text_block(first)?.to_owned();
+    let mut used = Vec::new();
+    for part in 2..=count {
+        let n = others.iter().position(|body| {
+            json_block(body)
+                .is_some_and(|h| h["schema"] == PARTS_SCHEMA && h["at"] == at && h["part"] == part)
+        })?;
+        encoded.push_str(text_block(others[n])?);
+        used.push(n);
+    }
+    let compressed = STANDARD.decode(encoded).ok()?;
+    let mut body = String::new();
+    let limit = MAX_SNAPSHOT_BYTES as u64 + 1;
+    (GzDecoder::new(compressed.as_slice()).take(limit))
+        .read_to_string(&mut body)
+        .ok()?;
+    let whole = body.len() <= MAX_SNAPSHOT_BYTES;
+    (whole && published(&body).is_some_and(|s| s["at"] == at)).then_some((body, used))
 }
 
 #[cfg(test)]
@@ -6491,5 +6683,143 @@ mod tests {
             assert_eq!(on(HoldKind::Stalled), alarms, "{at}");
             previous = Some(published);
         }
+    }
+
+    /// `holds` holds past the operator's, each with `chars` of hex that
+    /// does not compress, from a fixed seed, so that a test can fill
+    /// comments.
+    fn noisy(holds: u64, chars: usize) -> Snapshot {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut noise = || {
+            (0..chars)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    char::from_digit((seed % 16) as u32, 16).unwrap_or('0')
+                })
+                .collect::<String>()
+        };
+        let mut snapshot = bare(&board(holds, 0));
+        for hold in snapshot
+            .holds
+            .iter_mut()
+            .filter(|h| !h.operator && h.item.is_some())
+        {
+            hold.reason.push_str(&noise());
+        }
+        snapshot.at = "2026-11-07T00:00:00Z".into();
+        snapshot
+    }
+
+    /// A snapshot that fits one comment is that comment, plain; a longer
+    /// one is compressed across comments, each within one's size, and put
+    /// back together whichever order they are read in, but not from parts
+    /// of another snapshot, nor with one missing or amiss.
+    #[test]
+    fn parts_round_trip() {
+        let small = render(&noisy(2, 10)).unwrap();
+        assert_eq!(parts(&small, "t").unwrap(), std::slice::from_ref(&small));
+        assert_eq!(assemble(&small, &[]), Some(small));
+        let snapshot = noisy(100, 2_000);
+        let body = render(&snapshot).unwrap();
+        let at = &snapshot.at;
+        let comments = parts(&body, at).unwrap();
+        assert_eq!(comments.len(), 3, "{}", chars(&body));
+        assert!(comments.iter().all(|c| chars(c) <= MAX_COMMENT_CHARS));
+        assert!(comments[0].starts_with(HOLDS_MARKER));
+        assert!(comments[1..].iter().all(|c| c.starts_with(PART_MARKER)));
+        let (first, rest) = comments.split_first().unwrap();
+        let mut others: Vec<&str> = rest.iter().map(String::as_str).collect();
+        assert_eq!(assemble(first, &others).as_deref(), Some(body.as_str()));
+        others.reverse();
+        assert_eq!(assemble(first, &others).as_deref(), Some(body.as_str()));
+        // A reader never takes the header for a snapshot.
+        assert!(published(first).is_none());
+        // A pass part way through writing the next snapshot's parts.
+        let next = parts(
+            &body.replace(at, "2026-11-07T00:10:00Z"),
+            "2026-11-07T00:10:00Z",
+        );
+        let next = next.unwrap();
+        assert_eq!(assemble(first, &[&next[1], rest[1].as_str()]), None);
+        assert_eq!(assemble(first, &others[..1]), None);
+        let corrupt = rest[0].replacen("```text\n", "```text\n!", 1);
+        assert_eq!(assemble(first, &[&corrupt, rest[1].as_str()]), None);
+        // A header that claims more parts than any snapshot takes.
+        let greedy = first.replacen("\"parts\":3", &format!("\"parts\":{}", MAX_PARTS + 1), 1);
+        assert_ne!(&greedy, first);
+        assert_eq!(assemble(&greedy, &others), None);
+    }
+
+    /// For GitHub's comments the snapshot that one comment cut is whole,
+    /// compressed; one that does not compress into [`MAX_PARTS`] is left
+    /// out of as for one comment, until it does.
+    #[test]
+    fn fit_to_parts() {
+        let full = bare(&board(240, 0));
+        let (fitted, body) = fit_to(full.clone(), Bound::Parts).unwrap();
+        assert_eq!(
+            (fitted.truncated, fitted.holds.len()),
+            (0, full.holds.len())
+        );
+        assert!(chars(&body) > MAX_COMMENT_CHARS);
+        assert_eq!(parts(&body, "t").unwrap().len(), 1);
+        let (cut, _) = fit(full).unwrap();
+        assert!(cut.truncated > 0);
+        let noisy = noisy(240, 2_000);
+        let (fitted, body) = fit_to(noisy.clone(), Bound::Parts).unwrap();
+        assert!(fitted.truncated > 0);
+        assert_eq!(fitted.holds.len() + fitted.truncated, noisy.holds.len());
+        let comments = parts(&body, &fitted.at).unwrap();
+        assert_eq!(comments.len(), MAX_PARTS);
+        assert!(comments.iter().all(|c| chars(c) <= MAX_COMMENT_CHARS));
+    }
+
+    /// A new publication's parts go to part comments the published header
+    /// does not use, or new ones, so that one whose header write failed
+    /// leaves the published snapshot whole, clocks and all, for the next
+    /// pass to carry over; once its header is written it is the snapshot,
+    /// and the one after reuses the first's comments.
+    #[test]
+    fn parts_alternate_between_banks() {
+        assert_eq!(targets(0, &[], 1), []);
+        assert_eq!(targets(0, &[], 3), [None, None]);
+        assert_eq!(targets(4, &[1, 3], 3), [Some(0), Some(2)]);
+        assert_eq!(targets(3, &[0, 1], 4), [Some(2), None, None]);
+        let generation = |minute: u32| {
+            let mut snapshot = noisy(40, 1_000);
+            snapshot.at = format!("2026-11-07T00:{minute:02}:00Z");
+            let body = render(&snapshot).unwrap();
+            (body.clone(), split(&body, &snapshot.at, 14_000).unwrap())
+        };
+        let (a, a_parts) = generation(0);
+        assert_eq!(a_parts.len(), 3);
+        // The bot's part comments as the issue lists them, oldest first.
+        let mut comments: Vec<String> = a_parts[1..].to_vec();
+        fn others(comments: &[String]) -> Vec<&str> {
+            comments.iter().map(String::as_str).collect()
+        }
+        let (_, used) = assemble_from(&a_parts[0], &others(&comments)).unwrap();
+        assert_eq!(used, [0, 1]);
+        let (b, b_parts) = generation(10);
+        let to = targets(comments.len(), &used, b_parts.len());
+        assert_eq!(to, [None, None]);
+        for (body, target) in b_parts[1..].iter().zip(&to).rev() {
+            match target {
+                Some(n) => comments[*n] = body.clone(),
+                None => comments.push(body.clone()),
+            }
+        }
+        // The header's write failed: A is still whole.
+        assert_eq!(assemble(&a_parts[0], &others(&comments)), Some(a));
+        let (body, used) = assemble_from(&b_parts[0], &others(&comments)).unwrap();
+        // Written last to first, part 2 is the newest comment.
+        assert_eq!((body, used.clone()), (b, vec![3, 2]));
+        let (_, c_parts) = generation(20);
+        assert_eq!(
+            targets(comments.len(), &used, c_parts.len()),
+            [Some(0), Some(1)]
+        );
     }
 }

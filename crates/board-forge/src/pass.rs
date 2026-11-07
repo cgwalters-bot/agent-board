@@ -98,6 +98,8 @@ const AFTER_EPICS: usize = 38;
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop.
 const REVALIDATED_LIMIT: usize = PASS_REQUEST_LIMIT;
+// Each of the hold snapshot's comments is a write past its reads.
+const _: () = assert!(holds::MAX_PARTS <= WRITE_RESERVE);
 /// GraphQL points a query and a mutation are taken to cost where the
 /// response does not say (`rateLimit { cost }`), as GitHub's secondary
 /// limits count them.
@@ -112,9 +114,17 @@ const NOT_SENT: &str = "not sent: the pass stopped at a GitHub rate limit";
 const PULL_PAGES: usize = 3;
 /// Comment pages of the usage or holds issue read to find the bot's snapshot.
 const USAGE_PAGES: usize = 10;
-/// The reads before the hold snapshot's write: its comment's first page,
-/// the repository and the account.
-const HOLDS_READS: usize = 3;
+/// The pages of 100 comments read on the holds issue: every part of the
+/// snapshot is read, and the review app reads no more.
+const HOLDS_PAGES: usize = 1;
+/// The comments a page of an issue's lists, as `per_page` asks.
+const COMMENTS_PER_PAGE: usize = 100;
+/// The bot's hold comment, its part comments and the room left on the
+/// pages read ([`Schedule::hold_comments`]).
+type HoldComments = (Option<Value>, Vec<Value>, usize);
+/// The reads before the hold snapshot's write: its comments' pages, the
+/// repository and the account.
+const HOLDS_READS: usize = HOLDS_PAGES + 2;
 /// The start of a line that holds every new run on the WIP limit.
 const WIP_HOLD: &str = "hold wip: ";
 /// Pages of open board issues read, 100 each; a larger board is incomplete.
@@ -3101,9 +3111,26 @@ fn bot_comment(
     on: (&str, u64),
     (marker, what): (&str, &str),
 ) -> Result<Option<Value>> {
+    let (found, _) = bot_comments(client, bot, on, (&[marker], what), (true, USAGE_PAGES))?;
+    Ok(found.into_iter().next())
+}
+
+/// `bot`'s comments on issue `on` that start with one of `markers`, oldest
+/// first, from at most `pages` pages of 100, and how many comments of
+/// anyone's those pages had; with `first`, only the first, read no further
+/// than its page. An issue with more pages is an error.
+fn bot_comments(
+    client: &impl Rest,
+    bot: &str,
+    on: (&str, u64),
+    (markers, what): (&[&str], &str),
+    (first, pages): (bool, usize),
+) -> Result<(Vec<Value>, usize)> {
     let (repository, issue) = on;
     let mut url = format!("{API_ROOT}repos/{repository}/issues/{issue}/comments?per_page=100");
-    for _ in 0..USAGE_PAGES {
+    let mut kept = Vec::new();
+    let mut seen = 0;
+    for _ in 0..pages {
         let response = client.get(&url, None)?;
         ensure!(
             response.status == 200,
@@ -3114,18 +3141,23 @@ fn bot_comment(
             .body
             .as_array()
             .context("comments are not a list")?;
-        let found = comments.iter().find(|c| {
-            text(c, "/user/login").eq_ignore_ascii_case(bot) && text(c, "/body").starts_with(marker)
+        seen += comments.len();
+        let mine = comments.iter().filter(|c| {
+            let body = text(c, "/body");
+            text(c, "/user/login").eq_ignore_ascii_case(bot)
+                && markers.iter().any(|marker| body.starts_with(marker))
         });
-        if let Some(comment) = found {
-            return Ok(Some(comment.clone()));
+        kept.extend(mine.cloned());
+        if first && !kept.is_empty() {
+            kept.truncate(1);
+            return Ok((kept, seen));
         }
         match response.link.as_deref().and_then(next_link) {
             Some(next) => url = next,
-            None => return Ok(None),
+            None => return Ok((kept, seen)),
         }
     }
-    bail!("the usage issue has more than {USAGE_PAGES} pages of comments")
+    bail!("the {what}'s issue has more than {pages} pages of comments")
 }
 
 /// Whether `run` on `repo`, which GitHub says is `in_progress`, has ended
@@ -4417,6 +4449,22 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// with `marker`, the `what` an error names.
     fn bot_comment(&self, on: (&str, u64), marker: &str, what: &str) -> Result<Option<Value>> {
         bot_comment(&self.client, &self.config.bot, on, (marker, what))
+    }
+
+    /// The bot's hold snapshot comment on issue `on`, its other parts
+    /// ([`holds::parts`]), oldest first, and how many more comments the
+    /// issue may have before a new one falls outside what is read.
+    fn hold_comments(&self, on: (&str, u64)) -> Result<HoldComments> {
+        let markers = [holds::HOLDS_MARKER, holds::PART_MARKER];
+        let what = (markers.as_slice(), "hold snapshot");
+        // Within the reads kept for it, as the review app reads only the
+        // first page.
+        let read = (false, HOLDS_PAGES);
+        let (found, seen) = bot_comments(&self.client, &self.config.bot, on, what, read)?;
+        let (first, parts): (Vec<_>, Vec<_>) =
+            (found.into_iter()).partition(|c| text(c, "/body").starts_with(holds::HOLDS_MARKER));
+        let room = (HOLDS_PAGES * COMMENTS_PER_PAGE).saturating_sub(seen);
+        Ok((first.into_iter().next(), parts, room))
     }
 
     /// Every open issue on the board, whole, or an error: scheduling from

@@ -1248,23 +1248,23 @@ fn queue_line(
     project: &str,
     previous: Option<u64>,
 ) -> Result<Option<String>> {
-    use crate::pass::holds::{HOLDS_MARKER, HOLDS_SCHEMA};
+    use crate::pass::holds::{HOLDS_MARKER, published_among};
     let Some(usage) = &p.settings.usage else {
         return Ok(None);
     };
     let comments = paged(api, &usage.issue.repository, usage.issue.issue, "comments")?;
-    let Some(snapshot) = comments
-        .iter()
-        .find(|c| {
+    let bodies: Vec<&str> = (comments.iter())
+        .filter(|c| {
             c["user"]["login"]
                 .as_str()
                 .is_some_and(|l| l.eq_ignore_ascii_case(&usage.bot))
-                && c["body"]
-                    .as_str()
-                    .is_some_and(|b| b.starts_with(HOLDS_MARKER))
         })
-        .and_then(|c| super::super::health::json_block(c["body"].as_str()?))
-        .filter(|s| s["schema"] == HOLDS_SCHEMA)
+        .filter_map(|c| c["body"].as_str())
+        .collect();
+    // A long snapshot is compressed across the bot's comments (agent-board#774).
+    let Some(snapshot) = (bodies.iter())
+        .find(|b| b.starts_with(HOLDS_MARKER))
+        .and_then(|first| published_among(first, &bodies))
     else {
         return Ok(None);
     };
