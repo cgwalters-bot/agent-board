@@ -497,9 +497,12 @@ refuse are left out or `unknown`.
 
 A view whose newest pass, pools and runs are as published is no change for
 30 minutes, so an idle pass does not write every time; a pass not written
-is not in `passes`. Past the comment's size the view is left out whole,
-after the work inventory and before any hold. The pass's line says
-`holds: published URL, with the pass view`.
+is not in `passes`. Past the comment's size the view gives way only after
+the item holds that do not wait on the operator, and before any other hold
+or needs-you card: first its older passes, then the newest pass's last
+starts and reasons, counted in its `omitted`, then the last runs in flight,
+counted in the view's. Only where even that leaves no room is it left out
+whole. The pass's line says `holds: published URL, with the pass view`.
 
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
@@ -973,7 +976,8 @@ characters: past that, the `summary_cache` goes first, which only costs the
 next pass the bodies' downloads; then item holds that do not wait on the operator are left
 out until it fits, those without a Priority first, then the lowest Priority
 (`P3` before `P0`), then the newest (the highest number), and `truncated`
-counts them (otherwise 0). The holds a [stall alarm](#stall-alarms) watches
+counts them (otherwise 0). Then the [pass view](#pass-view) is cut down, and
+last left out. The holds a [stall alarm](#stall-alarms) watches
 are left out only after the rest, then the alarms, each together with its
 hold, and the alarms on the holds issue last. The operator's holds and the holds of every new
 run are kept ahead of the needs-you list's detail cards. The lowest ranked detail

@@ -181,6 +181,39 @@ pub(super) fn snapshot(
     })
 }
 
+/// Cut `view` by one entry for a comment it does not fit in, the least
+/// telling first: the oldest pass, down to the newest, then that pass's last
+/// start or reason, counted in its `omitted`, then the last run in flight,
+/// counted in the view's. Whether anything was cut: once nothing is, the
+/// view must go whole. What is left stays within the reader's bounds.
+pub(super) fn compact(view: &mut Value) -> bool {
+    let Some(passes) = view.get_mut("passes").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if passes.len() > 1 {
+        passes.pop();
+        return true;
+    }
+    if let Some(newest) = passes.first_mut().filter(|p| p.is_object()) {
+        let cut = ["started", "reasons"]
+            .into_iter()
+            .any(|list| newest[list].as_array_mut().and_then(Vec::pop).is_some());
+        if cut {
+            newest["omitted"] = (newest["omitted"].as_u64().unwrap_or_default() + 1).into();
+            return true;
+        }
+    }
+    if view["in_flight"]
+        .as_array_mut()
+        .and_then(Vec::pop)
+        .is_some()
+    {
+        view["omitted"] = (view["omitted"].as_u64().unwrap_or_default() + 1).into();
+        return true;
+    }
+    false
+}
+
 /// Whether `now`'s view, unchanged, is due to be written over the
 /// `published` one: [`REFRESH_MINUTES`] after it was observed.
 pub(super) fn due(published: Option<&Value>, now: Option<&Value>) -> bool {

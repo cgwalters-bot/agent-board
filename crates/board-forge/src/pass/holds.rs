@@ -2667,11 +2667,13 @@ fn left_out_first(hold: &Published) -> (bool, std::cmp::Reverse<String>, std::cm
 }
 
 /// `snapshot` within [`MAX_COMMENT_CHARS`] and its comment: where the whole
-/// is longer, the work inventory and then the pass view go whole, then the
+/// is longer, the work inventory goes whole, then the
 /// needs-you list's summary cache, then its
 /// context and approval evidence (lowest ranked first, counted), then
 /// the item holds that do not wait on the operator are left out,
-/// in [`left_out_first`] order, then the holds a stall alarm watches
+/// in [`left_out_first`] order, then the pass view is cut an entry at a
+/// time ([`super::view::compact`]) and, only should even its newest pass
+/// not fit, goes whole, then the holds a stall alarm watches
 /// ([`Published::watched`]), then the stall alarms, each with the hold it
 /// is on, then those on the holds issue, likewise, until it fits, and
 /// counted in `truncated`. So alarms
@@ -2690,9 +2692,6 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
         && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS
     {
         snapshot.dispatchable_work = None;
-    }
-    if snapshot.pass_view.is_some() && render(&snapshot)?.chars().count() > MAX_COMMENT_CHARS {
-        snapshot.pass_view = None;
     }
     let holds = &snapshot.holds;
     let on = |h: &Published| (h.item.clone(), h.epic);
@@ -2724,12 +2723,15 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
         let n = group[0];
         (rank(n), left_out_first(&holds[n]))
     });
-    let mut order = order.into_iter();
+    let mut order = order.into_iter().peekable();
     let mut dropped = BTreeSet::new();
     let mut needs_you = snapshot.needs_you.clone();
-    let without = |dropped: &BTreeSet<usize>, needs_you: &Option<NeedsYou>| Snapshot {
+    let mut pass_view = snapshot.pass_view.clone();
+    let without = |dropped: &BTreeSet<usize>,
+                   needs_you: &Option<NeedsYou>,
+                   pass_view: &Option<Value>| Snapshot {
         dispatchable_work: snapshot.dispatchable_work.clone(),
-        pass_view: snapshot.pass_view.clone(),
+        pass_view: pass_view.clone(),
         schema: snapshot.schema,
         at: snapshot.at.clone(),
         truncated: dropped.len(),
@@ -2743,7 +2745,7 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
             .collect(),
     };
     loop {
-        let fitted = without(&dropped, &needs_you);
+        let fitted = without(&dropped, &needs_you, &pass_view);
         let body = render(&fitted)?;
         let mut over = body.chars().count().saturating_sub(MAX_COMMENT_CHARS);
         if over == 0 {
@@ -2768,12 +2770,23 @@ pub fn fit(mut snapshot: Snapshot) -> Result<(Snapshot, String)> {
         // Each entry is its JSON and a ",\n"; the count may grow a digit,
         // which the next round sees.
         while over > 0 {
+            // Once the holds that need no one are gone, the pass view gives
+            // way, an entry at a time, before anything the operator or a
+            // stall clock needs; it goes whole only once nothing is left
+            // to cut.
+            let protected = order.peek().is_none_or(|group| rank(group[0]) > 0);
+            if let Some(view) = pass_view.as_mut().filter(|_| protected) {
+                if !super::view::compact(view) {
+                    pass_view = None;
+                }
+                break;
+            }
             let Some(group) = order.next() else {
                 // Detail eviction preserves every identity; past the last
                 // card, the cap leaves out what it must and says so. The
                 // holds this round dropped are not in `fitted`.
                 let Some(_) = needs_you.as_mut().and_then(NeedsYou::cut) else {
-                    return cap(without(&dropped, &needs_you));
+                    return cap(without(&dropped, &needs_you, &pass_view));
                 };
                 // A cut removes its descriptor too; re-render before cutting
                 // again so that the additional savings do not overcut asks.
@@ -3371,6 +3384,111 @@ mod tests {
         let parsed = parse(&body).unwrap();
         assert_eq!(parsed["truncated"], fitted.truncated);
         assert_eq!(parsed["needs_you"]["omitted"], count);
+    }
+
+    /// The pass view gives way only after the holds that need no one, an
+    /// entry at a time, its cuts counted, and goes whole only where the
+    /// operator's holds leave no room for even its newest pass: never
+    /// does it cost a hold the operator needs.
+    #[test]
+    fn fit_keeps_the_pass_view_ahead_of_holds_that_need_no_one() {
+        use super::super::view;
+        let at = "2026-11-05T12:00:00Z";
+        let run = |n: u64| {
+            let started = Some("2026-11-05T11:00:00Z");
+            view::Run::new(
+                ("o/work", n),
+                "implement",
+                Some("claude"),
+                ("o/runner", n),
+                started,
+            )
+            .unwrap()
+        };
+        let flights: Vec<_> = (1..=40).map(run).collect();
+        let mut full = None;
+        for pass in 0..5 {
+            let started: Vec<_> = (1..=10).map(|n| run(100 * pass + n)).collect();
+            let record = view::record(at, 0, &started, &[]);
+            let previous = full.map(|v| json!({ "pass_view": v }));
+            full = Some(view::snapshot(
+                at,
+                record,
+                previous.as_ref(),
+                None,
+                Some(&flights),
+            ));
+        }
+        let full = full.unwrap();
+        assert!(view::tests::accepted(&full));
+        let viewed = |holds: Vec<Entry>| {
+            let mut snapshot = bare(&holds);
+            snapshot.pass_view = Some(full.clone());
+            snapshot
+        };
+        let room = |holds: Vec<Entry>| MAX_COMMENT_CHARS - chars(&render(&bare(&holds)).unwrap());
+        let size = chars(&render(&viewed(board(0, 0))).unwrap())
+            - chars(&render(&bare(&board(0, 0))).unwrap());
+        enum Kept {
+            Whole,
+            Compacted,
+            Gone,
+        }
+        let cases = [
+            // Room for it all.
+            ("fits", board(0, 0), false, Kept::Whole),
+            // Holds that need no one go, and the view stays whole.
+            ("others", board(59, room(board(59, 0))), true, Kept::Whole),
+            // The operator's holds leave room for half the view.
+            (
+                "half",
+                board(0, room(board(0, 0)) - size / 2),
+                false,
+                Kept::Compacted,
+            ),
+            // And for none of it.
+            ("none", board(0, room(board(0, 0)) - 10), false, Kept::Gone),
+        ];
+        for (name, holds, truncated, kept) in cases {
+            let snapshot = viewed(holds);
+            let (fitted, body) = fit(snapshot.clone()).unwrap();
+            assert!(chars(&body) <= MAX_COMMENT_CHARS, "{name}");
+            assert_eq!(fitted.truncated > 0, truncated, "{name}");
+            assert!(
+                (fitted.holds.iter()).all(|h| !h.operator || snapshot.holds.contains(h)),
+                "{name}"
+            );
+            let operator = |s: &Snapshot| s.holds.iter().filter(|h| h.operator).count();
+            assert_eq!(operator(&fitted), operator(&snapshot), "{name}");
+            let published = parse(&body).unwrap();
+            assert_eq!(
+                published.get("pass_view"),
+                fitted.pass_view.as_ref(),
+                "{name}"
+            );
+            let Some(view) = fitted.pass_view else {
+                assert!(matches!(kept, Kept::Gone), "{name}");
+                continue;
+            };
+            assert!(view::tests::accepted(&view), "{name}: {view}");
+            match kept {
+                Kept::Whole => assert_eq!(view, full, "{name}"),
+                Kept::Compacted => assert_ne!(view, full, "{name}"),
+                Kept::Gone => panic!("{name}: the view was kept"),
+            }
+            // What was cut is counted: the newest pass's starts, and the
+            // runs in flight.
+            let listed = |v: &Value, list: &str| v[list].as_array().unwrap().len() as u64;
+            let counted = |v: &Value| {
+                let newest = &v["passes"][0];
+                (
+                    listed(newest, "started") + newest["omitted"].as_u64().unwrap(),
+                    listed(v, "in_flight") + v["omitted"].as_u64().unwrap(),
+                )
+            };
+            assert_eq!(counted(&view), counted(&full), "{name}");
+            assert_eq!(view["passes"][0]["at"], full["passes"][0]["at"], "{name}");
+        }
     }
 
     /// The full form of `identity`, as published before the compact one.
