@@ -1384,6 +1384,29 @@ impl Config {
         self.budget.as_ref()?.harness_repositories.as_deref()
     }
 
+    /// What this configuration loses from one pass to the next without
+    /// `state`, beyond requests, that a pass cannot read again from the
+    /// forge. The hosted pass keeps no state on purpose, so the CLI says this
+    /// once a pass rather than leave it silent; `authored` needs none (its
+    /// turn is the clock's, and its priority read in the same pass).
+    pub fn stateless_losses(&self) -> Vec<&'static str> {
+        if self.state.is_some() {
+            return Vec::new();
+        }
+        let mut lost = Vec::new();
+        if self.notifications {
+            lost.push(
+                "the intake searches its two-day lookback afresh, retries a thread waiting for a midstream fork only while that search finds it, with no authored precedence (intake_waiting), and tries direction GitHub refused for good again each time it finds it (intake_refused)",
+            );
+        }
+        if self.maintain.is_some() {
+            lost.push(
+                "maintain derives its repositories again each pass once due, a done day included (maintain)",
+            );
+        }
+        lost
+    }
+
     /// Whether stage 2 follows any repository: `follow`'s, `midstream`'s or
     /// `authored`'s.
     fn follows(&self) -> bool {
@@ -2799,6 +2822,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         caps,
         report: &mut report,
         epics: BTreeMap::new(),
+        epic_listing: None,
         swept: None,
         busy: None,
         board: None,
@@ -3124,6 +3148,9 @@ struct Scheduler<'a, C> {
     report: &'a mut Report,
     /// Whether each parent read is a live epic, or why that is unknown.
     epics: BTreeMap<String, std::result::Result<bool, String>>,
+    /// Stage 3's listing of the open epics, where stage 2 read it first
+    /// for `authored` ([`Self::authored_named`]), until stage 3 takes it.
+    epic_listing: Option<Result<epics::Listing>>,
     /// With [`Config::sweep`], the newest sweep issue, read before stage
     /// 4's candidates; `None` where it was not read.
     swept: Option<Option<sweep::Found>>,
@@ -3397,13 +3424,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // Unread, the repositories it added last pass would be decided as
         // gone, and what was held there dropped.
         let (mut swept, mut waiting) = (Vec::new(), Vec::new());
-        // Without the option there is no round to keep a place in.
-        let mut cursor = config.authored.and(state.authored_cursor.clone());
-        // Stage 3 replaces them where it reads the live epics.
-        let named = (config.authored)
-            .map(|_| state.authored_priority.clone())
-            .unwrap_or_default();
+        // Without the option there is no round to keep a place in, and
+        // without `state` none is kept: the clock takes turns instead.
+        let kept = config.state.is_some();
+        let mut cursor = (config.authored.filter(|_| kept)).and(state.authored_cursor.clone());
         if let Some(per_pass) = config.authored {
+            // This pass's, not the last's: a pass without `state` has no last.
+            let named = self.authored_named().unwrap_or_default();
             let read = match authored::read(&config.bot, &self.client) {
                 Ok(read) => read,
                 Err(error) => {
@@ -3422,7 +3449,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let forks = routes.as_ref().map(|r| &r.forks);
             let priority = authored::priority(&named, threads, forks);
             let room = POLL_REPOSITORY_LIMIT.saturating_sub(self.follows.len());
-            let turn = match authored::turn(&new, &priority, (per_pass, room), cursor.as_deref()) {
+            let rotation = match kept {
+                true => authored::Rotation::Cursor(cursor.as_deref()),
+                false => authored::Rotation::Clock(self.now),
+            };
+            let turn = match authored::turn(&new, &priority, (per_pass, room), rotation) {
                 Ok(turn) => turn,
                 Err(error) => {
                     self.report.failures += 1;
@@ -3443,6 +3474,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 new.len(),
                 swept.len()
             ));
+            if prioritized > 0 {
+                self.line(format!(
+                    "authored: first: {}",
+                    swept[..prioritized].join(", ")
+                ));
+            }
             waiting = (new.iter())
                 .filter(|r| !swept.contains(r))
                 .map(|r| r.to_ascii_lowercase())
@@ -3498,7 +3535,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // pass held there is kept.
                 outcome.undecided.extend(waiting);
                 outcome.state.authored_cursor = cursor;
-                outcome.state.authored_priority = named;
                 if !self.apply {
                     for step in &outcome.steps {
                         if step.ran

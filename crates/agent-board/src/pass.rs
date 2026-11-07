@@ -384,6 +384,14 @@ pub fn run(args: &Pass, runtime: &Runtime, out: &mut impl Write) -> Result<()> {
                 }
                 (None, Some(path)) => record_pass(runtime, &client, &config, (path, limits), now)?,
                 (_, None) => {
+                    let lost = config.stateless_losses();
+                    if !lost.is_empty() {
+                        eprintln!(
+                            "warning: no state in {}, so this pass keeps nothing for the next: {}",
+                            path.display(),
+                            lost.join("; ")
+                        );
+                    }
                     // Only an applying pass writes the cache; a preview reads it.
                     let state = match config.state.as_deref().map(PathBuf::from) {
                         Some(path) if path.exists() => {

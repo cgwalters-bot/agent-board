@@ -191,6 +191,10 @@ pub struct EpicFacts {
     pub priorities: BTreeMap<String, String>,
 }
 
+/// The open epics of a repository as [`Scheduler::open_epics`] lists them:
+/// each read whole, or the epic and why not.
+pub(super) type Listing = Vec<std::result::Result<EpicFacts, (ItemRef, anyhow::Error)>>;
+
 /// An item's fields on the board.
 #[derive(Debug, Default)]
 pub(super) struct BoardFields {
@@ -1182,7 +1186,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         git_ref: &str,
         turn: &mut Turn,
     ) -> Result<()> {
-        let listed = self.open_epics(repository, None)?;
+        // Stage 2 read it already, for `authored` ([`Self::authored_named`]).
+        let listed = match self.epic_listing.take() {
+            Some(listed) => listed?,
+            None => self.open_epics(repository, None)?,
+        };
         let open = listed.len();
         let mut live = Vec::new();
         for facts in listed {
@@ -1210,7 +1218,6 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Err(why) => self.epic_held(&facts, Hold::new(HoldKind::Unreadable, why)),
             }
         }
-        self.authored_priority(&live);
         *self.report.tally.1.live_epics.get_or_insert(0) += live.len();
         self.line(format!(
             "epics: {} live of {open} open in {repository}",
@@ -1293,33 +1300,59 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         Ok(())
     }
 
-    /// With `authored`, the repositories the `live` epics name, kept for the
-    /// next pass's stage 2 to follow first ([`authored`]), as many as the
-    /// poll may follow at all.
-    fn authored_priority(&mut self, live: &[EpicFacts]) {
-        if self.config.authored.is_none() {
-            return;
+    /// With `authored` and `epics`, the repositories this pass's live epics
+    /// name, for stage 2 to follow first ([`authored`]): the stage 3 listing
+    /// read now, ahead of stage 2, and kept for stage 3, which reads it no
+    /// more, so it costs no request more; its requests count to stage 3 all
+    /// the same. Whether an epic is live is kept too ([`Self::live`]). None
+    /// where the listing fails, which stage 3 then reports.
+    pub(super) fn authored_named(&mut self) -> Option<Vec<String>> {
+        let repository = &self.config.epics.as_ref()?.repository;
+        let bounds = self.client.bounds;
+        let (stage, left) = (bounds.stage.replace(Stage::Epics), bounds.left.get());
+        let listed = self.open_epics(repository, None);
+        let mut live = Vec::new();
+        if let Ok(listed) = &listed {
+            for facts in listed.iter().flatten() {
+                let parent = Parent {
+                    issue: facts.issue.clone(),
+                    open: true,
+                    labels: facts.labels.clone(),
+                    labels_complete: facts.labels_complete,
+                };
+                // One whose liveness is unknown stage 3 holds.
+                if self.live(&parent) == Ok(true) {
+                    live.push(facts.clone());
+                }
+            }
         }
-        let mut named = BTreeSet::new();
-        for epic in live {
-            named.extend(authored::referenced(&epic.body));
-            let subs = epic.census.sub_issues.iter();
-            named.extend(subs.map(|sub| sub.repo.to_ascii_lowercase()));
-        }
-        if let Some(state) = self.report.state.as_mut() {
-            state.authored_priority = named.into_iter().take(POLL_REPOSITORY_LIMIT).collect();
-        }
+        let spent = left.saturating_sub(bounds.left.get());
+        bounds.stage.set(stage);
+        let named = match &listed {
+            Ok(_) => {
+                let named = authored::named(&live);
+                self.line(format!(
+                    "authored: {} live epics name {} repositories ({spent} requests, stage 3's listing read early)",
+                    live.len(),
+                    named.len()
+                ));
+                Some(named)
+            }
+            Err(error) => {
+                self.line(format!(
+                    "authored: the live epics could not be read, so none is prioritized: {error:#}"
+                ));
+                None
+            }
+        };
+        self.epic_listing = Some(listed);
+        named
     }
 
     /// The open epics of `repository`, each read whole or why not; the
     /// sub-issues only of the epic `only` (`OWNER/REPO#N`, lower case) where
     /// it is given, the others' left empty.
-    #[allow(clippy::type_complexity)]
-    fn open_epics(
-        &self,
-        repository: &str,
-        only: Option<&str>,
-    ) -> Result<Vec<std::result::Result<EpicFacts, (ItemRef, anyhow::Error)>>> {
+    fn open_epics(&self, repository: &str, only: Option<&str>) -> Result<Listing> {
         let (owner, name) = repository.split_once('/').context("epics repository")?;
         let board = self.config.github_board();
         let field = board.map_or("Priority", |b| b.priority_field.as_str());
