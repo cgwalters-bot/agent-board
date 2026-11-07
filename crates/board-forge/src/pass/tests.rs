@@ -14331,7 +14331,9 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
                 true => "o/tracker",
                 false => "o/fork",
             };
-            assert_eq!(routes.unwrap()["upstream/project"], staging);
+            let routes = routes.unwrap();
+            assert_eq!(routes.staging["upstream/project"], staging);
+            assert_eq!(routes.forks["upstream/project"], "o/fork");
         }
     }
     let mut recorded = replay();
@@ -14355,6 +14357,33 @@ fn notification_routes_require_verified_unambiguous_fork_parents() {
         )
         .is_err()
     );
+}
+
+/// The authored sweep prioritizes a named midstream fork's upstream by the
+/// fork, never by where the intake stages its direction: with issues
+/// disabled that is the dispatch repository, which an epic naming it must
+/// not turn into every such upstream.
+#[test]
+fn authored_priority_maps_forks_not_staging() {
+    let mut recorded = replay();
+    recorded.requests.push(
+        json!({"request": {"get": format!("{API_ROOT}repos/o/fork")},
+        "answer": {"status": 200, "body": {"full_name": "o/fork", "fork": true,
+            "has_issues": false, "parent": {"full_name": "Upstream/Project"}}}}),
+    );
+    let routes = midstream::routes(&recorded, &["o/fork".into()], "o/tracker").unwrap();
+    assert_eq!(routes.staging["upstream/project"], "o/tracker");
+    for (named, expected) in [
+        ("o/fork", &["o/fork", "upstream/project"][..]),
+        ("o/tracker", &["o/tracker"]),
+    ] {
+        let found = authored::priority(&[named.to_owned()], [], Some(&routes.forks));
+        assert_eq!(
+            found.iter().map(String::as_str).collect::<Vec<_>>(),
+            expected,
+            "{named}"
+        );
+    }
 }
 
 /// A midstream listing that fails or is incomplete stops stage 2, here

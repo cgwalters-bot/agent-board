@@ -54,16 +54,18 @@ pub(super) struct Turn {
 /// The repositories, lower case, that a pass follows first: those the last
 /// pass's live epics `named`, those of the intake's `waiting` threads
 /// (`OWNER/REPO#N`), and the upstream of each midstream fork among them by
-/// the notification intake's `routes`, upstream to fork, where it read them.
+/// `forks`, upstream to fork, where the notification intake read them. Not
+/// the intake's staging routes: those map a fork with issues disabled's
+/// upstream to the dispatch repository, which every epic may name.
 pub(super) fn priority<'a>(
     named: &[String],
     waiting: impl IntoIterator<Item = &'a str>,
-    routes: Option<&BTreeMap<String, String>>,
+    forks: Option<&BTreeMap<String, String>>,
 ) -> BTreeSet<String> {
     let mut priority: BTreeSet<String> = named.iter().map(|r| r.to_ascii_lowercase()).collect();
     let threads = waiting.into_iter().filter_map(|t| t.split_once('#'));
     priority.extend(threads.map(|(repo, _)| repo.to_ascii_lowercase()));
-    for (upstream, fork) in routes.into_iter().flatten() {
+    for (upstream, fork) in forks.into_iter().flatten() {
         if priority.contains(&fork.to_ascii_lowercase()) {
             priority.insert(upstream.to_ascii_lowercase());
         }

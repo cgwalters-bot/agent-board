@@ -3378,7 +3378,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if config.notifications {
             match midstream::routes(&self.client, &midstreams, &config.dispatch_repo) {
                 Ok(read) => {
-                    for parent in (read.iter()).filter(|(_, r)| **r == config.dispatch_repo) {
+                    let staged = read.staging.iter();
+                    for parent in staged.filter(|(_, r)| **r == config.dispatch_repo) {
                         self.line(format!(
                             "notifications: the midstream fork of {} has issues disabled; its direction is staged in {}",
                             parent.0, config.dispatch_repo
@@ -3418,7 +3419,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 })
                 .collect();
             let threads = state.intake_waiting.keys().map(String::as_str);
-            let priority = authored::priority(&named, threads, routes.as_ref());
+            let forks = routes.as_ref().map(|r| &r.forks);
+            let priority = authored::priority(&named, threads, forks);
             let room = POLL_REPOSITORY_LIMIT.saturating_sub(self.follows.len());
             let turn = match authored::turn(&new, &priority, (per_pass, room), cursor.as_deref()) {
                 Ok(turn) => turn,
@@ -3464,7 +3466,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
-        poll.policy.notification_intake = routes;
+        poll.policy.notification_intake = routes.map(|r| r.staging);
         poll.policy.no_merge.extend(midstreams);
         poll.policy.no_merge.extend(swept.iter().cloned());
         poll.policy.bot_only = swept;

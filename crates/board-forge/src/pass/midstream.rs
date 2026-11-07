@@ -11,6 +11,18 @@ pub const MIDSTREAM_PAGES: usize = 5;
 /// GitHub's longest topic.
 const TOPIC_LIMIT: usize = 50;
 
+/// The midstream forks' parents, each keyed by the upstream, lower case.
+#[derive(Debug, Default)]
+pub(super) struct Routes {
+    /// Where the intake stages the upstream's direction: the fork, or the
+    /// dispatch repository when the fork has issues disabled.
+    pub staging: BTreeMap<String, String>,
+    /// The midstream fork itself, wherever its direction is staged, so that
+    /// an epic naming the fork prioritizes its upstream ([`super::authored`])
+    /// and one naming the dispatch repository prioritizes no upstream.
+    pub forks: BTreeMap<String, String>,
+}
+
 /// Resolve only topic-admitted forks, never a target named in thread text.
 /// Ambiguous forks fail closed rather than putting work in the wrong tree.
 /// A fork with issues disabled cannot hold the tracking issue staged there,
@@ -20,12 +32,12 @@ pub(super) fn routes(
     client: &impl Rest,
     repositories: &[String],
     fallback: &str,
-) -> Result<BTreeMap<String, String>> {
+) -> Result<Routes> {
     ensure!(
         repositories.len() <= POLL_REPOSITORY_LIMIT,
         "too many midstream routes"
     );
-    let mut routes = BTreeMap::new();
+    let mut routes = Routes::default();
     for repository in repositories {
         let response = client.get(&format!("{API_ROOT}repos/{repository}"), None)?;
         ensure!(response.status == 200, "cannot read midstream {repository}");
@@ -43,12 +55,14 @@ pub(super) fn routes(
             true => fallback,
             false => repository,
         };
+        let parent = parent.to_ascii_lowercase();
         ensure!(
-            routes
-                .insert(parent.to_ascii_lowercase(), staging.to_owned())
+            (routes.forks)
+                .insert(parent.clone(), repository.to_owned())
                 .is_none(),
             "multiple midstreams for {parent}"
         );
+        routes.staging.insert(parent, staging.to_owned());
     }
     Ok(routes)
 }

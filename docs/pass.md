@@ -1598,7 +1598,9 @@ A pass captures one clock and performs these stages in order:
     sub-issue; those of threads whose operator direction the intake keeps
     waiting; and, with `notifications`, the upstream of any `midstream`
     fork so named, so an epic naming `ORG/ostree#5` puts `ostreedev/ostree`
-    first. Stage 3 reads the epics after stage 2 has followed, so these
+    first, even when that fork has issues disabled and its upstream's
+    direction is staged in `dispatchRepo` (an epic naming `dispatchRepo`
+    puts no upstream first). Stage 3 reads the epics after stage 2 has followed, so these
     names are kept in the poll state (`authored_priority`) and take effect
     from the next pass; a pass that read the live epics replaces them. No
     request is added for them: the epics' bodies come with the stage 3
