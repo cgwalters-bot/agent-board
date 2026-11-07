@@ -558,6 +558,9 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         self.inbox_epics(&mut list, &nodes, true);
         carry::evidence(&mut list, previous, &nodes);
         list.retain_evidence(reading.reviews.approval_evidence.as_ref());
+        if config.holds.as_ref().is_some_and(|h| h.act_now) {
+            list.rank_act_now(&snapshot.holds);
+        }
         holds::preserve_changed_at(&mut list, previous);
         list
     }
@@ -1333,6 +1336,7 @@ mod tests {
             since: at.into(),
             carried: false,
             watched: false,
+            releases: 1,
         });
         snapshot.holds[0].reason = "x".into();
         let size = holds::render(&snapshot).unwrap().chars().count();
@@ -1457,6 +1461,7 @@ mod tests {
             since: format!("2026-11-0{}T08:00:00Z", 1 + n % 4),
             carried: false,
             watched: false,
+            releases: 1,
         };
         snapshot.holds = (1..=40)
             .map(|n| hold(n, true))

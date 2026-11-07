@@ -12246,6 +12246,18 @@ fn config_table() {
             "invalid type",
         ),
         (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "actNow": true}}),
+            "holds actNow needs holds needsYou",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true, "actNow": true}}),
+            "holds actNow needs holds approvalEvidence",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true, "actNow": "yes"}}),
+            "invalid type",
+        ),
+        (
             json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true, "drafts": "../other"}}),
             "holds drafts repository",
         ),
@@ -13293,6 +13305,7 @@ fn approval_evidence_pass_option_and_head_observations() {
                 "holds":{"repository":"cgwalters-forge/bot-ops","issue":1,"needsYou":true}});
             if let Some(gate) = gate {
                 settings["holds"]["approvalEvidence"] = json!(gate);
+                settings["holds"]["actNow"] = json!(gate);
             }
             followed(
                 &mut forge.replay,
@@ -13365,6 +13378,18 @@ fn approval_evidence_pass_option_and_head_observations() {
                 assert_eq!(entry["diff"], json!({"additions":12,"deletions":3}));
                 assert_eq!(entry["ci"]["state"], state, "{entry:#?}");
                 assert_eq!(evidence["omitted"], 0);
+                // Only green checks make the approval the operator's now.
+                let act_now = list["act_now"].as_array().unwrap();
+                let listed: Vec<_> = (act_now.iter())
+                    .map(|r| (&r["key"], &r["unblocks"], &r["action"]["head"]))
+                    .collect();
+                match state {
+                    "green" => assert_eq!(
+                        listed,
+                        [(&json!(format!("{REPO}#9")), &json!(1), &json!(head))]
+                    ),
+                    _ => assert!(listed.is_empty(), "{listed:?}"),
+                }
                 if state == "green" {
                     // The next pass cannot list stage 2. Revalidate the
                     // carried identity cheaply, but never carry its evidence.
@@ -13406,6 +13431,8 @@ fn approval_evidence_pass_option_and_head_observations() {
                         if count == 1 {
                             assert_eq!(list["items"][0]["carried"], true);
                         }
+                        // A carried card is not one to act on now.
+                        assert_eq!(list["act_now"], json!([]));
                         let reads: Vec<_> = forge
                             .chain_reads
                             .borrow()
@@ -13418,6 +13445,7 @@ fn approval_evidence_pass_option_and_head_observations() {
                 }
             } else {
                 assert!(list.get("approval_evidence").is_none());
+                assert!(list.get("act_now").is_none());
             }
         }
     }

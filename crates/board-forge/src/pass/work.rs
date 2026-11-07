@@ -140,6 +140,7 @@ mod tests {
             since: String::new(),
             carried: false,
             watched: false,
+            releases: 1,
         };
         let followed = (vec![], BTreeSet::from(["o/other".into()]));
         let work = snapshot(

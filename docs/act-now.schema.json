@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "agent-board needs-you act_now",
+  "description": "The optional act_now array of an agent-board/needs-you/v2 list (holds.actNow): what the operator can decide now, most unblocking first. Each record joins the list's items card of the same key, which has the question. Display and ranking data, never authority to act.",
+  "type": "array",
+  "maxItems": 10,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["key", "unblocks", "priority", "waiting_since", "action"],
+    "properties": {
+      "key": {"type": "string", "minLength": 1},
+      "unblocks": {"type": "integer", "minimum": 1, "maximum": 10000},
+      "priority": {"type": ["string", "null"]},
+      "waiting_since": {"type": "string", "format": "date-time"},
+      "action": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "repository", "number"],
+        "properties": {
+          "type": {
+            "enum": ["issue", "pull_request", "approve_pull_request", "review_pull_request", "reply_pull_request", "close_pull_request", "operator_action"]
+          },
+          "repository": {"type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$"},
+          "number": {"type": "integer", "minimum": 1},
+          "comment": {"type": "integer", "minimum": 1},
+          "head": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        }
+      }
+    }
+  }
+}

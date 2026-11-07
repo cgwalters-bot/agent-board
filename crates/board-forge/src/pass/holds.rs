@@ -266,6 +266,9 @@ pub struct Hold {
     pub kind: HoldKind,
     pub reason: String,
     pub operator: bool,
+    /// How many items its release lets go: its own, or those a blocker
+    /// holds ([`Self::releases`]); `act_now`'s `unblocks` ([`ActNow`]).
+    pub releases: usize,
 }
 
 impl Hold {
@@ -275,6 +278,7 @@ impl Hold {
             kind,
             reason: reason.into(),
             operator: kind.operator(),
+            releases: 1,
         }
     }
 
@@ -282,6 +286,14 @@ impl Hold {
     /// retry by itself is not the operator's yet.
     pub fn operator(self, operator: bool) -> Self {
         Self { operator, ..self }
+    }
+
+    /// The same hold, whose release lets `items` go.
+    pub fn releases(self, items: usize) -> Self {
+        Self {
+            releases: items,
+            ..self
+        }
     }
 }
 
@@ -354,6 +366,7 @@ impl Entry {
             since: String::new(),
             carried: false,
             watched: false,
+            releases: self.hold.releases,
         }
     }
 }
@@ -577,6 +590,10 @@ pub struct Published {
     /// published.
     #[serde(skip)]
     pub watched: bool,
+    /// [`Hold::releases`], or the children of a parent that is not a live
+    /// epic; not published, and zero where carried.
+    #[serde(skip)]
+    pub releases: usize,
 }
 
 /// What makes two passes' holds the same: the item, whether it is an epic,
@@ -646,6 +663,7 @@ fn not_live(epic: &ItemRef, children: &[&Entry]) -> Published {
         since: String::new(),
         carried: false,
         watched: false,
+        releases: children.len(),
     }
 }
 
@@ -944,6 +962,7 @@ pub fn alarm(snapshot: &mut Snapshot, previous: Option<&Value>, watch: &Watch) -
         since,
         carried: false,
         watched: false,
+        releases: 1,
     };
     let mut lines = Vec::new();
     let mut holds = Vec::with_capacity(snapshot.holds.len());
@@ -1269,6 +1288,39 @@ pub struct NeedsYou {
     /// off or stage 2 was not read this pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_evidence: Option<ApprovalEvidence>,
+    /// Optional extension with `holds.actNow` ([`Self::rank_act_now`]):
+    /// absent where it is off, and empty where nothing qualifies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act_now: Option<Vec<ActNow>>,
+}
+
+/// The most records `act_now` lists, as the review app's Act now shows.
+pub const MAX_ACT_NOW: usize = 10;
+
+/// The most items one `act_now` record says it unblocks, as the review app
+/// accepts.
+pub const MAX_UNBLOCKS: usize = 10_000;
+
+/// Card kinds `act_now` leaves out, though their descriptor may read as a
+/// decision: a stall alarm asks the operator to look into why the pass is
+/// stuck, not for one action, and a digest's waiting pull request waits on
+/// its author upstream.
+const NOT_ACT_NOW: &[&str] = &["stalled", "digest-waiting"];
+
+/// One of the cards the operator can decide now, with how much that
+/// unblocks; it joins the list's `items` card of the same `key`, which has
+/// the question.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ActNow {
+    pub key: String,
+    /// The items that wait on it: a group's members, the open children
+    /// of a parent that is not a live epic, the items a blocker holds by
+    /// overlap, else 1.
+    pub unblocks: usize,
+    pub priority: Option<String>,
+    pub waiting_since: String,
+    /// The card's `action`, with the head an approval or review is at.
+    pub action: Reference,
 }
 
 /// The most approval rows [`ApprovalEvidence`] describes, highest ranked
@@ -1631,6 +1683,10 @@ impl NeedsYou {
         {
             evidence.omitted += 1;
         }
+        // A record without its card says nothing a reader may show.
+        if let Some(rows) = &mut self.act_now {
+            rows.retain(|r| r.key != ask.key);
+        }
         self.requests.retain(|r| r.key != ask.key);
         self.request_sources.retain(|r| r.key != ask.key);
         self.summary_cache.remove(&ask.key);
@@ -1672,6 +1728,66 @@ impl NeedsYou {
 
     fn evidence_len(&self) -> usize {
         self.approval_evidence.as_ref().map_or(0, |e| e.items.len())
+    }
+
+    /// Sets `act_now` to at most [`MAX_ACT_NOW`] of the cards, most
+    /// unblocking first, then in the list's order. A card qualifies where
+    /// it is not carried, its kind is not in [`NOT_ACT_NOW`], and every
+    /// descriptor it has is a fresh, concrete `decision` (so neither carried
+    /// nor generic). An approval among them also needs this pass's evidence
+    /// for the card at its head, with green checks and a verdict of the
+    /// review job: else it may wait on CI, a fix round or the review, which
+    /// are not the operator's yet, and without evidence nothing says; so a
+    /// hold's card on such an approval, unjoined, is left out too. `holds`
+    /// are the snapshot's, whose [`Published::releases`] a hold's card
+    /// unblocks.
+    pub(super) fn rank_act_now(&mut self, holds: &[Published]) {
+        let ready = |key: &str| {
+            (self.approval_evidence.as_ref())
+                .and_then(|e| e.items.get(key))
+                .is_some_and(|e| e.ci.state == approval::CiState::Green && e.review.is_some())
+        };
+        let decision = |key: &str| {
+            let mut own = self.requests.iter().filter(|r| r.key == key).peekable();
+            own.peek().is_some()
+                && own.all(|r| {
+                    r.quality == requests::DECISION
+                        && (r.target.kind != RefKind::ApprovePullRequest || ready(key))
+                })
+        };
+        let unblocks = |ask: &Ask| {
+            let released = match (&ask.group, ask.source_ref.kind) {
+                (Some(group), _) => group.numbers.len(),
+                (None, RefKind::Hold) => (holds.iter())
+                    .find(|h| h.item.as_deref() == Some(&ask.item) && h.kind.name() == ask.kind)
+                    .map_or(1, |h| h.releases),
+                _ => 1,
+            };
+            released.clamp(1, MAX_UNBLOCKS)
+        };
+        // A hold on the operator's approval of a pull request that stage 2
+        // did not join to its approval wait has no evidence of its own.
+        let unjoined_approval = |ask: &Ask| {
+            ask.source_ref.kind == RefKind::Hold
+                && (holds.iter()).any(|h| {
+                    h.item.as_deref() == Some(&ask.item) && approval_of(&h.reason).is_some()
+                })
+        };
+        let mut rows: Vec<ActNow> = (self.items.iter())
+            .filter(|a| !a.carried && !NOT_ACT_NOW.contains(&a.kind.as_str()))
+            .filter(|a| decision(&a.key) && !unjoined_approval(a))
+            .map(|a| ActNow {
+                key: a.key.clone(),
+                unblocks: unblocks(a),
+                priority: a.priority.clone(),
+                waiting_since: a.waiting_since.clone(),
+                action: a.action.clone(),
+            })
+            .collect();
+        // Stable: equal counts keep the list's Priority, then age, order.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.unblocks));
+        rows.truncate(MAX_ACT_NOW);
+        self.act_now = Some(rows);
     }
 }
 
@@ -2541,6 +2657,7 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
         summary_cache,
         carry_validation: BTreeMap::new(),
         approval_evidence,
+        act_now: None,
     };
     preserve_changed_at(&mut list, previous);
     list
@@ -4185,6 +4302,7 @@ mod tests {
             since: since.into(),
             carried: false,
             watched: false,
+            releases: 1,
         };
         snapshot
             .holds
@@ -5282,6 +5400,188 @@ mod tests {
         assert_eq!((evidence.items.len(), evidence.omitted), (49, 0));
         for ask in &list.items[..3] {
             assert!(!evidence.items.contains_key(&ask.key));
+        }
+    }
+
+    /// The board of `fixtures/act-now-needs-you.json`: a question, an epic
+    /// that is not live over 63 held children, a blocker holding three
+    /// items, and asks that are not the operator's to decide now (a reason
+    /// with no question, a carried hold, a stall alarm, an unjoined hold on
+    /// a pull request's approval, a digest's waiting
+    /// pull request, an approval whose checks are pending and one the
+    /// review job has not judged), beside a green, reviewed approval and
+    /// `extra` P3 questions.
+    fn act_now_list(extra: u64) -> NeedsYou {
+        let at = "2026-11-06T12:00:00Z";
+        let t = |n| item("o/t", n);
+        let asked = |n, priority: &str| Entry {
+            why: Some(format!("Q: Pick A or B for o/t#{n}?")),
+            priority: Some(priority.into()),
+            ..entry(
+                Scope::Item(t(n)),
+                HoldKind::NeedsHuman,
+                "labelled needs-human",
+            )
+        };
+        let mut entries = vec![
+            asked(10, "P1"),
+            asked(11, "P0"),
+            Entry {
+                priority: Some("P0".into()),
+                ..entry(
+                    Scope::Item(t(2)),
+                    HoldKind::NeedsOperator,
+                    "an invalid plan",
+                )
+            },
+            // On the approval of a pull request stage 2 has no wait for.
+            Entry {
+                hold: Hold::new(
+                    HoldKind::PrOpen,
+                    format!("{APPROVE_PREFIX}o/z#5{APPROVE_SUFFIX}"),
+                )
+                .operator(true),
+                ..asked(7, "P0")
+            },
+            Entry {
+                scope: Scope::Item(t(30)),
+                hold: Hold::new(HoldKind::Blocking, "only a person moves it").releases(3),
+                priority: Some("P2".into()),
+                why: None,
+            },
+        ];
+        entries.extend((100..163).map(|n| Entry {
+            priority: Some("P2".into()),
+            ..entry(
+                Scope::Under(t(n), t(20)),
+                HoldKind::EpicNotLive,
+                "its parent is not a live epic",
+            )
+        }));
+        entries.extend((40..40 + extra).map(|n| asked(n, "P3")));
+        let mut board = snapshot(&entries, at.into(), tally());
+        for hold in &mut board.holds {
+            hold.carried = hold.item.as_deref() == Some("o/t#11");
+        }
+        board.holds.push(Published {
+            item: Some("o/ops#1".into()),
+            url: None,
+            kind: HoldKind::Stalled,
+            reason: "no apply".into(),
+            operator: true,
+            priority: None,
+            ..board.holds[0].clone()
+        });
+        // Green and reviewed; pending; green with no review verdict yet.
+        let mut reviews = approvals(1..=3, HEAD_A);
+        for ask in &mut reviews.asks {
+            ask.kind = "review-approve".into();
+            ask.ask = format!("Approve {} at its head?", ask.item);
+        }
+        let evidence = reviews.approval_evidence.as_mut().unwrap();
+        for (key, review) in [("o/a#1", true), ("o/a#2", true), ("o/a#3", false)] {
+            evidence.get_mut(key).unwrap().review = review.then(|| approval::AgentReview {
+                verdict: approval::Verdict::Approved,
+                at: "2026-10-28T07:00:00Z".into(),
+            });
+        }
+        evidence.get_mut("o/a#2").unwrap().ci.state = approval::CiState::Pending;
+        let mut waiting = own(DIGEST, ("o/d", 1), RefKind::ReplyPullRequest, None);
+        waiting.kind = "digest-waiting".into();
+        waiting.ask = "Reply to the author?".into();
+        let said = |question: &str| {
+            Some(Summary {
+                question: Some(question.into()),
+                ..Summary::default()
+            })
+        };
+        let (on, options) = (item("o/ops", 1), options(&["P0", "P1", "P2", "P3"]));
+        let reading = Reading {
+            epics: false,
+            reviews,
+            digest: collected(Read::Complete, vec![waiting], &[]),
+            summaries: (
+                Read::Complete,
+                BTreeMap::from([
+                    ("o/t#20".into(), said("Label o/t#20 an epic?")),
+                    ("o/t#30".into(), said("Merge or close o/t#30?")),
+                ]),
+            ),
+            ..reading(&on, &options)
+        };
+        let mut list = needs_you(&board, None, &reading);
+        list.rank_act_now(&board.holds);
+        list
+    }
+
+    /// `act_now` lists what the operator can decide now, most unblocking
+    /// first and then in the list's order, at most [`MAX_ACT_NOW`], each
+    /// joined to its card; the shared fixture is its publication. Off, the
+    /// field is absent; a card [`fit`] leaves out takes its record along.
+    #[test]
+    fn act_now_ranks_decisions_by_what_they_unblock() {
+        let list = act_now_list(0);
+        let rows: Vec<Value> = (list.act_now.iter().flatten())
+            .map(|r| json!([r.key, r.unblocks, r.priority, r.action.head]))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                json!(["o/t#20", 63, "P2", null]),
+                json!(["o/t#30", 3, "P2", null]),
+                json!(["o/t#10", 1, "P1", null]),
+                json!(["o/a#1", 1, null, HEAD_A]),
+            ]
+        );
+        for row in list.act_now.iter().flatten() {
+            let card = list.items.iter().find(|a| a.key == row.key).unwrap();
+            assert_eq!(
+                (&row.action, &row.waiting_since),
+                (&card.action, &card.waiting_since)
+            );
+        }
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../../fixtures/act-now-needs-you.json"))
+                .unwrap();
+        assert_eq!(serde_json::to_value(&list).unwrap(), fixture["needs_you"]);
+        let schema: Value =
+            serde_json::from_str(include_str!("../../../../docs/act-now.schema.json")).unwrap();
+        let record = &schema["items"];
+        assert_eq!(schema["maxItems"], MAX_ACT_NOW);
+        assert_eq!(record["properties"]["unblocks"]["maximum"], MAX_UNBLOCKS);
+        for row in fixture["needs_you"]["act_now"].as_array().unwrap() {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            let mut required: Vec<&str> = (record["required"].as_array().unwrap().iter())
+                .filter_map(Value::as_str)
+                .collect();
+            keys.sort();
+            required.sort();
+            assert_eq!(keys, required);
+            let types = &record["properties"]["action"]["properties"]["type"]["enum"];
+            assert!(types.as_array().unwrap().contains(&row["action"]["type"]));
+        }
+        // Past the cap, the most unblocking stay and the rest keep order.
+        let capped = act_now_list(12).act_now.unwrap();
+        assert_eq!(capped.len(), MAX_ACT_NOW);
+        let keys: Vec<&str> = capped.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys[..4], ["o/t#20", "o/t#30", "o/t#10", "o/t#40"]);
+        // Off, as `needs_you` alone leaves it.
+        let mut off = list.clone();
+        off.act_now = None;
+        assert!(serde_json::to_value(&off).unwrap().get("act_now").is_none());
+        let mut cut = list;
+        while let Some(ask) = cut.cut() {
+            let rows = cut.act_now.as_ref().unwrap();
+            assert!(rows.iter().all(|r| r.key != ask.key));
+            assert!(
+                rows.iter()
+                    .all(|r| cut.items.iter().any(|a| a.key == r.key))
+            );
         }
     }
 
