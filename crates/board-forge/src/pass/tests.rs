@@ -794,6 +794,217 @@ fn stage_shares_keep_requests_for_scheduling() {
     read().unwrap();
 }
 
+/// A saturated PR sweep must leave enough requests for the real scheduler
+/// to read the board and dispatch triage on an under-pace pool, not just
+/// reach stage 4 with enough requests for its initial listings.
+#[test]
+fn reserved_scheduling_starts_after_a_saturated_sweep() {
+    let mut forge = Forge::new(None, false);
+    forge.holds_destination(true);
+    let repositories: Vec<String> = (0..50).map(|n| format!("example/repo{n:02}")).collect();
+    for repo in &repositories {
+        followed(&mut forge.replay, (repo, 1), json!({}), json!([]));
+    }
+    let mut cfg = config(json!({
+        "reserveScheduling": true, "follow": repositories, "triage": true,
+        "pr": {"noMerge": repositories, "fixPools": ["claude"]}
+    }));
+    cfg.epics = None;
+    let report = apply(&forge, &cfg);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("pull requests: the stage's request share is spent")),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start triage ") && l.contains("pool=claude")),
+        "{:?}",
+        report.lines
+    );
+    assert!(!forge.dispatches().is_empty());
+    assert!(report.spent.requests <= PASS_REQUEST_LIMIT);
+    assert!(report.state.unwrap().share_cursor.is_some());
+}
+
+#[test]
+fn scheduling_reserve_is_opt_in_and_github_only() {
+    assert!(!config(json!({})).reserve_scheduling);
+    assert!(!config(json!({"reserveScheduling": false})).reserve_scheduling);
+    assert!(config(json!({"reserveScheduling": true})).reserve_scheduling);
+    for setting in [json!(false), json!(true)] {
+        assert!(forgejo::check_options(&json!({"reserveScheduling": setting})).is_err());
+    }
+}
+
+/// Both sweeps share the headroom before epics; each stage must stop its
+/// discovery rather than consuming the next stage's allocation.
+#[test]
+fn scheduling_reserve_precedes_all_discovery_stages() {
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    for (stage, percent) in [
+        (Stage::Maintain, SCHEDULE_SHARE + EPICS_SHARE),
+        (Stage::PullRequests, SCHEDULE_SHARE + EPICS_SHARE),
+        (Stage::Epics, SCHEDULE_SHARE),
+    ] {
+        bounds.enter_keeping(stage, percent);
+        while client.get("https://api.github.com/x", None).is_ok() {}
+        assert_eq!(
+            bounds.left.get(),
+            PASS_REQUEST_LIMIT * percent / 100 + WRITE_RESERVE
+        );
+        assert!(bounds.share_line().unwrap().contains(stage.name()));
+    }
+    bounds.enter(Stage::Schedule);
+    assert_eq!(client.share_left(), None);
+    assert!(bounds.left.get() > START_RESERVE + START_REQUESTS);
+}
+
+#[test]
+fn scheduling_retries_concurrency_after_maintain_spends_its_share() {
+    let repositories: Vec<String> = (0..20).map(|n| format!("example/source{n}")).collect();
+    let (mut cfg, replay) = maintained_with(
+        9,
+        vec![],
+        0.0,
+        json!({"sinceDays": 90, "min": 3, "max": 20, "include": repositories}),
+    );
+    cfg.reserve_scheduling = true;
+    cfg.triage = Some(TriageScope::All);
+    cfg.epics = None;
+    cfg.follow = vec![AUTHORED_REPO.into()];
+    cfg.pr.fix_pools = vec!["claude".into()];
+    cfg.pr.poll.review_pools = vec!["claude".into()];
+    cfg.pr.review_workflow = Some("review.yml".into());
+    let mut forge = Forge::new(None, false);
+    forge.replay = replay;
+    only(&mut forge.replay, &["cgwalters-forge/tracker#459"]);
+    forge.holds_destination(true);
+    for repo in &repositories {
+        for (path, body) in [
+            (format!("repos/{repo}"), visible(true)),
+            (
+                format!("repos/{repo}/pulls?state=open&per_page=100"),
+                json!([]),
+            ),
+        ] {
+            forge
+                .replay
+                .requests
+                .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
+                "answer": {"status": 200, "link": null, "body": body}}));
+        }
+    }
+    let report = apply_within(&forge, &cfg, 200);
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("budget: maintain stopped at its share")),
+        "{:?}",
+        report.lines
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("start triage cgwalters-forge/tracker#459 pool=claude")),
+        "{:?}",
+        report.lines
+    );
+    assert_eq!(forge.dispatches().len(), 1);
+    let cached = report.maintain.unwrap();
+    assert!(!cached.done);
+
+    // A still smaller share expires while validating source visibility.
+    // That is a deferral, not a nonpublic source or a completed empty day.
+    cfg.wip = 0;
+    cfg.follow.clear();
+    cfg.pr.poll.review_pools.clear();
+    let state = State {
+        maintain: Some(cached.clone()),
+        ..State::default()
+    };
+    let bounds = Bounds::new(100, Instant::now() + Duration::from_secs(60));
+    let report = block(run_within(
+        &forge,
+        &forge,
+        &cfg,
+        (
+            state,
+            Mode::Actions(&own()),
+            Limits::default(),
+            forge.replay.now,
+        ),
+        &bounds,
+    ))
+    .unwrap();
+    assert_eq!(report.failures, 0, "{:?}", report.lines);
+    assert_eq!(
+        serde_json::to_value(report.maintain).unwrap(),
+        serde_json::to_value(Some(cached)).unwrap()
+    );
+    assert!(
+        report
+            .lines
+            .iter()
+            .any(|l| l.starts_with("budget: maintain stopped at its share")),
+        "{:?}",
+        report.lines
+    );
+}
+
+#[test]
+fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
+    for (limit, starts) in [(200, false), (PASS_REQUEST_LIMIT, true)] {
+        let (mut cfg, mut replay) = maintained(9, vec![], 40.0);
+        cfg.reserve_scheduling = true;
+        cfg.work_repositories.clear();
+        cfg.epics = None;
+        digest_visibility(&mut replay, visible(true));
+        let mut forge = Forge {
+            replay,
+            ..Forge::new(None, false)
+        };
+        forge
+            .replay
+            .requests
+            .push(json!({"request": {"get": format!("{API_ROOT}user")},
+            "answer": {"status": 200, "link": null, "body": {"login": "cgwalters-bot"}}}));
+        let report = apply_within(&forge, &cfg, limit);
+        assert_eq!(report.failures, 0, "limit {limit}: {:?}", report.lines);
+        assert_eq!(!forge.dispatches().is_empty(), starts, "{:?}", report.lines);
+        let plans = forge
+            .comments_on("cgwalters-forge/bot-ops", 9)
+            .iter()
+            .filter(|body| plan::fenced_json(body, PLAN_FENCE).unwrap().is_some())
+            .count();
+        assert_eq!(plans, usize::from(starts));
+        assert_eq!(report.maintain.unwrap().done, starts);
+        if !starts {
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("budget: maintain stopped at its share")),
+                "{:?}",
+                report.lines
+            );
+        }
+    }
+}
+
 /// A 304 is not charged, as GitHub does not count it against the rate
 /// limit, but only up to [`REVALIDATED_LIMIT`]; the summary says how many.
 #[test]
