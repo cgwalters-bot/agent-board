@@ -17,8 +17,8 @@ nothing it derives from board text is write authority. Its own writes follow
 fixed rules from forge facts and preview by default, within a fixed request
 budget; what an agent produces needs an independent check.
 
-It is meant for any forge. Today GitHub works fully; Forgejo boards can be read
-but not written or dispatched from; GitLab is not supported yet. See
+It is meant for any forge. Today GitHub works fully; Forgejo and GitLab boards
+can be read but not written or dispatched from. See
 [forges](../docs/forges.md).
 
 ## How it fits

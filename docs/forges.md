@@ -11,7 +11,7 @@ works today:
 |---|---|---|
 | GitHub | Projects v2 | Yes |
 | Forgejo | Issues of configured repositories, fields from labels; pass identity and broker pacing | Stage 3 epics; stage 4 apply: claims, starts, recovery, leases and one rerun; no activation ([contract](#a-forgejo-pass)) |
-| GitLab | No | No ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
+| GitLab | Issues of configured projects, fields from labels | No; reads only ([#294](https://github.com/cgwalters-forge/agent-board/issues/294)) |
 
 Existing dispatch callers still use GitHub Actions. The backend boundary also
 offers opt-in native Forgejo start, recovery, active inventory, status, rerun,
@@ -1085,5 +1085,61 @@ GitHub reads ([architecture](architecture.md#async-forge-io)).
 
 ## GitLab
 
-Not supported yet. [#294](https://github.com/cgwalters-forge/agent-board/issues/294)
-starts with a read-only board, as for Forgejo, then plans, records and dispatch.
+Reads only, the first slice of [#294](https://github.com/cgwalters-forge/agent-board/issues/294):
+`--board-config agent-board.json` (trusted, default branch) makes the board the
+issues of some GitLab projects, exactly as for Forgejo. It is read by
+`snapshot create`, `project view`, `item list`, `item view` and
+`reconcile plan`; every other command, the pass and intake included, is
+refused, and the backend has no write path at all.
+
+```json
+{
+  "board": {
+    "forge": "gitlab",
+    "url": "https://gitlab.example/",
+    "tokenEnv": "GITLAB_TOKEN",
+    "repositories": ["group/subgroup/project"],
+    "membership": {"label": "agent-board"},
+    "recorders": [1234]
+  }
+}
+```
+
+`url` defaults to `https://gitlab.com/` and is otherwise held to the same
+canonical HTTP(S) rules as Forgejo's, with the same plain-HTTP warning; item
+identities keep only the host name. `repositories` are project paths
+`NAMESPACE/PROJECT`, where the namespace may be a chain of subgroups; only
+unreserved path characters are admitted, and the `/` separators are sent
+percent-encoded as `%2F`, which GitLab's API requires (the URL parser
+preserves `%2F` through a parse, so request URLs are built as whole strings
+rather than relative joins). The token is sent as a `PRIVATE-TOKEN` header
+from `tokenEnv`
+(never the GitHub token variables) and only to URLs under the configured
+instance's `/api/v4/` root, with redirects refused.
+
+`membership` is `{"label": NAME}` (open and closed issues with that label) or
+`"open"` (every open issue; GitLab spells the state `opened`, which the
+snapshot normalizes to `open`). Labels and notes mean what they mean on
+Forgejo: one `priority/P0`..`priority/P3` label and one `turn/...` label,
+`blocked/<reason>` labels for the Blocked list, and `board.statusLabels: true`
+to opt into the six [Status labels](#labels-and-status) (otherwise
+`status_field_absent`). Zero, two or an unknown value leaves the item's
+fields incomplete and `reconcile plan` says why.
+
+Run and Result come from the newest note by a `recorders` user id whose first
+line is `<!-- agent-board-run: URL -->` or
+`<!-- agent-board-result: URL -->`; with no recorders, notes are not read.
+GitLab's project issues API lists issues only, never merge requests, and the
+reader proves it per item through the issue's `web_url` ending
+`/-/issues/IID` or, on newer projects that serve issues as work items,
+`/-/work_items/IID` (the same iid namespace); `references.full` still
+cross-checks the project and number. The note listing is paginated
+(`per_page=50`) and includes
+GitLab's system notes; the user notes among them must match the issue's
+`user_notes_count`, or the item is marked incomplete rather than trusting a
+thread that changed mid-read. A recorder marker must be unedited
+(`created_at` equal to `updated_at`); an edited marker holds the item rather
+than falling back to an older record. Coverage is complete only when every
+page of a listing reported one `X-Total` equal to the items read, and the
+whole snapshot stays inside the shared request budget. Close reasons are
+null; GitLab records none on issues.

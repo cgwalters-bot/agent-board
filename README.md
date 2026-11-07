@@ -6,7 +6,7 @@ agent-board coordinates coding agents through a project board without depending
 on any one forge. The work is recorded in the board and its issues. agent-board
 decides what job each issue should get, starts it once through a pluggable
 dispatcher, and follows the pull requests that come back. GitHub is fully
-supported, Forgejo boards are read-only, and GitLab is not supported yet.
+supported, Forgejo and GitLab boards are read-only.
 
 **Documentation: <https://cgwalters-forge.github.io/agent-board/>**, built from
 [`docs/`](docs/) and [`site/`](site/).
