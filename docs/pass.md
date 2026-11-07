@@ -570,7 +570,7 @@ refuse are left out or `unknown`.
 
 A view whose newest pass, pools and runs are as published is no change for
 30 minutes, so an idle pass does not write every time; a pass not written
-is not in `passes`. Past the comment's size the view gives way only after
+is not in `passes`. Past the snapshot's size the view gives way only after
 the item holds that do not wait on the operator, and before any other hold
 or needs-you card: first its older passes, then the newest pass's last
 starts and reasons, counted in its `omitted`, then the last runs in flight,
@@ -1087,9 +1087,32 @@ so a reader treats a list whose `validated_at` is older than that and a pass
 interval as unknown, not as current. So does a reader that finds no
 `needs_you` where it is on, as after a pass whose stages failed.
 
-The JSON is compact, one entry a line, so that a board of a few hundred holds
-fits GitHub's 65,536-character comment. The comment is also capped at 60,000
-characters: past that, the `summary_cache` goes first, which only costs the
+The JSON is compact, one entry a line. A snapshot of up to 60,000 characters
+(under GitHub's 65,536 for a comment) is that comment as it is. A longer one
+(agent-board#774) is gzipped and its standard base64 cut into pieces of
+59,000 characters, across at most 4 comments: the first, found by its usual
+first line, says `{"schema": "agent-board/holds-parts/v1", "at": T,
+"encoding": "gzip+base64", "parts": N}` in its `json` block and has the
+first piece in a `text` block; each other has the first line
+`<!-- agent-board-holds part v1 -->`, `{"schema":
+"agent-board/holds-parts/v1", "at": T, "part": I}` and its piece. A reader
+joins the pieces in order, decodes them and inflates at most 8,000,000
+bytes, the plain comment the snapshot would be, whose `at` must be T. The
+pass writes the new parts last to first, to the bot's part comments that the
+published header does not use, or new comments, and then the first comment
+last. A failed write leaves the published snapshot whole, clocks and all.
+A reader that finds a part missing or of another `at` has no snapshot
+rather than a mix of two. That can happen while a pass writes, or if
+someone edits a comment. Unused parts are left as they are, so the issue
+holds at most 6 part comments. A publication that would add a comment past
+the first 100 is refused before any write. The pass reads only the first page of 100 comments on
+the holds issue, as the review app does, and past it publishes nothing
+(`holds error: …more than 1 pages of comments`). Its needs-you list carries
+over only where the bot last edited the first comment and every part used.
+The pass's line adds `, compressed across N comments`
+where there is more than one; it is still one write step. Forgejo's pass
+publishes one plain comment as before. The snapshot is also capped at
+4 comments, and at 2,000,000 characters plain: past that, the `summary_cache` goes first, which only costs the
 next pass the bodies' downloads; then item holds that do not wait on the operator are left
 out until it fits, those without a Priority first, then the lowest Priority
 (`P3` before `P0`), then the newest (the highest number), and `truncated`
@@ -2803,7 +2826,7 @@ afresh, so one clears itself once its hold changes, or once a pass makes
 progress or has no candidate free to start. A preview says them too but never makes
 progress of its own.
 
-Past the comment's 60,000-character cap, the holds the first alarm watches
+Past the snapshot's [cap](#decisions-and-review-draft-inbox-sources), the holds the first alarm watches
 (of a kind that stalls, on an epic or at P0 or P1, not waiting on the
 operator) are left out only after every other hold that does not wait on
 the operator, and the alarms after them, each together with the hold it is

@@ -11,6 +11,14 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The hold snapshot on GitHub is no longer cut to one 65,536-character
+  comment, which had left out every needs-you detail card and the pass view
+  (agent-board#774): one longer than a comment is gzipped, in base64, across
+  at most 4 of the bot's comments on the holds issue, the first with its
+  usual marker and a header that counts them, the others with
+  `<!-- agent-board-holds part v1 -->`. Readers must assemble it; the review
+  app does from its matching release (docs/pass.md).
+
 - The pass's `authored` sweep works without `state`, as the hosted pass
   runs: the repositories live epics name are read in the same pass, from
   stage 3's listing read early, so they come first every pass, and the rest

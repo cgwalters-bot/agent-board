@@ -264,11 +264,11 @@ impl Collector<'_> {
     }
 
     fn holds_snapshot(&self) -> Result<(Value, String)> {
-        use crate::pass::holds::{HOLDS_MARKER, HOLDS_SCHEMA};
+        use crate::pass::holds::{HOLDS_MARKER, HOLDS_SCHEMA, published_among};
         let usage = self.s.usage.as_ref().context("no holds location")?;
         let comments = self.comments(&usage.issue.repository, usage.issue.issue)?;
-        let comment = own_comments(&comments, &usage.bot)
-            .into_iter()
+        let own = own_comments(&comments, &usage.bot);
+        let comment = (own.iter())
             .filter(|c| {
                 c["body"]
                     .as_str()
@@ -276,8 +276,10 @@ impl Collector<'_> {
             })
             .max_by_key(|c| millis(&c["updatedAt"]))
             .context("no holds snapshot")?;
-        let snap =
-            json_block(comment["body"].as_str().context("holds body")?).context("holds JSON")?;
+        // A long snapshot is compressed across the bot's comments (agent-board#774).
+        let bodies: Vec<&str> = own.iter().filter_map(|c| c["body"].as_str()).collect();
+        let first = comment["body"].as_str().context("holds body")?;
+        let snap = published_among(first, &bodies).context("holds JSON")?;
         let at = millis(&snap["at"]).context("holds time")?;
         ensure!(
             snap["schema"] == HOLDS_SCHEMA
