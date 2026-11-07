@@ -462,8 +462,9 @@ pub struct Config {
     #[serde(default)]
     pub notifications: bool,
     /// Off unless set: stage 2 also follows up to this many repositories a
-    /// pass where the bot has an open pull request, and never merges in
-    /// those it adds ([`authored`]).
+    /// pass where the bot has an open pull request, besides those the live
+    /// epics name, which it follows first, and never merges in those it
+    /// adds ([`authored`]).
     pub authored: Option<usize>,
     #[serde(default)]
     pub work_repositories: Vec<String>,
@@ -3310,11 +3311,28 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return 0;
             }
         }
+        // Read before `authored`, which takes a named midstream's upstream
+        // first.
+        let mut routes = None;
+        if config.notifications {
+            match midstream::routes(&self.client, &midstreams) {
+                Ok(read) => routes = Some(read),
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("notifications error: midstream routes: {error:#}"));
+                    return 0;
+                }
+            }
+        }
         // Unread, the repositories it added last pass would be decided as
         // gone, and what was held there dropped.
         let (mut swept, mut waiting) = (Vec::new(), Vec::new());
         // Without the option there is no round to keep a place in.
         let mut cursor = config.authored.and(state.authored_cursor.clone());
+        // Stage 3 replaces them where it reads the live epics.
+        let named = (config.authored)
+            .map(|_| state.authored_priority.clone())
+            .unwrap_or_default();
         if let Some(per_pass) = config.authored {
             let read = match authored::read(&config.bot, &self.client) {
                 Ok(read) => read,
@@ -3330,26 +3348,27 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     !never(repo) && !self.follows.iter().any(|r| r.eq_ignore_ascii_case(repo))
                 })
                 .collect();
-            let room = per_pass.min(POLL_REPOSITORY_LIMIT.saturating_sub(self.follows.len()));
-            if room > 0 {
-                let names = new.iter().map(String::as_str);
-                let turn = match admission::admit(names, room, cursor.as_deref()) {
-                    Ok(turn) => turn,
-                    Err(error) => {
-                        self.report.failures += 1;
-                        self.line(format!("follow error: authored turn: {error:#}"));
-                        return 0;
-                    }
-                };
-                // As with `repositoriesPerPass`, only a pass that applies
-                // moves the cursor, so that a preview hides nothing.
-                if self.apply {
-                    cursor = turn.next;
+            let threads = state.intake_waiting.keys().map(String::as_str);
+            let priority = authored::priority(&named, threads, routes.as_ref());
+            let room = POLL_REPOSITORY_LIMIT.saturating_sub(self.follows.len());
+            let turn = match authored::turn(&new, &priority, (per_pass, room), cursor.as_deref()) {
+                Ok(turn) => turn,
+                Err(error) => {
+                    self.report.failures += 1;
+                    self.line(format!("follow error: authored turn: {error:#}"));
+                    return 0;
                 }
-                swept = turn.admitted;
+            };
+            // As with `repositoriesPerPass`, only a pass that applies moves
+            // the cursor, so that a preview hides nothing.
+            if self.apply {
+                cursor = turn.next;
             }
+            let prioritized = turn.prioritized.len();
+            swept = turn.prioritized;
+            swept.extend(turn.admitted);
             self.line(format!(
-                "authored: {found} repositories with the bot's open pull requests, {} not followed, {} of them this pass",
+                "authored: {found} repositories with the bot's open pull requests, {} not followed, {} of them this pass, {prioritized} prioritized",
                 new.len(),
                 swept.len()
             ));
@@ -3376,16 +3395,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             fresh = Some(json!({"schema": USAGE_SCHEMA, "updated_at": at, "pools": pools}));
         }
         let mut poll = config.poll(fresh.as_ref());
-        if config.notifications {
-            match midstream::routes(&self.client, &midstreams) {
-                Ok(routes) => poll.policy.notification_intake = Some(routes),
-                Err(error) => {
-                    self.report.failures += 1;
-                    self.line(format!("notifications error: midstream routes: {error:#}"));
-                    return 0;
-                }
-            }
-        }
+        poll.policy.notification_intake = routes;
         poll.policy.no_merge.extend(midstreams);
         poll.policy.no_merge.extend(swept.iter().cloned());
         poll.policy.bot_only = swept;
@@ -3417,6 +3427,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 // pass held there is kept.
                 outcome.undecided.extend(waiting);
                 outcome.state.authored_cursor = cursor;
+                outcome.state.authored_priority = named;
                 if !self.apply {
                     for step in &outcome.steps {
                         if step.ran

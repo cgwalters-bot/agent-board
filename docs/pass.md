@@ -1478,9 +1478,21 @@ A pass captures one clock and performs these stages in order:
     repositories not already followed take turns, N a pass, in sorted order
     from a cursor (`authored_cursor`) that only an applying pass moves, as
     with `repositoriesPerPass`. One out of its turn counts as undecided, so
-    what the last pass held there is kept. Its line is `authored: F
-    repositories with the bot's open pull requests, M not followed, K of
-    them this pass`. A repository only the search added is treated as in
+    what the last pass held there is kept. Ahead of that rotation, and in
+    addition to its N, each pass first follows the repositories that matter
+    now, at most 10: those the live epics name, in an epic's body as
+    `OWNER/REPO#N` or a `github.com/OWNER/REPO` link (prose such as
+    `ostree PR 3690` names none) or as the repository of an open
+    sub-issue; those of threads whose operator direction the intake keeps
+    waiting; and, with `notifications`, the upstream of any `midstream`
+    fork so named, so an epic naming `ORG/ostree#5` puts `ostreedev/ostree`
+    first. Stage 3 reads the epics after stage 2 has followed, so these
+    names are kept in the poll state (`authored_priority`) and take effect
+    from the next pass; a pass that read the live epics replaces them. No
+    request is added for them: the epics' bodies come with the stage 3
+    listing that is read anyway. Its line is `authored: F repositories
+    with the bot's open pull requests, M not followed, K of them this
+    pass, P prioritized`, K counting the P. A repository only the search added is treated as in
     `pr.noMerge`, as no one chose to let the pass merge there; only the
     bot's own pull requests are followed there, not `pr.mergeAuthors`'; and
     outside our own space it is written in as with `pr.ownSpaceOnly`, set

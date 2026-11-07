@@ -88,7 +88,7 @@ pub(super) const EPICS_QUERY: &str = r#"query($owner: String!, $name: String!, $
   repository(owner: $owner, name: $name) {
     issues(first: $first, after: $cursor, states: OPEN, labels: [$label], orderBy: {field: CREATED_AT, direction: ASC}) {
       nodes {
-        number state
+        number state body
         repository { nameWithOwner }
         labels(first: 50) { nodes { name } totalCount }
         projectItems(first: 10) { nodes { ...Fields } totalCount }
@@ -182,6 +182,8 @@ pub struct EpicFacts {
     pub priority: Option<String>,
     pub status: Option<String>,
     pub why: Option<String>,
+    /// Its body, for the repositories it names ([`authored::referenced`]).
+    pub body: String,
     /// Its sub-issues, open and closed, as an apply reads them.
     pub census: Epic,
     /// Each sub-issue's board Priority, where the board shows it to the
@@ -284,6 +286,7 @@ impl EpicFacts {
             priority,
             status,
             why,
+            body: text(node, "/body").to_owned(),
             census,
             priorities,
         })
@@ -1207,6 +1210,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Err(why) => self.epic_held(&facts, Hold::new(HoldKind::Unreadable, why)),
             }
         }
+        self.authored_priority(&live);
         *self.report.tally.1.live_epics.get_or_insert(0) += live.len();
         self.line(format!(
             "epics: {} live of {open} open in {repository}",
@@ -1287,6 +1291,24 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             waited.later = Some((project.clone(), slots.clone(), target.clone()));
         }
         Ok(())
+    }
+
+    /// With `authored`, the repositories the `live` epics name, kept for the
+    /// next pass's stage 2 to follow first ([`authored`]), as many as the
+    /// poll may follow at all.
+    fn authored_priority(&mut self, live: &[EpicFacts]) {
+        if self.config.authored.is_none() {
+            return;
+        }
+        let mut named = BTreeSet::new();
+        for epic in live {
+            named.extend(authored::referenced(&epic.body));
+            let subs = epic.census.sub_issues.iter();
+            named.extend(subs.map(|sub| sub.repo.to_ascii_lowercase()));
+        }
+        if let Some(state) = self.report.state.as_mut() {
+            state.authored_priority = named.into_iter().take(POLL_REPOSITORY_LIMIT).collect();
+        }
     }
 
     /// The open epics of `repository`, each read whole or why not; the

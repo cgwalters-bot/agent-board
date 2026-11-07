@@ -13720,7 +13720,7 @@ fn authored_search_failures_stop_stage_2() {
                 );
             }
             None => {
-                let line = "authored: 1 repositories with the bot's open pull requests, 0 not followed, 0 of them this pass";
+                let line = "authored: 1 repositories with the bot's open pull requests, 0 not followed, 0 of them this pass, 0 prioritized";
                 assert!(lines.iter().any(|l| l == line), "{name}: {lines:?}");
                 assert!(
                     !lines
@@ -13733,28 +13733,29 @@ fn authored_search_failures_stop_stage_2() {
     }
 }
 
-/// With `authored: 1` and two repositories found, a pass follows the first
-/// and an applying one leaves the cursor at the second, which a pass from
-/// that cursor follows instead; a preview leaves the cursor where it was.
-#[test]
-fn authored_repositories_take_turns() {
-    const REPO: &str = "cgwalters-forge/agentic-job";
-    const NEXT: &str = "cgwalters-forge/zzz";
+/// The forge of [`authored_repositories_take_turns`]: the search finds the
+/// bot's pull requests in `cgwalters-forge/agentic-job` (#9) and
+/// `cgwalters-forge/zzz` (#1), and each is read where followed.
+fn authored_forge() -> Forge {
     let mut forge = Forge::new(None, false);
-    for (url, link, body) in authored_search(&[&[(NEXT, 1), (REPO, 9)]]) {
+    let found = [(AUTHORED_NEXT, 1), (AUTHORED_REPO, 9)];
+    for (url, link, body) in authored_search(&[&found]) {
         forge.replay.requests.push(json!({"request": {"get": url},
             "answer": {"status": 200, "link": link, "body": body}}));
     }
-    followed(&mut forge.replay, (REPO, 9), json!({}), json!([]));
+    followed(&mut forge.replay, (AUTHORED_REPO, 9), json!({}), json!([]));
     for (path, body) in [
         ("user".to_owned(), json!({"login": "cgwalters-bot"})),
         (
             "repos/cgwalters-forge/bot-ops".into(),
             json!({"private": true}),
         ),
-        (format!("repos/{NEXT}/events?per_page=100"), json!([])),
         (
-            format!("repos/{NEXT}/pulls?state=open&per_page=100"),
+            format!("repos/{AUTHORED_NEXT}/events?per_page=100"),
+            json!([]),
+        ),
+        (
+            format!("repos/{AUTHORED_NEXT}/pulls?state=open&per_page=100"),
             json!([]),
         ),
     ] {
@@ -13764,18 +13765,49 @@ fn authored_repositories_take_turns() {
             .push(json!({"request": {"get": format!("{API_ROOT}{path}")},
             "answer": {"status": 200, "link": null, "body": body}}));
     }
+    forge
+}
+
+const AUTHORED_REPO: &str = "cgwalters-forge/agentic-job";
+const AUTHORED_NEXT: &str = "cgwalters-forge/zzz";
+
+/// With `authored: 1` and two repositories found, a pass follows the first
+/// and an applying one leaves the cursor at the second, which a pass from
+/// that cursor follows instead; a preview leaves the cursor where it was.
+/// A repository the last pass's live epics named, or a thread the intake
+/// keeps waiting in, is followed first whatever the cursor, and the rest
+/// still take their turn behind it.
+#[test]
+fn authored_repositories_take_turns() {
+    const REPO: &str = AUTHORED_REPO;
+    const NEXT: &str = AUTHORED_NEXT;
+    let forge = authored_forge();
     let cfg = config(json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1}));
-    let line = "authored: 2 repositories with the bot's open pull requests, 2 not followed, 1 of them this pass";
-    let at = |cursor: Option<&str>| State {
-        authored_cursor: cursor.map(str::to_owned),
-        ..State::default()
+    let at = |cursor: Option<&str>, priority: &str| {
+        let mut state = State {
+            authored_cursor: cursor.map(str::to_owned),
+            ..State::default()
+        };
+        match priority {
+            "epic" => state.authored_priority = vec![REPO.into()],
+            "intake" => {
+                let thread = format!("{REPO}#3");
+                state.intake_waiting = [(thread, "2026-10-23T00:00:00Z".into())].into();
+            }
+            _ => {}
+        }
+        state
     };
     let own = own();
-    for (cursor, applies, followed, next) in [
-        (None, false, true, None),
-        (None, true, true, Some(NEXT)),
-        (Some(NEXT), false, false, Some(NEXT)),
-        (Some(NEXT), true, false, None),
+    for (cursor, priority, applies, followed, next, (admitted, prioritized)) in [
+        (None, "", false, true, None, (1, 0)),
+        (None, "", true, true, Some(NEXT), (1, 0)),
+        (Some(NEXT), "", false, false, Some(NEXT), (1, 0)),
+        (Some(NEXT), "", true, false, None, (1, 0)),
+        (Some(NEXT), "epic", false, true, Some(NEXT), (2, 1)),
+        (Some(NEXT), "epic", true, true, None, (2, 1)),
+        (None, "epic", true, true, None, (2, 1)),
+        (Some(NEXT), "intake", true, true, None, (2, 1)),
     ] {
         let mode = if applies {
             Mode::Actions(&own)
@@ -13786,19 +13818,84 @@ fn authored_repositories_take_turns() {
             &forge,
             &forge,
             &cfg,
-            at(cursor),
+            at(cursor, priority),
             (mode, Limits::default()),
             forge.replay.now,
         ))
         .unwrap();
         let lines = &report.lines;
-        let name = format!("{cursor:?} applies={applies}");
+        let name = format!("{cursor:?} {priority} applies={applies}");
         assert_eq!(report.failures, 0, "{name}: {lines:?}");
-        assert!(lines.iter().any(|l| l == line), "{name}: {lines:?}");
+        let line = format!(
+            "authored: 2 repositories with the bot's open pull requests, 2 not followed, {admitted} of them this pass, {prioritized} prioritized"
+        );
+        assert!(lines.contains(&line), "{name}: {lines:?}");
         let decided = lines.iter().any(|l| l.starts_with(&format!("{REPO}#9 ")));
         assert_eq!(decided, followed, "{name}: {lines:?}");
         let state = report.state.unwrap();
         assert_eq!(state.authored_cursor.as_deref(), next, "{name}");
+        // This pass's stage 3 read no live epic, so the next names none.
+        assert_eq!(state.authored_priority, Vec::<String>::new(), "{name}");
+    }
+}
+
+/// Stage 3 keeps the repositories the live epics name for the next pass's
+/// `authored` turn: those named in an epic's body as `OWNER/REPO#N` or by a
+/// link, and those of its open sub-issues, but not a repository named only
+/// in prose. With `authored` unset it keeps none.
+#[test]
+fn live_epics_name_the_authored_priority() {
+    // The recorded open epics, tracker#596's body naming more.
+    let recorded = replay();
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "label": EPIC_LABEL,
+        "field": "Priority", "first": epics::EPICS_PER_PAGE, "cursor": null});
+    let request = graphql_key(epics::EPICS_QUERY, &variables);
+    let mut listing = (recorded.requests.iter())
+        .find(|e| e["request"] == request)
+        .unwrap()["answer"]
+        .clone();
+    let nodes = listing
+        .pointer_mut("/data/repository/issues/nodes")
+        .unwrap();
+    let epic = (nodes.as_array_mut().unwrap().iter_mut())
+        .find(|n| n["number"] == 596)
+        .unwrap();
+    epic["body"] = json!(format!(
+        "Follow {AUTHORED_NEXT}#1 closely, see https://github.com/Upstream/Thing/pull/2. \
+         Not ostree PR 3690, nor https://api.github.com/repos/o/api."
+    ));
+    for authored in [true, false] {
+        let mut forge = authored_forge();
+        forge.replay.requests.retain(|e| e["request"] != request);
+        (forge.replay.requests).push(json!({"request": request, "answer": listing}));
+        let mut settings = json!({"wip": 0, "pr": {"fixPools": ["claude"]}});
+        match authored {
+            true => settings["authored"] = json!(1),
+            false => settings["follow"] = json!([AUTHORED_REPO]),
+        }
+        let report = preview(&config(settings), &forge.replay);
+        let lines = &report.lines;
+        assert!(
+            lines.contains(&"epics: 3 live of 3 open in cgwalters-forge/tracker".to_owned()),
+            "{lines:?}"
+        );
+        let state = report.state.unwrap();
+        if !authored {
+            assert_eq!(state.authored_priority, Vec::<String>::new());
+            continue;
+        }
+        let named = &state.authored_priority;
+        for repo in [AUTHORED_NEXT, "upstream/thing"] {
+            assert!(named.contains(&repo.to_owned()), "{repo}: {named:?}");
+        }
+        for repo in ["ostreedev/ostree", "o/api", "repos/o"] {
+            assert!(!named.contains(&repo.to_owned()), "{repo}: {named:?}");
+        }
+        // The sub-issues' repositories: tracker#890's are in agent-board.
+        assert!(
+            named.contains(&"cgwalters-forge/agent-board".to_owned()),
+            "{named:?}"
+        );
     }
 }
 
@@ -13925,7 +14022,7 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 assert_eq!(lines.iter().any(|l| l == listed), topic, "{name}");
                 for (line, from) in [
                     (
-                        "authored: 1 repositories with the bot's open pull requests, 1 not followed, 1 of them this pass",
+                        "authored: 1 repositories with the bot's open pull requests, 1 not followed, 1 of them this pass, 0 prioritized",
                         "authored",
                     ),
                     (

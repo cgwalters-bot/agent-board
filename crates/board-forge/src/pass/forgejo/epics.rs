@@ -438,6 +438,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 priority,
                 status,
                 why: None,
+                // Only the GitHub pass's `authored` reads it.
+                body: String::new(),
                 census,
                 priorities,
             },
