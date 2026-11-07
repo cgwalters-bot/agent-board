@@ -273,8 +273,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             .collect();
         ensure!(records.len() <= 1, "duplicate source plans; held");
         if let Some(comment) = records.first() {
-            let parsed = plan::fenced_json(text(comment, "/body"), PLAN_FENCE)?
-                .context("source marker has no plan")?;
+            let parsed =
+                plan::plan_json(text(comment, "/body"))?.context("source marker has no plan")?;
             let plan = plan::JobPlan::from_json_for(&parsed, crate::forgejo::Naming::Forgejo)?;
             ensure!(
                 self.intake_source(&at, comment, &plan)?.as_ref() == Some(&record),

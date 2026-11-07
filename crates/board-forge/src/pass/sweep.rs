@@ -782,7 +782,7 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
         let step = self.start_triage(
             &found.issue,
             (&pool, brief, SWEEP_INTRO),
-            None,
+            Request::Post,
             None,
             line,
             context,

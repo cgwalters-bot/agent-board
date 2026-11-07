@@ -370,19 +370,21 @@ pub(crate) fn held<'a, T: Transport>(
 ) -> Result<Vec<(u64, &'a Comment)>> {
     let mut out = Vec::new();
     for record in crate::plan::records(comments, writers, plan) {
-        let primary = record.1.body.lines().nth(1).and_then(|line| {
-            let named = line
-                .trim_end()
-                .strip_prefix(&format!("<!-- {BATCH_MARKER}: "))?
-                .strip_suffix(" -->")?;
-            let (repo, number) = named.rsplit_once('#')?;
-            validate_repository(repo).ok()?;
-            Some(ItemRef {
-                repository: repo.into(),
-                number: number.parse().ok()?,
-                ..issue.clone()
-            })
-        });
+        let primary = crate::plan::record_lines(&record.1.body)
+            .get(1)
+            .and_then(|line| {
+                let named = line
+                    .trim_end()
+                    .strip_prefix(&format!("<!-- {BATCH_MARKER}: "))?
+                    .strip_suffix(" -->")?;
+                let (repo, number) = named.rsplit_once('#')?;
+                validate_repository(repo).ok()?;
+                Some(ItemRef {
+                    repository: repo.into(),
+                    number: number.parse().ok()?,
+                    ..issue.clone()
+                })
+            });
         let released = match primary {
             Some(primary) if primary != *issue => {
                 closed(transport, &primary)? && !open_pull(transport, issue)?

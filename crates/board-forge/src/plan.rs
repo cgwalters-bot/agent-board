@@ -1,6 +1,8 @@
-//! Job plans: a job proposal written as a fenced block in an issue comment
-//! (cgwalters-forge/agent-board#46), and the `workflow_dispatch` request that
-//! starts exactly that job on the caller's dispatch.yml. Schema: docs/job-plans.md.
+//! Job plans: a job proposal written in an issue comment, as a table and its
+//! brief ([`table`], agent-board#779) or, until every writer has moved, as a
+//! fenced JSON block (cgwalters-forge/agent-board#46), and the
+//! `workflow_dispatch` request that starts exactly that job on the caller's
+//! dispatch.yml. Schema: docs/job-plans.md.
 //!
 //! A plan carries only what the caller's dispatch.yml (cgwalters-forge/tracker)
 //! has an input for, so nothing in it is silently dropped on the way; the
@@ -17,8 +19,12 @@ use board_core::ItemRef;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+mod table;
+pub use table::{PLAN_END, PLAN_MARKER, canonical_hash, quiet, render};
+
 pub const JOB_PLAN_SCHEMA: &str = "agent-board/job-plan/v1";
-/// The info string of the fence that holds a plan: ```` ```agent-board-plan ````.
+/// The info string of the fence that holds a plan in the older format:
+/// ```` ```agent-board-plan ````.
 pub const PLAN_FENCE: &str = "agent-board-plan";
 /// The tag of the hidden first line of the comment that records a plan's
 /// dispatch: `<!-- agent-board-dispatch: PLAN-ID -->`.
@@ -29,6 +35,11 @@ pub const DISPATCH_MARKER: &str = "agent-board-dispatch";
 pub(crate) fn plan_epic_marker() -> String {
     format!("<!-- agent-board-plan-epic -->\n\n{}", crate::FOOTER)
 }
+
+/// The tag of the hidden line a plan shown as a table keeps after its marker
+/// once dispatch released its record: `<!-- agent-board-released: PLAN-ID -->`.
+/// It holds nothing, but dates the plan from its posting ([`newest_plan`]).
+pub const RELEASED_MARKER: &str = "agent-board-released";
 
 /// The tag of the hidden line after it in the record of a plan the pass
 /// wrote with the operator's direction: `<!-- agent-board-direction: HASH -->`.
@@ -235,11 +246,9 @@ impl JobPlan {
         })
     }
 
-    /// The plan from a comment body: `None` without a plan fence. The fence
-    /// must open at the start of a line, so a plan quoted in a reply (`> `) or
-    /// indented is not one.
+    /// The plan from a comment body: `None` without one ([`plan_json`]).
     pub fn from_comment(body: &str) -> Result<Option<Self>> {
-        fenced_json(body, PLAN_FENCE)?
+        plan_json(body)?
             .map(|value| Self::from_json(&value))
             .transpose()
     }
@@ -307,6 +316,23 @@ impl JobPlan {
     }
 }
 
+/// The comment that holds `plan` (a plan object) after `intro` on `issue`:
+/// shown as a table and its brief ([`render`]) where the brief is [`quiet`]
+/// there and reads back, else as the fenced JSON, which links and
+/// notifies no one.
+pub fn plan_comment(intro: &str, plan: &Value, issue: &ItemRef) -> Result<String> {
+    let job = JobPlan::from_json(plan)?;
+    let owner = issue.repository.split('/').next().unwrap_or_default();
+    let shown = quiet(&job.brief, owner)
+        .then(|| render(&job).ok())
+        .flatten();
+    let text = shown.unwrap_or_else(|| format!("```{PLAN_FENCE}\n{plan:#}\n```"));
+    Ok(match intro {
+        "" => text,
+        intro => format!("{intro}\n\n{text}"),
+    })
+}
+
 /// An issue comment, as far as plans need it.
 #[derive(Clone, Debug)]
 pub struct Comment {
@@ -341,10 +367,10 @@ pub fn newest_plan<'a>(
     comments: &'a [Comment],
     writers: &[&str],
 ) -> Result<(JobPlan, &'a Comment)> {
-    let newest = newest_fenced(comments, writers, PLAN_FENCE)?;
+    let newest = newest_by(comments, writers, holds_plan, PLAN_FENCE)?;
     let plan = JobPlan::from_comment(&newest.body)
         .with_context(|| format!("newest plan {}", newest.url))?
-        .context("plan fence vanished")?;
+        .context("plan vanished")?;
     Ok((plan, newest))
 }
 
@@ -355,17 +381,44 @@ pub(crate) fn newest_fenced<'a>(
     writers: &[&str],
     fence: &str,
 ) -> Result<&'a Comment> {
+    newest_by(comments, writers, |body| has_fence(body, fence), fence)
+}
+
+/// The newest of the writers' comments that `holds` a plan, or that anyone
+/// else edited, which must not be such an edit. A plan recorded in its own
+/// comment ([`record_lines`]), or released there, dates from when it was
+/// posted: dispatch's edits of its Status and record do not make it newer
+/// than a plan posted after it.
+fn newest_by<'a>(
+    comments: &'a [Comment],
+    writers: &[&str],
+    holds: impl Fn(&str) -> bool,
+    what: &str,
+) -> Result<&'a Comment> {
     for writer in writers {
         ensure!(is_github_login(writer), "invalid login {writer:?}");
     }
     let foreign_edit =
         |c: &Comment| (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor);
+    // Only dispatch's own lines for this plan, as it is now: a writer's
+    // edit to a new hash is a new plan, dated by the edit.
+    let when = |c: &Comment| {
+        let ours = plan_id(c).is_ok_and(|id| {
+            table::hidden_lines(&c.body)
+                .first()
+                .is_some_and(|l| *l == marker_line(&id) || *l == released_line(&id))
+        });
+        match ours {
+            true => c.created,
+            false => c.changed,
+        }
+    };
     let newest = comments
         .iter()
-        .filter(|c| weighed(c, writers, fence))
+        .filter(|c| trusted(writers, &c.author) && (holds(&c.body) || foreign_edit(c)))
         // max_by_key keeps the last of equals: the later comment wins a tie.
-        .max_by_key(|c| c.changed)
-        .with_context(|| format!("no plan on this issue from an accepted writer ({fence})"))?;
+        .max_by_key(|c| when(c))
+        .with_context(|| format!("no plan on this issue from an accepted writer ({what})"))?;
     ensure!(
         !foreign_edit(newest),
         "newest plan {} was last edited by {}, who may not write plans",
@@ -387,20 +440,38 @@ fn trusted(writers: &[&str], login: &Option<String>) -> bool {
 /// Whether [`newest_fenced`] weighs a comment: a writer's with a `fence`
 /// block, or one edited by anyone else. An edit counts as a writer's only
 /// when GitHub names a writer as its editor.
-fn weighed(c: &Comment, writers: &[&str], fence: &str) -> bool {
+fn weighed(c: &Comment, writers: &[&str], holds: impl Fn(&str) -> bool) -> bool {
     let foreign_edit = (c.edited || c.editor.is_some()) && !trusted(writers, &c.editor);
-    trusted(writers, &c.author) && (has_fence(&c.body, fence) || foreign_edit)
+    trusted(writers, &c.author) && (holds(&c.body) || foreign_edit)
+}
+
+/// Whether a comment body holds a job plan, in either format, valid or not.
+pub fn holds_plan(body: &str) -> bool {
+    has_fence(body, PLAN_FENCE) || table::marked(body)
+}
+
+/// The plan object in a comment body, in either format: `None` without
+/// one. A plan counts only at the top level: a fence or marker that opens
+/// a line, outside another fenced block or an HTML comment, so a plan
+/// quoted in a reply (`> `), indented or shown as an example is not one.
+pub fn plan_json(body: &str) -> Result<Option<Value>> {
+    match (fenced_json(body, PLAN_FENCE)?, table::json(body)?) {
+        (Some(_), Some(_)) => bail!("comment holds more than one plan"),
+        (fenced, shown) => Ok(fenced.or(shown)),
+    }
 }
 
 /// Whether no comment holds a plan for [`newest_plan`] to weigh, as against
 /// a newest plan that is invalid, which is never read as no plan.
 pub fn no_plan(comments: &[Comment], writers: &[&str]) -> bool {
-    no_fenced(comments, writers, PLAN_FENCE)
+    !comments.iter().any(|c| weighed(c, writers, holds_plan))
 }
 
 /// [`no_plan`] for any `fence`, such as an epic plan's.
 pub(crate) fn no_fenced(comments: &[Comment], writers: &[&str], fence: &str) -> bool {
-    !comments.iter().any(|c| weighed(c, writers, fence))
+    !comments
+        .iter()
+        .any(|c| weighed(c, writers, |body| has_fence(body, fence)))
 }
 
 pub(crate) fn has_fence(body: &str, fence: &str) -> bool {
@@ -643,12 +714,16 @@ fn comments<T: Transport>(
     )
 }
 
-/// A plan's identity: its comment's id and when the comment last changed. A
-/// writer's edit is a new plan, which may be dispatched; the same plan is not
-/// dispatched twice.
+/// A plan's identity: its comment's id and when the comment last changed,
+/// or for a plan shown as a table, the hash its marker names, since its
+/// Status changes with its dispatch. A writer's edit is a new plan, which
+/// may be dispatched; the same plan is not dispatched twice.
 pub fn plan_id(comment: &Comment) -> Result<String> {
     let id = comment_id(&comment.url).with_context(|| format!("{} has no id", comment.url))?;
-    Ok(format!("{id}@{}", comment.changed.format(&Rfc3339)?))
+    Ok(match table::hash(&comment.body) {
+        Some(hash) => format!("{id}@sha256:{hash}"),
+        None => format!("{id}@{}", comment.changed.format(&Rfc3339)?),
+    })
 }
 
 pub(crate) fn comment_id(url: &str) -> Option<u64> {
@@ -659,12 +734,64 @@ fn marker_line(plan: &str) -> String {
     format!("<!-- {DISPATCH_MARKER}: {plan} -->")
 }
 
+fn released_line(plan: &str) -> String {
+    format!("<!-- {RELEASED_MARKER}: {plan} -->")
+}
+
+/// Whether two comment bodies are the same text, as GitHub may store one
+/// with other line endings or trailing whitespace.
+fn same_body(a: &str, b: &str) -> bool {
+    let plain = |s: &str| s.replace("\r\n", "\n").trim_end().to_owned();
+    plain(a) == plain(b)
+}
+
+/// A token telling apart two dispatchers on one login, for a claim kept in
+/// a plan's comment: not a secret, only unlikely to repeat.
+fn claim_nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mixed = nanos ^ (u128::from(std::process::id()) << 64);
+    format!("{:08x}", (mixed ^ (mixed >> 64)) as u32)
+}
+
+/// The hidden lines of a dispatch record, the dispatch marker's first: a
+/// record comment's leading ones, or those a plan shown as a table keeps
+/// after its marker once dispatched ([`table`]). Empty for any other comment.
+pub(crate) fn record_lines(body: &str) -> Vec<&str> {
+    let dispatch = format!("<!-- {DISPATCH_MARKER}: ");
+    if body.starts_with(&dispatch) {
+        return body
+            .lines()
+            .map(str::trim_end)
+            .take_while(|l| l.starts_with("<!-- ") && l.ends_with(" -->"))
+            .collect();
+    }
+    table::record_lines(body)
+}
+
+/// Whether a comment is a dispatch record ([`record_lines`]).
+pub fn is_record(body: &str) -> bool {
+    !record_lines(body).is_empty()
+}
+
+/// What a dispatch record says: a plan comment's Status, where it keeps its
+/// own record, else the record comment's whole text, which names the run
+/// it started (`…/actions/runs/ID`).
+pub fn record_text(body: &str) -> std::borrow::Cow<'_, str> {
+    match table::record_lines(body).is_empty() {
+        true => body.into(),
+        false => table::status(body).unwrap_or_default().into(),
+    }
+}
+
 /// The hash of the operator's direction a dispatch record carries on its
 /// own hidden line, where the pass wrote the plan's brief with it.
 pub(crate) fn recorded_direction(record: &str) -> Option<&str> {
     let prefix = format!("<!-- {DIRECTION_MARKER}: ");
-    record
-        .lines()
+    record_lines(record)
+        .into_iter()
         .find_map(|l| l.strip_prefix(prefix.as_str())?.strip_suffix(" -->"))
 }
 
@@ -687,7 +814,7 @@ pub(crate) fn records<'a>(
             c.author
                 .as_deref()
                 .is_some_and(|a| logins.iter().any(|l| l.eq_ignore_ascii_case(a)))
-                && c.body.lines().next().map(str::trim_end) == Some(marker.as_str())
+                && record_lines(&c.body).first() == Some(&marker.as_str())
         })
         // A record without an id is taken for the earliest: it blocks the plan.
         .map(|c| (comment_id(&c.url).unwrap_or(0), c))
@@ -809,7 +936,16 @@ struct Record {
     header: String,
     id: u64,
     url: String,
+    /// For a plan shown as a table, the record is kept in the plan's own
+    /// comment: its body as this dispatch wrote it, which later edits
+    /// start from.
+    shown: Option<String>,
 }
+
+/// Why a read-back stops a dispatch: a conflict, and whether the record
+/// was lost with it, a plan comment edited since this dispatch wrote its
+/// record there, which is then no longer this dispatch's to edit.
+type Conflict = (String, bool);
 
 /// Start the job that the newest accepted plan on `issue` proposes, once.
 ///
@@ -1024,38 +1160,120 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     };
     // Built before anything is written, so a bad request posts no record.
     request(&chosen.extras.iter().collect::<Vec<_>>())?;
-    let post = |on: &ItemRef, plan: &str, plan_url: &str, header: String, text: String| {
+    let comments_url = |on: &ItemRef| {
+        format!(
+            "{API_ROOT}repos/{}/issues/{}/comments",
+            on.repository, on.number
+        )
+    };
+    let comment_url = |record: &Record| {
+        format!(
+            "{API_ROOT}repos/{}/issues/comments/{}",
+            record.issue.repository, record.id
+        )
+    };
+    // Whether a plan's comment is still `body`, read again just before an
+    // edit, which writes the whole comment: a writer's edit since must not
+    // be undone by one written from an older copy.
+    let unchanged = |on: &ItemRef, url: &str, body: &str| -> Result<bool> {
+        let id = comment_id(url).with_context(|| format!("{url} has no id"))?;
+        let path = format!("{API_ROOT}repos/{}/issues/comments/{id}", on.repository);
+        let read = client.get(&path, None)?;
+        ensure!(
+            read.status == 200,
+            "reading {url}: GitHub HTTP status {}",
+            read.status
+        );
+        Ok(read.body["body"]
+            .as_str()
+            .is_some_and(|now| same_body(now, body)))
+    };
+    // A plan shown as a table keeps its record in its own comment, with
+    // this dispatcher and a nonce in its Status, so that another's claim
+    // written over it reads back as a change; any other plan gets a record
+    // comment.
+    let nonce = claim_nonce();
+    let claim = |on: &ItemRef, plan: &str, from: &Comment, header: String, text: String| {
+        if table::hash(&from.body).is_some() {
+            let id = comment_id(&from.url).with_context(|| format!("{} has no id", from.url))?;
+            let status = format!("dispatching ({login} {nonce})");
+            let body = table::with_record(&from.body, &header, &status)?;
+            ensure!(
+                unchanged(on, &from.url, &from.body)?,
+                "the plan's comment {} changed since it was read; the next dispatch reads it again",
+                from.url
+            );
+            let record = Record {
+                issue: on.clone(),
+                plan: plan.into(),
+                plan_url: from.url.clone(),
+                header,
+                id,
+                url: from.url.clone(),
+                shown: Some(body),
+            };
+            let body = record.shown.as_deref().unwrap_or_default();
+            send(
+                client,
+                "PATCH",
+                &comment_url(&record),
+                &json!({"body": body}),
+                0,
+            )?;
+            return anyhow::Ok(record);
+        }
         let (_, posted) = send(
             client,
             "POST",
-            &format!(
-                "{API_ROOT}repos/{}/issues/{}/comments",
-                on.repository, on.number
-            ),
+            &comments_url(on),
             &json!({"body": format!("{header}\n{text}{note}")}),
             0,
         )?;
         anyhow::Ok(Record {
             issue: on.clone(),
             plan: plan.into(),
-            plan_url: plan_url.into(),
+            plan_url: from.url.clone(),
             header,
             id: posted["id"].as_u64().context("the new comment has no id")?,
             url: posted["html_url"]
                 .as_str()
                 .context("the new comment has no URL")?
                 .to_owned(),
+            shown: None,
         })
     };
-    let edit = |record: &Record, text: String| {
+    // `text` for a record comment, `status` for a plan's own; `keep` keeps
+    // the record, else it is released: without its marker the comment no
+    // longer holds the plan. A plan's comment changed since this dispatch
+    // wrote it is no longer its to edit, and is left as it is.
+    let edit = |record: &Record, text: String, status: String, keep: bool| {
+        if let Some(shown) = &record.shown
+            && !unchanged(&record.issue, &record.url, shown)?
+        {
+            return Ok(());
+        }
+        // The note is sentences; a Status is not one until it ends.
+        let status = match note.is_empty() {
+            true => status,
+            false => format!("{status}."),
+        };
+        let body = match (&record.shown, keep) {
+            (Some(shown), true) => {
+                table::with_record(shown, &record.header, &format!("{status}{note}"))?
+            }
+            (Some(shown), false) => table::with_record(
+                shown,
+                &released_line(&record.plan),
+                &format!("{status}{note}"),
+            )?,
+            (None, true) => format!("{}\n{text}{note}", record.header),
+            (None, false) => format!("{text}{note}"),
+        };
         send(
             client,
             "PATCH",
-            &format!(
-                "{API_ROOT}repos/{}/issues/comments/{}",
-                record.issue.repository, record.id
-            ),
-            &json!({"body": format!("{}\n{text}{note}", record.header)}),
+            &comment_url(record),
+            &json!({"body": body}),
             0,
         )
         .map(drop)
@@ -1063,42 +1281,57 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
     // Read again without a cache. Our own record counts even where the list
     // does not show it yet: only an earlier one stops this dispatch. This
     // relies on GitHub's reads showing comments posted before them; a caller
-    // that runs dispatch in one concurrency group does not need it.
+    // that runs dispatch in one concurrency group does not need it. A record
+    // kept in the plan's comment has no place in an order: any other record
+    // stops it, and so does a change to the comment since it was written.
     // `Ok(Some(why))` is a confirmed conflict; `Err` a read that failed.
-    let check = |record: &Record| -> Result<Option<String>> {
+    let check = |record: &Record| -> Result<Option<Conflict>> {
         let again = issue_comments(client, &record.issue)?;
+        if let Some(shown) = &record.shown
+            && !again
+                .iter()
+                .any(|c| c.url == record.url && same_body(&c.body, shown))
+        {
+            let why = "the plan's comment changed while it was being dispatched";
+            return Ok(Some((why.into(), true)));
+        }
         // A writer's edit since the first read is a new plan, for the next pass.
         let (_, now) = newest_plan(&again, writers)?;
         if plan_id(now)? != record.plan {
-            return Ok(Some(
-                "the plan changed while it was being dispatched".into(),
-            ));
+            let why = "the plan changed while it was being dispatched";
+            return Ok(Some((why.into(), false)));
         }
         Ok(held(client, &again, writers, &record.plan, &record.issue)?
             .into_iter()
-            .find(|(n, _)| *n < record.id)
-            .map(|(_, first)| format!("{} recorded this plan first", first.url)))
+            .find(|(n, c)| match record.shown {
+                Some(_) => c.url != record.url,
+                None => *n < record.id,
+            })
+            .map(|(_, first)| (format!("{} recorded this plan first", first.url), false)))
     };
     let header = match scheduled.direction {
         Some(hash) => format!("{}\n<!-- {DIRECTION_MARKER}: {hash} -->", marker_line(&id)),
         None => marker_line(&id),
     };
-    let mut records = vec![post(
+    let mut records = vec![claim(
         issue,
         &id,
-        &from.url,
+        from,
         header,
         format!("Dispatching the plan in {}.", from.url),
     )?];
     // Extras left out, by index into `chosen.extras`, why, and whether their
-    // record is released (the read-back failed rather than found a conflict).
-    let mut dropped: Vec<(usize, String, bool)> = Vec::new();
+    // record is released (the read-back failed rather than found a conflict)
+    // or lost (another wrote over it in the plan's comment).
+    let mut dropped: Vec<(usize, String, bool, bool)> = Vec::new();
+    // Whether the primary's record was lost to another dispatch.
+    let mut lost = false;
     let started = (|| -> Result<Option<String>> {
         for extra in &chosen.extras {
-            records.push(post(
+            records.push(claim(
                 &extra.issue,
                 &extra.id,
-                &extra.from.url,
+                &extra.from,
                 format!("{}\n{}", marker_line(&extra.id), batch_line(issue)),
                 format!(
                     "Dispatching the plan in {} with {}.",
@@ -1107,15 +1340,16 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
                 ),
             )?);
         }
-        if let Some(why) = check(&records[0])? {
+        if let Some((why, gone)) = check(&records[0])? {
+            lost = gone;
             bail!(why);
         }
         // Another pass taking one extra first leaves only that extra out.
         for (n, record) in records.iter().enumerate().skip(1) {
             match check(record) {
                 Ok(None) => {}
-                Ok(Some(why)) => dropped.push((n - 1, why, false)),
-                Err(why) => dropped.push((n - 1, format!("{why:#}"), true)),
+                Ok(Some((why, gone))) => dropped.push((n - 1, why, false, gone)),
+                Err(why) => dropped.push((n - 1, format!("{why:#}"), true, false)),
             }
         }
         let taken: Vec<_> = (chosen.extras.iter().enumerate())
@@ -1164,27 +1398,34 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
             let why: String = format!("{error:#}").chars().take(ERROR_LIMIT).collect();
             let refused = error.is::<Refused>();
             let mut noted = Ok(());
-            for record in &records {
+            for (n, record) in records.iter().enumerate() {
+                let gone = n
+                    .checked_sub(1)
+                    .is_some_and(|e| dropped.iter().any(|(d, _, _, lost)| *d == e && *lost));
+                if (n == 0 && lost) || gone {
+                    continue;
+                }
                 noted = noted.and(match refused {
-                    // Without its marker the comment no longer holds the plan.
-                    true => send(
-                        client,
-                        "PATCH",
-                        &format!(
-                            "{API_ROOT}repos/{}/issues/comments/{}",
-                            record.issue.repository, record.id
-                        ),
-                        &json!({"body": format!(
-                            "The plan in {} was not dispatched ({why}). A later dispatch may take it.{note}",
+                    true => edit(
+                        record,
+                        format!(
+                            "The plan in {} was not dispatched ({why}). A later dispatch may take it.",
                             record.plan_url
-                        )}),
-                        0,
-                    )
-                    .map(drop),
-                    false => edit(record, format!(
-                        "The plan in {} was not dispatched, or not knowingly ({why}). It is not tried again; edit or replace the plan to dispatch it.",
-                        record.plan_url
-                    )),
+                        ),
+                        format!("not dispatched ({why}); a later dispatch may take it"),
+                        false,
+                    ),
+                    false => edit(
+                        record,
+                        format!(
+                            "The plan in {} was not dispatched, or not knowingly ({why}). It is not tried again; edit or replace the plan to dispatch it.",
+                            record.plan_url
+                        ),
+                        format!(
+                            "not dispatched, or not knowingly ({why}); not tried again: reply with a new plan to dispatch it"
+                        ),
+                        true,
+                    ),
                 });
             }
             return Err(match noted {
@@ -1198,24 +1439,27 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
         let left = n
             .checked_sub(1)
             .and_then(|e| dropped.iter().find(|(d, ..)| *d == e));
-        let text = match (left, &run) {
-            (Some((_, why, true)), _) => {
+        let (text, status, keep) = match (left, &run) {
+            (Some((_, why, _, true)), _) => {
                 let why: String = why.chars().take(ERROR_LIMIT).collect();
                 notes.push(format!("{}: {why}", record.issue.display()));
-                // Without its marker the comment no longer holds the plan.
-                send(
-                    client,
-                    "PATCH",
-                    &format!(
-                        "{API_ROOT}repos/{}/issues/comments/{}",
-                        record.issue.repository, record.id
-                    ),
-                    &json!({"body": format!(
-                        "The plan in {} was left out of the run for {}: it could not be checked ({why}). A later dispatch may take it.{note}",
+                continue;
+            }
+            (Some((_, why, true, _)), _) => {
+                let why: String = why.chars().take(ERROR_LIMIT).collect();
+                notes.push(format!("{}: {why}", record.issue.display()));
+                edit(
+                    record,
+                    format!(
+                        "The plan in {} was left out of the run for {}: it could not be checked ({why}). A later dispatch may take it.",
                         record.plan_url,
                         issue.display()
-                    )}),
-                    0,
+                    ),
+                    format!(
+                        "left out of the run for {}: it could not be checked ({why}); a later dispatch may take it",
+                        issue.display()
+                    ),
+                    false,
                 )
                 .with_context(|| {
                     format!(
@@ -1226,36 +1470,56 @@ pub fn dispatch_with<C: Transport + Rest, D: Rest>(
                 })?;
                 continue;
             }
-            (Some((_, why, false)), _) => {
+            (Some((_, why, false, false)), _) => {
                 let why: String = why.chars().take(ERROR_LIMIT).collect();
                 notes.push(format!("{}: {why}", record.issue.display()));
-                format!(
-                    "The plan in {} was left out of the run for {} ({why}). It is not tried again; edit or replace the plan to dispatch it.",
-                    record.plan_url,
-                    issue.display()
+                (
+                    format!(
+                        "The plan in {} was left out of the run for {} ({why}). It is not tried again; edit or replace the plan to dispatch it.",
+                        record.plan_url,
+                        issue.display()
+                    ),
+                    format!(
+                        "left out of the run for {} ({why}); not tried again: reply with a new plan to dispatch it",
+                        issue.display()
+                    ),
+                    true,
                 )
             }
-            (None, Some(run)) if n > 0 => format!(
-                "Dispatched the plan in {} with {}: [run]({run}).",
-                record.plan_url,
-                issue.display()
+            (None, Some(run)) if n > 0 => (
+                format!(
+                    "Dispatched the plan in {} with {}: [run]({run}).",
+                    record.plan_url,
+                    issue.display()
+                ),
+                format!("dispatched with {}: [run]({run})", issue.display()),
+                true,
             ),
-            (None, Some(run)) => {
-                format!("Dispatched the plan in {}: [run]({run}).", record.plan_url)
-            }
-            (None, None) => format!(
-                "Dispatched the plan in {}{} to {} {}; GitHub did not name the run.",
-                record.plan_url,
-                match n {
+            (None, Some(run)) => (
+                format!("Dispatched the plan in {}: [run]({run}).", record.plan_url),
+                format!("dispatched: [run]({run})"),
+                true,
+            ),
+            (None, None) => {
+                let with = match n {
                     0 => String::new(),
                     _ => format!(" with {}", issue.display()),
-                },
-                target.caller,
-                target.workflow
-            ),
+                };
+                (
+                    format!(
+                        "Dispatched the plan in {}{with} to {} {}; GitHub did not name the run.",
+                        record.plan_url, target.caller, target.workflow
+                    ),
+                    format!(
+                        "dispatched{with} to {} {}; GitHub did not name the run",
+                        target.caller, target.workflow
+                    ),
+                    true,
+                )
+            }
         };
         // The run started: say so, rather than only that the record is stale.
-        edit(record, text).with_context(|| {
+        edit(record, text, status, keep).with_context(|| {
             format!(
                 "dispatched {}, but {} still says it is starting",
                 run.as_deref().unwrap_or("the plan"),
@@ -1950,6 +2214,23 @@ mod tests {
                     body,
                 });
             }
+            if let Some(id) = url.strip_prefix(
+                "https://api.github.com/repos/cgwalters-forge/tracker/issues/comments/",
+            ) {
+                let suffix = format!("-{id}");
+                let comments = self.comments.borrow();
+                let others = self.others.borrow();
+                let node = (comments.iter().chain(others.values().flatten()))
+                    .find(|c| c["url"].as_str().unwrap().ends_with(&suffix))
+                    .unwrap();
+                return Ok(crate::poll::RestResponse {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    link: None,
+                    body: json!({"body": node["body"]}),
+                });
+            }
             if url.contains("/collaborators/") {
                 return Ok(crate::poll::RestResponse {
                     status: 200,
@@ -2049,6 +2330,13 @@ mod tests {
                 node["body"] = text.into();
                 node["lastEditedAt"] = json!("2026-10-14T09:00:01Z");
                 node["editor"] = json!({"login": self.viewer});
+                // The operator's dispatch claims the plan just after ours.
+                let claim = format!("dispatching ({} ", self.viewer);
+                if self.twist == "overwritten" && text.contains(&claim) {
+                    let theirs = text.replace(&claim, &format!("dispatching ({OPERATOR} "));
+                    node["body"] = theirs.into();
+                    node["editor"] = json!({"login": OPERATOR});
+                }
                 return Ok((200, json!({})));
             }
             let expected = if self.overlap["routing"] == true {
@@ -2463,6 +2751,155 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A plan shown as a table keeps its record in its own comment: one
+    /// comment per job, dispatched once, whose Status says what became of it.
+    #[test]
+    fn shown_plan_keeps_its_record_and_dispatches_once() {
+        let shown = format!(
+            "Plan:\n\n{}\n",
+            render(&JobPlan::from_json(&plan()).unwrap()).unwrap()
+        );
+        let planned = || node(7, PLANNER, "2026-10-13T10:00:00Z", &shown);
+        let id = format!("7@sha256:{}", canonical_hash(&plan()).unwrap());
+        let run = (200, json!({"workflow_run_id": 99}));
+        let run_url = "https://github.com/cgwalters-forge/tracker/actions/runs/99";
+        let issue = crate::github::parse_github_issue(ISSUE, None, "github.com").unwrap();
+        let writers = [OPERATOR, PLANNER];
+        // Name, dispatch answers, what goes wrong; then the run or error,
+        // the Status left, and whether the plan is still recorded.
+        #[rustfmt::skip]
+        type Case<'a> = (&'a str, Vec<(u16, Value)>, &'a str, Result<&'a str, &'a str>, String, bool);
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            ("fresh", vec![run.clone()], "", Ok(run_url), format!("dispatched: [run]({run_url})"), true),
+            ("dispatch fails", vec![(500, json!({"message": "boom"}))], "", Err("GitHub HTTP status 500: boom"),
+                "not dispatched, or not knowingly (POST repos/cgwalters-forge/tracker/actions/workflows/dispatch.yml/dispatches: GitHub HTTP status 500: boom); not tried again: reply with a new plan to dispatch it".into(), true),
+            ("refused", vec![], "refused", Err("lease admission: no slot"),
+                "not dispatched (lease admission: no slot); a later dispatch may take it".into(), false),
+            // Another dispatcher wrote its claim over ours: theirs stands.
+            ("overwritten", vec![], "overwritten", Err("the plan's comment changed while it was being dispatched"),
+                format!("dispatching ({OPERATOR} "), true),
+        ];
+        for (name, answers, twist, expected, status, recorded) in cases {
+            let forge = Forge {
+                twist,
+                ..Forge::new(vec![planned()], vec![])
+            };
+            let dispatcher = Forge {
+                twist,
+                ..Forge::new(vec![], answers)
+            };
+            let result = dispatch(
+                &forge,
+                &dispatcher,
+                &issue,
+                &writers,
+                &target(),
+                0,
+                None,
+                None,
+            );
+            match (result, expected) {
+                (Ok(done), Ok(run)) => {
+                    assert_eq!(done.run.as_deref(), Some(run), "{name}");
+                    assert_eq!(
+                        done.record,
+                        Some(format!("{ISSUE}#issuecomment-7")),
+                        "{name}"
+                    );
+                }
+                (Err(error), Err(expected)) => {
+                    let error = format!("{error:#}");
+                    assert!(error.contains(expected), "{name}: {error}");
+                }
+                (result, expected) => panic!("{name}: {result:?} != {expected:?}"),
+            }
+            // No comment was added; the plan's own says what happened.
+            let bodies = forge.bodies();
+            assert_eq!(bodies.len(), 1, "{name}: {bodies:#?}");
+            let left = table::status(&bodies[0]).unwrap();
+            assert!(left.starts_with(&status), "{name}: {}", bodies[0]);
+            if name == "refused" {
+                assert!(bodies[0].contains(&released_line(&id)), "{}", bodies[0]);
+            }
+            assert_eq!(is_record(&bodies[0]), recorded, "{name}: {}", bodies[0]);
+            let comments = issue_comments(&forge, &issue).unwrap();
+            let (again, from) = newest_plan(&comments, &writers).unwrap();
+            assert_eq!(again, JobPlan::from_json(&plan()).unwrap(), "{name}");
+            assert_eq!(plan_id(from).unwrap(), id, "{name}");
+            assert_eq!(
+                records(&comments, &writers, &id).len(),
+                usize::from(recorded),
+                "{name}"
+            );
+            // Once recorded, it is not dispatched again.
+            if recorded {
+                let again = dispatch(
+                    &forge,
+                    &dispatcher,
+                    &issue,
+                    &writers,
+                    &target(),
+                    0,
+                    None,
+                    None,
+                );
+                let again = format!("{:#}", again.unwrap_err());
+                assert!(again.contains("record already"), "{name}: {again}");
+            }
+        }
+        // A plan posted after one that was dispatched is the newest, though
+        // the dispatch edited the older comment later.
+        let forge = Forge::new(vec![planned()], vec![]);
+        let dispatcher = Forge::new(vec![], vec![run.clone()]);
+        dispatch(
+            &forge,
+            &dispatcher,
+            &issue,
+            &writers,
+            &target(),
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut newer = plan();
+        newer["kind"] = json!("research");
+        forge
+            .comments
+            .borrow_mut()
+            .push(node(8, OPERATOR, "2026-10-14T08:00:00Z", &body(&newer)));
+        let comments = issue_comments(&forge, &issue).unwrap();
+        assert!(comments[0].changed > comments[1].changed);
+        let (newest, from) = newest_plan(&comments, &writers).unwrap();
+        assert_eq!(
+            (newest.kind.as_str(), from.url.as_str()),
+            ("research", comments[1].url.as_str())
+        );
+        // A writer's edit of the brief, with its hash, is a new plan.
+        let mut edited = plan();
+        edited["brief"] = json!("Follow up on the review, again.");
+        let text = render(&JobPlan::from_json(&edited).unwrap()).unwrap();
+        let forge = Forge::new(vec![planned()], vec![]);
+        let dispatcher = Forge::new(vec![], vec![run]);
+        dispatch(
+            &forge,
+            &dispatcher,
+            &issue,
+            &writers,
+            &target(),
+            0,
+            None,
+            None,
+        )
+        .unwrap();
+        forge.comments.borrow_mut()[0]["body"] = json!(format!("Plan:\n\n{text}\n"));
+        let comments = issue_comments(&forge, &issue).unwrap();
+        let (_, from) = newest_plan(&comments, &writers).unwrap();
+        assert_ne!(plan_id(from).unwrap(), id);
+        assert!(records(&comments, &writers, &plan_id(from).unwrap()).is_empty());
     }
 
     #[test]

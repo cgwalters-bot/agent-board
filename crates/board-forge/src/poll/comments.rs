@@ -446,9 +446,10 @@ fn triage_brief(
     };
     let answer = match tracking {
         Some(issue) => format!(
-            "then propose a plan as an `agent-board-plan` comment, or answer, on {issue}, the issue that tracks it, which is your item. The result stays on that issue: post nothing to the {what}"
+            "then propose a job plan (agent-board's docs/job-plans.md#format), or answer, on {issue}, the issue that tracks it, which is your item. The result stays on that issue: post nothing to the {what}"
         ),
-        None => "then propose a plan as an `agent-board-plan` comment, or answer there".into(),
+        None => "then propose a job plan (agent-board's docs/job-plans.md#format), or answer there"
+            .into(),
     };
     let mut lines = vec![
         format!(

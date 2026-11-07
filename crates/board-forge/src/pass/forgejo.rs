@@ -557,7 +557,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 continue;
             }
             let body = text(comment, "/body");
-            let parsed = plan::fenced_json(body, PLAN_FENCE);
+            let parsed = plan::plan_json(body);
             if matches!(parsed, Ok(None)) {
                 continue;
             }
@@ -1259,7 +1259,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         if comments
             .iter()
             .filter(recorder)
-            .any(|c| !matches!(plan::fenced_json(text(c, "/body"), PLAN_FENCE), Ok(None)))
+            .any(|c| !matches!(plan::plan_json(text(c, "/body")), Ok(None)))
         {
             let accepted = self.accepted(&facts.issue)?;
             if self.claim(facts, accepted.id)?.is_none_or(|c| {

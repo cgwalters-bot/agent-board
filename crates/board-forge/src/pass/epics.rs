@@ -13,7 +13,7 @@ use super::*;
 use crate::epic::{EPIC_PLAN_FENCE, Epic, IssueRef};
 use crate::epic_apply::{self, Outcome, Preconditions, Receipt};
 use crate::plan::{
-    Comment, DISPATCH_MARKER, PLAN_FENCE, fenced_json, has_fence, newest_fenced, no_fenced, plan_id,
+    Comment, DISPATCH_MARKER, fenced_json, has_fence, newest_fenced, no_fenced, plan_id,
 };
 
 /// Open epics listed a request. Each brings its labels and board items, so
@@ -392,7 +392,7 @@ fn planning_comment<'c>(comments: &'c [Comment], bot: &str) -> Option<&'c Commen
         .filter(|c| {
             bots(c, bot)
                 && c.body.starts_with(PLAN_INTRO)
-                && has_fence(&c.body, PLAN_FENCE)
+                && plan::holds_plan(&c.body)
                 && plan::comment_id(&c.url).is_some()
         })
         .max_by_key(|c| c.changed)
@@ -417,10 +417,9 @@ fn newest_said<'c>(comments: &'c [Comment], bot: &str, marker: &str) -> Option<&
 
 /// The newest dispatch request, shared by the pass and its health reader.
 fn newest_request<'c>(comments: &'c [Comment], writers: &[&str]) -> Option<&'c Comment> {
-    let marker = format!("<!-- {DISPATCH_MARKER}: ");
     comments
         .iter()
-        .filter(|c| is(c.author.as_deref(), writers) && c.body.starts_with(&marker))
+        .filter(|c| is(c.author.as_deref(), writers) && plan::is_record(&c.body))
         .max_by_key(|c| c.changed)
 }
 
@@ -458,12 +457,11 @@ pub(crate) fn health(comments: &[Comment], operator: &str, bot: &str) -> Result<
         && answered.is_none_or(|at| q.changed > at)
     {
         item["pending"] = json!({"at": stamp(q.changed)});
-        let marker = format!("<!-- {DISPATCH_MARKER}: ");
         let mut requests: Vec<_> = comments
             .iter()
             .filter(|c| {
                 is(c.author.as_deref(), &writers)
-                    && c.body.starts_with(&marker)
+                    && plan::is_record(&c.body)
                     && answered.is_none_or(|at| c.changed > at)
             })
             .collect();
@@ -519,15 +517,14 @@ pub(crate) fn health(comments: &[Comment], operator: &str, bot: &str) -> Result<
 /// and the run's status comment would read as direction, and plan the epic
 /// again after every run.
 fn spoke(i: &Inputs, receipts: &[Receipt]) -> Option<OffsetDateTime> {
-    let record = format!("<!-- {DISPATCH_MARKER}: ");
     (i.comments.iter())
         .filter(|c| {
             is(c.author.as_deref(), &[i.operator])
                 && !is(c.author.as_deref(), &[i.bot])
                 && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[i.operator]))
-                && !c.body.starts_with(&record)
+                && !plan::is_record(&c.body)
                 && !receipts.iter().any(|r| r.url == c.url)
-                && !has_fence(&c.body, PLAN_FENCE)
+                && !plan::holds_plan(&c.body)
                 && !has_fence(&c.body, EPIC_PLAN_FENCE)
         })
         .map(|c| c.changed)
@@ -560,11 +557,8 @@ pub(super) fn answered(i: &Inputs) -> Option<String> {
     let writers = [i.operator, i.bot];
     let (receipts, _) = epic_apply::receipts(i.comments, &writers);
     let asked = newest_said(i.comments, i.bot, &format!("<!-- {DONE_MARKER}: "))?;
-    let marker = format!("<!-- {DISPATCH_MARKER}: ");
     let requested = (i.comments.iter()).any(|c| {
-        is(c.author.as_deref(), &writers)
-            && c.body.starts_with(&marker)
-            && c.changed > asked.changed
+        is(c.author.as_deref(), &writers) && plan::is_record(&c.body) && c.changed > asked.changed
     });
     let spoke = spoke(i, &receipts).is_some_and(|s| s > asked.changed);
     (spoke && !requested).then(|| asked.url.clone())
@@ -653,9 +647,11 @@ pub(super) struct Inputs<'a> {
     pub direction: Option<&'a str>,
 }
 
-/// The run a dispatch record names, `…/actions/runs/ID`.
+/// The run a dispatch record names, `…/actions/runs/ID`
+/// ([`plan::record_text`]).
 pub(super) fn record_run(body: &str) -> Option<u64> {
-    let (_, rest) = body.split_once("/actions/runs/")?;
+    let text = plan::record_text(body);
+    let (_, rest) = text.split_once("/actions/runs/")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits.parse().ok()
 }
@@ -668,7 +664,8 @@ fn asked_by<'c>(
     record: &Comment,
 ) -> Option<&'c Comment> {
     let marker = format!("<!-- {DISPATCH_MARKER}: ");
-    let (id, _) = record.body.strip_prefix(&marker)?.split_once('@')?;
+    let line = *plan::record_lines(&record.body).first()?;
+    let (id, _) = line.strip_prefix(&marker)?.split_once('@')?;
     let id: u64 = id.parse().ok()?;
     (comments.iter())
         .find(|c| plan::comment_id(&c.url) == Some(id) && is(c.author.as_deref(), writers))
@@ -687,14 +684,13 @@ fn retried(comments: &[Comment], writers: &[&str], record: &Comment) -> Option<S
 /// of the bot's newest comment since, unedited by anyone else, that is
 /// neither a record nor a plan.
 fn reported(comments: &[Comment], bot: &str, at: OffsetDateTime) -> Option<String> {
-    let marker = format!("<!-- {DISPATCH_MARKER}: ");
     let said = (comments.iter())
         .filter(|c| {
             c.changed > at
                 && is(c.author.as_deref(), &[bot])
                 && (!(c.edited || c.editor.is_some()) || is(c.editor.as_deref(), &[bot]))
-                && !c.body.starts_with(&marker)
-                && !has_fence(&c.body, PLAN_FENCE)
+                && !plan::is_record(&c.body)
+                && !plan::holds_plan(&c.body)
                 && !has_fence(&c.body, EPIC_PLAN_FENCE)
         })
         .max_by_key(|c| c.changed)?;
@@ -2422,7 +2418,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let context = (slots, target, hold as HoldRule);
         let start = (pool.as_str(), brief, intro.as_str());
-        let step = self.start_triage(&facts.issue, start, reuse, None, line, context);
+        let request = Request::Epic(reuse);
+        let step = self.start_triage(&facts.issue, start, request, None, line, context);
         self.client.bounds.end_start();
         let step = match step {
             Ok(step) => step,

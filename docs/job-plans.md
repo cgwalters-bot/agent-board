@@ -13,8 +13,53 @@ doesn't make that decision.
 
 ## Format
 
-A plan is one fenced block with the info string `agent-board-plan`, at the
-start of a line, holding one JSON object:
+A plan is a short table of what runs where, with its brief under it as
+ordinary Markdown, between two hidden lines
+([#779](https://github.com/cgwalters-forge/agent-board/issues/779)):
+
+```markdown
+<!-- agent-board-plan: agent-board/job-plan/v1 sha256:HASH -->
+| Kind | Item | Runner | Pool | Status |
+| --- | --- | --- | --- | --- |
+| implement | `ostreedev/ostree#3665` | hosted | claude | planned |
+
+Follow up on the review of ostreedev/ostree#3665: ...
+
+<!-- /agent-board-plan -->
+```
+
+Text may come before the first hidden line and after the last. The table
+comes right after the first; the brief is everything between the table and
+`<!-- /agent-board-plan -->`, without its leading and trailing blank lines.
+`Item` is `repo#item`, in backticks so that GitHub does not link it. A `Pool`
+of `—` leaves it out. Two more columns go before `Status` where the plan sets
+them: `Effort` (`heavy`) and `Stacks on` (`` `#N` ``). `Status` is not part of the
+plan: write `planned`, and dispatch keeps it up to date (see
+[dispatch](#dispatch)).
+
+`HASH` is the SHA-256, in lowercase hex, of the plan as one JSON object with
+the fields below, its keys sorted and no whitespace between tokens, as
+`json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
+writes it in Python, with the brief exactly as the comment shows it. A plan
+whose table or brief does not match its hash is refused, so a plan is read
+back exactly, and an edit of its text is a new plan only with a new hash.
+To write one from a JSON file `plan.json`:
+
+```sh
+python3 -c 'import hashlib,json,sys
+p = json.load(open(sys.argv[1])); p["brief"] = p["brief"].replace("\r\n", "\n").strip()
+print(hashlib.sha256(json.dumps(p, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest())' plan.json
+```
+
+The brief is shown as Markdown on the issue, so it notifies and links as any
+comment does. Write logins and other organizations' issues and pull requests
+in backticks (`` `@someone` ``, `` `ostreedev/ostree#3665` ``): a bare
+mention there marks that item's timeline, upstream included. agent-board's
+own plans fall back to the older format for such a brief.
+
+The older format, one fenced block with the info string `agent-board-plan`
+at the start of a line holding the JSON object, is still read while writers
+move to the table, and is what the native Forgejo pass writes:
 
 ````markdown
 ```agent-board-plan
@@ -49,7 +94,8 @@ Anything else, including `null` for a field, is refused: the caller has no input
 for the base branch, budget or allowed outputs yet, so a plan must not appear to
 set them. A `devspace` runner is refused for the same reason; the caller has no
 devspace runner for upstream forks yet. Each is added to the schema when the
-caller can carry it. One plan per comment; a comment with two is refused.
+caller can carry it. One plan per comment, in either format; a comment with
+two is refused.
 
 ### Model effort (caller deployment required)
 
@@ -72,13 +118,15 @@ model, including when the pool was inherited.
 A plan counts only in a comment by the operator (`--operator`) or the login the
 planning run comments as (`--planner`); anyone else's is ignored, so a visitor
 can neither start work nor block it. A writer replaces a plan by replying with
-another or by editing one: the plan most recently written or edited wins. If
+another or by editing one: the plan most recently written or edited wins. A
+table plan that dispatch has recorded counts from when it was posted, since
+dispatch edits it ([dispatch](#dispatch)). If
 that plan is malformed, or was last edited by someone other than a writer
 (anyone with write access can edit others' comments) or by an account GitHub
 no longer names, dispatch stops instead of falling back to the plan it
 replaced. A writer's comment edited by someone else counts as such a plan even
-if the edit removed its fence. A plan quoted in a reply (`> `), or shown
-inside another fenced block or an HTML comment, is not a plan. An issue
+if the edit removed its fence or marker. A plan quoted in a reply (`> `), or
+shown inside another fenced block or an HTML comment, is not a plan. An issue
 with more than 1,000 comments is refused, since its newest plan could be
 unread.
 
@@ -99,18 +147,40 @@ the plan's comment on stderr. It needs a token that can read the issue. The
 caller, workflow and logins come from the caller's own configuration (its
 repository variables), never from a plan or a dispatcher's inputs.
 
-`--apply` sends that request, once per plan. A plan is its comment and the
-time that comment last changed, so a writer's edit, or a reply with a plan, is
-a new plan. Before sending, dispatch posts one comment on the issue whose
-hidden first line names the plan (`<!-- agent-board-dispatch: COMMENT-ID@TIME -->`),
-reads the comments again, and goes on only if the plan is unchanged and no
-earlier comment names it, so
-two dispatches racing on the same plan start one run as long as GitHub's reads
-show the comments posted before them; a caller that runs dispatch in one
-concurrency group does not rely on that. The comment is then edited to link
-the run, or to say why it was not started, and `record=` and (where GitHub
-names it) `run=` lines go to stdout; with `--bot`, a run held back writes no
-record and prints `waiting=true` instead ([overlap](#overlap)).
+`--apply` sends that request, once per plan. A table plan is its comment and
+its hash (`COMMENT-ID@sha256:HASH`); a fenced plan is its comment and the time
+that comment last changed (`COMMENT-ID@TIME`). Either way a writer's edit of
+the plan, or a reply with a plan, is a new plan.
+
+Before sending, dispatch records the plan. A table plan keeps its record in
+its own comment: dispatch edits it to add hidden lines after its marker,
+the first `<!-- agent-board-dispatch: COMMENT-ID@sha256:HASH -->`, and to
+set `Status` to `dispatching (LOGIN NONCE)`. It reads the comment again just
+before, and edits nothing if it changed since the issue was read, so a
+writer's edit is never written over from an older copy; every later edit of
+the record checks the same way and leaves a comment changed by anyone else
+alone. Editing another account's comment needs write access to the
+repository, which the plan writers have. A fenced plan gets a comment of its
+own whose hidden first line names it (`<!-- agent-board-dispatch: COMMENT-ID@TIME -->`).
+Dispatch then reads the comments again and goes on only if the plan is
+unchanged and no other record holds it: for a record comment, no earlier
+one; for a table plan, no other record, and its comment as dispatch wrote
+it, nonce included, so another dispatcher's claim written over it stops this
+one and is left alone. Two dispatches racing on a fenced plan start one run
+as long as GitHub's reads show the comments posted before them. A table
+plan's record has no such order: if one dispatcher reads the comment just
+before another's claim, and writes its own only after that one read its
+claim back, both start it. A caller that runs dispatch in one concurrency
+group, as the pass does, does not rely on either.
+
+The record is then edited to link the run (`Status` `dispatched: [run](URL)`
+for a table plan), or to say why it was not started, and `record=` (the
+plan's comment, for a table plan) and, where GitHub names it, `run=` lines go
+to stdout; with `--bot`, a run held back writes no record and prints
+`waiting=true` instead ([overlap](#overlap)). A table plan is one comment
+per job: the plan, its record and its run. The run's outcome is still
+agentic-job's own status comment, and an epic's planning request, which the
+pass edits for each request, is still a fenced plan with record comments.
 
 Records count only from the writers, so a visitor's copied marker does not
 block a plan, and `GH_TOKEN` must be a writer's user token (dispatch asks
@@ -118,8 +188,13 @@ GitHub whose it is): two accounts that each read only their own records would
 both dispatch. A plan with a record is refused, including one whose
 dispatch failed or whose dispatcher died between record and request: an
 ambiguous dispatch is not retried, and a writer edits or replaces the plan to
-try again. Anyone who can delete comments on the issue can remove a record and
-so have its plan dispatched again. The run is started with `DISPATCH_TOKEN` if
+try again (for a table plan, replies with a new one, or removes its hidden
+dispatch lines: an edit of its text without a new hash makes it invalid). A dispatch refused before anything was sent (a lease admission
+with no slot) releases its record: the record comment loses its marker, or
+the table plan's hidden lines become `<!-- agent-board-released: PLAN-ID -->`,
+which holds nothing, so a later dispatch may take it. Anyone who
+can delete or edit comments on the issue can remove a record and so have its
+plan dispatched again. The run is started with `DISPATCH_TOKEN` if
 it is set, else with `GH_TOKEN`.
 
 The scheduled [pass](pass.md#scheduling) dispatches the newest accepted,
@@ -182,7 +257,8 @@ whole task stays within 32,000 characters. An epic or a sibling that cannot be
 read only leaves extras out, and the issue runs alone. The task is the primary plan's brief,
 then a request for one commit per issue and one pull request with a
 `Closes #N` line for each issue finished (and the unfinished ones named, with
-why), then each extra's brief. Every extra gets the same kind of record as the primary,
+why), then each extra's brief. Every extra gets the same kind of record as the primary
+(in its own plan's comment, for a table plan),
 with a hidden second line `<!-- agent-board-batch: OWNER/REPO#N -->` naming the
 primary, and all are read back before the run starts. A conflict on the
 primary's record starts nothing; a conflict on an extra's leaves only that extra

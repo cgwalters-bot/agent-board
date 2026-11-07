@@ -2199,6 +2199,13 @@ state. A pass compares it with a fresh read only once the wait is over, at
 the cost of a request for the body each pass while such an issue stays
 unchanged. The sub-issues of an issue outside an epic are not read for it.
 
+The pass writes its plans (triage, revisit, sweep, body-plan copies, the
+maintain digest, and the job plans an epic's apply creates) as
+[tables](job-plans.md#format), so each keeps its dispatch record and run link
+in its own comment, unless its brief would mention a login or another
+owner's item, which keeps the fenced format. An epic's planning request stays
+fenced, with record comments, as each request edits it again.
+
 With `replanAfterDays` (agent-board#347), an issue whose newest plan is an
 implement plan that was dispatched, whose run is no longer in flight, and that
 is still open with no open bot or operator pull request, is triaged again to
@@ -2254,7 +2261,7 @@ it done. A merged slice that did only part of an issue waited the whole
 
 With `bodyPlans` (agent-board#342), an issue in the board's first two Priority
 options (P0 and P1) that has no plan comment is first read for a plan in its
-own body: one `agent-board-plan` block, weighed as a plan comment is. The
+own body: one job plan, in either [format](job-plans.md#format), weighed as a plan comment is. The
 body must be the operator's or the bot's, if edited last edited by one of
 them, and its plan must pass the plan checks. Such a plan is treated as the
 issue's accepted plan, with the same holds, target repository and pool checks.

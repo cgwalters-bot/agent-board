@@ -342,7 +342,7 @@ fn reason(object: &Map<String, Value>) -> Result<String> {
 fn body(object: &Map<String, Value>) -> Result<String> {
     let body = bounded(object, "body", BODY_LIMIT)?;
     ensure!(
-        !crate::plan::has_fence(body, crate::plan::PLAN_FENCE),
+        !crate::plan::holds_plan(body),
         "body holds an agent-board-plan fence"
     );
     Ok(body.into())
@@ -365,7 +365,7 @@ fn asked(object: &Map<String, Value>, body: String, labels: &[String]) -> Result
             let question = bounded(object, "question", REASON_LIMIT)?;
             let body = format!("{body}\n\nQ: {}\n", question.trim());
             ensure!(
-                !crate::plan::has_fence(&body, crate::plan::PLAN_FENCE),
+                !crate::plan::holds_plan(&body),
                 "question holds an agent-board-plan fence"
             );
             Ok(body)

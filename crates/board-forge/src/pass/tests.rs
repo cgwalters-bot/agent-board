@@ -2323,7 +2323,8 @@ fn replay_scenarios() {
 /// reads, and dispatches are kept. `fail` loses the response to the first
 /// request whose method and URL, or query, contain it: a write is made and
 /// its answer lost, a read fails. With `after_record` the first comments
-/// read after a dispatch record is posted fails instead. An issue read again
+/// read after a dispatch record is posted, or kept in its plan's comment,
+/// fails instead. An issue read again
 /// before a start is its board item's facts. `late` edits each answer, by its
 /// request, once a run is dispatched: what changed since the board was read.
 /// `racing` edits each GraphQL answer, by its query, before then: what
@@ -2554,6 +2555,14 @@ impl Forge {
             return Ok((200, json!({})));
         }
         if method == "PATCH" {
+            // A plan's own comment, edited to hold its record.
+            let record = text(body, "/body");
+            if self.after_record
+                && plan::is_record(record)
+                && plan::record_text(record).starts_with("dispatching (")
+            {
+                *self.fail.borrow_mut() = Some("comments(first: 100".into());
+            }
             let edited: u64 = path.rsplit('/').next().unwrap_or_default().parse()?;
             let at =
                 (self.replay.now + time::Duration::seconds((id % 1000) as i64)).format(&Rfc3339)?;
@@ -2622,6 +2631,13 @@ impl Rest for Forge {
         if url == format!("{runs}runs/4242") {
             return Ok(listed(json!({"id": 4242, "workflow_id": 77})));
         }
+        // A comment the pass added, as REST reads it.
+        if let Some((_, id)) = url.split_once("/issues/comments/")
+            && let Ok(id) = id.parse::<u64>()
+            && let Some(node) = (self.added.borrow().values().flatten()).find(|n| n["id"] == id)
+        {
+            return Ok(listed(json!({"id": id, "body": node["body"]})));
+        }
         if url == format!("{runs}workflows/77/runs?status=in_progress&per_page=100") {
             let mut runs = vec![json!({"id": 4242})];
             runs.extend(self.passes.iter().cloned());
@@ -2654,7 +2670,11 @@ impl Rest for Forge {
         }
         drop(refuse);
         let written = self.write(method, url, body)?;
-        self.failing(&what)?;
+        // With what it writes, so one edit of a comment can fail apart.
+        self.failing(&format!(
+            "{what} {}",
+            body["body"].as_str().unwrap_or_default()
+        ))?;
         Ok(written)
     }
 
@@ -5116,13 +5136,24 @@ fn apply_starts_once_and_reruns_start_nothing_twice() {
             && line.contains(" run=https://github.com/cgwalters-forge/tracker/actions/runs/"),
         "{line}"
     );
+    // One comment holds the plan, shown as a table, and its dispatch.
     let comments = forge.comments_on("cgwalters-forge/tracker", 446);
-    assert_eq!(comments.len(), 2, "{comments:#?}");
+    assert_eq!(comments.len(), 1, "{comments:#?}");
+    let job = plan::JobPlan::from_comment(&comments[0]).unwrap().unwrap();
+    assert_eq!((job.kind.as_str(), job.pool.as_str()), ("triage", "claude"));
     assert!(
-        comments[0].contains("```agent-board-plan") && comments[0].contains("\"kind\": \"triage\"")
+        !comments[0].contains("```agent-board-plan"),
+        "{}",
+        comments[0]
     );
-    assert!(comments[0].contains("\"pool\": \"claude\""));
-    assert!(comments[1].starts_with("<!-- agent-board-dispatch: "));
+    assert!(plan::is_record(&comments[0]), "{}", comments[0]);
+    assert!(
+        plan::record_text(&comments[0]).starts_with(
+            "dispatched: [run](https://github.com/cgwalters-forge/tracker/actions/runs/"
+        ),
+        "{}",
+        comments[0]
+    );
     let second = apply(&forge, &config);
     assert_eq!(second.failures, 0, "{:#?}", second.lines);
     assert_eq!(
@@ -5814,7 +5845,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 // The pass's line for a close on the first answer.
                 "closed" => {
                     let key = ("cgwalters-forge/tracker".to_owned(), 446);
-                    let first = text(&forge.added.borrow()[&key][2], "/url").to_owned();
+                    let first = text(&forge.added.borrow()[&key][1], "/url").to_owned();
                     let line = &wrote("", &first, "completed")[0].1;
                     line.as_str().unwrap().to_owned()
                 }
@@ -5829,7 +5860,7 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                 // agentic-job's status comment for the run the record names.
                 "status" => {
                     let key = ("cgwalters-forge/tracker".to_owned(), 446);
-                    let record = text(&forge.added.borrow()[&key][1], "/body").to_owned();
+                    let record = text(&forge.added.borrow()[&key][0], "/body").to_owned();
                     let run = epics::record_run(&record).unwrap();
                     format!("Done.{}", crate::supervise::health::status_end(run))
                 }
@@ -5856,10 +5887,10 @@ fn apply_follows_up_a_triage_by_its_verdict() {
         if name == "the operator's comment after the verdict triages it again, unlabelled" {
             verdict_removal(&mut forge, "needs-human", "2026-11-03T13:33:00Z");
         }
-        // The first verdict, after the plan and its record.
-        let first = (added[2..].iter())
+        // The first verdict, after the plan, which keeps its record.
+        let first = (added[1..].iter())
             .find(|c| text(c, "/body").contains(TRIAGE_FENCE))
-            .unwrap_or(&added[2]);
+            .unwrap_or(&added[1]);
         let answer = text(first, "/url").to_owned();
         let due = |days| {
             (at(text(first, "/createdAt")) + time::Duration::days(days))
@@ -8412,6 +8443,10 @@ fn apply_revisits_a_sample_with_spare_capacity() {
         let earlier = forge.replay.now - time::Duration::days(days);
         for node in forge.added.borrow_mut().get_mut(&key).unwrap() {
             node["createdAt"] = earlier.format(&Rfc3339).unwrap().into();
+            // A plan keeps its record: its dispatch's edit is as old.
+            if !node["lastEditedAt"].is_null() {
+                node["lastEditedAt"] = node["createdAt"].clone();
+            }
         }
         if let Some((author, body)) = said {
             let id = forge.ids.get() + 1;
@@ -10450,13 +10485,14 @@ fn apply_interrupted_at_each_write_reruns_without_duplicates() {
             Some("POST https://api.github.com/repos/cgwalters-forge/tracker/issues/446/comments"),
             false,
         ),
-        ("the dispatch record's read-back", None, true),
-        ("the dispatch response", Some("/dispatches"), false),
         (
-            "the run-link edit",
+            "the dispatch record's edit",
             Some("PATCH https://api.github.com/repos/cgwalters-forge/tracker/issues/comments/"),
             false,
         ),
+        ("the dispatch record's read-back", None, true),
+        ("the dispatch response", Some("/dispatches"), false),
+        ("the run-link edit", Some("| dispatched: [run]("), false),
     ] {
         let forge = Forge::new(fail, after_record);
         let first = apply(&forge, &config);
@@ -10468,8 +10504,12 @@ fn apply_interrupted_at_each_write_reruns_without_duplicates() {
         let mut failed = false;
         let writes = forge.writes.borrow();
         let mut comments = (0, 0);
-        for (method, url, _) in writes.iter() {
-            if !failed && fail.is_some_and(|f| format!("{method} {url}").contains(f)) {
+        for (method, url, body) in writes.iter() {
+            let what = format!(
+                "{method} {url} {}",
+                body["body"].as_str().unwrap_or_default()
+            );
+            if !failed && fail.is_some_and(|f| what.contains(f)) {
                 failed = true;
                 continue;
             }
@@ -10687,10 +10727,8 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
         ))
         .unwrap();
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
-        let planned = comments.iter().any(|c| c.contains("```agent-board-plan"));
-        let recorded = comments
-            .iter()
-            .any(|c| c.starts_with("<!-- agent-board-dispatch"));
+        let planned = comments.iter().any(|c| plan::holds_plan(c));
+        let recorded = comments.iter().any(|c| plan::is_record(c));
         let dispatched = !forge.dispatches().is_empty();
         assert_eq!(planned, recorded, "limit {limit}: {comments:#?}");
         assert_eq!(recorded, dispatched, "limit {limit}: {comments:#?}");
@@ -10715,19 +10753,19 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     let cases = [
         (
             196,
-            "budget: 102 requests left, only what a start may take (109); 1 more candidate(s) wait",
+            "budget: 108 requests left, only what a start may take (111); 2 more candidate(s) wait",
             0,
-            5,
+            4,
         ),
         (
-            165,
-            "budget: 113 requests left, only what a start may take (109); 4 more candidate(s) wait",
+            171,
+            "budget: 115 requests left, only what a start may take (111); 4 more candidate(s) wait",
             0,
             2,
         ),
         (
             120,
-            "budget: 105 requests left, only what a start may take (109); 9 more candidate(s) wait",
+            "budget: 105 requests left, only what a start may take (111); 9 more candidate(s) wait",
             1,
             0,
         ),
@@ -11087,14 +11125,15 @@ fn accepted_triage_plans_start_once() {
             );
             drop(writes);
             let comments = forge.comments_on("cgwalters-forge/tracker", 446);
-            // The pass's own triage posts its plan before the record.
-            assert_eq!(comments.len(), 1 + usize::from(planned.is_none()), "{name}");
-            assert!(
-                comments
-                    .last()
-                    .unwrap()
-                    .starts_with("<!-- agent-board-dispatch: "),
-                "{name}"
+            // A fenced plan gets a record comment; the pass's own triage
+            // plan, shown as a table, keeps its record.
+            assert_eq!(comments.len(), 1, "{name}");
+            let last = comments.last().unwrap();
+            assert!(plan::is_record(last), "{name}: {last}");
+            assert_eq!(
+                last.starts_with("<!-- agent-board-dispatch: "),
+                planned.is_some(),
+                "{name}: {last}"
             );
             // Its record holds it, the run done: not started again.
             let second = apply(&forge, &config);
@@ -11700,7 +11739,8 @@ fn generated_triage_plan_keeps_the_drawn_pool_and_explicit_held_plan_waits() {
                 forge
                     .comments_on("cgwalters-forge/tracker", 446)
                     .iter()
-                    .any(|body| body.replace(' ', "").contains("\"pool\":\"openai\""))
+                    .any(|body| plan::JobPlan::from_comment(body)
+                        .is_ok_and(|p| p.is_some_and(|p| p.pool == "openai")))
             );
         }
     }
@@ -11764,27 +11804,22 @@ fn body_plans_start_a_p0_or_p1_issue() {
             assert!(forge.writes.borrow().is_empty(), "{name}");
             continue;
         }
+        // The plan, shown as a table, keeps its record.
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
-        assert_eq!(comments.len(), 2, "{name}: {comments:#?}");
+        assert_eq!(comments.len(), 1, "{name}: {comments:#?}");
         let kind = if expected == implement {
             "implement"
         } else {
             "triage"
         };
-        assert!(
-            comments[0].contains(&format!("\"kind\": \"{kind}\"")),
-            "{name}: {}",
-            comments[0]
-        );
+        let job = plan::JobPlan::from_comment(&comments[0]).unwrap().unwrap();
+        assert_eq!(job.kind, kind, "{name}: {}", comments[0]);
         assert_eq!(
             comments[0].starts_with(BODY_PLAN),
             kind == "implement",
             "{name}"
         );
-        assert!(
-            comments[1].starts_with("<!-- agent-board-dispatch: "),
-            "{name}"
-        );
+        assert!(plan::is_record(&comments[0]), "{name}: {}", comments[0]);
         let writes = forge.writes.borrow();
         let (_, _, sent) = (writes.iter())
             .find(|(_, url, _)| url.ends_with("/dispatches"))
@@ -15832,7 +15867,12 @@ fn apply_edits_an_epics_planning_request_in_place() {
             .unwrap();
         let old = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker", "item": 596,
             "kind": "triage", "runner": TRIAGE_RUNNER, "brief": "Plan the epic."});
-        let body = plan_body("The board pass asks a triage run to plan this epic.", &old);
+        let body = plan_body(
+            "The board pass asks a triage run to plan this epic.",
+            &old,
+            None,
+        )
+        .unwrap();
         let id = 8_000_000_001_u64;
         let url =
             format!("https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-{id}");

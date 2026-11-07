@@ -543,7 +543,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     c["user"]["id"]
                         .as_u64()
                         .is_some_and(|id| self.board.recorders.contains(&id))
-                        && plan::has_fence(text(c, "/body"), PLAN_FENCE)
+                        && plan::holds_plan(text(c, "/body"))
                 }) =>
             {
                 if self.sweep_start_record(&found.issue, &thread, None) {
@@ -668,7 +668,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             return false;
         }
         let plans: Vec<_> = recorded()
-            .filter(|c| plan::has_fence(text(c, "/body"), PLAN_FENCE))
+            .filter(|c| plan::holds_plan(text(c, "/body")))
             .collect();
         let Some(accepted) = accepted else {
             return plans.is_empty();

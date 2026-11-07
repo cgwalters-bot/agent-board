@@ -666,7 +666,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                     let plans = forge.plan_thread(&at).unwrap_or_default();
                     plans.iter().any(|c| {
                         c["user"]["id"] == self.ids.bot
-                            && fenced_json(text(c, "/body"), PLAN_FENCE)
+                            && plan::plan_json(text(c, "/body"))
                                 .ok()
                                 .flatten()
                                 .is_some_and(|p| p["item"] == made.number)

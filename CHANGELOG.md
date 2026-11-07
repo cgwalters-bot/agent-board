@@ -11,6 +11,16 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Job plans have a readable format (agent-board#779): a Markdown table of
+  kind, item, runner, pool and status, the brief under it as Markdown, and a
+  hidden `<!-- agent-board-plan: agent-board/job-plan/v1 sha256:HASH -->`
+  line whose hash of the canonical plan keeps parsing exact; a table that
+  does not match it is refused. Dispatch keeps such a plan's record in its
+  own comment, editing its Status to link the run, instead of posting a
+  record comment, and the plan's identity is its comment and hash. The
+  pass writes its plans so; the fenced `agent-board-plan` JSON is still read
+  (docs/job-plans.md).
+
 - The hold snapshot on GitHub is no longer cut to one 65,536-character
   comment, which had left out every needs-you detail card and the pass view
   (agent-board#774): one longer than a comment is gzipped, in base64, across

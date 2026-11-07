@@ -3,7 +3,6 @@
 //! in particular, never `poll --apply` to gather facts. Signature excerpts are
 //! bounded untrusted data, not instructions; other checks publish only links.
 use super::{Api, HOUR_MS, Limits, Release, Settings, encode, iso, millis, run_title, word_repo};
-use crate::plan::DISPATCH_MARKER;
 use crate::poll::author_login as login;
 use anyhow::{Context, Result, bail, ensure};
 use board_core::NEEDS_HUMAN_LABEL as HOLD;
@@ -1377,16 +1376,22 @@ impl Collector<'_> {
         let skips: Vec<(&str, u64)> = lines.iter().filter_map(|l| skip_line(l)).collect();
         ensure!(skips.len() <= self.s.limits.max_items, "too many skips");
         let mut result = vec![];
-        let record = format!("<!-- {DISPATCH_MARKER}: ");
         for (repo, id) in skips {
             let comment = self
                 .api
                 .get(&format!("/repos/{repo}/issues/comments/{id}"))?;
             let body = comment["body"].as_str().unwrap_or_default();
-            if comment["user"]["login"] != self.s.bot.as_str() || !body.starts_with(&record) {
+            // A plan that keeps its own record is its writer's comment.
+            let author = comment["user"]["login"].as_str().unwrap_or_default();
+            let writer = author.eq_ignore_ascii_case(&self.s.bot)
+                || (crate::plan::record_text(body) != body
+                    && author.eq_ignore_ascii_case(&self.s.operator));
+            if !writer || !crate::plan::is_record(body) {
                 continue;
             }
-            let Some(run_id) = last_run_link(body, &self.s.dispatch_repo) else {
+            let Some(run_id) =
+                last_run_link(&crate::plan::record_text(body), &self.s.dispatch_repo)
+            else {
                 continue;
             };
             let run = self.cached_get(&format!("{}/actions/runs/{run_id}", self.root))?;

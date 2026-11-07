@@ -1299,8 +1299,12 @@ fn execute<C: Transport + Rest>(
                                 .context("stacks_on was not created")?;
                             job["stacks_on"] = lower.number.into();
                         }
-                        body["body"] =
-                            format!("```{}\n{job:#}\n```\n", crate::plan::PLAN_FENCE).into();
+                        let on = ItemRef {
+                            host: DEFAULT_HOST.into(),
+                            repository: issue.repo.clone(),
+                            number: issue.number,
+                        };
+                        body["body"] = crate::plan::plan_comment("", &job, &on)?.into();
                     }
                 }
             }

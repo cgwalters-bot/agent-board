@@ -427,9 +427,12 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
                 result.why.insert("operator-comment".into());
             }
             let body = comment["body"].as_str().unwrap_or_default();
-            if !is(comment["author"]["login"].as_str(), &[&self.config.bot])
-                || !body.starts_with(&format!("<!-- {}:", plan::DISPATCH_MARKER))
-            {
+            // A plan that keeps its own record is its writer's comment.
+            let writers = match plan::record_text(body) == body {
+                true => vec![self.config.bot.as_str()],
+                false => vec![self.config.bot.as_str(), self.config.operator.as_str()],
+            };
+            if !is(comment["author"]["login"].as_str(), &writers) || !plan::is_record(body) {
                 continue;
             }
             let Some(run) = super::super::epics::record_run(body) else {
