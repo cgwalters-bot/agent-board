@@ -549,6 +549,7 @@ mod tests {
             operator: "operator",
             epics: true,
             considered: true,
+            epics_whole: true,
             options: &[],
             on: &on,
             reviews: review_asks(true, Some(&(waits, BTreeSet::new())), at),

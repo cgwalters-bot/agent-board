@@ -1086,6 +1086,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let bonus = config.idle_replan
             && waited.changed
             && self.holds_whole
+            && self.deferred_epics.is_empty()
             && self.report.failures == 0
             && self.unconsidered == 0
             && self.unread == 0
@@ -1305,9 +1306,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 break;
             }
             // What the stage keeps for scheduling is no failure: the epics
-            // after it wait for the next pass.
+            // after it wait for the next pass, their holds as last published.
             if bounds.available() < START_REQUESTS {
-                self.holds_whole = false;
+                let deferred = live[n..].iter().map(|f| f.issue.display());
+                self.deferred_epics.extend(deferred);
                 self.line(format!(
                     "budget: epics stopped at its share, {} requests kept for scheduling; {} live epic(s) deferred",
                     bounds.kept.get(),

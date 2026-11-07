@@ -4759,7 +4759,13 @@ fn apply_publishes_what_needs_you() {
     let within = (state.0, state.1, state.2, forge.replay.now);
     let bounds = Bounds::new(PASS_REQUEST_LIMIT, past);
     let report = block(run_within(&forge, &forge, &config, within, &bounds)).unwrap();
-    assert!(report.lines.iter().all(|l| !l.starts_with("holds")));
+    let said: Vec<_> = (report.lines.iter())
+        .filter(|l| l.starts_with("holds"))
+        .collect();
+    assert_eq!(
+        said,
+        ["holds: not published; stage 3 or 4 stopped part way, so they would be partial"]
+    );
     assert!(forge.writes.borrow().is_empty());
 }
 

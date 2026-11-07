@@ -950,6 +950,35 @@ pub fn carry(
     }
 }
 
+/// Keeps the holds `previous` published on the live epics stage 3
+/// `deferred` to the next pass at its request share, as it did not read
+/// them again: marked [`Published::carried`], so that they raise no new
+/// alarm, and with their `since`. A stall alarm already raised on one is
+/// kept with it, so that a deferral does not drop what waits on the
+/// operator; the needs-you list says the epics were read in part
+/// ([`Reading::epics_whole`]). Without this, a pass that defers any
+/// epic, as most do once there are more live epics than its share reads,
+/// would have to leave the whole snapshot unpublished as partial.
+pub fn carry_epics(snapshot: &mut Snapshot, previous: Option<&Value>, deferred: &BTreeSet<String>) {
+    if deferred.is_empty() {
+        return;
+    }
+    let had: BTreeSet<Option<String>> = (snapshot.holds.iter())
+        .filter(|h| h.epic)
+        .map(|h| h.item.clone())
+        .collect();
+    let kept: Vec<Published> = previous_holds(previous)
+        .filter_map(|h| serde_json::from_value::<Published>(h.clone()).ok())
+        .filter(|h| h.epic && h.kind != HoldKind::EpicNotLive)
+        .filter(|h| h.item.as_ref().is_some_and(|i| deferred.contains(i)) && !had.contains(&h.item))
+        .map(|h| Published { carried: true, ..h })
+        .collect();
+    if !kept.is_empty() {
+        snapshot.holds.extend(kept);
+        snapshot.holds.sort_by_key(published_order);
+    }
+}
+
 /// What [`alarm`] watches for, and where it says so.
 pub struct Watch<'a> {
     pub stall: &'a Stall,
@@ -1881,6 +1910,10 @@ pub struct Reading<'a> {
     /// Whether stage 4 decided a hold, or a start, for each of its ranked
     /// candidates.
     pub considered: bool,
+    /// Whether stage 3 read every live epic: false where it left some for
+    /// the next pass at its request share, whose holds are only carried
+    /// ([`carry_epics`]) and which may wait on the operator anew.
+    pub epics_whole: bool,
     /// The board's Priority options in order; none where it was not read.
     pub options: &'a [String],
     /// The holds issue.
@@ -2126,7 +2159,11 @@ pub fn needs_you(snapshot: &Snapshot, previous: Option<&Value>, reading: &Readin
     let sources = Sources {
         epics: match reading.epics {
             false => Read::Off,
-            true => read(snapshot.pass.live_epics.is_some(), true, true),
+            true => read(
+                snapshot.pass.live_epics.is_some(),
+                true,
+                reading.epics_whole,
+            ),
         },
         // Where stage 4 did not get to its candidates, its holds are carried.
         items: read(
@@ -4479,6 +4516,98 @@ mod tests {
                 .all(|h| h["item"] != "o/t#12")
         );
     }
+
+    /// The epics stage 3 deferred at its share keep their published holds,
+    /// carried with their `since`; one it read again, or did not defer, is
+    /// as this pass decided.
+    #[test]
+    fn deferred_epics_keep_their_published_holds() {
+        let read = entry(Scope::Epic(item("o/t", 9)), HoldKind::Other, "plan P waits");
+        let deferred = entry(Scope::Epic(item("o/t", 7)), HoldKind::Other, "plan Q waits");
+        let gone = entry(Scope::Epic(item("o/t", 5)), HoldKind::Other, "plan R waits");
+        let (first, _) = pass_at(
+            &[read.clone(), deferred, gone],
+            "2026-10-28T00:00:00Z",
+            (1, false),
+            None,
+        );
+        let mut later = snapshot(&[read], "2026-10-28T03:00:00Z".into(), tally());
+        carry(&mut later, Some(&first), (false, true));
+        let set = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        carry_epics(&mut later, Some(&first), &set(&["o/t#7", "o/t#9"]));
+        let kept: Vec<_> = (later.holds.iter())
+            .map(|h| (h.item.clone().unwrap(), h.carried, h.since.clone()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("o/t#7".to_owned(), true, "2026-10-28T00:00:00Z".to_owned()),
+                ("o/t#9".to_owned(), false, "2026-10-28T00:00:00Z".to_owned()),
+            ]
+        );
+    }
+
+    /// A stalled epic deferred pass after pass keeps its hold and its stall
+    /// alarm, which still waits on the operator, while no new alarm is raised.
+    #[test]
+    fn deferred_epics_keep_their_stall_alarms() {
+        let epic = entry(Scope::Epic(item("o/t", 7)), HoldKind::Other, "plan Q waits");
+        let (first, _) = pass_at(
+            std::slice::from_ref(&epic),
+            "2026-10-28T00:00:00Z",
+            (1, false),
+            None,
+        );
+        let (stalled, lines) = pass_at(&[epic], "2026-10-28T07:00:00Z", (1, false), Some(&first));
+        assert!(
+            lines.iter().any(|l| l.starts_with("stall hold epic o/t#7")),
+            "{lines:?}"
+        );
+        let deferred = BTreeSet::from(["o/t#7".to_owned()]);
+        let mut previous = stalled;
+        for at in ["2026-10-28T08:00:00Z", "2026-10-28T09:00:00Z"] {
+            let mut later = snapshot(&[], at.into(), tally());
+            carry(&mut later, Some(&previous), (false, true));
+            carry_epics(&mut later, Some(&previous), &deferred);
+            let stall = Stall::default();
+            let lines = alarm(&mut later, Some(&previous), &watch(&stall, None));
+            assert!(lines.is_empty(), "{lines:?}");
+            let kinds: Vec<_> = (later.holds.iter())
+                .map(|h| (h.kind, h.operator, h.carried))
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    (HoldKind::Other, false, true),
+                    (HoldKind::Stalled, true, true)
+                ],
+                "{at}"
+            );
+            previous = parse(&render(&later).unwrap()).unwrap();
+        }
+    }
+
+    /// Epics deferred at the share leave the needs-you list's epics source
+    /// partial, and so the list incomplete, whether or not one had a hold.
+    #[test]
+    fn deferred_epics_make_the_epics_source_partial() {
+        let (on, options) = (item("o/ops", 1), options(&["P0", "P1", "P2", "P3"]));
+        let held = entry(Scope::Epic(item("o/t", 7)), HoldKind::Other, "plan Q waits");
+        for entries in [vec![held], vec![]] {
+            let (mut pass, _) = alarmed(&entries, "2026-10-28T00:00:00Z", (1, false), None);
+            pass.pass.live_epics = Some(2);
+            for (whole, read) in [(true, Read::Complete), (false, Read::Partial)] {
+                let reading = Reading {
+                    epics_whole: whole,
+                    ..reading(&on, &options)
+                };
+                let list = needs_you(&pass, None, &reading);
+                assert_eq!(list.sources.epics, read, "{entries:?}");
+                assert_eq!(list.complete, whole, "{entries:?}");
+            }
+        }
+    }
+
     /// A board with holds of every sort, read whole by stages 3 and 4: each
     /// item hold with its Priority, and its `since` at the given hour.
     fn waiting() -> Snapshot {
@@ -4573,6 +4702,7 @@ mod tests {
             operator: "operator",
             epics: true,
             considered: true,
+            epics_whole: true,
             options,
             on,
             reviews: Collected::off(),

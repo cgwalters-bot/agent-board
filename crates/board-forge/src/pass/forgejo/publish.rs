@@ -243,6 +243,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 operator: &self.config.operator,
                 epics: self.config.epics.is_some(),
                 considered: self.unconsidered == 0,
+                epics_whole: true,
                 options: &options,
                 on,
                 reviews: holds::Collected::off(),

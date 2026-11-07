@@ -3008,6 +3008,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         considered: false,
         probes: BTreeMap::new(),
         holds_whole: true,
+        deferred_epics: BTreeSet::new(),
         unconsidered: 0,
         unread: 0,
         ended: RefCell::new(BTreeMap::new()),
@@ -3098,6 +3099,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     bounds.enter(Stage::Holds);
     if scheduler.holds_whole {
         scheduler.publish_holds();
+    } else if scheduler.config.holds.is_some() {
+        let why = "stage 3 or 4 stopped part way, so they would be partial";
+        scheduler.line(format!("holds: not published; {why}"));
     }
     // Last, within a request bound of its own and the pass's time bound: the
     // cost reports, unless a rate limit stopped the pass.
@@ -3384,6 +3388,10 @@ struct Scheduler<'a, C> {
     /// Whether stages 3 and 4 decided every hold they would have, so that
     /// the holds may be published.
     holds_whole: bool,
+    /// The live epics, `OWNER/REPO#N`, stage 3 left for the next pass at
+    /// its request share: their published holds are carried over
+    /// ([`holds::carry_epics`]) rather than the snapshot left unpublished.
+    deferred_epics: BTreeSet<String>,
     /// Stage 4's ranked candidates it decided no hold for: those past where
     /// it stopped starting, and those whose consideration failed. Any may
     /// wait on the operator ([`holds::needs_you`]).
@@ -3996,7 +4004,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.report.tally.0.in_flight = Some(active + taken);
         self.report.tally.1.started += taken;
         if taken == 0 && free > 0 {
-            if earlier == 0 && self.holds_whole && self.report.failures == 0 && self.unread == 0 {
+            if earlier == 0
+                && self.holds_whole
+                && self.deferred_epics.is_empty()
+                && self.report.failures == 0
+                && self.unread == 0
+            {
                 self.line("pools: no ready work; unused headroom does not release holds".into());
             }
             let reasons: Vec<_> = self.report.lines[decisions..]

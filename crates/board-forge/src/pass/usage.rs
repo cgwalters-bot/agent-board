@@ -922,6 +922,7 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         snapshot.leases = self.report.leases.clone();
         let considered = snapshot.pass.candidates.is_some();
         holds::carry(&mut snapshot, previous, (self.made_progress(), considered));
+        holds::carry_epics(&mut snapshot, previous, &self.deferred_epics);
         let Some(at) = &self.config.holds else {
             return snapshot;
         };
