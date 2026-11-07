@@ -684,9 +684,132 @@ fn spent_names_each_stage_that_spent() {
             points: 7,
             estimated: *estimated,
             rate_limited: false,
+            revalidated: 0,
         };
         assert_eq!(spent.to_string(), *expected);
     }
+}
+
+/// A forge that answers every GET, 304 where the read is revalidated.
+struct Revalidating;
+
+impl Rest for Revalidating {
+    fn get(&self, _: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        Ok(RestResponse {
+            status: if validator.is_some() { 304 } else { 200 },
+            etag: None,
+            last_modified: None,
+            link: None,
+            body: json!({}),
+        })
+    }
+
+    fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+        Ok((200, json!({})))
+    }
+}
+
+/// However many pull requests stage 2 reads, its reads stop at what it
+/// keeps for the stages after it, and stage 3's at what it keeps for
+/// scheduling (agent-board#748): the last applying pass had read 407 for
+/// pull requests and 97 for epics, and scheduling stopped at the start
+/// reserve with eight slots free. Writes and a start's or apply's reads
+/// under way still go through, the poll sees the share it has left, and the
+/// stage says it was cut short.
+#[test]
+fn stage_shares_keep_requests_for_scheduling() {
+    let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    let read = || client.get("https://api.github.com/x", None);
+    let kept = |percent| PASS_REQUEST_LIMIT * percent / 100;
+    bounds.enter_keeping(Stage::PullRequests, AFTER_PULL_REQUESTS);
+    assert_eq!(
+        client.share_left(),
+        Some(PASS_REQUEST_LIMIT - WRITE_RESERVE - kept(AFTER_PULL_REQUESTS))
+    );
+    let mut reads = 0;
+    let error = loop {
+        match read() {
+            Ok(_) => reads += 1,
+            Err(error) => break error,
+        }
+    };
+    assert!(error.is::<ShareSpent>(), "{error:#}");
+    assert_eq!(
+        reads,
+        PASS_REQUEST_LIMIT - WRITE_RESERVE - kept(AFTER_PULL_REQUESTS)
+    );
+    assert_eq!(client.share_left(), Some(0));
+    assert_eq!(bounds.left.get(), WRITE_RESERVE + kept(AFTER_PULL_REQUESTS));
+    // A write, and the reads of a start or an apply under way, still go.
+    client
+        .send("POST", "https://api.github.com/x", &json!({}))
+        .unwrap();
+    bounds.finishing.set(true);
+    read().unwrap();
+    bounds.finishing.set(false);
+    assert!(read().is_err());
+    assert_eq!(
+        bounds.share_line().unwrap(),
+        format!(
+            "budget: pull requests stopped at its share, 2 read(s) refused; {} requests kept for the stages after it",
+            kept(AFTER_PULL_REQUESTS)
+        )
+    );
+    // Stage 3 has its own share, at least a live epic's consideration.
+    bounds.enter_keeping(Stage::Epics, AFTER_EPICS);
+    assert_eq!(bounds.share_line(), None);
+    assert!(
+        bounds.available() >= START_REQUESTS,
+        "{}",
+        bounds.available()
+    );
+    while read().is_ok() {}
+    assert_eq!(bounds.left.get(), WRITE_RESERVE + kept(AFTER_EPICS));
+    // An epic apply larger than what the share leaves still fits in the
+    // pass, and its reads under way go past the share.
+    let apply = kept(AFTER_EPICS) - 10;
+    assert!(bounds.available() < apply && bounds.fits(apply));
+    assert!(!bounds.fits(bounds.left.get() + 1));
+    bounds.finishing.set(true);
+    read().unwrap();
+    bounds.finishing.set(false);
+    assert!(read().is_err());
+    // Scheduling keeps nothing back: what the shares kept is its own,
+    // enough for its reads and a start beyond the start reserve.
+    bounds.enter(Stage::Schedule);
+    assert_eq!(client.share_left(), None);
+    assert!(bounds.left.get() > START_RESERVE + START_REQUESTS);
+    read().unwrap();
+}
+
+/// A 304 is not charged, as GitHub does not count it against the rate
+/// limit, but only up to [`REVALIDATED_LIMIT`]; the summary says how many.
+#[test]
+fn revalidated_reads_are_free_up_to_their_limit() {
+    let bounds = Bounds::new(10, Instant::now() + Duration::from_secs(60));
+    bounds.enter(Stage::PullRequests);
+    let client = Budget {
+        inner: &Revalidating,
+        bounds: &bounds,
+    };
+    let validator = Some(("If-None-Match", "\"e\""));
+    for _ in 0..REVALIDATED_LIMIT {
+        client.get("https://api.github.com/x", validator).unwrap();
+    }
+    client.get("https://api.github.com/x", None).unwrap();
+    assert_eq!(bounds.left.get(), 9);
+    // Past the limit a 304 is charged as any read.
+    client.get("https://api.github.com/x", validator).unwrap();
+    let spent = bounds.spent();
+    assert_eq!((spent.requests, spent.revalidated), (2, REVALIDATED_LIMIT));
+    assert_eq!(
+        spent.to_string(),
+        format!("requests 2 (pull requests 2), 304s {REVALIDATED_LIMIT}, points 0")
+    );
 }
 
 /// `triage` true, or with the scope `all`, triages each candidate without a
@@ -4800,6 +4923,30 @@ fn epics_error_still_dispatches() {
     assert!(!clean.dispatches().is_empty());
     assert_eq!(forge.dispatches(), clean.dispatches());
     assert_eq!(report.failures, 1, "{:#?}", report.lines);
+}
+
+/// Stage 3's census of the live epics that meets its share defers the
+/// epics to the next pass rather than failing as an `epics error`.
+#[test]
+fn epics_census_at_its_share_is_deferred() {
+    let config = config(json!({}));
+    // Stage 3 keeps 1 of 5 requests, and the 4 for writes leave its census
+    // no read.
+    let limit = 5;
+    assert_eq!(limit * AFTER_EPICS / 100 + WRITE_RESERVE, limit);
+    let forge = Forge::new(None, false);
+    let report = apply_within(&forge, &config, limit);
+    let deferred = "budget: epics stopped at its share; the live epics wait for the next pass: epics keeps its last 1 requests for the stages after it";
+    assert!(
+        report.lines.iter().any(|l| l == deferred),
+        "{:#?}",
+        report.lines
+    );
+    assert!(
+        !report.lines.iter().any(|l| l.starts_with("epics error")),
+        "{:#?}",
+        report.lines
+    );
 }
 
 /// A pass past its time bound starts nothing more, and sends nothing; a

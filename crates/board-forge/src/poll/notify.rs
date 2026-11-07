@@ -2508,6 +2508,7 @@ mod tests {
                 previous: BTreeMap::new(),
                 used: BTreeMap::new(),
                 remaining,
+                cut: None,
                 apply: Some(Apply {
                     dispatcher: &fake,
                     workflow: "dispatch.yml".into(),

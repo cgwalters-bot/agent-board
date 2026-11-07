@@ -487,6 +487,7 @@ mod tests {
             previous: BTreeMap::new(),
             used: BTreeMap::new(),
             remaining: 1 + ITEM_REQUESTS,
+            cut: None,
             apply: None,
             dispatched: 0,
             merged: 0,

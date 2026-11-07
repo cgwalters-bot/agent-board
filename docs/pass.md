@@ -1737,7 +1737,35 @@ when no candidate was considered. Revisits, the weekly sweep and blocker reads
 that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,
 labels or fails an item for it, nor fails the pass.
 Stage 5 and the hold snapshot, which come after every start, spend what is left. There is
-no second fill-page budget. Preview performs no forge writes or dispatches and
+no second fill-page budget.
+
+Stage 4 comes after the pull requests and the epics, so each of those stages
+reads only its share (agent-board#748): stage 2's reads leave 58% of the
+pass's requests (377) to the stages after it, and stage 3's leave 38% (247) to
+scheduling, Status and the holds, so stage 3 has at least 130. Stage 2 has at
+most 269, setup, usage and maintain included. A write, and a read of a start,
+an epic apply or a fix round whose claim is posted, is never refused for a
+share, nor are a review start's that the walk queued within it. An epic apply
+is admitted on what the whole pass has left, not on stage 3's share, so a plan
+larger than the share still applies on a busy pass; the applies a pass takes
+bound what it spends of the later stages'. Stage 2 checks its share before each followed repository and pull
+request, and stops there once less than one pull request's walk (32) is left;
+it says `pull requests: the stage's request share is spent at OWNER/REPO#N; M
+repositories wait for the next pass, which starts there`. The repositories it
+did not reach are undecided, so what the last pass held there is kept, and
+their review runs are still read and counted toward `wip`. An applying pass's
+next walk starts at that pull request (`share_cursor` in the poll state), goes
+on through the repositories after it and before it, and ends with that
+repository's pull requests before it, so a share too small for every followed
+pull request leaves none out pass after pass. Stage 3 defers the live epics it
+has no share left for, its census included (`budget: epics stopped at its
+share`). A stage whose reads were refused by its share says so (`budget: STAGE
+stopped at its share`). None of these is a failure.
+
+A 304 to a revalidated read (`If-None-Match` or `If-Modified-Since`) is not
+charged to the pass's requests, as GitHub does not count it against the rate
+limit; at most 650 a pass are free, so they still bound a runaway loop. The
+summary line counts them apart (`304s N`). Preview performs no forge writes or dispatches and
 does not change the apply cache.
 
 ## Scheduling

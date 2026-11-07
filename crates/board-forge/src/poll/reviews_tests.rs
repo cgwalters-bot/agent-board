@@ -567,3 +567,37 @@ fn ordinary_review_unreadable_admission_never_dispatches() {
         assert!(fake.writes.borrow().is_empty(), "{bad}");
     }
 }
+
+/// A review start the walk queued within the share still starts once the
+/// share is spent past it, the run census of the repositories after the
+/// cut included: it was admitted where it was queued.
+#[test]
+fn ordinary_review_queued_within_the_share_starts_past_it() {
+    const OTHER: &str = "cgwalters-forge/zzz";
+    let (mut fake, cfg) = ordinary_fixture("cgwalters", "OWNER", false);
+    for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
+        fake.page(&format!("repos/{OTHER}/{path}"), None, None, json!([]));
+    }
+    // The run census of the repository past the cut.
+    let since = (now() - time::Duration::days(1)).date();
+    fake.page(&format!("repos/{OTHER}/actions/workflows/review.yml/runs?event=workflow_dispatch&created=%3E%3D{since}&per_page={REVIEW_DISPATCH_READS}"),
+        None, None, json!({"workflow_runs": []}));
+    let follow = [REPO.to_owned(), OTHER.to_owned()];
+    let dispatcher = Fake::default();
+    // Room for the first repository and its pull request, then none.
+    let shared = Shared::new(&fake, 2);
+    let dispatching = Shared::new(&dispatcher, usize::MAX);
+    let apply = Some(Apply {
+        dispatcher: &dispatching,
+        workflow: "dispatch.yml".into(),
+        pools: vec!["claude".into(), "openai".into()],
+        git_ref: None,
+    });
+    let outcome = run(&shared, &shared, &cfg, State::default(), &[], &follow, apply, now()).unwrap();
+    assert!(shared.spent.get(), "{:?}", outcome.lines);
+    let cut = format!("pull requests: the stage's request share is spent at {OTHER}");
+    assert!(outcome.lines.iter().any(|l| l.starts_with(&cut)), "{:?}", outcome.lines);
+    assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+    assert_eq!(outcome.dispatched, 1, "{:?}", outcome.lines);
+    assert!(!shared.under_way.get());
+}

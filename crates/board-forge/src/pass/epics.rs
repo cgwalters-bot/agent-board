@@ -1007,11 +1007,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return 0;
         };
         let mut turn = Turn::default();
-        if let Err(error) = self.epics_within(&epics.repository, earlier, git_ref, &mut turn) {
-            self.holds_whole = false;
-            self.waited.clear();
-            self.report.failures += 1;
-            self.line(format!("epics error: {error:#}"));
+        match self.epics_within(&epics.repository, earlier, git_ref, &mut turn) {
+            Ok(()) => {}
+            // The census met the stage's share: the epics wait for the next
+            // pass, with the holds left unpublished as partial.
+            Err(error) if error.is::<ShareSpent>() => {
+                self.holds_whole = false;
+                self.waited.clear();
+                self.line(format!(
+                    "budget: epics stopped at its share; the live epics wait for the next pass: {error:#}"
+                ));
+            }
+            Err(error) => {
+                self.holds_whole = false;
+                self.waited.clear();
+                self.report.failures += 1;
+                self.line(format!("epics error: {error:#}"));
+            }
         }
         let starts = turn.starts;
         for waited in &mut self.waited {
@@ -1288,6 +1300,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.report.failures += 1;
                 self.line(format!(
                     "epics: the pass's request or time budget is low; {} live epic(s) deferred",
+                    live.len() - n
+                ));
+                break;
+            }
+            // What the stage keeps for scheduling is no failure: the epics
+            // after it wait for the next pass.
+            if bounds.available() < START_REQUESTS {
+                self.holds_whole = false;
+                self.line(format!(
+                    "budget: epics stopped at its share, {} requests kept for scheduling; {} live epic(s) deferred",
+                    bounds.kept.get(),
                     live.len() - n
                 ));
                 break;
@@ -1921,7 +1944,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let bounds = self.client.bounds;
         // Apply reads the comments three times, each as many pages as now.
         let needed = APPLY_REQUESTS + 3 * pages + ACTION_REQUESTS * planned.actions + WRITE_RESERVE;
-        if bounds.left.get() < needed || Instant::now() > bounds.admit_by {
+        if !bounds.fits(needed) {
             self.report.failures += 1;
             let why = format!(
                 "the pass has {} requests left, fewer than its apply may take ({needed}), or ran out of time",

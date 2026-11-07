@@ -42,6 +42,11 @@ pub const POLL_STATE_SCHEMA: &str = "agent-board/poll-state/v1";
 // already made.
 pub const POLL_REQUEST_LIMIT: usize = 500;
 pub const POLL_REPOSITORY_LIMIT: usize = 50;
+/// The share left ([`Rest::share_left`]) a pull request's walk needs before
+/// it begins: enough for its reads, a claim's read back and a round's
+/// start, so that the share stops the walk between pull requests rather
+/// than inside a round.
+const PULL_SHARE_MARGIN: usize = 32;
 /// The gap after a pass that saw anything change: poll.yml's wait today.
 pub const MIN_INTERVAL_SECONDS: i64 = 5 * 60;
 /// The gap the idle backoff stops doubling at: four passes a day.
@@ -1421,6 +1426,78 @@ pub trait Rest {
     fn download(&self, url: &str, _limit: u64) -> Result<Vec<u8>> {
         bail!("GET {url}: this client downloads nothing")
     }
+    /// The requests the poll may still read before it reaches what the pass
+    /// keeps for its later stages ([`crate::pass::AFTER_PULL_REQUESTS`]);
+    /// none where nothing is kept.
+    fn share_left(&self) -> Option<usize> {
+        None
+    }
+    /// A step is under way from here (`true`) until it is done: its reads
+    /// finish past the stage's share, as a claim already posted must reach
+    /// its run, and run counts that bound `wip` must be whole.
+    fn under_way(&self, _on: bool) {}
+}
+
+/// Which of a repository's pull requests one turn of the walk takes: the
+/// share's cursor names a pull request, from which the walk goes on, and
+/// those before it come last ([`walk`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Turn {
+    All,
+    From(u64),
+    Before(u64),
+}
+
+impl Turn {
+    fn takes(self, number: u64) -> bool {
+        match self {
+            Turn::All => true,
+            Turn::From(n) => number >= n,
+            Turn::Before(n) => number < n,
+        }
+    }
+}
+
+/// `follow` in turns from `cursor`, where the last pass's share stopped
+/// (`OWNER/REPO`, or `OWNER/REPO#N` for a pull request in it): from that
+/// pull request on, then the repositories after it and those before it,
+/// and last that repository's pull requests before it. Each pass's walk
+/// takes up where the last one's stopped, however large one repository is.
+fn walk<'r>(follow: &BTreeSet<&'r String>, cursor: Option<&str>) -> Vec<(&'r String, Turn)> {
+    let cursor = cursor.map(str::to_ascii_lowercase);
+    let (at, number) = match cursor.as_deref().map(|c| c.split_once('#')) {
+        Some(Some((repo, n))) => (Some(repo.to_owned()), n.parse().ok()),
+        Some(None) => (cursor.clone(), None),
+        None => (None, None),
+    };
+    let (before, after): (Vec<&String>, Vec<&String>) = follow
+        .iter()
+        .partition(|r| at.as_ref().is_some_and(|c| r.to_ascii_lowercase() < *c));
+    let mut turns: Vec<(&String, Turn)> = Vec::new();
+    let mut last = None;
+    for repo in after.into_iter().chain(before) {
+        match number {
+            Some(n) if Some(repo.to_ascii_lowercase()) == at => {
+                turns.push((repo, Turn::From(n)));
+                last = Some((repo, Turn::Before(n)));
+            }
+            _ => turns.push((repo, Turn::All)),
+        }
+    }
+    turns.extend(last);
+    turns
+}
+
+/// A share cursor: a repository, or a pull request in one.
+fn share_cursor(value: &str) -> bool {
+    match value.split_once('#') {
+        Some((repo, n)) => {
+            validate_repository(repo).is_ok()
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && n.parse::<u64>().is_ok_and(|n| n > 0)
+        }
+        None => validate_repository(value).is_ok(),
+    }
 }
 
 /// The `rel="next"` URL of a `Link` header.
@@ -1497,6 +1574,12 @@ pub struct State {
     /// Only an applying pass moves it, and a pass without the option drops
     /// it. Losing it only starts the round of the repositories again.
     pub follow_cursor: Option<String>,
+    /// Where the last applying pass's request share ran out
+    /// ([`Rest::share_left`]), `OWNER/REPO` or the pull request `OWNER/REPO#N`
+    /// it did not walk: the next pass walks from it ([`walk`]), so that the
+    /// same pull requests are not left out every pass. None walks in order.
+    /// Losing it only starts the walk over.
+    pub share_cursor: Option<String>,
     /// `notifications` ([`notify`]): the time the next listing starts at,
     /// and where the last one had pages left, the time it goes on before,
     /// for up to [`notify::NOTIFY_PAGES`]. Losing them costs requests: the
@@ -1534,6 +1617,7 @@ impl State {
                     "intake_refused",
                     "lock_refused",
                     "follow_cursor",
+                    "share_cursor",
                     "notify_since",
                     "notify_before",
                     "maintain",
@@ -1653,6 +1737,14 @@ impl State {
                 .transpose()
         };
         let follow_cursor = cursor("follow_cursor")?;
+        let share_cursor = (object.get("share_cursor"))
+            .map(|c| {
+                c.as_str()
+                    .filter(|c| share_cursor(c))
+                    .map(str::to_owned)
+                    .context("poll state share_cursor is not a repository or a pull request")
+            })
+            .transpose()?;
         let authored_cursor = cursor("authored_cursor")?;
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
@@ -1668,6 +1760,7 @@ impl State {
             intake_refused,
             lock_refused,
             follow_cursor,
+            share_cursor,
             notify_since,
             notify_before,
             maintain,
@@ -1698,6 +1791,9 @@ impl State {
         }
         if let Some(cursor) = &self.follow_cursor {
             state["follow_cursor"] = cursor.as_str().into();
+        }
+        if let Some(cursor) = &self.share_cursor {
+            state["share_cursor"] = cursor.as_str().into();
         }
         if let Some(since) = &self.notify_since {
             state["notify_since"] = since.as_str().into();
@@ -4437,6 +4533,9 @@ struct Pass<'a, R, G> {
     /// Only what this pass used is kept, which bounds the state file.
     used: BTreeMap<String, Value>,
     remaining: usize,
+    /// Where the pass's share stopped the walk ([`Rest::share_left`]), as
+    /// [`State::share_cursor`] names it; nothing more is walked after it.
+    cut: Option<String>,
     apply: Option<Apply<'a, R>>,
     dispatched: usize,
     /// See [`Outcome::merged`].
@@ -4607,6 +4706,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             previous: BTreeMap::new(),
             used: BTreeMap::new(),
             remaining: POLL_REQUEST_LIMIT,
+            cut: None,
             apply: None,
             dispatched: 0,
             merged: 0,
@@ -4636,6 +4736,50 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     /// A marker comment's body, signed with the configured attribution.
     fn marker_body(&self, state: &Value, text: &str) -> String {
         marker_body(state, text, &self.config.policy.footer)
+    }
+
+    /// Whether the pass's share leaves room to walk `repo`'s pull request
+    /// `number`, or the repository itself; if not, the walk stops there.
+    fn share_allows(&mut self, repo: &str, number: Option<u64>) -> bool {
+        if self.cut.is_none()
+            && self
+                .rest
+                .share_left()
+                .is_none_or(|left| left >= PULL_SHARE_MARGIN)
+        {
+            return true;
+        }
+        self.stop_at(repo, number);
+        false
+    }
+
+    /// Stops the walk at `repo`'s pull request `number`, or the repository.
+    fn stop_at(&mut self, repo: &str, number: Option<u64>) {
+        let repo = repo.to_ascii_lowercase();
+        let at = number.map_or(repo.clone(), |n| format!("{repo}#{n}"));
+        self.cut.get_or_insert(at);
+    }
+
+    /// Counts `repo`'s review runs toward `wip` ([`Self::review_runs`]),
+    /// past the stage's share: a repository the walk does not reach still
+    /// holds its slots.
+    fn count_reviews(&mut self, repo: &str, outcome: &mut Outcome) {
+        if self.config.policy.review_pools.is_empty()
+            || review_workflow(self.config, repo).is_none()
+        {
+            return;
+        }
+        self.rest.under_way(true);
+        let read = self.review_runs(repo);
+        self.rest.under_way(false);
+        if let Err(error) = read {
+            outcome.errors += 1;
+            outcome
+                .lines
+                .push(format!("{repo} error: the review job's runs: {error:#}"));
+            self.review_unread
+                .get_or_insert(format!("the review job's runs in {repo} could not be read"));
+        }
     }
 
     fn spend(&mut self) -> Result<()> {
@@ -5037,6 +5181,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             0,
         )?;
         let mine = posted["id"].as_u64().context("the new comment has no id")?;
+        // Posted, the claim must reach its run or its note: the rest of the
+        // round's reads are not refused by the stage's share.
+        self.rest.under_way(true);
         let again = self.paged_reserved(&format!("{comments}?per_page=100"), true, reserve)?;
         // A marker newer than the one read was not claimed from it: a stop is
         // posted without a claim, and a reset of it may be under way.
@@ -8007,17 +8154,33 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         ))
     }
 
+    #[cfg(test)]
     fn follow(&mut self, repo: &str, outcome: &mut Outcome) -> Result<()> {
+        self.follow_turn(repo, Turn::All, outcome)
+    }
+
+    /// The pull requests of `repo` that `turn` takes, each decided.
+    fn follow_turn(&mut self, repo: &str, turn: Turn, outcome: &mut Outcome) -> Result<()> {
         // The envelope is the bound, not the loop that walks it: a step in a
         // repository outside it is refused here, before anything is read.
         ensure!(
             self.envelope.as_ref().is_none_or(|e| e.admits(repo)),
             "{repo} is outside this pass's envelope"
         );
+        let first = match turn {
+            Turn::From(n) => Some(n),
+            Turn::All | Turn::Before(_) => None,
+        };
+        if !self.share_allows(repo, first) {
+            return Ok(());
+        }
         let open = self.paged(
             &format!("repos/{repo}/pulls?state=open&per_page=100"),
             false,
         )?;
+        let open: Vec<Value> = (open.into_iter())
+            .filter(|p| p["number"].as_u64().is_some_and(|n| turn.takes(n)))
+            .collect();
         if self.config.policy.maintainer_report.is_some() {
             for p in &open {
                 if let Some(number) = p["number"].as_u64() {
@@ -8071,17 +8234,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         numbers.sort_unstable();
         // Read whether or not a head waits for a review: a run of a head
         // pushed over since, or of a pull request closed, still takes a slot.
-        if !self.config.policy.review_pools.is_empty()
-            && review_workflow(self.config, repo).is_some()
-            && let Err(error) = self.review_runs(repo)
-        {
-            outcome.errors += 1;
-            outcome
-                .lines
-                .push(format!("{repo} error: the review job's runs: {error:#}"));
-            self.review_unread
-                .get_or_insert(format!("the review job's runs in {repo} could not be read"));
-        }
+        self.count_reviews(repo, outcome);
         let mut required = BTreeMap::new();
         let left = self.left_labelled(repo, &open);
         let on_hold: BTreeSet<u64> = open
@@ -8090,6 +8243,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             .filter_map(|p| p["number"].as_u64())
             .collect();
         for (number, merge_only) in numbers {
+            if !self.share_allows(repo, Some(number)) {
+                break;
+            }
             self.deferring = None;
             let label = if on_hold.contains(&number) {
                 HOLD_LABEL
@@ -8100,6 +8256,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 Some(listed) => Ok(self.labelled_skip(repo, number, merge_only, (listed, label))),
                 None => self.pull(repo, number, merge_only, &mut required),
             };
+            // A round's claim made its reads under way ([`Self::claim`]).
+            self.rest.under_way(false);
             match read {
                 Ok((line, flying, wait, stepped)) => {
                     if let Some(p) = self.report_pulls.get_mut(&(repo.to_owned(), number))
@@ -8118,6 +8276,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                     outcome.in_flight += usize::from(flying);
                     outcome.waits.extend(wait);
                     outcome.steps.extend(stepped);
+                }
+                Err(error) if error.is::<crate::pass::ShareSpent>() => {
+                    self.stop_at(repo, Some(number));
+                    break;
                 }
                 Err(error) => {
                     outcome.errors += 1;
@@ -8294,7 +8456,15 @@ pub fn run_capped<R: Rest, G: Transport>(
         };
         pass.envelope = Some(envelope);
     }
-    for repo in &follow {
+    // The repositories the pass's share left unwalked, or walked in part.
+    let mut waiting = BTreeSet::new();
+    for (repo, turn) in walk(&follow, state.share_cursor.as_deref()) {
+        let excluded = pass.envelope.as_ref().is_some_and(|e| !e.admits(repo))
+            || missing.contains(&repo.to_ascii_lowercase());
+        // A repository's second turn says nothing the first did not.
+        if excluded && matches!(turn, Turn::Before(_)) {
+            continue;
+        }
         if let Some(envelope) = &pass.envelope
             && !envelope.admits(repo)
         {
@@ -8308,8 +8478,29 @@ pub fn run_capped<R: Rest, G: Transport>(
             outcome.undecided.insert(repo.to_ascii_lowercase());
             continue;
         }
-        match pass.follow(repo, &mut outcome) {
+        // Past the share, the rest wait for the next pass, which starts
+        // with them; what the last pass held there is kept.
+        // Its review runs still hold their slots.
+        if pass.cut.is_some() {
+            pass.count_reviews(repo, &mut outcome);
+            outcome.undecided.insert(repo.to_ascii_lowercase());
+            waiting.insert(repo.to_ascii_lowercase());
+            continue;
+        }
+        let result = pass.follow_turn(repo, turn, &mut outcome);
+        if let Err(error) = &result
+            && error.is::<crate::pass::ShareSpent>()
+        {
+            pass.stop_at(repo, None);
+        }
+        if pass.cut.is_some() {
+            pass.count_reviews(repo, &mut outcome);
+            outcome.undecided.insert(repo.to_ascii_lowercase());
+            waiting.insert(repo.to_ascii_lowercase());
+        }
+        match result {
             Ok(()) => {}
+            Err(error) if error.is::<crate::pass::ShareSpent>() => {}
             // Only its list of pull requests passes a 404 up: each pull
             // request's own errors stay its own.
             Err(error) if error.is::<crate::github::NotFound>() => {
@@ -8323,8 +8514,30 @@ pub fn run_capped<R: Rest, G: Transport>(
             }
         }
     }
-    // Once every repository's review runs are counted toward `wip`.
+    // As the other cursors, only an applying pass moves it.
+    let share_cursor = match &pass.cut {
+        Some(repo) => {
+            let waiting = waiting.len();
+            outcome.lines.push(format!(
+                "pull requests: the stage's request share is spent at {repo}; {waiting} repositories wait for the next pass, which starts there"
+            ));
+            // Unread is not unchanged: the next pass comes soon.
+            outcome.activity += 1;
+            if pass.apply.is_some() {
+                Some(repo.clone())
+            } else {
+                state.share_cursor.clone()
+            }
+        }
+        None if pass.apply.is_some() => None,
+        None => state.share_cursor.clone(),
+    };
+    // Once every repository's review runs are counted toward `wip`. Each
+    // start was admitted within the share where the walk queued it, so its
+    // reads are under way: the run census past a cut must not strand it.
+    pass.rest.under_way(true);
     pass.start_reviews(&mut outcome);
+    pass.rest.under_way(false);
     // After the followed pull requests, which come first for the runs a pass
     // may start. A preview keeps the cursor, so that it hides nothing from the
     // next pass that applies.
@@ -8356,6 +8569,11 @@ pub fn run_capped<R: Rest, G: Transport>(
             // fail the pass's own steps along with it. Where the search is
             // also `operatorComments`', which a caller turned on as a step,
             // its failure stays an error.
+            Err(error) if error.is::<crate::pass::ShareSpent>() => {
+                outcome
+                    .lines
+                    .push(format!("operator comments deferred: {error:#}"));
+            }
             Err(error) if pass.intaking && config.policy.operator_comments.is_empty() => {
                 outcome.lines.push(format!(
                     "warning: operator direction search failed, retried next pass: {error:#}"
@@ -8385,6 +8603,11 @@ pub fn run_capped<R: Rest, G: Transport>(
                 notify_before = before;
             }
             Ok(_) => {}
+            Err(error) if error.is::<crate::pass::ShareSpent>() => {
+                outcome
+                    .lines
+                    .push(format!("notifications deferred: {error:#}"));
+            }
             Err(error) => {
                 outcome.errors += 1;
                 outcome
@@ -8413,6 +8636,8 @@ pub fn run_capped<R: Rest, G: Transport>(
     } else {
         state.interval_seconds
     };
+    // Any claim's step is over: nothing is under way past the poll.
+    pass.rest.under_way(false);
     outcome.dispatched = pass.dispatched;
     outcome.merged = pass.merged;
     outcome.reviewing = pass.reviewing;
@@ -8425,6 +8650,7 @@ pub fn run_capped<R: Rest, G: Transport>(
         intake_refused: pass.intake_refused,
         lock_refused,
         follow_cursor,
+        share_cursor,
         notify_since,
         notify_before,
         maintain: None,
@@ -20369,6 +20595,303 @@ mod tests {
         }
     }
 
+    /// The pass's budget as the poll sees it ([`Rest::share_left`]): room
+    /// for `walks` more of the walk's checks, then none. Past it, a read
+    /// after a claim is posted is refused unless a step is under way, as the
+    /// pass's budget refuses it.
+    use std::cell::Cell;
+
+    struct Shared<'f> {
+        fake: &'f Fake,
+        walks: Cell<usize>,
+        posted: Cell<bool>,
+        spent: Cell<bool>,
+        under_way: Cell<bool>,
+    }
+
+    impl<'f> Shared<'f> {
+        fn new(fake: &'f Fake, walks: usize) -> Self {
+            Shared {
+                fake,
+                walks: Cell::new(walks),
+                posted: Cell::new(false),
+                spent: Cell::new(false),
+                under_way: Cell::new(false),
+            }
+        }
+
+        /// The pass's budget refuses a read here, as past the share.
+        fn refuses(&self) -> Result<()> {
+            if (self.posted.get() || self.spent.get()) && !self.under_way.get() {
+                return Err(crate::pass::ShareSpent("the share is spent".into()).into());
+            }
+            Ok(())
+        }
+    }
+
+    impl Transport for Shared<'_> {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            if !query.trim_start().starts_with("mutation") {
+                self.refuses()?;
+            }
+            self.fake.graphql(query, variables)
+        }
+    }
+
+    impl Rest for Shared<'_> {
+        fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+            self.refuses()?;
+            self.fake.get(url, validator)
+        }
+
+        fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+            if method == "POST" && url.ends_with("/comments") {
+                self.posted.set(true);
+            }
+            self.fake.send(method, url, body)
+        }
+
+        fn share_left(&self) -> Option<usize> {
+            let walks = self.walks.get();
+            self.walks.set(walks.saturating_sub(1));
+            self.spent.set(self.spent.get() || walks == 0);
+            Some(if walks > 0 { PULL_SHARE_MARGIN } else { 0 })
+        }
+
+        fn under_way(&self, on: bool) {
+            self.under_way.set(on);
+        }
+    }
+
+    /// The walk's turns from a share cursor: from the pull request it names
+    /// on, the repositories after it and before it, and last the pull
+    /// requests before it in its repository.
+    #[test]
+    fn the_walk_starts_at_the_share_cursor() {
+        let (a, b, c) = ("o/a".to_owned(), "o/b".to_owned(), "o/c".to_owned());
+        let follow: BTreeSet<&String> = [&a, &b, &c].into_iter().collect();
+        let cases = [
+            (
+                None,
+                vec![(&a, Turn::All), (&b, Turn::All), (&c, Turn::All)],
+            ),
+            (
+                Some("o/b"),
+                vec![(&b, Turn::All), (&c, Turn::All), (&a, Turn::All)],
+            ),
+            (
+                Some("O/B"),
+                vec![(&b, Turn::All), (&c, Turn::All), (&a, Turn::All)],
+            ),
+            (
+                Some("o/b#7"),
+                vec![
+                    (&b, Turn::From(7)),
+                    (&c, Turn::All),
+                    (&a, Turn::All),
+                    (&b, Turn::Before(7)),
+                ],
+            ),
+            // A repository no longer followed: the walk goes on after it.
+            (
+                Some("o/bb#7"),
+                vec![(&c, Turn::All), (&a, Turn::All), (&b, Turn::All)],
+            ),
+        ];
+        for (cursor, expected) in cases {
+            assert_eq!(walk(&follow, cursor), expected, "{cursor:?}");
+        }
+        assert!([6, 7, 8].iter().all(|n| Turn::All.takes(*n)));
+        assert!(!Turn::From(7).takes(6) && Turn::From(7).takes(7));
+        assert!(Turn::Before(7).takes(6) && !Turn::Before(7).takes(7));
+        for (cursor, valid) in [
+            ("o/b", true),
+            ("o/b#7", true),
+            ("o/b#0", false),
+            ("o/b#x", false),
+            ("o", false),
+        ] {
+            assert_eq!(share_cursor(cursor), valid, "{cursor}");
+        }
+    }
+
+    /// Where the pass's share runs out, the walk stops between pull
+    /// requests: the rest wait, undecided rather than failed, and each
+    /// applying pass's walk starts from the state the last one returned,
+    /// at the pull request it stopped at, so that a share too small for
+    /// every followed pull request leaves none out pass after pass
+    /// (agent-board#748).
+    #[test]
+    fn the_share_stops_the_walk_and_the_next_pass_starts_there() {
+        const OTHER: &str = "cgwalters-forge/zzz";
+        let mut fake = github();
+        for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
+            fake.page(&format!("repos/{OTHER}/{path}"), None, None, json!([]));
+        }
+        let follow = [REPO.to_owned(), OTHER.to_owned()];
+        let dispatcher = Fake::default();
+        let pass = |state: State, walks: usize, apply: bool| {
+            fake.sent.borrow_mut().clear();
+            let shared = Shared::new(&fake, walks);
+            let dispatching = Shared::new(&dispatcher, usize::MAX);
+            let apply = apply.then(|| Apply {
+                dispatcher: &dispatching,
+                workflow: "dispatch.yml".into(),
+                pools: vec!["claude".into()],
+                git_ref: None,
+            });
+            // As the next pass reads it.
+            let state = match state == State::default() {
+                true => state,
+                false => State::from_json(&state.to_json()).unwrap(),
+            };
+            run(&shared, &fake, &config(), state, &[], &follow, apply, now()).unwrap()
+        };
+        let pulls = |repo: &str| format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100");
+        let read = |repo: &str| fake.sent.borrow().iter().any(|(u, _)| *u == pulls(repo));
+        let walked = |outcome: &Outcome| {
+            outcome
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("{REPO}#470 ")))
+        };
+        let spent = |at: &str, waiting: usize| {
+            format!(
+                "pull requests: the stage's request share is spent at {at}; {waiting} repositories wait for the next pass, which starts there"
+            )
+        };
+
+        // Room for the first repository's listing only: its pull request
+        // is not walked, and the other repository is not reached.
+        let first = pass(State::default(), 1, true);
+        assert!(read(REPO) && !read(OTHER) && !walked(&first));
+        let at = format!("{REPO}#470");
+        assert!(first.lines.contains(&spent(&at, 2)), "{:?}", first.lines);
+        assert_eq!(first.errors, 0, "{:?}", first.lines);
+        assert!(first.undecided.contains(REPO) && first.undecided.contains(OTHER));
+        assert_eq!(first.state.share_cursor.as_deref(), Some(at.as_str()));
+        // A preview stops alike but keeps the cursor it was given.
+        let preview = pass(State::default(), 1, false);
+        assert!(preview.lines.contains(&spent(&at, 2)));
+        assert_eq!(preview.state.share_cursor, None);
+
+        // The next pass, as the same share again, starts at that pull
+        // request, walks it, and stops at the next repository.
+        let second = pass(first.state.clone(), 2, true);
+        assert!(walked(&second), "{:?}", second.lines);
+        assert!(
+            second.lines.contains(&spent(OTHER, 2)),
+            "{:?}",
+            second.lines
+        );
+        assert_eq!(second.state.share_cursor.as_deref(), Some(OTHER));
+
+        // The third starts there and wraps around to the first repository.
+        let third = pass(second.state.clone(), 1, true);
+        assert!(read(OTHER) && !walked(&third), "{:?}", fake.sent.borrow());
+        assert!(third.lines.contains(&spent(REPO, 1)), "{:?}", third.lines);
+        assert!(third.undecided.contains(REPO) && !third.undecided.contains(OTHER));
+        assert_eq!(third.state.share_cursor.as_deref(), Some(REPO));
+
+        // With room for all, everything is walked and the cursor dropped.
+        let whole = pass(third.state.clone(), usize::MAX, true);
+        assert!(read(REPO) && read(OTHER) && walked(&whole));
+        assert!(!whole.lines.iter().any(|l| l.starts_with("pull requests: ")));
+        assert_eq!(whole.state.share_cursor, None);
+    }
+
+    /// A repository the share leaves unwalked still has its review runs
+    /// counted toward `wip`: the slots they hold are not freed for more
+    /// reviews or for scheduling because the walk did not reach them.
+    #[test]
+    fn review_runs_of_an_unwalked_repository_still_count() {
+        let mut fake = github();
+        let mut active = ordinary_run();
+        active["status"] = "in_progress".into();
+        active["conclusion"] = Value::Null;
+        ordinary_runs(&mut fake, vec![active]);
+        let mut cfg = config();
+        cfg.policy.review_dispatch_repositories = vec![REPO.into()];
+        cfg.policy.review_pools = vec!["claude".into()];
+        let follow = [REPO.to_owned()];
+        let shared = Shared::new(&fake, 0);
+        let outcome = run(
+            &shared,
+            &fake,
+            &cfg,
+            State::default(),
+            &[],
+            &follow,
+            None,
+            now(),
+        )
+        .unwrap();
+        let pulls = format!("{API_ROOT}repos/{REPO}/pulls?state=open&per_page=100");
+        assert!(!fake.sent.borrow().iter().any(|(url, _)| *url == pulls));
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|l| l.starts_with("pull requests: "))
+        );
+        assert_eq!(outcome.reviewing, 1, "{:?}", outcome.lines);
+        assert_eq!(outcome.errors, 0, "{:?}", outcome.lines);
+        assert!(!shared.under_way.get());
+    }
+
+    /// A claim posted with too little of the share left still reads its
+    /// comments back and starts its round: the share stops the walk between
+    /// pull requests, never between a claim and its run.
+    #[test]
+    fn a_claim_posted_at_the_share_still_starts_its_round() {
+        let comments = format!("{API_ROOT}repos/{REPO}/issues/470/comments?per_page=100");
+        let read = json!({"id": 5, "user": {"login": BOT}, "body": marker_body(&json!({"rounds": 1, "sha": "older"}), "Fix round 1 of 2.")});
+        let mut fake = github();
+        let failing = json!({"contexts": {"review": {"state": "FAILURE"}}});
+        fake.pulls.insert(470, pull("pull-470", failing));
+        fake.rest.get_mut(&comments).unwrap().3 = json!([read]);
+        fake.answers.borrow_mut().insert(
+            format!("{API_ROOT}repos/{REPO}/issues/470/comments"),
+            vec![(201, json!({"id": 99}))],
+        );
+        fake.answers.borrow_mut().insert(
+            format!("{API_ROOT}repos/{REPO}/labels"),
+            vec![(422, json!({}))],
+        );
+        let dispatcher = Fake::default();
+        let shared = Shared::new(&fake, 2);
+        let dispatching = Shared::new(&dispatcher, usize::MAX);
+        let apply = Some(Apply {
+            dispatcher: &dispatching,
+            workflow: "dispatch.yml".into(),
+            pools: vec!["claude".into(), "openai".into()],
+            git_ref: None,
+        });
+        let follow = [REPO.to_owned()];
+        let outcome = run(
+            &shared,
+            &fake,
+            &config(),
+            State::default(),
+            &[],
+            &follow,
+            apply,
+            now(),
+        )
+        .unwrap();
+        assert!(shared.posted.get());
+        assert_eq!(dispatcher.writes.borrow().len(), 1, "{:?}", outcome.lines);
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|l| l.contains("fix: review requested changes -> ")),
+            "{:?}",
+            outcome.lines
+        );
+        assert!(!shared.under_way.get());
+    }
+
     /// The envelope is checked where a step starts, not only by the loop
     /// that walks it: a followed repository outside it is refused unread.
     #[test]
@@ -20384,6 +20907,7 @@ mod tests {
             previous: BTreeMap::new(),
             used: BTreeMap::new(),
             remaining: POLL_REQUEST_LIMIT,
+            cut: None,
             apply: None,
             dispatched: 0,
             merged: 0,

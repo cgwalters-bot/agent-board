@@ -81,6 +81,23 @@ const LEASE_RECHECK_REQUESTS: usize = 2;
 /// Requests only writes may spend: a claim already posted is still sent or
 /// noted when its reads have spent the rest.
 const WRITE_RESERVE: usize = 4;
+/// The percentage of the pass's requests that stage 2's reads leave to the
+/// stages after it: epics, scheduling and its starts, Status and the holds
+/// (agent-board#748), 377 of [`PASS_REQUEST_LIMIT`]. Without it a sweep of
+/// many followed pull requests spent the pass, and scheduling stopped at
+/// [`START_RESERVE`] with slots free and nothing started. Stage 2 stops at
+/// a pull request's boundary short of it, and what it did not reach goes
+/// first in the next pass ([`poll::State::share_cursor`]).
+pub(crate) const AFTER_PULL_REQUESTS: usize = 58;
+/// The percentage stage 3's reads leave to scheduling and its starts,
+/// Status and the holds, 247 of [`PASS_REQUEST_LIMIT`]. Stage 3 gets at
+/// least the difference from [`AFTER_PULL_REQUESTS`], 130, enough to
+/// consider a live epic ([`START_REQUESTS`]).
+const AFTER_EPICS: usize = 38;
+/// 304s a pass does not charge to its budget: GitHub does not count them
+/// against the rate limit, so a revalidated read that answers from the cache
+/// is free, but only this many, so that they still bound a runaway loop.
+const REVALIDATED_LIMIT: usize = PASS_REQUEST_LIMIT;
 /// GraphQL points a query and a mutation are taken to cost where the
 /// response does not say (`rateLimit { cost }`), as GitHub's secondary
 /// limits count them.
@@ -2209,6 +2226,13 @@ struct Bounds {
     /// after which nothing more is sent, and how many requests were not.
     rate_limited: RefCell<Option<String>>,
     not_sent: Cell<usize>,
+    /// What the stage under way leaves to the stages after it
+    /// ([`AFTER_PULL_REQUESTS`], [`AFTER_EPICS`]), or none, and how many of
+    /// its reads that refused.
+    kept: Cell<usize>,
+    cut: Cell<usize>,
+    /// 304s refunded, up to [`REVALIDATED_LIMIT`].
+    revalidated: Cell<usize>,
 }
 
 impl Bounds {
@@ -2231,6 +2255,9 @@ impl Bounds {
             estimated: Cell::new(false),
             rate_limited: RefCell::new(None),
             not_sent: Cell::new(0),
+            kept: Cell::new(0),
+            cut: Cell::new(0),
+            revalidated: Cell::new(0),
         }
     }
 
@@ -2242,6 +2269,7 @@ impl Bounds {
             points: self.points.get(),
             estimated: self.estimated.get(),
             rate_limited: self.rate_limited.borrow().is_some(),
+            revalidated: self.revalidated.get(),
         }
     }
 
@@ -2257,10 +2285,74 @@ impl Bounds {
         self.starting.set(false);
     }
 
-    /// Counts the requests from here on to `stage`.
+    /// Counts the requests from here on to `stage`, which keeps nothing back
+    /// for the stages after it.
     fn enter(&self, stage: Stage) {
+        self.enter_keeping(stage, 0);
+    }
+
+    /// Counts the requests from here on to `stage`, whose reads leave
+    /// `percent` of the pass's limit to the stages after it.
+    fn enter_keeping(&self, stage: Stage, percent: usize) {
         self.stage.set(stage);
         self.start_kind.borrow_mut().clear();
+        self.kept.set(self.limit * percent / 100);
+        self.cut.set(0);
+        // A step a stage left under way does not carry into the next.
+        self.finishing.set(false);
+    }
+
+    /// What the stage under way may still read before it reaches what it
+    /// keeps for the stages after it; all that is left where it keeps none.
+    fn available(&self) -> usize {
+        self.left.get().saturating_sub(self.kept.get())
+    }
+
+    /// Whether a step decided from what was read, an epic apply, fits in
+    /// what the pass has left and its time: the whole of it, not the stage's
+    /// share, which bounds only the reads that look for work. An apply larger
+    /// than a share would otherwise wait on every busy pass; the applies a
+    /// pass takes (`epics.appliesPerPass`) bound what it spends of the
+    /// later stages' share, and it runs under way ([`Bounds::finishing`]).
+    fn fits(&self, needed: usize) -> bool {
+        self.left.get() >= needed && Instant::now() <= self.admit_by
+    }
+
+    /// Whether the share of the stage under way refuses a read now: never
+    /// one of a step under way, a start's or an apply's, which finishes.
+    fn share_spent(&self) -> bool {
+        let kept = self.kept.get();
+        kept > 0
+            && !self.starting.get()
+            && !self.finishing.get()
+            && self.left.get() <= WRITE_RESERVE + kept
+    }
+
+    /// The line saying the stage under way had reads refused by its share,
+    /// if it did.
+    fn share_line(&self) -> Option<String> {
+        let cut = self.cut.get();
+        (cut > 0).then(|| {
+            format!(
+                "budget: {} stopped at its share, {cut} read(s) refused; {} requests kept for the stages after it",
+                self.stage.get().name(),
+                self.kept.get()
+            )
+        })
+    }
+
+    /// Gives back the request a 304 spent, up to [`REVALIDATED_LIMIT`].
+    fn refund(&self) {
+        let revalidated = self.revalidated.get();
+        let stage = self.stage.get() as usize;
+        let mut by_stage = self.by_stage.get();
+        if revalidated >= REVALIDATED_LIMIT || by_stage[stage] == 0 {
+            return;
+        }
+        by_stage[stage] -= 1;
+        self.by_stage.set(by_stage);
+        self.left.set(self.left.get() + 1);
+        self.revalidated.set(revalidated + 1);
     }
 
     /// `report` with its failures for requests the breaker did not send
@@ -2291,6 +2383,8 @@ pub struct Spent {
     pub points: u64,
     pub estimated: bool,
     pub rate_limited: bool,
+    /// 304s, which are not among `requests` ([`REVALIDATED_LIMIT`]).
+    pub revalidated: usize,
 }
 
 impl std::fmt::Display for Spent {
@@ -2304,6 +2398,9 @@ impl std::fmt::Display for Spent {
         if !stages.is_empty() {
             write!(f, " ({})", stages.join(", "))?;
         }
+        if self.revalidated > 0 {
+            write!(f, ", 304s {}", self.revalidated)?;
+        }
         write!(f, ", points {about}{}", self.points)?;
         if self.rate_limited {
             f.write_str(", rate-limited")?;
@@ -2312,7 +2409,24 @@ impl std::fmt::Display for Spent {
     }
 }
 
-/// Every request through it spends one of the pass's budget; reads leave
+/// A read the share of the stage under way refused ([`AFTER_PULL_REQUESTS`],
+/// [`AFTER_EPICS`]): what it did not reach waits for the next pass, a
+/// deferral rather than a failure of what it read.
+#[derive(Debug)]
+pub(crate) struct ShareSpent(pub(crate) String);
+
+impl std::fmt::Display for ShareSpent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ShareSpent {}
+
+/// Every request through it spends one of the pass's budget, but a 304,
+/// which GitHub does not count, up to [`REVALIDATED_LIMIT`]. Reads leave
+/// the stages after the one under way what it keeps for them
+/// ([`Bounds::enter_keeping`]), and
 /// [`WRITE_RESERVE`] of it to writes, and those outside a start the
 /// reserve ([`START_RESERVE`]) to starts. A write is never refused for the
 /// reserve: one may follow a read that decided it. Past the time bound it
@@ -2369,6 +2483,15 @@ impl<C> Budget<'_, C> {
                 bounds.reserve.get()
             );
         }
+        if !write && bounds.share_spent() {
+            bounds.cut.set(bounds.cut.get() + 1);
+            return Err(ShareSpent(format!(
+                "{} keeps its last {} requests for the stages after it",
+                bounds.stage.get().name(),
+                bounds.kept.get()
+            ))
+            .into());
+        }
         bounds.left.set(left - 1);
         bounds.writes.set(bounds.writes.get() + usize::from(write));
         let mut by_stage = bounds.by_stage.get();
@@ -2422,7 +2545,24 @@ impl<C: Rest> Rest for Budget<'_, C> {
 
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         self.spend(false)?;
-        self.observe(self.inner.get(url, validator))
+        let response = self.observe(self.inner.get(url, validator))?;
+        if validator.is_some() && response.status == 304 {
+            self.bounds.refund();
+        }
+        Ok(response)
+    }
+
+    /// The poll's claim, or its count of review runs, is under way: as a
+    /// start's, its reads are not refused by the share, and finish past the
+    /// time bound.
+    fn under_way(&self, on: bool) {
+        self.bounds.finishing.set(on);
+    }
+
+    fn share_left(&self) -> Option<usize> {
+        let bounds = self.bounds;
+        let kept = bounds.kept.get();
+        (kept > 0).then(|| bounds.left.get().saturating_sub(WRITE_RESERVE + kept))
     }
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
@@ -2881,17 +3021,23 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
     // Without stage 2's state, the incoming one keeps the maintain stage's.
     let kept = scheduler.report.maintain.is_some().then(|| state.clone());
-    // Stage 2: pull request follow-up, today's poll.
-    bounds.enter(Stage::PullRequests);
+    // Stage 2: pull request follow-up, today's poll, within its share.
+    bounds.enter_keeping(Stage::PullRequests, AFTER_PULL_REQUESTS);
     let mut earlier = maintained + scheduler.follow(state, &git_ref, maintained);
+    if let Some(line) = bounds.share_line() {
+        scheduler.line(line);
+    }
     if let Some(day) = scheduler.report.maintain.clone() {
         let state = (scheduler.report.state).get_or_insert_with(|| kept.unwrap_or_default());
         state.maintain = Some(day);
     }
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
     // starts take their slots before stage 4's.
-    bounds.enter(Stage::Epics);
+    bounds.enter_keeping(Stage::Epics, AFTER_EPICS);
     earlier += scheduler.epics(earlier, &git_ref);
+    if let Some(line) = bounds.share_line() {
+        scheduler.line(line);
+    }
     // Stage 4: choose and start work.
     bounds.enter(Stage::Schedule);
     if let Err(error) = scheduler.schedule(earlier, &git_ref) {
