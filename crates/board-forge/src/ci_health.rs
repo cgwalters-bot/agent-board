@@ -15,10 +15,15 @@ const TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const REQUESTS: u32 = 500;
 const SECONDS: u64 = 120;
 
+/// Trusted local CI health settings, at most 1 MiB; unknown fields are rejected.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Explicit repository/workflow pairs: 1 to 20, with no duplicates or discovery.
     pub targets: Vec<Target>,
+
+    /// Optional reviewed classifications keyed by a prior report's 64-hex signature.
+    /// Observations do not assign classes; caller assertions are copied verbatim.
     #[serde(default)]
     pub index: BTreeMap<String, Classification>,
 }
@@ -26,20 +31,40 @@ pub struct Config {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
+    /// GitHub OWNER/REPO whose Actions history is read.
     pub repository: String,
+
+    /// Workflow file name, for example ci.yml, not its display name.
     pub workflow: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Classification {
+    /// Reviewed class: unknown, flake, regression or infrastructure.
     pub class: String,
+
+    /// Nonempty list of HTTPS evidence links; relevance is the caller's responsibility.
     pub evidence: Vec<String>,
+
+    /// Nonblank responsible person or team.
     pub owner: String,
+
+    /// Optional GitHub issue URL; a URL alone does not verify issue state.
     pub issue: Option<String>,
+
+    /// Caller-verified fix state: unknown, open, staged or deployed.
+    /// A green run never promotes staged to deployed.
     pub fix_status: String,
+
+    /// RFC 3339 first-seen timestamp, no later than the report's exclusive until.
     pub first_seen: String,
+
+    /// Optional RFC 3339 explanation timestamp between first_seen and until.
+    /// Must be paired with explanation.
     pub explained_at: Option<String>,
+
+    /// Nonblank explanation, paired with explained_at; absent/null means unexplained.
     pub explanation: Option<String>,
 }
 

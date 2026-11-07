@@ -7,7 +7,33 @@ use std::{
     path::PathBuf,
 };
 
+pub const CI_HEALTH_ABOUT: &str = "Report rolling 30-day CI observations for explicit GitHub repositories and workflow files. Use this for historical first-attempt rates and recurring failure evidence, not supervise health's one-day signature check or latest-main verdict.
+
+Supply --config from a trusted local checkout and GH_TOKEN or GITHUB_TOKEN with read access to the targets' Actions runs, jobs and logs. There is no organization discovery or implicit board scope. The exclusive --until date must be YYYY-MM-DD and no later than today (UTC); it defaults to today's UTC midnight.
+
+Prints agent-board/ci-health/v1 JSON to stdout by default; --format human prints a concise summary. Exit zero means a report was produced, not that CI is healthy or coverage complete. Check complete at both report and target levels and display warnings before using rates. Invalid configuration or authentication setup fails the command. Consumers must use JSON, not scrape the human format.
+
+Reads are bounded to 500 API operations, a 120-second collection deadline, ten 100-item pages per listing, 1 MiB per log and 32 MiB aggregate decoded bytes. In-flight requests can overrun the deadline. Busy windows and unavailable logs can leave coverage incomplete.
+
+Nothing invokes this command by default. It never writes to the forge, files issues, retries runs, quarantines, dispatches, posts upstream or schedules anything. See docs/ci-health.md for window, denominator, signature and coverage contracts.";
+
 #[derive(clap::Args)]
+#[command(after_long_help = "Examples:
+  Print the rolling report ending at today's UTC midnight:
+    agent-board ci-health --config ci-health.json
+
+  Print a human summary for a fixed exclusive end date:
+    agent-board ci-health --config ci-health.json --until 2026-10-28 --format human
+
+  Configuration shape (save as ci-health.json in the trusted checkout):
+    {\"targets\":[{\"repository\":\"cgwalters-forge/agent-board\",\"workflow\":\"ci.yml\"}],\"index\":{}}
+
+  Configure 1 to 20 unique repository/workflow targets. Unknown fields are rejected.
+  The optional index maps a prior report's 64-hex signature to a reviewed
+  classification; observations never assign authoritative classes.
+  Config field contracts: crates/board-forge/src/ci_health.rs (Config, Target,
+  Classification). Both examples read GitHub and require a read token;
+  neither publishes a report.")]
 pub struct CiHealth {
     /// Trusted JSON with explicit targets and an optional reviewed classification index.
     #[arg(long, value_name = "FILE")]

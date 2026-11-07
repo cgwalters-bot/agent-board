@@ -181,6 +181,7 @@ enum Command {
     #[command(long_about = cost::COST_ABOUT)]
     Cost(cost::Cost),
     /// Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md).
+    #[command(long_about = ci_health::CI_HEALTH_ABOUT)]
     CiHealth(ci_health::CiHealth),
     /// Open issues of the board's work repositories that are candidates to close (overtaken, duplicate, stale or triaged done), each with its reasons and evidence, unless labelled keep (read-only; docs/prune.md).
     Prune(prune::Prune),
