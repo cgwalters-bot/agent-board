@@ -11,6 +11,14 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- The pass's `authored` sweep works without `state`, as the hosted pass
+  runs: the repositories live epics name are read in the same pass, from
+  stage 3's listing read early, so they come first every pass, and the rest
+  take turns by the pass's clock, the next N each 10-minute slot, rather than
+  from a cursor that was never kept. The poll state's `authored_priority` is
+  read no more. Without `state` the pass also warns on stderr what the
+  intake and `maintain` lose between passes (docs/pass.md).
+
 - The pass's `notifications` intake no longer fails every pass on one
   thread: a midstream fork with issues disabled has its upstream's direction
   staged in `dispatchRepo`, a write GitHub always refuses (404, 410) leaves

@@ -13977,33 +13977,53 @@ fn authored_forge() -> Forge {
 const AUTHORED_REPO: &str = "cgwalters-forge/agentic-job";
 const AUTHORED_NEXT: &str = "cgwalters-forge/zzz";
 
-/// With `authored: 1` and two repositories found, a pass follows the first
-/// and an applying one leaves the cursor at the second, which a pass from
-/// that cursor follows instead; a preview leaves the cursor where it was.
-/// A repository the last pass's live epics named, or a thread the intake
+/// `forge` with its open epics those of the recording, tracker#596's body
+/// replaced with `body`: three live epics, one of whose sub-issues
+/// (tracker#890's) are in cgwalters-forge/agent-board.
+fn epics_naming(forge: &mut Forge, body: &str) {
+    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "label": EPIC_LABEL,
+        "field": "Priority", "first": epics::EPICS_PER_PAGE, "cursor": null});
+    let request = graphql_key(epics::EPICS_QUERY, &variables);
+    let mut listing = (replay().requests.iter())
+        .find(|e| e["request"] == request)
+        .unwrap()["answer"]
+        .clone();
+    let nodes = listing
+        .pointer_mut("/data/repository/issues/nodes")
+        .unwrap();
+    let epic = (nodes.as_array_mut().unwrap().iter_mut())
+        .find(|n| n["number"] == 596)
+        .unwrap();
+    epic["body"] = body.into();
+    forge.replay.requests.retain(|e| e["request"] != request);
+    (forge.replay.requests).push(json!({"request": request, "answer": listing}));
+}
+
+/// `forge` answers the reads of `repo`, where the bot has no pull request
+/// the poll reads further.
+fn quiet(forge: &mut Forge, repo: &str) {
+    for path in ["events?per_page=100", "pulls?state=open&per_page=100"] {
+        forge.replay.requests.push(
+            json!({"request": {"get": format!("{API_ROOT}repos/{repo}/{path}")},
+            "answer": {"status": 200, "link": null, "body": []}}),
+        );
+    }
+}
+
+/// With `state` and `authored: 1` and two repositories found, a pass follows
+/// the first and an applying one leaves the cursor at the second, which a
+/// pass from that cursor follows instead; a preview leaves the cursor where
+/// it was. A repository this pass's live epics name, or a thread the intake
 /// keeps waiting in, is followed first whatever the cursor, and the rest
 /// still take their turn behind it.
 #[test]
 fn authored_repositories_take_turns() {
     const REPO: &str = AUTHORED_REPO;
     const NEXT: &str = AUTHORED_NEXT;
-    let forge = authored_forge();
-    let cfg = config(json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1}));
-    let at = |cursor: Option<&str>, priority: &str| {
-        let mut state = State {
-            authored_cursor: cursor.map(str::to_owned),
-            ..State::default()
-        };
-        match priority {
-            "epic" => state.authored_priority = vec![REPO.into()],
-            "intake" => {
-                let thread = format!("{REPO}#3");
-                state.intake_waiting = [(thread, "2026-10-23T00:00:00Z".into())].into();
-            }
-            _ => {}
-        }
-        state
-    };
+    let cfg = config(
+        json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1,
+        "state": ".state/poll.json"}),
+    );
     let own = own();
     for (cursor, priority, applies, followed, next, (admitted, prioritized)) in [
         (None, "", false, true, None, (1, 0)),
@@ -14015,65 +14035,198 @@ fn authored_repositories_take_turns() {
         (None, "epic", true, true, None, (2, 1)),
         (Some(NEXT), "intake", true, true, None, (2, 1)),
     ] {
+        let mut forge = authored_forge();
+        let mut state = State {
+            authored_cursor: cursor.map(str::to_owned),
+            ..State::default()
+        };
+        match priority {
+            "epic" => epics_naming(&mut forge, &format!("Land {REPO}#9 first.")),
+            "intake" => {
+                let thread = format!("{REPO}#3");
+                state.intake_waiting = [(thread, "2026-10-23T00:00:00Z".into())].into();
+            }
+            _ => {}
+        }
         let mode = if applies {
             Mode::Actions(&own)
         } else {
             Mode::Preview
         };
+        let now = forge.replay.now;
         let report = block(run(
             &forge,
             &forge,
             &cfg,
-            at(cursor, priority),
+            state,
             (mode, Limits::default()),
-            forge.replay.now,
+            now,
         ))
         .unwrap();
         let lines = &report.lines;
         let name = format!("{cursor:?} {priority} applies={applies}");
-        assert_eq!(report.failures, 0, "{name}: {lines:?}");
+        // The edited tracker#596 has every sub-issue closed, and the replay
+        // records no answer to the question an applying pass asks there.
+        let asked = usize::from(applies && priority == "epic");
+        assert_eq!(report.failures, asked, "{name}: {lines:?}");
         let line = format!(
             "authored: 2 repositories with the bot's open pull requests, 2 not followed, {admitted} of them this pass, {prioritized} prioritized"
         );
         assert!(lines.contains(&line), "{name}: {lines:?}");
+        let first = format!("authored: first: {REPO}");
+        assert_eq!(
+            lines.contains(&first),
+            !priority.is_empty(),
+            "{name}: {lines:?}"
+        );
         let decided = lines.iter().any(|l| l.starts_with(&format!("{REPO}#9 ")));
         assert_eq!(decided, followed, "{name}: {lines:?}");
         let state = report.state.unwrap();
         assert_eq!(state.authored_cursor.as_deref(), next, "{name}");
-        // This pass's stage 3 read no live epic, so the next names none.
-        assert_eq!(state.authored_priority, Vec::<String>::new(), "{name}");
     }
 }
 
-/// Stage 3 keeps the repositories the live epics name for the next pass's
-/// `authored` turn: those named in an epic's body as `OWNER/REPO#N` or by a
-/// link, and those of its open sub-issues, but not a repository named only
-/// in prose. With `authored` unset it keeps none.
+/// Without `state`, as the hosted pass runs, nothing carries from one pass
+/// to the next: each consecutive applying pass, ten minutes apart and each
+/// from an empty state, still takes the next turn of the clock, so the three
+/// repositories in rotation are all swept within three passes, one a pass,
+/// and the one a live epic names (here by its fork's upstream would do too)
+/// comes first in every one of them.
+#[test]
+fn stateless_passes_sweep_every_authored_repository_and_priority_every_pass() {
+    const NAMED: &str = AUTHORED_NEXT;
+    let rotating = [AUTHORED_REPO, "cgwalters-forge/xxx", "cgwalters-forge/yyy"];
+    let cfg = config(json!({"wip": 0, "pr": {"fixPools": ["claude"]}, "authored": 1}));
+    let own = own();
+    let mut swept = BTreeSet::new();
+    let passes = rotating.len();
+    // Mid-slot, as a hosted pass starts some seconds after its slot.
+    let start = replay().now + time::Duration::seconds(17);
+    for pass in 0..passes as i32 {
+        let mut forge = authored_forge();
+        let found: Vec<(&str, u64)> = (rotating.iter().map(|r| (*r, 9)))
+            .chain([(NAMED, 1)])
+            .collect();
+        forge.replay.requests.retain(|e| {
+            !text(&e["request"], "/get").contains("/search/issues?q=author%3Acgwalters-bot")
+        });
+        for (url, link, body) in authored_search(&[&found]) {
+            forge.replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": 200, "link": link, "body": body}}));
+        }
+        for repo in &rotating[1..] {
+            quiet(&mut forge, repo);
+        }
+        epics_naming(&mut forge, &format!("Land {NAMED}#1 first."));
+        let read = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let reads = read.clone();
+        forge.on_get = Some(Box::new(move |url, _| {
+            reads.borrow_mut().push(url.to_owned())
+        }));
+        let now = start + time::Duration::minutes(authored::SLOT_MINUTES * i64::from(pass));
+        let report = block(run(
+            &forge,
+            &forge,
+            &cfg,
+            State::default(),
+            (Mode::Actions(&own), Limits::default()),
+            now,
+        ))
+        .unwrap();
+        let lines = &report.lines;
+        // As in [`authored_repositories_take_turns`]: tracker#596's question.
+        assert_eq!(report.failures, 1, "pass {pass}: {lines:?}");
+        assert!(
+            !(lines.iter()).any(|l| l.starts_with("follow error") || l.starts_with("epics error")),
+            "pass {pass}: {lines:?}"
+        );
+        let line = "authored: 4 repositories with the bot's open pull requests, 4 not followed, 2 of them this pass, 1 prioritized";
+        assert!(lines.iter().any(|l| l == line), "pass {pass}: {lines:?}");
+        let first = format!("authored: first: {NAMED}");
+        assert!(lines.contains(&first), "pass {pass}: {lines:?}");
+        assert!(
+            (lines.iter()).any(|l| l.starts_with("authored: 3 live epics name ")),
+            "pass {pass}: {lines:?}"
+        );
+        let pulls = |repo: &str| format!("{API_ROOT}repos/{repo}/pulls?state=open&per_page=100");
+        let read = read.borrow();
+        assert!(read.contains(&pulls(NAMED)), "pass {pass}: {read:?}");
+        let this: Vec<&str> = (rotating.iter().copied())
+            .filter(|repo| read.contains(&pulls(repo)))
+            .collect();
+        assert_eq!(this.len(), 1, "pass {pass}: {this:?}");
+        swept.extend(this);
+        // Nothing for a next pass to read: none is kept.
+        assert_eq!(report.state.unwrap().authored_cursor, None, "pass {pass}");
+    }
+    assert_eq!(swept, BTreeSet::from(rotating), "{swept:?}");
+}
+
+/// Without `state`, the intake's and maintain's losses between passes are
+/// said, never `authored`'s, which needs none; with it, nothing is.
+#[test]
+fn stateless_losses_name_what_needs_state() {
+    let maintain = json!({"repos": {"sinceDays": 90, "min": 3, "max": 2}, "share": 0.2,
+        "hourUtc": 9, "digest": {"repository": "cgwalters-forge/bot-ops", "issue": 9}});
+    for (settings, expected) in [
+        (json!({"authored": 3}), &[][..]),
+        (json!({"notifications": true}), &["intake_refused"]),
+        (json!({"maintain": maintain}), &["(maintain)"]),
+        (
+            json!({"notifications": true, "maintain": maintain, "authored": 3}),
+            &["intake_waiting", "(maintain)"],
+        ),
+        (
+            json!({"notifications": true, "maintain": maintain, "state": ".state/poll.json"}),
+            &[],
+        ),
+    ] {
+        let mut settings = settings;
+        settings["pr"] = json!({"fixPools": ["claude"]});
+        let lost = config(settings.clone()).stateless_losses();
+        assert_eq!(lost.len(), expected.len(), "{settings}: {lost:?}");
+        for (said, word) in lost.iter().zip(expected) {
+            assert!(said.contains(word), "{settings}: {said}");
+        }
+    }
+}
+
+/// Stage 2 follows first the repositories this pass's live epics name, read
+/// ahead of stage 3, which reads them no more: those named in an epic's body
+/// as `OWNER/REPO#N` or by a link, but not a repository named only in prose.
+/// With `authored` unset it reads nothing ahead.
 #[test]
 fn live_epics_name_the_authored_priority() {
-    // The recorded open epics, tracker#596's body naming more.
-    let recorded = replay();
-    let variables = json!({"owner": "cgwalters-forge", "name": "tracker", "label": EPIC_LABEL,
-        "field": "Priority", "first": epics::EPICS_PER_PAGE, "cursor": null});
-    let request = graphql_key(epics::EPICS_QUERY, &variables);
-    let mut listing = (recorded.requests.iter())
-        .find(|e| e["request"] == request)
-        .unwrap()["answer"]
-        .clone();
-    let nodes = listing
-        .pointer_mut("/data/repository/issues/nodes")
-        .unwrap();
-    let epic = (nodes.as_array_mut().unwrap().iter_mut())
-        .find(|n| n["number"] == 596)
-        .unwrap();
-    epic["body"] = json!(format!(
+    let body = format!(
         "Follow {AUTHORED_NEXT}#1 closely, see https://github.com/Upstream/Thing/pull/2. \
          Not ostree PR 3690, nor https://api.github.com/repos/o/api."
-    ));
+    );
+    let found = [
+        (AUTHORED_NEXT, 1),
+        (AUTHORED_REPO, 9),
+        ("Upstream/Thing", 2),
+        ("ostreedev/ostree", 3690),
+        ("o/api", 1),
+        ("cgwalters-forge/agent-board", 1),
+    ];
     for authored in [true, false] {
         let mut forge = authored_forge();
-        forge.replay.requests.retain(|e| e["request"] != request);
-        (forge.replay.requests).push(json!({"request": request, "answer": listing}));
+        epics_naming(&mut forge, &body);
+        forge.replay.requests.retain(|e| {
+            !text(&e["request"], "/get").contains("/search/issues?q=author%3Acgwalters-bot")
+        });
+        for (url, link, body) in authored_search(&[&found]) {
+            forge.replay.requests.push(json!({"request": {"get": url},
+                "answer": {"status": 200, "link": link, "body": body}}));
+        }
+        for repo in [
+            "Upstream/Thing",
+            "ostreedev/ostree",
+            "o/api",
+            "cgwalters-forge/agent-board",
+        ] {
+            quiet(&mut forge, repo);
+        }
         let mut settings = json!({"wip": 0, "pr": {"fixPools": ["claude"]}});
         match authored {
             true => settings["authored"] = json!(1),
@@ -14081,26 +14234,27 @@ fn live_epics_name_the_authored_priority() {
         }
         let report = preview(&config(settings), &forge.replay);
         let lines = &report.lines;
-        assert!(
-            lines.contains(&"epics: 3 live of 3 open in cgwalters-forge/tracker".to_owned()),
-            "{lines:?}"
-        );
-        let state = report.state.unwrap();
+        let listed = "epics: 3 live of 3 open in cgwalters-forge/tracker".to_owned();
+        assert!(lines.contains(&listed), "{lines:?}");
+        // Stage 2's line comes before stage 3's, from the one listing.
+        let listing = lines.iter().position(|l| l == &listed).unwrap();
+        let early = lines
+            .iter()
+            .position(|l| l.starts_with("authored: 3 live epics name "));
+        assert_eq!(early.is_some(), authored, "{lines:?}");
         if !authored {
-            assert_eq!(state.authored_priority, Vec::<String>::new());
             continue;
         }
-        let named = &state.authored_priority;
-        for repo in [AUTHORED_NEXT, "upstream/thing"] {
-            assert!(named.contains(&repo.to_owned()), "{repo}: {named:?}");
-        }
-        for repo in ["ostreedev/ostree", "o/api", "repos/o"] {
-            assert!(!named.contains(&repo.to_owned()), "{repo}: {named:?}");
-        }
-        // The sub-issues' repositories: tracker#890's are in agent-board.
+        assert!(early < Some(listing), "{lines:?}");
+        assert_eq!(report.failures, 0, "{lines:?}");
+        // tracker#890's open sub-issues are in agent-board: named too.
+        let first = format!(
+            "authored: first: cgwalters-forge/agent-board, {AUTHORED_NEXT}, Upstream/Thing"
+        );
+        assert!(lines.contains(&first), "{lines:?}");
         assert!(
-            named.contains(&"cgwalters-forge/agent-board".to_owned()),
-            "{named:?}"
+            lines.contains(&"authored: 6 repositories with the bot's open pull requests, 6 not followed, 4 of them this pass, 3 prioritized".to_owned()),
+            "{lines:?}"
         );
     }
 }

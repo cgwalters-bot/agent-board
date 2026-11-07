@@ -108,7 +108,12 @@ GitHub will always refuse (HTTP 404 or 410, such as an issue in a repository
 whose issues are disabled) leaves the direction it was for to a person, the
 line its receipt: the poll state's `intake_refused` records those comment IDs
 (the newest 100), so neither the search's overlap nor a later unrelated update
-of the thread tries them again, while new direction there still is. A thread
+of the thread tries them again, while new direction there still is. Without
+`state` both that record and the waiting threads below are lost each pass:
+the search starts from its two-day lookback, a waiting thread is retried only
+while it finds it, and refused direction is tried again each time it does.
+The pass says so on stderr once a pass (`warning: no state in …`), as it does
+for `maintain`, which then derives its repositories again each pass. A thread
 the pass is not done with (no matching fork, a cap, any other error, including
 a 422, which GitHub also answers for a temporary spam restriction, a pending
 claim) does not hold the time cursor: it is kept in the poll state, up
@@ -1587,9 +1592,16 @@ A pass captures one clock and performs these stages in order:
     as those in `follow`. Each pass searches `author:BOT is:pr is:open`, up
     to 3 pages of 100, leaving out archived repositories. N bounds what they
     spend of the poll's one request budget, which `follow` needs too: the
-    repositories not already followed take turns, N a pass, in sorted order
-    from a cursor (`authored_cursor`) that only an applying pass moves, as
-    with `repositoriesPerPass`. One out of its turn counts as undecided, so
+    repositories not already followed take turns, N a pass, in sorted order.
+    Without `state`, as the hosted pass runs, the turn is the pass's clock:
+    each 10-minute slot the next N, wrapping around, so any ceil(M/N)
+    consecutive slots sweep all M, with nothing kept: as many passes at the
+    hosted interval of 10 minutes (`pass next --wait-minutes 10`). A late
+    pass skips a window for one round; a longer interval that is a multiple
+    of the slot could skip some for good, so keep the two equal. The
+    rotating set changes as pull requests open and close and as the
+    priority set moves. With `state`, it is a cursor (`authored_cursor`) that only
+    an applying pass moves, as with `repositoriesPerPass`. One out of its turn counts as undecided, so
     what the last pass held there is kept. Ahead of that rotation, and in
     addition to its N, each pass first follows the repositories that matter
     now, at most 10: those the live epics name, in an epic's body as
@@ -1600,13 +1612,18 @@ A pass captures one clock and performs these stages in order:
     fork so named, so an epic naming `ORG/ostree#5` puts `ostreedev/ostree`
     first, even when that fork has issues disabled and its upstream's
     direction is staged in `dispatchRepo` (an epic naming `dispatchRepo`
-    puts no upstream first). Stage 3 reads the epics after stage 2 has followed, so these
-    names are kept in the poll state (`authored_priority`) and take effect
-    from the next pass; a pass that read the live epics replaces them. No
-    request is added for them: the epics' bodies come with the stage 3
-    listing that is read anyway. Its line is `authored: F repositories
+    puts no upstream first). Stage 2 reads stage 3's listing of the open
+    epics for this, in the same pass, and stage 3 takes that listing rather
+    than read it again, so no request is added; its requests still count to
+    stage 3, which therefore sees the epics as they were before stage 2's
+    merges (a sub-issue a merge closes counts from the next pass). That line is `authored: E live epics name R repositories (Q
+    requests, stage 3's listing read early)`, or, where the listing fails,
+    `authored: the live epics could not be read, so none is prioritized: …`
+    and stage 3 reports the failure. The waiting threads are kept only with
+    `state`. Its line is `authored: F repositories
     with the bot's open pull requests, M not followed, K of them this
-    pass, P prioritized`, K counting the P. A repository only the search added is treated as in
+    pass, P prioritized`, K counting the P, followed where P is not 0 by
+    `authored: first: REPO, …`. A repository only the search added is treated as in
     `pr.noMerge`, as no one chose to let the pass merge there; only the
     bot's own pull requests are followed there, not `pr.mergeAuthors`'; and
     outside our own space it is written in as with `pr.ownSpaceOnly`, set

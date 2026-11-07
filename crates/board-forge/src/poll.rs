@@ -1513,12 +1513,6 @@ pub struct State {
     /// pass, not the poll, keeps, as `follow_cursor` is kept. Losing it only
     /// starts their round again.
     pub authored_cursor: Option<String>,
-    /// The pass's `authored`: the repositories, lower case, that the last
-    /// pass's live epics name, which the next pass's turn takes first
-    /// ([`crate::pass::authored::turn`]). Stage 3 reads them after stage 2
-    /// has followed, so they wait a pass here; losing them only takes away
-    /// that precedence for a pass.
-    pub authored_priority: Vec<String>,
 }
 
 impl State {
@@ -1544,6 +1538,7 @@ impl State {
                     "notify_before",
                     "maintain",
                     "authored_cursor",
+                    // Read no more: the pass reads the live epics itself.
                     "authored_priority"
                 ]
                 .contains(&key.as_str()),
@@ -1659,19 +1654,6 @@ impl State {
         };
         let follow_cursor = cursor("follow_cursor")?;
         let authored_cursor = cursor("authored_cursor")?;
-        let authored_priority: Vec<String> = match object.get("authored_priority") {
-            None => Vec::new(),
-            Some(named) => serde_json::from_value(named.clone())
-                .context("poll state authored_priority is not a list of strings")?,
-        };
-        ensure!(
-            authored_priority.len() <= POLL_REPOSITORY_LIMIT,
-            "poll state authored_priority holds over {POLL_REPOSITORY_LIMIT} repositories"
-        );
-        for repo in &authored_priority {
-            validate_repository(repo)
-                .with_context(|| format!("poll state authored_priority entry {repo:?}"))?;
-        }
         let notify_since = time("notify_since")?;
         let notify_before = time("notify_before")?;
         let maintain = (object.get("maintain"))
@@ -1690,7 +1672,6 @@ impl State {
             notify_before,
             maintain,
             authored_cursor,
-            authored_priority,
         })
     }
 
@@ -1729,9 +1710,6 @@ impl State {
         }
         if let Some(cursor) = &self.authored_cursor {
             state["authored_cursor"] = cursor.as_str().into();
-        }
-        if !self.authored_priority.is_empty() {
-            state["authored_priority"] = json!(self.authored_priority);
         }
         state
     }
@@ -8451,7 +8429,6 @@ pub fn run_capped<R: Rest, G: Transport>(
         notify_before,
         maintain: None,
         authored_cursor: None,
-        authored_priority: Vec::new(),
     };
     Ok(outcome)
 }
@@ -11797,12 +11774,14 @@ mod tests {
         let mut with_cursor = good.clone();
         with_cursor["follow_cursor"] = json!("o/r");
         with_cursor["authored_cursor"] = json!("u/r");
-        with_cursor["authored_priority"] = json!(["u/p", "u/r"]);
         let state = State::from_json(&with_cursor).unwrap();
         assert_eq!(state.follow_cursor.as_deref(), Some("o/r"));
         assert_eq!(state.authored_cursor.as_deref(), Some("u/r"));
-        assert_eq!(state.authored_priority, ["u/p", "u/r"]);
         assert_eq!(state.to_json(), with_cursor);
+        // An older cache's `authored_priority` is accepted and dropped.
+        let mut older = with_cursor.clone();
+        older["authored_priority"] = json!(["u/p", "u/r"]);
+        assert_eq!(State::from_json(&older).unwrap().to_json(), with_cursor);
         let mut with_notify = good.clone();
         with_notify["notify_since"] = json!("2026-10-16T11:50:00Z");
         with_notify["notify_before"] = json!("2026-10-16T08:00:00Z");
@@ -11826,12 +11805,6 @@ mod tests {
             ("follow_cursor", json!("not a repository")),
             ("follow_cursor", json!(1)),
             ("authored_cursor", json!("not a repository")),
-            ("authored_priority", json!("u/r")),
-            ("authored_priority", json!(["not a repository"])),
-            (
-                "authored_priority",
-                json!(vec!["u/r"; POLL_REPOSITORY_LIMIT + 1]),
-            ),
             ("notify_since", json!("yesterday")),
             ("notify_since", json!(1)),
             ("notify_before", json!(true)),
