@@ -898,6 +898,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let view = view::snapshot(at, pass, previous, usage.as_ref(), flights.as_deref());
             snapshot.pass_view = Some(view);
         }
+        if self.apply && self.config.holds.as_ref().is_some_and(|h| h.today) {
+            snapshot.today = Some(self.today(snapshot.pass.overhead.as_ref()));
+        }
         snapshot
     }
 }
