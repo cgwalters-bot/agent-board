@@ -175,6 +175,25 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     #[test]
+    fn cost_examples_are_rendered_and_parse() {
+        let reference = super::markdown(crate::Cli::command());
+        for example in [
+            "agent-board cost --config agent-board.json --date 2026-10-28",
+            "agent-board cost --config agent-board.json --date 2026-10-28 --human",
+            "agent-board cost --config agent-board.json --date 2026-10-28 --cache cost-cache",
+        ] {
+            assert!(reference.contains(example), "missing example: {example}");
+            let cli = crate::Cli::try_parse_from(example.split_whitespace()).unwrap();
+            let crate::Command::Cost(args) = cli.command else {
+                panic!("expected cost")
+            };
+            assert_eq!(args.date, "2026-10-28");
+            assert_eq!(args.human, example.ends_with("--human"));
+            assert_eq!(args.cache.is_some(), example.contains("--cache"));
+        }
+    }
+
+    #[test]
     fn broker_examples_are_rendered_and_parse() {
         let reference = super::markdown(crate::Cli::command());
         for example in [

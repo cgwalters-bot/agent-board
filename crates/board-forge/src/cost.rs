@@ -77,16 +77,22 @@ const OTHER: &str = "other";
 /// What a summary that names no model counts under.
 const UNKNOWN_MODEL: &str = "unknown";
 
-/// One model's list prices, in US dollars per million tokens.
+/// One model's list prices, in US dollars per million tokens, each finite
+/// and between 0 and 10,000 inclusive. All three fields are required.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Price {
+    /// Price for input and cache-write tokens, treated as disjoint counts.
     pub input: f64,
+    /// Price for cache-read tokens.
     pub cached_input: f64,
+    /// Price for output tokens.
     pub output: f64,
 }
 
-/// The configuration's `prices`, by model.
+/// The configuration's `prices`, keyed by the model name in a run summary.
+/// An absent model is unpriced (null USD), not free. Defaults to an empty
+/// map when the pass configuration omits `prices`.
 pub type Prices = BTreeMap<String, Price>;
 
 pub fn check_prices(prices: &Prices) -> Result<()> {
