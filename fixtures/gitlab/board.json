@@ -1,0 +1,134 @@
+{
+  "schema": "board-snapshot/v1",
+  "project": "https://gitlab.example/",
+  "clock": "2026-10-20T00:00:00Z",
+  "coverage": {
+    "complete": true,
+    "observed_at": "2026-10-20T00:00:00Z"
+  },
+  "items": [
+    {
+      "identity": {
+        "host": "gitlab.example",
+        "repository": "sample/board",
+        "number": 1
+      },
+      "assignment": null,
+      "title": "Read the board from labels",
+      "state": "open",
+      "state_reason": null,
+      "status": null,
+      "priority": "P1",
+      "turn": "Coordinator",
+      "fields_complete": true,
+      "evidence": [
+        {
+          "url": "https://gitlab.example/sample/board/-/issues/1",
+          "observed_at": "2026-10-20T00:00:00Z",
+          "provenance": "GitLab API"
+        }
+      ],
+      "content_kind": "issue",
+      "labels": [
+        "agent-board",
+        "priority/P1",
+        "turn/coordinator"
+      ],
+      "assignees": [
+        "operator"
+      ],
+      "timestamps": {
+        "closedAt": null,
+        "createdAt": "2026-10-01T09:00:00Z",
+        "updatedAt": "2026-10-02T10:00:00Z"
+      },
+      "fields": {
+        "Result": "https://gitlab.example/sample/board/-/merge_requests/9",
+        "Run": "https://gitlab.example/sample/runner/-/pipelines/41"
+      }
+    },
+    {
+      "identity": {
+        "host": "gitlab.example",
+        "repository": "sample/board",
+        "number": 2
+      },
+      "assignment": null,
+      "title": "Two priorities set by hand",
+      "state": "open",
+      "state_reason": null,
+      "status": null,
+      "priority": null,
+      "turn": "Operator",
+      "fields_complete": false,
+      "field_errors": [
+        "2 priority/ labels"
+      ],
+      "evidence": [
+        {
+          "url": "https://gitlab.example/sample/board/-/issues/2",
+          "observed_at": "2026-10-20T00:00:00Z",
+          "provenance": "GitLab API"
+        }
+      ],
+      "content_kind": "issue",
+      "labels": [
+        "agent-board",
+        "priority/P2",
+        "priority/P3",
+        "turn/operator",
+        "blocked/upstream"
+      ],
+      "assignees": [],
+      "timestamps": {
+        "closedAt": null,
+        "createdAt": "2026-10-03T09:00:00Z",
+        "updatedAt": "2026-10-03T09:00:00Z"
+      },
+      "fields": {
+        "Blocked": [
+          "upstream"
+        ]
+      }
+    },
+    {
+      "identity": {
+        "host": "gitlab.example",
+        "repository": "sample/board",
+        "number": 3
+      },
+      "assignment": null,
+      "title": "Closed without a priority",
+      "state": "closed",
+      "state_reason": null,
+      "status": null,
+      "priority": null,
+      "turn": "Worker",
+      "fields_complete": false,
+      "field_errors": [
+        "no priority/ label"
+      ],
+      "evidence": [
+        {
+          "url": "https://gitlab.example/sample/board/-/issues/3",
+          "observed_at": "2026-10-20T00:00:00Z",
+          "provenance": "GitLab API"
+        }
+      ],
+      "content_kind": "issue",
+      "labels": [
+        "agent-board",
+        "turn/rust-worker"
+      ],
+      "assignees": [],
+      "timestamps": {
+        "closedAt": "2026-10-05T09:00:00Z",
+        "createdAt": "2026-10-04T09:00:00Z",
+        "updatedAt": "2026-10-05T09:00:00Z"
+      },
+      "fields": {}
+    }
+  ],
+  "fields": [],
+  "status_field_absent": true
+}

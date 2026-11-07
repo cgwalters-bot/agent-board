@@ -66,7 +66,7 @@ const PAGE_LIMIT: &str = "50";
 // partial snapshot; it also stops a server that ignores `page` from looping.
 const SNAPSHOT_REQUEST_LIMIT: usize = 1_000;
 /// The GitHub token variables, which must not be sent to another host.
-const GITHUB_TOKEN_ENVS: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+pub(crate) const GITHUB_TOKEN_ENVS: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
 /// Names that resolve only inside a cluster or local network, so plain HTTP
 /// to them does not warn.
 const LOCAL_NAME_SUFFIXES: [&str; 4] = [".svc", ".cluster.local", ".local", ".internal"];
@@ -78,6 +78,7 @@ const LOCAL_NAME_SUFFIXES: [&str; 4] = [".svc", ".cluster.local", ".local", ".in
 pub enum Board {
     Github {},
     Forgejo(Config),
+    Gitlab(crate::gitlab::Config),
 }
 
 impl Board {
@@ -87,8 +88,10 @@ impl Board {
             return Ok(Self::Github {});
         };
         let board = Self::deserialize(board).context("decode board config")?;
-        if let Self::Forgejo(config) = &board {
-            config.validate()?;
+        match &board {
+            Self::Forgejo(config) => config.validate()?,
+            Self::Gitlab(config) => config.validate()?,
+            Self::Github {} => {}
         }
         Ok(board)
     }
@@ -199,18 +202,68 @@ impl Naming {
     }
 }
 
+/// The instance URL every forge config requires: HTTP(S), no credentials,
+/// query or fragment. Shared so each backend refuses the same shapes.
+pub(crate) fn validate_instance_url(url: &Url) -> Result<()> {
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "board url must be a canonical HTTP(S) URL without credentials, query or fragment"
+    );
+    Ok(())
+}
+
+/// A membership label every label-scoped backend can filter on without the
+/// filter widening a field scope.
+pub(crate) fn validate_membership_label(label: &str) -> Result<()> {
+    // The issues API takes a comma-separated label list.
+    // A field label would also count towards its own scope.
+    ensure!(
+        !label.trim().is_empty()
+            && !label.contains(',')
+            && ![PRIORITY_SCOPE, TURN_SCOPE, BLOCKED_SCOPE, STATUS_SCOPE]
+                .iter()
+                .any(|scope| label.starts_with(scope)),
+        "invalid board membership label"
+    );
+    Ok(())
+}
+
+/// A warning for a plain `http://` URL to a host that is not loopback, a
+/// private address or a cluster or local name: anyone on the path to it can
+/// read the token sent with each request.
+pub(crate) fn plain_http_warning(url: &Url) -> Option<String> {
+    if url.scheme() != "http" {
+        return None;
+    }
+    let local = match url.host()? {
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        url::Host::Ipv6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+        url::Host::Domain(name) => {
+            let name = name.trim_end_matches('.');
+            !name.contains('.')
+                || LOCAL_NAME_SUFFIXES
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        }
+    };
+    if local {
+        return None;
+    }
+    Some(format!(
+        "Warning: board url {url} is plain HTTP to a non-local host; the token is sent unencrypted"
+    ))
+}
+
 impl Config {
     pub(crate) fn validate(&self) -> Result<()> {
-        let url = &self.url;
-        ensure!(
-            matches!(url.scheme(), "http" | "https")
-                && url.host_str().is_some()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            "board url must be a canonical HTTP(S) URL without credentials, query or fragment"
-        );
+        validate_instance_url(&self.url)?;
         ensure!(
             !self.token_env.is_empty() && !GITHUB_TOKEN_ENVS.contains(&self.token_env.as_str()),
             "board tokenEnv must name a Forgejo token variable, not empty or a GitHub token"
@@ -228,16 +281,7 @@ impl Config {
             );
         }
         if let Membership::Label(label) = &self.membership {
-            // The issues API takes a comma-separated label list.
-            // A field label would also count towards its own scope.
-            ensure!(
-                !label.trim().is_empty()
-                    && !label.contains(',')
-                    && ![PRIORITY_SCOPE, TURN_SCOPE, BLOCKED_SCOPE, STATUS_SCOPE]
-                        .iter()
-                        .any(|scope| label.starts_with(scope)),
-                "invalid board membership label"
-            );
+            validate_membership_label(label)?;
         }
         ensure!(
             self.recorders.iter().all(|id| *id > 0),
@@ -253,29 +297,7 @@ impl Config {
     /// a private address or a cluster or local name: anyone on the path to
     /// it can read the token sent with each request.
     pub fn plain_http_warning(&self) -> Option<String> {
-        if self.url.scheme() != "http" {
-            return None;
-        }
-        let local = match self.url.host()? {
-            url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-            url::Host::Ipv6(ip) => {
-                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
-            }
-            url::Host::Domain(name) => {
-                let name = name.trim_end_matches('.');
-                !name.contains('.')
-                    || LOCAL_NAME_SUFFIXES
-                        .iter()
-                        .any(|suffix| name.ends_with(suffix))
-            }
-        };
-        if local {
-            return None;
-        }
-        Some(format!(
-            "Warning: board url {} is plain HTTP to a non-local host; the token is sent unencrypted",
-            self.url
-        ))
+        plain_http_warning(&self.url)
     }
 
     /// The instance URL as a directory, so joins keep a subpath install.
@@ -760,7 +782,7 @@ fn item(
         if comments.len() as u64 != count {
             errors.push(format!("{} comments read, {count} counted", comments.len()));
         }
-        for (name, value) in markers(comments, &config.recorders, &mut errors)? {
+        for (name, value) in markers(comments, "user", &config.recorders, &mut errors)? {
             fields.insert(name.to_owned(), value.into());
         }
     }
@@ -818,7 +840,7 @@ fn item(
 
 /// The value of the one label in `scope`, or an error when there are zero,
 /// several, or one whose value `parse` does not know.
-fn exclusive<V>(
+pub(crate) fn exclusive<V>(
     labels: &[String],
     scope: &str,
     errors: &mut Vec<String>,
@@ -849,9 +871,11 @@ fn exclusive<V>(
 }
 
 /// The newest recorder's Run and Result markers. A malformed newest marker
-/// is an error rather than falling back to an older one.
-fn markers(
+/// is an error rather than falling back to an older one. `author_key` names
+/// the author object, `user` on Forgejo and `author` on GitLab.
+pub(crate) fn markers(
     comments: &[Value],
+    author_key: &str,
     recorders: &[u64],
     errors: &mut Vec<String>,
 ) -> Result<BTreeMap<&'static str, String>> {
@@ -863,7 +887,7 @@ fn markers(
         ensure!(seen.insert(id), "comment {id} listed twice");
         // Forgejo's ghost (deleted) and Actions users have negative ids, so
         // anything but a recorder's id is skipped rather than refused.
-        if !comment["user"]["id"]
+        if !comment[author_key]["id"]
             .as_u64()
             .is_some_and(|author| recorders.contains(&author))
         {
@@ -875,7 +899,11 @@ fn markers(
             edited = true;
             errors.push(format!("comment {id}: edited recorder record"));
         }
-        let first = text(comment, "body")?.lines().next().unwrap_or_default();
+        // Neutral wording: GitLab's reader shares this scan.
+        let body = comment["body"]
+            .as_str()
+            .with_context(|| format!("comment {id} is missing a body"))?;
+        let first = body.lines().next().unwrap_or_default();
         let Some(inner) = first
             .trim()
             .strip_prefix("<!--")
@@ -925,7 +953,7 @@ pub(crate) fn unedited(comment: &Value) -> bool {
     })
 }
 
-fn parse_priority(value: &str) -> Option<Priority> {
+pub(crate) fn parse_priority(value: &str) -> Option<Priority> {
     serde_json::from_value(value.into()).ok()
 }
 
@@ -1153,7 +1181,7 @@ mod tests {
             ),
         ] {
             let mut errs = vec![];
-            let fields = markers(&comments, &[BOT], &mut errs).unwrap();
+            let fields = markers(&comments, "user", &[BOT], &mut errs).unwrap();
             assert_eq!(
                 fields
                     .get("Run")
@@ -1166,6 +1194,7 @@ mod tests {
         assert!(
             markers(
                 &[comment(1, BOT, run), comment(1, BOT, run)],
+                "user",
                 &[BOT],
                 &mut errs
             )
@@ -1186,7 +1215,8 @@ mod tests {
             comments[2]["created_at"] = created;
             comments[2]["updated_at"] = updated;
             let mut errors = vec![];
-            let fields = markers(comments.as_array().unwrap(), &[BOT], &mut errors).unwrap();
+            let fields =
+                markers(comments.as_array().unwrap(), "user", &[BOT], &mut errors).unwrap();
             assert!(!fields.contains_key("Run"));
             assert!(
                 errors
@@ -1205,7 +1235,7 @@ mod tests {
             comments[2]["updated_at"] = "2026-10-03T00:00:00Z".into();
             let mut errors = vec![];
             assert!(
-                markers(comments.as_array().unwrap(), &[BOT], &mut errors)
+                markers(comments.as_array().unwrap(), "user", &[BOT], &mut errors)
                     .unwrap()
                     .is_empty()
             );
@@ -1591,7 +1621,8 @@ mod tests {
                 json!({"board": {"forge": "github", "url": "https://x.example/"}}),
                 false,
             ),
-            (json!({"board": {"forge": "gitlab"}}), false),
+            // An unknown forge is refused, not treated as GitHub.
+            (json!({"board": {"forge": "gitea"}}), false),
             (
                 json!({"board": {"forge": "forgejo", "url": "https://forge.example/", "repositories": ["sample/board"], "membership": "open"}}),
                 true,

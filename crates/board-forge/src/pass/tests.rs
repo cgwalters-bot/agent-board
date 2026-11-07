@@ -21105,3 +21105,13 @@ fn settled_890(replay: &mut Replay) {
     subs["totalCount"] = nodes.len().into();
     subs["nodes"] = nodes.into();
 }
+
+#[test]
+fn gitlab_board_is_refused() {
+    // Reads-only slice: the pass has no GitLab board yet.
+    let error = Config::parse(
+        r#"{"board": {"forge": "gitlab", "url": "https://gitlab.example/", "repositories": ["sample/board"], "membership": "open"}}"#,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("not GitLab"), "{error:#}");
+}

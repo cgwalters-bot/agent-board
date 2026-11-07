@@ -847,6 +847,10 @@ impl<'de> Deserialize<'de> for BoardConfig {
                 crate::forgejo::Board::Github {} => Err(de::Error::custom(
                     "pass GitHub board uses owner, project and priorityField without a forge tag",
                 )),
+                // Reads-only slice: the pass has no GitLab board yet.
+                crate::forgejo::Board::Gitlab(_) => Err(de::Error::custom(
+                    "the pass supports GitHub and Forgejo boards, not GitLab",
+                )),
             }
         } else {
             serde_json::from_value(value)

@@ -18,6 +18,7 @@ pub mod epic;
 pub mod epic_apply;
 pub mod forgejo;
 pub mod github;
+pub mod gitlab;
 pub mod input;
 pub mod items;
 pub mod org_status;
