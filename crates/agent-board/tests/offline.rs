@@ -1104,6 +1104,93 @@ fn forgejo_snapshot_table() {
     }
 }
 
+/// The snapshot board-forge's GitLab reader makes of the issue listing and
+/// note fixtures (its unit test keeps the two in step).
+#[test]
+fn gitlab_snapshot_table() {
+    let fixture = format!(
+        "{}/../../fixtures/gitlab/board.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    for (args, expected) in [
+        (
+            vec!["item", "list"],
+            "ITEM\tSTATUS\tPRIORITY\tTURN\tTITLE\n\
+             sample/board#1\t-\tP1\tCoordinator\tRead the board from labels\n\
+             sample/board#2\t-\t-\tOperator\tTwo priorities set by hand\n\
+             sample/board#3\t-\t-\tWorker\tClosed without a priority\n",
+        ),
+        (
+            vec![
+                "item",
+                "list",
+                "--priority",
+                "P1",
+                "--json",
+                "number",
+                "--jq",
+                ".[].number",
+            ],
+            "1\n",
+        ),
+        (
+            vec![
+                "item", "list", "--state", "closed", "--json", "url", "--jq", ".[].url",
+            ],
+            // The JSON url is the synthesized one, as for Forgejo; the
+            // exact per-forge link is the item's evidence URL.
+            "https://gitlab.example/sample/board/issues/3\n",
+        ),
+        (
+            vec![
+                "item",
+                "view",
+                "sample/board#1",
+                "--hostname",
+                "gitlab.example",
+                "--json",
+                "fields",
+                "--jq",
+                ".fields.Run",
+            ],
+            "https://gitlab.example/sample/runner/-/pipelines/41\n",
+        ),
+        (
+            vec![
+                "reconcile",
+                "plan",
+                "--json",
+                "actions",
+                "--jq",
+                ".actions | length",
+            ],
+            "0\n",
+        ),
+        (
+            vec![
+                "reconcile",
+                "plan",
+                "--json",
+                "diagnostics",
+                "--jq",
+                ".diagnostics | to_entries[] | \"\\(.key) \\(.value)\"",
+            ],
+            "sample/board#2 missing_data: incomplete fields: 2 priority/ labels\n\
+             sample/board#3 missing_data: incomplete fields: no priority/ label\n",
+        ),
+    ] {
+        let output = command()
+            .args(&args)
+            .args(["--snapshot", &fixture])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(String::from_utf8(output).unwrap(), expected, "{args:?}");
+    }
+}
+
 #[test]
 fn board_config_cli_table() {
     let dir = std::env::temp_dir().join(format!("agent-board-board-{}", std::process::id()));
@@ -1122,10 +1209,20 @@ fn board_config_cli_table() {
     .unwrap();
     let github = dir.join("github.json");
     std::fs::write(&github, r#"{"board":{"forge":"github"}}"#).unwrap();
-    let (forgejo, invalid, github) = (
+    let gitlab = dir.join("gitlab.json");
+    std::fs::write(
+        &gitlab,
+        r#"{"board":{"forge":"gitlab","url":"https://gitlab.example/","tokenEnv":"AGENT_BOARD_TEST_GITLAB_TOKEN","repositories":["sample/board"],"membership":"open"}}"#,
+    )
+    .unwrap();
+    let unknown = dir.join("unknown.json");
+    std::fs::write(&unknown, r#"{"board":{"forge":"gitea"}}"#).unwrap();
+    let (forgejo, invalid, github, gitlab, unknown) = (
         forgejo.to_str().unwrap(),
         invalid.to_str().unwrap(),
         github.to_str().unwrap(),
+        gitlab.to_str().unwrap(),
+        unknown.to_str().unwrap(),
     );
     // Plain HTTP warns once on stderr, and only for a host outside the cluster.
     for (url, warnings) in [
@@ -1161,6 +1258,34 @@ fn board_config_cli_table() {
             vec!["snapshot", "create", "--board-config", forgejo],
             4,
             "AGENT_BOARD_TEST_FORGEJO_TOKEN",
+        ),
+        // The GitLab read board refuses the same way, and refuses every
+        // write command and intake outright.
+        (
+            vec!["snapshot", "create", "--board-config", gitlab],
+            4,
+            "AGENT_BOARD_TEST_GITLAB_TOKEN",
+        ),
+        (
+            vec!["reconcile", "plan", "--board-config", gitlab],
+            4,
+            "AGENT_BOARD_TEST_GITLAB_TOKEN",
+        ),
+        (
+            vec!["item", "add", "sample/board#1", "--board-config", gitlab],
+            1,
+            "only read by",
+        ),
+        (
+            vec!["intake", "--board-config", gitlab, "--json"],
+            1,
+            "only read by",
+        ),
+        // An unknown forge is a decode failure, not GitHub.
+        (
+            vec!["item", "list", "--board-config", unknown],
+            1,
+            "unknown variant",
         ),
         (
             vec!["reconcile", "plan", "--board-config", forgejo],
@@ -1210,6 +1335,7 @@ fn board_config_cli_table() {
     ] {
         let output = command()
             .env_remove("AGENT_BOARD_TEST_FORGEJO_TOKEN")
+            .env_remove("AGENT_BOARD_TEST_GITLAB_TOKEN")
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
             .args(&args)

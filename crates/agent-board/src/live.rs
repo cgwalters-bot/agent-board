@@ -33,6 +33,9 @@ pub fn error_exit_code(error: &anyhow::Error) -> i32 {
         || error
             .downcast_ref::<board_forge::forgejo::AuthenticationRequired>()
             .is_some()
+        || error
+            .downcast_ref::<board_forge::gitlab::AuthenticationRequired>()
+            .is_some()
     {
         4
     } else if error.downcast_ref::<crate::deploy::Cancelled>().is_some() {

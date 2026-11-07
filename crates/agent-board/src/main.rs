@@ -489,34 +489,45 @@ fn github(cli: &Cli) -> Result<board_forge::github::GitHub<board_forge::github::
 }
 
 /// The board `--board-config` selects. Only the read commands accept a
-/// Forgejo one: it has no write path, and writes elsewhere assume GitHub.
+/// Forgejo or GitLab one: neither has a write path, and writes elsewhere
+/// assume GitHub.
 fn board(cli: &Cli) -> Result<board_forge::forgejo::Board> {
     let Some(path) = &cli.board_config else {
         return Ok(board_forge::forgejo::Board::Github {});
     };
     let board = board_forge::forgejo::Board::from_config(&supervise::read(path)?)?;
+    // The read set both non-GitHub forges share; GitLab also has no intake.
+    let reads_only = matches!(
+        cli.command,
+        Command::Snapshot { .. }
+            | Command::Project {
+                command: Project::View
+            }
+            | Command::Item {
+                command: Item::List(_) | Item::View { .. }
+            }
+            | Command::Reconcile { .. }
+    ) || matches!(
+        (&board, &cli.command),
+        (board_forge::forgejo::Board::Forgejo(_), Command::Intake(_))
+    );
     ensure!(
-        matches!(board, board_forge::forgejo::Board::Github {})
-            || matches!(
-                cli.command,
-                Command::Snapshot { .. }
-                    | Command::Intake(_)
-                    | Command::Project {
-                        command: Project::View
-                    }
-                    | Command::Item {
-                        command: Item::List(_) | Item::View { .. }
-                    }
-                    | Command::Reconcile { .. }
-            ),
-        "unsupported_capability: a Forgejo board is only read by snapshot create, project view, item list, item view and reconcile plan"
+        matches!(board, board_forge::forgejo::Board::Github {}) || reads_only,
+        "unsupported_capability: a Forgejo or GitLab board is only read by snapshot create, project view, item list, item view and reconcile plan"
     );
     Ok(board)
 }
 
 fn load(cli: &Cli, runtime: &Runtime) -> Result<Snapshot> {
     let policy = agent_policy(cli)?;
-    let live = if let board_forge::forgejo::Board::Forgejo(config) = board(cli)? {
+    let live = if let board_forge::forgejo::Board::Gitlab(config) = board(cli)? {
+        ensure!(
+            cli.owner.is_none() && cli.project.is_none(),
+            "a GitLab board is chosen by its config, not --owner or --project"
+        );
+        let transport = board_forge::gitlab::Client::from_env(&config)?;
+        Some(board_forge::gitlab::Gitlab { transport, config }.snapshot_with_policy(&policy)?)
+    } else if let board_forge::forgejo::Board::Forgejo(config) = board(cli)? {
         ensure!(
             cli.owner.is_none() && cli.project.is_none(),
             "a Forgejo board is chosen by its config, not --owner or --project"
@@ -565,9 +576,12 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
         cli.template.is_none(),
         "unsupported_capability: --template is not implemented"
     );
-    if let board_forge::forgejo::Board::Forgejo(config) = board(&cli)?
-        && let Some(warning) = config.plain_http_warning()
-    {
+    let warning = match board(&cli)? {
+        board_forge::forgejo::Board::Forgejo(config) => config.plain_http_warning(),
+        board_forge::forgejo::Board::Gitlab(config) => config.plain_http_warning(),
+        board_forge::forgejo::Board::Github {} => None,
+    };
+    if let Some(warning) = warning {
         eprintln!("{warning}");
     }
     match &cli.command {
