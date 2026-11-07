@@ -614,6 +614,10 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         self.report.maintain = cached.clone();
         match self.digest(maintain, cached, git_ref) {
             Ok(started) => started,
+            Err(error) if error.is::<ShareSpent>() => {
+                self.line("maintain: deferred to the next pass at its request share".into());
+                0
+            }
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("maintain error: {error:#}"));
@@ -748,6 +752,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 let dry = match self.public(repo) {
                     Ok(true) => None,
                     Ok(false) => Some(format!("{repo} is not public")),
+                    Err(error) if error.is::<ShareSpent>() => return Err(error),
                     Err(error) => Some(format!("cannot read whether {repo} is public: {error:#}")),
                 };
                 let public = dry.is_none();
@@ -808,8 +813,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     fn public_sources(&self, repos: &[String]) -> Result<()> {
         for repo in repos {
             // Do not include the name or transport error in public diagnostics.
+            let public = match self.public(repo) {
+                Err(error) if error.is::<ShareSpent>() => return Err(error),
+                result => result.unwrap_or(false),
+            };
             ensure!(
-                self.public(repo).unwrap_or(false),
+                public,
                 "a maintain source repository is nonpublic or unreadable"
             );
         }
@@ -882,6 +891,20 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         }) {
             self.line("maintain: a research plan already exists today; the digest waits".into());
             return Ok(None);
+        }
+        let bounds = self.client.bounds;
+        if self.config.reserve_scheduling {
+            // Defer before posting a plan, which would veto another attempt
+            // today. Once admitted, leave room for the whole start and its
+            // receipt, and let its reads finish like stage 4's starts.
+            let needed = START_REQUESTS + writes + WRITE_RESERVE;
+            if bounds.available() < needed {
+                self.line(format!(
+                    "budget: maintain stopped at its share; {needed} requests needed for a digest start and record"
+                ));
+                return Ok(None);
+            }
+            bounds.finishing.set(true);
         }
         self.caps.count(Kind::Dispatch);
         if !self.apply {

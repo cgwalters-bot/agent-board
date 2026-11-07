@@ -1763,7 +1763,7 @@ Stage 5 and the hold snapshot, which come after every start, spend what is left.
 no second fill-page budget.
 
 Stage 4 comes after the pull requests and the epics, so each of those stages
-reads only its share (agent-board#748): stage 2's reads leave 58% of the
+reads only its share (agent-board#748): by default, stage 2's reads leave 58% of the
 pass's requests (377) to the stages after it, and stage 3's leave 38% (247) to
 scheduling, Status and the holds, so stage 3 has at least 130. Stage 2 has at
 most 269, setup, usage and maintain included. A write, and a read of a start,
@@ -1784,6 +1784,24 @@ pull request leaves none out pass after pass. Stage 3 defers the live epics it
 has no share left for, its census included (`budget: epics stopped at its
 share`). A stage whose reads were refused by its share says so (`budget: STAGE
 stopped at its share`). None of these is a failure.
+
+The concrete failure `reserveScheduling: true` stops is a busy PR/maintain
+sweep or epic census leaving scheduling too few requests to start work with
+slots free and pools under pace. This GitHub-only option is off by default.
+It uses the same discovery-share mechanism: maintain and PR discovery leave
+80% of the pass request limit, and epic discovery leaves 60% (390 of 650),
+for scheduling and the later Status/holds stages. Unused requests remain
+available to later stages; neither the total limit nor mutation authority
+changes. The existing finish exceptions above still apply, so this is not a
+hard partition for writes or a guarantee of starts. A deferred maintain read
+keeps its cached state for the next pass, not a successful empty digest.
+Before posting a digest's plan, maintain also requires enough discovery
+headroom for the whole start and receipt; an admitted start may finish.
+Concurrency reads refused by an earlier stage's share are retried by later
+stages, not cached as pass-wide failures.
+
+Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set
+`reserveScheduling` to `true`. No caller settings are changed here.
 
 A 304 to a revalidated read (`If-None-Match` or `If-Modified-Since`) is not
 charged to the pass's requests, as GitHub does not count it against the rate

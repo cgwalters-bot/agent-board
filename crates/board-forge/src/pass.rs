@@ -94,6 +94,14 @@ pub(crate) const AFTER_PULL_REQUESTS: usize = 58;
 /// least the difference from [`AFTER_PULL_REQUESTS`], 130, enough to
 /// consider a live epic ([`START_REQUESTS`]).
 const AFTER_EPICS: usize = 38;
+
+/// Opt-in shares for busy passes: leave 60% for scheduling (390 requests),
+/// and another 20% for epics before that. These bound discovery, not a
+/// claim already under way.
+const SCHEDULE_SHARE: usize = 60;
+
+const EPICS_SHARE: usize = 20;
+
 /// 304s a pass does not charge to its budget: GitHub does not count them
 /// against the rate limit, so a revalidated read that answers from the cache
 /// is free, but only this many, so that they still bound a runaway loop.
@@ -521,6 +529,10 @@ pub struct Config {
     /// epics name, which it follows first, and never merges in those it
     /// adds ([`authored`]).
     pub authored: Option<usize>,
+    /// Off by default: keep a larger scheduling share before the maintain
+    /// and PR sweeps and epic discovery can consume it.
+    #[serde(default)]
+    pub reserve_scheduling: bool,
     #[serde(default)]
     pub work_repositories: Vec<String>,
     pub board: Option<BoardConfig>,
@@ -3054,12 +3066,32 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     if state.interval_seconds == 0 {
         state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
     }
-    bounds.enter(Stage::Maintain);
+    let after_epics = if config.reserve_scheduling {
+        SCHEDULE_SHARE
+    } else {
+        AFTER_EPICS
+    };
+    let after_pulls = if config.reserve_scheduling {
+        SCHEDULE_SHARE + EPICS_SHARE
+    } else {
+        AFTER_PULL_REQUESTS
+    };
+    bounds.enter_keeping(
+        Stage::Maintain,
+        if config.reserve_scheduling {
+            after_pulls
+        } else {
+            0
+        },
+    );
     let maintained = scheduler.maintain(state.maintain.take(), &git_ref);
+    if let Some(line) = bounds.share_line() {
+        scheduler.line(line);
+    }
     // Without stage 2's state, the incoming one keeps the maintain stage's.
     let kept = scheduler.report.maintain.is_some().then(|| state.clone());
     // Stage 2: pull request follow-up, today's poll, within its share.
-    bounds.enter_keeping(Stage::PullRequests, AFTER_PULL_REQUESTS);
+    bounds.enter_keeping(Stage::PullRequests, after_pulls);
     let mut earlier = maintained + scheduler.follow(state, &git_ref, maintained);
     if let Some(line) = bounds.share_line() {
         scheduler.line(line);
@@ -3070,7 +3102,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     }
     // Stage 3: epic plans applied, applies recovered, an epic planned. Its
     // starts take their slots before stage 4's.
-    bounds.enter_keeping(Stage::Epics, AFTER_EPICS);
+    bounds.enter_keeping(Stage::Epics, after_epics);
     earlier += scheduler.epics(earlier, &git_ref);
     if let Some(line) = bounds.share_line() {
         scheduler.line(line);
@@ -3796,6 +3828,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             git_ref: Some(git_ref.to_owned()),
         });
         let follow = &self.follows;
+        let deferred_state = state.clone();
         match poll::run_capped(
             &self.client,
             &self.client,
@@ -3842,6 +3875,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 self.followed = Some((outcome.waits, outcome.undecided));
                 self.stepped = outcome.steps;
                 outcome.dispatched
+            }
+            Err(error) if error.is::<ShareSpent>() => {
+                self.report.state = Some(deferred_state);
+                self.line(
+                    "budget: pull requests stopped at its share; discovery waits for the next pass"
+                        .into(),
+                );
+                0
             }
             Err(error) => {
                 self.report.failures += 1;

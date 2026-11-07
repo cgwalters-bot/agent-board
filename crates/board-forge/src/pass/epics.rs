@@ -1488,7 +1488,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return Ok(None);
         };
         if self.other.is_none() {
-            self.other = Some(self.overlapping(own).map_err(|e| format!("{e:#}")));
+            let other = self.overlapping(own);
+            // A stage's discovery share is not a pass-wide failure. A later
+            // stage with its own headroom must repeat the concurrency check.
+            if other.as_ref().is_err_and(|e| e.is::<ShareSpent>()) {
+                return other;
+            }
+            self.other = Some(other.map_err(|e| format!("{e:#}")));
         }
         self.other
             .clone()

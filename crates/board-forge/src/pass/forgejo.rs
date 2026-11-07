@@ -37,6 +37,10 @@ const LEASE_BRANCH: &str = "agent-board-leases";
 /// Reject explicit settings, even false, empty or malformed ones, before typed
 /// decoding can discard their presence or hide the capability diagnostic.
 pub(super) fn check_options(value: &Value) -> Result<()> {
+    ensure!(
+        value.get("reserveScheduling").is_none(),
+        "unsupported_capability: reserveScheduling: GitHub stage shares only"
+    );
     let contract: Value = serde_json::from_str(CONTRACT).context("Forgejo pass contract")?;
     for (option, entry) in contract["options"]
         .as_object()
