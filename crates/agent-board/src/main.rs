@@ -178,6 +178,7 @@ enum Command {
     /// What each item under the board's open epics has cost, sub-issues included, beside the board's weekly budget and each item's Budget ($) field, or with --split a window's spend split between upstream work and the harness (read-only; docs/pass.md#budget-tree).
     Budget(budget::Budget),
     /// What one UTC day's agent runs spent, by kind, model, repository and item, from each run's agent-run artifact, as agent-board/cost-day/v1 JSON (read-only; docs/cost.md).
+    #[command(long_about = cost::COST_ABOUT)]
     Cost(cost::Cost),
     /// Rolling 30-day CI observations for explicit repositories/workflows; read-only, opt-in (docs/ci-health.md).
     CiHealth(ci_health::CiHealth),
@@ -1695,6 +1696,17 @@ mod tests {
                 );
                 let help = error.to_string();
                 assert!(help.contains("Usage:"), "{argv:?}: {help}");
+                if path.iter().map(String::as_str).eq(["agent-board", "cost"]) && flag == "--help" {
+                    for text in [
+                        "GH_TOKEN",
+                        "null costs, not zero",
+                        "Never writes to the forge",
+                        "agent-board cost --config agent-board.json --date 2026-10-28 --human",
+                        "--cache cost-cache",
+                    ] {
+                        assert!(help.contains(text), "missing {text}: {help}");
+                    }
+                }
                 if path
                     .iter()
                     .map(String::as_str)
