@@ -1479,12 +1479,11 @@ impl<R: Rest, G: Transport> Pass<'_, R, G> {
             self.authored.insert((repo.to_ascii_lowercase(), number));
         }
         // As on a followed pull request: the policy step would refuse the run.
-        if let Some(why) = self
-            .config
-            .policy
-            .fix_bounds
-            .refusal(repo, text(&pull, "/head/ref"))
-        {
+        if let Some(why) = self.config.policy.fix_bounds.refusal(
+            repo,
+            text(&pull, "/user/login"),
+            text(&pull, "/head/ref"),
+        ) {
             return Ok((true, format!("{LEFT_TO_OPERATOR}{why}")));
         }
         // And where apply would refuse to push to its head, as apply reads it.

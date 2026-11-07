@@ -1397,7 +1397,9 @@ file for its `fix` kind (tracker's `.github/agentic-job/fix.toml`), from the
 same trusted checkout as `--config`. With it, stage 2 starts no fix, rebase
 or continuation round, all dispatched as that kind, on a pull request
 whose repository or head branch the file's `repos` and
-`outputs.push_to_pull_request_branch.branches` leave out; its line says
+`outputs.push_to_pull_request_branch.branches` leave out (its `own_author`,
+where set, admits that login's own pull requests in any repository, the
+branches still applying, as agentic-job's policy step does); its line says
 `skip: left to the operator: head branch "B" is outside the fix bounds`, and
 nothing is claimed, marked, labelled or dispatched. Merges are unchanged.
 The flag repeats, one file per bounds tracker dispatches with (`fix.toml`
@@ -1766,7 +1768,10 @@ stage 2: every open PR sharing the head must be in a followed repository.
 It charges the next stage 2 fix round in our own space. For upstream work,
 the ledger is the unique same-head midstream PR (including one closed by
 promotion), verified as the bot's and not frozen. Both repositories must be
-followed. With `fixPlans`, stage 2 leaves upstream PRs read-only; its midstream
+followed. With `fixPlans`, stage 2 leaves upstream PRs read-only but the
+bot's own with no same-head midstream PR, on which it takes the bot's own
+rounds directly ([the poll](poll.md)); a plan's pull request always has one,
+so the two never start on the same pull request. Its midstream
 rounds and planned fixes share that ledger's two fix rounds. Missing or
 ambiguous ledgers, unread facts, and legacy upstream markers or claims hold
 the plan for operator migration rather than resetting the allowance. Neither
@@ -3680,7 +3685,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
-| `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling); `false` |
+| `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-head midstream pull request, see [the poll](poll.md); `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |

@@ -4363,7 +4363,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             )));
         }
         let branch = text(&pull, "/headRefName");
-        if let Some(refused) = config.fix_bounds.refusal(&dest.repository, branch) {
+        let author = text(&pull, "/author/login");
+        if let Some(refused) = config.fix_bounds.refusal(&dest.repository, author, branch) {
             return Err(held(refused));
         }
         let poll = config.poll(None);

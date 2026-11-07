@@ -268,6 +268,16 @@ pub(crate) const LEFT_TO_OPERATOR: &str = "left to the operator: ";
 /// [`PollPolicy::own_space_only`].
 pub(crate) const NOT_OURS: &str =
     "is outside our own space (pr.ownSpaceOnly), so the pass writes nothing there";
+/// Why stage 2 skips a pull request outside our own space with
+/// [`PollPolicy::fix_plans`]: someone else's, or one with a midstream pull
+/// request ([`Pass::planned_upstream`]).
+pub(crate) const FIX_PLANS_UPSTREAM: &str =
+    "fixPlans follows upstream fixes through the midstream pull request";
+/// Why a step, after its repository, is left to the operator on the bot's
+/// own pull request there with [`PollPolicy::fix_plans`]: one outside
+/// [`AUTHORED_STEPS`] ([`Config::held_in`]).
+pub(crate) const FIX_PLANS_HELD: &str =
+    "is outside our own space, where fixPlans takes only the bot's own rounds";
 /// The steps the pass takes on the bot's own pull request outside our own
 /// space, where [`Config::writes_in`] would hold every write: the operator
 /// lets the bot act on what it authored in any repository. They are its
@@ -473,8 +483,24 @@ impl Config {
         !(self.policy.own_space_only || swept) || self.ours(repo)
     }
 
+    /// Why stage 2 holds every step on `repo`'s pull requests but
+    /// [`AUTHORED_STEPS`] on the bot's own: [`NOT_OURS`] where
+    /// [`Self::writes_in`] holds its writes, or [`FIX_PLANS_HELD`]
+    /// outside our own space with [`PollPolicy::fix_plans`], which plans
+    /// upstream work rather than taking maintainers' steps there. None where
+    /// it holds nothing.
+    pub(crate) fn held_in(&self, repo: &str) -> Option<&'static str> {
+        if !self.writes_in(repo) {
+            Some(NOT_OURS)
+        } else if self.policy.fix_plans && !self.ours(repo) {
+            Some(FIX_PLANS_HELD)
+        } else {
+            None
+        }
+    }
+
     /// Whether `author` is the bot, whose own pull requests the pass may
-    /// take [`AUTHORED_STEPS`] on where [`Self::writes_in`] holds the rest.
+    /// take [`AUTHORED_STEPS`] on where [`Self::held_in`] holds the rest.
     pub(crate) fn authored(&self, author: &str) -> bool {
         !author.is_empty() && author.eq_ignore_ascii_case(&self.bot)
     }
@@ -674,7 +700,9 @@ pub struct PollPolicy {
     /// fix-kind run on it ([`bounds`]); none (the default) checks nothing.
     pub fix_bounds: bounds::FixBoundsSet,
     /// The pass's `fixPlans`: upstream branch fixes are planned on the tracker
-    /// and accounted on their same-head midstream PR, never by upstream writes.
+    /// and accounted on their same-head midstream PR, never by upstream writes,
+    /// but for the bot's own [`AUTHORED_STEPS`] on a pull request it authored
+    /// upstream with no midstream PR ([`Config::held_in`]).
     pub fix_plans: bool,
     /// The pass's `pr.staleDays`: a stopped pull request of the bot's that
     /// conflicts or has changes requested, untouched by the operator for this
@@ -4794,7 +4822,7 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // label or review request needs a maintainer's permissions, and a
         // stop without one would read as reset. Nothing is written; the
         // operator takes it, as any stop there ([`Self::human_wait`]).
-        if !self.config.writes_in(repo) {
+        if self.config.held_in(repo).is_some() {
             return Ok(());
         }
         let number = pull["number"]
@@ -4872,8 +4900,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
     }
 
     fn human_wait(&self, repo: &str, pull: &Value) -> String {
-        if !self.config.writes_in(repo) {
-            format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS} (needs-human)")
+        if let Some(why) = self.config.held_in(repo) {
+            format!("{LEFT_TO_OPERATOR}{repo} {why} (needs-human)")
         } else if self.config.policy.assign_holds && pull["isDraft"] != true {
             format!("requested {}'s review", self.config.operator)
         } else {
@@ -7148,6 +7176,55 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             })
     }
 
+    /// Why stage 2 leaves `repo`'s pull request `number`, outside our own
+    /// space, to [`PollPolicy::fix_plans`]: [`FIX_PLANS_UPSTREAM`] unless it
+    /// is the bot's own with no midstream pull request
+    /// ([`Self::midstream_pulls`]). The bot may always work on what it
+    /// authored, so stage 2 takes [`AUTHORED_STEPS`] there ([`Config::held_in`]).
+    /// A promoted one's midstream pull request is the round ledger fix plans
+    /// charge ([`planned_fix_control`]), and the two never share a pull
+    /// request: a round of stage 2's here would split that ledger, and its
+    /// marker hold the plans for migration.
+    fn planned_upstream(&mut self, repo: &str, number: u64, pull: &Value) -> Option<String> {
+        if !self.config.authored(text(pull, "/author/login")) {
+            return Some(FIX_PLANS_UPSTREAM.into());
+        }
+        match self.midstream_pulls(repo, number, pull) {
+            Ok(midstream) => midstream
+                .first()
+                .map(|(at, n)| format!("{FIX_PLANS_UPSTREAM} {at}#{n}")),
+            Err(why) => Some(format!("{FIX_PLANS_UPSTREAM}, and {why}")),
+        }
+    }
+
+    /// The pull requests, any state, that share the head of `repo`'s pull
+    /// request `number`, `pull`, in its head repository where that is in our
+    /// own space: its midstream pull requests, one of which
+    /// is the round ledger of [`PollPolicy::fix_plans`] (a promotion closes
+    /// it, and its comments remain the ledger).
+    fn midstream_pulls(
+        &mut self,
+        repo: &str,
+        number: u64,
+        pull: &Value,
+    ) -> std::result::Result<Vec<(String, u64)>, String> {
+        let head_repo = text(pull, "/headRepository/nameWithOwner");
+        if !self.config.ours(head_repo) {
+            return Ok(Vec::new());
+        }
+        let (owner, name) = repo.split_once('/').ok_or("its repository has no owner")?;
+        let shared = self.associated_pulls(owner, name, number, CONTROL_HEAD_QUERY)?;
+        shared
+            .iter()
+            .filter(|p| text(p, "/repository/nameWithOwner").eq_ignore_ascii_case(head_repo))
+            .map(|p| {
+                let n = p["number"].as_u64().filter(|n| *n > 0);
+                n.map(|n| (head_repo.to_owned(), n))
+                    .ok_or_else(|| "its midstream pull request number could not be read".into())
+            })
+            .collect()
+    }
+
     fn shared_pulls(
         &mut self,
         owner: &str,
@@ -7207,15 +7284,11 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         // labels here, or after them, so a new stop with no label reads them
         // again; an older one's label would have shown ([`STOP_WRITES_SECONDS`]).
         let mut pull = self.read_pull(owner, name, number)?;
-        if self.config.policy.fix_plans && !self.config.ours(repo) {
-            return Ok((
-                format!(
-                    "{repo}#{number} skip: fixPlans follows upstream fixes through the midstream pull request"
-                ),
-                false,
-                None,
-                None,
-            ));
+        if self.config.policy.fix_plans
+            && !self.config.ours(repo)
+            && let Some(why) = self.planned_upstream(repo, number, &pull)
+        {
+            return Ok((format!("{repo}#{number} skip: {why}"), false, None, None));
         }
         let mut intake =
             ordinary_reviews(self.config, repo) && self.review_intake.pulls < reviews::INTAKE_PULLS;
@@ -7559,7 +7632,10 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             "fix" | "continue" | "rebase" | "answer" | RUN_RERUN
         );
         let mut left = round
-            .then(|| bounds.refusal(repo, text(&pull, "/headRefName")))
+            .then(|| {
+                let author = text(&pull, "/author/login");
+                bounds.refusal(repo, author, text(&pull, "/headRefName"))
+            })
             .flatten();
         if round && left.is_none() && self.config.policy.owner_branches {
             let cross = pull["isCrossRepository"].as_bool().unwrap_or(false);
@@ -7579,7 +7655,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
             decision = step("skip", format!("{LEFT_TO_OPERATOR}{why}"));
         }
         // With `ownSpaceOnly`, every step that writes outside our own space,
-        // a stop included, is the operator's. Its `needs-human` wait is the
+        // a stop included, is the operator's, and with `fixPlans` every one
+        // upstream ([`Config::held_in`]). Its `needs-human` wait is the
         // hold, in the pass's own state and inbox, decided again each pass.
         // But on the bot's own pull request, its runs, their markers and its
         // edits of what it authored are its own to make ([`AUTHORED_STEPS`]).
@@ -7590,18 +7667,23 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         };
         let authored = self.config.authored(text(&pull, "/author/login"))
             && (!writes || AUTHORED_STEPS.contains(&action));
-        if (writes || retarget.is_some()) && !self.config.writes_in(repo) && authored {
-            self.authored.insert((repo.to_ascii_lowercase(), number));
-        } else if (writes || retarget.is_some()) && !self.config.writes_in(repo) {
-            answer.clear();
-            retarget = None;
-            decision = step(
-                "skip",
-                format!(
-                    "{LEFT_TO_OPERATOR}{repo} {NOT_OURS} ({}: {})",
-                    decision.action, decision.reason
-                ),
-            );
+        let held = (self.config.held_in(repo)).filter(|_| writes || retarget.is_some());
+        match held {
+            Some(_) if authored => {
+                self.authored.insert((repo.to_ascii_lowercase(), number));
+            }
+            Some(why) => {
+                answer.clear();
+                retarget = None;
+                decision = step(
+                    "skip",
+                    format!(
+                        "{LEFT_TO_OPERATOR}{repo} {why} ({}: {})",
+                        decision.action, decision.reason
+                    ),
+                );
+            }
+            None => {}
         }
         // Read only for a diagnostic round that starts, or the stop after
         // one, and only where the step is taken. A read that fails is said
@@ -8319,20 +8401,13 @@ pub(crate) fn planned_fix_control<R: Rest, G: Transport>(
     if !config.ours(head_repo) {
         return Err("its head has no round ledger in our own space".into());
     }
-    let shared = pass.associated_pulls(owner, name, number, CONTROL_HEAD_QUERY)?;
-    let controls: Vec<_> = shared
-        .iter()
-        .filter(|p| text(p, "/repository/nameWithOwner").eq_ignore_ascii_case(head_repo))
-        .collect();
-    let [control] = controls.as_slice() else {
+    // Stage 2 takes the bot's own rounds on a pull request with none of
+    // these ([`Pass::planned_upstream`]), so the two never share one.
+    let [(_, control_number)] = pass.midstream_pulls(repo, number, pull)?[..] else {
         return Err(
             "it needs exactly one same-head midstream pull request for round accounting".into(),
         );
     };
-    let control_number = control["number"]
-        .as_u64()
-        .filter(|n| *n > 0)
-        .ok_or("its midstream pull request number could not be read")?;
     if !pass.followed.contains(&head_repo.to_ascii_lowercase()) {
         return Err("its midstream round ledger is not in a followed repository".into());
     }
@@ -11897,7 +11972,9 @@ mod tests {
                     .push(variables["branch"].clone());
                 return Ok(json!({"repository": {"pullRequests": {"nodes": self.lower}}}));
             }
-            if query == SHARED_HEAD_QUERY {
+            // The midstream pull request a `fixPlans` ledger is, any state,
+            // reads the same pull requests here.
+            if query == SHARED_HEAD_QUERY || query == CONTROL_HEAD_QUERY {
                 *self.shared_reads.borrow_mut() += 1;
                 let pull = self.shared_head.clone().unwrap_or_else(|| {
                     json!({"headRef": {"associatedPullRequests": {
@@ -15966,6 +16043,12 @@ mod tests {
                 "repos = [\"{repos}\"]\n[outputs]\npush_to_pull_request_branch = {{ branches = [\"dispatch/**\", \"bot/**\"] }}\n"
             )
         };
+        // The same under `[github.outputs]`, with agentic-job#3164's key.
+        let own_author = |repos: &str, login: &str| {
+            format!(
+                "repos = [\"{repos}\"]\n[github.outputs.push_to_pull_request_branch]\nbranches = [\"dispatch/**\", \"bot/**\"]\nown_author = \"{login}\"\n"
+            )
+        };
         // A `headOwners` fork of the repository, in the owner's account.
         const FORK: &str = "cgwalters-forge/agentic-job-midstream";
         let contents = |head: &str| format!("{API_ROOT}repos/{head}/contents/{OWNER_BRANCHES}");
@@ -16098,6 +16181,39 @@ mod tests {
             (
                 "a continuation in a repository outside the fix bounds is not started",
                 json!({"isDraft": true, "body": checkpointed("budget"), "contexts": {"review": null}, "bounds": bounds("bootc-dev/*")}),
+                none.clone(),
+                vec![],
+                vec![],
+                "skip: left to the operator: repository cgwalters-forge/agentic-job is outside the fix bounds",
+                vec![],
+                0,
+            ),
+            // agentic-job#3164's `own_author` admits the bot's own pull
+            // request in a repository `repos` does not list, still only from
+            // a branch the file admits.
+            (
+                "a change request on the bot's own pull request outside repos starts a fix run with own_author",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "bounds": own_author("bootc-dev/*", BOT)}),
+                none.clone(),
+                vec![],
+                vec![(200, json!({"workflow_run_id": 1234}))],
+                "fix: review requested changes -> https://github.com/cgwalters-forge/tracker/actions/runs/1234",
+                vec![comment.clone(), patch(99), patch(99)],
+                1,
+            ),
+            (
+                "own_author still applies the branch globs",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "bounds": own_author("bootc-dev/*", BOT), "headRefName": "ci-drop-grub-cc"}),
+                none.clone(),
+                vec![],
+                vec![],
+                r#"skip: left to the operator: head branch "ci-drop-grub-cc" is outside the fix bounds"#,
+                vec![],
+                0,
+            ),
+            (
+                "own_author naming someone else admits no repository outside repos",
+                json!({"contexts": {"review": {"state": "FAILURE"}}, "bounds": own_author("bootc-dev/*", "someone")}),
                 none.clone(),
                 vec![],
                 vec![],
@@ -16397,9 +16513,18 @@ mod tests {
     /// bot's own pull request its runs are its own to start anywhere
     /// ([`AUTHORED_STEPS`]), written only on that pull request; a merge or a
     /// stop there, and any step on someone else's, are still held.
+    ///
+    /// `fixPlans` holds the same upstream ([`FIX_PLANS_UPSTREAM`]), with or
+    /// without `ownSpaceOnly`: the bot's own runs start on its own pull
+    /// request, and someone else's, or one with a midstream pull request
+    /// whose ledger fix plans charge, is skipped.
     #[test]
     fn own_space_only_writes_nothing_upstream() {
         const UPSTREAM: &str = "bootc-dev/bootc";
+        const MIDSTREAM: &str = "cgwalters-forge/bootc";
+        let failing = json!({"contexts": {"ci": {"conclusion": "FAILURE"}}});
+        let promoted = json!({"contexts": {"review": {"state": "FAILURE"}},
+            "headRepository": {"nameWithOwner": MIDSTREAM}});
         let changes = json!({"contexts": {"review": {"state": "FAILURE"}}});
         let used_up = json!({"rounds": 2, "sha": "older"});
         // The recorded pull request and its reads, moved to `repo`; GraphQL
@@ -16446,41 +16571,57 @@ mod tests {
             Runs,
             /// The operator's wait; nothing written.
             Held,
+            /// `fixPlans`' skip, after it: no step, no wait.
+            Planned(&'static str),
         }
         use Expect::*;
+        // `ownSpaceOnly`, `fixPlans`, or both.
+        const OWN: (bool, bool) = (true, false);
+        const PLANS: (bool, bool) = (false, true);
+        const BOTH: (bool, bool) = (true, true);
+        const NEITHER: (bool, bool) = (false, false);
         const OTHER: &str = "someone";
         let approved =
             json!({"reviews": {"nodes": [review("APPROVED", user("cgwalters"), HEAD, "")]}});
+        // The skip's suffix naming that midstream pull request.
+        const LEDGER: &str = " cgwalters-forge/bootc#12";
+        let null = &Value::Null;
         // The step decided, the pull request's author, the repository
-        // followed, `ownSpaceOnly`, and what the pass does.
-        for (action, change, marker, author, repo, own_space_only, expect) in [
-            ("needs-human", &changes, &used_up, BOT, UPSTREAM, true, Held),
-            ("fix", &changes, &Value::Null, BOT, UPSTREAM, true, Runs),
-            ("merge", &json!({}), &Value::Null, BOT, UPSTREAM, true, Held),
-            (
-                "merge",
-                &approved,
-                &Value::Null,
-                OTHER,
-                UPSTREAM,
-                true,
-                Held,
-            ),
-            (
-                "needs-human",
-                &changes,
-                &used_up,
-                BOT,
-                UPSTREAM,
-                false,
-                Stops,
-            ),
-            ("needs-human", &changes, &used_up, BOT, REPO, true, Stops),
-        ] {
-            let name = format!("{action} by {author} in {repo}, ownSpaceOnly {own_space_only}");
-            let fake = moved(repo, change.clone(), marker, author);
+        // followed, `ownSpaceOnly` and `fixPlans`, and what the pass does.
+        #[rustfmt::skip]
+        let cases = [
+            ("needs-human", &changes, &used_up, BOT, UPSTREAM, OWN, Held),
+            ("fix", &changes, null, BOT, UPSTREAM, OWN, Runs),
+            ("merge", &json!({}), null, BOT, UPSTREAM, OWN, Held),
+            ("merge", &approved, null, OTHER, UPSTREAM, OWN, Held),
+            ("needs-human", &changes, &used_up, BOT, UPSTREAM, NEITHER, Stops),
+            ("needs-human", &changes, &used_up, BOT, REPO, OWN, Stops),
+            ("fix", &changes, null, BOT, UPSTREAM, PLANS, Runs),
+            ("fix", &failing, null, BOT, UPSTREAM, PLANS, Runs),
+            ("fix", &changes, null, BOT, UPSTREAM, BOTH, Runs),
+            ("fix", &failing, null, BOT, UPSTREAM, BOTH, Runs),
+            ("merge", &json!({}), null, BOT, UPSTREAM, PLANS, Held),
+            ("needs-human", &changes, &used_up, BOT, UPSTREAM, PLANS, Held),
+            ("fix", &changes, null, OTHER, UPSTREAM, PLANS, Planned("")),
+            ("merge", &approved, null, OTHER, UPSTREAM, BOTH, Planned("")),
+            ("fix", &promoted, null, BOT, UPSTREAM, PLANS, Planned(LEDGER)),
+            ("fix", &promoted, null, BOT, UPSTREAM, BOTH, Planned(LEDGER)),
+            ("needs-human", &changes, &used_up, BOT, REPO, BOTH, Stops),
+        ];
+        for (action, change, marker, author, repo, (own_space_only, fix_plans), expect) in cases {
+            let name = format!(
+                "{action} by {author} in {repo}, ownSpaceOnly {own_space_only}, fixPlans {fix_plans}"
+            );
+            let mut fake = moved(repo, change.clone(), marker, author);
+            if *change == promoted {
+                fake.shared_head = Some(json!({"headRef": {"associatedPullRequests": {
+                    "nodes": [{"number": 470, "repository": {"nameWithOwner": UPSTREAM}},
+                        {"number": 12, "repository": {"nameWithOwner": MIDSTREAM}}],
+                    "pageInfo": {"hasNextPage": false}}}}));
+            }
             let mut cfg = config();
             cfg.policy.own_space_only = own_space_only;
+            cfg.policy.fix_plans = fix_plans;
             if author == OTHER {
                 cfg.policy.merge_authors = vec![OTHER.into()];
             }
@@ -16503,9 +16644,17 @@ mod tests {
                 expect != Runs,
                 "{name}: {got}"
             );
+            if let Planned(after) = expect {
+                let line = format!("{repo}#470 skip: {FIX_PLANS_UPSTREAM}{after}");
+                assert_eq!(*got, line, "{name}");
+                assert!(fake.writes.borrow().is_empty(), "{name}: {got}");
+                assert!(outcome.waits.is_empty(), "{name}: {:?}", outcome.waits);
+                continue;
+            }
             if expect == Runs {
                 assert!(got.contains(&format!("{action}: ")), "{name}: {got}");
                 assert!(!got.contains(NOT_OURS), "{name}: {got}");
+                assert!(!got.contains("fixPlans"), "{name}: {got}");
                 let writes = written(&fake.writes);
                 assert!(!writes.is_empty(), "{name}: {got}");
                 for write in writes {
@@ -16528,7 +16677,8 @@ mod tests {
                 assert_eq!(written(&fake.writes), writes, "{name}");
                 continue;
             }
-            let why = format!("{LEFT_TO_OPERATOR}{repo} {NOT_OURS} ({action}: ");
+            let held = cfg.held_in(repo).unwrap();
+            let why = format!("{LEFT_TO_OPERATOR}{repo} {held} ({action}: ");
             assert!(got.contains(&format!("skip: {why}")), "{name}: {got}");
             assert!(fake.writes.borrow().is_empty(), "{name}: {got}");
             let waits: Vec<_> = (outcome.waits.iter())
@@ -17125,22 +17275,6 @@ mod tests {
             assert!(fake.writes.borrow().is_empty(), "{step}: {line}");
             assert!(dispatcher.writes.borrow().is_empty(), "{step}: {line}");
         }
-    }
-
-    #[test]
-    fn fix_plans_leave_upstream_stage_two_read_only() {
-        let fake = github();
-        let mut config = config();
-        config.policy.fix_plans = true;
-        let mut pass = Pass::new(&fake, &fake, &config, now());
-        let (line, _, _, _) = pass
-            .pull("containers/composefs-rs", 470, false, &mut BTreeMap::new())
-            .unwrap();
-        assert!(
-            line.contains("fixPlans follows upstream fixes through the midstream pull request"),
-            "{line}"
-        );
-        assert!(fake.writes.borrow().is_empty());
     }
 
     #[test]

@@ -5,9 +5,9 @@
 //! boundary; this only saves the run it would refuse. The flag repeats, one
 //! file per bounds the caller dispatches with, read as a [`FixBoundsSet`].
 //!
-//! Only the top-level `repos` and `outputs.push_to_pull_request_branch.branches`,
-//! under `[github]` since agentic-job v0.6.5, are read; every other key is
-//! agentic-job's. A glob is evaluated only in
+//! Only the top-level `repos` and `outputs.push_to_pull_request_branch`'s
+//! `branches` and `own_author`, under `[github]` since agentic-job v0.6.5,
+//! are read; every other key is agentic-job's. A glob is evaluated only in
 //! the forms below, and any other is refused rather than guessed at.
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
@@ -41,6 +41,11 @@ const BRANCHES: Field = Field {
     fold: false,
 };
 
+/// The login whose own pull requests a fix may push to in a repository
+/// `repos` does not list (agentic-job#3164), as agentic-job's policy step
+/// admits them; `branches` still applies.
+const OWN_AUTHOR: &str = "outputs.push_to_pull_request_branch.own_author";
+
 /// Characters that make a glob anywhere but in a field's wildcard.
 const GLOB_CHARS: &[char] = &['*', '?', '[', '{'];
 
@@ -49,6 +54,7 @@ const GLOB_CHARS: &[char] = &['*', '?', '[', '{'];
 pub struct FixBounds {
     repos: Vec<String>,
     branches: Vec<String>,
+    own_author: Option<String>,
 }
 
 impl FixBounds {
@@ -62,15 +68,25 @@ impl FixBounds {
     pub fn parse(text: &str) -> Result<Self> {
         let value: toml::Value = toml::from_str(text).context("decode TOML")?;
         // agentic-job v0.6.5 moved `outputs` under the forge's section.
-        let branches = value
+        let push = value
             .get("github")
             .and_then(|g| g.get("outputs"))
             .or_else(|| value.get("outputs"))
-            .and_then(|o| o.get("push_to_pull_request_branch"))
-            .and_then(|p| p.get("branches"));
+            .and_then(|o| o.get("push_to_pull_request_branch"));
+        let own_author = match push.and_then(|p| p.get("own_author")) {
+            None => None,
+            Some(login) => {
+                let login = login
+                    .as_str()
+                    .filter(|l| !l.is_empty())
+                    .with_context(|| format!("{OWN_AUTHOR} is not a login"))?;
+                Some(login.to_owned())
+            }
+        };
         Ok(Self {
             repos: patterns(&REPOS, value.get("repos"))?,
-            branches: patterns(&BRANCHES, branches)?,
+            branches: patterns(&BRANCHES, push.and_then(|p| p.get("branches")))?,
+            own_author,
         })
     }
 
@@ -79,9 +95,17 @@ impl FixBounds {
         admits(&REPOS, &self.repos, repo)
     }
 
-    /// Whether a fix run may push to `repo`'s pull request from `branch`.
-    fn admits_pull(&self, repo: &str, branch: &str) -> bool {
-        self.admits_repo(repo) && admits(&BRANCHES, &self.branches, branch)
+    /// Whether a fix run may push to `repo`'s pull request by `author` from
+    /// `branch`: in a repository `repos` lists, or else on [`OWN_AUTHOR`]'s
+    /// own pull request.
+    fn admits_pull(&self, repo: &str, author: &str, branch: &str) -> bool {
+        (self.admits_repo(repo) || self.own(author)) && admits(&BRANCHES, &self.branches, branch)
+    }
+
+    /// Whether `author` is this file's [`OWN_AUTHOR`], as agentic-job's
+    /// policy step compares logins: ignoring case.
+    fn own(&self, author: &str) -> bool {
+        (self.own_author.as_deref()).is_some_and(|own| own.eq_ignore_ascii_case(author))
     }
 }
 
@@ -114,13 +138,16 @@ impl FixBoundsSet {
         self.files.iter().any(|f| f.admits_repo(repo))
     }
 
-    /// Why a fix run on `repo`'s pull request from `branch` is outside every
-    /// file's bounds: its repository where no file admits it, else its head
-    /// branch; none where one file admits both, or there are no files.
-    pub fn refusal(&self, repo: &str, branch: &str) -> Option<String> {
-        if self.files.is_empty() || self.files.iter().any(|f| f.admits_pull(repo, branch)) {
+    /// Why a fix run on `repo`'s pull request by `author` from `branch` is
+    /// outside every file's bounds: its repository where no file admits it
+    /// (by `repos`, or by `own_author` for the author's own pull request),
+    /// else its head branch; none where one file admits both, or there are
+    /// no files.
+    pub fn refusal(&self, repo: &str, author: &str, branch: &str) -> Option<String> {
+        let files = &self.files;
+        if files.is_empty() || files.iter().any(|f| f.admits_pull(repo, author, branch)) {
             None
-        } else if self.admits_repo(repo) {
+        } else if self.admits_repo(repo) || files.iter().any(|f| f.own(author)) {
             Some(format!("head branch {branch:?} is outside the fix bounds"))
         } else {
             Some(format!("repository {repo} is outside the fix bounds"))
@@ -175,6 +202,8 @@ fn matches(field: &Field, pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BOT: &str = "cgwalters-bot";
 
     const TRACKER: &str = r#"
 hosts = ["github.com"]
@@ -238,7 +267,7 @@ push_to_pull_request_branch = { max = 1, branches = ["bot/**"] }
             ),
         ] {
             assert_eq!(
-                bounds.refusal(repo, branch).as_deref(),
+                bounds.refusal(repo, BOT, branch).as_deref(),
                 want,
                 "{repo} {branch}"
             );
@@ -272,7 +301,7 @@ push_to_pull_request_branch = { max = 1, branches = ["bot/**"] }
             ),
         ] {
             assert_eq!(
-                bounds.refusal(repo, branch).as_deref(),
+                bounds.refusal(repo, BOT, branch).as_deref(),
                 want,
                 "{repo} {branch}"
             );
@@ -285,20 +314,96 @@ push_to_pull_request_branch = { max = 1, branches = ["bot/**"] }
             assert_eq!(bounds.admits_repo(repo), want, "{repo}");
             assert!(!set(&[]).admits_repo(repo), "{repo}");
         }
-        assert_eq!(set(&[]).refusal("a/b", "c"), None);
+        assert_eq!(set(&[]).refusal("a/b", BOT, "c"), None);
+    }
+
+    /// [`TRACKER`] with agentic-job#3164's `own_author`: the bot's own pull
+    /// request is inside in a repository `repos` does not list, still only
+    /// from a branch `branches` admits; anyone else's is not.
+    #[test]
+    fn own_author_refusal_table() {
+        let own = TRACKER.replace(
+            "replacement_max_commits = 5",
+            &format!("replacement_max_commits = 5, own_author = \"{BOT}\""),
+        );
+        const OUTSIDE: &str = "repository bootc-devx/bootc is outside the fix bounds";
+        let branch = r#"head branch "ci-x" is outside the fix bounds"#;
+        // The bounds files, the repository, the author, the branch, and why
+        // it is refused.
+        for (files, repo, author, head, want) in [
+            (&[own.as_str()][..], "bootc-devx/bootc", BOT, "bot/x", None),
+            (
+                &[own.as_str()],
+                "bootc-devx/bootc",
+                "CGWalters-Bot",
+                "bot/x",
+                None,
+            ),
+            (
+                &[own.as_str()],
+                "bootc-devx/bootc",
+                BOT,
+                "ci-x",
+                Some(branch),
+            ),
+            (
+                &[own.as_str()],
+                "bootc-devx/bootc",
+                "someone",
+                "bot/x",
+                Some(OUTSIDE),
+            ),
+            (
+                &[own.as_str()],
+                "bootc-devx/bootc",
+                "",
+                "bot/x",
+                Some(OUTSIDE),
+            ),
+            // A listed repository admits anyone's, as without the key.
+            (&[own.as_str()], "bootc-dev/bootc", "someone", "bot/x", None),
+            // Without the key, the bot's own is outside as before.
+            (&[TRACKER], "bootc-devx/bootc", BOT, "bot/x", Some(OUTSIDE)),
+            // The file naming the author must admit the branch too, not
+            // another file.
+            (
+                &[MIDSTREAM, own.as_str()],
+                "bootc-devx/bootc",
+                BOT,
+                "main",
+                None,
+            ),
+            (
+                &[own.as_str(), MIDSTREAM],
+                "bootc-devx/bootc",
+                BOT,
+                "x/y",
+                Some(r#"head branch "x/y" is outside the fix bounds"#),
+            ),
+        ] {
+            assert_eq!(
+                set(files).refusal(repo, author, head).as_deref(),
+                want,
+                "{files:?} {repo} {author} {head}"
+            );
+        }
     }
 
     /// `[outputs]` and agentic-job v0.6.5's `[github.outputs]` read the same.
     #[test]
     fn outputs_at_the_top_or_under_github() {
-        let body = "[{}.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]\n";
+        let body = format!(
+            "[{{}}.push_to_pull_request_branch]\nbranches = [\"dispatch/**\"]\nown_author = \"{BOT}\"\n"
+        );
         let [old, new] = ["outputs", "github.outputs"].map(|table| {
             let text = format!("repos = [\"o/r\"]\n{}", body.replace("{}", table));
             FixBounds::parse(&text).unwrap()
         });
         assert_eq!(old, new);
-        assert!(new.admits_pull("o/r", "dispatch/x"));
-        assert!(!new.admits_pull("o/r", "main"));
+        assert!(new.admits_pull("o/r", "someone", "dispatch/x"));
+        assert!(!new.admits_pull("o/r", "someone", "main"));
+        assert!(new.admits_pull("p/q", BOT, "dispatch/x"));
+        assert!(!new.admits_pull("p/q", "someone", "dispatch/x"));
     }
 
     #[test]
@@ -358,6 +463,16 @@ push_to_pull_request_branch = { max = 1, branches = ["bot/**"] }
                 "an alternation",
                 "repos = [\"{a,b}/c\"]".to_owned(),
                 "repos: \"{a,b}/c\" is not an exact name or NAME/*, the only glob read",
+            ),
+            (
+                "an own_author of no login",
+                "repos = [\"a/b\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"x\"]\nown_author = \"\"".to_owned(),
+                "outputs.push_to_pull_request_branch.own_author is not a login",
+            ),
+            (
+                "an own_author list",
+                "repos = [\"a/b\"]\n[outputs.push_to_pull_request_branch]\nbranches = [\"x\"]\nown_author = [\"bot\"]".to_owned(),
+                "outputs.push_to_pull_request_branch.own_author is not a login",
             ),
             ("not TOML", "repos = [".to_owned(), "decode TOML"),
         ] {

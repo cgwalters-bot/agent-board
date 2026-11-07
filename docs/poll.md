@@ -607,7 +607,12 @@ it is a `needs-human` wait on the operator, as the pass's needs-you list
 reads it. On the
 operator's comments the thread's line says the same and the comments are
 handled, as for a `left to a person` thread. Merges and every other step are
-unchanged. Only those two keys are read; the rest is agentic-job's. A glob is
+unchanged. With `own_author = "LOGIN"` beside those `branches`
+(agentic-job#3164), a pull request LOGIN authored is inside in a repository
+`repos` does not list, as agentic-job's policy step admits it; the login
+compares case-insensitively and the branch globs still apply. Without it, the
+bot's own pull request in an unlisted repository is outside, as before.
+Only those three keys are read; the rest is agentic-job's. A glob is
 read only as `OWNER/*` in `repos` (owner and name compare case-insensitively)
 and `PREFIX/**` in `branches` (any branch starting `PREFIX/`), and any other
 `*`, `?`, `[` or `{`, a missing key or a value that is not an array of strings
@@ -619,7 +624,8 @@ The flag repeats, as tracker picks one bounds file per repository
 (`midstream-fix.toml` for its midstream forks, `fix.toml` for the rest). A
 pull request is then inside where any one file admits both its repository
 and its head branch; a repository one file admits paired with a branch only
-another admits is refused, since no single file allows that run. The line
+another admits is refused, since no single file allows that run, and so is
+an `own_author` from one file with a branch only another admits. The line
 names the repository where no file admits it, and otherwise the head branch.
 The pass's direction check refuses a repository that any of the files admits.
 
@@ -671,6 +677,24 @@ the repository's own checks or review stay the operator's, as does every step
 on someone else's pull request there. Where such a round cannot start, the
 stop it would label is left to the operator with nothing written for it. The
 same holds in a repository only the pass's `authored` sweep added.
+
+With the pass's [`fixPlans`](pass.md#scheduling), stage 2 leaves a pull
+request outside our own space to fix plans, its line saying `skip: fixPlans
+follows upstream fixes through the midstream pull request`, unless the bot
+authored it. On the bot's own, such as one it opened upstream from its fork,
+it takes the same steps as above with or without `ownSpaceOnly`: its fix,
+continuation, rebase and answer rounds start on its reviews and failing
+checks, and a merge, stop, close or rerun of the repository's checks is left
+to the operator as a `needs-human` wait, the reason saying `OWNER/REPO is
+outside our own space, where fixPlans takes only the bot's own rounds (STEP:
+REASON)` where `ownSpaceOnly` is off. The exception is a promoted one: where the head
+repository is in our own space and a pull request there, open or closed,
+shares the head, that midstream pull request is the round ledger fix plans
+charge, and the line names it (`skip: fixPlans follows upstream fixes through
+the midstream pull request OWNER/REPO#N`). So stage 2 and a fix plan never
+start on the same pull request: the plan needs exactly one such midstream
+pull request, and stage 2 starts nothing where there is one. Where they could
+not be read, stage 2 starts nothing either.
 
 `diagnosticPool` (absent by default, which labels a pull request `needs-human`
 once its 2 fix rounds are used) gives a pull request that still fails one more
