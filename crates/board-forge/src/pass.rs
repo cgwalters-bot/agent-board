@@ -254,10 +254,7 @@ const RELEASES_PER_PASS: usize = 5;
 /// The hidden first line of the comment the pass posts as it releases one,
 /// which answers no verdict ([`Scheduler::verdict_answers`]).
 const RELEASE_MARKER: &str = "<!-- agent-board-release -->";
-/// What a triage brief that asks for a verdict says about follow-through
-/// and the operator ([`Scheduler::verdict_ask`]).
-const MECHANICAL: &str = " Mechanical follow-through (rebasing, re-running CI, fixing conflicts or refreshing a stale branch) is work, not a decision: plan it as an implement job; a rebase keeps existing Signed-off-by trailers and adds none. Only a real decision goes to the operator.";
-/// What a triage brief adds to [`MECHANICAL`] with [`Config::fix_plans`]:
+/// What a triage brief adds with [`Config::fix_plans`]:
 /// a promoted pull request's midstream one is closed, and only a `fix` run
 /// on the upstream one rewrites its branch in place, where an implement
 /// run would open another midstream pull request (agent-board#735).
@@ -6070,7 +6067,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     }
 
     /// What a triage brief adds with [`Config::triage_follow_up_days`]: the
-    /// verdict [`Self::follow_up`] reads, after [`MECHANICAL`]. Nothing
+    /// verdict [`Self::follow_up`] reads, with optional caller policy. Nothing
     /// without it.
     fn verdict_ask(&self, facts: &Facts) -> String {
         let active = if self.config.skip_active_work {
@@ -6092,13 +6089,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             false => String::new(),
         };
         format!(
-            "{MECHANICAL}{promoted} If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
+            "{promoted} If you post no plan, end your comment with one {TRIAGE_FENCE} fenced JSON block, \
              {{\"verdict\": \"VERDICT\"}}, VERDICT one of done (every part is complete), \
              obsolete (no longer wanted: close as not planned), needs-design, needs-operator, \
              needs-issue (a follow-up needs a real issue number: give its repository, title and body \
              in your comment for the controller, not needs-operator; do not invent an issue number), \
              partly, not-done or {FOLLOW_THROUGH_VERDICT} (only mechanical follow-through \
-             remains and you could not plan it; never done or needs-operator for that).{harness}{active}"
+              remains and you could not plan it).{harness}{active}"
         )
     }
 
