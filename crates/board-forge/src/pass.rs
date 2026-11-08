@@ -32,6 +32,8 @@ use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+pub(crate) mod cache;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -2746,6 +2748,7 @@ struct Bounds {
     responses: RefCell<BTreeMap<String, Value>>,
     next_responses: RefCell<BTreeMap<String, Value>>,
     response_bytes: Cell<usize>,
+    shared_responses: RefCell<cache::Responses>,
     effects: RefCell<Effects>,
     start_kind: RefCell<String>,
     /// The runs started whose dispatch named them, for the pass view.
@@ -2814,6 +2817,7 @@ impl Bounds {
             responses: RefCell::default(),
             next_responses: RefCell::default(),
             response_bytes: Cell::new(0),
+            shared_responses: RefCell::default(),
             effects: RefCell::default(),
             start_kind: RefCell::default(),
             started: RefCell::default(),
@@ -3358,6 +3362,9 @@ impl<C> Budget<'_, C> {
     /// `rateLimit { cost }` where it reads one, or else an estimate.
     fn graphql_spent(&self, mutation: bool, result: Result<Value>) -> Result<Value> {
         let bounds = self.bounds;
+        if mutation {
+            bounds.shared_responses.borrow_mut().entries.clear();
+        }
         let cost = result
             .as_ref()
             .ok()
@@ -3412,26 +3419,41 @@ impl<C: Rest> Rest for Budget<'_, C> {
         }
         let class = endpoint_class(url);
         self.spend(false, &class)?;
-        let enabled = self.bounds.cache_enabled.get()
+        let cacheable = validator.is_none()
+            && self.bounds.shared_responses.borrow().enabled
+            && self.inner.cache_context().is_some_and(|context| {
+                self.bounds.shared_responses.borrow().context.as_ref() == Some(&context)
+            })
+            && !self.bounds.starting.get()
+            && !self.bounds.finishing.get()
+            && url.starts_with(API_ROOT)
+            && !url.contains('#');
+        let enabled = validator.is_none()
+            && self.bounds.cache_enabled.get()
+            && (!self.bounds.shared_responses.borrow().enabled || cacheable)
             && !self.bounds.starting.get()
             && !self.bounds.finishing.get();
-        let cached = enabled
-            .then(|| self.bounds.responses.borrow().get(url).cloned())
-            .flatten()
-            .filter(|entry| {
-                // A full final array page can acquire a successor without
-                // changing its body/ETag. Read its current Link header fresh.
-                let per_page = url
-                    .split("per_page=")
-                    .nth(1)
-                    .and_then(|s| s.split('&').next())
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(30);
-                entry["body"].as_array().is_none_or(|a| a.len() < per_page)
-                    || entry["link"]
-                        .as_str()
-                        .is_some_and(|l| l.contains("rel=\"next\""))
-            });
+        let cached = if cacheable {
+            self.bounds.shared_responses.borrow_mut().get(url)
+        } else {
+            (enabled && !self.bounds.shared_responses.borrow().enabled)
+                .then(|| self.bounds.responses.borrow().get(url).cloned())
+                .flatten()
+        }
+        .filter(|entry| {
+            // A full final array page can acquire a successor without
+            // changing its body/ETag. Read its current Link header fresh.
+            let per_page = url
+                .split("per_page=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(30);
+            entry["body"].as_array().is_none_or(|a| a.len() < per_page)
+                || entry["link"]
+                    .as_str()
+                    .is_some_and(|l| l.contains("rel=\"next\""))
+        });
         let condition = cached.as_ref().and_then(|c| {
             c["etag"]
                 .as_str()
@@ -3445,6 +3467,7 @@ impl<C: Rest> Rest for Budget<'_, C> {
         let mut response = self.observe(self.inner.get(url, condition.or(validator)))?;
         if condition.or(validator).is_some() && response.status == 304 {
             self.bounds.refund(&class);
+            self.bounds.shared_responses.borrow_mut().modified += 1;
         }
         if response.status == 304
             && condition.is_some()
@@ -3479,7 +3502,18 @@ impl<C: Rest> Rest for Budget<'_, C> {
         if response.status == 200 {
             self.keep_publication_read(url.to_owned(), KeptRead::Rest(response.clone()));
         }
+        if cacheable {
+            self.bounds
+                .shared_responses
+                .borrow_mut()
+                .keep(url, &response);
+        }
         Ok(response)
+    }
+
+    fn get_live(&self, url: &str) -> Result<RestResponse> {
+        self.spend(false, &endpoint_class(url))?;
+        self.observe(self.inner.get_live(url))
     }
 
     /// The poll's claim, or its count of review runs, is under way: as a
@@ -3497,6 +3531,10 @@ impl<C: Rest> Rest for Budget<'_, C> {
 
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         self.spend(method != "GET", &endpoint_class(url))?;
+        // An ambiguous failed write may have committed.
+        if method != "GET" {
+            self.bounds.shared_responses.borrow_mut().entries.clear();
+        }
         let prepared = self
             .bounds
             .living
@@ -3772,6 +3810,11 @@ impl<C: Rest> Rest for Kept<'_, C> {
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
         self.inner.get_fresh(url)
     }
+
+    fn get_live(&self, url: &str) -> Result<RestResponse> {
+        self.inner.get_live(url)
+    }
+
     fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
         let key = json!({"get": url, "validator": validator});
         let read = || Ok(KeptRead::Rest(self.inner.get(url, validator)?));
@@ -3974,7 +4017,7 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     client: &C,
     dispatcher: &C,
     config: &Config,
-    (state, mode, limits, now): (State, Mode<'_>, Limits, OffsetDateTime),
+    (mut state, mode, limits, now): (State, Mode<'_>, Limits, OffsetDateTime),
     bounds: &Bounds,
 ) -> Result<Report> {
     if let Some(path) = &config.living_status {
@@ -3982,10 +4025,50 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
         *bounds.living.borrow_mut() = Some(living::Store::load(path, &config.bot, now)?);
     }
     bounds.cache_enabled.set(config.state.is_some());
-    *bounds.responses.borrow_mut() = state.pass_responses.clone();
     *bounds.publication_pending.borrow_mut() = state.holds_pending.clone();
     *bounds.publication_summary_cursor.borrow_mut() = state.holds_summary_cursor.clone();
+    // No context means no persistent shared cache (including recordings and
+    // transports without an authenticated identity). The old poll stays usable.
+    let scope = config
+        .state
+        .as_ref()
+        .and_then(|_| client.cache_context())
+        .map(|context| {
+            format!(
+                "{:x}",
+                Sha256::digest(format!("agent-board/responses/v1\0{context}\0{config:?}"))
+            )
+        });
+    if let Some(scope) = &scope {
+        state.bind_responses(scope);
+        if state.interval_seconds == 0 {
+            state.interval_seconds = poll::MIN_INTERVAL_SECONDS;
+        }
+        let mut responses = bounds.shared_responses.borrow_mut();
+        responses.enabled = true;
+        responses.context = client.cache_context();
+        responses.entries = state
+            .responses
+            .iter()
+            .filter(|(key, _)| key.ends_with(cache::REPRESENTATION))
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+    }
+    let network = || {
+        let reads = client.network_requests()?;
+        Some(
+            reads
+                + if std::ptr::eq(client, dispatcher) {
+                    0
+                } else {
+                    dispatcher.network_requests()?
+                },
+        )
+    };
+    let network_before = network();
+    *bounds.responses.borrow_mut() = state.pass_responses.clone();
     let previous = state.clone();
+    let preserved_state = scope.as_ref().map(|_| state.clone());
     let caps = Caps::new(limits);
     let mut lines = Vec::new();
     // The budget first, before any request is spent of it: the read of the
@@ -4026,6 +4109,26 @@ async fn run_within<C: Rest + Transport + crate::github::GraphQl + Broker>(
     .await;
     lines.append(&mut report.lines);
     report.lines = lines;
+    if let Some(scope) = scope {
+        let responses = bounds.shared_responses.borrow();
+        if report.state.is_none() {
+            report.state = preserved_state;
+        }
+        if let Some(state) = &mut report.state {
+            state.response_scope = Some(scope);
+            state
+                .responses
+                .retain(|key, _| bounds.writes.get() == 0 && !key.ends_with(cache::REPRESENTATION));
+            state.responses.extend(responses.entries.clone());
+            cache::bound(&mut state.responses);
+        }
+        report.lines.push(format!(
+            "cache: hits {}, misses {}, 304s {}, network sends {} (including retries), charged requests {}, GraphQL points {}",
+            responses.hits, responses.misses, responses.modified,
+            network().zip(network_before).map(|(after, before)| after.saturating_sub(before).to_string()).unwrap_or_else(|| "unavailable".into()),
+            bounds.limit.get().saturating_sub(bounds.left.get()), bounds.points.get()
+        ));
+    }
     bounds.collapse(&mut report);
     report.summary = caps.summary();
     report.spent = bounds.spent();

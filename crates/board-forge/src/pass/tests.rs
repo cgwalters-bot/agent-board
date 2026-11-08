@@ -536,12 +536,76 @@ impl crate::github::GraphQl for ConditionalFixture {
     }
 }
 
+/// Replay the same server state with synthetic ETags. This measures the
+/// transport opportunity, not GitHub's actual validator availability or costs.
+struct ConditionalRecording {
+    replay: Replay,
+    reads: RefCell<BTreeMap<String, usize>>,
+}
+
+impl ConditionalRecording {
+    fn count(&self, key: String) {
+        *self.reads.borrow_mut().entry(key).or_default() += 1;
+    }
+}
+
+impl Rest for ConditionalRecording {
+    fn network_requests(&self) -> Option<usize> {
+        Some(self.reads.borrow().values().sum())
+    }
+
+    fn cache_context(&self) -> Option<String> {
+        Some("recorded-identity".into())
+    }
+
+    fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+        self.count(format!("REST {url}"));
+        let mut response = self.replay.get(url, None)?;
+        if response.status == 200 {
+            let etag = format!("{:x}", Sha256::digest(response.body.to_string()));
+            if validator == Some(("If-None-Match", etag.as_str())) {
+                response.status = 304;
+                response.body = Value::Null;
+            }
+            response.etag = Some(etag);
+        }
+        Ok(response)
+    }
+
+    fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
+        self.replay.send(method, url, body)
+    }
+}
+
+impl Transport for ConditionalRecording {
+    fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        self.count(format!("GraphQL {query}"));
+        self.replay.data(query, variables)
+    }
+}
+
+impl crate::github::GraphQl for ConditionalRecording {
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        Transport::graphql(self, query, variables)
+    }
+}
+
 impl Broker for ConditionalFixture {
     fn usage(&self, url: &str) -> Result<Value> {
         self.0.usage(url)
     }
     fn grant(&self, url: &str) -> Result<Value> {
         self.0.grant(url)
+    }
+}
+
+impl Broker for ConditionalRecording {
+    fn usage(&self, url: &str) -> Result<Value> {
+        self.replay.usage(url)
+    }
+
+    fn grant(&self, url: &str) -> Result<Value> {
+        self.replay.grant(url)
     }
 }
 
@@ -686,6 +750,78 @@ fn top_down_does_not_trust_a_label_without_its_author() {
                 .any(|h| matches!(h.hold.kind, HoldKind::EpicNotLive | HoldKind::Unreadable))
         );
     }
+}
+
+#[test]
+fn response_cache_recorded_steady_state_comparison() {
+    let mut replay = replay();
+    rest_comment_pages(&mut replay);
+    let forge = ConditionalRecording {
+        replay,
+        reads: RefCell::default(),
+    };
+    let config = config(json!({"state": ".state/poll.json"}));
+    let pass = |state| {
+        block(run(
+            &forge,
+            &forge,
+            &config,
+            state,
+            (Mode::Preview, Limits::default()),
+            forge.replay.now,
+        ))
+        .unwrap()
+    };
+    let cold = pass(State::default());
+    assert_eq!(cold.failures, 0, "{:?}", cold.lines);
+    let saved = State::from_json(&cold.state.unwrap().to_json()).unwrap();
+    forge.reads.borrow_mut().clear();
+    let warm = pass(saved.clone());
+    let warm_network: usize = forge.reads.borrow().values().sum();
+    let mut hot: Vec<_> = forge
+        .reads
+        .borrow()
+        .iter()
+        .map(|(k, n)| (k.clone(), *n))
+        .collect();
+    hot.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (key, count) in hot.iter().take(12) {
+        eprintln!(
+            "trace: {count} {} [{:x}]",
+            key.chars().take(120).collect::<String>(),
+            Sha256::digest(key)
+        );
+    }
+    let mut lost_state = saved;
+    // Lose only the disposable response data, not waiting asks or cursors.
+    lost_state.responses.clear();
+    forge.reads.borrow_mut().clear();
+    let lost = pass(lost_state);
+    let lost_network: usize = forge.reads.borrow().values().sum();
+    assert_eq!(warm.failures, 0, "{:?}", warm.lines);
+    assert_eq!(lost.failures, 0, "{:?}", lost.lines);
+    let decisions = |r: &Report| {
+        r.lines
+            .iter()
+            .filter(|l| !l.starts_with("cache:") && !l.starts_with("activity "))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(decisions(&warm), decisions(&lost));
+    assert_eq!(warm.planned_starts, lost.planned_starts);
+    assert!(warm.spent.requests < lost.spent.requests);
+    eprintln!(
+        "measured: cold charged {}; warm charged {}, transport {}, 304s {}, points {}; lost charged {}, transport {}, 304s {}, points {}",
+        cold.spent.requests,
+        warm.spent.requests,
+        warm_network,
+        warm.spent.revalidated,
+        warm.spent.points,
+        lost.spent.requests,
+        lost_network,
+        lost.spent.revalidated,
+        lost.spent.points
+    );
 }
 
 fn at(stamp: &str) -> OffsetDateTime {
