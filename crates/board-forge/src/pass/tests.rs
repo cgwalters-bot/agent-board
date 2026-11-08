@@ -13750,7 +13750,7 @@ fn config_table() {
                 both["follow"] = json!(["O/FORK"]);
                 both
             },
-            "promote fork o/fork is also in follow; a fork's pull requests are promoted, never merged",
+            "promote fork o/fork is also in follow without midstream ownership; a fork's pull requests are promoted, never merged",
         ),
         (
             promote(json!({"signoff": "-"})),
@@ -13813,24 +13813,30 @@ fn config_table() {
     assert!(
         format!("{:#}", Config::parse(duplicate).unwrap_err()).contains("pool a is named twice")
     );
-    // Promote is off when absent and with empty `forks`, which need nothing
-    // else; with forks it says how many, and that nothing evaluates them.
-    for (edit, line) in [
-        (json!({}), "promote: off"),
-        (json!({"promote": {}}), "promote: off"),
-        (json!({"promote": {"forks": {}}}), "promote: off"),
-        (
-            promote(json!({})),
-            "promote: 1 fork(s) configured; evaluation is not built",
-        ),
-        (
-            promote(json!({"policyPath": "-"})),
-            "promote: 1 fork(s) configured; evaluation is not built",
-        ),
+    for (edit, enabled) in [
+        (json!({}), false),
+        (json!({"promote": {}}), false),
+        (json!({"promote": {"forks": {}}}), false),
+        (promote(json!({})), true),
+        (promote(json!({"policyPath": "-"})), true),
     ] {
         let parsed = config(edit.clone());
-        assert_eq!(promote::line(parsed.promote.as_ref()), line, "{edit}");
+        assert_eq!(crate::promote::enabled(&parsed), enabled, "{edit}");
     }
+    let mut followed_promote = promote(json!({}));
+    followed_promote["follow"] = json!(["O/FORK"]);
+    followed_promote["midstream"] = json!({"owner":"o", "topic":"bot-midstream"});
+    assert!(
+        Config::parse(&{
+            let mut value = minimal.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(followed_promote.as_object().unwrap().clone());
+            value.to_string()
+        })
+        .is_ok()
+    );
     // The harness's repositories alone set no budget and need no broker.
     let mut harness = minimal.clone();
     harness["budget"] = json!({"harnessRepositories": ["o/r"]});
@@ -15314,18 +15320,291 @@ fn live_epics_name_the_authored_priority() {
     }
 }
 
+/// Pass view scenarios reuse the public promotion observations and explicit
+/// hypothetical edits; `view` has no mutation authority, even with publish set.
+#[test]
+fn promotion_view_is_read_only_and_budgeted() {
+    use crate::promote::tests::{awaiting_scenario, discovery};
+    for case in [
+        "behind",
+        "needs-human",
+        "policy missing",
+        "DCO",
+        "silent",
+        "budget",
+        "time",
+        "read error",
+        "unreadable compare",
+        "missing behind",
+        "malformed detail",
+        "canceled command",
+        "stale permission",
+    ] {
+        let (mut replay, cfg) = awaiting_scenario();
+        let mut expected = "DCO sign-off rewrite required";
+        let mut failures = 0;
+        match case {
+            "behind" => {
+                answer(&mut replay, "/compare/")["body"]["behind_by"] = json!(31);
+                expected = "needs rebase and a fresh approval or command (behind_by=31)";
+            }
+            "needs-human" => {
+                let e = replay
+                    .requests
+                    .iter_mut()
+                    .find(|e| {
+                        e["request"]["get"]
+                            .as_str()
+                            .is_some_and(|s| s.ends_with("/pulls/34"))
+                    })
+                    .unwrap();
+                e["answer"]["body"]["labels"] = json!([{"name":"needs-human"}]);
+                expected = "needs-human";
+            }
+            "policy missing" => {
+                answer(
+                    &mut replay,
+                    "contents/upstream-policy/composefs/composefs-rs.md",
+                )["status"] = json!(404);
+                expected = "policy missing: no record at cgwalters-forge/tracker:upstream-policy/composefs/composefs-rs.md";
+            }
+            "silent" => discovery(&mut replay, &cfg, |d| {
+                d["repository"]["pullRequests"]["nodes"][0]["reviews"]["nodes"] = json!([])
+            }),
+            "read error" => {
+                answer(&mut replay, "/compare/")["status"] = json!(502);
+                failures = 1;
+            }
+            "unreadable compare" => {
+                answer(&mut replay, "/compare/")["body"] = json!({});
+                failures = 1;
+            }
+            "missing behind" => {
+                answer(&mut replay, "/compare/")["body"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("behind_by");
+                failures = 1;
+            }
+            "malformed detail" => {
+                let e = replay
+                    .requests
+                    .iter_mut()
+                    .find(|e| {
+                        e["request"]["get"]
+                            .as_str()
+                            .is_some_and(|s| s.ends_with("/pulls/34"))
+                    })
+                    .unwrap();
+                e["answer"]["body"].as_object_mut().unwrap().remove("body");
+                failures = 1;
+            }
+            "canceled command" => {
+                // Discovery sees an old command; complete revalidation sees
+                // the later change request. It is no longer awaiting promotion.
+                discovery(&mut replay, &cfg, |d| {
+                    let p = &mut d["repository"]["pullRequests"]["nodes"][0];
+                    p["reviews"]["nodes"][0]["state"] = json!("CHANGES_REQUESTED");
+                    p["comments"]["nodes"] =
+                        json!([{"author":{"login":"cgwalters"},"body":"/promote"}]);
+                });
+                crate::promote::tests::cancel_awaiting(&mut replay);
+            }
+            "stale permission" => {
+                answer(&mut replay, "/pulls/34/reviews?")["body"][0]["submitted_at"] =
+                    json!("2026-10-22T00:00:00Z");
+            }
+            _ => {}
+        }
+        let bounds = Bounds::new(
+            if case == "budget" {
+                WRITE_RESERVE + 1
+            } else {
+                PASS_REQUEST_LIMIT
+            },
+            Instant::now() + Duration::from_secs(60),
+        );
+        if case == "time" {
+            // Discovery succeeded in a previous pass is not assumed: when no
+            // discovery can run, report its incompleteness explicitly.
+            let expired = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() - Duration::from_secs(1));
+            let budget = Budget {
+                inner: &replay,
+                bounds: &expired,
+            };
+            assert_eq!(promote::view(&budget, &cfg, replay.now), (vec!["promote: discovery incomplete (budget); fork cgwalters-forge/composefs-rs not evaluated".into()], 0));
+            continue;
+        }
+        let budget = Budget {
+            inner: &replay,
+            bounds: &bounds,
+        };
+        let (lines, errors) = promote::view(&budget, &cfg, replay.now);
+        assert_eq!(errors, failures, "{case}: {lines:?}");
+        assert_eq!(bounds.writes.get(), 0, "{case}");
+        match case {
+            "silent" => {
+                assert!(lines.is_empty());
+                assert_eq!(bounds.spent().requests, 1);
+            }
+            "canceled command" | "stale permission" => {
+                assert!(lines.is_empty(), "{case}: {lines:?}")
+            }
+            "budget" => assert_eq!(lines, ["promote: 1 candidate(s) not evaluated (budget)"]),
+            "read error" | "unreadable compare" | "missing behind" | "malformed detail" => assert!(
+                lines[0].starts_with("promote error: cgwalters-forge/composefs-rs#34:"),
+                "{lines:?}"
+            ),
+            _ => assert_eq!(
+                lines,
+                [format!(
+                    "promote awaiting cgwalters-forge/composefs-rs#34: {expected}"
+                )],
+                "{case}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn promotion_policy_absence_is_a_hold_for_live_and_replay_clients() {
+    struct LiveNotFound<'a>(&'a Replay);
+    impl Rest for LiveNotFound<'_> {
+        fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
+            let response = self.0.get(url, validator)?;
+            if response.status == 404 {
+                return Err(crate::github::NotFound.into());
+            }
+            Ok(response)
+        }
+        fn send(&self, _: &str, _: &str, _: &Value) -> Result<(u16, Value)> {
+            bail!("read-only test")
+        }
+    }
+    impl Transport for LiveNotFound<'_> {
+        fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+            self.0.graphql(query, variables)
+        }
+    }
+    let (mut replay, cfg) = crate::promote::tests::awaiting_scenario();
+    // First verify that optional absent policy-scan directories are ordinary
+    // absence, then that an absent record is the first held gate.
+    for missing in [false, true] {
+        if missing {
+            answer(
+                &mut replay,
+                "contents/upstream-policy/composefs/composefs-rs.md",
+            )["status"] = json!(404);
+        }
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let budget = Budget {
+            inner: &replay,
+            bounds: &bounds,
+        };
+        let expected = promote::view(&budget, &cfg, replay.now);
+        let live = LiveNotFound(&replay);
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let budget = Budget {
+            inner: &live,
+            bounds: &bounds,
+        };
+        assert_eq!(promote::view(&budget, &cfg, replay.now), expected);
+        assert_eq!(expected.1, 0);
+        assert!(expected.0[0].contains(if missing {
+            "policy missing"
+        } else {
+            "DCO sign-off rewrite required"
+        }));
+    }
+}
+
+#[test]
+fn promotion_provenance_distinguishes_missing_authorship_from_unreadable_evidence() {
+    for case in ["valid", "other editor", "malformed", "truncated"] {
+        let (mut replay, cfg) = crate::promote::tests::awaiting_human_scenario();
+        let p = &mut replay
+            .requests
+            .iter_mut()
+            .find(|e| {
+                e["answer"]["data"]["repository"]["pullRequest"]["userContentEdits"].is_object()
+            })
+            .unwrap()["answer"]["data"]["repository"]["pullRequest"];
+        match case {
+            "other editor" => p["editor"]["login"] = json!("someone-else"),
+            "malformed" => {
+                p["userContentEdits"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("nodes");
+            }
+            "truncated" => p["userContentEdits"]["pageInfo"]["hasNextPage"] = json!(true),
+            _ => {}
+        }
+        let bounds = Bounds::new(PASS_REQUEST_LIMIT, Instant::now() + Duration::from_secs(60));
+        let budget = Budget {
+            inner: &replay,
+            bounds: &bounds,
+        };
+        let (lines, failures) = promote::view(&budget, &cfg, replay.now);
+        let unreadable = matches!(case, "malformed" | "truncated");
+        assert_eq!(failures, usize::from(unreadable), "{case}: {lines:?}");
+        assert!(
+            lines[0].starts_with(if unreadable {
+                "promote error:"
+            } else {
+                "promote awaiting"
+            }),
+            "{case}: {lines:?}"
+        );
+        assert_eq!(bounds.writes.get(), 0);
+    }
+}
+
+#[test]
+fn applying_pass_never_publishes_promotion_candidates() {
+    for bad_read in [false, true] {
+        let (mut promotion, mut cfg) = crate::promote::tests::awaiting_scenario();
+        cfg.promote.as_mut().unwrap().publish = true;
+        let mut settings = config(json!({"wip":0,"workRepositories":[]}));
+        settings.promote = cfg.promote;
+        if bad_read {
+            answer(&mut promotion, "/compare/")["status"] = json!(502);
+        }
+        let mut forge = Forge::new(None, false);
+        forge.replay.requests.extend(promotion.requests);
+        let report = apply(&forge, &settings);
+        assert_eq!(report.failures, usize::from(bad_read), "{:?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| l.starts_with(if bad_read {
+                "promote error:"
+            } else {
+                "promote awaiting cgwalters-forge/composefs-rs#34: DCO sign-off rewrite required"
+            })),
+            "{:?}",
+            report.lines
+        );
+        assert!(
+            forge
+                .writes
+                .borrow()
+                .iter()
+                .all(|(_, url, _)| !url.contains("composefs"))
+        );
+    }
+}
+
 #[test]
 fn no_merge_preserves_followed_rounds_and_holds() {
     const REPO: &str = "cgwalters-forge/agentic-job";
     let approval = json!({"nodes": [{"state": "APPROVED", "author": {"__typename": "User", "login": "cgwalters"},
         "commit": {"oid": "abc"}, "submittedAt": "2026-10-23T00:00:00Z", "body": "Approved"}],
         "pageInfo": {"hasPreviousPage": false}});
-    let sources = ["listed", "topic", "authored"];
+    let sources = ["listed", "topic", "promote", "missing-topic", "authored"];
     for (queued, source) in [false, true]
         .into_iter()
         .flat_map(|q| sources.map(|s| (q, s)))
     {
-        let topic = source == "topic";
+        let topic = matches!(source, "topic" | "promote" | "missing-topic");
         for (name, change, action) in [
             ("ready", json!({}), "wait: pr.noMerge:"),
             ("conflict", json!({"mergeable": "CONFLICTING"}), "rebase:"),
@@ -15374,12 +15653,36 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                     (
                         &second,
                         json!(null),
-                        json!([{"full_name": REPO, "topics": ["rust", "bot-midstream"]}]),
+                        json!([{"full_name": REPO, "topics": if source == "missing-topic" {json!(["rust"])} else {json!(["rust", "bot-midstream"])}}]),
                     ),
                 ] {
                     forge.replay.requests.push(json!({"request": {"get": url},
                         "answer": {"status": 200, "link": link, "body": body}}));
                 }
+            }
+            if source == "promote" || source == "missing-topic" {
+                settings["follow"] = json!([REPO]);
+                settings["promote"] = json!({"forks": {REPO: {"upstream":"example/upstream", "base":"main"}},
+                    "signoff":{"name":"Op", "email":"op@example.invalid"}, "policyRepository":"cgwalters-forge/tracker"});
+                struct Empty;
+                impl Transport for Empty {
+                    fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+                        Ok(
+                            json!({"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}),
+                        )
+                    }
+                }
+                let recorder = Recorder::new(&Empty);
+                crate::promote::awaiting::candidates(&recorder, &config(settings.clone()), REPO)
+                    .unwrap();
+                forge.replay.requests.extend(
+                    Replay::from_json(
+                        &serde_json::from_str(&recorder.fixture(forge.replay.now).unwrap())
+                            .unwrap(),
+                    )
+                    .unwrap()
+                    .requests,
+                );
             }
             // The same, with REPO neither listed nor tagged but found by the
             // search for the bot's open pull requests, over two pages. There
@@ -15425,6 +15728,11 @@ fn no_merge_preserves_followed_rounds_and_holds() {
             let cfg = config(settings);
             for report in [preview(&cfg, &forge.replay), apply(&forge, &cfg)] {
                 let lines = &report.lines;
+                if source == "missing-topic" {
+                    assert_eq!(report.failures, 1, "{lines:?}");
+                    assert!(lines.iter().any(|l| l == &format!("follow error: promote fork {REPO} is not a topic-selected midstream")), "{lines:?}");
+                    continue;
+                }
                 assert_eq!(
                     report.failures, 0,
                     "{name} {source} queue={queued}: {lines:?}"
@@ -15649,16 +15957,6 @@ fn midstream_listing_failures_stop_stage_2() {
         // Read, but naming what `follow` may not, or leaving out a work
         // repository `pr.unstall` needs.
         (
-            "promote",
-            vec![(
-                first.clone(),
-                200,
-                json!(null),
-                tagged("cgwalters-forge/ostree"),
-            )],
-            "midstream cgwalters-forge/ostree is the direction repository or a promote fork",
-        ),
-        (
             "direction",
             vec![(
                 first.clone(),
@@ -15666,7 +15964,7 @@ fn midstream_listing_failures_stop_stage_2() {
                 json!(null),
                 tagged("cgwalters-forge/operator"),
             )],
-            "midstream cgwalters-forge/operator is the direction repository or a promote fork",
+            "midstream cgwalters-forge/operator is the direction repository",
         ),
         (
             "unstall",

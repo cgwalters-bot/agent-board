@@ -15,6 +15,85 @@ use crate::{
 const API: &str = "https://api.github.com/";
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 10;
+
+/// An unreadable response, distinct from a well-read fact holding promotion.
+#[derive(Debug)]
+pub(crate) struct ReadFailure(String);
+
+impl std::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ReadFailure {}
+
+#[derive(Debug)]
+struct Held(String);
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Held {}
+
+#[derive(Debug)]
+pub(crate) struct NotSelected(String);
+
+impl std::fmt::Display for NotSelected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotSelected {}
+
+macro_rules! hold {
+    ($condition:expr, $($message:tt)*) => {
+        if !$condition { return Err(Held(format!($($message)*)).into()); }
+    };
+}
+
+/// Cached failures retain their classification, not just rendered diagnostics.
+#[derive(Clone)]
+struct GateFailure {
+    why: String,
+    operational: bool,
+}
+
+impl std::fmt::Display for GateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl GateFailure {
+    fn policy(error: anyhow::Error) -> Self {
+        Self {
+            operational: !error.is::<Held>(),
+            why: format!("{error:#}"),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        if self.operational {
+            ReadFailure(self.why).into()
+        } else {
+            Held(self.why).into()
+        }
+    }
+}
+
+type Policies = BTreeMap<String, std::result::Result<policy::Permitted, GateFailure>>;
+
+fn read_failure(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::github::RateLimited>() || error.is::<pass::ShareSpent>() {
+        return error;
+    }
+    ReadFailure(format!("{error:#}")).into()
+}
 pub const REMAINING: &str = "promote: preview only; publication requires promote.publish, --apply and --max-writes; DCO rewrites and fork closure not implemented; bot-fork heads require recorded staging verification";
 
 /// Authenticated command selection and its observed branch binding, not output
@@ -53,6 +132,38 @@ enum Gates {
         detail: String,
         signoffs: usize,
     },
+}
+
+/// Shared read-only assessment; rendered CLI lines are never parsed as facts.
+fn assess(
+    client: &(impl Rest + Transport),
+    config: &Config,
+    repo: &str,
+    pull: &Value,
+    target: &pass::promote::Fork,
+    command: &Command,
+    policies: &mut Policies,
+) -> Result<(Gates, std::result::Result<&'static str, GateFailure>)> {
+    let gate = gates(client, config, repo, pull, &target.upstream, &target.base)?;
+    if matches!(gate, Gates::Promoted(_)) {
+        return Ok((gate, Ok("")));
+    }
+    let policy = policies
+        .entry(target.upstream.to_ascii_lowercase())
+        .or_insert_with(|| {
+            policy::gate(client, config, &target.upstream).map_err(GateFailure::policy)
+        });
+    let verdict = match policy {
+        Ok(policy::Permitted::BotOk) => Ok("bot-ok"),
+        Ok(policy::Permitted::HumanText) => provenance::verify(client, config, repo, pull, command)
+            .map(|()| "human-text; provenance verified")
+            .map_err(|e| GateFailure {
+                operational: !e.is::<Held>(),
+                why: format!("needs-text: {e:#}"),
+            }),
+        Err(why) => Err(why.clone()),
+    };
+    Ok((gate, verdict))
 }
 
 pub fn enabled(config: &Config) -> bool {
@@ -115,36 +226,22 @@ pub fn preview<C: Rest + Transport>(
                 );
                 match evidence {
                     Ok(command) => {
-                        match gates(client, config, repo, &pull, &target.upstream, &target.base) {
-                            Ok(Gates::Promoted(result)) => {
+                        match assess(client, config, repo, &pull, target, &command, &mut policies) {
+                            Ok((Gates::Promoted(result), _)) => {
                                 lines.push(format!("{result}; head={head} {command}; staging verification required for bot-fork head"));
                             }
-                            Ok(Gates::Ready {
-                                summary, detail, ..
-                            }) => {
-                                let policy = policies
-                                    .entry(target.upstream.to_ascii_lowercase())
-                                    .or_insert_with(|| {
-                                        policy::gate(client, config, &target.upstream)
-                                            .map_err(|e| format!("{e:#}"))
-                                    });
-                                let permission = match policy {
-                                    Ok(policy::Permitted::BotOk) => Ok("bot-ok"),
-                                    Ok(policy::Permitted::HumanText) => {
-                                        provenance::verify(client, config, repo, &pull, &command)
-                                            .map(|()| "human-text; provenance verified")
-                                            .map_err(|e| format!("needs-text: {e:#}"))
-                                    }
-                                    Err(why) => Err(why.clone()),
-                                };
+                            Ok((
+                                Gates::Ready {
+                                    summary, detail, ..
+                                },
+                                permission,
+                            )) => {
                                 lines.push(match permission {
                                     Ok(verdict) => format!(
-                                         "would promote {repo}#{number} -> {} ({summary}) (policy {verdict}); preview only; publication revalidates approval and all gates; {detail}; head={head} {command}; staging verification required for bot-fork head",
-                                        target.upstream
+                                          "would promote {repo}#{number} -> {} ({summary}) (policy {verdict}); preview only; publication revalidates approval and all gates; {detail}; head={head} {command}; staging verification required for bot-fork head",
+                                         target.upstream
                                     ),
-                                    Err(why) => {
-                                        format!("hold promote {repo}#{number} head={head}: {why}")
-                                    }
+                                    Err(why) => format!("hold promote {repo}#{number} head={head}: {why}"),
                                 });
                             }
                             Err(error) => lines.push(format!(
@@ -264,11 +361,11 @@ fn gates_impl(
             .as_u64()
             .filter(|n| *n > 0)
             .context("invalid upstream pull number")?;
-        ensure!(
+        hold!(
             p["state"] == "open",
             "upstream {upstream}#{n} is closed/merged"
         );
-        ensure!(
+        hold!(
             p["head"]["sha"] == head,
             "upstream {upstream}#{n} has a different head"
         );
@@ -286,15 +383,15 @@ fn gates_impl(
     let compare = comparison(client, &path, head)?;
     let ahead = compare["ahead_by"].as_u64().context("missing ahead_by")?;
     let behind = compare["behind_by"].as_u64().context("missing behind_by")?;
-    ensure!(ahead > 0, "already upstream (zero ahead)");
-    ensure!(
+    hold!(ahead > 0, "already upstream (zero ahead)");
+    hold!(
         behind == 0,
-        "needs rebase and a fresh /promote (behind_by={behind})"
+        "needs rebase and a fresh approval or command (behind_by={behind})"
     );
     let stack = stack_gate(client, config, repo, pull, upstream, base)?;
     let dco = dco_gate(client, config, upstream, base, &compare, head)?;
     let text = pull["body"].as_str().context("missing pull body")?;
-    ensure!(!text.trim().is_empty(), "empty body");
+    hold!(!text.trim().is_empty(), "empty body");
     let title = pull["title"].as_str().context("missing pull title")?;
     for text in [title, text] {
         // A qualified reference keeps its meaning; any bare reference changes
@@ -307,14 +404,14 @@ fn gates_impl(
                     .next()
                     .unwrap_or_default();
                 let qualified = validate_repository(qualifier).is_ok();
-                ensure!(
+                hold!(
                     qualified,
                     "text has a bare #N reference that changes repository upstream"
                 );
             }
         }
         for n in referenced_numbers(text) {
-            ensure!(
+            hold!(
                 !crate::stack::closes(text, repo, n),
                 "text has a closing reference to {repo}#{n}"
             );
@@ -456,7 +553,7 @@ fn stack_gate(
         .into_iter()
         .filter(|n| crate::stack::closes(text, repo, *n) || crate::stack::part_of(text, repo, *n))
         .collect();
-    ensure!(
+    hold!(
         issues.len() == 1,
         "cannot tie fork PR to one issue deterministically{}",
         if text.trim().is_empty() {
@@ -475,8 +572,9 @@ fn stack_gate(
     if crate::plan::no_plan(&comments, &writers) {
         return Ok("stack=none (no plan)".into());
     }
-    let (plan, _) = crate::plan::newest_plan(&comments, &writers)?;
-    ensure!(
+    let (plan, _) =
+        crate::plan::newest_plan(&comments, &writers).map_err(|e| Held(format!("{e:#}")))?;
+    hold!(
         plan.repo.eq_ignore_ascii_case(repo) && plan.item == issue.number,
         "accepted plan issue mismatch"
     );
@@ -498,7 +596,7 @@ fn stack_gate(
                     || crate::stack::part_of(body, repo, lower))
         })
         .collect();
-    ensure!(
+    hold!(
         parents.len() == 1,
         "stack parent {repo}#{lower} has no unique fork PR"
     );
@@ -528,27 +626,33 @@ fn stack_gate(
             .filter(|n| *n > 0)
             .context("invalid parent upstream PR number")?;
         if p["state"] == "closed" && p["merged_at"].is_string() {
-            ensure!(
+            hold!(
                 p["base"]["ref"] == base,
                 "stack parent {upstream}#{pn}: merged into a different base, not {base}"
             );
-            ensure!(
+            hold!(
                 p["head"]["sha"] == parent_head,
                 "stack parent {upstream}#{pn}: merged head differs from fork parent {repo}#{n}"
             );
             return Ok(format!("stack={repo}#{n} -> {upstream}#{pn} merged"));
         }
-        ensure!(
+        hold!(
             p["state"] != "open",
             "stack parent {upstream}#{pn}: open upstream PR"
         );
-        anyhow::bail!("stack parent {upstream}#{pn}: closed unmerged; rebase by hand");
+        return Err(Held(format!(
+            "stack parent {upstream}#{pn}: closed unmerged; rebase by hand"
+        ))
+        .into());
     }
-    ensure!(
+    hold!(
         parent["state"] != "open",
         "stack parent {repo}#{n}: open fork PR"
     );
-    anyhow::bail!("stack parent {repo}#{n}: closed unmerged; rebase by hand")
+    Err(Held(format!(
+        "stack parent {repo}#{n}: closed unmerged; rebase by hand"
+    ))
+    .into())
 }
 
 fn dco_gate(
@@ -664,7 +768,7 @@ fn dco_gate(
             commits.last().is_some_and(|c| c["sha"] == head),
             "compare head mismatch"
         );
-        ensure!(
+        hold!(
             problems.is_empty(),
             "missing sign-off on {missing} of {} commits: {}",
             commits.len(),
@@ -735,6 +839,21 @@ fn in_network(value: &Value, upstream: &str) -> bool {
         })
 }
 
+fn observed_network(value: &Value, upstream: &str) -> Result<bool> {
+    let fork = value["fork"]
+        .as_bool()
+        .context("missing repository fork flag")?;
+    if fork {
+        ensure!(
+            ["parent", "source"]
+                .iter()
+                .any(|k| value[*k]["full_name"].is_string()),
+            "missing repository network identity"
+        );
+    }
+    Ok(in_network(value, upstream))
+}
+
 fn at(value: &Value) -> Result<OffsetDateTime> {
     OffsetDateTime::parse(value.as_str().context("missing evidence time")?, &Rfc3339)
         .context("invalid evidence time")
@@ -748,10 +867,10 @@ fn evaluate(
     (network, upstream): (bool, &str),
     now: OffsetDateTime,
 ) -> Result<Command> {
-    ensure!(network, "fork-network mismatch");
-    ensure!(pull["state"] == "open", "pull is not open");
+    hold!(network, "fork-network mismatch");
+    hold!(pull["state"] == "open", "pull is not open");
     repository(&pull["base"]["repo"], repo)?;
-    ensure!(
+    hold!(
         pull["user"]["login"]
             .as_str()
             .is_some_and(|s| s.eq_ignore_ascii_case(&config.bot)),
@@ -774,15 +893,15 @@ fn evaluate(
         .as_str()
         .context("missing head branch")?;
     validate_branch(branch)?;
-    ensure!(
+    hold!(
         (owner.eq_ignore_ascii_case(&config.bot) || head_repo.eq_ignore_ascii_case(repo))
             && (branch.starts_with("bot/") || branch.starts_with("dispatch/")),
         "not a bot-owned branch"
     );
     let head_metadata = get(client, &format!("repos/{head_repo}"))?;
     repository(&head_metadata, head_repo)?;
-    ensure!(
-        in_network(&head_metadata, upstream),
+    hold!(
+        observed_network(&head_metadata, upstream)?,
         "head fork-network mismatch"
     );
     let reference = format!("refs/heads/{branch}");
@@ -803,18 +922,43 @@ fn evaluate(
     )?;
     let metadata = crate::plan::comment_metadata(client, &item, true)?;
     let reviews = pages(client, &format!("repos/{repo}/pulls/{number}/reviews"))?;
+    // Validate the complete observation before selecting a decision. Otherwise
+    // a malformed latest review could look like no permission and disappear
+    // from the pass without reporting the unreadable evidence.
+    let mut previous = None;
+    let mut ids = BTreeSet::new();
+    for review in &reviews {
+        let id = review["id"].as_u64().context("missing review id")?;
+        ensure!(ids.insert(id), "duplicate review evidence");
+        ensure!(review["user"]["login"].is_string(), "missing review author");
+        ensure!(review["state"].is_string(), "missing review state");
+        if review["user"]["login"]
+            .as_str()
+            .is_some_and(|a| a.eq_ignore_ascii_case(&config.operator))
+        {
+            ensure!(
+                matches!(
+                    review["state"].as_str(),
+                    Some("APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED")
+                ),
+                "unknown operator review state"
+            );
+        }
+        let submitted = at(&review["submitted_at"])?;
+        ensure!(
+            submitted <= now && previous.is_none_or(|p| submitted >= p),
+            "out-of-order reviews"
+        );
+        previous = Some(submitted);
+    }
     let on_approval = config.promote.as_ref().is_some_and(|p| p.on_approval);
-    ensure!(on_approval || pull["draft"] == false, "draft");
+    if !on_approval && pull["draft"] != false {
+        return Err(NotSelected("draft".into()).into());
+    }
     let labels = pull["labels"].as_array().context("missing labels")?;
     for label in labels {
         ensure!(label["name"].is_string(), "missing label name");
     }
-    ensure!(
-        !labels.iter().any(|l| l["name"]
-            .as_str()
-            .is_some_and(|s| s.eq_ignore_ascii_case("needs-human"))),
-        "needs-human"
-    );
     let mut command = None;
     ensure!(
         metadata.len() == comments.len(),
@@ -888,49 +1032,41 @@ fn evaluate(
     if command.is_none() && on_approval && pull["draft"] == true {
         command = approval(client, &reviews, config, (repo, number), head, pushed)?;
     }
-    let (url, created, human_text) = command.with_context(|| {
-        stale.unwrap_or_else(|| {
+    let (url, created, human_text) = command.ok_or_else(|| {
+        NotSelected(stale.unwrap_or_else(|| {
             if on_approval {
                 "no operator command or approval after observed push".into()
             } else {
                 "no operator command after observed push".into()
             }
-        })
+        }))
     })?;
     let evidence = format!(
         "command={url} at={} human-text={human_text} push={}",
         created.format(&Rfc3339)?,
         pushed.format(&Rfc3339)?
     );
-    (|| {
-        let mut previous = None;
-        let mut ids = BTreeSet::new();
+    let selected = (|| {
         for review in &reviews {
-            let id = review["id"].as_u64().context("missing review id")?;
-            ensure!(ids.insert(id), "duplicate review evidence");
             let author = review["user"]["login"]
                 .as_str()
                 .context("missing review author")?;
             let submitted = at(&review["submitted_at"])?;
-            ensure!(
-                submitted <= now && previous.is_none_or(|p| submitted >= p),
-                "out-of-order reviews"
-            );
-            previous = Some(submitted);
             if !author.eq_ignore_ascii_case(&config.operator) {
                 continue;
             }
             let state = review["state"].as_str().context("missing review state")?;
             // REST dates the original submission, not the dismissal. Without a
             // proved dismissal time no command can be proved newer than it.
-            ensure!(
-                state != "DISMISSED",
-                "operator dismissal has no proved cancellation time"
-            );
-            ensure!(
-                state != "CHANGES_REQUESTED" || submitted < created,
-                "operator change request cancels command"
-            );
+            if state == "DISMISSED" {
+                return Err(NotSelected(
+                    "operator dismissal has no proved cancellation time".into(),
+                )
+                .into());
+            }
+            if state == "CHANGES_REQUESTED" && submitted >= created {
+                return Err(NotSelected("operator change request cancels command".into()).into());
+            }
             ensure!(
                 matches!(state, "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED"),
                 "unknown operator review state"
@@ -946,7 +1082,14 @@ fn evaluate(
             human_text,
         })
     })()
-    .with_context(|| evidence)
+    .with_context(|| evidence)?;
+    hold!(
+        !labels.iter().any(|l| l["name"]
+            .as_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("needs-human"))),
+        "needs-human"
+    );
+    Ok(selected)
 }
 
 /// With `promote.onApproval`, on a draft, the operator's latest deciding review,
@@ -1074,5 +1217,7 @@ mod policy;
 
 mod provenance;
 
+pub(crate) mod awaiting;
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

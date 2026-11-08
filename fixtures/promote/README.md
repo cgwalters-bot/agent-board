@@ -112,3 +112,14 @@ Status/scheduling handoff and tracker deployment remain follow-ups to #308.
 The shared recorder's known not-found limitation remains: live-client 404 errors
 are not saved as replayable responses. These separate public observations and
 edited scenarios do not claim a successful live promote record/replay.
+
+`awaiting-public-2026-11-08.json` projects the public response of the
+`PromoteAwaiting` GraphQL query in `promote/awaiting.rs`, read with `gh api
+graphql` on 8 November 2026 for cgwalters-forge/composefs-rs. It retains only
+PR #59 (the other open PRs are omitted), its head, author, draft flag, reviews,
+comments and page flags. No evidence fields in that retained node are edited.
+This is discovery evidence, not proof that later gates pass or publication ran.
+Pass scenarios reuse the older recorded gate responses, explicitly substitute
+PR #34 and its head in this discovery node, and edit review/command, behind,
+policy, DCO and head-owner facts. Those scenarios are hypothetical. The pass
+uses the shared evaluator read-only, even when `pass --apply` is requested.

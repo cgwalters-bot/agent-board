@@ -1,0 +1,18 @@
+{
+  "repository": {
+    "pullRequests": {
+      "pageInfo": {"hasNextPage": false},
+      "nodes": [{
+        "number": 59,
+        "headRefOid": "897100d8251b04bb1ca44f4a76e8a3b20c97e812",
+        "isDraft": true,
+        "author": {"login": "cgwalters-bot"},
+        "reviews": {
+          "pageInfo": {"hasPreviousPage": false},
+          "nodes": [{"state": "APPROVED", "author": {"login": "cgwalters"}, "commit": {"oid": "897100d8251b04bb1ca44f4a76e8a3b20c97e812"}}]
+        },
+        "comments": {"pageInfo": {"hasPreviousPage": false}, "nodes": []}
+      }]
+    }
+  }
+}
