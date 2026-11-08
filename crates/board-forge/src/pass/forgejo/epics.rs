@@ -555,6 +555,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         Facts {
             issue: facts.issue.clone(),
             open: true,
+            promotion: None,
             created: OffsetDateTime::UNIX_EPOCH,
             updated: None,
             author: None,

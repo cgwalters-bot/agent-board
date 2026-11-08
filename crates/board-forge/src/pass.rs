@@ -2040,6 +2040,8 @@ fn choose_with(
 pub struct Facts {
     pub issue: ItemRef,
     pub open: bool,
+    /// First-party handoff evidence, independent of closing-reference paging.
+    pub promotion: Option<Promotion>,
     pub created: OffsetDateTime,
     /// When anything about it last changed, read only where
     /// [`Config::revisit`] is set ([`board_query`]).
@@ -2069,6 +2071,12 @@ pub struct ClosingPull {
     pub author: Option<String>,
     /// When anything about it last changed, where read.
     pub updated: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Promotion {
+    Open(ClosingPull),
+    Merged,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2172,6 +2180,7 @@ impl Facts {
             .with_context(|| format!("{} has an invalid updatedAt", issue.display()))?;
         Ok(Self {
             open: node["state"] == "OPEN",
+            promotion: None,
             created,
             updated,
             author: node
@@ -2203,7 +2212,7 @@ impl Facts {
 /// `OWNER/REPO#N` in lower case, as runs and holds are matched. An issue of
 /// another forge carries its instance as its host, which leads its key, so
 /// that two instances' `OWNER/REPO#N` never meet.
-fn key(issue: &ItemRef) -> String {
+pub(crate) fn key(issue: &ItemRef) -> String {
     match issue.host == DEFAULT_HOST {
         true => issue.display().to_ascii_lowercase(),
         false => format!("{}/{}", issue.host, issue.display()).to_ascii_lowercase(),
@@ -2308,7 +2317,7 @@ pub(crate) fn board_item<'a>(items: &'a [Value], board: &Board) -> Option<&'a Va
 /// says it closes one must not keep work off it. Pull requests left unread
 /// hold it, so the scheduler reads them all first ([`PULL_PAGES`]).
 pub fn hold(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Hold> {
-    if !facts.open {
+    if !facts.open || facts.promotion == Some(Promotion::Merged) {
         return Some(Hold::new(HoldKind::Closed, "closed"));
     }
     let held = person_hold(
@@ -2336,11 +2345,23 @@ const PR_OPEN: [&str; 2] = ["pull request ", " is open"];
 /// operator's approval of its pull request, as the poll's merge gate does;
 /// labels not all read say nothing.
 fn under_way(facts: &Facts, busy: &BTreeMap<String, String>, people: &[&str]) -> Option<Hold> {
+    // Revisits and triage follow-ups use this shared rule too, rather than
+    // hold(); a verified delivery must not acquire another planning run.
+    if facts.promotion == Some(Promotion::Merged) {
+        return Some(Hold::new(HoldKind::Closed, "promoted pull request merged"));
+    }
     if let Some(ClosingPull {
         number,
         repository: repo,
         ..
-    }) = (facts.pulls.iter()).find(|p| is(p.author.as_deref(), people))
+    }) = facts
+        .pulls
+        .iter()
+        .chain(match &facts.promotion {
+            Some(Promotion::Open(pull)) => Some(pull),
+            _ => None,
+        })
+        .find(|p| is(p.author.as_deref(), people))
     {
         let approval = facts.labels_complete
             && facts
@@ -5249,6 +5270,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             }
             match connection["pageInfo"]["hasNextPage"].as_bool() {
                 Some(false) => {
+                    crate::promote::handoff::enrich(&self.client, config, &mut items)
+                        .context("reading promotion handoff")?;
                     return Ok(BoardRead {
                         options: options.unwrap_or_default(),
                         items,
@@ -5502,6 +5525,18 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => Facts::from_node(&self.issue(ISSUE_QUERY, issue)?)?,
         };
         self.complete_pulls(&mut facts)?;
+        if board.items.contains_key(&key(issue)) {
+            return Ok(facts);
+        }
+        self.handoff(facts)
+    }
+
+    fn handoff(&self, facts: Facts) -> Result<Facts> {
+        let at = key(&facts.issue);
+        let mut items = BTreeMap::from([(at.clone(), facts)]);
+        crate::promote::handoff::enrich(&self.client, self.config, &mut items)
+            .context("rechecking promotion handoff")?;
+        let facts = items.remove(&at).context("missing rechecked issue")?;
         Ok(facts)
     }
 
@@ -5740,7 +5775,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             .and_then(Value::as_str)
             .map(str::to_owned);
         self.complete_pulls(&mut facts)?;
-        Ok(facts)
+        self.handoff(facts)
     }
 
     /// Reads the closing pull requests of `facts` past the ten the board

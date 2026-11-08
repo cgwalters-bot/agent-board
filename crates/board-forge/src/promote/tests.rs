@@ -1574,6 +1574,33 @@ fn publication() -> (PublishingForge, Config) {
     (forge, config)
 }
 
+/// Scenario edits of recorded public responses: a hypothetical successful
+/// publication followed by fork closure. This is not live promotion evidence.
+pub(crate) fn handoff_scenario() -> (Replay, Config) {
+    let mut replay = scenario();
+    let mut fork = pull(&mut replay).clone();
+    fork["state"] = json!("closed");
+    fork["body"] = json!(format!("Closes {REPO}#31"));
+    *pull(&mut replay) = fork.clone();
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/pulls/34")},"answer":{"status":200,"link":null,"body":fork.clone()}}));
+    let receipt = handoff::success(REPO, &fork, &fork, "composefs/composefs-rs", 70).unwrap();
+    *comments(&mut replay) = json!([{"id":99,"user":{"login":"cgwalters-bot"},"created_at":COMMAND,"updated_at":COMMAND,"body":receipt}]);
+    sync_metadata(&mut replay);
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/issues/31/timeline?per_page=100&page=1")},"answer":{"status":200,"link":null,"body":[{"event":"cross-referenced","source":{"issue":{"html_url":format!("https://github.com/{REPO}/pull/34"),"pull_request":{}}}}]}}));
+    let mut pr = upstream_pr();
+    pr["base"] = json!({"ref":"main","repo":{"full_name":"composefs/composefs-rs"}});
+    pr["user"] = json!({"login":"cgwalters-bot"});
+    pr["body"] = fork["body"].clone();
+    pr["merged"] = json!(false);
+    pr["merged_at"] = Value::Null;
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/composefs/composefs-rs/pulls/70")},"answer":{"status":200,"link":null,"body":pr}}));
+    let config = Config::parse(CONFIG).unwrap();
+    discovery(&mut replay, &config, |answer| {
+        answer["repository"]["pullRequests"]["nodes"] = json!([])
+    });
+    (replay, config)
+}
+
 #[test]
 fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
     for existing in [false, true] {
@@ -1623,6 +1650,55 @@ fn publish_creates_or_updates_exact_text_and_one_fork_receipt() {
                 .contains("Published approved head")
         );
         assert!(writes.iter().all(|(_, url, _)| !url.contains("/git/")));
+        let receipt = writes.last().unwrap().2["body"].as_str().unwrap();
+        let record = crate::plan::fenced_json(receipt, "agent-board-promoted")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record["schema"], "agent-board/promoted/v1");
+        assert_eq!(record["fork_repository"], REPO);
+        assert_eq!(record["fork_pr"], 34);
+        assert_eq!(record["approved_oid"], HEAD);
+        assert_eq!(record["upstream_repository"], "composefs/composefs-rs");
+        assert_eq!(record["upstream_pr"], 70);
+        assert_eq!(record["source_repository"], REPO);
+        assert_eq!(record["source_issue"], 31);
+    }
+}
+
+#[test]
+fn interrupted_publication_never_emits_handoff_authority() {
+    for case in [
+        "lost response",
+        "changed returned head",
+        "receipt write failed",
+    ] {
+        let (mut forge, config) = publication();
+        match case {
+            "lost response" => forge.fail = Some(2),
+            "changed returned head" => forge.returned_head = true,
+            _ => forge.fail = Some(3),
+        }
+        assert!(
+            apply(&forge, &config, forge.replay.now, 3).is_err(),
+            "{case}"
+        );
+        let writes = forge.writes.borrow();
+        if case != "receipt write failed" {
+            assert!(
+                writes.iter().all(|(_, _, payload)| !payload["body"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("```agent-board-promoted")),
+                "{case}"
+            );
+        }
+        // Even a failed final PATCH cannot make a pending comment authoritative.
+        assert!(
+            !writes[0].2["body"]
+                .as_str()
+                .unwrap()
+                .contains("```agent-board-promoted")
+        );
     }
 }
 
@@ -1681,6 +1757,57 @@ fn publication_rebases_and_signs_independently_of_dco() {
                     lines[0].starts_with(if conflict { "hold promote" } else { "promoted" }),
                     "{lines:?}"
                 );
+                if !conflict {
+                    let (mut replay, config) = handoff_scenario();
+                    let receipt = forge.writes.borrow().last().unwrap().2["body"].clone();
+                    for entry in &mut replay.requests {
+                        if entry["request"]["get"]
+                            .as_str()
+                            .is_some_and(|p| p.ends_with("/pulls/34"))
+                        {
+                            entry["answer"]["body"] = forge.fresh.clone();
+                        }
+                    }
+                    comments(&mut replay)[0]["body"] = receipt;
+                    sync_metadata(&mut replay);
+                    let upstream = body(&mut replay, "/pulls/70");
+                    upstream["body"] = forge.fresh["body"].clone();
+                    upstream["head"]["sha"] = json!("c".repeat(40));
+                    upstream["head"]["ref"] = json!("bot/promote/fixture");
+                    let facts = crate::pass::Facts {
+                        issue: crate::parse_github_item(
+                            &format!("{REPO}#31"),
+                            None,
+                            crate::github::DEFAULT_HOST,
+                        )
+                        .unwrap(),
+                        open: true,
+                        promotion: None,
+                        created: replay.now,
+                        updated: None,
+                        author: Some(config.operator.clone()),
+                        labels: vec![],
+                        labels_complete: true,
+                        assignees: Some(vec![]),
+                        blocked_by: 0,
+                        pulls: vec![],
+                        pulls_complete: true,
+                        parent: None,
+                        priority: None,
+                        status: None,
+                        why: None,
+                    };
+                    let key = crate::pass::key(&facts.issue);
+                    let mut items = BTreeMap::from([(key.clone(), facts)]);
+                    handoff::enrich(&replay, &config, &mut items).unwrap();
+                    assert!(matches!(
+                        items[&key].promotion,
+                        Some(crate::pass::Promotion::Open(_))
+                    ));
+                    // A subsequent change to the published head is still refused.
+                    body(&mut replay, "/pulls/70")["head"]["sha"] = json!("d".repeat(40));
+                    assert!(handoff::enrich(&replay, &config, &mut items).is_err());
+                }
             }
         }
     }

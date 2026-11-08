@@ -368,7 +368,11 @@ fn item_facts(
 ) -> ItemFacts {
     let at = key(&item.identity);
     let pull_request = item.content_kind == "pull_request";
-    let open = item.state == "open";
+    let promoted_merge = !pull_request
+        && open_issues
+            .and_then(|read| read.items.get(&at))
+            .is_some_and(|facts| facts.promotion == Some(Promotion::Merged));
+    let open = item.state == "open" && !promoted_merge;
     // A closed issue's and any pull request's own facts are all there is.
     let (pulls, pulls_read) = match (pull_request || !open, open_issues) {
         (true, _) => (vec![], true),
@@ -377,6 +381,12 @@ fn item_facts(
                 (facts.pulls.iter())
                     .filter(|p| ours.moving(p.author.as_deref(), p.updated))
                     .map(|p| format!("{}#{}", p.repository, p.number))
+                    .chain(match &facts.promotion {
+                        Some(Promotion::Open(pull)) => {
+                            Some(format!("{}#{}", pull.repository, pull.number))
+                        }
+                        _ => None,
+                    })
                     .collect(),
                 facts.pulls_complete,
             ),
@@ -392,11 +402,12 @@ fn item_facts(
         pull_request,
         moving: pull_request && ours.moving(item.author.as_deref(), updated(item)),
         open,
-        merged: pull_request
-            && item
-                .timestamps
-                .get("mergedAt")
-                .is_some_and(|merged| merged.is_some()),
+        merged: promoted_merge
+            || pull_request
+                && item
+                    .timestamps
+                    .get("mergedAt")
+                    .is_some_and(|merged| merged.is_some()),
         needs_human: item
             .labels
             .iter()
@@ -540,6 +551,463 @@ mod tests {
         assert_eq!(lines[2..], refused);
         assert_eq!(report.summary, "summary: dispatched 0, writes 0, held 0");
         assert_eq!(report.failures, 1);
+    }
+
+    /// Scenario edits of public promote/Status recordings, not live evidence.
+    /// The existing hold and Status paths consume the same verified facts.
+    #[test]
+    fn promotion_handoff_recorded_scenarios() {
+        const REPO: &str = "cgwalters-forge/composefs-rs";
+        let cases = [
+            "open",
+            "merge",
+            "closed-unmerged",
+            "head",
+            "fork head",
+            "missing linkage",
+            "source issue",
+            "conflicting fork",
+            "incomplete state",
+            "base",
+            "network",
+            "forged",
+            "edited",
+            "unknown editor",
+            "duplicate",
+            "duplicate key",
+            "unknown field",
+            "schema",
+            "missing metadata",
+            "missing read",
+            "pagination",
+            "no record",
+            "legacy prose",
+            "pending",
+            "bot edit",
+            "no record open",
+            "visitor duplicate",
+            "partial merge",
+            "linkage kind",
+        ];
+        for case in cases {
+            let (mut replay, config) = crate::promote::tests::handoff_scenario();
+            for entry in &mut replay.requests {
+                let path = entry["request"]["get"].as_str().unwrap_or("").to_owned();
+                let body = &mut entry["answer"]["body"];
+                if path.ends_with("/pulls/70") {
+                    match case {
+                        "merge" | "partial merge" => {
+                            body["state"] = json!("closed");
+                            body["merged"] = json!(true);
+                            body["merged_at"] = json!("2026-10-24T00:00:00Z");
+                            if case == "partial merge" {
+                                body["body"] = json!(format!("Part of {REPO}#31"));
+                            }
+                        }
+                        "linkage kind" => body["body"] = json!(format!("Part of {REPO}#31")),
+                        "closed-unmerged" => body["state"] = json!("closed"),
+                        "head" => body["head"]["sha"] = json!("a".repeat(40)),
+                        "base" => body["base"]["ref"] = json!("other"),
+                        "incomplete state" => {
+                            body.as_object_mut().unwrap().remove("merged");
+                        }
+                        "missing read" => entry["answer"]["status"] = json!(403),
+                        _ => {}
+                    }
+                } else if path.ends_with("/pulls/34") {
+                    match case {
+                        "fork head" => body["head"]["sha"] = json!("a".repeat(40)),
+                        "missing linkage" => body["body"] = json!("link removed"),
+                        "partial merge" => body["body"] = json!(format!("Part of {REPO}#31")),
+                        "no record open" => body["state"] = json!("open"),
+                        _ => {}
+                    }
+                } else if path.contains("/timeline?") {
+                    match case {
+                        "conflicting fork" => body.as_array_mut().unwrap().push(json!({"event":"cross-referenced","source":{"issue":{"html_url":format!("https://github.com/{REPO}/pull/35"),"pull_request":{}}}})),
+                        "pagination" => {
+                            entry["answer"]["link"] =
+                                json!("<https://api.github.com/next>; rel=\"next\"")
+                        }
+                        _ => {}
+                    }
+                } else if path.contains("/issues/34/comments?") {
+                    match case {
+                        "forged" => body[0]["user"]["login"] = json!("visitor"),
+                        "visitor duplicate" => {
+                            let mut receipt = body[0].clone();
+                            receipt["user"]["login"] = json!("visitor");
+                            receipt["id"] = json!(100);
+                            body.as_array_mut().unwrap().push(receipt);
+                        }
+                        "partial merge" => {
+                            body[0]["body"] = json!(body[0]["body"].as_str().unwrap().replace(
+                                "\"completes_source\": true",
+                                "\"completes_source\": false"
+                            ))
+                        }
+                        "duplicate" => {
+                            let receipt = body[0].clone();
+                            body.as_array_mut().unwrap().push(receipt);
+                        }
+                        "no record" | "no record open" => *body = json!([]),
+                        "legacy prose" => {
+                            body[0]["body"] = json!(
+                                "Published approved head as upstream.\n\n<!-- agent-board-promote-status -->"
+                            )
+                        }
+                        "pending" => {
+                            body[0]["body"] = json!(
+                                "Promoting approved head.\n\n<!-- agent-board-promote-status -->"
+                            )
+                        }
+                        "schema" => {
+                            body[0]["body"] = json!(
+                                body[0]["body"]
+                                    .as_str()
+                                    .unwrap()
+                                    .replace("promoted/v1", "promoted/v2")
+                            )
+                        }
+                        "source issue" => {
+                            body[0]["body"] = json!(
+                                body[0]["body"]
+                                    .as_str()
+                                    .unwrap()
+                                    .replace("\"source_issue\": 31", "\"source_issue\": 32")
+                            )
+                        }
+                        "duplicate key" => {
+                            body[0]["body"] =
+                                json!(body[0]["body"].as_str().unwrap().replace(
+                                    "\"fork_pr\": 34,",
+                                    "\"fork_pr\": 34, \"fork_pr\": 34,"
+                                ))
+                        }
+                        "unknown field" => {
+                            body[0]["body"] =
+                                json!(body[0]["body"].as_str().unwrap().replace(
+                                    "\"fork_pr\": 34,",
+                                    "\"fork_pr\": 34, \"extra\": true,"
+                                ))
+                        }
+                        "edited" | "unknown editor" | "bot edit" => {
+                            body[0]["updated_at"] = json!("2026-10-24T00:00:00Z")
+                        }
+                        _ => {}
+                    }
+                } else if path.ends_with(&format!("repos/{REPO}")) && case == "network" {
+                    body["parent"]["full_name"] = json!("other/repo");
+                    body["source"]["full_name"] = json!("other/repo");
+                }
+                if entry["request"]["variables"]["number"] == 34 {
+                    let nodes = &mut entry["answer"]["data"]["repository"]["pullRequest"]["comments"]
+                        ["nodes"];
+                    match case {
+                        "visitor duplicate" => {
+                            let mut visitor = nodes[0].clone();
+                            visitor["author"] = json!({"login":"visitor"});
+                            visitor["url"] = json!(format!(
+                                "https://github.com/{REPO}/pull/34#issuecomment-100"
+                            ));
+                            nodes.as_array_mut().unwrap().push(visitor);
+                        }
+                        "no record" | "no record open" => *nodes = json!([]),
+                        "missing metadata" => {
+                            nodes[0].as_object_mut().unwrap().remove("editor");
+                        }
+                        "edited" | "unknown editor" | "bot edit" => {
+                            nodes[0]["lastEditedAt"] = json!("2026-10-24T00:00:00Z");
+                            nodes[0]["editor"] = match case {
+                                "edited" => json!({"login":"visitor"}),
+                                "bot edit" => json!({"login":"cgwalters-bot"}),
+                                _ => Value::Null,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let facts = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
+            let at = key(&facts.issue);
+            let mut read = BoardRead {
+                options: vec![],
+                items: BTreeMap::from([(at.clone(), facts)]),
+            };
+            let result = crate::promote::handoff::enrich(&replay, &config, &mut read.items);
+            let valid = matches!(
+                case,
+                "open"
+                    | "merge"
+                    | "bot edit"
+                    | "no record open"
+                    | "visitor duplicate"
+                    | "forged"
+                    | "no record"
+                    | "partial merge"
+            );
+            assert_eq!(result.is_ok(), valid, "{case}: {result:?}");
+            if !valid {
+                continue;
+            }
+            let facts = &read.items[&at];
+            let busy = BTreeMap::new();
+            if matches!(case, "forged" | "no record" | "partial merge") {
+                assert!(facts.promotion.is_none(), "{case}");
+                assert!(
+                    hold(facts, &busy, &[&config.operator, &config.bot]).is_none(),
+                    "{case}"
+                );
+                assert!(
+                    revisit::revisit_hold(facts, &busy, &[&config.operator, &config.bot]).is_none(),
+                    "{case}"
+                );
+                continue;
+            }
+            let held = hold(facts, &busy, &[&config.operator, &config.bot]).unwrap();
+            assert_eq!(
+                held.kind,
+                if case == "merge" {
+                    HoldKind::Closed
+                } else {
+                    HoldKind::PrOpen
+                },
+                "{case}"
+            );
+            assert_eq!(
+                revisit::revisit_hold(facts, &busy, &[&config.operator, &config.bot])
+                    .unwrap()
+                    .kind,
+                if case == "merge" {
+                    HoldKind::Closed
+                } else {
+                    HoldKind::PrOpen
+                },
+                "revisit {case}"
+            );
+            let item: Item = serde_json::from_value(json!({
+                "identity": facts.issue, "title": case, "state":"open", "status":"Todo",
+                "priority":null, "turn":null, "fields_complete":true, "content_kind":"issue"
+            }))
+            .unwrap();
+            let ours = Ours {
+                operator: &config.operator,
+                bot: &config.bot,
+                stale_before: Some(replay.now),
+            };
+            let mut status = item_facts(&item, Some(&busy), Some(&read), &ours);
+            assert_eq!(
+                derive(&status).unwrap().to,
+                if case == "merge" { Done } else { InProgress },
+                "{case}"
+            );
+            status.status = Some(Blocked);
+            assert_eq!(
+                derive(&status).map(|c| c.to),
+                (case == "merge").then_some(Done)
+            );
+            status.status = Some(Todo);
+            status.needs_human = true;
+            assert_eq!(
+                derive(&status).unwrap().to,
+                if case == "merge" { Done } else { NeedsHuman }
+            );
+        }
+    }
+
+    /// Scenario edits: source issue substituted into the recorded board, a
+    /// closed fork and an open upstream. Replay rejects every attempted write.
+    #[test]
+    fn promotion_handoff_abandoned_attempt_and_unrelated_history() {
+        const REPO: &str = "cgwalters-forge/composefs-rs";
+        let (mut replay, config) = crate::promote::tests::handoff_scenario();
+        let mut replacement = Value::Null;
+        for entry in &mut replay.requests {
+            let path = entry["request"]["get"].as_str().unwrap_or("").to_owned();
+            if path.ends_with("/pulls/34") {
+                replacement = entry["answer"]["body"].clone();
+                replacement["number"] = json!(35);
+                replacement["state"] = json!("open");
+            } else if path.contains("/issues/34/comments?") {
+                entry["answer"]["body"] = json!([]);
+            } else if path.contains("/issues/31/timeline?") {
+                entry["answer"]["body"].as_array_mut().unwrap().push(json!({
+                    "event":"cross-referenced", "source":{"issue":{
+                        "html_url":format!("https://github.com/{REPO}/pull/35"), "pull_request":{}
+                    }}
+                }));
+            }
+        }
+        for (path, body) in [
+            (format!("repos/{REPO}/pulls/35"), replacement),
+            (
+                format!("repos/{REPO}/issues/35/comments?per_page=100&page=1"),
+                json!([]),
+            ),
+        ] {
+            replay.requests.push(json!({"request":{"get":format!("https://api.github.com/{path}")},"answer":{"status":200,"link":null,"body":body}}));
+        }
+        // Ten full pages of unrelated history used to exhaust the global
+        // listing cap. None is needed to read this source's two attempts.
+        for page in 1..=10 {
+            replay.requests.push(json!({"request":{"get":format!("https://api.github.com/repos/{REPO}/pulls?state=all&sort=created&direction=asc&per_page=100&page={page}")},"answer":{"status":200,"link":"<https://api.github.com/next>; rel=\"next\"","body":vec![json!({"user":{"login":"visitor"}});100]}}));
+        }
+        let facts = crate::pass::tests::facts(REPO, 31, "2026-10-23T00:00:00Z");
+        let at = key(&facts.issue);
+        let mut items = BTreeMap::from([(at.clone(), facts)]);
+        crate::promote::handoff::enrich(&replay, &config, &mut items).unwrap();
+        assert!(
+            matches!(&items[&at].promotion, Some(super::super::Promotion::Open(p)) if p.number == 35)
+        );
+    }
+
+    #[test]
+    fn promotion_handoff_pass_preview_holds_scheduling_without_writes() {
+        const REPO: &str = "cgwalters-forge/composefs-rs";
+        for case in [
+            "open",
+            "merge",
+            "closed-unmerged",
+            "unread",
+            "retarget off-board",
+            "retarget closed",
+        ] {
+            let mut replay = replay();
+            let mut added = crate::pass::tests::replay();
+            replay.now = added.now;
+            let (handoff, mut promotion_config) = crate::promote::tests::handoff_scenario();
+            added.requests.extend(handoff.requests);
+            for entry in added.requests {
+                if !replay
+                    .requests
+                    .iter()
+                    .any(|e| e["request"] == entry["request"])
+                {
+                    replay.requests.push(entry);
+                }
+            }
+            for entry in &mut replay.requests {
+                // Substitute one source issue in both independent board reads.
+                for path in [
+                    "/data/repositoryOwner/projectV2/items/nodes",
+                    "/data/node/items/nodes",
+                ] {
+                    if let Some(nodes) = entry["answer"]
+                        .pointer_mut(path)
+                        .and_then(Value::as_array_mut)
+                    {
+                        for node in nodes.iter_mut() {
+                            let content = &mut node["content"];
+                            if text(content, "/repository/nameWithOwner") == "bootc-dev/bcvk"
+                                && content["number"].as_u64()
+                                    == Some(if path.contains("repositoryOwner") {
+                                        157
+                                    } else {
+                                        153
+                                    })
+                            {
+                                content["repository"]["nameWithOwner"] = json!(REPO);
+                                content["number"] = json!(31);
+                                content["state"] = json!("OPEN");
+                                content["author"] = json!({"login":"cgwalters"});
+                                node["status"] = json!({"name":"Todo"});
+                                if let Some(fields) = node["fieldValues"]["nodes"].as_array_mut() {
+                                    for field in fields {
+                                        if text(field, "/field/name") == "Status" {
+                                            field["name"] = json!("Todo");
+                                            field["optionId"] = json!(option("Todo"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if case == "retarget closed"
+                            && path.contains("repositoryOwner")
+                            && let Some(source) = nodes.iter().find(|node| {
+                                text(node, "/content/repository/nameWithOwner") == REPO
+                            })
+                        {
+                            let mut closed = source.clone();
+                            closed["content"]["number"] = json!(32);
+                            closed["content"]["state"] = json!("CLOSED");
+                            nodes.push(closed);
+                        }
+                    }
+                }
+                if case.starts_with("retarget")
+                    && entry["request"]["get"]
+                        .as_str()
+                        .is_some_and(|p| p.ends_with("/pulls/34"))
+                {
+                    entry["answer"]["body"]["body"] = json!(format!("Part of {REPO}#32"));
+                }
+                if entry["request"]["get"]
+                    .as_str()
+                    .is_some_and(|p| p.ends_with("/pulls/70"))
+                {
+                    match case {
+                        "unread" => entry["answer"]["status"] = json!(403),
+                        "merge" => {
+                            entry["answer"]["body"]["state"] = json!("closed");
+                            entry["answer"]["body"]["merged"] = json!(true);
+                            entry["answer"]["body"]["merged_at"] = json!("2026-10-24T00:00:00Z");
+                        }
+                        "closed-unmerged" => entry["answer"]["body"]["state"] = json!("closed"),
+                        _ => {}
+                    }
+                }
+            }
+            let mut config = crate::pass::tests::config(json!({"wip":8,"workRepositories":[REPO]}));
+            config.promote = promotion_config.promote.take();
+            let report = crate::pass::tests::preview(&config, &replay);
+            assert_eq!(report.tally.1.started, 0, "{:?}", report.lines);
+            assert!(
+                !report
+                    .lines
+                    .iter()
+                    .any(|l| l.starts_with("start ") && l.contains(REPO)),
+                "{:?}",
+                report.lines
+            );
+            if matches!(case, "unread" | "closed-unmerged") || case.starts_with("retarget") {
+                assert!(report.failures > 0, "{:?}", report.lines);
+                if case.starts_with("retarget") {
+                    assert!(
+                        report
+                            .lines
+                            .iter()
+                            .any(|l| l.contains("handoff identity mismatch")),
+                        "{case}: {:?}",
+                        report.lines
+                    );
+                }
+                assert!(
+                    !report
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with(&format!("status {REPO}#31:"))),
+                    "{:?}",
+                    report.lines
+                );
+            } else if case == "merge" {
+                assert!(report.lines.iter().any(|l| l.starts_with(&format!("status {REPO}#31: Todo -> Done (merged)"))), "{:?}", report.lines);
+            } else {
+                assert!(
+                    report.holds.iter().any(|h| h.hold.kind == HoldKind::PrOpen
+                        && h.line().contains("composefs/composefs-rs#70")),
+                    "{:?}",
+                    report.lines
+                );
+                assert!(
+                    report
+                        .lines
+                        .iter()
+                        .any(|l| l.starts_with(&format!("status {REPO}#31: Todo -> In Progress"))),
+                    "{:?}",
+                    report.lines
+                );
+            }
+        }
     }
 
     /// The recorded board as a forge that takes Status writes: an item's

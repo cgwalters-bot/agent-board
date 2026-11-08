@@ -1852,11 +1852,20 @@ A pass captures one clock and performs these stages in order:
      publication is permitted. Standalone `--apply` also needs caller opt-in,
      a whole-step write cap and the operator's current-head approval; it
      revalidates all gates, creates an upstream draft or updates a same-head PR,
-     and edits one fork status comment. It never pushes, marks ready or closes
-     a fork. See the [architecture](architecture.md#promote); DCO rewrites and
-     the Status/scheduling handoff remain unbuilt. A
+     and edits one fork status comment. Sign-off/rebase may publish a new ref;
+     it never marks ready or closes a fork. Its verified success comment carries
+     the machine handoff described in the [architecture](architecture.md#promote).
+     Status and scheduling reuse that record plus live upstream identity,
+     including when the fork is closed: open upstream work holds scheduling and
+     derives In Progress; only a matching closing merge derives Done. A merged
+     `Part of` slice leaves the source unfinished. An abandoned closed attempt
+     without a publication marker is ignored; unreadable or invalid first-party
+     publication evidence fails the board read safely. The scan and start
+     rechecks share existing pagination/request/time bounds; no new caller
+     option is added. Capped recoverable fork closure remains separate
+     acceptance work after replay proof. A
    separate tracker schedule and recorded bot-fork staging verification are
-   still required; neither is enabled or claimed here.
+   still required (tracker#1464); neither is enabled or claimed here.
 5. Derive Status for every board item, closed issues and merged pull
    requests included (this stage reads those, which earlier stages skip),
    from this pass's facts and its own starts, and write each one that differs:
