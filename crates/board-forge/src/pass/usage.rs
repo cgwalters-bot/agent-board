@@ -32,7 +32,7 @@ const GRANT_HOLD: &str = "grant";
 const NO_GRANT: &str = "no-grant";
 /// How old a grant may be: the broker itself calls a reading stale past one
 /// five-hour window.
-const GRANT_STALE_SECONDS: f64 = 5.0 * 3600.0;
+pub(super) const GRANT_STALE_SECONDS: f64 = 5.0 * 3600.0;
 
 /// The inference broker's `/usage`, and its grant for this board's consumer
 /// (`budget.url`), read without the forge's token.
@@ -978,6 +978,9 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
         }
         if self.apply && self.config.holds.as_ref().is_some_and(|h| h.today) {
             snapshot.today = Some(self.today(snapshot.pass.overhead.as_ref()));
+        }
+        if !self.apply {
+            self.report.projection = Some(snapshot.clone());
         }
         snapshot
     }

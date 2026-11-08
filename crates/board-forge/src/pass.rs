@@ -2877,6 +2877,10 @@ impl<C: Broker> Broker for Budget<'_, C> {
 /// stages 3 and 4's holds as data, whose lines are among `lines`.
 #[derive(Default)]
 pub struct Report {
+    /// Library projection of facts already read; never rendered by the CLI.
+    observation: Option<decision::Observation>,
+    /// The existing publication builder's unencoded projection, where reached.
+    projection: Option<holds::Snapshot>,
     /// Accepted, scoped plans observed by stage 4; not a census of unread work.
     pub accepted_plans: RefCell<BTreeMap<String, String>>,
     /// Suppressed candidates, by rule; absent from the summary when disabled.
@@ -3210,6 +3214,9 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
     } else if scheduler.config.holds.is_some() {
         let why = "stage 3 or 4 stopped part way, so they would be partial";
         scheduler.line(format!("holds: not published; {why}"));
+    }
+    if !apply {
+        scheduler.observe_decision();
     }
     // Last, within a request bound of its own and the pass's time bound: the
     // cost reports, unless a rate limit stopped the pass.
@@ -7505,6 +7512,7 @@ mod cost;
 pub(crate) mod epics;
 pub mod holds;
 
+pub mod decision;
 pub mod lease;
 pub mod maintain;
 pub mod midstream;
