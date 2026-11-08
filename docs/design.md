@@ -9,6 +9,19 @@ summary, not approval of every paragraph or of the later deployment proposal.
 
 ## 1. Scope and durable model
 
+agent-board is a generic controller: project-specific prompts and policy belong
+outside the binary. Briefs should be neutral skeletons pointing to repository
+guidance (`AGENTS.md`, `CONTRIBUTING.md`, or a documented path), not copies of its
+build, review or human-escalation rules. Midstream forks are the exception to
+keeping guidance in the work tree: their upstream tree should remain unchanged,
+with per-upstream guidance in agenthome and an explicit board-config mapping.
+Cross-repository policy belongs in board config or agenthome, referenced by path
+and revision. A brief should be traceable to the files and revisions it used.
+These are design requirements, not claims that guidance loading and provenance
+are implemented; the [pass policy audit](pass.md#prompt-and-policy-migration-audit)
+tracks the incremental migration. Protocol schemas and enforced authorization
+boundaries are not free-form prompt policy.
+
 Build a new Rust project, not a homegit migration. agent-board is a typed interface and controller for a forge-hosted work board. Deterministic reconciliation repairs bookkeeping and admits eligible work; short-lived agentic jobs supply triage, prioritization and synthesis. GitHub Projects v2, issues, comments, PRs and Actions remain the records people inspect and edit. The proposed read-only persistent deployment in tracker#1456 may serve derived decisions, but introduces no private task authority, new chat system or credential-bearing coordinator agent. Code push, PR close and upstream promotion belong to separately bounded jobs; merging an approved green head is one of the [pass](pass.md)'s own writes. Leave homegit v1 untouched, and never give both controllers write ownership of the experimental board.
 
 Start with one new organization project and an explicit issue-write repository allowlist. All issues in a dedicated intake repository are enrolled; other repositories require a configured inclusion label or existing membership. This catches work opened outside the tool without claiming every upstream issue. A separate read allowlist may include upstream repositories. Only public work is in scope initially; do not copy private context into public tracking issues.

@@ -6173,7 +6173,10 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             comments[0].contains("schedule-triage fenced JSON block"),
             "{name}"
         );
-        assert!(comments[0].contains(MECHANICAL.trim()), "{name}");
+        assert!(
+            !comments[0].contains("Only a real decision goes to the operator"),
+            "{name}"
+        );
         let fix_plan = format!("{PROMOTED}{NO_UPSTREAM_COMMENT}");
         assert_eq!(comments[0].contains(&fix_plan), promoted, "{name}");
         assert!(comments[0].contains("needs-issue"), "{name}");
@@ -7110,6 +7113,14 @@ fn harness_work_is_planned_rather_than_held() {
                     return Some(format!("{method} hold"));
                 }
                 if body.starts_with(RELEASE_MARKER) {
+                    assert!(
+                        body.contains("configured operatorAsk policy"),
+                        "{name}: {body}"
+                    );
+                    assert!(
+                        !body.contains("credentials, budget, rulesets"),
+                        "{name}: {body}"
+                    );
                     return Some(format!("{method} release"));
                 }
                 let held = path.ends_with("/assignees") || path.starts_with("/labels");
@@ -7205,6 +7216,14 @@ fn operator_ask_policy_keeps_its_domains_and_defaults_to_no_delegation() {
                 .find(|c| c.contains(PLAN_FENCE))
                 .unwrap_or_else(|| panic!("{name}: {:?}", initial.lines)),
         );
+        let tracker_policy = name != "absent" && name != "custom";
+        for text in [
+            "Mechanical follow-through (rebasing, re-running CI",
+            "a rebase keeps existing Signed-off-by trailers and adds none",
+            "Only a real decision goes to the operator",
+        ] {
+            assert_eq!(brief.contains(text), tracker_policy, "{name}: {brief}");
+        }
         if let Some(policy) = config.operator_ask.as_ref() {
             assert!(brief.contains(&policy.text), "{name}: {brief}");
             assert!(brief.contains(&format!("one of: {}.", policy.domains.join(", "))));

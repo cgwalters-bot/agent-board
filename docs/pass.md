@@ -1993,13 +1993,14 @@ tracker's triage bounds allow no `create_issue`, and agentic-job holds
 not bypass that boundary by executing an agent's proposed issue creation
 itself.
 
-Mechanical follow-through (rebasing, re-running CI, fixing conflicts or
-refreshing a stale branch) is the pass's work, never the operator's
-(agent-board#728). The brief that asks for a verdict says to plan it as an
-implement job, a rebase keeping existing `Signed-off-by` trailers and adding
-none, and that only a real decision goes to the operator: a design choice,
-posting upstream for the first time, credentials, bounds or budget. A
-`follow-through` verdict, for such work the run did not plan, labels
+Mechanical follow-through policy (agent-board#728) is caller guidance, not a
+default instruction in every triage brief. The example `operatorAsk.text` in
+[`fixtures/operator-ask.json`](../fixtures/operator-ask.json) asks harness work
+to plan rebases, CI reruns, conflict fixes and stale-branch refreshes as implement
+jobs, preserving existing `Signed-off-by` trailers and adding none. Without that
+config, or outside its harness scope, none of that project-specific prose is
+added. The verdict protocol still defines `follow-through`: for work the run
+did not plan, it labels
 nothing: the issue is triaged again at once, the plan and brief saying it is
 for that follow-through. A `follow-through` verdict on such a plan waits as
 `partly` does, the two counting as one streak for its doubling wait, so they
@@ -2050,6 +2051,38 @@ disclosure (`security`), and target repository bounds (`bounds`). Architecture
 uses `architecture`. Everything else takes the recommended option and records
 why. The fixture is an example caller value tested here, not a built-in default;
 no tracker config or pin is changed in this repository.
+
+### Prompt and policy migration audit
+
+Audit for agent-board#788 after #802, by runtime string family (test fixtures
+and historical comments are not shipped guidance). Paths below are relative to
+`crates/board-forge/src/`. The remaining families are candidates for later slices,
+not migrated by this change:
+
+| Location / family | Source or next disposition |
+| --- | --- |
+| `pass.rs`: former `HARNESS_ASK` and `OPERATOR_DOMAINS` | Moved in #802 to optional `operatorAsk.text` and `.domains`; absent means no harness delegation. |
+| `pass.rs`: former `MECHANICAL` and the verdict's “never done or needs-operator” instruction | Mechanical escalation and trailer policy now live only in the caller example's `operatorAsk.text`; neutral defaults retain verdict meanings, not that policy. |
+| `pass/wait.rs`: `RELEASE_TEXT` | Removed the compiled credentials/budget/ruleset/upstream/bounds list; the receipt now describes the configured policy decision without inventing its domains. |
+| `pass.rs`: `HARNESS`, `OPERATOR_LABELS`, `TARGET_LABEL_PREFIX`, `harness_item` | Remaining harness classification and replanning policy; make scope caller-owned together, not prose alone. `operatorAsk` gates it today. |
+| `pass.rs`: `PROMOTED`, `NO_UPSTREAM_COMMENT`, `verdict_ask` | Promoted-work routing and upstream-silence policy remain behind `fixPlans`. Move wording together with the checked fix-plan contract, never remove its bounds as a prose-only migration. |
+| `pass.rs`: `verdict_ask` active-work and follow-up-issue instructions | Routing guidance remains coupled to `skipActiveWork` and the verdict/plan protocol. Separate caller preference from required output shape. |
+| `pass/epics.rs`, `pass/forgejo/epics.rs`: planning tasks | Planning procedure, repository scope, operator-comment precedence and epic-edit restrictions remain duplicated. Repository planning norms should move to repository guidance; authenticated scope stays enforced. |
+| `pass/revisit.rs`, `pass/forgejo.rs`, `pass/sweep.rs`: revisit/sweep tasks | Evidence, close/plan/question and epic-attachment guidance remain built in. Feature controls select work, not caller prose. |
+| `pass/maintain.rs`: digest task and `PLAN_PLACEHOLDER` | Digest format, assessment and reply-drafting instructions remain built in; caller config selects the digest, not its editorial policy. |
+| `poll.rs`: continuation, rebase, fix, queue-diagnostic and review tasks | Remaining task procedure should use repository or midstream guidance. Existing poll settings choose routing and bounds, not replacement prompts. |
+| `pass/holds.rs`: hold/inbox asks and recommendations | Derived review/promotion/approval and digest wording remains built in. It describes controller decisions, not agent instructions; separate presentation policy from schemas and action identities before moving any of it. |
+
+Neutral protocol text stays: plan/verdict fences and schemas, receipt markers,
+attribution/data boundaries, validated repository identities, request/write caps
+and checks of approvals, heads and bounds. A caller's prose cannot authorize a
+write. Labels, status names and numeric scheduling defaults are also controller
+policy, not repository prompts; making them configurable is separate work.
+The existing `direction` issue is authenticated cross-run direction, not a
+repository-guidance loader. Repository `AGENTS.md` and pinned agenthome midstream
+loading, source precedence, missing-source handling and provenance fixtures are
+still unimplemented acceptance work for #788. This audit is recorded here because
+the worker handback cannot post a comment directly to that issue.
 
 Work already promoted upstream is the exception (agent-board#735). Its
 midstream pull request is closed, and an implement run can only open another

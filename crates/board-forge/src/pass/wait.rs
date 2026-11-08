@@ -167,7 +167,7 @@ pub(super) fn response<'c>(
 const RELEASE_WRITES: usize = 2;
 
 /// What the comment of a release says after [`RELEASE_MARKER`].
-const RELEASE_TEXT: &str = "The board pass released this hold: it is our own infrastructure and not an operator decision (credentials, budget, rulesets, first upstream posting or bounds), so the pass plans the work.";
+const RELEASE_TEXT: &str = "The board pass released this hold under the configured operatorAsk policy: the verdict names no configured operator domain, so the pass plans the work.";
 
 /// The hold a [`Scheduler::release_harness`] takes off.
 #[derive(Clone, Copy)]
