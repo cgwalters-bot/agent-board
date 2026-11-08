@@ -5451,6 +5451,34 @@ fn epics_census_at_its_share_is_deferred() {
     );
 }
 
+/// Stage 2's search for the bot's pull requests that meets its share defers
+/// them to the next pass rather than failing as a `follow error`
+/// (agent-board#800).
+#[test]
+fn authored_read_at_its_share_is_deferred() {
+    let mut settings = json!({"follow": [AUTHORED_REPO], "pr": {"fixPools": ["claude"]},
+        "reserveScheduling": true});
+    // Stage 2 keeps 8 of 10 requests, and the 4 for writes leave its search
+    // no read; the stages after it fail on what is left either way.
+    let forge = Forge::new(None, false);
+    let without = apply_within(&forge, &config(settings.clone()), 10);
+    settings["authored"] = json!(2);
+    let report = apply_within(&forge, &config(settings), 10);
+    let deferred = "budget: pull requests stopped at its share; authored pull requests wait for the next pass: pull requests keeps its last 8 requests for the stages after it";
+    assert!(
+        report.lines.iter().any(|l| l == deferred),
+        "{:#?}",
+        report.lines
+    );
+    assert!(
+        !report.lines.iter().any(|l| l.starts_with("follow error")),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(report.failures, without.failures, "{:#?}", report.lines);
+    assert!(report.state.is_some());
+}
+
 /// A pass past its time bound starts nothing more, and sends nothing; a
 /// start under way when it passed may finish, for a while.
 #[test]
