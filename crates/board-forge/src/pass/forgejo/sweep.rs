@@ -309,6 +309,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             author: Some(self.config.bot.clone()),
             labels: labels.to_vec(),
             labels_complete: true,
+            assignees: None,
             blocked_by: 0,
             pulls: Vec::new(),
             pulls_complete: true,

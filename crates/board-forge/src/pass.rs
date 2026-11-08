@@ -362,14 +362,24 @@ fragment Board on ProjectV2 {
 
 /// [`BOARD_QUERY`] with its facts, and with `updatedAt` where `revisit`
 /// needs it: a pass without [`Config::revisit`] sends the query it always
-/// did, which recorded boards replay.
-fn board_query(revisit: bool) -> String {
-    let facts = match revisit {
+/// did, which recorded boards replay. With `assignees`
+/// ([`Config::assign_holds`]), each issue's assignees too, so that stage 4
+/// reads no candidate's assignment events unless the operator is assigned
+/// (agent-board#789).
+fn board_query(revisit: bool, assignees: bool) -> String {
+    let mut facts = match revisit {
         true => FACTS.replacen("createdAt", "createdAt updatedAt", 1),
         false => FACTS.to_owned(),
     };
+    if assignees {
+        facts = facts.replacen("labels(first: 50)", BOARD_ASSIGNEES, 1);
+    }
     format!("{BOARD_QUERY}{facts}")
 }
+
+/// What [`board_query`] reads of an issue's assignees, before its labels.
+const BOARD_ASSIGNEES: &str =
+    "assignees(first: 20) { nodes { login } totalCount }\n  labels(first: 50)";
 
 const ISSUE_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { issue(number: $number) { ...Facts } }
@@ -1768,6 +1778,9 @@ pub struct Facts {
     pub author: Option<String>,
     pub labels: Vec<String>,
     pub labels_complete: bool,
+    /// Every assignee, where the read asked for them and had them all
+    /// ([`board_query`]); otherwise unknown.
+    pub assignees: Option<Vec<String>>,
     pub blocked_by: u64,
     /// Open pull requests that close it.
     pub pulls: Vec<ClosingPull>,
@@ -1812,6 +1825,15 @@ fn labels(node: &Value) -> Result<(Vec<String>, bool)> {
         .context("labels have no totalCount")?;
     let complete = total == names.len() as u64;
     Ok((names, complete))
+}
+
+/// The logins of `node`'s assignees, where it has them all.
+fn assignees(node: &Value) -> Option<Vec<String>> {
+    let read = node.get("assignees")?;
+    let logins = (read["nodes"].as_array()?.iter())
+        .map(|a| a["login"].as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    (read["totalCount"].as_u64() == Some(logins.len() as u64)).then_some(logins)
 }
 
 fn issue_ref(node: &Value) -> Result<ItemRef> {
@@ -1889,6 +1911,7 @@ impl Facts {
                 .map(str::to_owned),
             labels,
             labels_complete,
+            assignees: assignees(node),
             blocked_by: node
                 .pointer("/issueDependenciesSummary/blockedBy")
                 .and_then(Value::as_u64)
@@ -4140,6 +4163,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut taken = 0;
         let pools = &self.config.pools;
         let all: Vec<String> = pools.0.iter().map(|(n, _)| n.clone()).collect();
+        // What considering the candidates spent, which a budget stop says,
+        // to tell it from the stage's other reads (agent-board#789).
+        let before = self.client.bounds.left.get();
         for (n, (_, facts)) in candidates.iter().enumerate() {
             let left = candidates.len() - n;
             if free == 0 {
@@ -4207,7 +4233,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Step::Stop(why, halt) => {
                     self.report.failures += usize::from(halt.failed(earlier));
                     self.unconsidered += left;
-                    let line = format!("{why}; {left} more candidate(s) wait");
+                    let read = match halt {
+                        Halt::Budget if n > 0 => {
+                            let spent = before.saturating_sub(self.client.bounds.left.get());
+                            format!(
+                                "; {n} candidate(s) considered, starts included, for {spent} requests"
+                            )
+                        }
+                        Halt::Budget | Halt::Full | Halt::Time => String::new(),
+                    };
+                    let line = format!("{why}{read}; {left} more candidate(s) wait");
                     // A recheck that finds every slot taken holds new runs.
                     match line.strip_prefix(WIP_HOLD) {
                         Some(why) if matches!(halt, Halt::Full) => {
@@ -4625,7 +4660,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// part of the board would start the wrong work.
     fn board(&self) -> Result<BoardRead> {
         let board = self.config.github_board().context("no GitHub board")?;
-        let query = board_query(self.config.revisit.is_some() || self.config.sweep.is_some());
+        let config = self.config;
+        let revisit = config.revisit.is_some() || config.sweep.is_some();
+        let query = board_query(revisit, config.assign_holds);
         let mut cursor = Value::Null;
         let mut options = None;
         let mut items = BTreeMap::new();

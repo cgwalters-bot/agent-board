@@ -260,6 +260,14 @@ impl<C: Rest + Transport> Scheduler<'_, C> {
             }
             return self.migrate(issue).map(Waited::Held);
         }
+        // The board read every assignee and the operator is not one: no
+        // assignment of theirs stands, and its events are not read, a
+        // request saved for each such candidate (agent-board#789).
+        if (facts.assignees.as_ref())
+            .is_some_and(|a| !a.iter().any(|l| is(Some(l.as_str()), &[operator])))
+        {
+            return Ok(Waited::Go(None));
+        }
         let (assigned, comments) = match self.standing(issue) {
             Ok(Some(standing)) => standing,
             Ok(None) => return Ok(Waited::Go(None)),

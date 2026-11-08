@@ -3071,6 +3071,12 @@ impl Transport for Forge {
             }
             Err(_) if query == wait::WAIT_QUERY => json!({"repository": {"issue": {
                 "assignees": {"nodes": [], "totalCount": 0}, "assignments": {"nodes": []}}}}),
+            // A board read with assignees, recorded without: none read, so
+            // each candidate's assignment is read as before.
+            Err(_) if query.contains(BOARD_ASSIGNEES) => {
+                let plain = query.replacen(BOARD_ASSIGNEES, "labels(first: 50)", 1);
+                self.replay.graphql(&plain, variables.clone())?
+            }
             // A comment whose edits were not recorded: the bot's, unedited.
             Err(_) if query == needs::EDITS_QUERY => {
                 json!({"node": {"author": {"login": "cgwalters-bot"}, "lastEditedAt": null, "editor": null}})
@@ -8827,7 +8833,7 @@ fn apply_raises_an_alarm_when_nothing_starts() {
 /// `OWNER/REPO#N`) before the recording and the rest a day before, and
 /// the items of `held` labelled `needs-human` on every page.
 fn silent(replay: &mut Replay, days: &[(&str, i64)], held: &[&str]) {
-    let plain = fnv(&board_query(false));
+    let plain = fnv(&board_query(false, false));
     let now = replay.now;
     let mut pages = Vec::new();
     for entry in &mut replay.requests {
@@ -8852,7 +8858,7 @@ fn silent(replay: &mut Replay, days: &[(&str, i64)], held: &[&str]) {
         }
         if entry["request"]["graphql"] == plain.as_str() {
             let mut page = entry.clone();
-            page["request"]["graphql"] = fnv(&board_query(true)).into();
+            page["request"]["graphql"] = fnv(&board_query(true, false)).into();
             pages.push(page);
         }
     }
@@ -11247,13 +11253,13 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
     let cases = [
         (
             196,
-            "budget: 102 requests left, only what a start may take (109); 1 more candidate(s) wait",
+            "budget: 102 requests left, only what a start may take (109); 8 candidate(s) considered, starts included, for 79 requests; 1 more candidate(s) wait",
             0,
             5,
         ),
         (
             165,
-            "budget: 113 requests left, only what a start may take (109); 4 more candidate(s) wait",
+            "budget: 113 requests left, only what a start may take (109); 5 candidate(s) considered, starts included, for 37 requests; 4 more candidate(s) wait",
             0,
             2,
         ),
@@ -11281,6 +11287,62 @@ fn apply_defers_the_rest_when_its_budget_runs_out() {
             assert_eq!(holds, 3, "limit {limit}: {:#?}", report.lines);
             assert!(report.lines.iter().any(|l| l == overlap), "limit {limit}");
         }
+    }
+}
+
+/// The recorded board as read with its issues' assignees, `logins` each,
+/// and `unread` more past them.
+fn board_assignees(replay: &mut Replay, (logins, unread): (&[&str], usize)) {
+    let plain = fnv(&board_query(false, false));
+    let nodes: Vec<_> = logins.iter().map(|l| json!({"login": l})).collect();
+    let mut pages = Vec::new();
+    for entry in &replay.requests {
+        if entry["request"]["graphql"] != plain.as_str() {
+            continue;
+        }
+        let mut page = entry.clone();
+        page["request"]["graphql"] = fnv(&board_query(false, true)).into();
+        let items = page["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes");
+        for node in items.and_then(Value::as_array_mut).into_iter().flatten() {
+            let total = nodes.len() + unread;
+            node["content"]["assignees"] = json!({"nodes": nodes, "totalCount": total});
+        }
+        pages.push(page);
+    }
+    assert!(!pages.is_empty(), "no board page recorded");
+    replay.requests.extend(pages);
+}
+
+/// agent-board#789: with `assignHolds`, stage 4 spent a request on each
+/// candidate's assignment events, and a live pass ran out of its share
+/// before it reached work it could start. The board's assignees spare each
+/// candidate the operator is not assigned to that read, so the same budget
+/// considers more and starts more; one the board shows the operator
+/// assigned to is read as before, as is a board read without assignees or
+/// with only some of them.
+#[test]
+fn assign_holds_read_no_assignment_the_board_rules_out() {
+    let config = config(json!({"wip": 8, "assignHolds": true}));
+    // The board's assignees, if read, and whether the events are spared.
+    type Read<'a> = Option<(&'a [&'a str], usize)>;
+    let cases: [(Read, bool); 4] = [
+        (None, false),
+        (Some((&["cgwalters"], 0)), false),
+        (Some((&["visitor"], 1)), false),
+        (Some((&["visitor"], 0)), true),
+    ];
+    let mut started = Vec::new();
+    for (assignees, _) in cases {
+        let mut forge = Forge::new(None, false);
+        if let Some(read) = assignees {
+            board_assignees(&mut forge.replay, read);
+        }
+        let report = apply_within(&forge, &config, 165);
+        assert_eq!(report.failures, 0, "{assignees:?}: {:#?}", report.lines);
+        started.push(forge.dispatches().len());
+    }
+    for ((assignees, spared), n) in cases.iter().zip(&started) {
+        assert_eq!(*n > started[0], *spared, "{assignees:?}: {started:?}");
     }
 }
 
@@ -13733,6 +13795,7 @@ pub(super) fn facts(repo: &str, number: u64, created: &str) -> Facts {
         author: Some("op".into()),
         labels: vec![],
         labels_complete: true,
+        assignees: None,
         blocked_by: 0,
         pulls: vec![],
         pulls_complete: true,
