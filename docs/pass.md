@@ -3527,6 +3527,23 @@ and same-day dispatch protections are unchanged.
 
 ## Epic planning and recovery
 
+Malformed bot-written JSON can strand machine work in the operator's queue.
+`replanInvalid: true` (GitHub only, off by default) gives an invalid bot-written
+job plan or unparseable epic plan one replacement planning run, quoting the
+parser diagnostic as data. It never repairs an operator's plan or a plan last
+edited by an untrusted or unidentified account. A second invalid answer waits
+on the operator; a valid replacement resets this allowance. The repair request
+is an ordinary triage job plan and dispatch record, not a separate retry ledger.
+Pending requests wait under the existing run/dispatch recovery rules. Existing
+human holds, WIP, pool, budget, request/time and write/dispatch caps still apply;
+issue recovery also requires `triage`. Preview starts nothing. Epic plans that
+parse but fail apply's policy or relationship checks remain refused as before.
+Planning prompts require serializing and strictly parsing the exact JSON before
+posting it, including when submitted as a comment safe-output; generated plan
+comments already use JSON serialization. The independent safe-output checker
+in agentic-job is not changed here. In `cgwalters-forge/tracker`, enable this
+with `.github/pass.json`'s `replanInvalid` set to `true` after deploying this revision.
+
 A live, unheld epic is due initially, after changed intent/operator direction
 or membership/state changes in its children since its last applied plan's
 receipt, and never on a timer alone (agent-board#383), so the early re-plan
@@ -3974,6 +3991,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `triageClose` | Close an issue locked throughout its triage on a `done` (as completed) or `obsolete` (as not planned) triage verdict instead of labelling it `needs-human`, see [scheduling](#scheduling); needs `triageFollowUpDays`; `false` |
 | `assignHolds` | Stage 4 waits on the operator by assigning them rather than by the `needs-human` label, which it moves to an assignment; any response of theirs (a comment, or an unassignment) releases the wait, and the pass then takes its assignment off, see [scheduling](#scheduling). Stage 2 requests their PR review instead of labelling a stop; submitting a review or removing that request releases it, see [poll](poll.md#one-pass). GitHub only; `false` |
 | `idleReplan` | GitHub only: at most two changed live epics planned early by an idle stage 4 when its selected planning pool is under pace and resets within 48 hours; existing holds and caps remain; `false` |
+| `replanInvalid` | GitHub only: request one replacement of an invalid bot-written job plan or unparseable epic plan before asking the operator; existing holds and start caps remain; `false` |
 | `researchPlans` | GitHub only: start accepted research plans on their own issue under existing pacing and caps; `false` |
 | `fixPlans` | GitHub only: ask follow-through on promoted work for a fix plan on its upstream pull request, and start accepted fix plans on the bot's open pull requests within `--fix-bounds`, see [scheduling](#scheduling). Stage 2 then takes no step outside our own space but the bot's own rounds on a pull request it authored there with no same-head midstream pull request, see [the poll](poll.md); `false` |
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |

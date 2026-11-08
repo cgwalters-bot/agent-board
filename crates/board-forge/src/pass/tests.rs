@@ -3123,6 +3123,90 @@ fn inventory_on(replay: &mut Replay, repository: &str, number: u64, label: &str)
     );
 }
 
+#[test]
+fn invalid_bot_plan_replans_once() {
+    for case in [
+        "off",
+        "bot",
+        "operator",
+        "foreign-edit",
+        "twice",
+        "triage-off",
+        "cap",
+    ] {
+        let mut replay = replay();
+        only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        let nodes =
+            answer(&mut replay, r#""name":"tracker","number":446"#)["data"]["repository"]["issue"]
+                ["comments"]["nodes"]
+                .as_array_mut()
+                .unwrap();
+        if case == "twice" {
+            nodes.push(json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-8",
+                "body": plan::INVALID_REPLAN, "createdAt": "2026-10-22T00:00:00Z",
+                "lastEditedAt": null, "author": {"login": "cgwalters-bot"}, "editor": null}));
+        }
+        nodes.push(json!({"url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-9",
+            "body": "```agent-board-plan\n{\"brief\":\"raw\nnewline\"}\n```",
+            "createdAt": "2026-10-23T00:00:00Z",
+            "lastEditedAt": if case == "foreign-edit" {json!("2026-10-23T00:00:00Z")} else {Value::Null},
+            "author": {"login": if case == "operator" {"cgwalters"} else {"cgwalters-bot"}},
+            "editor": if case == "foreign-edit" {json!({"login":"visitor"})} else {Value::Null}}));
+        let mut forge = Forge::new(None, false);
+        forge.replay = without_epics(replay);
+        let settings =
+            config(json!({"replanInvalid": case != "off", "triage": case != "triage-off"}));
+        let limits = Limits {
+            dispatch: if case == "cap" { Some(0) } else { None },
+            ..Limits::default()
+        };
+        let report = apply_limited(&forge, &settings, limits);
+        assert_eq!(report.failures, 0, "{case}: {:?}", report.lines);
+        assert_eq!(
+            forge.dispatches().len(),
+            usize::from(case == "bot"),
+            "{case}: {:?}",
+            report.lines
+        );
+        if case == "bot" {
+            let writes = forge.writes.borrow();
+            let body = writes
+                .iter()
+                .filter_map(|(_, _, b)| b["body"].as_str())
+                .find(|b| b.starts_with(plan::INVALID_REPLAN))
+                .unwrap();
+            let job = plan::JobPlan::from_comment(body).unwrap().unwrap();
+            assert!(
+                job.brief.contains("plan is not valid JSON"),
+                "{}",
+                job.brief
+            );
+            assert!(job.brief.contains(plan::VALIDATE_PLAN_JSON));
+            assert!(!report.holds.iter().any(|h| h.hold.operator));
+            drop(writes);
+            // The real request just posted, not local state, spends the
+            // one repair even when its answer is malformed again.
+            forge.replay.now += time::Duration::seconds(2);
+            let when = forge.replay.now.format(&Rfc3339).unwrap();
+            forge.added.borrow_mut().entry(("cgwalters-forge/tracker".into(), 446))
+                .or_default().push(json!({
+                    "url": "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-9900000000",
+                    "body": "```agent-board-plan\n{}\n```", "createdAt": when,
+                    "lastEditedAt": null, "author": {"login": "cgwalters-bot"}, "editor": null}));
+            let again = apply(&forge, &settings);
+            assert_eq!(forge.dispatches().len(), 1, "{:?}", again.lines);
+            assert!(
+                again.lines.iter().any(|l| l
+                    .starts_with("hold cgwalters-forge/tracker#446: its newest plan is invalid")),
+                "{:?}",
+                again.lines
+            );
+        }
+    }
+    assert!(!config(json!({})).replan_invalid);
+    assert!(forgejo::check_options(&json!({"replanInvalid": true})).is_err());
+}
+
 fn apply(forge: &Forge, config: &Config) -> Report {
     apply_limited(forge, config, Limits::default())
 }

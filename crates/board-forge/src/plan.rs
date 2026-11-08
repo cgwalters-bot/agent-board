@@ -348,6 +348,49 @@ pub fn newest_plan<'a>(
     Ok((plan, newest))
 }
 
+/// Durable introduction on the pass's single invalid-plan repair request.
+pub(crate) const INVALID_REPLAN: &str =
+    "The board pass asks for one replacement of its invalid bot-written plan";
+
+/// Only a bot-authored, trusted-edited plan can spend a repair attempt.
+/// A previous repair consumes it until a valid replacement plan intervenes.
+/// Do not recover foreign edits: those remain an operator decision.
+pub(crate) fn repairable<'a>(
+    comments: &'a [Comment],
+    writers: &[&str],
+    bot: &str,
+    fence: &str,
+) -> Option<&'a Comment> {
+    let newest = newest_fenced(comments, writers, fence).ok()?;
+    if !trusted(&[bot], &newest.author) {
+        return None;
+    }
+    let previous = comments
+        .iter()
+        .filter(|c| {
+            c.changed <= newest.changed
+                && c.url != newest.url
+                && trusted(writers, &c.author)
+                && (!(c.edited || c.editor.is_some()) || trusted(writers, &c.editor))
+        })
+        .filter(|c| {
+            c.body.starts_with(INVALID_REPLAN)
+                || (has_fence(&c.body, fence)
+                    && if fence == PLAN_FENCE {
+                        JobPlan::from_comment(&c.body).is_ok_and(|v| v.is_some())
+                    } else {
+                        fenced_json(&c.body, fence).is_ok_and(|v| v.is_some())
+                    })
+        })
+        .max_by_key(|c| c.changed);
+    if previous.is_some_and(|c| c.body.starts_with(INVALID_REPLAN)) {
+        return None;
+    }
+    Some(newest)
+}
+
+pub(crate) const VALIDATE_PLAN_JSON: &str = " Before posting, serialize the plan with a JSON serializer and parse the exact fenced JSON with a strict JSON parser; fix any error before submitting the comment or safe-output. Encode newlines inside strings as \\n, never literal line breaks.";
+
 /// The comment holding the newest `fence` block by a writer, by the rules of
 /// [`newest_plan`], which epic plans share; the caller parses the block.
 pub(crate) fn newest_fenced<'a>(
