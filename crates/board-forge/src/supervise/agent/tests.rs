@@ -424,6 +424,7 @@ fn block(requests: &[Value]) -> String {
 fn run(fake: &Fake, s: &Settings, url: &str, attempt: u64) -> Outcome {
     let p = policy(s);
     let ctx = Run {
+        profile_commit: None,
         source: Source::Comment(url.into()),
         run_url: RUN_URL.into(),
         default_branch: "main".into(),
@@ -435,6 +436,7 @@ fn run(fake: &Fake, s: &Settings, url: &str, attempt: u64) -> Outcome {
 
 fn ctx(url: &str) -> Run {
     Run {
+        profile_commit: None,
         source: Source::Comment(url.into()),
         run_url: RUN_URL.into(),
         default_branch: "main".into(),

@@ -275,11 +275,25 @@ delimiter) and keeps its diagnostics on stderr. All but `due` also take
   profile and skill, and the opening prompt as task data, at most 60,000
   bytes.
 
-`agent.profile` is `{"repository": "OWNER/agenthome", "ref": "FULL_COMMIT"}`:
-a 40-character commit, never a branch, so that what the agent is told
-changes only with a reviewed config edit. `compose` and `session` read
+`agent.profile` is `{"repository": "OWNER/agenthome", "ref": "main"}`:
+a plain branch name or a full 40-character lowercase commit id. It remains
+absent by default. Choosing a branch trusts updates to that branch without a
+caller config edit; a commit pin still reads that exact commit. `compose` and
+`session` resolve a branch once through the Git refs API, then read both
 `.github/agentic-job/profiles/supervisor.md` and `skills/supervisor/SKILL.md`
-there through the contents API with `GH_TOKEN`, each at most 64 KiB.
+at that commit through the contents API with `GH_TOKEN`, each at most 64 KiB.
+This prevents a branch movement between reads from mixing profile and skill
+versions. Resolution adds one read, with no retry or branch fallback. Paths,
+URLs, revision expressions and full `refs/` names are refused.
+
+Both commands log the repository and resolved commit to stderr and print
+`profile_commit` alongside their existing workflow outputs. The caller must
+pass compose's trusted step output to `supervise execute --profile-commit
+COMMIT` when following a branch; the executor refuses a missing or malformed
+commit rather than resolving again. For a full pin, omission uses the configured
+commit and a conflicting value is refused. The executor adds the repository and
+commit to its run log and any `replace_state` body, within the existing state
+size bound. Do not pass agent-written text as this argument.
 
 ### Pass restart
 
@@ -423,8 +437,8 @@ passConfig are absent. Null is not a general substitute for omission: null
 state/profile is absent, but null kinds, caps, tracker, project, passConfig or
 skipUnchangedFailures fails for an enabled agent. Issue references accept
 `repository` (preferred) or `repo`, with a positive integer `issue`; when both
-names are strings, `repository` wins. The profile ref is exactly 40 lowercase
-hex characters. Pool availability/kind assignments and tracker/state membership
+names are strings, `repository` wins. The profile ref is a full lowercase commit
+id or a plain branch name, at most 200 bytes. Pool availability/kind assignments and tracker/state membership
 in `follow` are checked by the executor, not all by this settings loader. An
 agent being enabled is not permission for any write without its matching caps
 and the request's evidence checks.

@@ -24,7 +24,7 @@ enum Command {
     Due(Due),
     /// Say whether to skip the trigger because no check newly fails, for $GITHUB_OUTPUT (offline).
     Repeat(Repeat),
-    /// Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads).
+    /// Compose the agent's task from the resolved profile, the trigger's task and the operator request (GH_TOKEN reads).
     Compose(Compose),
     /// Print the agent's result comment without applying it (GH_TOKEN reads).
     Preview(Preview),
@@ -92,6 +92,9 @@ struct Execute {
     /// The pools file; a request must name one of its pools.
     #[arg(long, value_name = "FILE")]
     pools: PathBuf,
+    /// The full commit printed by compose as profile_commit; required with a branch profile. Pass the trusted step output, not agent text.
+    #[arg(long, value_name = "COMMIT")]
+    profile_commit: Option<String>,
     #[command(flatten)]
     source: Source,
     /// The previous executor run's ledger, an artifact of that run; leave it out when none was found.
@@ -266,7 +269,7 @@ fn agent_settings(s: &Settings) -> Result<&supervise::AgentSettings> {
         .context("supervisor: the requests and log issues are not configured")
 }
 
-fn pinned_profile(s: &Settings) -> Result<&supervise::profile::Profile> {
+fn configured_profile(s: &Settings) -> Result<&supervise::profile::Profile> {
     agent_settings(s)?
         .profile
         .as_ref()
@@ -407,6 +410,12 @@ pub fn run(args: &Supervise) -> Result<()> {
                 (None, None) => anyhow::bail!("--result-url or --requests is required"),
             };
             let run = agent::Run {
+                profile_commit: policy
+                    .agent
+                    .profile
+                    .as_ref()
+                    .map(|p| p.execution_commit(args.profile_commit.as_deref()))
+                    .transpose()?,
                 source,
                 run_url: format!(
                     "{}/{repository}/actions/runs/{run_id}",
@@ -489,11 +498,13 @@ pub fn run(args: &Supervise) -> Result<()> {
                 requests,
             )?;
             let client = board_forge::github::Client::from_env()?;
-            let text = pinned_profile(&s)?.read(&client)?;
-            let task = profile::supervisor_task(&text, &args.task, &request)?;
-            std::io::stdout()
-                .lock()
-                .write_all(output_block("task", &task, &delimiter("task")?)?.as_bytes())?;
+            let profile = configured_profile(&s)?;
+            let loaded = profile.read(&client)?;
+            eprintln!("{}", profile.provenance(&loaded.commit));
+            let task = profile::supervisor_task(&loaded.text, &args.task, &request)?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(output_line("profile_commit", &loaded.commit)?.as_bytes())?;
+            out.write_all(output_block("task", &task, &delimiter("task")?)?.as_bytes())?;
             Ok(())
         }
         Command::Preview(args) => {
@@ -531,20 +542,23 @@ pub fn run(args: &Supervise) -> Result<()> {
             let rules = std::fs::read_to_string(&args.rules)
                 .with_context(|| format!("read {}", args.rules.display()))?;
             let client = board_forge::github::Client::from_env()?;
+            let profile = configured_profile(&s)?;
+            let loaded = profile.read(&client)?;
+            eprintln!("{}", profile.provenance(&loaded.commit));
             let outputs = profile::session(
                 &read(&args.session)?,
                 &read(&args.pools)?,
                 &rules,
                 agent.state.as_ref(),
                 &agent.requests,
-                &pinned_profile(&s)?.read(&client)?,
+                &loaded.text,
                 &args.pool,
                 args.idle_minutes.as_deref().unwrap_or_default(),
                 args.prompt.as_deref().unwrap_or_default(),
             )?;
-            std::io::stdout()
-                .lock()
-                .write_all(session_output(&outputs, &delimiter("session")?)?.as_bytes())?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(output_line("profile_commit", &loaded.commit)?.as_bytes())?;
+            out.write_all(session_output(&outputs, &delimiter("session")?)?.as_bytes())?;
             Ok(())
         }
         Command::Restart(args) => {

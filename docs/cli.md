@@ -898,7 +898,7 @@ Commands:
 - [`execute`](#agent-board-supervise-execute): Perform the agent's validated dispatch requests and log them (writes with GH_TOKEN, the bot's)
 - [`due`](#agent-board-supervise-due): Say whether this pass is a sweep, from the previous run's times, for $GITHUB_OUTPUT (offline)
 - [`repeat`](#agent-board-supervise-repeat): Say whether to skip the trigger because no check newly fails, for $GITHUB_OUTPUT (offline)
-- [`compose`](#agent-board-supervise-compose): Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads)
+- [`compose`](#agent-board-supervise-compose): Compose the agent's task from the resolved profile, the trigger's task and the operator request (GH_TOKEN reads)
 - [`preview`](#agent-board-supervise-preview): Print the agent's result comment without applying it (GH_TOKEN reads)
 - [`session`](#agent-board-supervise-session): Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads)
 - [`restart`](#agent-board-supervise-restart): Start the poll workflow once when its chain has stopped, and tell the operator once if that does not take; off unless the supervisor's file sets restartPass (writes with GH_TOKEN, the bot's: actions on dispatchRepo, comments on the log issue)
@@ -951,6 +951,7 @@ Options:
 - `--supervisor-config <FILE>`: The supervisor's settings: workflows, thresholds, the release and wrapper to compare, the agent
 - `--usage-config <FILE>`: Where the usage snapshot is ({repo, issue, bot}); without it the pace check is unavailable
 - `--pools <FILE>`: The pools file; a request must name one of its pools
+- `--profile-commit <COMMIT>`: The full commit printed by compose as profile_commit; required with a branch profile. Pass the trusted step output, not agent text
 - `--result-url <URL>`: The agent run's result URL: its comment on the requests issue
 - `--requests <FILE>`: The agent run's safe outputs (JSON Lines), handed back as an artifact of this run
 - `--ledger <FILE>`: The previous executor run's ledger, an artifact of that run; leave it out when none was found
@@ -991,7 +992,7 @@ Options:
 
 ## agent-board supervise compose
 
-Compose the agent's task from the pinned profile, the trigger's task and the operator request (GH_TOKEN reads)
+Compose the agent's task from the resolved profile, the trigger's task and the operator request (GH_TOKEN reads)
 
 ```text
 agent-board supervise compose [OPTIONS] --config <FILE> --supervisor-config <FILE> --task <TASK> --event <FILE>
