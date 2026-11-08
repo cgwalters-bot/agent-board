@@ -198,6 +198,7 @@
     "assignHolds": {"verdict": "refused", "reason": "the operator's wait is read from GitHub's assignment timeline"},
     "skipActiveWork": {"verdict": "refused", "reason": "active work suppression is only built for GitHub"},
     "idleReplan": {"verdict": "refused", "reason": "bounded idle epic replanning is only built for GitHub"},
+    "replanInvalid": {"verdict": "refused", "reason": "invalid bot-plan recovery is only built for GitHub"},
     "researchPlans": {"verdict": "refused", "reason": "accepted research plan starts are only built for GitHub"},
     "fixPlans": {"verdict": "refused", "reason": "accepted fix plan starts on a pull request are only built for GitHub"},
     "replanAfterDays": {"verdict": "refused", "reason": "needs a merged pull request's closing issues, which Forgejo's API does not name"},

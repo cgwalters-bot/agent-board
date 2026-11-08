@@ -185,6 +185,97 @@ fn invalid_596(replay: &mut Replay) {
     plan_596(replay, "nope", json!([]));
 }
 
+#[test]
+fn invalid_bot_epic_plan_replans_once() {
+    for case in ["off", "bot", "operator", "foreign-edit", "twice", "pending"] {
+        let mut replay = replay();
+        let broken = "```agent-board-epic-plan\n{\"reason\":\"raw\nnewline\"}\n```";
+        let mut from = posted(
+            &replay,
+            596,
+            7_000_000_003,
+            if case == "operator" {
+                "cgwalters"
+            } else {
+                "cgwalters-bot"
+            },
+            5,
+            broken,
+        );
+        if case == "foreign-edit" {
+            from["lastEditedAt"] = from["createdAt"].clone();
+            from["editor"] = json!({"login": "visitor"});
+        }
+        comments(&mut replay, COMMENTS_596).push(from);
+        if case == "twice" || case == "pending" {
+            let request = posted(
+                &replay,
+                596,
+                7_000_000_000,
+                "cgwalters-bot",
+                if case == "twice" { 10 } else { 3 },
+                plan::INVALID_REPLAN,
+            );
+            comments(&mut replay, COMMENTS_596).push(request);
+            requested(&mut replay, if case == "twice" { 9 } else { 2 });
+        }
+        let settings = config(json!({"replanInvalid": case != "off", "planPools": ["claude"]}));
+        let report = preview(&settings, &replay);
+        if case == "bot" {
+            assert!(
+                stage(&report).iter().any(|l| l
+                    .starts_with("start planning cgwalters-forge/tracker#596")
+                    && l.contains("plan is not valid JSON")),
+                "{case}: {:?}",
+                report.lines
+            );
+        } else if case == "pending" {
+            assert!(
+                !report.holds.iter().any(|h| h.hold.operator
+                    && matches!(&h.scope, holds::Scope::Epic(i) if i.number == 596)),
+                "{:?}",
+                report.lines
+            );
+        } else {
+            assert!(
+                stage(&report).iter().any(|l| l.starts_with(
+                    "hold epic cgwalters-forge/tracker#596: its newest epic plan is invalid"
+                )),
+                "{case}: {:?}",
+                report.lines
+            );
+        }
+        // Busy takes precedence over repair, even before a dispatch record.
+        let facts =
+            EpicFacts::from_node(&node(&replay, 596), Some(settings.github_board().unwrap()))
+                .unwrap();
+        let comments = plan::issue_comments(&replay, &facts.issue).unwrap();
+        let next = decide(&Inputs {
+            replan_invalid: true,
+            epic: &facts,
+            comments: &comments,
+            operator: "cgwalters",
+            bot: "cgwalters-bot",
+            busy: Some("run URL"),
+            now: replay.now,
+            follow_up_days: 0,
+            direction: None,
+        });
+        if case == "bot" {
+            assert!(
+                matches!(
+                    next,
+                    Next::Hold(Hold {
+                        kind: HoldKind::InFlight,
+                        ..
+                    })
+                ),
+                "{next:?}"
+            );
+        }
+    }
+}
+
 /// A plan on tracker#596 with `action` on agentic-job#630, a sub-issue
 /// that closed after it was written.
 fn stale_596(replay: &mut Replay, action: Value) {
@@ -2040,6 +2131,7 @@ fn decide_coalesces_changes_but_not_direction() {
         all.extend(extra);
         let (follow_up_days, now) = now.split_once(' ').unwrap_or(("0", now));
         let next = decide(&Inputs {
+            replan_invalid: false,
             epic: facts,
             comments: &all,
             operator: "cgwalters",
@@ -2070,6 +2162,7 @@ fn decide_coalesces_changes_but_not_direction() {
         let mut all = recorded.clone();
         all.extend(extra);
         let next = decide(&Inputs {
+            replan_invalid: false,
             epic: &facts,
             comments: &all,
             operator: "cgwalters",
@@ -2123,6 +2216,7 @@ fn decide_coalesces_changes_but_not_direction() {
             all.push(nothing(1));
             all.extend(extra.clone());
             let next = decide(&Inputs {
+                replan_invalid: false,
                 epic,
                 comments: &all,
                 operator: "cgwalters",
@@ -2167,6 +2261,7 @@ fn decide_coalesces_changes_but_not_direction() {
             all.push(record(31, "2026-10-25T14:00:00Z", now_hash));
         }
         let next = decide(&Inputs {
+            replan_invalid: false,
             epic: &settled,
             comments: &all,
             operator: "cgwalters",
