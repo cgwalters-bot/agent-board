@@ -1783,7 +1783,10 @@ their review runs are still read and counted toward `wip`. An applying pass's
 next walk starts at that pull request (`share_cursor` in the poll state), goes
 on through the repositories after it and before it, and ends with that
 repository's pull requests before it, so a share too small for every followed
-pull request leaves none out pass after pass. Stage 3 defers the live epics it
+pull request leaves none out pass after pass. Stage 2's share, spent when it
+searches the bot's pull requests (`authored`), defers the stage to the next pass
+(`budget: pull requests stopped at its share; authored pull requests wait for
+the next pass`). Stage 3 defers the live epics it
 has no share left for, its census included (`budget: epics stopped at its
 share`). A stage whose reads were refused by its share says so (`budget: STAGE
 stopped at its share`). None of these is a failure.

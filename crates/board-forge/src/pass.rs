@@ -3770,6 +3770,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let named = self.authored_named().unwrap_or_default();
             let read = match authored::read(&config.bot, &self.client) {
                 Ok(read) => read,
+                // As the poll's below: the stages after it keep their share,
+                // and the pull requests wait for the next pass.
+                Err(error) if error.is::<ShareSpent>() => {
+                    self.report.state = Some(state);
+                    self.line(format!(
+                        "budget: pull requests stopped at its share; authored pull requests wait for the next pass: {error:#}"
+                    ));
+                    return 0;
+                }
                 Err(error) => {
                     self.report.failures += 1;
                     self.line(format!("follow error: authored pull requests: {error:#}"));
