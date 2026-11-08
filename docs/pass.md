@@ -1799,6 +1799,13 @@ Before posting a digest's plan, maintain also requires enough discovery
 headroom for the whole start and receipt; an admitted start may finish.
 Concurrency reads refused by an earlier stage's share are retried by later
 stages, not cached as pass-wide failures.
+Scheduling also keeps one start's recheck/write reserve, plus room to read its
+candidate's plan, before discovering candidates' live parents. The pass logs
+the number of requests held back. At that bound it stops discovery and starts
+the best candidate read so far in the normal priority/focus order, still ranking
+unparented candidates and cached parents without more requests, rather than
+spending the start's requests reading more parents. Unread items wait without
+new holds; existing per-start checks, caps and the total request bound still apply.
 
 Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set
 `reserveScheduling` to `true`. No caller settings are changed here.
