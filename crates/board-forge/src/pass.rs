@@ -237,11 +237,10 @@ const FOLLOW_THROUGH: &str =
 /// answering a plan that starts so waits as `partly` does, so that the two
 /// cannot loop.
 const HARNESS: &str = "The board pass asks a triage run to plan this issue again: it is our own infrastructure, not an operator decision.";
-/// What a triage brief on harness work adds ([`Scheduler::verdict_ask`]).
-const HARNESS_ASK: &str = " This issue is in our own infrastructure, which is always ours to work on: plan it rather than ask. Only an operator-domain decision goes to the operator: then answer needs-operator and add \"operator\" to the same JSON block, one of credentials, budget, ruleset, upstream (posting upstream for the first time) or bounds.";
-/// The `operator` values of a triage verdict that make it an
-/// operator-domain decision ([`plan::triage_operator`]).
-const OPERATOR_DOMAINS: &[&str] = &["credentials", "budget", "ruleset", "upstream", "bounds"];
+/// Bounds on caller policy text and the verdict domains rendered into a brief.
+const OPERATOR_POLICY_CHARS: usize = 4_000;
+const OPERATOR_POLICY_DOMAINS: usize = 16;
+const OPERATOR_DOMAIN_BYTES: usize = 64;
 /// Labels that make an issue the operator's whatever its repository:
 /// proposed operator actions, consolidated decisions, an ask's question and
 /// a review draft before its first upstream posting.
@@ -257,7 +256,7 @@ const RELEASES_PER_PASS: usize = 5;
 const RELEASE_MARKER: &str = "<!-- agent-board-release -->";
 /// What a triage brief that asks for a verdict says about follow-through
 /// and the operator ([`Scheduler::verdict_ask`]).
-const MECHANICAL: &str = " Mechanical follow-through (rebasing, re-running CI, fixing conflicts or refreshing a stale branch) is work, not a decision: plan it as an implement job; a rebase keeps existing Signed-off-by trailers and adds none. Only a real decision goes to the operator: a design choice, posting upstream for the first time, credentials, bounds or budget.";
+const MECHANICAL: &str = " Mechanical follow-through (rebasing, re-running CI, fixing conflicts or refreshing a stale branch) is work, not a decision: plan it as an implement job; a rebase keeps existing Signed-off-by trailers and adds none. Only a real decision goes to the operator.";
 /// What a triage brief adds to [`MECHANICAL`] with [`Config::fix_plans`]:
 /// a promoted pull request's midstream one is closed, and only a `fix` run
 /// on the upstream one rewrites its branch in place, where an implement
@@ -565,6 +564,9 @@ pub struct Config {
     /// epic's planning backs off.
     #[serde(default)]
     pub triage_follow_up_days: u64,
+    /// Off unless set: caller-owned policy for asks on harness work. Without
+    /// it, repository ownership alone never releases an operator wait.
+    pub operator_ask: Option<OperatorAsk>,
     /// Avoid duplicate planning while a PR or research answer owns the work.
     #[serde(default)]
     pub skip_active_work: bool,
@@ -666,6 +668,44 @@ pub struct Config {
     /// `--fix-bounds`, never the file's: the poll's [`PollPolicy::fix_bounds`].
     #[serde(skip)]
     pub fix_bounds: poll::bounds::FixBoundsSet,
+}
+
+/// Trusted caller policy, not issue text. Prose and accepted verdict domains
+/// travel together so the scheduler keeps the asks its brief solicits.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorAsk {
+    pub text: String,
+    pub domains: Vec<String>,
+}
+
+impl OperatorAsk {
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.text.trim().is_empty() && self.text.chars().count() <= OPERATOR_POLICY_CHARS,
+            "operatorAsk.text must be nonempty and at most {OPERATOR_POLICY_CHARS} characters"
+        );
+        ensure!(
+            !self.domains.is_empty() && self.domains.len() <= OPERATOR_POLICY_DOMAINS,
+            "operatorAsk.domains must have 1 to {OPERATOR_POLICY_DOMAINS} entries"
+        );
+        let mut seen = BTreeSet::new();
+        for domain in &self.domains {
+            ensure!(
+                !domain.is_empty()
+                    && domain.len() <= OPERATOR_DOMAIN_BYTES
+                    && domain.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                    && seen.insert(domain),
+                "operatorAsk.domains entries must be distinct lowercase ASCII names (letters or hyphens), at most {OPERATOR_DOMAIN_BYTES} bytes"
+            );
+        }
+        Ok(())
+    }
+
+    fn operator_verdict(&self, verdict: &str, body: &str) -> bool {
+        CLOSE_VERDICTS.iter().any(|(v, _)| *v == verdict)
+            || plan::triage_operator(body).is_some_and(|d| self.domains.contains(&d))
+    }
 }
 
 /// Which candidates without a plan a triage run plans
@@ -1167,6 +1207,13 @@ impl Config {
             self.triage_follow_up_days == 0 || self.triage.is_some(),
             "triageFollowUpDays needs triage"
         );
+        if let Some(policy) = &self.operator_ask {
+            ensure!(
+                self.forgejo_board().is_none(),
+                "operatorAsk supports only GitHub"
+            );
+            policy.check()?;
+        }
         ensure!(
             !self.triage_close || self.triage_follow_up_days > 0,
             "triageClose needs triageFollowUpDays"
@@ -3591,7 +3638,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 && (label.get(len..))
                     .is_some_and(|o| !o.is_empty() && !o.eq_ignore_ascii_case(ours))
         };
-        self.harness_repository(&facts.issue.repository)
+        self.config.operator_ask.is_some()
+            && self.harness_repository(&facts.issue.repository)
             && facts.labels_complete
             && !OPERATOR_LABELS.iter().any(|l| facts.labelled(l))
             && !facts.labels.iter().any(|l| foreign(l))
@@ -3599,10 +3647,13 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
 
     /// Whether the triage verdict `verdict`, in the comment `body`, is the
     /// operator's to settle on harness work: a close to confirm, or a
-    /// decision naming one of [`OPERATOR_DOMAINS`].
-    fn operator_verdict(verdict: &str, body: &str) -> bool {
-        CLOSE_VERDICTS.iter().any(|(v, _)| *v == verdict)
-            || plan::triage_operator(body).is_some_and(|d| OPERATOR_DOMAINS.contains(&d.as_str()))
+    /// decision naming one of the caller's configured domains. With no policy,
+    /// keep waits rather than inferring delegation from repository ownership.
+    fn operator_verdict(&self, verdict: &str, body: &str) -> bool {
+        self.config
+            .operator_ask
+            .as_ref()
+            .is_none_or(|policy| policy.operator_verdict(verdict, body))
     }
 
     /// Whether the wait on the operator over `facts`, whose newest triage
@@ -3612,7 +3663,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.harness_item(facts)
             && !self
                 .newest_verdict(comments)
-                .is_some_and(|(_, c, verdict)| Self::operator_verdict(&verdict, &c.body))
+                .is_some_and(|(_, c, verdict)| self.operator_verdict(&verdict, &c.body))
     }
 
     /// With `pr.reviewPools`, what stage 2's review starts and reruns go by:
@@ -6023,10 +6074,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if self.config.triage_follow_up_days == 0 {
             return active.to_owned();
         }
-        let harness = match self.harness_item(facts) {
-            true => HARNESS_ASK,
-            false => "",
-        };
+        let harness = self.config.operator_ask.as_ref()
+            .filter(|_| self.harness_item(facts))
+            .map(|policy| format!(
+                " {} For an operator decision, answer needs-operator and add \"operator\" to the same JSON block, one of: {}.",
+                policy.text, policy.domains.join(", ")
+            )).unwrap_or_default();
         let promoted = match self.config.fix_plans {
             true => format!("{PROMOTED}{NO_UPSTREAM_COMMENT}"),
             false => String::new(),
@@ -6114,7 +6167,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let harness = verdict.as_ref().is_some_and(|(_, c, verdict)| {
             ASK_VERDICTS.contains(&verdict.as_str())
                 && self.harness_item(facts)
-                && !Self::operator_verdict(verdict, &c.body)
+                && !self.operator_verdict(verdict, &c.body)
         });
         if harness && !from.body.starts_with(HARNESS) {
             return self.triage(read, HARNESS, (snapshot, target, slots));
@@ -6587,7 +6640,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if ASK_VERDICTS.contains(&verdict.as_str())
             && self.harness_item(facts)
-            && !Self::operator_verdict(&verdict, &c.body)
+            && !self.operator_verdict(&verdict, &c.body)
         {
             // Harness work, as in a follow-up (agent-board#778).
             return self.triage((facts, comments), HARNESS, context).map(Some);

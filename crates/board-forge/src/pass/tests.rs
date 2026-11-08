@@ -7068,7 +7068,8 @@ fn harness_work_is_planned_rather_than_held() {
     ];
     for (name, verdict, events, assignees, labels, writes, expected) in cases {
         let (line, held, again) = expected;
-        let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true}));
+        let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true,
+            "operatorAsk": tracker_operator_ask()}));
         let mut forge = Forge::new(None, false);
         only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
         assert_eq!(apply(&forge, &config).failures, 0, "{name}");
@@ -7127,8 +7128,12 @@ fn harness_work_is_planned_rather_than_held() {
             let plan = (comments.iter().rev()).find(|c| c.contains(PLAN_FENCE));
             let plan = plan.unwrap();
             assert!(plan.starts_with(HARNESS), "{name}: {plan}");
-            let ask = HARNESS_ASK.split(':').next().unwrap().trim();
-            assert!(plan.contains(ask), "{name}: {plan}");
+            let ask = tracker_operator_ask();
+            // The whole caller policy, not just its opening phrase.
+            assert!(
+                plan_brief(plan).contains(ask["text"].as_str().unwrap()),
+                "{name}: {plan}"
+            );
         }
         // The plan again answered as before: it waits, held for no one.
         if again && held.is_empty() {
@@ -7149,6 +7154,122 @@ fn harness_work_is_planned_rather_than_held() {
             assert_eq!(forge.writes.borrow().len(), before, "{name}");
         }
     }
+}
+
+fn tracker_operator_ask() -> Value {
+    serde_json::from_str(include_str!("../../../../fixtures/operator-ask.json")).unwrap()
+}
+
+fn plan_brief(body: &str) -> String {
+    let json = body.split_once(&format!("```{PLAN_FENCE}\n")).unwrap().1;
+    let value: Value = serde_json::from_str(json.split_once("\n```").unwrap().0).unwrap();
+    value["brief"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn operator_ask_policy_keeps_its_domains_and_defaults_to_no_delegation() {
+    let example = tracker_operator_ask();
+    let mut cases = vec![("absent", None, None, true)];
+    for domain in example["domains"].as_array().unwrap() {
+        cases.push((
+            domain.as_str().unwrap(),
+            Some(example.clone()),
+            domain.as_str(),
+            true,
+        ));
+    }
+    cases.push(("unknown", Some(example.clone()), Some("unknown"), false));
+    cases.push(("missing", Some(example.clone()), None, false));
+    // A different caller chooses both its own prose and its own domain vocabulary.
+    cases.push((
+        "custom",
+        Some(json!({"text":"Ask only about licensing.", "domains":["license"]})),
+        Some("license"),
+        true,
+    ));
+    for (name, policy, domain, held) in cases {
+        let mut settings = json!({"triageFollowUpDays":3, "assignHolds":true});
+        if let Some(policy) = &policy {
+            settings["operatorAsk"] = policy.clone();
+        }
+        let config = config(settings);
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        assignments(&mut forge.replay, 446, &[], &[]);
+        let initial = apply(&forge, &config);
+        assert_eq!(initial.failures, 0, "{name}");
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        let brief = plan_brief(
+            comments
+                .iter()
+                .find(|c| c.contains(PLAN_FENCE))
+                .unwrap_or_else(|| panic!("{name}: {:?}", initial.lines)),
+        );
+        if let Some(policy) = config.operator_ask.as_ref() {
+            assert!(brief.contains(&policy.text), "{name}: {brief}");
+            assert!(brief.contains(&format!("one of: {}.", policy.domains.join(", "))));
+        } else {
+            assert!(
+                !brief.contains("For an operator decision"),
+                "{name}: {brief}"
+            );
+            assert!(!brief.contains("big-picture architecture"));
+        }
+        let mut verdict = json!({"verdict":"needs-operator"});
+        if let Some(domain) = domain {
+            verdict["operator"] = json!(domain);
+        }
+        answered(
+            &forge,
+            ("cgwalters-bot", None),
+            &format!("```{TRIAGE_FENCE}\n{verdict}\n```"),
+            0,
+        );
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+        assert_eq!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.contains("tracker#446") && l.contains("assign cgwalters")),
+            held,
+            "{name}: {:?}",
+            report.lines
+        );
+    }
+}
+
+#[test]
+fn operator_ask_policy_rejects_invalid_config() {
+    let base: Value = serde_json::from_str(CONFIG).unwrap();
+    for policy in [
+        Value::Null,
+        json!({}),
+        json!({"text":"policy"}),
+        json!({"text":"", "domains":["architecture"]}),
+        json!({"text":"  ", "domains":["architecture"]}),
+        json!({"text":"x".repeat(OPERATOR_POLICY_CHARS + 1), "domains":["architecture"]}),
+        json!({"text":"policy", "domains":[]}),
+        json!({"text":"policy", "domains":["architecture", "architecture"]}),
+        json!({"text":"policy", "domains":["ARCHITECTURE"]}),
+        json!({"text":"policy", "domains":["a,b"]}),
+        json!({"text":"policy", "domains":[""]}),
+        json!({"text":"policy", "domains":["x".repeat(OPERATOR_DOMAIN_BYTES + 1)]}),
+        json!({"text":"policy", "domains":vec!["a"; OPERATOR_POLICY_DOMAINS + 1]}),
+        json!({"text":"policy", "domains":["architecture"], "unknown":true}),
+        json!("missing source"),
+    ] {
+        let mut value = base.clone();
+        value["operatorAsk"] = policy.clone();
+        assert!(
+            Config::parse(&value.to_string()).is_err(),
+            "accepted {policy}"
+        );
+    }
+    let boundary = json!({"text":"é".repeat(OPERATOR_POLICY_CHARS), "domains":["a".repeat(OPERATOR_DOMAIN_BYTES)]});
+    let mut value = base;
+    value["operatorAsk"] = boundary;
+    assert!(Config::parse(&value.to_string()).is_ok());
 }
 
 /// Before a first triage, the bot's earlier verdict with nothing after it
