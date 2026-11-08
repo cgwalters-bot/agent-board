@@ -1010,6 +1010,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                         if let Some(effort) = job.effort {
                             fields["effort"] = json!(effort.as_str());
                         }
+                        plan::JobPlan::from_json_for(&fields, crate::forgejo::Naming::Forgejo)?;
                         let body = format!("```{PLAN_FENCE}\n{fields:#}\n```\n");
                         self.write_on(&forge, &item, &names, BoardOperation::Comment { body })?;
                         record(detail, "comment", &child);
@@ -1274,7 +1275,8 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             config.work_repositories.join(", "),
         );
         let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": epic.repository, "item": epic.number,
-            "kind": "triage", "runner": TRIAGE_RUNNER, "brief": brief, "pool": pool});
+            "kind": "triage", "runner": TRIAGE_RUNNER, "brief": format!("{brief}{}", recovery::VALIDATE), "pool": pool});
+        plan::JobPlan::from_json_for(&job, crate::forgejo::Naming::Forgejo)?;
         let body = format!(
             "The board pass asks a triage run to plan this epic at {}.\n\n```{PLAN_FENCE}\n{job:#}\n```\n",
             self.now.format(&Rfc3339)?

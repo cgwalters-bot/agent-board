@@ -150,6 +150,50 @@ Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
 and keep the existing pass token. No deployed config or token is changed here.
 
+## Invalid bot-plan recovery
+
+The concrete failure is malformed bot output (for example, a literal newline
+inside a JSON string) becoming an operator decision, while blindly retrying it
+would spend indefinitely. `replanInvalid: true` opts the GitHub pass into **one
+replacement request per unresolved invalid-plan episode**, off by default.
+It covers stage 3 epic plans and stage 4 job-plan comments. Ordinary issue
+recovery needs `triage` and its scope admission; epic recovery uses `planPools`.
+It does not recover issue-body plans or change manual dispatch.
+
+Only a newest plan authored by the configured bot and passing the existing
+last-editor check qualifies. Operator-authored plans, foreign/deleted editors,
+unreadable receipts and interrupted applies still hold. An older valid plan is
+never a fallback, and malformed JSON is never repaired or executed. The request
+carries the invalid plan URL and parse/validation diagnostic as JSON-quoted task
+data, asking for one strictly valid whole replacement, including child plans.
+
+Recovery posts a normal triage job plan with a durable recovery introduction and
+dispatches through the existing records, leases, WIP, pool/budget checks and
+`--max-dispatch`/`--max-writes`. The original bad epic plan remains newest until
+answered: its newer recovery request suppresses duplicate starts and operator
+asks while waiting. A second invalid answer holds for the operator. No answer
+uses the existing planning grace (five minutes after a confirmed run ends, six
+hours for an unconfirmed dispatch) and then holds, with no further automatic
+recovery. An ambiguous claim is not retried. A valid job replacement, or an
+applied epic replacement receipt, ends the episode; normal dispatch/apply
+deduplication remains authoritative.
+
+Local plan-posting paths serialize JSON and validate generated job plans before
+writes. Planning prompts require strict parsing/schema checks before handback,
+but prompts are not an independent validator. Agentic-job's safe-output check
+and apply live outside this repository and still need plan-payload validation
+before posting; this option does not grant agents a direct write path.
+
+Read-only verification on 8 November 2026 found applied replacements already on
+tracker#596 ([receipt 6722086248](https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6722086248),
+then [6722292149](https://github.com/cgwalters-forge/tracker/issues/596#issuecomment-6722292149))
+and tracker#1215 ([6722189981](https://github.com/cgwalters-forge/tracker/issues/1215#issuecomment-6722189981)).
+Those actions must not be replayed or replaced merely to deploy recovery.
+
+Caller: deploy this revision in `cgwalters-forge/tracker` and set
+`.github/pass.json`'s `replanInvalid` to `true`, retaining its existing triage,
+planning pools, leases and caps. No caller configuration is changed here.
+
 ## What is built
 
 The GitHub pass implements the configuration below and stages 1 to 5, except
@@ -3979,6 +4023,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `skipActiveWork` | Skip issue triage/replanning while the operator's or bot's open closing PR, its plan-run's linked PR, or unchanged research work answers it (GitHub only); `false` |
 | `replanAfterDays` | Triage an issue still open after its dispatched implement plan's run, this many days (0–30) after the dispatch record, or at once when the run's pull request merged without closing it, see [scheduling](#scheduling); needs `triage`; `0` (off) |
 | `bodyPlans` | Start a P0 or P1 issue with no plan comment by the plan in its body, see [scheduling](#scheduling); `false` |
+| `replanInvalid` | GitHub only: one bounded triage recovery for an invalid newest bot-authored plan comment; see [recovery](#invalid-bot-plan-recovery); `false` |
 | `revisit.perPass`, `revisit.afterDays` | Revisit up to this many (1–5) old candidates a pass with spare slots, once untouched this many days (1–90), see [revisits](#revisits); needs `triage`; section absent (off) |
 | `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |

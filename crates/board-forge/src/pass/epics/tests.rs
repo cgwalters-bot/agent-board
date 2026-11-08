@@ -185,6 +185,311 @@ fn invalid_596(replay: &mut Replay) {
     plan_596(replay, "nope", json!([]));
 }
 
+#[test]
+fn invalid_epic_recovery_replays() {
+    for bad in [
+        "{\"body\":\"raw\nnewline\"}",
+        "{",
+        "[]",
+        "{}",
+        "{\"schema\":\"nope\"}",
+    ] {
+        for (author, editor, enabled, starts) in [
+            ("cgwalters-bot", None, true, true),
+            ("cgwalters", None, true, false),
+            ("cgwalters-bot", Some("visitor"), true, false),
+            ("cgwalters-bot", Some("deleted"), true, false),
+            ("cgwalters-bot", None, false, false),
+        ] {
+            let mut replay = replay();
+            census(&mut replay, 596);
+            let older = posted(
+                &replay,
+                596,
+                6_999_999_999,
+                "cgwalters-bot",
+                20,
+                &format!(
+                    "```{EPIC_PLAN_FENCE}\n{}\n```",
+                    json!({"schema":EPIC_PLAN_SCHEMA,"epic":"cgwalters-forge/tracker#596","actions":[]})
+                ),
+            );
+            let mut invalid = posted(
+                &replay,
+                596,
+                7_000_000_003,
+                author,
+                10,
+                &format!("```{EPIC_PLAN_FENCE}\n{bad}\n```"),
+            );
+            if let Some(editor) = editor {
+                invalid["lastEditedAt"] = invalid["createdAt"].clone();
+                invalid["editor"] = if editor == "deleted" {
+                    Value::Null
+                } else {
+                    json!({"login":editor})
+                };
+            }
+            comments(&mut replay, COMMENTS_596).extend([older, invalid]);
+            let settings = config(json!({"wip":3,"replanInvalid":enabled}));
+            for _ in 0..2 {
+                let first = preview(&settings, &replay);
+                assert_eq!(first.failures, 0, "{bad} {author}: {:?}", first.lines);
+                assert_eq!(
+                    stage(&first).iter().any(|l| l
+                        .starts_with("start planning cgwalters-forge/tracker#596")
+                        && l.contains(recovery::INTRO)),
+                    starts,
+                    "{bad} {author}: {:?}",
+                    first.lines
+                );
+                assert!(
+                    !stage(&first)
+                        .iter()
+                        .any(|l| l.starts_with("apply epic cgwalters-forge/tracker#596"))
+                );
+            }
+            if !starts {
+                continue;
+            }
+            let from = plan::comment(comments(&mut replay, COMMENTS_596).last().unwrap()).unwrap();
+            let request = posted(
+                &replay,
+                596,
+                7_000_000_000,
+                "cgwalters-bot",
+                10,
+                &plan_body(
+                    &recovery::intro(&from, "invalid plan"),
+                    &json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":596,"kind":"triage","runner":"hosted","brief":"Replace invalid plan"}),
+                ),
+            );
+            let request_id = plan_id(&plan::comment(&request).unwrap()).unwrap();
+            comments(&mut replay, COMMENTS_596).push(request);
+            requested(&mut replay, 7);
+            let record = comments(&mut replay, COMMENTS_596).last_mut().unwrap();
+            record["body"] = json!(
+                text(record, "/body").replace("7000000000@2026-10-23T20:03:00Z", &request_id)
+            );
+            run_77(&mut replay, None);
+            let queued = answer(&mut replay, "status=queued")["body"].clone();
+            for busy in [false, true] {
+                if busy {
+                    answer(&mut replay, "status=queued")["body"] = json!({"total_count":1,"workflow_runs":[{"id":77,"display_title":"triage cgwalters-forge/tracker#596 (claude)","html_url":"https://github.com/cgwalters-forge/tracker/actions/runs/77"}]});
+                }
+                let waiting = preview(&settings, &replay);
+                assert_eq!(waiting.failures, 0, "{:?}", waiting.lines);
+                let held = waiting
+                    .holds
+                    .iter()
+                    .find(|h| {
+                        h.line()
+                            .starts_with("hold epic cgwalters-forge/tracker#596:")
+                    })
+                    .unwrap();
+                assert!(!held.hold.operator, "{:?}", waiting.lines);
+                assert!(
+                    !stage(&waiting)
+                        .iter()
+                        .any(|l| l.starts_with("start planning cgwalters-forge/tracker#596"))
+                );
+            }
+            answer(&mut replay, "status=queued")["body"] = queued;
+            // Ended without an answer: existing bounded unanswered handling
+            // asks, without dispatching another recovery.
+            answer(&mut replay, "runs/77")["body"] = json!({"status":"completed","conclusion":"failure","updated_at":(replay.now-time::Duration::hours(1)).format(&Rfc3339).unwrap()});
+            let no_answer = preview(&settings, &replay);
+            assert!(
+                no_answer.holds.iter().any(|h| h
+                    .line()
+                    .starts_with("hold epic cgwalters-forge/tracker#596:")
+                    && h.hold.operator),
+                "{:?}",
+                no_answer.lines
+            );
+            let replacement = posted(
+                &replay,
+                596,
+                7_000_000_004,
+                "cgwalters-bot",
+                1,
+                &format!("```{EPIC_PLAN_FENCE}\n{bad}\n```"),
+            );
+            comments(&mut replay, COMMENTS_596).push(replacement);
+            for _ in 0..2 {
+                let invalid_answer = preview(&settings, &replay);
+                assert!(invalid_answer.holds.iter().any(|h| {
+                    h.line()
+                        .starts_with("hold epic cgwalters-forge/tracker#596:")
+                        && h.hold.operator
+                }));
+                assert!(
+                    !stage(&invalid_answer)
+                        .iter()
+                        .any(|l| l.starts_with("start planning cgwalters-forge/tracker#596"))
+                );
+            }
+            let valid = json!({"schema":EPIC_PLAN_SCHEMA,"epic":"cgwalters-forge/tracker#596","actions":[]});
+            comments(&mut replay, COMMENTS_596).last_mut().unwrap()["body"] =
+                json!(format!("```{EPIC_PLAN_FENCE}\n{valid}\n```"));
+            let replacement = preview(&settings, &replay);
+            assert_eq!(replacement.failures, 0, "{:?}", replacement.lines);
+            assert!(
+                stage(&replacement)
+                    .iter()
+                    .any(|l| l.starts_with("apply epic cgwalters-forge/tracker#596")),
+                "{:?}",
+                replacement.lines
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_epic_recovery_applies_once_with_caps_and_lost_dispatch() {
+    for (name, dispatch_cap, lost) in [
+        ("normal", 3, false),
+        ("capped", 0, false),
+        ("lost", 3, true),
+    ] {
+        let mut replay = replay();
+        crate::pass::tests::only(&mut replay, &["cgwalters-forge/tracker#446"]);
+        invalid_596(&mut replay);
+        for entry in &mut replay.requests {
+            if let Some(nodes) = entry["answer"]
+                .pointer_mut("/data/repository/issues/nodes")
+                .and_then(Value::as_array_mut)
+            {
+                nodes.retain(|n| n["number"] == 596);
+            }
+        }
+        let mut fresh = replay
+            .requests
+            .iter()
+            .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+            .filter_map(Value::as_array)
+            .flatten()
+            .find(|n| n["content"]["number"] == 446)
+            .unwrap()["content"]
+            .clone();
+        fresh["number"] = json!(596);
+        fresh["projectItems"] = json!({"nodes":[],"totalCount":0});
+        replay.requests.push(json!({"request":graphql_key(&format!("{FRESH_QUERY}{FACTS}"), &json!({"owner":"cgwalters-forge","name":"tracker","number":596})),"answer":{"data":{"repository":{"issue":fresh}}}}));
+        let forge = Forge::new(replay);
+        forge.dispatch_lost.set(lost);
+        let settings = config(json!({"wip":3,"triage":false,"replanInvalid":true}));
+        let limits = Limits {
+            dispatch: Some(dispatch_cap),
+            writes: Some(20),
+            ..Limits::default()
+        };
+        let pass = || {
+            block(run(
+                &forge,
+                &forge,
+                &settings,
+                State::default(),
+                (Mode::Local, limits),
+                forge.replay.now,
+            ))
+            .unwrap()
+        };
+        let first = pass();
+        assert_eq!(
+            first.failures,
+            usize::from(lost),
+            "{name}: {:?}",
+            first.lines
+        );
+        let starts = || {
+            forge
+                .written()
+                .iter()
+                .filter(|w| w.ends_with("/dispatches"))
+                .count()
+        };
+        assert_eq!(
+            starts(),
+            usize::from(dispatch_cap > 0),
+            "{name}: {:?}",
+            first.lines
+        );
+        if dispatch_cap == 0 {
+            assert!(
+                !forge
+                    .added
+                    .borrow()
+                    .iter()
+                    .any(|n| text(n, "/body").starts_with(recovery::INTRO))
+            );
+            continue;
+        }
+        let original = forge
+            .added
+            .borrow()
+            .iter()
+            .find(|n| text(n, "/body").starts_with(recovery::INTRO))
+            .cloned()
+            .unwrap();
+        let request = plan::comment(&original).unwrap();
+        assert!(
+            plan::JobPlan::from_comment(&request.body)
+                .unwrap()
+                .unwrap()
+                .brief
+                .contains(recovery::VALIDATE)
+        );
+        for _ in 0..2 {
+            let waiting = pass();
+            assert_eq!(waiting.failures, 0, "{name}: {:?}", waiting.lines);
+            assert_eq!(starts(), 1);
+            assert!(
+                !waiting.holds.iter().any(|h| h
+                    .line()
+                    .starts_with("hold epic cgwalters-forge/tracker#596:")
+                    && h.hold.operator),
+                "{name}: {:?}",
+                waiting.lines
+            );
+        }
+        let invalid = posted(
+            &forge.replay,
+            596,
+            7_000_000_005,
+            "cgwalters-bot",
+            -1,
+            "```agent-board-epic-plan\n{}\n```",
+        );
+        forge.added.borrow_mut().push(invalid);
+        let bad_answer = pass();
+        assert_eq!(starts(), 1);
+        assert!(bad_answer.holds.iter().any(|h| {
+            h.line()
+                .starts_with("hold epic cgwalters-forge/tracker#596:")
+                && h.hold.operator
+        }));
+        forge.added.borrow_mut().last_mut().unwrap()["body"] = json!(format!(
+            "```{EPIC_PLAN_FENCE}\n{}\n```",
+            json!({"schema":EPIC_PLAN_SCHEMA,"epic":"cgwalters-forge/tracker#596","actions":[]})
+        ));
+        let valid = pass();
+        assert_eq!(valid.failures, 0, "{name}: {:?}", valid.lines);
+        assert!(
+            valid
+                .lines
+                .iter()
+                .any(|l| l.starts_with("apply epic cgwalters-forge/tracker#596")),
+            "{name}: {:?}",
+            valid.lines
+        );
+        let writes = forge.written();
+        let again = pass();
+        assert_eq!(again.failures, 0, "{name}: {:?}", again.lines);
+        assert_eq!(starts(), 1);
+        assert_eq!(forge.written(), writes, "{name}: {:?}", again.lines);
+    }
+}
+
 /// A plan on tracker#596 with `action` on agentic-job#630, a sub-issue
 /// that closed after it was written.
 fn stale_596(replay: &mut Replay, action: Value) {
@@ -800,6 +1105,7 @@ struct Forge {
     comment_reads: RefCell<BTreeMap<u64, usize>>,
     changed_plan: Cell<Option<(u64, usize)>>,
     link_fails: Cell<bool>,
+    dispatch_lost: Cell<bool>,
 }
 
 impl Forge {
@@ -815,6 +1121,7 @@ impl Forge {
             comment_reads: RefCell::new(BTreeMap::new()),
             changed_plan: Cell::new(None),
             link_fails: Cell::new(false),
+            dispatch_lost: Cell::new(false),
         }
     }
 
@@ -855,6 +1162,9 @@ impl Rest for Forge {
     fn send(&self, method: &str, url: &str, body: &Value) -> Result<(u16, Value)> {
         let path = url.trim_start_matches(API_ROOT);
         self.kept(format!("{method} {path}"), body.clone());
+        if path.ends_with("/dispatches") && self.dispatch_lost.replace(false) {
+            bail!("lost dispatch response");
+        }
         let id = self.next();
         if method == "POST" && path.ends_with("/issues") {
             return Ok((201, json!({"number": id})));
@@ -869,7 +1179,10 @@ impl Rest for Forge {
             let mut node = posted(&self.replay, n, id, "cgwalters-bot", 0, text(body, "/body"));
             node["url"] = html_url.clone().into();
             self.added.borrow_mut().push(node);
-            return Ok((201, json!({"id": id, "html_url": html_url})));
+            return Ok((
+                201,
+                json!({"id": id, "html_url": html_url, "created_at": self.replay.now.format(&Rfc3339)?}),
+            ));
         }
         if method == "PATCH" && path.starts_with("repos/cgwalters-forge/tracker/issues/comments/") {
             let edited = path.rsplit('/').next().unwrap();

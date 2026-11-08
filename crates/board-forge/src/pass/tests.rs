@@ -11707,6 +11707,139 @@ fn accepted_triage_plans_start_once() {
     }
 }
 
+#[test]
+fn invalid_job_recovery_is_strict_opt_in_and_starts_once() {
+    assert!(!config(json!({})).replan_invalid);
+    assert!(forgejo::check_options(&json!({"replanInvalid": true})).is_err());
+    for invalid in [
+        "{\"brief\":\"raw\nnewline\"}",
+        "{",
+        "[]",
+        "{}",
+        "{\"schema\":\"unknown\"}",
+    ] {
+        for (author, editor, enabled, starts) in [
+            ("cgwalters-bot", None, true, true),
+            ("cgwalters", None, true, false),
+            ("cgwalters-bot", Some("visitor"), true, false),
+            ("cgwalters-bot", Some("deleted"), true, false),
+            ("cgwalters-bot", None, false, false),
+        ] {
+            let mut forge = Forge::new(None, false);
+            only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+            // An older valid plan must not be dispatched as a fallback.
+            implement_plan(&mut forge.replay);
+            let nodes =
+                answer(&mut forge.replay, r#""name":"tracker","number":446"#)["data"]["repository"]
+                    ["issue"]["comments"]["nodes"]
+                    .as_array_mut()
+                    .unwrap();
+            let mut bad = nodes.last().unwrap().clone();
+            bad["url"] =
+                json!("https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-10");
+            bad["createdAt"] = json!("2026-10-23T01:00:00Z");
+            bad["body"] = json!(format!("```{PLAN_FENCE}\n{invalid}\n```"));
+            bad["author"] = json!({"login":author});
+            if let Some(editor) = editor {
+                bad["lastEditedAt"] = json!("2026-10-23T01:00:01Z");
+                bad["editor"] = if editor == "deleted" {
+                    Value::Null
+                } else {
+                    json!({"login":editor})
+                };
+            }
+            nodes.push(bad);
+            let settings = config(json!({"wip":3,"replanInvalid":enabled}));
+            let first = apply(&forge, &settings);
+            assert_eq!(first.failures, 0, "{invalid} {author}: {:?}", first.lines);
+            assert_eq!(
+                forge.dispatches().len(),
+                usize::from(starts),
+                "{invalid} {author}: {:?}",
+                first.lines
+            );
+            if !starts {
+                assert!(first.holds.iter().any(|h| h.hold.operator));
+                continue;
+            }
+            assert!(!first.holds.iter().any(|h| h.hold.operator));
+            let posted = forge.comments_on("cgwalters-forge/tracker", 446);
+            let recovery = posted
+                .iter()
+                .find(|c| c.starts_with(recovery::INTRO))
+                .unwrap();
+            let plan = plan::JobPlan::from_comment(recovery).unwrap().unwrap();
+            assert_eq!(plan.kind, "triage");
+            assert!(plan.brief.contains("issuecomment-10"));
+            assert!(plan.brief.contains("error"));
+            assert!(plan.brief.contains(recovery::VALIDATE));
+            let run = posted.iter().find_map(|c| epics::record_run(c)).unwrap();
+            forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}repos/cgwalters-forge/tracker/actions/runs/{run}")},"answer":{"status":200,"body":{"status":"in_progress"}}}));
+            for _ in 0..2 {
+                let again = apply(&forge, &settings);
+                assert_eq!(again.failures, 0, "{:?}", again.lines);
+                assert!(!again.holds.iter().any(|h| h.hold.operator));
+                assert_eq!(forge.dispatches().len(), 1);
+            }
+            // No answer: the existing bounded completion grace ends in a hold,
+            // not a fresh triage start.
+            let url = format!("runs/{run}");
+            let now = (forge.replay.now - time::Duration::hours(1))
+                .format(&Rfc3339)
+                .unwrap();
+            answer(&mut forge.replay, &url)["body"] =
+                json!({"status":"completed","conclusion":"failure","updated_at":now});
+            let unanswered = apply(&forge, &settings);
+            assert!(
+                unanswered.holds.iter().any(|h| h.hold.operator),
+                "{:?}",
+                unanswered.lines
+            );
+            assert_eq!(forge.dispatches().len(), 1);
+            // An invalid recovery answer is a terminal operator hold.
+            let mut replacement = forge.added.borrow().values().next().unwrap()[0].clone();
+            replacement["id"] = json!(9_000_001_000_u64);
+            replacement["url"] = json!(
+                "https://github.com/cgwalters-forge/tracker/issues/446#issuecomment-9000001000"
+            );
+            replacement["createdAt"] = json!(
+                (forge.replay.now + time::Duration::minutes(1))
+                    .format(&Rfc3339)
+                    .unwrap()
+            );
+            replacement["body"] = json!(format!("```{PLAN_FENCE}\n{invalid}\n```"));
+            forge
+                .added
+                .borrow_mut()
+                .values_mut()
+                .next()
+                .unwrap()
+                .push(replacement);
+            for _ in 0..2 {
+                let invalid_answer = apply(&forge, &settings);
+                assert!(invalid_answer.holds.iter().any(|h| h.hold.operator));
+                assert_eq!(forge.dispatches().len(), 1);
+            }
+            // A strictly valid replacement releases that hold and dispatches
+            // exactly once; the older malformed proposal is never repaired.
+            let valid = json!({"schema":JOB_PLAN_SCHEMA,"repo":"cgwalters-forge/tracker","item":446,"kind":"triage","runner":"hosted","pool":"claude","brief":"A valid replacement"});
+            forge
+                .added
+                .borrow_mut()
+                .values_mut()
+                .next()
+                .unwrap()
+                .last_mut()
+                .unwrap()["body"] = json!(format!("```{PLAN_FENCE}\n{valid}\n```"));
+            let valid_answer = apply(&forge, &settings);
+            assert_eq!(valid_answer.failures, 0, "{:?}", valid_answer.lines);
+            assert_eq!(forge.dispatches().len(), 2, "{:?}", valid_answer.lines);
+            apply(&forge, &settings);
+            assert_eq!(forge.dispatches().len(), 2);
+        }
+    }
+}
+
 /// With `fixPlans`, an accepted fix plan on tracker#446 for upstream
 /// composefs-rs#429, a promoted pull request whose head is the midstream
 /// organization's `bot/` branch, starts as a fix run on that pull request

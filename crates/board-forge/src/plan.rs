@@ -20,6 +20,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const JOB_PLAN_SCHEMA: &str = "agent-board/job-plan/v1";
 /// The info string of the fence that holds a plan: ```` ```agent-board-plan ````.
 pub const PLAN_FENCE: &str = "agent-board-plan";
+
+/// Writer guidance, not a substitute for independent safe-output checking.
+pub(crate) const VALIDATE_PLAN: &str = " Serialize plan objects with a JSON serializer, escaping string newlines as \\n; never put literal newlines inside JSON strings. Before handback, strictly parse the exact fenced JSON and validate its schema, including every nested child job plan, against agent-board's documented format. Do not post malformed JSON or silently repair a proposal during execution.";
+
 /// The tag of the hidden first line of the comment that records a plan's
 /// dispatch: `<!-- agent-board-dispatch: PLAN-ID -->`.
 pub const DISPATCH_MARKER: &str = "agent-board-dispatch";

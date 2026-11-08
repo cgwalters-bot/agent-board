@@ -1304,6 +1304,11 @@ fn execute<C: Transport + Rest>(
                     }
                 }
             }
+            if let Some(text) = body["body"].as_str()
+                && let Some(job) = crate::plan::fenced_json(text, crate::plan::PLAN_FENCE)?
+            {
+                crate::plan::JobPlan::from_json(&job).context("generated child job plan")?;
+            }
             let (_, response) = send(client, method, &url, &body, 0)?;
             if method == "POST" && url.ends_with("/issues") {
                 let repo = url

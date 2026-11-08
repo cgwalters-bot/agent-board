@@ -51,6 +51,12 @@ set them. A `devspace` runner is refused for the same reason; the caller has no
 devspace runner for upstream forks yet. Each is added to the schema when the
 caller can carry it. One plan per comment; a comment with two is refused.
 
+Writers must build the object with a JSON serializer: string newlines are `\n`,
+not literal line breaks between quotes. Strictly parse the exact fenced payload
+and check the schema before handback/posting. Local controller posting paths
+also validate generated job plans before writes; safe-output enforcement in
+agentic-job is independent and is not implemented by these prompt instructions.
+
 ### Model effort (caller deployment required)
 
 Planners must omit `effort` for now: no caller accepts it yet, so GitHub
@@ -81,6 +87,13 @@ if the edit removed its fence. A plan quoted in a reply (`> `), or shown
 inside another fenced block or an HTML comment, is not a plan. An issue
 with more than 1,000 comments is refused, since its newest plan could be
 unread.
+
+With the pass's opt-in [`replanInvalid`](pass.md#invalid-bot-plan-recovery), a
+malformed newest **bot-authored comment** gets one ordinary triage replacement
+request instead of an immediate operator ask. Its durable request and dispatch
+receipt prevent starts on repeated passes. A bad recovery answer or bounded
+unanswered run holds for the operator. Operator plans and foreign/unidentified
+editors remain held, and no older valid plan is dispatched as a fallback.
 
 The planner login is trusted as a whole: any run that comments as it could
 write a plan. The caller's bounds still check every dispatched run, so a plan

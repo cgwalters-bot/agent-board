@@ -785,6 +785,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let issue = &found.issue;
         let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": issue.repository, "item": issue.number,
             "kind": "triage", "runner": TRIAGE_RUNNER, "brief": brief, "pool": pool});
+        plan::JobPlan::from_json_for(&job, crate::forgejo::Naming::Forgejo)?;
         let body = format!(
             "{} At {}.\n\n```{PLAN_FENCE}\n{job:#}\n```\n",
             shared::SWEEP_INTRO,

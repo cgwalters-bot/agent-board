@@ -61,6 +61,23 @@ digits or hyphens (`[A-Za-z0-9-]`). It grants no authority and is not a replay k
 Plans without it remain valid. See [the schema](epic-plans.schema.json) for the
 structural format; runtime checks also enforce the bounds and relationships below.
 
+Serialize the complete object with a JSON serializer, including every nested
+child job plan. Escape newlines in string values as `\n`; literal line breaks
+inside quotes are invalid JSON. Strictly parse and validate the exact payload
+and nested schemas before handback/posting. Prompts request this check but are
+not independent enforcement: agentic-job must separately validate safe-output
+plan payloads before posting them. Its validator lives outside this repository.
+
+The GitHub pass's opt-in [`replanInvalid`](pass.md#invalid-bot-plan-recovery)
+requests one strictly valid replacement when the newest bot-authored plan fails
+parsing or validation. Its triage plan and dispatch record distinguish the
+original malformed plan from an invalid recovery answer. While recovery runs,
+there is no duplicate start or operator ask. A bad replacement or an unanswered
+recovery after the bounded planning grace holds for the operator. A valid
+replacement is applied normally, once, using its receipt. Operator-authored
+plans and foreign/deleted editors retain the existing holds; older valid plans
+are never fallback candidates, and no malformed proposal is repaired or applied.
+
 `epic` must be the issue the plan is on. Each action is one of:
 
 | `type` | Fields | Mutations |

@@ -599,6 +599,10 @@ pub struct Config {
     /// ([`Scheduler::body_plan`]).
     #[serde(default)]
     pub body_plans: bool,
+
+    /// Recover malformed bot output once, rather than asking the operator immediately.
+    #[serde(default)]
+    pub replan_invalid: bool,
     /// Off unless set: spare slots after stage 4's starts revisit a sample
     /// of old issues ([`Scheduler::revisit`]).
     pub revisit: Option<revisit::Revisit>,
@@ -5315,6 +5319,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             let (plan, from) = match plan::newest_plan(&comments, &writers) {
                 Ok(found) => found,
                 Err(error) => {
+                    if config.replan_invalid
+                        && let Some(step) = self.invalid_job(
+                            read,
+                            &format!("{error:#}"),
+                            (snapshot, target, slots),
+                        )?
+                    {
+                        return Ok(step);
+                    }
                     let why = format!("its newest plan is invalid: {error:#}");
                     return Ok(Step::Hold(Hold::new(HoldKind::NeedsOperator, why)));
                 }
@@ -5323,6 +5336,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             match batch::held(&self.client, &comments, &writers, &id, issue)?.first() {
                 None => (plan, id, None, None),
                 Some((_, record)) => {
+                    if recovery::request(from, &config.bot) {
+                        return self.recovery_wait(record);
+                    }
                     // The run this plan's record names, where it failed: re-run
                     // once its plan's item passes a start's checks below, with
                     // `reruns`, or with `starts` where it failed before its
@@ -5957,6 +5973,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              If it can be done, post one accepted implement job plan for it (agent-board's docs/job-plans.md). \
              Otherwise say on the issue what design or decision it needs. Do not close the issue."
         );
+        brief.push_str(recovery::VALIDATE);
         brief.push_str(&self.verdict_ask(read.0));
         if intro == FOLLOW_THROUGH {
             brief.push_str(" Its last triage found that only mechanical follow-through remains: post one implement job plan for that, unless it is already in an open pull request.");
@@ -6856,6 +6873,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(step) = self.recheck(slots, (issue, issue), target, rule)? {
             return Ok(step);
         }
+        let brief = if brief.ends_with(recovery::VALIDATE) {
+            brief
+        } else {
+            format!("{brief}{}", recovery::VALIDATE)
+        };
         let plan = json!({
             "schema": JOB_PLAN_SCHEMA,
             "repo": issue.repository,
@@ -6982,6 +7004,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// The bot's comment `id` on `issue` edited to hold `plan` after
     /// `intro`, as [`Self::post_plan`] would post it.
     fn edit_plan(&self, issue: &ItemRef, id: u64, intro: &str, plan: &Value) -> Result<()> {
+        plan::JobPlan::from_json(plan)?;
         let url = format!("{API_ROOT}repos/{}/issues/comments/{id}", issue.repository);
         let body = plan_body(intro, plan);
         plan::send(&self.client, "PATCH", &url, &json!({"body": body}), 0).map(drop)
@@ -6990,6 +7013,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// Posts `plan` on `issue` after `intro`, as the plan writer the pass's
     /// token is, and returns the posted plan's id ([`plan::plan_id`]).
     fn post_plan(&self, issue: &ItemRef, intro: &str, plan: &Value) -> Result<String> {
+        plan::JobPlan::from_json(plan)?;
         let body = plan_body(intro, plan);
         let comments = format!(
             "{API_ROOT}repos/{}/issues/{}/comments",
@@ -7425,7 +7449,9 @@ pub mod authored;
 mod blockers;
 mod cost;
 pub(crate) mod epics;
+
 pub mod holds;
+mod recovery;
 
 pub mod lease;
 pub mod maintain;
