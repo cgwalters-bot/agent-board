@@ -526,6 +526,7 @@ fn gates_impl(
     })
 }
 
+pub(crate) mod handoff;
 mod publish;
 mod rewrite;
 

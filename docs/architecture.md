@@ -462,19 +462,44 @@ approved work visible without granting the pass upstream write authority.
   existing upstream PRs first, and never creates a second one intentionally.
   Concurrent invocations still need caller serialization; GitHub does not offer
   an atomic create-if-absent status comment. Nothing except the PR is posted
-  upstream. Fork PRs remain open until the Status/scheduling handoff is built.
+  upstream. Fork PRs remain open: capped, recoverable fork closure requires
+  separate acceptance after the handoff replay proof.
   No unsigned head is published: sign-off completeness is checked independently
   of DCO detection before publication. Live publication and bot-fork staging
   verification remain unverified by the offline fixtures.
 
 The answers to the brief's open questions:
 
-1. **After promote.** The fork pull request is closed with a comment linking
-   the upstream one, as homegit did. The item's first-party state (its
-   hidden state comment) records the upstream pull request, and Status counts
-   an open one recorded there as In Progress and its merge as Done. A replay
-   scenario must show that before anything closes a fork pull request. This
-   Status/scheduling handoff is not built by the preview.
+1. **After promote.** The delivered handoff appends a strict
+   `agent-board/promoted/v1` machine record to the readable first-party fork
+   publication-status comment, only after publication response verification.
+   It binds fork repository/PR, approved oid, verified publication oid/branch
+   (which may differ after sign-off/rebase), upstream repository/PR and source
+   issue and whether the link closes it or only delivers a partial slice.
+   Legacy readable-only receipts still prevent duplicate publication,
+   but their prose never authorizes a handoff. With the existing configured
+   `promote.forks` mapping (absent/empty is off), the pass scans at most ten
+   100-row pages per open source issue's cross-reference timeline in its
+   request/time budget, including closed PRs and historical body links. It
+   does not enumerate unrelated fork PR history. Visitor comments are ignored
+   before selecting or counting receipts.
+   REST comment identity/times must agree with complete GraphQL bot authorship
+   and bot last-edit evidence. Network/base mapping, unique source linkage,
+   fork head and the live upstream PR/head must all match. A verified open
+   upstream supplies In Progress and the existing scheduler open-PR hold even
+   if the fork is closed or stale. A matching verified closing merge supplies Done
+   under normal Status precedence; person holds remain until Done. Missing,
+   malformed, foreign-edited, conflicting, closed-unmerged or unreadable handoff
+   evidence refuses the board read rather than releasing work. An ordinary
+   open bot fork without a receipt still holds as an open PR; a closed one
+   without any first-party publication marker is an abandoned attempt, not
+   an error or completion. A verified merged `Part of` slice does not complete
+   its source or conflict with the next slice. This conservative
+   whole-board failure is deliberate, not a new state store. Start rechecks
+   use the same verifier. Fork closure is **not delivered**: it needs its own
+   capped, recoverable acceptance after replay proof. Caller rollout and
+   staging acceptance remain tracker#1464, separately approved; no live
+   promotion or bot-fork acceptance is claimed by edited response scenarios.
 2. **`--human-text`.** Only the operator's command carries the marker; the
    read-only provenance gate checks the current-head pusher and title/body editors.
 3. **Policy records.** Read from the configured repository's default
@@ -512,7 +537,7 @@ Three rules learned from reviewing the first attempt (agent-board#312):
 
 The preview reports candidates only; apply additionally requires current-head
 review approval and refuses missing DCO sign-offs. Sign-off semantics/proof and
-rewrites, the Status/scheduling handoff and the caller's independent 10–15 minute
+rewrites, recoverable fork closure and the caller's independent 10–15 minute
 tracker schedule remain follow-up slices. The known recording limitations for
 typed absence and policy tree projection remain separate work; edited mock
 scenarios are not successful live recordings. Creation sends

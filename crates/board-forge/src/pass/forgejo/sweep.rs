@@ -304,6 +304,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         Facts {
             issue: found.issue.clone(),
             open: true,
+            promotion: None,
             created: found.created,
             updated: None,
             author: Some(self.config.bot.clone()),

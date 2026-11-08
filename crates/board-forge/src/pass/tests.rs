@@ -15695,6 +15695,7 @@ pub(super) fn facts(repo: &str, number: u64, created: &str) -> Facts {
         },
         open: true,
         created: at(created),
+        promotion: None,
         updated: None,
         author: Some("op".into()),
         labels: vec![],
@@ -17523,6 +17524,21 @@ fn no_merge_preserves_followed_rounds_and_holds() {
                 settings["follow"] = json!([REPO]);
                 settings["promote"] = json!({"forks": {REPO: {"upstream":"example/upstream", "base":"main"}},
                     "signoff":{"name":"Op", "email":"op@example.invalid"}, "policyRepository":"cgwalters-forge/tracker"});
+                // Scenario edits: this legacy no-merge fixture has no
+                // publication handoffs; the bounded Status scan reads that
+                // absence and the configured network explicitly.
+                for (path, body) in [
+                    (
+                        format!("repos/{REPO}"),
+                        json!({"full_name":REPO,"fork":true,"parent":{"full_name":"example/upstream"}}),
+                    ),
+                    (
+                        format!("repos/{REPO}/issues/188/timeline?per_page=100&page=1"),
+                        json!([]),
+                    ),
+                ] {
+                    forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}{path}")},"answer":{"status":200,"link":null,"body":body}}));
+                }
                 struct Empty;
                 impl Transport for Empty {
                     fn graphql(&self, _: &str, _: Value) -> Result<Value> {

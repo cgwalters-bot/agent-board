@@ -105,10 +105,10 @@ live observation. Provenance reads accept only a complete single page of fewer
 than 100 edits and renames; longer, deleted or unverifiable histories hold.
 
 No caller setting, schedule, policy record, forge write, live promotion or
-staging test was enabled. Provenance evaluation is implemented; publication,
-first-write revalidation and unchanged-text publication, bounded writes/recovery,
-sign-off semantics/proof, recorded bot-fork staging verification,
-Status/scheduling handoff and tracker deployment remain follow-ups to #308.
+staging test was enabled. Provenance, bounded publication/revalidation/recovery
+and the first-party Status/scheduling handoff are implemented. Recorded bot-fork
+staging verification, capped recoverable fork closure and tracker deployment
+(#1464) remain separately accepted follow-ups.
 The shared recorder keeps the live client's typed not-found error (404 or 410)
 as `{"absent": true}`, and replay returns the same typed error; older fixtures'
 recorded `"status": 404` answers, as in `policy-public-2026-11-04.json`, still
@@ -131,3 +131,13 @@ Pass scenarios reuse the older recorded gate responses, explicitly substitute
 PR #34 and its head in this discovery node, and edit review/command, behind,
 policy, DCO and head-owner facts. Those scenarios are hypothetical. The pass
 uses the shared evaluator read-only, even when `pass --apply` is requested.
+
+Handoff scenarios in `promote/tests.rs` and `pass/status.rs` explicitly edit
+these public response shapes: a successful versioned receipt, closed fork,
+open/merged/closed-unmerged upstream, matching or changed heads/base/network,
+forged or edited comments, duplicate/invalid records, missing edit evidence,
+incomplete reads, no record and interrupted publication. The full pass preview
+substitutes the source issue in the recorded board and proves the scheduler
+holds instead of dispatching; replay refuses mutations. These are synthetic
+scenario edits, not a recording of a live promotion or fork closure. They do
+not accept later closure or caller rollout on their own.

@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::json;
 
-const STATUS: &str = "<!-- agent-board-promote-status -->";
+use super::handoff::STATUS;
 const STEP_WRITES: usize = 3;
 
 /// Explicit caller permission plus --apply; at most one candidate and four
@@ -191,9 +191,17 @@ pub(super) fn apply_with<C: Rest + Transport>(
                     );
                     if pr["title"] == fresh["title"]
                         && pr["body"] == fresh["body"]
-                        && receipts
-                            .first()
-                            .is_some_and(|r| r["body"] == status_body(&command, &url))
+                        && receipts.first().is_some_and(|r| {
+                            r["body"] == status_body(&command, &url)
+                                || handoff::success(
+                                    repo,
+                                    &fresh,
+                                    &publication_pull,
+                                    &target.upstream,
+                                    pr["number"].as_u64().unwrap_or(0),
+                                )
+                                .is_ok_and(|body| r["body"] == body)
+                        })
                     {
                         // Already confirmed and unchanged: don't consume this
                         // invocation's single publication slot indefinitely.
@@ -325,9 +333,9 @@ pub(super) fn apply_with<C: Rest + Transport>(
                         .filter(|n| *n > 0)
                         .context("invalid upstream number")?;
                     let url = format!("https://github.com/{}/pull/{n}", target.upstream);
-                    Ok::<_, anyhow::Error>(url)
+                    Ok::<_, anyhow::Error>((url, n))
                 })();
-                let url = match publication {
+                let (url, upstream_number) = match publication {
                     Ok(url) => url,
                     Err(error) => {
                         let body = format!(
@@ -343,7 +351,13 @@ pub(super) fn apply_with<C: Rest + Transport>(
                         return Err(error);
                     }
                 };
-                let body = status_body(&command, &url);
+                let body = handoff::success(
+                    repo,
+                    &fresh,
+                    &publication_pull,
+                    &target.upstream,
+                    upstream_number,
+                )?;
                 send(
                     client,
                     "PATCH",

@@ -1730,6 +1730,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
         let facts = Facts {
             issue: at,
             open: true,
+            promotion: None,
             created,
             updated: issue["updated_at"]
                 .as_str()
