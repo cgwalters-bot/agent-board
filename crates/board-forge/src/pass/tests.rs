@@ -1041,9 +1041,12 @@ fn scheduling_retries_concurrency_after_maintain_spends_its_share() {
     );
 }
 
+/// A digest start is admitted on what the pass has left, not on maintain's
+/// share: at 200 the share (40) is less than a start needs, which held the
+/// digest pass after pass (agent-board#803).
 #[test]
 fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
-    for (limit, starts) in [(200, false), (PASS_REQUEST_LIMIT, true)] {
+    for (limit, starts) in [(110, false), (200, true), (PASS_REQUEST_LIMIT, true)] {
         let (mut cfg, mut replay) = maintained(9, vec![], 40.0);
         cfg.reserve_scheduling = true;
         cfg.work_repositories.clear();
@@ -1073,7 +1076,7 @@ fn scheduling_reserve_admits_a_whole_digest_before_posting_its_plan() {
                 report
                     .lines
                     .iter()
-                    .any(|l| l.starts_with("budget: maintain stopped at its share")),
+                    .any(|l| l.starts_with("budget: maintain stopped; a digest start")),
                 "{:?}",
                 report.lines
             );
@@ -6073,6 +6076,15 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             "",
         ),
         (
+            // The cooldown stops only re-triage (agent-board#803).
+            "a newer implement plan in the cooldown starts at once",
+            vec![(bot, None, "partly", 0), (bot, None, "implement-plan", 0)],
+            (false, None),
+            "start implement cgwalters-forge/tracker#446 plan=",
+            true,
+            "",
+        ),
+        (
             "partly, its day past and nothing changed, is not triaged again",
             vec![(bot, None, "partly", -4)],
             (false, None),
@@ -6285,6 +6297,13 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                     "Not done yet.\n\n<!-- {}: 99@abc -->",
                     plan::DISPATCH_MARKER
                 ),
+                "implement-plan" => {
+                    unpathed(&mut forge.replay);
+                    let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker",
+                        "item": 446, "kind": "implement", "runner": "hosted",
+                        "brief": "Implement the bounded fix."});
+                    format!("```{PLAN_FENCE}\n{job}\n```")
+                }
                 text if text.contains(' ') => text.to_owned(),
                 said => verdict(said),
             };
@@ -11127,6 +11146,41 @@ fn maintain_share_is_left_while_a_digest_is_due() {
     }
 }
 
+/// A due digest this pass cannot start leaves the other stages the whole
+/// allowance: with its plan already posted today, claude within the share
+/// (45% of 54.3%) still starts stage 4's work (agent-board#803).
+#[test]
+fn maintain_share_is_not_held_for_a_digest_that_cannot_start() {
+    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/bot-ops", "item": 9,
+        "kind": "research", "runner": TRIAGE_RUNNER, "pool": "claude", "brief": "Digest."});
+    let posted = json!({"url": format!("{DIGEST}#issuecomment-4"),
+        "body": format!("Plan.\n\n```{PLAN_FENCE}\n{plan}\n```\n"),
+        "createdAt": TODAY, "lastEditedAt": null,
+        "author": {"login": "cgwalters-bot"}, "editor": null});
+    let (config, mut replay) = maintained(9, vec![posted], 45.0);
+    digest_visibility(&mut replay, visible(true));
+    let report = block(run(
+        &replay,
+        &replay,
+        &config,
+        State::default(),
+        (Mode::Preview, Limits::default()),
+        replay.now,
+    ))
+    .unwrap();
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    for expected in [
+        "maintain: a research plan already exists today; the digest waits",
+        "start triage cgwalters-forge/tracker#446 pool=claude",
+    ] {
+        assert!(
+            report.lines.iter().any(|l| l == expected),
+            "{expected}: {:#?}",
+            report.lines
+        );
+    }
+}
+
 /// `--max-dispatch` starts the first runs the pass would and holds the rest,
 /// a line each, writing nothing for them; a preview of the recorded board
 /// plans what a local apply over it starts. A start is a dispatch, not a
@@ -11496,36 +11550,55 @@ fn apply_never_runs_out_between_a_claim_and_its_run() {
 /// (tracker#908); one too small for the first candidate is still a failure.
 /// Stage 4 stops considering where what is left is what a start may take,
 /// so tracker#527, whose plan waits on an open pull request's overlap, is
-/// held for that, never stopped by the budget.
+/// held for that, never stopped by the budget. A stop with nothing started
+/// names each pool under pace and the first candidate left unread
+/// (agent-board#803).
 #[test]
 fn apply_defers_the_rest_when_its_budget_runs_out() {
     let config = config(json!({"wip": 8}));
     let overlap = "hold cgwalters-forge/tracker#527: Waiting: open pull request cgwalters-forge/tracker#832 changes `README.md`.";
-    // The limit, the stop, the failures, and the runs started.
-    let cases = [
+    // The limit, the stop, the failures, the runs started, and the idle
+    // lines after the stop.
+    let cases: [(usize, &str, usize, usize, &[&str]); 3] = [
         (
             196,
             "budget: 102 requests left, only what a start may take (109); 8 candidate(s) considered, starts included, for 79 requests; 1 more candidate(s) wait",
             0,
             5,
+            &[],
         ),
         (
             165,
             "budget: 113 requests left, only what a start may take (109); 5 candidate(s) considered, starts included, for 37 requests; 4 more candidate(s) wait",
             0,
             2,
+            &[],
         ),
         (
             120,
             "budget: 105 requests left, only what a start may take (109); 9 more candidate(s) wait",
             1,
             0,
+            &[
+                "idle: claude is under pace and nothing started; stage 4's budget left 9 candidate(s) unread, first cgwalters-forge/tracker#446",
+            ],
         ),
     ];
-    for (limit, line, failures, started) in cases {
+    for (limit, line, failures, started, idle) in cases {
         let forge = Forge::new(None, false);
         let report = apply_within(&forge, &config, limit);
-        assert_eq!(last_scheduled(&report), line, "limit {limit}");
+        let after: Vec<&str> = (report.lines.iter())
+            .skip_while(|l| *l != line)
+            .skip(1)
+            .filter(|l| l.starts_with("idle: "))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(after, idle, "limit {limit}: {:#?}", report.lines);
+        assert_eq!(
+            last_scheduled(&report),
+            idle.last().copied().unwrap_or(line),
+            "limit {limit}"
+        );
         assert_eq!(
             report.failures, failures,
             "limit {limit}: {:#?}",

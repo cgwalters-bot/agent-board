@@ -1771,7 +1771,11 @@ found could use; the rest wait for the next pass, and the stop is a failure only
 when no candidate was considered. Past a candidate, the line also says how many
 were considered and the requests they took, starts included (`K candidate(s)
 considered, starts included, for R requests`), to tell them from the stage's own
-reads: the board, run listings and leases (agent-board#789). Revisits, the weekly sweep and blocker reads
+reads: the board, run listings and leases (agent-board#789). A stop before
+any candidate started leaves no slot for the `idle:` line, so it adds one line
+for each pool still under pace (`idle: POOL is under pace and nothing started;
+stage 4's budget left M candidate(s) unread, first OWNER/REPO#N`), naming the
+candidate it stopped at (agent-board#803). Revisits, the weekly sweep and blocker reads
 that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,
 labels or fails an item for it, nor fails the pass.
 Stage 5 and the hold snapshot, which come after every start, spend what is left. There is
@@ -1813,8 +1817,13 @@ available to later stages; neither the total limit nor mutation authority
 changes. The existing finish exceptions above still apply, so this is not a
 hard partition for writes or a guarantee of starts. A deferred maintain read
 keeps its cached state for the next pass, not a successful empty digest.
-Before posting a digest's plan, maintain also requires enough discovery
-headroom for the whole start and receipt; an admitted start may finish.
+Before posting a digest's plan, maintain also requires that the pass has
+enough requests and time left for the whole start and receipt (`budget:
+maintain stopped; a digest start and record need N requests, M left, before
+the time bound`); an admitted start may finish. Like an epic apply, the start
+is charged to what the pass has left rather than to maintain's share: in a
+busy pass that share's discovery left less than a start needs, and the digest
+did not start for days (agent-board#803). It starts once a day.
 Concurrency reads refused by an earlier stage's share are retried by later
 stages, not cached as pass-wide failures.
 Scheduling also keeps one start's recheck/write reserve, plus room to read its
@@ -3514,7 +3523,11 @@ is due, and plans its run:
    the allowance, uses no more than it. The pass cannot meter one stage's
    use apart from another's, so this bounds where maintain starts, not what
    its run then spends; it starts once a day. The published snapshot is not
-   changed.
+   changed. The share is left only while the digest waits on what the
+   other stages' runs take (a pool, WIP or a hold), not where this pass
+   cannot start it anyway: its requests (with `reserveScheduling`),
+   `--max-dispatch` or `--max-writes`, or a plan already posted today,
+   this pass's included where its dispatch waited or failed (agent-board#803).
 
 The day's repositories, and whether the day is done, are kept in the poll
 cache, `state`, which an applying pass writes, with `follow` set or not. A later
