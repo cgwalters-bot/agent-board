@@ -25,6 +25,7 @@ mod release_train;
 mod review;
 mod review_setup;
 mod supervise;
+mod triage;
 
 use anyhow::{Context, Result, bail, ensure};
 use board_core::{Capability, Policy, Snapshot};
@@ -86,6 +87,11 @@ enum Command {
     Action {
         #[command(subcommand)]
         command: Action,
+    },
+    /// Apply an operator-reviewed triage verdict list (preview unless --apply).
+    Triage {
+        #[command(subcommand)]
+        command: Triage,
     },
     /// Check proposals without applying them.
     Check {
@@ -240,6 +246,12 @@ enum Review {
 enum Action {
     /// Print the newest accepted proposal's typed mutations without writing.
     Check(action::Check),
+}
+
+#[derive(Subcommand)]
+enum Triage {
+    /// Comment decisions, remove needs-human/needs-operator and unassign the operator.
+    Apply(triage::Apply),
 }
 
 #[derive(Subcommand)]
@@ -547,6 +559,21 @@ fn execute(cli: Cli, runtime: &Runtime) -> Result<()> {
             io::stdout()
                 .write_all(cli_docs::markdown(Cli::command()).as_bytes())
                 .context("write CLI reference")
+        }
+        Command::Triage {
+            command: Triage::Apply(args),
+        } => {
+            ensure!(
+                cli.json.is_none() && cli.snapshot.is_none(),
+                "triage apply prints requests as JSON lines; --json and --snapshot are unsupported"
+            );
+            triage::run(
+                args,
+                cli.repo.as_deref(),
+                &cli.hostname,
+                board_forge::github::Client::from_env,
+                &mut io::stdout().lock(),
+            )
         }
         Command::Action {
             command: Action::Check(args),
