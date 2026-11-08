@@ -1440,6 +1440,17 @@ pub struct RestResponse {
 
 /// Conditional GETs against the REST API. `validator` is a header name and value.
 pub trait Rest {
+    /// Transport sends, including retries; none when the transport cannot count.
+    fn network_requests(&self) -> Option<usize> {
+        None
+    }
+
+    /// Opaque binding to the API host, representation and credential context.
+    /// Implementations must never return the credential itself.
+    fn cache_context(&self) -> Option<String> {
+        None
+    }
+
     /// Accounting context for subsequent run dispatches and reruns. This
     /// observes decisions only; it neither authorizes nor counts a start.
     fn start_kind(&self, _kind: &str) {}
@@ -1448,6 +1459,12 @@ pub trait Rest {
     /// Bypass every conditional cache, including a pass-wide wrapper. Claims
     /// need current pagination even when the first page's body is unchanged.
     fn get_fresh(&self, url: &str) -> Result<RestResponse> {
+        self.get(url, None)
+    }
+
+    /// Evidence immediately before a write must not acquire a cached body in
+    /// an enclosing transport, even when the caller supplied no validator.
+    fn get_live(&self, url: &str) -> Result<RestResponse> {
         self.get(url, None)
     }
     /// A write, or a GET whose 404 is an answer; any status comes back,
@@ -1576,6 +1593,8 @@ impl std::error::Error for Refused {}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct State {
     pub interval_seconds: i64,
+    /// Disposable responses only; cursors and pending asks are not scoped away.
+    pub response_scope: Option<String>,
     /// Responses by URL: `etag`, `last_modified`, `next` and `body`.
     pub responses: BTreeMap<String, Value>,
     /// Raw pass GET responses, separate from the poll's slimmed bodies.
@@ -1651,6 +1670,17 @@ pub struct State {
 }
 
 impl State {
+    /// Discard only responses on a host/credential/representation/config change.
+    /// In particular, pending intake and fairness cursors must survive cache loss.
+    pub fn bind_responses(&mut self, scope: &str) {
+        if self.response_scope.as_deref() != Some(scope) {
+            eprintln!("cache: absent or incompatible response scope; cold reads");
+            self.responses.clear();
+            self.pass_responses.clear();
+            self.response_scope = Some(scope.to_owned());
+        }
+    }
+
     pub fn from_json(value: &Value) -> Result<Self> {
         let object = value.as_object().context("poll state is not an object")?;
         ensure!(
@@ -1664,6 +1694,7 @@ impl State {
                     "interval_seconds",
                     "responses",
                     "pass_responses",
+                    "response_scope",
                     "operator_cursor",
                     "operator_page",
                     "intake_page",
@@ -1693,20 +1724,28 @@ impl State {
             .and_then(Value::as_i64)
             .filter(|s| (MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(s))
             .context("poll state interval_seconds is missing or out of bounds")?;
-        let responses = object
+        let mut responses = object
             .get("responses")
             .and_then(Value::as_object)
-            .context("poll state responses is not an object")?
-            .iter()
-            .map(|(url, entry)| {
-                ensure!(url.starts_with(API_ROOT), "poll state URL outside the API");
-                ensure!(
-                    entry.get("body").is_some(),
-                    "poll state response has no body"
-                );
-                Ok((url.clone(), entry.clone()))
+            .into_iter()
+            .flat_map(|responses| responses.iter())
+            .filter_map(|(url, entry)| {
+                if !url.starts_with(API_ROOT)
+                    || !crate::pass::cache::intact(entry)
+                    || (object.get("response_scope").is_some_and(Value::is_string)
+                        && !entry.get("digest").is_some_and(Value::is_string))
+                {
+                    eprintln!("cache: invalid disposable response discarded; cold read");
+                    return None;
+                }
+                Some((url.clone(), entry.clone()))
             })
-            .collect::<Result<_>>()?;
+            .collect::<BTreeMap<_, _>>();
+        let before = responses.len();
+        crate::pass::cache::bound(&mut responses);
+        if before != responses.len() || !object.get("responses").is_some_and(Value::is_object) {
+            eprintln!("cache: missing, oversized or evicted disposable responses; cold reads");
+        }
         let pass_responses: BTreeMap<String, Value> = object
             .get("pass_responses")
             .map(|v| serde_json::from_value(v.clone()))
@@ -1874,6 +1913,10 @@ impl State {
             .map(crate::pass::maintain::Day::from_json)
             .transpose()?;
         Ok(Self {
+            response_scope: object
+                .get("response_scope")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             interval_seconds,
             responses,
             pass_responses,
@@ -1905,6 +1948,9 @@ impl State {
         });
         if !self.pass_responses.is_empty() {
             state["pass_responses"] = json!(self.pass_responses);
+        }
+        if let Some(scope) = &self.response_scope {
+            state["response_scope"] = scope.as_str().into();
         }
         if let Some(cursor) = &self.operator_cursor {
             state["operator_cursor"] = cursor.as_str().into();
@@ -4965,6 +5011,8 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
         }
         self.spend()?;
         self.writes += 1;
+        self.previous.clear();
+        self.used.clear();
         let (status, response) = client.send(method, &format!("{API_ROOT}{path}"), &body)?;
         if !((200..300).contains(&status) || status == allowed) {
             let message = format!(
@@ -6666,7 +6714,9 @@ impl<'a, R: Rest, G: Transport> Pass<'a, R, G> {
                 "body": slim(&response.body),
             }),
         };
+        let entry = crate::pass::cache::seal(entry);
         self.used.insert(url.to_owned(), entry.clone());
+        crate::pass::cache::bound(&mut self.used);
         Ok((
             entry["body"].clone(),
             entry["next"].as_str().map(str::to_owned),
@@ -8818,6 +8868,7 @@ pub(crate) fn run_capped_after_direction<R: Rest, G: Transport>(
         notify_before,
     } = cursors;
     outcome.state = State {
+        response_scope: state.response_scope,
         interval_seconds: next_interval(previous, active),
         responses: pass.used,
         pass_responses: BTreeMap::new(),
@@ -12412,16 +12463,20 @@ mod tests {
             ),
             ("interval_seconds", json!(60)),
             ("interval_seconds", json!(MAX_INTERVAL_SECONDS + 1)),
-            ("responses", json!({"https://evil.example/": {"body": []}})),
-            (
-                "responses",
-                json!({"https://api.github.com/x": {"etag": "\"a\""}}),
-            ),
             ("unknown", json!(1)),
         ] {
             let mut bad = good.clone();
             bad[field] = value;
             assert!(State::from_json(&bad).is_err(), "{field}");
+        }
+        for responses in [
+            Value::Null,
+            json!({"https://evil.example/": {"body": []}}),
+            json!({"https://api.github.com/x": {"etag": "\"a\""}}),
+        ] {
+            let mut disposable = good.clone();
+            disposable["responses"] = responses;
+            assert!(State::from_json(&disposable).unwrap().responses.is_empty());
         }
     }
 

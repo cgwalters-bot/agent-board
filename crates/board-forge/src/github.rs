@@ -571,6 +571,7 @@ impl<T: GraphQl> GraphQl for ReadBudget<'_, T> {
 /// The live GitHub client: [`Api`] for the snapshot, and ureq for every
 /// other read and write, which are still sync.
 pub struct Client {
+    requests: std::sync::atomic::AtomicUsize,
     token: String,
     agent: ureq::Agent,
     api: Api,
@@ -626,6 +627,8 @@ impl Client {
             "refusing to send the token outside {API_ROOT}"
         );
         let path = url.trim_start_matches(API_ROOT);
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut response = self
             .agent
             .get(url)
@@ -646,6 +649,8 @@ impl Client {
                 .filter(|l| l.starts_with("https://"))
                 .with_context(|| format!("GET {path}: redirect without an HTTPS location"))?
                 .to_owned();
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             response = self
                 .agent
                 .get(&location)
@@ -668,6 +673,7 @@ impl Client {
 
     fn with_token(token: String) -> Self {
         Self {
+            requests: std::sync::atomic::AtomicUsize::new(0),
             api: Api::new(token.clone()),
             token,
             agent: http_agent(),
@@ -830,6 +836,7 @@ impl Http for Https {
 /// [`RATE_LIMIT_WAIT`] ([`Backoff`]). An operation's request budget
 /// is its own ([`GitHub::snapshot_with_policy`]).
 pub(crate) struct Api<H = Https> {
+    requests: std::sync::atomic::AtomicUsize,
     http: H,
     in_flight: tokio::sync::Semaphore,
     /// No retry waits past it ([`Client::retry_within`]).
@@ -848,6 +855,7 @@ impl Api {
 impl<H: Http> Api<H> {
     fn with_http(http: H) -> Self {
         Self {
+            requests: std::sync::atomic::AtomicUsize::new(0),
             http,
             in_flight: tokio::sync::Semaphore::new(MAX_IN_FLIGHT),
             deadline: None,
@@ -862,6 +870,8 @@ impl<H: Http> Api<H> {
         loop {
             let reply = {
                 let _slot = self.in_flight.acquire().await?;
+                self.requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.http.post(url, body).await?
             };
             let decoded = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
@@ -1133,6 +1143,8 @@ impl Transport for Client {
     fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
         let request = json!({"query":query,"variables":variables});
         let send = || {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut response = self
                 .agent
                 .post(GRAPHQL_URL)
@@ -1172,6 +1184,24 @@ impl crate::pass::Broker for Client {
 }
 
 impl crate::poll::Rest for Client {
+    fn network_requests(&self) -> Option<usize> {
+        use std::sync::atomic::Ordering;
+        Some(self.requests.load(Ordering::Relaxed) + self.api.requests.load(Ordering::Relaxed))
+    }
+
+    fn cache_context(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        // Rotation and permission-context changes must never reuse another
+        // credential's representation. Only the digest leaves this client.
+        Some(format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{API_ROOT}\0application/vnd.github+json\02022-11-28\0{}",
+                self.token
+            ))
+        ))
+    }
+
     fn download(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
         Client::download(self, url, limit)
     }
@@ -1183,6 +1213,8 @@ impl crate::poll::Rest for Client {
         );
         let path = url.trim_start_matches(API_ROOT);
         let request = |request: ureq::RequestBuilder<ureq::typestate::WithBody>| {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let request = self
                 .authorize(request)
                 .header("User-Agent", "agent-board")
@@ -1244,6 +1276,8 @@ impl crate::poll::Rest for Client {
         );
         let path = url.trim_start_matches(API_ROOT);
         let send = || {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut request = self
                 .authorize(self.agent.get(url))
                 .header("User-Agent", "agent-board")

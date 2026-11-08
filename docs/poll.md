@@ -10,6 +10,108 @@ the caller's dispatch workflow ([dispatch](dispatch.md)).
 
 ## One pass
 
+### Disposable REST responses (partial #794)
+
+The concrete threats are reusing one credential's private representation with
+another credential, and treating corrupt or stale local data as write authority.
+The GitHub pass extends the existing `state` response map and shared request
+budget; no control-app service is contacted. With no `state` path it is off.
+The full REST representation index is rebuilt from URL keys ending in
+`#agent-board-rest-v1`; poll's slim responses retain their distinct URL keys.
+The response scope hashes the API host, REST Accept/API version, credential
+context and parsed configuration. Credentials themselves are never serialized.
+Dispatcher reads participate only with the same credential context as the
+primary client; a distinct or contextless dispatcher always reads directly.
+An older unscoped state starts cold on activation; its pending intake, refusal
+records, fairness cursors and maintain state are retained.
+
+The index holds at most 1,024 responses, 8 MiB of serialized response data,
+and 256 KiB per entry. Deterministic eviction drops responses only. Newly
+written entries include a SHA-256 corruption checksum; this is **not** writer
+authentication. Invalid responses are discarded with diagnostics. An incompatible
+response scope also starts cold. Legacy poll states still decode. A malformed
+whole state or incompatible *poll-state* schema remains an error, rather than
+silently losing waiting asks: do not delete that state to repair its disposable
+responses. The file is parsed before the response bounds are applied; these are
+retained-data bounds, not an input file allocation bound.
+
+Full shared REST reads revalidate their own ETags on every access. A 304 replaces
+the body with the validated representation; a present Link replaces pagination
+metadata, while an absent Link retains it. There is no TTL or issue-`updatedAt`
+shortcut for comments, timelines, reviews, checks or relationships. Existing
+GraphQL reads remain fresh. The existing `Kept` hold-only read deduplication is
+retained; it does not authorize starts. Explicit live poll reads bypass the
+shared cache, as do shared reads during start/recovery admission. Writes,
+including ambiguous failures and GraphQL mutations, discard the disposable
+shared index. Poll writes also discard their local response index; a pass that
+wrote does not carry old slim responses into its next state. All pagination,
+coverage errors, per-pass time/request reserves and the existing 304-refund cap
+remain in force. No action ledger or budget counter is stored in this cache.
+
+The `cache:` line separates validator hits/misses, observed 304s, transport
+network sends (including retries), charged requests and GraphQL points. Network
+sends count API transport calls and explicit download redirects, not broker
+traffic, TCP attempts or redirects internal to an HTTP library. A transport
+without counters reports `unavailable`, not an inferred wire count. The existing
+summary's 304 count is the capped number of refunded requests, not all 304s.
+
+#### Measurement and remaining acceptance
+
+`cargo test --locked -p board-forge response_cache_recorded_steady_state_comparison -- --nocapture`
+traces a representative October 23 pass recording, with **synthetic** ETags over
+the recorded bodies. Cold: 49 charged requests. Equivalent repeated steady
+states: warm 43 charged requests, 56 transport sends, 13 refunded 304s and 43
+GraphQL points; response data lost: 49 charged, 56 sends, 7 refunded 304s and 43
+points. Decisions and planned starts agree. The lost-cache pass can still obtain
+304s from responses read earlier in that same pass. These are offline transport
+measurements, not hosted GitHub rate readings or evidence of deployed savings.
+The test prints the hottest exact GraphQL queries and REST URLs; repeated
+dispatch-run status listings are among the REST hot spots. GraphQL dominates
+this fixture. No hot issue-state/labels/assignees/timeline conversion is shipped
+by this partial change; proving equivalent complete REST semantics and measuring
+those conversions is still needed. The well-under-half target against roughly
+645 charged requests, reduced wire traffic, and comparable hosted applying-pass
+logs are **not met**. Service options (b)/(c) remain deferred.
+
+#### Caller deployment follow-up (tracker)
+
+This checkout cannot carry a change or file an issue in the caller repository.
+The concrete follow-up for `cgwalters-forge/tracker` is:
+
+* `.github/pass.json`: set `state` to `.state/agent-board-poll.json` only after
+  the confidentiality and writer conditions below have been established. Update
+  the agent-board pin to the reviewed version.
+* `.github/workflows/poll.yml`: restore that path immediately before the serialized
+  applying default-branch pass, and save it only after that pass. Use pinned
+  `actions/cache/restore` and `actions/cache/save`, a new immutable key per run,
+  and a compatible-version restore prefix. Missing/evicted/refused restore or
+  failed save means cold response reads, not skipped gates. Do not grant preview,
+  fork, PR or agent-produced code access to the poll's writable state.
+* Audit **all** default-branch cache writers and reusable workflow callers, not
+  merely poll.yml's key prefix. Only the serialized applying poll may write
+  trusted response state. Set other jobs to `cache-mode: read` or `none` as
+  appropriate, and do not opt low-trust triggers into cache writes.
+
+GitHub's [cache access reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#cache-access-for-low-trust-workflow-triggers)
+(checked November 8, 2026) grants default-branch writes by default to push,
+workflow_dispatch, repository_dispatch, delete, registry_package, page_build
+and schedule runs. Other default-branch triggers default to read-only but can
+explicitly opt into writes. Caches are shared between workflows on the same
+ref; a key prefix is not authorization. PR merge-ref caches are not restored by
+the default branch, **but fork PRs can read base/default-branch caches**. Cache
+contents are not authenticated. Scope hashes and checksums do not fix this.
+
+**Do not upload this entire state to a broadly readable Actions cache.** REST
+responses and pending intake can include private payloads and repository names.
+Option (a) deployment remains blocked until tracker provides a reviewed storage
+confidentiality/writer boundary or an explicitly public-only export that leaves
+pending intake out of that disposable archive. No encryption protocol, second
+cache or private-payload export is added here. Keep existing protected durable
+state separate from disposable archive loss; losing an archive must not erase
+waiting asks. The caller follow-up must verify actual cache-mode enforcement,
+restore provenance, concurrent-run serialization, cold failure behavior and
+comparable cold/warm hosted logs before claiming savings.
+
 ### Dispatching machine work
 
 With `unstall: true` (the pass's `pr.unstall`, still off by default), a
