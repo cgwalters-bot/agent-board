@@ -843,6 +843,82 @@ fn scheduling_reserve_is_opt_in_and_github_only() {
     }
 }
 
+/// Parent discovery alone could spend the scheduling share. Keep enough
+/// requests to start the highest-ranked candidate already discovered.
+#[test]
+fn scheduling_starts_the_best_candidate_before_reading_more_parents() {
+    // The ready unparented candidates can precede or follow the expensive
+    // parent lookups; locally decidable work must not be skipped at the bound.
+    for begin in [1000, 9000] {
+        let mut forge = Forge::new(None, false);
+        sub_issue(&mut forge.replay, "cgwalters-forge/tracker", "cgwalters");
+        let labelled = forge.replay.requests.last().unwrap().clone();
+        for entry in &mut forge.replay.requests {
+            let Some(nodes) = entry["answer"]
+                .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let Some(first) = nodes.iter_mut().find(|n| n["content"]["number"] == 446) else {
+                continue;
+            };
+            let template = first.clone();
+            first["content"]["parent"] = Value::Null;
+            first["content"]["author"]["login"] = "cgwalters".into();
+            first["priority"]["name"] = "P1".into();
+            // This later item is better than #446; both must be read before
+            // discovery stops, and ranking, not discovery order, must win.
+            let mut best = first.clone();
+            best["content"]["number"] = 459.into();
+            best["priority"]["name"] = "P0".into();
+            nodes.push(best);
+            for number in begin..begin + 400 {
+                let mut child = template.clone();
+                child["content"]["number"] = number.into();
+                child["content"]["parent"]["number"] = (number + 1000).into();
+                child["priority"]["name"] = "P2".into();
+                nodes.push(child);
+            }
+        }
+        for number in begin + 1000..begin + 1400 {
+            let mut parent = labelled.clone();
+            parent["request"]["variables"]["number"] = number.into();
+            forge.replay.requests.push(parent);
+        }
+        let cfg = config(json!({"reserveScheduling": true, "wip": 3}));
+        let report = apply_within(&forge, &cfg, 390);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert_eq!(forge.dispatches(), ["cgwalters-forge/tracker#459"]);
+        assert!(
+            report.lines.iter().any(|l| l
+                == &format!(
+                    "budget: holding back {} requests for a start and its candidate reads",
+                    START_RESERVE + START_REQUESTS
+                )),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("budget: candidate discovery stopped;")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(
+            !report
+                .lines
+                .iter()
+                .any(|l| l.starts_with("hold ") && l.contains("could not")),
+            "{:#?}",
+            report.lines
+        );
+        assert!(report.spent.requests <= 390);
+    }
+}
+
 /// Both sweeps share the headroom before epics; each stage must stop its
 /// discovery rather than consuming the next stage's allocation.
 #[test]

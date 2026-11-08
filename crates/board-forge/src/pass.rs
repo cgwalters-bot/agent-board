@@ -4014,13 +4014,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let holds = self.report.holds.len();
         let decisions = self.report.lines.len();
+        let leases = LEASE_RECHECK_REQUESTS * slots.leased.len();
+        let reserve = START_RESERVE + leases;
+        if config.reserve_scheduling {
+            // Parent discovery must leave both the start's reserve and room
+            // to read the best candidate's plan before its recheck begins.
+            self.client.bounds.reserve.set(reserve + START_REQUESTS);
+            self.line(format!(
+                "budget: holding back {} requests for a start and its candidate reads",
+                reserve + START_REQUESTS
+            ));
+        }
         let mut candidates = self.candidates(&board);
         self.focus_first(&mut candidates);
         // From here on, until stage 4 is done, a read that would leave too
         // little for a start is not sent ([`START_RESERVE`]), with each
         // lease's own reads where its recheck reads them again.
-        let leases = LEASE_RECHECK_REQUESTS * slots.leased.len();
-        self.client.bounds.reserve.set(START_RESERVE + leases);
+        self.client.bounds.reserve.set(reserve);
         let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
         self.focus_judged(candidates.len(), free);
         // With a focus, only its children are revisited: a revisit is a
@@ -4694,6 +4704,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             control.push(key(&found.issue));
         }
         let mut ranked = Vec::new();
+        let mut deferred = 0;
         let (mut visitors, mut outside, mut unparented) = (0, Vec::new(), 0);
         for facts in board.items.values() {
             let epic = match screen(facts, config, &control, &people) {
@@ -4710,31 +4721,54 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     unparented += 1;
                     None
                 }
-                Screen::Child(parent) => match self.live(parent) {
-                    Ok(true) => board.items.get(&key(&parent.issue)),
-                    Ok(false) => {
-                        let why = format!(
-                            "its parent {} is not a live epic (open and labelled epic by the operator or the bot)",
-                            parent.issue.display()
-                        );
-                        let top = top_priority(&board.options, facts);
-                        outside.push(Entry {
-                            scope: Scope::Under(facts.issue.clone(), parent.issue.clone()),
-                            hold: Hold::new(HoldKind::EpicNotLive, why).operator(top),
-                            priority: facts.priority.clone(),
-                            why: facts.why.clone(),
-                        });
+                Screen::Child(parent) => {
+                    // Local facts and cached parents cost no requests: keep
+                    // ranking them even once further discovery must wait.
+                    let at = key(&parent.issue);
+                    if config.reserve_scheduling
+                        && !self.epics.contains_key(&at)
+                        && self.client.bounds.reserved()
+                    {
+                        deferred += 1;
                         continue;
                     }
-                    Err(why) => {
-                        self.held(facts, Hold::new(HoldKind::Unreadable, why));
-                        continue;
+                    let refused = self.client.bounds.refused.get();
+                    match self.live(parent) {
+                        Ok(true) => board.items.get(&key(&parent.issue)),
+                        Ok(false) => {
+                            let why = format!(
+                                "its parent {} is not a live epic (open and labelled epic by the operator or the bot)",
+                                parent.issue.display()
+                            );
+                            let top = top_priority(&board.options, facts);
+                            outside.push(Entry {
+                                scope: Scope::Under(facts.issue.clone(), parent.issue.clone()),
+                                hold: Hold::new(HoldKind::EpicNotLive, why).operator(top),
+                                priority: facts.priority.clone(),
+                                why: facts.why.clone(),
+                            });
+                            continue;
+                        }
+                        Err(why) => {
+                            if config.reserve_scheduling
+                                && self.client.bounds.refused.get() > refused
+                            {
+                                self.epics.remove(&at);
+                                deferred += 1;
+                                continue;
+                            }
+                            self.held(facts, Hold::new(HoldKind::Unreadable, why));
+                            continue;
+                        }
                     }
-                },
+                }
             };
             let epic = epic.and_then(|e| e.priority.as_deref());
             let rank = rank(&board.options, epic, facts.priority.as_deref(), facts);
             ranked.push((rank, facts));
+        }
+        if deferred > 0 {
+            self.candidates_deferred(deferred);
         }
         ranked.sort_by(|a, b| a.0.cmp(&b.0));
         self.report.tally.1.candidates = Some(ranked.len());
@@ -4744,6 +4778,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             self.record(entry);
         }
         ranked
+    }
+
+    /// Discovery stopped, not a decision that the unread items are held.
+    fn candidates_deferred(&mut self, left: usize) {
+        self.holds_whole = false;
+        self.line(format!(
+            "budget: candidate discovery stopped; {left} candidate(s) wait for parent reads; starting the best candidate read so far"
+        ));
     }
 
     /// Whether `parent` is a live epic: open, in the epics repository (or,
