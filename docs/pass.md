@@ -2007,17 +2007,30 @@ cannot loop. An earlier `follow-through` verdict on an issue without the
 pass's plan also waits. A run that still answers `done` for such work is
 closed or held as before: only the brief steers it.
 
-Work on our own infrastructure, harness work, never waits on the operator
-for anything but their own decisions (agent-board#778). A harness repository
+The concrete failure `operatorAsk` prevents is applying one caller's delegation
+policy to another caller, or releasing an ask whose domain the brief requested
+but the scheduler does not recognize. This optional trusted config key holds
+both `text` (the policy prose) and `domains` (accepted `operator` verdict values).
+It currently supports only GitHub and is refused on Forgejo.
+It is off by default: an absent key adds no repository-specific ask policy and
+never releases a wait merely because the repository is our own infrastructure.
+Invalid config fails validation, with no fallback to a compiled policy. Text
+must be nonblank and at most 4,000 characters; there must be 1–16 distinct domains,
+each 1–64 bytes of lowercase ASCII letters or hyphens. Unknown fields are refused.
+This is brief guidance and wait classification, not a grant of mutation authority;
+existing dispatch, write and release caps are unchanged.
+
+With `operatorAsk` set, work on our own infrastructure, harness work, waits on
+the operator only for the caller's domains (agent-board#778, #787, first policy
+moved under #788). A harness repository
 is a work repository of `dispatchRepo`'s owner that is neither in
 `pr.noMerge` nor a midstream fork stage 2 read (none where `midstream` is set
 and its read failed); an issue there is harness work unless it is labelled
 one of `operator-action`, `decision`, `question` or `review-draft`, or
 `target:ORG` for another organization than `dispatchRepo`'s. On harness work
-the triage brief adds that it is ours to plan, and that an operator-domain
+the triage brief adds the configured text, and says that an operator-domain
 decision is answered `needs-operator` with `"operator"` in the same JSON
-block, one of `credentials`, `budget`, `ruleset`, `upstream` (posting
-upstream for the first time) or `bounds`. A `needs-operator` or
+block, one of the configured domains. A `needs-operator` or
 `needs-design` verdict without one, as a follow-up or an earlier verdict,
 labels and assigns nothing: the issue is triaged again at once, its plan
 starting `The board pass asks a triage run to plan this issue again: it is
@@ -2025,6 +2038,18 @@ our own infrastructure, not an operator decision.`, and a verdict on such a
 plan waits as `partly` does, sharing its doubling wait (`…, harness work held
 for no one; triaged again from …`). `done` and `obsolete`, a close for the
 operator to confirm, and a verdict naming its domain, are asked as before.
+
+For [tracker#1445](https://github.com/cgwalters-forge/tracker/issues/1445), set
+`cgwalters-forge/tracker`'s `.github/pass.json` key `operatorAsk` to the object in
+[`fixtures/operator-ask.json`](../fixtures/operator-ask.json), after bumping its
+agent-board pin. The value asks only about big-picture architecture for our own
+infrastructure, plus the unchanged posture list: upstream posting (`upstream`),
+midstream promotion (`promotion`), credentials (`credentials`), broker policy
+(`broker`), rulesets and bypasses (`ruleset`), spending caps (`budget`), security
+disclosure (`security`), and target repository bounds (`bounds`). Architecture
+uses `architecture`. Everything else takes the recommended option and records
+why. The fixture is an example caller value tested here, not a built-in default;
+no tracker config or pin is changed in this repository.
 
 Work already promoted upstream is the exception (agent-board#735). Its
 midstream pull request is closed, and an implement run can only open another

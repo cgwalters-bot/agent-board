@@ -1,0 +1,14 @@
+{
+  "text": "For our own infrastructure, ask the operator only about big-picture architecture, plus posture: upstream posting, midstream promotion, credentials, broker policy, rulesets and bypasses, spending caps, security disclosure, and changes to which repositories agents may target (target bounds). For everything else, take the recommended option and record why.",
+  "domains": [
+    "architecture",
+    "upstream",
+    "promotion",
+    "credentials",
+    "broker",
+    "ruleset",
+    "budget",
+    "security",
+    "bounds"
+  ]
+}
