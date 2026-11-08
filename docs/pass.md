@@ -2089,6 +2089,25 @@ keeps it from starting twice; a failed run is re-run by hand, and after the
 run the issue stays held as dispatched until the operator closes it or
 posts another plan.
 
+The controller can accept a triage-posted verdict list with
+`agent-board triage apply --verdicts decisions.json --operator LOGIN --dry-run`.
+The file is an operator-reviewed JSON array, for example
+`[{"item":"OWNER/REPO#123","verdict":"proceed","decision":"Use the recommended option."}]`.
+`item` accepts issue URLs, `OWNER/REPO#N`, or numbers with `--repo`.
+This is explicit operator acceptance, not an automatic consumer of agent comments:
+the list has no authority on its own. Preview is the default; `--apply` writes
+with the controller's `GH_TOKEN`. It posts the verdict and decision, then removes
+`needs-human` and `needs-operator` if present, and unassigns only the named operator.
+It does not close issues or interpret the verdict as another mutation.
+To bound an accidentally oversized batch, `--max-writes` defaults to 20 and accepts
+0 through 100. Each comment, label removal and unassignment costs one write;
+the entire list is read and checked against the cap before the first write.
+Input is limited to 1 MiB, with at most one issue read per available write.
+Preview requires a read token. Duplicate items and pull requests are refused.
+Errors stop the batch; completed requests are printed as JSON lines. Inspect
+partial results before retrying: comments are not deduplicated on rerun, and
+concurrent changes to labels or assignments are not transactionally isolated.
+
 With `assignHolds` (off by default; agent-board#727), stage 4 waits on the
 operator by assignment instead of the `needs-human` label, so that the wait
 shows in GitHub's own assignment lists and notifications and the operator

@@ -16,6 +16,7 @@ Commands:
 
 - [`intake`](#agent-board-intake): Report new Forgejo issues and comments; no bodies, routing or forge writes
 - [`action`](#agent-board-action): Validate proposed operator mutations; never execute them
+- [`triage`](#agent-board-triage): Apply an operator-reviewed triage verdict list (preview unless --apply)
 - [`check`](#agent-board-check): Check proposals without applying them
 - [`project`](#agent-board-project): Inspect a project's summary and schema
 - [`changes`](#agent-board-changes): What landed, closed, opened or changed hold on the live project since a time, each line a link (read-only); --board-config's operator counts as an author whose new pull requests are listed
@@ -98,6 +99,34 @@ Arguments:
 Options:
 
 - `--config <FILE>`: Repository-owned configuration from a protected default-branch checkout
+
+## agent-board triage
+
+Apply an operator-reviewed triage verdict list (preview unless --apply)
+
+```text
+agent-board triage [OPTIONS] <COMMAND>
+```
+
+Commands:
+
+- [`apply`](#agent-board-triage-apply): Comment decisions, remove needs-human/needs-operator and unassign the operator
+
+## agent-board triage apply
+
+Comment decisions, remove needs-human/needs-operator and unassign the operator
+
+```text
+agent-board triage apply [OPTIONS] --verdicts <FILE> --operator <LOGIN>
+```
+
+Options:
+
+- `--verdicts <FILE>`: Operator-reviewed JSON array of {item, verdict, decision}; not fetched from agent comments
+- `--operator <LOGIN>`: Operator login to unassign; other assignees are preserved
+- `--dry-run`: Print the planned requests without writing (the default)
+- `--apply`: Apply with your GH_TOKEN; this is the operator's acceptance of the list
+- `--max-writes <MAX_WRITES>`: Maximum write requests for the whole list, 0..100; refused before any writes if exceeded (default: `20`)
 
 ## agent-board check
 
