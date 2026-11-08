@@ -44,6 +44,46 @@ saw to the operator, recommending a rollback of the pin if it misbehaves.
 Why: a scheduler should be boring and replayable, and judgment should not
 compete with it for the same decisions.
 
+### Proposed read-only persistent consumer
+
+tracker#1456 proposes a persistent deployment reading the same deterministic
+preview decisions. `board-forge::pass::decision::preview` is the bounded library
+seam: it invokes `pass::run` in `Mode::Preview`, reuses holds/needs-you (including
+Act now and next context) and work projections, and exports `agent-board/decision/v1`.
+It does not parse `Report.lines`, create a scheduler or change CLI/publication
+output. Needs-you extensions remain caller-configured; an unavailable projection
+is null, not an empty inbox. Existing pass reads may consult forge receipts and
+carried evidence; the library never scrapes rendered comments to recover decisions.
+
+The concrete threat addressed by its read-only transport is an accidental apply
+path in a persistent preview consumer. REST methods other than GET (dispatch and
+rerun POSTs included), GraphQL documents with a `mutation` token, and accounting
+callbacks are not forwarded. Both synchronous and asynchronous GraphQL are
+guarded. This conservative check also refuses that token in a comment or literal;
+it is for library-owned documents, not arbitrary GraphQL passthrough. Deploy with
+read-only credentials too; this adapter does not constrain an independently
+supplied transport's implementation of reads.
+
+Observation time is not source validation time. The snapshot preserves needs-you's
+validation clock, usage's computation clock separately from per-pool observation
+clocks and stale/missing/partial evidence status, carried hold
+provenance, per-repository coverage, nullable candidate/WIP counts, preview starts
+and separate confirmed effects. WIP retains the pass's preview semantics (including
+would-start slots), not a count of confirmed new runs. Issue work coverage remains
+incomplete because admission may stop at caps without reading all plans. The
+existing 200-item work bound counts omitted entries per repository. Holds/needs
+reuse the 60,000-character single-comment fitting bound and its omission counts;
+pools are limited to 16 with an explicit omitted count. These are bounded sections,
+not a new total wire-size contract. Missing sections or incomplete coverage must
+never be rendered as proof of no work.
+
+This is a library capability, not deployment approval or a daemon switch. Forge
+records remain authoritative, caches disposable, and the applying pass remains
+the one writer. #794 owns cache changes; #788 owns coordinating generic policy
+work. Caller configuration and deployment prompts stay outside this public API.
+Phase 3's credential decision remains unresolved. Bot comments describing the
+proposal do not resolve it or constitute operator approval.
+
 ## Writes
 
 `agent-board pass --apply` makes its own writes directly; agentic-job's
