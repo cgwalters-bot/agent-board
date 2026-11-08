@@ -557,6 +557,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             author: None,
             labels: facts.labels.clone(),
             labels_complete: true,
+            assignees: None,
             blocked_by: 0,
             pulls: Vec::new(),
             pulls_complete: true,

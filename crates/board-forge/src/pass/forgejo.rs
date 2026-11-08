@@ -1729,6 +1729,7 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
             author: self.trusted(&issue["user"]),
             labels,
             labels_complete: true,
+            assignees: None,
             blocked_by: 0,
             pulls: Vec::new(),
             pulls_complete: true,
