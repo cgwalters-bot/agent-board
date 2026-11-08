@@ -88,6 +88,7 @@ fn own_runs(fake: &mut Fake, runs: &[(u64, &str, &str, &str)]) {
 
 fn hand_back_ctx(outputs: &str, previous: Option<(u64, Value)>, attempt: u64) -> Run {
     Run {
+        profile_commit: None,
         source: Source::HandBack(HandBack {
             outputs: outputs.into(),
             previous,

@@ -1,6 +1,6 @@
 //! The supervisor agent's task as the caller's workflow hands it to the
 //! wrapper, moved from tracker's `supervisor-profile.cjs` and `session.cjs`:
-//! a reviewed profile and skill read at a pinned commit, then the trigger's
+//! a profile and skill read at one resolved commit, then the trigger's
 //! task and the checked operator request ([`supervisor_task`]), or the
 //! session's rules and opening prompt ([`session`]).
 use super::{Api, IssueRef, agent::MAX_TASK_BYTES};
@@ -22,13 +22,25 @@ const MAX_IDLE_MINUTES: u64 = 60;
 const PROFILE_KEYS: &[&str] = &["repository", "ref"];
 const SESSION_KEYS: &[&str] = &["enabled", "repository", "issue", "idleMinutes"];
 
-/// `agent.profile`: the repository holding the profile and a full commit of
-/// it, so that a config edit cannot point the read at a moving branch or
-/// another API path.
+/// `agent.profile`: the repository holding the profile and a full commit or
+/// branch name. Branches are resolved once before either file is read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
     pub repository: String,
+    pub reference: String,
+}
+
+/// The exact text and commit used for this run, not a moving branch.
+pub struct LoadedProfile {
     pub commit: String,
+    pub text: String,
+}
+
+pub fn is_commit(reference: &str) -> bool {
+    reference.len() == 40
+        && reference
+            .bytes()
+            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl Profile {
@@ -42,31 +54,81 @@ impl Profile {
             .as_str()
             .with_context(|| format!("{what}: repository"))?;
         validate_repository(repository).context(what)?;
-        let commit = value["ref"]
+        let reference = value["ref"]
             .as_str()
-            .filter(|r| r.len() == 40 && r.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')))
-            .with_context(|| format!("{what}: ref must be a full commit id"))?;
+            .with_context(|| format!("{what}: ref must be a full commit id or branch name"))?;
+        if !is_commit(reference) {
+            // Prevent a ref from injecting a query or escaping the branch API
+            // path. Only plain branch names, not URLs or revision expressions.
+            crate::overlap::validate_branch(reference).context(what)?;
+            ensure!(
+                !reference.starts_with("refs/")
+                    && reference.split('/').all(|part| !part.is_empty()
+                        && !part.starts_with('.')
+                        && !part.ends_with(['.', '/'])
+                        && !part.ends_with(".lock")),
+                "{what}: ref must be a full commit id or branch name"
+            );
+        }
         Ok(Some(Self {
             repository: repository.to_owned(),
-            commit: commit.to_owned(),
+            reference: reference.to_owned(),
         }))
     }
 
-    /// The profile, then the skill, as the agent reads them.
-    pub fn read(&self, api: &dyn Api) -> Result<String> {
-        Ok(format!(
+    /// The profile, then the skill, at the same commit even if the branch moves.
+    pub fn read(&self, api: &dyn Api) -> Result<LoadedProfile> {
+        let commit = if is_commit(&self.reference) {
+            self.reference.clone()
+        } else {
+            let branch = api
+                .get(&format!(
+                    "/repos/{}/git/ref/heads/{}",
+                    self.repository, self.reference
+                ))
+                .context("resolve supervisor profile branch")?;
+            ensure!(
+                branch["object"]["type"] == "commit",
+                "profile branch does not point to a commit"
+            );
+            branch["object"]["sha"]
+                .as_str()
+                .filter(|s| is_commit(s))
+                .context("profile branch has no full commit id")?
+                .to_owned()
+        };
+        let text = format!(
             "{}\n{}",
-            self.file(api, PROFILE_PATH)?,
-            self.file(api, SKILL_PATH)?
-        ))
+            self.file(api, PROFILE_PATH, &commit)?,
+            self.file(api, SKILL_PATH, &commit)?
+        );
+        Ok(LoadedProfile { commit, text })
     }
 
-    fn file(&self, api: &dyn Api, path: &str) -> Result<String> {
-        let what = format!("{}/{path} at {}", self.repository, self.commit);
+    /// Carry the composition step's commit into execution without resolving the
+    /// branch again. A branch caller must wire the trusted step output through.
+    pub fn execution_commit(&self, composed: Option<&str>) -> Result<String> {
+        let commit = composed
+            .or_else(|| is_commit(&self.reference).then_some(self.reference.as_str()))
+            .context("branch profile requires --profile-commit from supervise compose")?;
+        ensure!(is_commit(commit), "profile commit must be a full commit id");
+        ensure!(
+            !is_commit(&self.reference) || commit == self.reference,
+            "profile commit differs from configured pin"
+        );
+        Ok(commit.to_owned())
+    }
+
+    pub fn provenance(&self, commit: &str) -> String {
+        format!("Supervisor profile: {} at {commit}", self.repository)
+    }
+
+    fn file(&self, api: &dyn Api, path: &str, commit: &str) -> Result<String> {
+        let what = format!("{}/{path} at {commit}", self.repository);
         let file = api
             .get(&format!(
                 "/repos/{}/contents/{path}?ref={}",
-                self.repository, self.commit
+                self.repository, commit
             ))
             .with_context(|| format!("read {what}"))?;
         ensure!(file["encoding"] == "base64", "{what}: not a small file");
@@ -249,7 +311,7 @@ mod tests {
     fn profile() -> Profile {
         Profile {
             repository: "example/home".into(),
-            commit: COMMIT.into(),
+            reference: COMMIT.into(),
         }
     }
 
@@ -261,8 +323,105 @@ mod tests {
     }
 
     #[test]
+    fn branches_resolve_once_before_both_files_are_read() {
+        struct MovingBranch {
+            home: Contents,
+            resolutions: std::cell::Cell<usize>,
+        }
+        impl Api for MovingBranch {
+            fn get(&self, path: &str) -> Result<Value> {
+                if path == "/repos/example/home/git/ref/heads/main" {
+                    let reads = self.resolutions.get();
+                    self.resolutions.set(reads + 1);
+                    return Ok(json!({"object": {"type": "commit", "sha":
+                        if reads == 0 { COMMIT.to_owned() } else { "f".repeat(40) }}}));
+                }
+                self.home.get(path)
+            }
+            fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+                bail!("no graphql")
+            }
+            fn download(&self, _: &str, _: u64) -> Result<Vec<u8>> {
+                bail!("no download")
+            }
+            fn send(&self, _: &str, _: &str, _: &Value) -> Result<Value> {
+                bail!("no writes")
+            }
+        }
+        let api = MovingBranch {
+            home: home(),
+            resolutions: std::cell::Cell::new(0),
+        };
+        let p = Profile::from_json(Some(&json!({"repository": "example/home", "ref": "main"})))
+            .unwrap()
+            .unwrap();
+        let loaded = p.read(&api).unwrap();
+        assert_eq!(api.resolutions.get(), 1);
+        assert_eq!(loaded.commit, COMMIT);
+        assert_eq!(loaded.text, profile().read(&home()).unwrap().text);
+        assert!(p.execution_commit(None).is_err());
+        assert_eq!(p.execution_commit(Some(&loaded.commit)).unwrap(), COMMIT);
+        assert_eq!(profile().execution_commit(None).unwrap(), COMMIT);
+        assert!(profile().execution_commit(Some(&"f".repeat(40))).is_err());
+        for commit in ["main", "../main", "https://example.com"] {
+            assert!(p.execution_commit(Some(commit)).is_err());
+        }
+    }
+
+    #[test]
+    fn only_commit_ids_and_plain_branch_names_are_accepted() {
+        let parse = |reference: &Value| {
+            Profile::from_json(Some(&json!({
+                "repository": "example/home", "ref": reference
+            })))
+        };
+        for reference in [COMMIT, "main", "release/v1", "topic-1.2"] {
+            let p = parse(&json!(reference)).unwrap().unwrap();
+            assert_eq!(p.reference, reference);
+        }
+        for reference in [
+            "",
+            "../main",
+            "/tmp/main",
+            "./main",
+            "https://example.com/main",
+            "main?ref=other",
+            "main#fragment",
+            "main\n",
+            "HEAD~1",
+            "refs/tags/v1",
+            "topic//name",
+            "topic/.hidden",
+            "topic/name.lock",
+            "topic.",
+        ] {
+            assert!(parse(&json!(reference)).is_err(), "{reference:?}");
+        }
+        for reference in [Value::Null, json!(1), json!(true), json!("x".repeat(201))] {
+            assert!(parse(&reference).is_err(), "{reference}");
+        }
+        for object in [
+            json!({}),
+            json!({"type": "tag", "sha": COMMIT}),
+            json!({"type": "commit", "sha": "main"}),
+        ] {
+            let api = Contents(BTreeMap::from([(
+                "/repos/example/home/git/ref/heads/main".into(),
+                json!({"object": object}),
+            )]));
+            let p = Profile {
+                reference: "main".into(),
+                ..profile()
+            };
+            assert!(p.read(&api).is_err());
+        }
+    }
+
+    #[test]
     fn the_supervisor_task_composes_the_pinned_profile_and_the_operator_request() {
-        let text = profile().read(&home()).unwrap();
+        let loaded = profile().read(&home()).unwrap();
+        assert_eq!(loaded.commit, COMMIT);
+        let text = loaded.text;
         let event = json!({"comment": {"user": {"login": "owner"}, "body": "Look at #9."},
             "issue": {"number": 5, "locked": true}});
         let request = request(&event, "", "owner", &requests()).unwrap();
@@ -270,7 +429,7 @@ mod tests {
         assert_eq!(task, fixture("supervisor-task.md"));
         // Another commit or repository is not read.
         let moved = Profile {
-            commit: "f".repeat(40),
+            reference: "f".repeat(40),
             ..profile()
         };
         assert!(moved.read(&home()).is_err());

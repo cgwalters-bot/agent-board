@@ -965,6 +965,11 @@ impl Checked {
                 }
                 Write::ReplaceState { body } => {
                     let s = p.agent.state.as_ref().context("No state issue")?;
+                    let body = ctx.with_profile(p, body);
+                    ensure!(
+                        body.chars().count() <= 60_000,
+                        "Oversized supervisor state with profile provenance"
+                    );
                     (
                         "PATCH",
                         format!("/repos/{}/issues/{}", s.repository, s.issue),

@@ -1307,11 +1307,10 @@ pub(crate) mod tests {
             ),
             ("kinds", json!(["Triage", "research"])),
             ("kinds", json!(["fix"])),
-            // A profile read at a branch, or from a path that is not a
-            // repository, could change without a review of the caller.
+            // Refuse paths and URLs rather than reading another API path.
             (
                 "profile",
-                json!({"repository": "example/home", "ref": "main"}),
+                json!({"repository": "example/home", "ref": "../main"}),
             ),
             (
                 "profile",
@@ -1319,7 +1318,7 @@ pub(crate) mod tests {
             ),
             (
                 "profile",
-                json!({"repository": "example/home", "ref": "A".repeat(40)}),
+                json!({"repository": "example/home", "ref": "https://example.com/main"}),
             ),
             (
                 "profile",

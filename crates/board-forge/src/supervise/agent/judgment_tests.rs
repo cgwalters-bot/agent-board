@@ -30,6 +30,42 @@ fn action(name: &str, fields: Value) -> Value {
     v
 }
 
+#[test]
+fn resolved_profile_commit_is_published_in_state_and_run_log() {
+    let mut s = configured();
+    s.agent.as_mut().unwrap().profile = Some(crate::supervise::profile::Profile {
+        repository: "example/home".into(),
+        reference: "main".into(),
+    });
+    let p = policy(&s);
+    let commit = "a".repeat(40);
+    let mut run = ctx(RESULT_URL);
+    run.profile_commit = Some(commit.clone());
+    let mut fake = Fake::new("");
+    evidence(&mut fake);
+    let provenance = format!("Supervisor profile: example/home at {commit}");
+    let text = lines(&[action("replace_state", json!({"body": "Memory"}))]);
+    let mut requests = judgment::parse_batch(&text, &p).unwrap();
+    requests[0].preflight(&fake, &p, run.now).unwrap();
+    requests[0].apply(&fake, &p, &run).unwrap();
+    assert_eq!(
+        fake.writes()[0].2["body"],
+        format!("Memory\n\n{provenance}")
+    );
+    assert!(log_body(&p, &run, &[]).contains(&provenance));
+
+    // Provenance does not allow a state body to exceed its existing bound.
+    let mut requests = judgment::parse_batch(&text, &p).unwrap();
+    if let judgment::Checked::Write(judgment::Write::ReplaceState { body }) = &mut requests[0] {
+        *body = "x".repeat(60_000);
+    } else {
+        panic!("expected replace_state");
+    }
+    requests[0].preflight(&fake, &p, run.now).unwrap();
+    assert!(requests[0].apply(&fake, &p, &run).is_err());
+    assert_eq!(fake.writes().len(), 1);
+}
+
 fn actions() -> Vec<Value> {
     actions_signed(&Footer::default())
 }
@@ -2146,6 +2182,7 @@ fn listed_release_cannot_authorize_a_later_hold() {
             release_events(&mut fake, 9);
             requests[0].preflight(&fake, &p, 0).unwrap();
             let ctx = Run {
+                profile_commit: None,
                 source: Source::Comment(String::new()),
                 run_url: String::new(),
                 default_branch: "main".into(),

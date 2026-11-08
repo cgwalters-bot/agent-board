@@ -82,6 +82,7 @@ fn filed_bug_arrives_under_fixed_epic_on_board_at_p1() {
     requests[0].preflight(&api, &p, 0).unwrap();
     assert!(api.calls.borrow().is_empty());
     let run = Run {
+        profile_commit: None,
         source: Source::Comment(String::new()),
         run_url: String::new(),
         default_branch: "main".into(),

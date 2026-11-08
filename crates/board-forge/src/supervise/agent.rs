@@ -468,11 +468,23 @@ pub enum Source {
 
 /// Where the executor runs: its own run, from the Actions environment.
 pub struct Run {
+    /// The trusted composition step's resolved profile commit, never resolved
+    /// again by the executor or taken from the agent's safe outputs.
+    pub profile_commit: Option<String>,
     pub source: Source,
     pub run_url: String,
     pub default_branch: String,
     pub attempt: u64,
     pub now: i64,
+}
+
+impl Run {
+    fn with_profile(&self, policy: &Policy, body: &str) -> String {
+        match (&policy.agent.profile, &self.profile_commit) {
+            (Some(profile), Some(commit)) => format!("{body}\n\n{}", profile.provenance(commit)),
+            _ => body.to_owned(),
+        }
+    }
 }
 
 /// What a pass did: one line each, the log comment it recorded its
@@ -763,7 +775,7 @@ pub fn log_body(policy: &Policy, ctx: &Run, lines: &[String]) -> String {
         body.push('\n');
         body.push_str(line);
     }
-    body
+    ctx.with_profile(policy, &body)
 }
 
 fn log_path(log: &IssueRef) -> String {
