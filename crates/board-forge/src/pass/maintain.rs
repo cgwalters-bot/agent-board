@@ -598,6 +598,19 @@ fn example(date: time::Date) -> Value {
     })
 }
 
+/// What came of a digest start ([`Scheduler::start_digest`]).
+#[derive(Debug)]
+enum Start {
+    /// Started, or sent and perhaps started, with the posted plan's id;
+    /// none in a preview or where only the plan is printed.
+    Posted(Option<String>),
+    /// Waits on capacity the later stages' runs take: WIP or a hold.
+    Waits,
+    /// This pass cannot start it, whatever the later stages leave: its
+    /// requests, a cap, or a plan already posted today.
+    Deferred,
+}
+
 impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
     /// With [`Config::maintain`], before stage 2: the day's digest, if it is
     /// due, planned, and while it is due the other stages left the rest of
@@ -734,6 +747,10 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         });
         let all: Vec<String> = config.pools.0.iter().map(|(n, _)| n.clone()).collect();
         let mut started = 0;
+        // Whether the other stages leave the digest its share of each pool:
+        // only while it waits on capacity their runs would take, not where
+        // this pass cannot admit it anyway (agent-board#803).
+        let mut waits = true;
         match choose(own.as_ref(), &config.pools, &all, self.now) {
             Ok(pool) => {
                 let more = changed.len() - review.len();
@@ -761,14 +778,15 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 let posted = match dry {
                     Some(why) => {
                         self.line(format!("maintain: plan only; {why}: {plan}"));
-                        Some(None)
+                        Start::Posted(None)
                     }
                     None => {
                         let writes = record_writes(comment.as_ref());
                         self.start_digest(&issue, &pool, &plan, git_ref, writes)?
                     }
                 };
-                if let Some(id) = posted {
+                waits = !matches!(posted, Start::Deferred);
+                if let Start::Posted(id) = posted {
                     let record = json!({"schema": PLAN_SCHEMA, "from": stamp, "heads": acknowledged,
                         "pending": {"plan": id, "heads": pending}, "plan": plan});
                     started = usize::from(public);
@@ -783,7 +801,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             Err(why) => self.line(format!("maintain: no pool: {why}")),
         }
         let done = self.report.maintain.as_ref().is_some_and(|d| d.done);
-        if let (Some(snapshot), false) = (snapshot, done) {
+        if let (Some(snapshot), false, true) = (snapshot, done, waits) {
             let why = "that the due maintain digest leaves the other stages";
             self.snapshot = Some(Some(reserve(&snapshot, 1.0 - maintain.share, why)));
         }
@@ -839,18 +857,18 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
         plan: &Value,
         git_ref: &str,
         writes: usize,
-    ) -> Result<Option<Option<String>>> {
+    ) -> Result<Start> {
         let line = format!(
             "maintain: start {DIGEST_KIND} {} pool={pool}",
             issue.display()
         );
         if let Some(why) = self.budget_hold(1.0) {
             self.line(format!("maintain: {why}; the digest waits"));
-            return Ok(None);
+            return Ok(Start::Waits);
         }
         if let Some(why) = self.other_holds() {
             self.line(format!("maintain: {why}; the digest waits"));
-            return Ok(None);
+            return Ok(Start::Waits);
         }
         let target = self.config.target(git_ref);
         target.validate()?;
@@ -861,12 +879,12 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 "maintain: wip: {} of {wip} runs active; the digest waits",
                 active.len()
             ));
-            return Ok(None);
+            return Ok(Start::Waits);
         }
         for (kind, n) in [(Kind::Dispatch, 1), (Kind::Write, writes)] {
             if let Some(held) = self.caps.check_many(kind, n) {
                 self.line(format!("{held}: {line}"));
-                return Ok(None);
+                return Ok(Start::Deferred);
             }
         }
         // Do not adopt heads from discovered plans, which a run can forge.
@@ -890,19 +908,24 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                     .is_ok_and(|p| p.is_some_and(|p| p.kind == DIGEST_KIND))
         }) {
             self.line("maintain: a research plan already exists today; the digest waits".into());
-            return Ok(None);
+            return Ok(Start::Deferred);
         }
         let bounds = self.client.bounds;
         if self.config.reserve_scheduling {
             // Defer before posting a plan, which would veto another attempt
             // today. Once admitted, leave room for the whole start and its
-            // receipt, and let its reads finish like stage 4's starts.
+            // receipt, and let its reads finish like stage 4's starts. As
+            // an epic apply, the start is a step decided from what was read,
+            // charged to what the pass has left, not to maintain's share:
+            // in a busy pass that share's discovery left less than a start
+            // needs (agent-board#803), and the digest starts once a day.
             let needed = START_REQUESTS + writes + WRITE_RESERVE;
-            if bounds.available() < needed {
+            if !bounds.fits(needed) {
                 self.line(format!(
-                    "budget: maintain stopped at its share; {needed} requests needed for a digest start and record"
+                    "budget: maintain stopped; a digest start and record need {needed} requests, {} left, before the time bound",
+                    bounds.left.get()
                 ));
-                return Ok(None);
+                return Ok(Start::Deferred);
             }
             bounds.finishing.set(true);
         }
@@ -914,7 +937,7 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
                 .entry(DIGEST_KIND.to_owned())
                 .or_default() += 1;
             self.line(line);
-            return Ok(Some(None));
+            return Ok(Start::Posted(None));
         }
         let intro = "The board pass's maintain digest for today: a read-only run, whose only \
                      output is one comment on this issue.";
@@ -947,18 +970,22 @@ impl<C: Rest + Transport + usage::Broker> Scheduler<'_, C> {
             }) => {
                 let run = run.as_deref().unwrap_or("unnamed");
                 self.line(format!("{line} record={record} run={run}"));
-                Ok(Some(Some(id)))
+                Ok(Start::Posted(Some(id)))
             }
+            // The plan posted vetoes another start today.
             Ok(_) => {
                 self.line(format!("{line}: the dispatch waited; the digest waits"));
-                Ok(None)
+                Ok(Start::Deferred)
             }
             // Preparation failures and confirmed refusals record nothing.
             // A lost response or server error might still hide a start.
             Err(error) => {
                 self.report.failures += 1;
                 self.line(format!("{line} failed: {error:#}"));
-                Ok(maybe_started.then_some(Some(id)))
+                Ok(match maybe_started {
+                    true => Start::Posted(Some(id)),
+                    false => Start::Deferred,
+                })
             }
         }
     }

@@ -4333,6 +4333,17 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                         }
                         _ => self.line(line),
                     }
+                    // The stop leaves no slot free, so no `idle:` line says
+                    // why the pools under pace started nothing (agent-board#803).
+                    if matches!(halt, Halt::Budget) && taken == 0 {
+                        for (pool, settings) in &pools.0 {
+                            if room(snapshot, pool, settings, self.now).is_ok() {
+                                self.line(format!(
+                                    "idle: {pool} is under pace and nothing started; stage 4's budget left {left} candidate(s) unread, first {issue}"
+                                ));
+                            }
+                        }
+                    }
                     free = 0;
                     break;
                 }
