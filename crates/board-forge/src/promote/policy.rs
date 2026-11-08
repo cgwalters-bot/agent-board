@@ -61,10 +61,11 @@ pub(super) fn gate(client: &impl Rest, config: &Config, upstream: &str) -> Resul
     segments(&file).context("policy invalid: policyPath")?;
     let Some(found) = read(client, &contents(policy, &file, None)).context("policy unreadable")?
     else {
-        anyhow::bail!("policy missing: no record at {policy}:{file}");
+        return Err(Held(format!("policy missing: no record at {policy}:{file}")).into());
     };
-    let current = text(&found, &file).context("policy invalid")?;
-    let record = parse(&current).context("policy invalid")?;
+    let invalid = |e: anyhow::Error| anyhow::Error::from(Held(format!("policy invalid: {e:#}")));
+    let current = text(&found, &file).map_err(invalid)?;
+    let record = parse(&current).map_err(invalid)?;
     fresh(client, upstream, &record)?;
     loosening(client, config, policy, &file, (&found["sha"], &current))?;
     match record.verdict.as_str() {
@@ -76,14 +77,15 @@ pub(super) fn gate(client: &impl Rest, config: &Config, upstream: &str) -> Resul
                 .iter()
                 .map(|s| format!("{}:{}", s.repo, s.path))
                 .collect();
-            anyhow::bail!(
+            Err(Held(format!(
                 "policy {verdict}: the bot may not post there; sources: {}",
                 if sources.is_empty() {
                     "none".into()
                 } else {
                     sources.join(", ")
                 }
-            )
+            ))
+            .into())
         }
     }
 }
@@ -402,7 +404,7 @@ fn fresh(client: &impl Rest, upstream: &str, record: &Record) -> Result<()> {
             }
         }
     }
-    ensure!(changes.is_empty(), "policy stale: {}", changes.join(", "));
+    hold!(changes.is_empty(), "policy stale: {}", changes.join(", "));
     Ok(())
 }
 
@@ -510,7 +512,7 @@ fn loosening(
     })()
     .context("policy history unreadable")?;
     if let Some(irregular) = irregular {
-        anyhow::bail!("policy invalid: {irregular}, not a regular file");
+        return Err(Held(format!("policy invalid: {irregular}, not a regular file")).into());
     }
     let (mut baseline, mut previous, mut unvouched) = (None, None, None);
     let mut branch = None;
@@ -532,7 +534,7 @@ fn loosening(
         previous = Some(rank);
     }
     if let Some((login, sha)) = unvouched {
-        anyhow::bail!("policy loosened by {login} at {sha}");
+        return Err(Held(format!("policy loosened by {login} at {sha}")).into());
     }
     Ok(())
 }

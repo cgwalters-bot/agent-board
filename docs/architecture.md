@@ -143,12 +143,14 @@ and a person should be able to read what the machine read.
 ## Promote
 
 A fork pull request the operator requests be promoted is evaluated by standalone
-`agent-board promote --config FILE`, not by the pass or poll (#308). The newer
+`agent-board promote --config FILE` (#308). The newer
 [decision context](https://github.com/cgwalters-forge/agent-board/issues/308#issuecomment-6606946679)
 supersedes the old pass-stage and review-only plan. The command previews
 command/head evidence and candidate read gates by default. Explicit publication
-uses no inference pool or dispatch slot. The pass retains an inert compatibility line, with no
-promotion reads or writes.
+uses no inference pool or dispatch slot. The pass's stage 4b reports selected
+candidates and their first held gate through the same read-only evaluator; it
+never publishes, even with `pass --apply` and `promote.publish` set. This makes
+approved work visible without granting the pass upstream write authority.
 
 * **Permission.** An exact operator-authored `/promote` or
   `/promote --human-text` conversation command after the observed push
@@ -175,13 +177,15 @@ promotion reads or writes.
   with unverifiable authorship, ambiguous or out-of-order evidence holds.
 * **Where it goes.** `promote.forks` in the configuration, never the pull
   request's body, which anyone can edit. At run time the fork's GitHub parent
-  or network root must be the configured upstream. A fork is never in
-  `follow`: its main moves only by sync.
+  or network root must be the configured upstream. A fork may also be in
+  `follow` only when `midstream` owns it; stage 2 must then verify its topic
+  membership before following it with midstream's no-merge policy. Otherwise
+  it refuses, so a missing topic cannot permit a merge into the fork's main.
 * **Candidate read gates.** Only after command/head evidence passes, read in
   order: all upstream PRs for the head repository owner's branch (same open
   head is already promoted; different, closed or merged holds); upstream-base
   comparison (zero ahead or any behind holds, needing a rebase and fresh
-  `/promote`); the issue's accepted plan's `stacks_on`; DCO facts from required
+  approval or command); the issue's accepted plan's `stacks_on`; DCO facts from required
   base-branch checks or base-head check runs; and unchanged title/body text.
   This prevents duplicate publication, stale bases, unmerged dependencies,
   unsafe sign-off rewrites and references changing meaning upstream. Only a

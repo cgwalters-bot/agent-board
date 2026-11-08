@@ -158,12 +158,10 @@ infrastructure failures, and stage 2 still writes poll's claim
 and marker comments in every followed repository, external ones included,
 unless `pr.ownSpaceOnly` keeps every write out of them but those on the bot's
 own pull requests ([the poll](poll.md)).
-The old stage 4b promote line is compatibility scaffolding only: it evaluates
-no fork pull request, reads nothing and writes nothing. The shared `promote`
-configuration now serves the separate read-only
-[`agent-board promote`](cli.md#agent-board-promote); it does not enable a pass
-stage. The newer [comment-trigger contract](architecture.md#promote) replaces
-the obsolete review-only/pass-stage plan.
+Stage 4b reports approved promotion candidates and their first held gate using
+the standalone [`agent-board promote`](cli.md#agent-board-promote) evaluator.
+It never publishes, even in an applying pass. The shared `promote.forks` setting
+enables these reads; absent or empty means `promote: off` with no reads.
 The [maintain](#maintain) digest is dispatched only where its repository is
 public; elsewhere it is planned and recorded but not dispatched.
 
@@ -1605,8 +1603,10 @@ A pass captures one clock and performs these stages in order:
     than follow without it: a midstream also in `follow` would otherwise be
     merged in. Its line is `midstream: N repositories with topic TOPIC in ORG`.
     `pr.unstall`'s need for every work repository to be followed is then
-    checked there for ORG's, once they are read, as are the refusals of the
-    direction repository and `promote.forks` entries. The listing holds only
+    checked there for ORG's, once they are read, as is the refusal of the
+    direction repository. A `promote.forks` entry may also be in `follow` only
+    under the midstream owner and with verified topic membership; a missing
+    topic fails stage 2 before any merge admission. The listing holds only
     the repositories the pass's token can read.
     With `authored: N`, absent by default, stage 2 also follows up to N
     (1 to 10) more repositories a pass where the bot has an open pull
@@ -1652,8 +1652,9 @@ A pass captures one clock and performs these stages in order:
     outside our own space it is written in as with `pr.ownSpaceOnly`, set
     or not, so a step there waits on the operator with nothing written
     upstream, but for the rounds and edits the bot may make on its own pull
-    requests anywhere ([the poll](poll.md)). The direction repository and `promote.forks` entries are never
-    added, nor more than the poll's limit of 50 repositories in all. A
+    requests anywhere ([the poll](poll.md)). The direction repository and
+    promotion forks outside midstream ownership are never added, nor more
+    than the poll's limit of 50 repositories in all. A
     search that fails, is incomplete or runs past 3 pages fails stage 2
     (`follow error: authored pull requests: …`), as a midstream listing
     does: followed without it, the repositories it added would be decided
@@ -1678,11 +1679,22 @@ A pass captures one clock and performs these stages in order:
    plan claim and run link, and the existing board Run update where supported;
    it does not close issues from guessed outcomes.
 
-   4b. Inert promote compatibility scaffolding. It keeps the existing replay
-   line `promote: off`, or `promote: N fork(s) configured; evaluation is not
-   built`, with no promotion reads or writes. Evaluation is now standalone,
-   not scheduled by this stage. Status stays stage 5. Do not use pass `--apply`
-    to promote. The standalone preview checks operator command/head evidence,
+   4b. Read-only promotion visibility. With `promote.forks`, one bounded GraphQL
+   query per fork discovers the bot's open PRs with an operator command or,
+   under `promote.onApproval`, a draft's latest deciding approval of its current
+   head. Non-selected PRs print nothing and get no per-PR gate reads. Discovery
+   accepts at most 100 open PRs and 100 reviews/comments per PR; truncation is
+   an error, never an empty list. Each selected PR is independently re-read
+   and evaluated, printing `promote awaiting OWNER/REPO#N: REASON` for its first
+   hold, already-promoted observation, or `ready to publish`. Reasons include
+   needs-human, behind distance, missing policy, DCO rewrite required and
+   unverified bot-fork staging. Reads share the pass's request/time budget and
+   reserve; unfinished known candidates print `promote: N candidate(s) not
+   evaluated (budget)`. If even discovery cannot finish, its incomplete fork
+   is named instead of claiming a candidate count. Read failures print
+   `promote error:` and count as pass failures. No publication, label, notice,
+   rewrite or fork closure occurs here. Status stays stage 5. Do not use pass
+   `--apply` to promote. The shared preview checks operator command/head evidence,
     then candidate upstream PRs, distance, accepted-plan stacks, GitHub DCO
     facts and title/body references, then the upstream's contribution-policy
      record and human-text provenance. Passing says `would promote`, not that
@@ -4134,11 +4146,11 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
-| `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, read by standalone `promote`, never the pass; the destination comes from here, never a pull request's body; a fork is named once ignoring case, is not its own upstream, nor in `follow` (its main moves only by sync); `base` non-empty; absent or `{}` means off with no forge reads |
-| `promote.publish` | Default `false`: allow standalone `promote --apply --max-writes N` to publish one upstream draft or update one same-head PR after fresh gates and operator current-head approval; three writes reserved; no pushes, ready changes or fork closure; the pass remains inert |
+| `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, shared by standalone `promote` and the read-only pass view; destination comes from here, never a PR body; a fork is named once ignoring case, is not its own upstream, and may also be in `follow` only under the midstream owner with topic membership verified in stage 2; `base` non-empty; absent or `{}` means off with no forge reads |
+| `promote.publish` | Default `false`: allow standalone `promote --apply --max-writes N` to publish one upstream draft or update one same-head PR after fresh gates and operator current-head approval; three writes reserved; no pushes, ready changes or fork closure; the pass always remains read-only for promotion |
 | `promote.onApproval` | Default `false`: standalone `promote` also evaluates draft fork PRs and, on a draft without a `/promote` command, takes the operator's latest deciding review approving the current head, submitted after its push, as the trigger (never `--human-text`); publication still needs `promote.publish` |
 | `promote.signoff.name`, `promote.signoff.email` | Reserved operator sign-off identity; both non-empty; required with `promote.forks`, no default; no sign-off is performed in the preview |
-| `promote.policyRepository` | Repository whose default branch will supply upstream policy records, never written; required with `promote.forks`, but policy is not read by this preview |
+| `promote.policyRepository` | Repository whose default branch supplies upstream policy records, never written; required with `promote.forks`; read only after earlier candidate gates pass |
 | `promote.policyPath` | Directory of the records in it, one `OWNER/REPO.md` per upstream; absent, its top level |
 
 The PR stage otherwise uses today's default poll policy, including two fix

@@ -879,7 +879,7 @@ Options:
 
 - `--apply`: Publish at most one approved candidate; also requires promote.publish
 - `--max-writes <MAX_WRITES>`: Whole-step publication cap (three writes reserved per candidate)
-- `--config <FILE>`: Trusted shared pass configuration; promote.forks absent or empty means off, with no forge reads or token lookup. The pass remains inert. With forks, GH_TOKEN reads within the pass's request/time bounds and ten 100-row pages per listing
+- `--config <FILE>`: Trusted shared pass configuration; promote.forks absent or empty means off, with no forge reads or token lookup. The pass uses it only for read-only awaiting-candidate diagnostics, never publication. With forks, GH_TOKEN reads within the pass's request/time bounds and ten 100-row pages per listing
 - `--record <FILE>`: Save live read responses projected to the evidence fields used here for offline replay. No forge writes. Record public repositories only before publishing the file; comment bodies remain in it
 - `--replay <FILE>`: Preview recorded reads at their recorded clock, without credentials
 

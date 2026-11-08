@@ -41,14 +41,14 @@ pub(super) fn verify(
     pull: &Value,
     command: &Command,
 ) -> Result<()> {
-    ensure!(command.human_text, "selected command lacks --human-text");
+    hold!(command.human_text, "selected command lacks --human-text");
     ensure!(
         command.author.eq_ignore_ascii_case(&config.operator)
             && pull["head"]["sha"] == command.head
             && command.pushed < command.created,
         "command head/push binding mismatch"
     );
-    ensure!(
+    hold!(
         command
             .pusher
             .as_deref()
@@ -56,7 +56,7 @@ pub(super) fn verify(
         "current-head pusher is not the operator or is missing"
     );
     let body = pull["body"].as_str().context("missing REST body")?;
-    ensure!(
+    hold!(
         !body.to_ascii_lowercase().contains("generated-by:"),
         "body still has Generated-by attribution"
     );
@@ -75,7 +75,7 @@ pub(super) fn verify(
         "REST/GraphQL PR/head/text disagreement"
     );
     let edits = complete(&p["userContentEdits"], "body edit history", true)?;
-    ensure!(!edits.is_empty(), "missing body edit proof");
+    hold!(!edits.is_empty(), "missing body edit proof");
     let mut previous = None;
     for edit in edits {
         let t = at(&edit["editedAt"]).context("unverifiable body edit time")?;
@@ -90,7 +90,7 @@ pub(super) fn verify(
         previous = Some(t);
     }
     let latest = &edits[0];
-    ensure!(
+    hold!(
         operator(&latest["editor"], config) && operator(&p["editor"], config),
         "last body editor is not the operator or is missing"
     );
@@ -99,13 +99,13 @@ pub(super) fn verify(
         at(&p["lastEditedAt"])? == edited,
         "body edit metadata disagreement"
     );
-    ensure!(
+    hold!(
         edited < command.created,
         "body edit does not predate command; fresh command required"
     );
 
     let renames = complete(&p["timelineItems"], "title rename timeline", false)?;
-    ensure!(!renames.is_empty(), "missing title rename proof");
+    hold!(!renames.is_empty(), "missing title rename proof");
     let mut ids = BTreeSet::new();
     let mut previous_time = None;
     let mut previous_title = None;
@@ -131,7 +131,7 @@ pub(super) fn verify(
         previous_title = Some(after);
     }
     let latest = &renames[renames.len() - 1];
-    ensure!(
+    hold!(
         operator(&latest["actor"], config),
         "last title renamer is not the operator or is missing"
     );
@@ -139,7 +139,7 @@ pub(super) fn verify(
         latest["currentTitle"] == p["title"],
         "title rename/current title disagreement"
     );
-    ensure!(
+    hold!(
         at(&latest["createdAt"])? < command.created,
         "title rename does not predate command; fresh command required"
     );

@@ -113,6 +113,193 @@ fn scenario() -> Replay {
     replay
 }
 
+/// Shared pass/standalone test scenario: all permission and gate changes are
+/// hypothetical edits of the public observations described in the fixture README.
+pub(crate) fn awaiting_scenario() -> (Replay, Config) {
+    let mut replay = scenario();
+    pull(&mut replay)["draft"] = json!(true);
+    *comments(&mut replay) = json!([]);
+    sync_metadata(&mut replay);
+    *reviews(&mut replay) = json!([{"id":1,"user":{"login":"cgwalters"},"state":"APPROVED","commit_id":HEAD,"submitted_at":COMMAND}]);
+    timeline(&mut replay, json!([]));
+    // The list observation is not a detail endpoint; serve the same scenario
+    // pull at the independently re-read detail URL.
+    let detail = pull(&mut replay).clone();
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/pulls/34")},"answer":{"status":200,"link":null,"body":detail}}));
+    let mut config: Value = serde_json::from_str(CONFIG).unwrap();
+    config["promote"]["onApproval"] = json!(true);
+    let config = Config::parse(&config.to_string()).unwrap();
+    discovery(&mut replay, &config, |_| {});
+    (replay, config)
+}
+
+fn awaiting_pull(replay: &mut Replay) -> &mut Value {
+    &mut replay
+        .requests
+        .iter_mut()
+        .find(|e| {
+            e["request"]["get"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("/pulls/34"))
+        })
+        .unwrap()["answer"]["body"]
+}
+
+pub(crate) fn cancel_awaiting(replay: &mut Replay) {
+    *comments(replay) = json!([{"id":1,"user":{"login":"cgwalters"},"created_at":COMMAND,"updated_at":COMMAND,"body":"/promote"}]);
+    sync_metadata(replay);
+    reviews(replay)[0]["state"] = json!("CHANGES_REQUESTED");
+    reviews(replay)[0]["submitted_at"] = json!("2026-10-24T00:00:00Z");
+}
+
+pub(crate) fn discovery(replay: &mut Replay, config: &Config, edit: impl FnOnce(&mut Value)) {
+    struct Answer(Value);
+    impl Transport for Answer {
+        fn graphql(&self, _: &str, _: Value) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+    }
+    let mut answer: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/promote/awaiting-public-2026-11-08.json"
+    ))
+    .unwrap();
+    let p = &mut answer["repository"]["pullRequests"]["nodes"][0];
+    p["number"] = json!(34);
+    p["headRefOid"] = json!(HEAD);
+    p["reviews"]["nodes"][0]["commit"]["oid"] = json!(HEAD);
+    edit(&mut answer);
+    let answer = Answer(answer);
+    let recorder = crate::pass::Recorder::new(&answer);
+    awaiting::candidates(&recorder, config, REPO).ok();
+    let recorded =
+        Replay::from_json(&serde_json::from_str(&recorder.fixture(replay.now).unwrap()).unwrap())
+            .unwrap();
+    for entry in recorded.requests {
+        replay.requests.retain(|r| r["request"] != entry["request"]);
+        replay.requests.push(entry);
+    }
+}
+
+#[test]
+fn awaiting_read_gates() {
+    type Case = (&'static str, fn(&mut Replay), &'static str);
+    for (name, edit, reason) in [
+        (
+            "behind",
+            (|r: &mut Replay| body(r, "/compare/")["behind_by"] = json!(31)) as fn(&mut Replay),
+            "needs rebase and a fresh approval or command (behind_by=31)",
+        ),
+        (
+            "needs-human",
+            |r| awaiting_pull(r)["labels"] = json!([{"name":"needs-human"}]),
+            "needs-human",
+        ),
+        (
+            "policy missing",
+            |r| {
+                entry(r, RECORD)["answer"]["status"] = json!(404);
+            },
+            "policy missing",
+        ),
+        ("DCO", |_| {}, "DCO sign-off rewrite required"),
+        (
+            "bot fork",
+            |r| {
+                body(r, "/check-runs?")["check_runs"] = json!([]);
+                body(r, "/check-runs?")["total_count"] = json!(0);
+            },
+            "bot-fork staging unverified",
+        ),
+    ] as [Case; 5]
+    {
+        let (mut replay, config) = awaiting_scenario();
+        edit(&mut replay);
+        assert_eq!(
+            awaiting::candidates(&replay, &config, REPO).unwrap(),
+            [34],
+            "{name}"
+        );
+        let error = awaiting::Awaiting::new(&config)
+            .reason(&replay, REPO, 34, replay.now)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(reason), "{name}: {error:#}");
+    }
+    let (mut replay, config) = awaiting_scenario();
+    // Same-network midstream-owned head, no DCO: hypothetical ready candidate.
+    body(&mut replay, "/check-runs?")["check_runs"] = json!([]);
+    body(&mut replay, "/check-runs?")["total_count"] = json!(0);
+    let old = format!("{API}repos/cgwalters-bot/composefs-rs/activity?");
+    for e in &mut replay.requests {
+        if let Some(url) = e["request"]["get"].as_str().filter(|s| s.starts_with(&old)) {
+            e["request"]["get"] =
+                json!(url.replace("repos/cgwalters-bot/", "repos/cgwalters-forge/"));
+        }
+    }
+    awaiting_pull(&mut replay)["head"]["repo"]["full_name"] = json!(REPO);
+    awaiting_pull(&mut replay)["head"]["repo"]["owner"]["login"] = json!("cgwalters-forge");
+    for e in &mut replay.requests {
+        if let Some(url) = e["request"]["get"]
+            .as_str()
+            .filter(|s| s.contains("/compare/") || s.contains("pulls?state=all&head="))
+        {
+            e["request"]["get"] = json!(url.replace("cgwalters-bot", "cgwalters-forge"));
+        }
+    }
+    assert_eq!(
+        awaiting::Awaiting::new(&config)
+            .reason(&replay, REPO, 34, replay.now)
+            .unwrap(),
+        "ready to publish"
+    );
+}
+
+#[test]
+fn awaiting_discovery_is_not_permission() {
+    let (mut replay, config) = awaiting_scenario();
+    for (state, selected) in [
+        ("APPROVED", true),
+        ("CHANGES_REQUESTED", false),
+        ("DISMISSED", false),
+        ("COMMENTED", false),
+    ] {
+        discovery(&mut replay, &config, |data| {
+            data["repository"]["pullRequests"]["nodes"][0]["reviews"]["nodes"][0]["state"] =
+                json!(state)
+        });
+        assert_eq!(
+            !awaiting::candidates(&replay, &config, REPO)
+                .unwrap()
+                .is_empty(),
+            selected
+        );
+    }
+    discovery(&mut replay, &config, |data| {
+        data["repository"]["pullRequests"]["nodes"][0]["reviews"]["nodes"][0]["commit"]["oid"] =
+            json!("0".repeat(40))
+    });
+    assert!(
+        awaiting::candidates(&replay, &config, REPO)
+            .unwrap()
+            .is_empty()
+    );
+    discovery(&mut replay, &config, |data| {
+        data["repository"]["pullRequests"]["pageInfo"]["hasNextPage"] = json!(true)
+    });
+    assert!(awaiting::candidates(&replay, &config, REPO).is_err());
+}
+
+#[test]
+fn awaiting_cached_policy_read_failures_remain_failures() {
+    let (mut replay, config) = awaiting_scenario();
+    entry(&mut replay, RECORD)["answer"]["status"] = json!(502);
+    let mut evaluator = awaiting::Awaiting::new(&config);
+    for _ in 0..2 {
+        let error = evaluator.reason(&replay, REPO, 34, replay.now).unwrap_err();
+        assert!(error.is::<ReadFailure>(), "{error:#}");
+        assert!(format!("{error:#}").contains("policy unreadable"));
+    }
+}
+
 fn plan_comments(replay: &mut Replay, nodes: Value) {
     struct Answer(Value);
     impl Transport for Answer {
@@ -200,6 +387,35 @@ fn human_scenario() -> Replay {
             .requests,
     );
     replay
+}
+
+pub(crate) fn awaiting_human_scenario() -> (Replay, Config) {
+    let mut replay = human_scenario();
+    let detail = pull(&mut replay).clone();
+    replay.requests.push(json!({"request":{"get":format!("{API}repos/{REPO}/pulls/34")},"answer":{"status":200,"link":null,"body":detail}}));
+    let config = Config::parse(CONFIG).unwrap();
+    discovery(&mut replay, &config, |d| {
+        d["repository"]["pullRequests"]["nodes"][0]["comments"]["nodes"] =
+            json!([{"author":{"login":"cgwalters"},"body":"/promote --human-text"}])
+    });
+    (replay, config)
+}
+
+#[test]
+fn awaiting_invalid_plan_is_a_semantic_hold() {
+    let (mut replay, cfg) = awaiting_scenario();
+    plan_comments(
+        &mut replay,
+        json!([{
+            "url":format!("https://github.com/{REPO}/issues/31#issuecomment-99"),
+            "author":{"login":"cgwalters"},"createdAt":COMMAND,"lastEditedAt":null,"editor":null,
+            "body":"```agent-board-plan\n{}\n```"
+        }]),
+    );
+    let error = awaiting::Awaiting::new(&cfg)
+        .reason(&replay, REPO, 34, replay.now)
+        .unwrap_err();
+    assert!(error.is::<Held>(), "{error:#}");
 }
 
 fn human_candidate() -> String {
@@ -1015,7 +1231,7 @@ fn candidate_read_gates() {
         (
             "behind",
             |r| body(r, "/compare/")["behind_by"] = json!(1),
-            gate_hold("needs rebase and a fresh /promote (behind_by=1)"),
+            gate_hold("needs rebase and a fresh approval or command (behind_by=1)"),
         ),
         (
             "zero ahead",

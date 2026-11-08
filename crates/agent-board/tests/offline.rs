@@ -2771,23 +2771,33 @@ fn fix_bounds_repeats() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A `promote` section changes nothing in a replay but stage 4b's line: it
-/// needs no token, reads nothing the recording lacks and writes nothing. A
-/// section the configuration refuses fails before any read.
+/// Opted-in promotion discovery replays token-free; an empty candidate list
+/// changes no other decisions. Invalid configuration fails before any read.
 #[test]
-fn pass_replay_with_promote_reads_and_writes_nothing() {
+fn pass_replay_with_promote_discovery_is_read_only() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let dir = std::env::temp_dir().join(format!("agent-board-promote-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let base: Value =
         serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    let mut recording: Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/board-2026-10-23.json")).unwrap();
+    // Scenario edit: an empty fork discovery, using the PromoteAwaiting query
+    // key and the public response shape documented in fixtures/promote/README.md.
+    recording["requests"].as_array_mut().unwrap().push(serde_json::json!({
+        "request":{"graphql":"ac69d4026a5e9797","variables":{"owner":"cgwalters-forge","name":"bootc"}},
+        "answer":{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false},"nodes":[]}}}}
+    }));
+    let recording_path = dir.join("replay.json");
+    std::fs::write(&recording_path, recording.to_string()).unwrap();
     let replay = |config: &Value, name: &str| {
         let path = dir.join(format!("{name}.json"));
         std::fs::write(&path, config.to_string()).unwrap();
         command()
             .args(["pass", "--config"])
             .arg(&path)
-            .args(["--replay", "fixtures/pass/board-2026-10-23.json"])
+            .arg("--replay")
+            .arg(&recording_path)
             .current_dir(root)
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
@@ -2804,13 +2814,17 @@ fn pass_replay_with_promote_reads_and_writes_nothing() {
     let output = replay(&with, "with").success().get_output().clone();
     let without = String::from_utf8(without.stdout).unwrap();
     assert!(without.contains("\npromote: off\n"), "{without}");
-    // The same reads, decisions and previewed writes, the summary included.
+    // One extra discovery read, no candidates or promotion writes. The summary
+    // accounts for the extra request and GraphQL point; other decisions match.
+    let decisions = |s: &str| {
+        s.lines()
+            .filter(|l| !l.starts_with("summary:") && *l != "promote: off")
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        without.replace(
-            "\npromote: off\n",
-            "\npromote: 1 fork(s) configured; evaluation is not built\n"
-        )
+        decisions(&String::from_utf8(output.stdout).unwrap()),
+        decisions(&without)
     );
     // The case, its edit of the configuration, and the error.
     type Case = (&'static str, fn(&mut Value), &'static str);

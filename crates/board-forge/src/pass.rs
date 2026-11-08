@@ -3192,9 +3192,8 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         scheduler.line(format!("schedule error: {error:#}"));
     }
     scheduler.focus_unjudged();
-    // Stage 4b: approved fork pull requests promoted upstream, after stage 2,
-    // which may move a head, and before Status, which sees its effects.
-    scheduler.line(promote::line(config.promote.as_ref()));
+    // Stage 4b: read-only visibility into approved fork PRs, never publication.
+    scheduler.promote();
     // Stage 5: board Status from the facts read, this pass's starts included.
     // No start comes after stage 4, so it and the holds spend what is left.
     bounds.reserve.set(0);
@@ -3734,13 +3733,14 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     fn follow(&mut self, state: State, git_ref: &str, earlier: usize) -> usize {
         let config = self.config;
         // [`Config::check`]'s refusals of these in `follow`: a run on the
-        // direction would steer every brief, and a fork promote reads moves
-        // only by sync.
+        // direction would steer every brief. Promotion forks owned by midstream
+        // may be followed: stage 2's midstream policy prevents merges/rebases.
         let direction = config.direction.as_ref().map(|d| &d.repository);
         let promoted = config.promote.as_ref().map(|p| &p.forks);
         let never = |repo: &str| {
             direction.is_some_and(|d| d.eq_ignore_ascii_case(repo))
-                || promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
+                || (promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
+                    && !config.midstream_owns(repo))
         };
         let mut midstreams = Vec::new();
         if let Some(midstream) = &config.midstream {
@@ -3764,7 +3764,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             if let Some(repo) = midstreams.iter().find(|repo| never(repo)) {
                 self.report.failures += 1;
                 self.line(format!(
-                    "follow error: midstream {repo} is the direction repository or a promote fork, which the pass never follows"
+                    "follow error: midstream {repo} is the direction repository, which the pass never follows"
                 ));
                 return 0;
             }
@@ -3790,6 +3790,19 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 ));
                 return 0;
             }
+        }
+        // Owner admission at parse time is not topic membership. A configured
+        // promotion fork must actually receive midstream's no-merge policy
+        // before an overlapping follow entry can reach the poll.
+        if let Some(repo) = self.follows.iter().find(|repo| {
+            promoted.is_some_and(|f| f.keys().any(|k| k.eq_ignore_ascii_case(repo)))
+                && !midstreams.iter().any(|m| m.eq_ignore_ascii_case(repo))
+        }) {
+            self.report.failures += 1;
+            self.line(format!(
+                "follow error: promote fork {repo} is not a topic-selected midstream"
+            ));
+            return 0;
         }
         // Read before `authored`, which takes a named midstream's upstream
         // first.
