@@ -1,8 +1,8 @@
 use super::*;
 use crate::epic::{EPIC_PLAN_SCHEMA, SUB_ISSUES_QUERY};
 use crate::pass::tests::{
-    answer, block, config, preview, replay as board, set_usage, subs_mut, subs_request, unfinished,
-    usage,
+    answer, block, config, preview, preview_within, replay as board, set_usage, subs_mut,
+    subs_request, unfinished, usage,
 };
 use std::cell::{Cell, RefCell};
 
@@ -3146,4 +3146,186 @@ fn held_plan_hours_plans_an_epic_when_every_candidate_is_held() {
             assert_eq!(wait, !planned, "{name}: {:#?}", report.holds);
         }
     }
+}
+
+/// The recorded comments read of `repository`#`number`, as the recording
+/// keys it.
+fn comments_key(repository: &str, number: u64) -> Value {
+    let (owner, name) = repository.split_once('/').unwrap();
+    let variables = json!({"owner": owner, "name": name, "number": number, "after": null});
+    graphql_key(plan::COMMENTS_QUERY, &variables)
+}
+
+/// The recording's candidates whose comments it did not read, answered as
+/// tracker#446's, which hold no plan: a board with more candidates than a
+/// pass's budget reads, every one it reads held, as the live board is
+/// (agent-board#803).
+fn unrecorded_as_446(replay: &mut Replay) {
+    let recorded: Vec<Value> = (replay.requests.iter())
+        .map(|e| e["request"].clone())
+        .collect();
+    let template = (replay.requests.iter())
+        .find(|e| e["request"] == comments_key("cgwalters-forge/tracker", 446))
+        .unwrap()
+        .clone();
+    let items: Vec<(String, u64)> = (replay.requests.iter())
+        .filter_map(|e| e["answer"].pointer("/data/repositoryOwner/projectV2/items/nodes"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .map(|n| {
+            let content = &n["content"];
+            let repository = text(content, "/repository/nameWithOwner").to_owned();
+            (repository, content["number"].as_u64().unwrap())
+        })
+        .collect();
+    for (repository, number) in items {
+        let request = comments_key(&repository, number);
+        if recorded.contains(&request) {
+            continue;
+        }
+        let mut entry = template.clone();
+        entry["request"] = request;
+        replay.requests.push(entry);
+    }
+}
+
+/// The recording as [`held_plan_hours_plans_an_epic_when_every_candidate_is_held`]
+/// holds it, with every candidate readable ([`unrecorded_as_446`]), and the
+/// settings that keep tracker#890 for `hours`.
+fn held_board(hours: u64) -> (Replay, Value) {
+    let mut replay = replay();
+    unfinished(&mut replay);
+    unchanged_890(&mut replay);
+    label_596(&mut replay, &["needs-human"]);
+    unrecorded_as_446(&mut replay);
+    let epics = json!({"repository": "cgwalters-forge/tracker", "heldPlanHours": hours});
+    let settings = json!({"triage": false, "planPools": ["claude"], "epics": epics});
+    (replay, settings)
+}
+
+/// Over a board with more candidates than a pass reads, stage 4's budget
+/// stops every pass with candidates unread, so `epics.heldPlanHours` would
+/// never plan it: it counts the board held where every candidate read is
+/// held and the rest are unread only for the budget, and its start spends
+/// the requests the stop kept for one (agent-board#803). Never with a start,
+/// a failed read or an unreadable candidate before the stop.
+#[test]
+fn held_plan_hours_plans_an_epic_past_a_budget_stop() {
+    const LIMIT: usize = 300;
+    const STOP: &str = "budget: 113 requests left, only what a start may take (109); ";
+    const IDLE: &str = "idle: claude is under pace and nothing started; stage 4's budget left ";
+    const POOLS: &str = "pools: claude under pace with every candidate read held, 121 unread for the budget; planning cgwalters-forge/tracker#890 (one epic a pass)";
+    const START: &str = "start planning cgwalters-forge/tracker#890 pool=claude: its last planning request was at 2026-10-23T13:34:49Z, 1 hour(s) or more ago; every candidate read is held, 121 unread for the budget, with claude under pace and 6 slot(s) free and nothing started";
+    type Edit = fn(&mut Replay, &mut Value);
+    let none: Edit = |_, _| {};
+    // Name, the hours, the edit, whether the budget stops stage 4, the
+    // failures and whether tracker#890 is planned.
+    let cases: [(&str, u64, Edit, bool, usize, bool); 5] = [
+        ("planned", 1, none, true, 0, true),
+        ("off", 0, none, true, 0, false),
+        (
+            "a start before the stop",
+            1,
+            |_, c| c["triage"] = true.into(),
+            false,
+            0,
+            false,
+        ),
+        (
+            "a failed read before the stop",
+            1,
+            |r, _| {
+                let unrecorded = comments_key("cgwalters-forge/agent-board", 46);
+                r.requests.retain(|e| e["request"] != unrecorded);
+            },
+            true,
+            1,
+            false,
+        ),
+        (
+            "an unreadable candidate before the stop",
+            1,
+            |r, _| {
+                // tracker#446's closing pull requests are more than its
+                // board page shows, and not read after.
+                let nodes = (r.requests.iter_mut())
+                    .filter_map(|e| {
+                        e["answer"].pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                    })
+                    .filter_map(Value::as_array_mut)
+                    .flatten();
+                for node in nodes.filter(|n| n["content"]["number"] == 446) {
+                    node["content"]["closedByPullRequestsReferences"]["totalCount"] = 12.into();
+                }
+            },
+            true,
+            0,
+            false,
+        ),
+    ];
+    for (name, hours, edit, stopped, failures, planned) in cases {
+        let (mut replay, mut settings) = held_board(hours);
+        edit(&mut replay, &mut settings);
+        let report = preview_within(&config(settings), &replay, LIMIT);
+        let has = |prefix: &str| report.lines.iter().any(|l| l.starts_with(prefix));
+        assert_eq!(report.failures, failures, "{name}: {:#?}", report.lines);
+        assert_eq!(has(STOP), stopped, "{name}: {:#?}", report.lines);
+        assert_eq!(has(IDLE), stopped, "{name}: {:#?}", report.lines);
+        assert_eq!(has("pools: "), planned, "{name}: {:#?}", report.lines);
+        assert_eq!(has(POOLS), planned, "{name}: {:#?}", report.lines);
+        assert_eq!(has(START), planned, "{name}: {:#?}", report.lines);
+        // The stop left what it keeps for a start whole.
+        assert!(
+            !has("budget: 113 requests left, fewer than"),
+            "{name}: {:#?}",
+            report.lines
+        );
+        let starts = (report.lines.iter())
+            .filter(|l| l.starts_with("start "))
+            .count();
+        let started = planned || name == "a start before the stop";
+        assert_eq!(starts > 0, started, "{name}: {:#?}", report.lines);
+        assert_eq!(report.tally.1.started, starts, "{name}");
+        if name == "an unreadable candidate before the stop" {
+            let unreadable = (report.lines.iter()).any(|l| {
+                l.starts_with("hold cgwalters-forge/tracker#446: ")
+                    && l.contains("could not all be read")
+            });
+            assert!(unreadable, "{name}: {:#?}", report.lines);
+        }
+        if name == "off" {
+            // The stop's line is still the stage's last word.
+            let last =
+                (report.lines.iter()).rfind(|l| l.starts_with("idle: ") || l.starts_with("start "));
+            assert!(
+                last.is_some_and(|l| l.starts_with(IDLE)),
+                "{name}: {:#?}",
+                report.lines
+            );
+        }
+    }
+    // Applying, the start has what the stop kept for one: its recheck
+    // reads, the planning request and the dispatch, with nothing failed.
+    use crate::pass::tests::{Forge as PassForge, apply_within};
+    let (replay, settings) = held_board(1);
+    let mut forge = PassForge::new(None, false);
+    forge.replay = replay;
+    let report = apply_within(&forge, &config(settings), LIMIT);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let pools = &POOLS[..POOLS.find(',').unwrap()];
+    for prefix in [STOP, pools] {
+        assert!(
+            (report.lines.iter()).any(|l| l.starts_with(prefix)),
+            "{prefix}: {:#?}",
+            report.lines
+        );
+    }
+    let start = &START[..START.find(':').unwrap()];
+    assert!(
+        (report.lines.iter()).any(|l| l.starts_with(start) && l.contains(" record=")),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(forge.dispatches(), ["cgwalters-forge/tracker#890"]);
+    assert!(report.spent.requests <= LIMIT, "{}", report.spent);
 }

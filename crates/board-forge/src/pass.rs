@@ -3140,6 +3140,7 @@ async fn stages<C: Rest + Transport + crate::github::GraphQl + Broker>(
         deferred_epics: BTreeSet::new(),
         unconsidered: 0,
         unread: 0,
+        budget_stop: None,
         ended: RefCell::new(BTreeMap::new()),
         kept: RefCell::default(),
         ignored: RefCell::default(),
@@ -3418,6 +3419,15 @@ impl Step {
     }
 }
 
+/// Stage 4's stop for the budget with nothing started ([`Halt::Budget`]).
+#[derive(Clone, Copy)]
+struct BudgetStop {
+    /// The candidates it left unread, counted in `unconsidered`.
+    unread: usize,
+    /// The slots free at the stop.
+    free: usize,
+}
+
 /// What stopped a pass's starts.
 #[derive(Clone, Copy)]
 enum Halt {
@@ -3531,7 +3541,7 @@ struct Scheduler<'a, C> {
     /// The epics stage 4 may plan early where it would be idle.
     waited: Vec<epics::Waited>,
     /// With `epics.heldPlanHours`, the epic stage 4 may plan where it held
-    /// every candidate.
+    /// every candidate it read, the rest unread only for its budget.
     held_epic: Option<epics::Waited>,
     /// Stage 4's account of `epics.focus`.
     focus: epics::Focus,
@@ -3556,6 +3566,12 @@ struct Scheduler<'a, C> {
     /// considered ([`Self::held`]): what they wait on is unknown, so an idle
     /// stage 4 is not taken for one with no ready work.
     unread: usize,
+    /// Where stage 4's budget stopped it with nothing started
+    /// ([`Halt::Budget`]). The candidates it left unread alone do not keep
+    /// a held board from `epics.heldPlanHours`
+    /// ([`epics::Scheduler::replan_held`]), whose start spends what the stop
+    /// kept for one.
+    budget_stop: Option<BudgetStop>,
     /// Whether each `in_progress` run looked at has ended, by id ([`Self::ended`]).
     ended: RefCell<BTreeMap<u64, bool>>,
     /// The reads of stage 4's look ahead at overlaps ([`Self::kept`]).
@@ -4206,6 +4222,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut holds = holds;
         if taken == 0 && free > 0 {
             taken = self.replan_idle(free, &mut holds);
+        } else if taken == 0
+            && let Some(BudgetStop { free, .. }) = self.budget_stop
+        {
+            taken = self.replan_held(free, &mut holds);
         }
         let free = free - taken.min(free);
         self.report.tally.0.in_flight = Some(active + taken);
@@ -4386,6 +4406,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     // The stop leaves no slot free, so no `idle:` line says
                     // why the pools under pace started nothing (agent-board#803).
                     if matches!(halt, Halt::Budget) && taken == 0 {
+                        self.budget_stop = Some(BudgetStop { unread: left, free });
                         for (pool, settings) in &pools.0 {
                             if room(snapshot, pool, settings, self.now).is_ok() {
                                 self.line(format!(

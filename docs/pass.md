@@ -1453,13 +1453,25 @@ two reasons, with no run in flight and no person's hold, once its last
 planning request (its record, or its newest plan) is at least that many hours
 old. Stage 4 plans that one epic where it would otherwise start nothing: it
 must have read and held every candidate, whatever held it (none unread,
-failed or deferred; a board with no candidates qualifies too). Stage 3 must
+failed or deferred; a board with no candidates qualifies too). On a board
+with more candidates than a pass reads, stage 4's budget stops it with
+candidates unread every pass, so that alone never proves one ready: where
+the stop came past a candidate with nothing started, the candidates it left
+unread count as held too, and the start spends the requests the stop kept
+for one, as a candidate's start would, where they are whole: a candidate's
+recheck that held may have spent into them, and then the epic waits, with
+`budget: N requests left, fewer than stage 4 keeps for a start (K); planning
+OWNER/REPO#N waits`. Stage 3 must
 have planned nothing, and a `planPools` pool must be under its pace, with
 room left at it. Only such pools are drawn for the run. The pass logs
 `pools: P under pace with every candidate held; planning OWNER/REPO#N (one epic a pass)`,
 P listing those pools, and then `start planning OWNER/REPO#N pool=P: its last
 planning request was at T, H hour(s) or more ago; every candidate is held,
-with P under pace and N slot(s) free and nothing started`. The epic's backoff
+with P under pace and N slot(s) free and nothing started`; past a budget stop
+both say `every candidate read held, M unread for the budget` (`every
+candidate read is held, M unread for the budget` in the start's line) in
+place of `every candidate held`, after the stop's own `budget:` and `idle:`
+lines. The epic's backoff
 hold, where it has one, is taken back. The start uses the same early-planning
 path as above, with all its budget, WIP, overlap and `--max-dispatch` checks.
 The start writes a
@@ -1899,7 +1911,9 @@ reads: the board, run listings and leases (agent-board#789). A stop before
 any candidate started leaves no slot for the `idle:` line, so it adds one line
 for each pool still under pace (`idle: POOL is under pace and nothing started;
 stage 4's budget left M candidate(s) unread, first OWNER/REPO#N`), naming the
-candidate it stopped at (agent-board#803). Revisits, the weekly sweep and blocker reads
+candidate it stopped at (agent-board#803). Where every candidate it did read
+was held, `epics.heldPlanHours` may then plan an epic with what the stop kept
+([what is built](#what-is-built)). Revisits, the weekly sweep and blocker reads
 that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,
 labels or fails an item for it, nor fails the pass.
 Stage 5 and the hold snapshot, which come after every start, spend what is left. There is
@@ -4213,7 +4227,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `epics.focus` | The one live epic, `OWNER/REPO#N`, whose planning, applies and children go first, everything else starting only as spillover; refused where it is not a live epic, and on a Forgejo board, see [scheduling](#scheduling); unset (no focus) |
 | `epics.maxAppliesPerPass` | The most accepted epic plans a pass applies (1–10), the focus epic's first, then in Priority order; a refused plan does not count, and `--max-writes` still holds what they write; `1` |
 | `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
-| `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
+| `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate it read (the rest unread only for its budget) and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
