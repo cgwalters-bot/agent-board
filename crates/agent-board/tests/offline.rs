@@ -2686,6 +2686,54 @@ fn cli_reference_is_current() {
     );
 }
 
+/// A dry run of a daily session (agent-board#830) on the recorded board:
+/// with `sessions` naming agent-board#40 as the anchor, the preview plans
+/// the session start first, triages that issue no more, and writes
+/// nothing.
+#[test]
+fn pass_replay_previews_a_daily_session() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("../../../fixtures/pass/config.json")).unwrap();
+    config["triagePools"] = serde_json::json!(["claude"]);
+    config["sessions"] = serde_json::json!({
+        "hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"]
+    });
+    let path = std::env::temp_dir().join(format!(
+        "agent-board-session-config-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, config.to_string()).unwrap();
+    let output = command()
+        .args(["pass", "--config"])
+        .arg(&path)
+        .args(["--replay", "fixtures/pass/board-2026-10-23.json"])
+        .current_dir(root)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    std::fs::remove_file(&path).unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    let starts: Vec<&str> = text.lines().filter(|l| l.starts_with("start ")).collect();
+    assert_eq!(
+        starts.first(),
+        Some(&"start session cgwalters-forge/agent-board#40 pool=claude"),
+        "{text}"
+    );
+    assert_eq!(starts.len(), 6, "{text}");
+    assert!(
+        !text.contains("triage cgwalters-forge/agent-board#40"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(", planned starts {\"session\":1,\"triage\":5}\n"),
+        "{text}"
+    );
+}
+
 /// The recorded pass of 23 October previews offline, a line per decision,
 /// and refuses what would leave preview or mix sources.
 #[test]

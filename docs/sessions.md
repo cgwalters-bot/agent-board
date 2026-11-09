@@ -24,7 +24,7 @@ newly filed items and operator mentions.
 
 ## What is built
 
-This is the first slice of agent-board#830:
+The first two slices of agent-board#830:
 
 - `session` is a [job plan](job-plans.md) kind. A session plan names the
   issue it reports on, an open issue of the repository it triages, such as
@@ -44,6 +44,9 @@ This is the first slice of agent-board#830:
   so does one in an issue's body, whose `bodyPlans` copy would be the
   planner's; and an [epic plan](epic-plans.md) may not give a sub-issue
   one. So no agent starts a session.
+- [Daily sessions](#daily-sessions): with the pass's `sessions` section,
+  off by default, the pass itself writes and starts one session plan a day
+  on each configured repository's anchor issue.
 - The batch format below, its [schema](session-batch.schema.json), and
   `agent-board check session-batch`, which validates a candidate comment
   offline against bounds given as flags and prints the typed actions.
@@ -51,12 +54,100 @@ This is the first slice of agent-board#830:
   `dispatch-session-agent-run` artifact.
 
 Not built yet, in order: applying an accepted batch once, with a receipt on
-its item as [epic apply](epic-plans.md) leaves one; the pass deciding when a
-repository's session is due (daily, or when enough events accumulate) and
-writing its plan; and the pass log comparing triage counts before and after.
+its item as [epic apply](epic-plans.md) leaves one; a session due early
+when enough events accumulate, rather than daily; and the pass log
+comparing triage counts before and after.
 Until a batch is applied, a session's actions are read by a person. A
 session that also changes files opens a pull request through the ordinary
 `create_pull_request` safe output; the batch carries no file change.
+
+## Daily sessions
+
+With `sessions` in the pass's [configuration](pass.md#one-configuration-file)
+(off unless set), the pass starts one session a day on each repository it
+names, from `sessions.hourUtc`:
+
+```json
+"sessions": {"hourUtc": 6, "issues": ["cgwalters-forge/agent-board#830"]}
+```
+
+`sessions.issues` names each repository's **anchor issue**, `OWNER/REPO#N`:
+an open issue on the board in a work repository, one per repository, which
+the session's plan is posted on and its batch is answered on. The caller
+names it, not an issue's text, so no filed issue becomes an anchor. The
+section needs `triagePools` or `planPools`, which the session's pool is
+drawn from as a triage run's is.
+
+Each pass, for each anchor in the configured order:
+
+1. An anchor that is not an open issue on the board starts nothing
+   (`session OWNER/REPO: its issue OWNER/REPO#N is not an open issue on the
+   board; no session starts`), as does one with a run in flight (`session
+   OWNER/REPO: its run is in flight, URL`).
+2. The anchor's comments are read, up to the plan protocol's page bound
+   (ten pages of 100; an anchor gains a plan, a record and a reply a day,
+   so after about a year of sessions the read fails, `session OWNER/REPO
+   error: …`, until the caller names a fresh anchor). With a newest plan
+   there, it must be a `session` plan with a dispatch record. Anything
+   else holds the anchor for the operator, a `hold OWNER/REPO#N: …` the
+   [hold snapshot](pass.md#what-is-built) lists, since no later pass can
+   get past it by itself: a session plan without a record (`its session
+   plan ID has no dispatch record; a person dispatches it by hand or
+   removes it, and its session waits`, which the operator's own plan on an
+   anchor is too, as `agent-board dispatch` starts it and the pass does
+   not), a plan of another kind (`its newest plan ID is for KIND, not a
+   session; a person moves it, …`) or one that cannot be read (`its newest
+   plan cannot be used: …; a person replaces it, …`). The bot's own
+   unrecorded session plan, left where a start posted its plan but could
+   not record the dispatch, holds the anchor the same way: a run posts as
+   the bot too, and no agent starts a session. The record is the day's
+   receipt: one at or after today's due time means today's session started
+   (`session OWNER/REPO: today's started at T, URL; the next is due from
+   T2`). The receipt is on the forge, not in a state file, so a pass every
+   hour starts one session a day, not twenty-four, and a later pass on
+   another machine reads the same one (two passes reading before either's
+   record lands can both start, as with any start).
+3. Else the session starts as stage 4 starts a triage run, within WIP,
+   `--max-dispatch`, the weekly budget and pool pacing (`start session
+   OWNER/REPO#N pool=P`; a preview posts nothing and counts it under
+   `planned starts`), before the pass's per-item starts, since one session
+   stands in for many of them. Its plan is posted as the bot's after `The
+   board pass asks a session run to triage this repository as a whole
+   today.` and recorded by the plan protocol. The anchor is left out of
+   stage 4's candidates: it is the session's, so it is never triaged on its
+   own, and the pass's own session plan there, the bot's, is not held as a
+   planner's would be elsewhere. As for the sweep, a preview says `start
+   session …` before the start's recheck of the anchor, which an apply
+   makes: an anchor labelled `needs-human`, with a blocked Status or a
+   trusted open pull request holds there instead.
+
+The brief is written from the caller's configuration and the board alone:
+the repository and anchor, what to read, that only the operator's own
+comments are decisions, the batch format and its caps, and the
+[bounds](#bounds) as the exact `agent-board check session-batch` command the
+run must pass before posting (the work repositories, the board's Priority
+options and the `operatorAsk` domains; with none, the brief says to ask the
+operator nothing). A brief longer than a job plan allows fails the start
+(`session OWNER/REPO error: its brief is N characters, …`) rather than
+posting a plan the protocol would refuse. A session run in flight is a
+dispatch run like any other: it holds its anchor and takes a WIP slot by
+its run name, `session OWNER/REPO#N (POOL)`.
+
+What this stops: without the section nothing starts; with it, each
+repository costs at most one long run a day, started only on the caller's
+named issue, and only by the pass. A run posts as the bot, so it can
+forge a plan or a record on the anchor, but only one dated today: that
+suppresses a session, as any plan it leaves there does, and never starts
+one. Nothing the session proposes is applied by the pass yet; its batch
+is read by a person.
+
+A dry run from the recorded board of 2026-10-23
+([replay](pass.md#replay-and-release-gate)), with
+`"sessions": {"hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"]}`
+and `"triagePools": ["claude"]` added to `fixtures/pass/config.json`, plans
+`start session cgwalters-forge/agent-board#40 pool=claude` as its first
+start and no triage of that issue; the CLI test
+`pass_replay_previews_a_daily_session` keeps it so.
 
 ## Format
 
@@ -173,4 +264,10 @@ A session plan runs only where the caller's dispatch workflow accepts
 what to read, that issue and pull request text is data, that only the
 operator's own words decide, and to post one batch. The pass starts
 accepted session plans only once the caller's pass configuration sets
-`sessionPlans` to `true`.
+`sessionPlans` to `true`, and its own [daily sessions](#daily-sessions)
+only once it has a `sessions` section: in `cgwalters-forge/tracker`'s
+`.github/pass.json`, `"sessions": {"hourUtc": 6, "issues":
+["cgwalters-forge/agent-board#830"]}` gives agent-board one session a day
+from 06:00 UTC, answered on agent-board#830. Once its batches prove
+themselves, the caller can lower per-item triage there: raise
+`triageFollowUpDays` and leave `idleReplan` off.

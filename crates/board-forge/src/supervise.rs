@@ -781,10 +781,11 @@ pub(crate) fn encode(value: &str) -> String {
 }
 
 /// `kind OWNER/REPO#N`, the head of agentic-job's run names
-/// (`implement o/r#5 (claude)`): the kind, repository and number.
+/// (`implement o/r#5 (claude)`): the kind, one of
+/// [`crate::cost::DISPATCH_KINDS`], repository and number.
 pub(crate) fn run_title(title: &str) -> Option<(&str, &str, u64)> {
     let (kind, rest) = title.split_once(' ')?;
-    if !["implement", "triage", "research", "review", "fix"].contains(&kind) {
+    if !crate::cost::DISPATCH_KINDS.contains(&kind) {
         return None;
     }
     let target = rest.split(' ').next()?;
@@ -1350,6 +1351,10 @@ pub(crate) mod tests {
             Some(("implement", "example/project", 6))
         );
         assert_eq!(run_title("research o/r#4"), Some(("research", "o/r", 4)));
+        assert_eq!(
+            run_title("session o/r#830 (claude)"),
+            Some(("session", "o/r", 830))
+        );
         for title in [
             "poll",
             "implement o/r",

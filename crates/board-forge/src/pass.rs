@@ -623,6 +623,9 @@ pub struct Config {
     /// Off unless set: once a week, one issue lists the candidates outside
     /// every live epic for one triage run ([`Scheduler::sweep`]).
     pub sweep: Option<sweep::Sweep>,
+    /// Off unless set: one session run a day on each configured
+    /// repository's anchor issue ([`Scheduler::sessions`], agent-board#830).
+    pub sessions: Option<sessions::Sessions>,
     /// Off unless set: a daily digest of incoming pull requests, planned
     /// before stage 2 within a share of the pools ([`Scheduler::maintain`]).
     pub maintain: Option<maintain::Maintain>,
@@ -1357,6 +1360,9 @@ impl Config {
         );
         if let Some(sweep) = &self.sweep {
             sweep.check(self)?;
+        }
+        if let Some(sessions) = &self.sessions {
+            sessions.check(self)?;
         }
         if let Some(maintain) = &self.maintain {
             maintain.check(self)?;
@@ -4323,6 +4329,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         // little for a start is not sent ([`START_RESERVE`]), with each
         // lease's own reads where its recheck reads them again.
         self.client.bounds.reserve.set(reserve);
+        // A due session stands in for many of the item starts below, so it
+        // takes its slot first ([`Self::sessions`]).
+        let (free, sessions) = self.sessions(&board, &mut slots, free, context);
         let (free, started) = self.start(&candidates, &board, &mut slots, free, context);
         self.focus_judged(candidates.len(), free);
         // With a focus, only its children are revisited: a revisit is a
@@ -4333,7 +4342,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         };
         let (free, revisited) = self.revisit(revisits, &board, &mut slots, free, context);
         let (free, swept) = self.sweep(&candidates, &board, &mut slots, free, context);
-        let mut taken = started + revisited + swept;
+        let mut taken = sessions + started + revisited + swept;
         let ranked: Vec<ItemRef> = candidates.iter().map(|(_, f)| f.issue.clone()).collect();
         drop(candidates);
         self.free = holds::free(Some(&ranked), &self.report.holds[holds..]);
@@ -5025,6 +5034,8 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if let Some(Some(found)) = &self.swept {
             control.push(key(&found.issue));
         }
+        // A session anchor's run is its session's to start.
+        control.extend(self.session_anchors().iter().map(key));
         if config.epic_focus() {
             self.quiet = Some(focus::quiet(board.items.values(), &people));
         }
@@ -7258,6 +7269,23 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         reuse: Option<&plan::Comment>,
         read: Option<(&Facts, &[plan::Comment])>,
         line: String,
+        context: (&Slots, &Target, HoldRule),
+    ) -> Result<Step> {
+        let start = ("triage", pool, brief, intro);
+        self.start_run(issue, start, reuse, read, line, context)
+    }
+
+    /// [`Self::start_triage`] for the pass's own plan of `kind`, `triage`
+    /// or [`plan::SESSION_KIND`]: a run whose brief names no files to
+    /// change, so it is not checked for overlap, stacked or batched (a
+    /// session's own pull request, if it opens one, is the poll's as any).
+    fn start_run(
+        &self,
+        issue: &ItemRef,
+        (kind, pool, brief, intro): (&str, &str, String, &str),
+        reuse: Option<&plan::Comment>,
+        read: Option<(&Facts, &[plan::Comment])>,
+        line: String,
         (slots, target, rule): (&Slots, &Target, HoldRule),
     ) -> Result<Step> {
         let holds = vec![issue.clone()];
@@ -7297,7 +7325,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             "schema": JOB_PLAN_SCHEMA,
             "repo": issue.repository,
             "item": issue.number,
-            "kind": "triage",
+            "kind": kind,
             "runner": TRIAGE_RUNNER,
             "pool": pool,
             "brief": self.directed(brief),
@@ -7890,6 +7918,7 @@ pub mod needs;
 pub mod next;
 pub mod promote;
 pub mod revisit;
+pub mod sessions;
 pub mod starts;
 mod status;
 pub mod sweep;

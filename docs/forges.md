@@ -293,7 +293,8 @@ is opt-in through a trusted config file, with no caller or adapter activation.
 
 PR follow-up is the largest gap: a Forgejo pass follows no pull request, and
 every option of it (`follow`, `pr.*`, `state`) is refused, with `maintain`,
-whose digest reads the operator's pull requests across GitHub. Work whose run
+whose digest reads the operator's pull requests across GitHub, and
+`sessions`, whose daily starts are built on GitHub only. Work whose run
 opens a pull request must still hold its issue until a person merges or closes
 it. GitHub names a pull request's closing issues; no such field was found in
 Forgejo's pull request API, so stage 4 matches them itself (#522, below), and

@@ -1555,8 +1555,8 @@ Try a pass without credentials, against the recorded board:
 agent-board pass --config fixtures/pass/config.json --replay fixtures/pass/board-2026-10-23.json
 ```
 
-Each decision is one line: `start triage|implement|planning|revisit OWNER/REPO#N … pool=P`,
-`revisit: …` and `revisit OWNER/REPO#N: why`, `maintain: …`,
+Each decision is one line: `start triage|implement|planning|revisit|session OWNER/REPO#N … pool=P`,
+`revisit: …` and `revisit OWNER/REPO#N: why`, `maintain: …`, `session OWNER/REPO: …`,
 `apply|recover epic OWNER/REPO#N …`, `epic OWNER/REPO#N: …`, `usage: …`, `holds: …`,
 `hold [epic] OWNER/REPO#N: why`, `hold wip|pools|budget: why`,
 `review rerun|check rerun|run rerun OWNER/REPO#N …`,
@@ -1913,7 +1913,7 @@ for each pool still under pace (`idle: POOL is under pace and nothing started;
 stage 4's budget left M candidate(s) unread, first OWNER/REPO#N`), naming the
 candidate it stopped at (agent-board#803). Where every candidate it did read
 was held, `epics.heldPlanHours` may then plan an epic with what the stop kept
-([what is built](#what-is-built)). Revisits, the weekly sweep and blocker reads
+([what is built](#what-is-built)). Revisits, daily sessions, the weekly sweep and blocker reads
 that meet the reserve wait too, saying so (`sweep: budget: …`); none holds,
 labels or fails an item for it, nor fails the pass.
 Stage 5 and the hold snapshot, which come after every start, spend what is left. There is
@@ -2664,7 +2664,9 @@ repository, so starting one is the operator's decision, not a planner's,
 and the planner's session plan holds its issue (`hold OWNER/REPO#N: plan ID
 is a session plan the operator did not write; …`), as does one in an issue
 body, whose `bodyPlans` copy would be the planner's. Its batch is a
-proposal the pass does not apply yet.
+proposal the pass does not apply yet. The pass's own session plans, one a
+day on each configured anchor issue, are [daily sessions](#daily-sessions)'
+and need no `sessionPlans`; an anchor is no candidate here.
 Plans for a different issue stay manual (`needs-operator`): a triage plan of another issue than the
 one it is on (`hold OWNER/REPO#N: plan ID triages OWNER/REPO#M, not this
 issue; …`), whose run's verdict or plan would land where this issue's
@@ -2865,6 +2867,30 @@ comment ([Forgejo](forges.md#the-weekly-sweep)):
    between the comment and that write, and no new sweep is filed while it
    is open. The live epics are those stage 3 read in `epics.repository`
    and the parents stage 4 read.
+
+## Daily sessions
+
+With `sessions` set (off unless set), stage 4 starts, before its per-item
+starts, one [session](sessions.md#daily-sessions) run a day on each
+configured repository's anchor issue, from `sessions.hourUtc`
+(agent-board#830). The anchor, `OWNER/REPO#N` in `sessions.issues`, is an
+open issue on the board in a work repository, one per repository; it is
+left out of the candidates, as the sweep issue is, since its run is the
+session's to start. The day's receipt is the dispatch record on the anchor:
+a session plan recorded at or after the due time means today's started
+(`session OWNER/REPO: today's started at T, URL; the next is due from T2`);
+one recorded before it, or no plan, lets today's start as stage 4 starts a
+triage run, within WIP, `--max-dispatch`, the weekly budget and pacing
+(`start session OWNER/REPO#N pool=P`, its pool drawn from `triagePools`), its
+plan posted as the bot's and recorded by the plan protocol. An anchor off
+the board or with a run in flight starts nothing, in one `session
+OWNER/REPO: …` line a pass; one whose newest plan is unrecorded, of
+another kind or unusable is held for the operator (`hold OWNER/REPO#N: its
+session plan ID has no dispatch record; …`), which the hold snapshot lists,
+since no pass gets past it by itself. A session run in flight counts for
+WIP and holds its anchor by its run name as any dispatch run. The brief names the configured bounds
+and the offline check the run must pass before posting its batch, which the
+pass does not apply yet ([sessions](sessions.md#daily-sessions)).
 
 ## Reruns
 
@@ -4314,6 +4340,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `forgejoIntake.state` | Forgejo only: opt-in operator issue-comment routing with a separate per-instance cursor file, see [native issue intake](forges.md#native-issue-intake); section absent (off). Caller follow-up: tracker `.github/forgejo-pass.json`, `forgejoIntake: {"state": ".state/forgejo-intake.json"}`, only after #271 prerequisites; not the GitHub pass config |
 | `sweep.weekday`, `sweep.hourUtc` | The day of the week (its English name) and hour (0–23 UTC) from which a week's [sweep](#the-weekly-sweep) of the issues outside the epics is due; needs `triage`, either scope; section absent (off) |
 | `sweep.max`, `sweep.repository` | The most issues (1–100) one sweep lists; the work repository its issue is filed in; `40`, `epics.repository` |
+| `sessions.hourUtc`, `sessions.issues` | GitHub only: the hour (0–23 UTC) from which a day's [sessions](sessions.md#daily-sessions) are due, and the anchor issue (`OWNER/REPO#N`, an open issue on the board) of each work repository that gets one session a day, one per repository, see [daily sessions](#daily-sessions); needs `triagePools` or `planPools`; section absent (off) |
 | `revisit.heldAfterDays`, `revisit.pools` | Days (1–90) for an issue a person holds; ordered pool names for revisit runs; `afterDays`, `triagePools` |
 | `maintain.repos.sinceDays`, `maintain.repos.min`, `maintain.repos.max` | The repositories whose incoming pull requests a daily digest assesses: those with at least `min` (≥ 1) of the operator's opened or reviewed pull requests updated in `sinceDays` (1–365) days, the `max` (1–20) most active, derived once a day, see [maintain](#maintain); required |
 | `maintain.repos.include`, `maintain.repos.exclude` | Repositories always kept (at most `max`) and never kept, no duplicates across both; `[]`, `[]` |
