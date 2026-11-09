@@ -2266,6 +2266,11 @@ pub(super) mod tests {
         pub(in crate::poll) issues_disabled: RefCell<BTreeSet<String>>,
         /// Every request, in order, as `METHOD URL`.
         pub(in crate::poll) log: RefCell<Vec<String>>,
+        /// A URL part whose first GET spends the pass's stage share: that
+        /// GET and every one after it is refused with `ShareSpent`, even
+        /// one under way, which the pass's budget would let through.
+        pub(in crate::poll) share_spent_at: RefCell<Option<String>>,
+        share_spent: RefCell<bool>,
         /// Whether a search for a tracking issue finds none, as a search
         /// index that has not caught up.
         unindexed: RefCell<bool>,
@@ -2289,6 +2294,12 @@ pub(super) mod tests {
         fn get(&self, url: &str, validator: Option<(&str, &str)>) -> Result<RestResponse> {
             assert!(validator.is_none() || !url.contains("/issues/"));
             self.log.borrow_mut().push(format!("GET {url}"));
+            if (self.share_spent_at.borrow().as_ref()).is_some_and(|at| url.contains(at.as_str())) {
+                *self.share_spent.borrow_mut() = true;
+            }
+            if *self.share_spent.borrow() {
+                return Err(crate::pass::ShareSpent("the share is spent".into()).into());
+            }
             if self.gone.borrow().contains(url) {
                 return Err(anyhow::Error::from(NotFound).context(format!("GET {url}: 404")));
             }

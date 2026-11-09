@@ -539,6 +539,7 @@ pub const POLL_OPTIONS: &[&str] = &[
     // The pass's `pr` keys of [`PrOptions`].
     "checkReruns",
     "unstall",
+    "directionFirst",
     "ownerBranches",
     "ownSpaceOnly",
     "foldRounds",
@@ -728,6 +729,12 @@ pub struct PollPolicy {
     /// is; and a draft whose continuation is used up or failed gets one fresh
     /// continuation round on another pool before its stop. Off by default.
     pub unstall: bool,
+    /// The pass's `pr.directionFirst` (agent-board#840): the operator's
+    /// direction (the `operatorComments` search or the pass's intake, then
+    /// `notifications`) is read before the followed repositories' activity
+    /// and pull requests rather than after them, so that a walk spending the
+    /// stage's request share cannot defer it pass after pass. Off by default.
+    pub direction_first: bool,
     /// The pass's `pr.ownerBranches`: a round on a head that is not the bot's
     /// fork is skipped where agentic-job's apply would refuse to push there
     /// ([`OWNER_BRANCHES`]). Off by default.
@@ -1027,6 +1034,8 @@ pub struct PrOptions {
     #[serde(default)]
     pub unstall: bool,
     #[serde(default)]
+    pub direction_first: bool,
+    #[serde(default)]
     pub owner_branches: bool,
     #[serde(default)]
     pub own_space_only: bool,
@@ -1151,6 +1160,7 @@ impl PrOptions {
         let Self {
             check_reruns,
             unstall,
+            direction_first,
             owner_branches,
             own_space_only,
             fold_rounds,
@@ -1164,6 +1174,7 @@ impl PrOptions {
         } = self.clone();
         policy.check_reruns = check_reruns;
         policy.unstall = unstall;
+        policy.direction_first = direction_first;
         policy.owner_branches = owner_branches;
         policy.own_space_only = own_space_only;
         policy.fold_rounds = fold_rounds;
@@ -1289,6 +1300,7 @@ impl PollPolicy {
             stale_days: 0,
             check_reruns: false,
             unstall: false,
+            direction_first: false,
             owner_branches: false,
             fix_plans: false,
             own_space_only: false,
@@ -8335,7 +8347,7 @@ pub fn run_capped<R: Rest, G: Transport>(
     rest: &R,
     graphql: &G,
     config: &Config,
-    state: State,
+    mut state: State,
     (watch, follow): (&[String], &[String]),
     apply: Option<Apply<'_, R>>,
     caps: Option<&caps::Caps>,
@@ -8391,8 +8403,9 @@ pub fn run_capped<R: Rest, G: Transport>(
     for repo in &repositories {
         validate_repository(repo)?;
     }
+    let mut cursors = Cursors::new(config, &mut state);
     let mut pass = Pass {
-        previous: state.responses,
+        previous: std::mem::take(&mut state.responses),
         apply,
         followed: follow.iter().map(|r| r.to_ascii_lowercase()).collect(),
         caps,
@@ -8411,6 +8424,17 @@ pub fn run_capped<R: Rest, G: Transport>(
         );
     }
     let mut outcome = Outcome::default();
+    // Only an applying pass writes, so only it records refusals.
+    if config.policy.notification_intake.is_some() {
+        pass.intake_refused = std::mem::take(&mut state.intake_refused);
+    }
+    let follow: BTreeSet<&String> = follow.iter().collect();
+    // What the operator asks the bot is answered within the pass: before the
+    // followed repositories' reads, whose share would otherwise leave the
+    // intake nothing pass after pass (agent-board#840).
+    if config.policy.direction_first {
+        read_direction(&mut pass, config, &follow, &mut cursors, &mut outcome);
+    }
     // A listed repository that is not there, as one a merged configuration
     // change named by mistake (agent-board#683), is the operator's to fix;
     // it stops nothing else.
@@ -8453,7 +8477,6 @@ pub fn run_capped<R: Rest, G: Transport>(
         // Unread is not unchanged: the next pass comes soon.
         outcome.activity += 1;
     }
-    let follow: BTreeSet<&String> = follow.iter().collect();
     // With `repositoriesPerPass`, the steps of this pass stay inside an
     // envelope computed from the followed set, the cap and the cursor the
     // last pass left, and recorded as a line before them so two passes'
@@ -8561,29 +8584,113 @@ pub fn run_capped<R: Rest, G: Transport>(
     pass.start_reviews(&mut outcome);
     pass.rest.under_way(false);
     // After the followed pull requests, which come first for the runs a pass
-    // may start. A preview keeps the cursor, so that it hides nothing from the
-    // next pass that applies.
-    let (mut operator_cursor, mut operator_page) = (state.operator_cursor, state.operator_page);
-    // As the cursor; without the pass's intake it is dropped.
-    let mut intake_waiting = match &config.policy.notification_intake {
-        Some(_) => state.intake_waiting,
+    // may start, unless `directionFirst` read it before them.
+    if !config.policy.direction_first {
+        read_direction(&mut pass, config, &follow, &mut cursors, &mut outcome);
+    }
+    if let Some(line) = pass.pace_line() {
+        outcome.lines.push(line);
+    }
+    // After the rounds, on what is left of the request budget.
+    let lock_refused = match config.policy.lock_items {
+        Some(limit) => pass.lock(&follow, limit, &state.lock_refused, &mut outcome),
         None => BTreeMap::new(),
     };
-    // Only an applying pass writes, so only it records refusals.
-    if config.policy.notification_intake.is_some() {
-        pass.intake_refused = state.intake_refused;
+    // Cosmetic cleanup comes last, after locking has spent its budget too.
+    pass.fold(&mut outcome.lines);
+    pass.maintainer_report(&follow, &mut outcome);
+    // What could not be read counts as a change: an API error must not stretch
+    // the gap while a pull request may be waiting on it.
+    let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
+    let previous = if state.interval_seconds == 0 {
+        MIN_INTERVAL_SECONDS
+    } else {
+        state.interval_seconds
+    };
+    // Any claim's step is over: nothing is under way past the poll.
+    pass.rest.under_way(false);
+    outcome.dispatched = pass.dispatched;
+    outcome.merged = pass.merged;
+    outcome.reviewing = pass.reviewing;
+    let Cursors {
+        operator_cursor,
+        operator_page,
+        intake_waiting,
+        notify_since,
+        notify_before,
+    } = cursors;
+    outcome.state = State {
+        interval_seconds: next_interval(previous, active),
+        responses: pass.used,
+        operator_cursor,
+        operator_page,
+        intake_waiting,
+        intake_refused: pass.intake_refused,
+        lock_refused,
+        follow_cursor,
+        share_cursor,
+        notify_since,
+        notify_before,
+        maintain: None,
+        authored_cursor: None,
+    };
+    Ok(outcome)
+}
+
+/// Where the operator's direction is read from ([`read_direction`]): the
+/// state's cursors, for the next pass.
+struct Cursors {
+    operator_cursor: Option<String>,
+    operator_page: Option<u64>,
+    intake_waiting: BTreeMap<String, String>,
+    notify_since: Option<String>,
+    notify_before: Option<String>,
+}
+
+impl Cursors {
+    /// Taken from `state`: the search's cursor and page always, the intake's
+    /// waiting threads only with the pass's intake, and the notifications'
+    /// cursors only with `notifications`.
+    fn new(config: &Config, state: &mut State) -> Self {
+        let notifications = config.policy.notifications.is_some();
+        Self {
+            operator_cursor: state.operator_cursor.take(),
+            operator_page: state.operator_page.take(),
+            // As the cursor; without the pass's intake it is dropped.
+            intake_waiting: match &config.policy.notification_intake {
+                Some(_) => std::mem::take(&mut state.intake_waiting),
+                None => BTreeMap::new(),
+            },
+            notify_since: state.notify_since.take().filter(|_| notifications),
+            notify_before: state.notify_before.take().filter(|_| notifications),
+        }
     }
+}
+
+/// The operator's direction: the `operatorComments` search or the pass's
+/// intake, then `notifications`. A preview keeps the cursors, so that it
+/// hides nothing from the next pass that applies.
+fn read_direction<R: Rest, G: Transport>(
+    pass: &mut Pass<'_, R, G>,
+    config: &Config,
+    follow: &BTreeSet<&String>,
+    cursors: &mut Cursors,
+    outcome: &mut Outcome,
+) {
     if !config.policy.operator_comments.is_empty()
         || (config.policy.notification_intake.is_some() && config.policy.notifications.is_none())
     {
-        let at = (operator_cursor.as_deref(), operator_page.unwrap_or(1));
+        let at = (
+            cursors.operator_cursor.as_deref(),
+            cursors.operator_page.unwrap_or(1),
+        );
         pass.intaking = config.policy.notification_intake.is_some();
-        let mut waiting = intake_waiting.clone();
-        match pass.operator_comments(&follow, at, &mut waiting, &mut outcome) {
+        let mut waiting = cursors.intake_waiting.clone();
+        match pass.operator_comments(follow, at, &mut waiting, outcome) {
             Ok((cursor, page)) if pass.apply.is_some() => {
-                operator_cursor = Some(cursor);
-                operator_page = Some(page).filter(|p| *p > 1);
-                intake_waiting = waiting;
+                cursors.operator_cursor = Some(cursor);
+                cursors.operator_page = Some(page).filter(|p| *p > 1);
+                cursors.intake_waiting = waiting;
             }
             Ok(_) => {}
             // The pass's intake is a side channel of direction, which the
@@ -8611,18 +8718,16 @@ pub fn run_capped<R: Rest, G: Transport>(
         pass.intaking = false;
     }
     // After the search, so that a comment it claimed is seen claimed here.
-    // As there, a preview keeps the cursor; without the option it is dropped.
-    let (mut notify_since, mut notify_before) = match &config.policy.notifications {
-        Some(_) => (state.notify_since, state.notify_before),
-        None => (None, None),
-    };
     if let Some(settings) = &config.policy.notifications {
-        let at = (notify_since.as_deref(), notify_before.as_deref());
+        let at = (
+            cursors.notify_since.as_deref(),
+            cursors.notify_before.as_deref(),
+        );
         pass.intaking = config.policy.notification_intake.is_some();
-        match pass.notifications(settings, &follow, at, &mut outcome) {
+        match pass.notifications(settings, follow, at, outcome) {
             Ok((since, before)) if pass.apply.is_some() => {
-                notify_since = Some(since);
-                notify_before = before;
+                cursors.notify_since = Some(since);
+                cursors.notify_before = before;
             }
             Ok(_) => {}
             Err(error) if error.is::<crate::pass::ShareSpent>() => {
@@ -8639,46 +8744,6 @@ pub fn run_capped<R: Rest, G: Transport>(
         }
         pass.intaking = false;
     }
-    if let Some(line) = pass.pace_line() {
-        outcome.lines.push(line);
-    }
-    // After the rounds, on what is left of the request budget.
-    let lock_refused = match config.policy.lock_items {
-        Some(limit) => pass.lock(&follow, limit, &state.lock_refused, &mut outcome),
-        None => BTreeMap::new(),
-    };
-    // Cosmetic cleanup comes last, after locking has spent its budget too.
-    pass.fold(&mut outcome.lines);
-    pass.maintainer_report(&follow, &mut outcome);
-    // What could not be read counts as a change: an API error must not stretch
-    // the gap while a pull request may be waiting on it.
-    let active = outcome.activity > 0 || outcome.in_flight > 0 || outcome.errors > 0;
-    let previous = if state.interval_seconds == 0 {
-        MIN_INTERVAL_SECONDS
-    } else {
-        state.interval_seconds
-    };
-    // Any claim's step is over: nothing is under way past the poll.
-    pass.rest.under_way(false);
-    outcome.dispatched = pass.dispatched;
-    outcome.merged = pass.merged;
-    outcome.reviewing = pass.reviewing;
-    outcome.state = State {
-        interval_seconds: next_interval(previous, active),
-        responses: pass.used,
-        operator_cursor,
-        operator_page,
-        intake_waiting,
-        intake_refused: pass.intake_refused,
-        lock_refused,
-        follow_cursor,
-        share_cursor,
-        notify_since,
-        notify_before,
-        maintain: None,
-        authored_cursor: None,
-    };
-    Ok(outcome)
 }
 
 /// Reuse stage 2's push preflights, then locate the authorized round ledger.
