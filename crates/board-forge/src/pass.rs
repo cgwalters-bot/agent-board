@@ -7533,6 +7533,9 @@ fn broker_key(path: &str) -> Value {
     json!({"broker": path})
 }
 
+/// A recorded GET answer's flag for the live client's typed not-found error.
+const ABSENT: &str = "absent";
+
 /// A download, such as a job's log, in a recording.
 fn download_key(url: &str) -> Value {
     json!({"download": url})
@@ -7582,13 +7585,20 @@ fn fixture_text(head: &Value, entries: &[Value]) -> String {
 }
 
 impl<C: Rest> Rest for Recorder<'_, C> {
+    /// Keeps the live client's typed absence ([`crate::github::NotFound`],
+    /// 404 or 410) as [`ABSENT`], not as a status it cannot tell. Any other
+    /// failure is not kept, so neither its message nor a guess at it is.
     fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
-        let response = self.inner.get(url, None)?;
-        self.keep(
-            json!({"get": url}),
-            json!({"status": response.status, "link": response.link, "body": response.body}),
-        );
-        Ok(response)
+        let read = self.inner.get(url, None);
+        let answer = match &read {
+            Ok(response) => {
+                json!({"status": response.status, "link": response.link, "body": response.body})
+            }
+            Err(error) if error.is::<crate::github::NotFound>() => json!({ABSENT: true}),
+            Err(_) => return read,
+        };
+        self.keep(json!({"get": url}), answer);
+        read
     }
 
     fn send(&self, method: &str, url: &str, _: &Value) -> Result<(u16, Value)> {
@@ -7748,8 +7758,14 @@ impl<C: crate::github::GraphQl> crate::github::GraphQl for Seeded<'_, C> {
 }
 
 impl Rest for Replay {
+    /// A recorded [`ABSENT`] answer is the live client's typed error again;
+    /// an older fixture's recorded 404 status stays a response.
     fn get(&self, url: &str, _: Option<(&str, &str)>) -> Result<RestResponse> {
         let answer = self.answer(&json!({"get": url}))?;
+        if answer[ABSENT] == true {
+            return Err(anyhow::Error::from(crate::github::NotFound)
+                .context(format!("GET {url}: recorded as not found")));
+        }
         Ok(RestResponse {
             status: answer["status"].as_u64().context("recorded status")? as u16,
             etag: None,

@@ -70,7 +70,7 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         if let Some(path) = &args.record {
             let recorder = Recorder::new(&client);
             let result = promote::preview(&recorder, &config, now);
-            std::fs::write(path, recording(&recorder.fixture(now)?)?)
+            std::fs::write(path, promote::recording(&recorder.fixture(now)?)?)
                 .with_context(|| format!("write {}", path.display()))?;
             result?
         } else if args.apply {
@@ -88,101 +88,4 @@ pub fn run(args: &Promote, out: &mut impl Write) -> Result<()> {
         writeln!(out, "{line}")?;
     }
     Ok(())
-}
-
-/// Keep the observed fields this evaluator uses, not avatars, descriptions,
-/// unrelated PR text or review bodies. This is a projection, not scenario data.
-fn recording(fixture: &str) -> Result<String> {
-    let mut value: serde_json::Value = serde_json::from_str(fixture)?;
-    fn project(value: &mut serde_json::Value, comments: bool) {
-        match value {
-            serde_json::Value::Array(rows) => rows.iter_mut().for_each(|v| project(v, comments)),
-            serde_json::Value::Object(object) => {
-                object.retain(|key, _| {
-                    [
-                        "full_name",
-                        "fork",
-                        "parent",
-                        "source",
-                        "owner",
-                        "login",
-                        "user",
-                        "number",
-                        "head",
-                        "base",
-                        "repo",
-                        "ref",
-                        "sha",
-                        "state",
-                        "draft",
-                        "labels",
-                        "name",
-                        "id",
-                        "created_at",
-                        "updated_at",
-                        "submitted_at",
-                        "timestamp",
-                        "before",
-                        "after",
-                        "activity_type",
-                        "actor",
-                        "title",
-                        "body",
-                        "merged_at",
-                        "ahead_by",
-                        "behind_by",
-                        "total_commits",
-                        "merge_base_commit",
-                        "commits",
-                        "commit",
-                        "message",
-                        "parents",
-                        "author",
-                        "protected",
-                        "protection",
-                        "enabled",
-                        "required_status_checks",
-                        "checks",
-                        "contexts",
-                        "context",
-                        "app_id",
-                        "integration_id",
-                        "enforcement_level",
-                        "type",
-                        "parameters",
-                        "check_runs",
-                        "total_count",
-                        // The policy gate: record files, listings and history.
-                        "path",
-                        "size",
-                        "encoding",
-                        "content",
-                        "committer",
-                        "verification",
-                        "verified",
-                        "default_branch",
-                        "merge_commit_sha",
-                        "commit_id",
-                        "tree",
-                    ]
-                    .contains(&key.as_str())
-                        || (comments && key == "body")
-                });
-                object.values_mut().for_each(|v| project(v, comments));
-            }
-            _ => {}
-        }
-    }
-    for entry in value["requests"]
-        .as_array_mut()
-        .context("recorded requests")?
-    {
-        let comments = entry["request"]["get"]
-            .as_str()
-            .is_some_and(|s| s.contains("/comments?"));
-        if let Some(body) = entry["answer"].get_mut("body") {
-            project(body, comments);
-        }
-    }
-    Ok(serde_json::to_string_pretty(&value)?)
 }

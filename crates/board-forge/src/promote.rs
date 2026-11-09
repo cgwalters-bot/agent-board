@@ -166,6 +166,105 @@ fn assess(
     Ok((gate, verdict))
 }
 
+/// The REST response fields a recorded preview keeps: those this evaluator
+/// reads, not avatars, descriptions or other fields it never reads.
+const RECORDED_FIELDS: &[&str] = &[
+    "full_name",
+    "fork",
+    "parent",
+    "source",
+    "owner",
+    "login",
+    "user",
+    "number",
+    "head",
+    "base",
+    "repo",
+    "ref",
+    "sha",
+    "state",
+    "draft",
+    "labels",
+    "name",
+    "id",
+    "created_at",
+    "updated_at",
+    "submitted_at",
+    "timestamp",
+    "before",
+    "after",
+    "activity_type",
+    "actor",
+    "title",
+    "body",
+    "merged_at",
+    "ahead_by",
+    "behind_by",
+    "total_commits",
+    "merge_base_commit",
+    "commits",
+    "commit",
+    "message",
+    "parents",
+    "author",
+    "protected",
+    "protection",
+    "enabled",
+    "required_status_checks",
+    "checks",
+    "contexts",
+    "context",
+    "app_id",
+    "integration_id",
+    "enforcement_level",
+    "type",
+    "parameters",
+    "check_runs",
+    "total_count",
+    // An approval trigger: the timeline's draft conversions.
+    "event",
+    // The policy gate: record files, listings, history and trees.
+    "path",
+    "size",
+    "encoding",
+    "content",
+    "committer",
+    "verification",
+    "verified",
+    "default_branch",
+    "merge_commit_sha",
+    "commit_id",
+    "tree",
+    "mode",
+    "truncated",
+];
+
+/// A [`crate::pass::Recorder`] fixture projected to [`RECORDED_FIELDS`] in
+/// REST bodies. Statuses, links, typed absence and GraphQL answers (queried
+/// for exactly their evidence) are kept whole. A projection, not scenario data.
+pub fn recording(fixture: &str) -> Result<String> {
+    fn project(value: &mut Value) {
+        match value {
+            Value::Array(rows) => rows.iter_mut().for_each(project),
+            Value::Object(object) => {
+                object.retain(|key, _| RECORDED_FIELDS.contains(&key.as_str()));
+                object.values_mut().for_each(project);
+            }
+            _ => {}
+        }
+    }
+    let mut value: Value = serde_json::from_str(fixture).context("recorded fixture")?;
+    for entry in value["requests"]
+        .as_array_mut()
+        .context("recorded requests")?
+    {
+        if let Some(body) = entry["answer"].get_mut("body") {
+            project(body);
+        }
+    }
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
 pub fn enabled(config: &Config) -> bool {
     config.promote.as_ref().is_some_and(|p| !p.forks.is_empty())
 }
