@@ -2173,7 +2173,8 @@ closed or held as before: only the brief steers it.
 The concrete failure `operatorAsk` prevents is applying one caller's delegation
 policy to another caller, or releasing an ask whose domain the brief requested
 but the scheduler does not recognize. This optional trusted config key holds
-both `text` (the policy prose) and `domains` (accepted `operator` verdict values).
+both `text` (the policy prose) and `domains` (accepted `operator` verdict values),
+plus an optional `harness` delegation policy.
 It currently supports only GitHub and is refused on Forgejo.
 It is off by default: an absent key adds no repository-specific ask policy and
 never releases a wait merely because the repository is our own infrastructure.
@@ -2183,21 +2184,38 @@ each 1–64 bytes of lowercase ASCII letters or hyphens. Unknown fields are refu
 This is brief guidance and wait classification, not a grant of mutation authority;
 existing dispatch, write and release caps are unchanged.
 
-With `operatorAsk` set, work on our own infrastructure, harness work, waits on
+The concrete failure `operatorAsk.harness` prevents is automatically releasing
+unrelated waits merely because a repository shares `dispatchRepo`'s owner.
+Without this explicit opt-in, even a configured `operatorAsk` delegates no work.
+The required fields of `harness` are:
+
+- `repositories`: an explicit allowlist of 1–50 repository identities, distinct
+  ignoring ASCII case. Listing one does not add it to `workRepositories`.
+- `excludedLabels`: at most 32 labels, distinct ignoring ASCII case (an empty
+  list is allowed). Each is nonblank, at most 50 bytes and contains no controls.
+- `foreignTargetLabelPrefix`: a nonblank prefix, at most 50 bytes without
+  controls. A label with this prefix and a nonempty suffix naming another owner
+  than the issue repository's owner excludes the issue. Prefix and owner match
+  ignoring ASCII case; the dispatch repository's owner is irrelevant.
+- `replanText`: nonblank guidance of at most 4,000 characters. It starts the
+  replan comment and identifies that replan for the existing once-then-backoff
+  behavior. Changing it can start a new replan streak.
+
+With `operatorAsk.harness` set, delegated harness work waits on
 the operator only for the caller's domains (agent-board#778, #787, first policy
 moved under #788). A harness repository
-is a work repository of `dispatchRepo`'s owner that is neither in
+is an allowlisted work repository that is neither in
 `pr.noMerge` nor a midstream fork stage 2 read (none where `midstream` is set
-and its read failed); an issue there is harness work unless it is labelled
-one of `operator-action`, `decision`, `question` or `review-draft`, or
-`target:ORG` for another organization than `dispatchRepo`'s. On harness work
+and its read failed). All labels must have been read, with none matching
+`excludedLabels` or the foreign-target rule. The example retains
+`operator-action`, `decision`, `question`, `review-draft` and `target:`;
+these conventions are not defaults in the binary. On harness work
 the triage brief adds the configured text, and says that an operator-domain
 decision is answered `needs-operator` with `"operator"` in the same JSON
 block, one of the configured domains. A `needs-operator` or
 `needs-design` verdict without one, as a follow-up or an earlier verdict,
 labels and assigns nothing: the issue is triaged again at once, its plan
-starting `The board pass asks a triage run to plan this issue again: it is
-our own infrastructure, not an operator decision.`, and a verdict on such a
+starting with `replanText`, and a verdict on such a
 plan waits as `partly` does, sharing its doubling wait (`…, harness work held
 for no one; triaged again from …`). `done` and `obsolete`, a close for the
 operator to confirm, and a verdict naming its domain, are asked as before.
@@ -2205,7 +2223,10 @@ operator to confirm, and a verdict naming its domain, are asked as before.
 For [tracker#1445](https://github.com/cgwalters-forge/tracker/issues/1445), set
 `cgwalters-forge/tracker`'s `.github/pass.json` key `operatorAsk` to the object in
 [`fixtures/operator-ask.json`](../fixtures/operator-ask.json), after bumping its
-agent-board pin. The value asks only about big-picture architecture for our own
+agent-board pin to a release containing the harness-policy extraction. The caller
+must review `operatorAsk.harness.repositories` as its explicit delegation list;
+the example does not automatically include other same-owner repositories.
+The value asks only about big-picture architecture for our own
 infrastructure, plus the unchanged posture list: upstream posting (`upstream`),
 midstream promotion (`promotion`), credentials (`credentials`), broker policy
 (`broker`), rulesets and bypasses (`ruleset`), spending caps (`budget`), security
@@ -2216,7 +2237,7 @@ no tracker config or pin is changed in this repository.
 
 ### Prompt and policy migration audit
 
-Audit for agent-board#788 after #802, by runtime string family (test fixtures
+Audit for agent-board#788 after operator-ask and harness extraction, by runtime string family (test fixtures
 and historical comments are not shipped guidance). Paths below are relative to
 `crates/board-forge/src/`. The remaining families are candidates for later slices,
 not migrated by this change:
@@ -2226,7 +2247,7 @@ not migrated by this change:
 | `pass.rs`: former `HARNESS_ASK` and `OPERATOR_DOMAINS` | Moved in #802 to optional `operatorAsk.text` and `.domains`; absent means no harness delegation. |
 | `pass.rs`: former `MECHANICAL` and the verdict's “never done or needs-operator” instruction | Mechanical escalation and trailer policy now live only in the caller example's `operatorAsk.text`; neutral defaults retain verdict meanings, not that policy. |
 | `pass/wait.rs`: `RELEASE_TEXT` | Removed the compiled credentials/budget/ruleset/upstream/bounds list; the receipt now describes the configured policy decision without inventing its domains. |
-| `pass.rs`: `HARNESS`, `OPERATOR_LABELS`, `TARGET_LABEL_PREFIX`, `harness_item` | Remaining harness classification and replanning policy; make scope caller-owned together, not prose alone. `operatorAsk` gates it today. |
+| `pass.rs`: former `HARNESS`, `OPERATOR_LABELS`, `TARGET_LABEL_PREFIX`, same-owner classification | Moved to optional `operatorAsk.harness`: `replanText`, `excludedLabels`, `foreignTargetLabelPrefix` and explicit `repositories`. No delegation without it; complete-label, work-scope, noMerge and verified-midstream checks remain enforced. |
 | `pass.rs`: `PROMOTED`, `NO_UPSTREAM_COMMENT`, `verdict_ask` | Promoted-work routing and upstream-silence policy remain behind `fixPlans`. Move wording together with the checked fix-plan contract, never remove its bounds as a prose-only migration. |
 | `pass.rs`: `verdict_ask` active-work and follow-up-issue instructions | Routing guidance remains coupled to `skipActiveWork` and the verdict/plan protocol. Separate caller preference from required output shape. |
 | `pass/epics.rs`, `pass/forgejo/epics.rs`: planning tasks | Planning procedure, repository scope, operator-comment precedence and epic-edit restrictions remain duplicated. Repository planning norms should move to repository guidance; authenticated scope stays enforced. |

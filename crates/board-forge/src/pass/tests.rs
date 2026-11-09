@@ -7069,7 +7069,7 @@ fn assign_holds_wait_on_the_operator() {
 /// agent-board#778: on harness work (tracker is a work repository of
 /// dispatchRepo's owner), an asking verdict does not wait on the operator
 /// unless it names an operator-domain decision or the issue carries an
-/// operator label: it is triaged again, once, with [`HARNESS`] first. The
+/// operator label: it is triaged again, once, with caller replan text first. The
 /// bot's standing assignment, or a `needs-human` label, is released with
 /// one comment and the issue planned, and an assignment the bot took off
 /// itself is not put back. Each case: the verdict's JSON, the assignment
@@ -7261,8 +7261,11 @@ fn harness_work_is_planned_rather_than_held() {
         if again {
             let plan = (comments.iter().rev()).find(|c| c.contains(PLAN_FENCE));
             let plan = plan.unwrap();
-            assert!(plan.starts_with(HARNESS), "{name}: {plan}");
             let ask = tracker_operator_ask();
+            assert!(
+                plan.starts_with(ask["harness"]["replanText"].as_str().unwrap()),
+                "{name}: {plan}"
+            );
             // The whole caller policy, not just its opening phrase.
             assert!(
                 plan_brief(plan).contains(ask["text"].as_str().unwrap()),
@@ -7292,6 +7295,151 @@ fn harness_work_is_planned_rather_than_held() {
 
 fn tracker_operator_ask() -> Value {
     serde_json::from_str(include_str!("../../../../fixtures/operator-ask.json")).unwrap()
+}
+
+#[test]
+fn harness_policy_requires_delegation_and_complete_evidence() {
+    for (name, label, delegated) in [
+        ("configured", "needs-human", true),
+        ("absent policy", "needs-human", false),
+        ("absent harness", "needs-human", false),
+        ("not allowed", "needs-human", false),
+        ("another owner", "needs-human", true),
+        ("excluded mixed case", "DeCiSiOn", false),
+        ("custom exclusion", "CaLlEr-HoLd", false),
+        ("foreign target", "TaRgEt:other", false),
+        ("own target", "TaRgEt:CGWALTERS-FORGE", true),
+        ("custom target", "UpStReAm:other", false),
+        ("incomplete labels", "needs-human", false),
+        ("unread midstreams", "needs-human", false),
+        ("verified midstream", "needs-human", false),
+        ("noMerge", "needs-human", false),
+    ] {
+        let mut settings = json!({"triageFollowUpDays":3, "assignHolds":true,
+            "operatorAsk":tracker_operator_ask()});
+        let harness = &mut settings["operatorAsk"]["harness"];
+        harness["replanText"] = json!("Caller asks for a new plan.");
+        match name {
+            "absent policy" => {
+                settings.as_object_mut().unwrap().remove("operatorAsk");
+            }
+            "absent harness" => {
+                settings["operatorAsk"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("harness");
+            }
+            "not allowed" => harness["repositories"] = json!(["cgwalters-forge/elsewhere"]),
+            "custom exclusion" => harness["excludedLabels"] = json!(["caller-hold"]),
+            "custom target" => harness["foreignTargetLabelPrefix"] = json!("upstream:"),
+            _ => {}
+        }
+        let mut config = config(settings);
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        assert_eq!(apply(&forge, &config).failures, 0, "{name}");
+        answered(
+            &forge,
+            ("cgwalters-bot", None),
+            &format!("```{TRIAGE_FENCE}\n{{\"verdict\":\"needs-operator\"}}\n```"),
+            0,
+        );
+        assignments(
+            &mut forge.replay,
+            446,
+            &[("AssignedEvent", "cgwalters-bot", 1)],
+            &["cgwalters"],
+        );
+        board_labelled(&mut forge.replay, label);
+        if name == "incomplete labels" {
+            for entry in &mut forge.replay.requests {
+                for node in entry["answer"]
+                    .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    node["content"]["labels"]["totalCount"] = json!(999);
+                }
+            }
+        }
+        if matches!(name, "unread midstreams" | "verified midstream") {
+            config.midstream = Some(midstream::Midstream {
+                owner: "cgwalters-forge".into(),
+                topic: "bot-midstream".into(),
+            });
+            if name == "verified midstream" {
+                forge.replay.requests.push(json!({"request":{"get":format!("{API_ROOT}orgs/cgwalters-forge/repos?per_page=100")},
+                    "answer":{"status":200,"body":[{"full_name":"cgwalters-forge/tracker","topics":["bot-midstream"]}]}}));
+            }
+        }
+        if name == "noMerge" {
+            config
+                .pr
+                .poll
+                .no_merge
+                .push("cgwalters-forge/tracker".into());
+        }
+        if name == "another owner" {
+            // Preview needs no workflow-run identity in the other dispatch repository.
+            config.dispatch_repo = "another/controller".into();
+            let requests: Vec<Value> = forge
+                .replay
+                .requests
+                .iter()
+                .map(|entry| {
+                    serde_json::from_str(&entry.to_string().replace(
+                        "repos/cgwalters-forge/tracker/actions/",
+                        "repos/another/controller/actions/",
+                    ))
+                    .unwrap()
+                })
+                .collect();
+            forge.replay.requests.extend(requests);
+            let report = block(run(
+                &forge,
+                &forge,
+                &config,
+                State::default(),
+                (Mode::Preview, Limits::default()),
+                forge.replay.now,
+            ))
+            .unwrap();
+            assert!(
+                report
+                    .lines
+                    .iter()
+                    .any(|l| l.contains("tracker#446") && l.contains("start triage")),
+                "{name}: {:?}",
+                report.lines
+            );
+            continue;
+        }
+        let before = forge.writes.borrow().len();
+        let report = apply(&forge, &config);
+        let writes = forge.writes.borrow();
+        let released = writes[before..].iter().any(|(method, _, body)| {
+            method == "POST" && text(body, "/body").starts_with(RELEASE_MARKER)
+        });
+        assert_eq!(released, delegated, "{name}: {:?}", report.lines);
+        if delegated {
+            assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+            let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+            assert!(
+                comments
+                    .iter()
+                    .any(|c| c.starts_with("Caller asks for a new plan.")),
+                "{name}: {comments:?}"
+            );
+        } else {
+            assert!(
+                !writes[before..]
+                    .iter()
+                    .any(|(_, url, _)| url.ends_with("/dispatches")),
+                "{name}"
+            );
+        }
+    }
 }
 
 fn plan_brief(body: &str) -> String {
@@ -7347,7 +7495,7 @@ fn operator_ask_policy_keeps_its_domains_and_defaults_to_no_delegation() {
         ] {
             assert_eq!(brief.contains(text), tracker_policy, "{name}: {brief}");
         }
-        if let Some(policy) = config.operator_ask.as_ref() {
+        if let Some(policy) = config.operator_ask.as_ref().filter(|p| p.harness.is_some()) {
             assert!(brief.contains(&policy.text), "{name}: {brief}");
             assert!(brief.contains(&format!("one of: {}.", policy.domains.join(", "))));
         } else {
@@ -7412,6 +7560,62 @@ fn operator_ask_policy_rejects_invalid_config() {
     let mut value = base;
     value["operatorAsk"] = boundary;
     assert!(Config::parse(&value.to_string()).is_ok());
+}
+
+#[test]
+fn harness_policy_rejects_invalid_config() {
+    let example = tracker_operator_ask();
+    for (key, value) in [
+        ("repositories", json!([])),
+        ("repositories", json!(["not-a-repository"])),
+        ("repositories", json!(["a/b", "A/B"])),
+        (
+            "repositories",
+            json!(vec!["a/b"; POLL_REPOSITORY_LIMIT + 1]),
+        ),
+        ("excludedLabels", json!([""])),
+        ("excludedLabels", json!(["decision", "DECISION"])),
+        ("excludedLabels", json!(["bad\nlabel"])),
+        (
+            "excludedLabels",
+            json!(["x".repeat(HARNESS_LABEL_BYTES + 1)]),
+        ),
+        ("excludedLabels", json!(vec!["a"; HARNESS_LABEL_LIMIT + 1])),
+        ("foreignTargetLabelPrefix", json!(" ")),
+        (
+            "foreignTargetLabelPrefix",
+            json!("x".repeat(HARNESS_LABEL_BYTES + 1)),
+        ),
+        ("foreignTargetLabelPrefix", json!("target:\n")),
+        ("replanText", json!(" ")),
+        ("replanText", json!("x".repeat(OPERATOR_POLICY_CHARS + 1))),
+        ("unknown", json!(true)),
+    ] {
+        let mut base: Value = serde_json::from_str(CONFIG).unwrap();
+        base["operatorAsk"] = example.clone();
+        base["operatorAsk"]["harness"][key] = value;
+        assert!(
+            Config::parse(&base.to_string()).is_err(),
+            "accepted {key}: {base}"
+        );
+    }
+    for key in [
+        "repositories",
+        "excludedLabels",
+        "foreignTargetLabelPrefix",
+        "replanText",
+    ] {
+        let mut base: Value = serde_json::from_str(CONFIG).unwrap();
+        base["operatorAsk"] = example.clone();
+        base["operatorAsk"]["harness"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(
+            Config::parse(&base.to_string()).is_err(),
+            "accepted missing {key}"
+        );
+    }
 }
 
 /// Before a first triage, the bot's earlier verdict with nothing after it
