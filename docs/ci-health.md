@@ -25,8 +25,9 @@ draft PRs, but not `pull_request_target`, merge queues, dispatches or schedules.
 Pushes to other branches are excluded. The populations are never pooled.
 
 Each population counts distinct run IDs (`runs`), `expected_attempts` from listed
-run_attempt values and successfully read `attempts`. Every attempt 1..run_attempt
-is read separately; successful reruns cannot erase `first_attempt_failed` or
+run_attempt values and successfully read `attempts`. The latest attempt is
+observed from each validated listing record; earlier attempts are read separately.
+Successful reruns cannot erase an observed `first_attempt_failed` or
 their log evidence. Attempts are deduplicated by run ID and attempt; duplicate
 run IDs in pagination are a coverage error, not extra observations.
 
@@ -46,8 +47,9 @@ JSON is the default stable interface: `schema: agent-board/ci-health/v1`, UTC
 `since`/`until`, `complete`, `targets`, `groups`, `bounds`, and `decoded_bytes`.
 Before using rates, consumers must check `complete` at both the report and
 target levels and display `warnings`. Each target contains its configured `target`,
-`listing_complete`, `populations`, `complete`, and `warnings`. A failed history
-listing is discarded, not represented as a successful empty census. No eligible
+`listing_complete`, `populations`, `complete`, and `warnings`. Validated records
+from partial history listings are retained, with `listing_complete: false` and
+a warning; they are not a complete census. No eligible
 history is explicitly warned and incomplete. Unavailable repositories, changing
 page totals, truncated listings, missing attempts, expired/unavailable logs and
 failed jobs without a meaningful error all make coverage incomplete. Partial
@@ -87,6 +89,25 @@ The command disables transport backoff retries. Byte accounting is after decodin
 not a wire-byte meter; the last bounded response may exceed the aggregate limit
 and is then refused. These limits can leave a busy 30-day window incomplete.
 Do not claim full coverage based on a live sample or a shorter history.
+
+The same busy-target threat also includes starvation: deep history or logs for
+one target must not consume every later target's allocation. Metadata is read
+first, then history listings advance one page per target per round, before any
+earlier-attempt/job/log enrichment. Reads use repository/workflow sort order,
+independent of config order; reports retain config target order. Every target
+gets `floor(500 / target_count)` operations and
+`floor(32 MiB / target_count)` decoded bytes across both phases. Enrichment gets
+an equal share of the remaining collection time per target, checked before each
+operation, still under the global deadline. Unused shares are not redistributed.
+Log download limits shrink to the remaining target/global byte allocation;
+allocation-truncated logs cannot supply signatures. The last bounded JSON
+response can cross a target's byte allocation and is refused; it still charges
+the global aggregate. An in-flight request can overrun a time
+share, so fairness is finite-budget allocation, not guaranteed coverage under
+slow responses or global exhaustion. Missing enrichment is warned even when
+all latest attempts were observed. No batching, target rotation, extra collection
+or raised bound is used. This remains the existing opt-in command, not a new
+scheduled or enabled-by-default mechanism.
 
 Daily reporting is a separate caller integration in `cgwalters-forge/tracker`;
 this command neither schedules collection nor publishes reports. Consumers use

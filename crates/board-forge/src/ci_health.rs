@@ -185,24 +185,51 @@ fn failed(value: &Value) -> bool {
 struct Reader<'a> {
     api: &'a dyn Api,
     bytes: Cell<usize>,
+    aggregate_bytes: &'a Cell<usize>,
+    byte_limit: usize,
+    deadline: Cell<i64>,
+    clock: &'a dyn Fn() -> i64,
+    operations: Cell<u32>,
+    operation_limit: u32,
 }
 
 impl Reader<'_> {
     fn charge(&self, bytes: usize) -> Result<()> {
         let total = self.bytes.get().saturating_add(bytes);
         self.bytes.set(total);
-        ensure!(total <= TOTAL_BYTES, "aggregate byte budget exhausted");
+        let aggregate = self.aggregate_bytes.get().saturating_add(bytes);
+        self.aggregate_bytes.set(aggregate);
+        ensure!(aggregate <= TOTAL_BYTES, "aggregate byte budget exhausted");
+        ensure!(total <= self.byte_limit, "target byte allocation exhausted");
         Ok(())
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        ensure!(
-            self.bytes.get() < TOTAL_BYTES,
-            "aggregate byte budget exhausted"
-        );
+        self.available()?;
+        self.operations.set(self.operations.get() + 1);
         let value = self.api.get(path)?;
         self.charge(serde_json::to_vec(&value)?.len())?;
         Ok(value)
+    }
+
+    fn available(&self) -> Result<()> {
+        ensure!(
+            self.operations.get() < self.operation_limit,
+            "target request allocation exhausted"
+        );
+        ensure!(
+            self.aggregate_bytes.get() < TOTAL_BYTES,
+            "aggregate byte budget exhausted"
+        );
+        ensure!(
+            self.bytes.get() < self.byte_limit,
+            "target byte allocation exhausted"
+        );
+        ensure!(
+            (self.clock)() < self.deadline.get(),
+            "target time allocation exhausted"
+        );
+        Ok(())
     }
 
     fn pages(&self, path: &str, key: &str) -> Result<Vec<Value>> {
@@ -292,15 +319,21 @@ fn groups_for(
         observed = true;
         let job_id = job["id"].as_u64().context("job id")?;
         ensure!(seen.insert(job_id), "duplicate job id in pages");
-        ensure!(
-            reader.bytes.get() < TOTAL_BYTES,
-            "aggregate byte budget exhausted"
-        );
+        reader.available()?;
+        reader.operations.set(reader.operations.get() + 1);
+        // A full-size log near the end of a share would predictably spend
+        // another target's bytes. A share-truncated log is not signature evidence.
+        let limit = LOG_BYTES
+            .min((reader.byte_limit - reader.bytes.get()) as u64)
+            .min((TOTAL_BYTES - reader.aggregate_bytes.get()) as u64);
         let log = reader
             .api
-            .download(&format!("{root}/actions/jobs/{job_id}/logs"), LOG_BYTES)?;
+            .download(&format!("{root}/actions/jobs/{job_id}/logs"), limit)?;
         reader.charge(log.len())?;
-        ensure!(log.len() < LOG_BYTES as usize, "possibly truncated log");
+        ensure!(
+            log.len() < limit as usize,
+            "possibly truncated log (log bound or byte allocation)"
+        );
         let (test, error) =
             first_error(std::str::from_utf8(&log)?).context("no meaningful first error in log")?;
         let name = job["name"].as_str().context("job name")?;
@@ -334,6 +367,87 @@ fn groups_for(
     Ok(())
 }
 
+struct History {
+    branch: Option<String>,
+    total: Option<usize>,
+    listed: usize,
+    stopped: bool,
+    listing_complete: bool,
+    seen: BTreeSet<u64>,
+    runs: Vec<(Value, &'static str, u64)>,
+    populations: BTreeMap<&'static str, Counts>,
+    warnings: Vec<String>,
+}
+
+impl History {
+    fn new() -> Self {
+        Self {
+            branch: None,
+            total: None,
+            listed: 0,
+            stopped: false,
+            listing_complete: false,
+            seen: BTreeSet::new(),
+            runs: vec![],
+            populations: BTreeMap::from([
+                ("default_push", Counts::default()),
+                ("pull_request", Counts::default()),
+            ]),
+            warnings: vec![],
+        }
+    }
+
+    fn page(&mut self, value: Value, since: i64, until: i64) -> Result<()> {
+        let total = value["total_count"]
+            .as_u64()
+            .context("missing total_count")? as usize;
+        ensure!(
+            self.total.is_none_or(|n| n == total),
+            "pagination changed while reading"
+        );
+        self.total = Some(total);
+        let items = value["workflow_runs"]
+            .as_array()
+            .context("missing page items")?;
+        ensure!(items.len() <= 100, "oversized page");
+        ensure!(self.listed + items.len() <= total, "incomplete pages");
+        for run in items {
+            let at = millis(&run["created_at"]).context("run created_at")?;
+            if at < since || at >= until {
+                continue;
+            }
+            let population = match run["event"].as_str() {
+                Some("push") if run["head_branch"].as_str() == self.branch.as_deref() => {
+                    "default_push"
+                }
+                Some("pull_request") => "pull_request",
+                _ => continue,
+            };
+            let id = run["id"].as_u64().context("run id")?;
+            ensure!(self.seen.insert(id), "duplicate run id in pages");
+            let attempts = run["run_attempt"].as_u64().context("run_attempt")?;
+            ensure!(
+                (1..=100).contains(&attempts),
+                "invalid or excessive attempt count"
+            );
+            let counts = self.populations.get_mut(population).context("population")?;
+            counts.runs += 1;
+            counts.expected_attempts += attempts as usize;
+            // The listing itself observes the latest attempt, even if enrichment
+            // later runs out of allocation. Never count it again during enrichment.
+            counts.observe(run, attempts);
+            self.runs.push((run.clone(), population, attempts));
+        }
+        self.listed += items.len();
+        self.listing_complete = self.listed == total;
+        ensure!(
+            self.listing_complete || !items.is_empty(),
+            "incomplete pages"
+        );
+        Ok(())
+    }
+}
+
 /// `until` is exclusive UTC midnight; use an injected clock for bounded reads.
 pub fn collect(api: &dyn Api, config: &Config, until: i64, clock: &dyn Fn() -> i64) -> Value {
     let limits = Limits {
@@ -341,61 +455,101 @@ pub fn collect(api: &dyn Api, config: &Config, until: i64, clock: &dyn Fn() -> i
         collection_timeout_seconds: SECONDS,
         ..Limits::default()
     };
+    let started = clock();
     let bounded = Bounded::new(api, &limits, clock);
-    let reader = Reader {
-        api: &bounded,
-        bytes: Cell::new(0),
-    };
+    // A busy target must not spend another target's API/decoded-byte share.
+    // Unused shares are not redistributed: the allocation is independent of
+    // config order and unavailable targets, not a promise of complete coverage.
+    let count = config.targets.len();
+    let aggregate_bytes = Cell::new(0);
+    let readers: Vec<_> = (0..count)
+        .map(|_| Reader {
+            api: &bounded,
+            bytes: Cell::new(0),
+            aggregate_bytes: &aggregate_bytes,
+            byte_limit: TOTAL_BYTES / count,
+            deadline: Cell::new(i64::MAX),
+            clock,
+            operations: Cell::new(0),
+            operation_limit: REQUESTS / count as u32,
+        })
+        .collect();
     let since = until - 30 * DAY;
     let mut targets = vec![];
     let mut groups = BTreeMap::new();
-    for target in &config.targets {
-        let mut populations = BTreeMap::from([
-            ("default_push", Counts::default()),
-            ("pull_request", Counts::default()),
-        ]);
-        let mut warnings = vec![];
-        let mut listing_complete = false;
-        let result = (|| -> Result<()> {
-            let root = format!("/repos/{}", target.repository);
-            let metadata = reader.get(&root)?;
-            let branch = metadata["default_branch"]
-                .as_str()
-                .context("default branch unavailable")?;
-            // A date-only inclusive API range is filtered again to [since, until).
+    let mut histories: Vec<_> = (0..count).map(|_| History::new()).collect();
+    let mut order: Vec<_> = (0..count).collect();
+    order.sort_by_key(|&i| (&config.targets[i].repository, &config.targets[i].workflow));
+    for &i in &order {
+        let result = readers[i]
+            .get(&format!("/repos/{}", config.targets[i].repository))
+            .and_then(|v| {
+                v["default_branch"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("default branch unavailable")
+            });
+        match result {
+            Ok(branch) => histories[i].branch = Some(branch),
+            Err(error) => {
+                histories[i].stopped = true;
+                histories[i]
+                    .warnings
+                    .push(format!("history unavailable/incomplete: {error}"));
+            }
+        }
+    }
+    // One history page per target per round, before any attempt/job/log reads.
+    for page in 1..=PAGES {
+        for &i in &order {
+            let history = &mut histories[i];
+            if history.stopped || history.listing_complete {
+                continue;
+            }
+            let target = &config.targets[i];
             let path = format!(
-                "{root}/actions/workflows/{}/runs?created={}..{}",
+                "/repos/{}/actions/workflows/{}/runs?created={}..{}&per_page=100&page={page}",
+                target.repository,
                 target.workflow,
                 &iso(since)[..10],
                 &iso(until)[..10]
             );
-            let runs = reader.pages(&path, "workflow_runs")?;
-            listing_complete = true;
-            let mut seen = BTreeSet::new();
-            for run in runs {
-                let at = millis(&run["created_at"]).context("run created_at")?;
-                if at < since || at >= until {
-                    continue;
-                }
-                let population = match run["event"].as_str() {
-                    Some("push") if run["head_branch"] == branch => "default_push",
-                    Some("pull_request") => "pull_request",
-                    _ => continue,
-                };
+            let result = readers[i]
+                .get(&path)
+                .and_then(|v| history.page(v, since, until));
+            if let Err(error) = result {
+                history.stopped = true;
+                history
+                    .warnings
+                    .push(format!("history unavailable/incomplete: {error}"));
+            } else if page == PAGES && !history.listing_complete {
+                history.warnings.push("history unavailable/incomplete: pagination limit reached (at most 1000 records)".into());
+            }
+        }
+    }
+    // Each target also gets an equal share of the remaining wall-clock window.
+    // The global deadline still applies; an in-flight request may overrun either.
+    let enrichment_ms = (SECONDS as i64 * 1000 - (clock() - started)).max(0) / count as i64;
+    for &i in &order {
+        let target = &config.targets[i];
+        let reader = &readers[i];
+        reader.deadline.set(clock().saturating_add(enrichment_ms));
+        let history = &mut histories[i];
+        history.runs.sort_by_key(|(run, _, _)| run["id"].as_u64());
+        let result = (|| -> Result<()> {
+            let root = format!("/repos/{}", target.repository);
+            for (run, population, attempts) in &history.runs {
                 let id = run["id"].as_u64().context("run id")?;
-                if !seen.insert(id) {
-                    anyhow::bail!("duplicate run id in pages");
-                }
-                let counts = populations.get_mut(population).context("population")?;
-                counts.runs += 1;
-                let attempts = run["run_attempt"].as_u64().context("run_attempt")?;
-                ensure!(
-                    (1..=100).contains(&attempts),
-                    "invalid or excessive attempt count"
-                );
-                counts.expected_attempts += attempts as usize;
-                for attempt in 1..=attempts {
-                    let observed = if attempt == attempts {
+                let counts = history
+                    .populations
+                    .get_mut(population)
+                    .context("population")?;
+                for attempt in 1..=*attempts {
+                    if attempt == *attempts && !failed(run) {
+                        continue;
+                    }
+                    reader.available()?;
+                    let observed = if attempt == *attempts {
                         Ok(run.clone())
                     } else {
                         reader.get(&format!("{root}/actions/runs/{id}/attempts/{attempt}"))
@@ -407,10 +561,12 @@ pub fn collect(api: &dyn Api, config: &Config, until: i64, clock: &dyn Fn() -> i
                                 && observed["run_attempt"].as_u64() == Some(attempt),
                             "attempt identity mismatch"
                         );
-                        counts.observe(&observed, attempt);
+                        if attempt != *attempts {
+                            counts.observe(&observed, attempt);
+                        }
                         if failed(&observed) {
                             groups_for(
-                                &reader,
+                                reader,
                                 &root,
                                 &target.repository,
                                 &observed,
@@ -421,19 +577,26 @@ pub fn collect(api: &dyn Api, config: &Config, until: i64, clock: &dyn Fn() -> i
                         Ok(())
                     })();
                     if let Err(error) = result {
-                        warnings.push(format!("run {id} attempt {attempt}: {error}"));
+                        history
+                            .warnings
+                            .push(format!("run {id} attempt {attempt}: {error}"));
                     }
                 }
             }
             Ok(())
         })();
         if let Err(error) = result {
-            warnings.push(format!("history unavailable/incomplete: {error}"));
+            history
+                .warnings
+                .push(format!("enrichment unavailable/incomplete: {error}"));
         }
-        if populations.values().all(|p| p.runs == 0) {
+    }
+    for (target, history) in config.targets.iter().zip(histories) {
+        let mut warnings = history.warnings;
+        if history.populations.values().all(|p| p.runs == 0) {
             warnings.push("no eligible history observed".into());
         }
-        targets.push(json!({"target":target,"listing_complete":listing_complete,"complete":warnings.is_empty(),"warnings":warnings,"populations":populations}));
+        targets.push(json!({"target":target,"listing_complete":history.listing_complete,"complete":warnings.is_empty(),"warnings":warnings,"populations":history.populations}));
     }
     let groups: Vec<Value> = groups.into_values().map(|group| {
         let entry = config.index.get(&group.signature);
@@ -448,7 +611,7 @@ pub fn collect(api: &dyn Api, config: &Config, until: i64, clock: &dyn Fn() -> i
         json!({"observation":group,"classification":entry,"class":entry.map_or("unknown", |e| e.class.as_str()),"findings":findings})
     }).collect();
     json!({"schema":"agent-board/ci-health/v1","since":iso(since),"until":iso(until),"complete":targets.iter().all(|t| t["complete"] == true),"targets":targets,"groups":groups,
-        "bounds":{"api_operations":REQUESTS,"collection_seconds":SECONDS,"pages_per_listing":PAGES,"log_bytes":LOG_BYTES,"aggregate_decoded_bytes":TOTAL_BYTES},"decoded_bytes":reader.bytes.get()})
+        "bounds":{"api_operations":REQUESTS,"collection_seconds":SECONDS,"pages_per_listing":PAGES,"log_bytes":LOG_BYTES,"aggregate_decoded_bytes":TOTAL_BYTES},"decoded_bytes":aggregate_bytes.get()})
 }
 
 pub fn human(report: &Value) -> String {
