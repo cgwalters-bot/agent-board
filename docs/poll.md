@@ -362,7 +362,9 @@ configuration`, decides nothing there, and goes on.
 The file's top level also takes the keys of the pass's
 [`pr`](pass.md) that change what the poll decides, read by the same code with
 the same names, types, defaults, bounds and meaning, so one `pr` block gives one
-policy either way: `checkReruns`, `unstall`, `ownerBranches`, `ownSpaceOnly`,
+policy either way: `checkReruns`, `unstall`, `directionFirst` (`operatorComments`
+and `notifications` read before the followed repositories rather than after
+them), `ownerBranches`, `ownSpaceOnly`,
 `foldRounds`, `reviewPools`, `reviewDispatchRepositories`,
 `draftReviewRepositories`, `headOwners`, `noMerge`, `operatorPaths` and
 `staleDays`, besides `mergeAuthors`, `toilFixPool`, `conflictFixPool`,

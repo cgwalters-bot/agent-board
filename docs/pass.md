@@ -103,6 +103,21 @@ reports completion.
 Search is still not a complete inventory: lag beyond the overlap, or within
 such a skipped overlap, can hide direction.
 
+The intake reads within stage 2's request share, after the followed
+repositories' activity and pull requests by default. Where those spend the
+share, it is an `operator comments deferred:` line, and a pass that does so
+every time never answers: the operator's question on a draft the poll had
+stopped following (cgwalters-forge/composefs-rs#54) waited a day that way
+(agent-board#840). `pr.directionFirst: true` (off by default) runs the
+intake's search first, before those reads, within the same share and the
+same bounds; the walk then takes what is left, and the share cursor carries
+what it does not reach to the next pass as before. The trade-off is the
+mirror image: an intake with many waiting threads to retry can leave the
+walk too little to reach a repository, a `pull requests: the stage's request
+share is spent` line, until those threads settle. The intake's starts come
+before the walk's within the poll's three a pass. `operatorAnswers` on a
+followed pull request is still read in the walk.
+
 One thread's error is a `warning:` line, never a failure of the pass. A write
 GitHub will always refuse (HTTP 404 or 410, such as an issue in a repository
 whose issues are disabled) leaves the direction it was for to a person, the
@@ -4366,6 +4381,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `pr.foldRounds` | Minimize as outdated the bot's routine marker each new round, refund, check rerun or review start supersedes, at the end of the pass, so a pull request shows its current round with the earlier ones folded; stops are never folded; at most 20 a pass, one `--max-writes` step; see [the poll](poll.md); `false` |
 | `pr.checkReruns` | Only pre-fix failed-check retries and recovery waits ([reruns](#reruns)); one retry per head/check, no agent/review recovery or stacked-retarget updates; `false` |
 | `pr.unstall` | Keep followed pull requests from waiting unseen, see [unstall](#unstall); needs every `workRepositories` entry in `follow`; `false` |
+| `pr.directionFirst` | Run the intake's search (a standalone poll's `operatorComments` and `notifications`) before the followed repositories' reads, so that they cannot spend stage 2's share first, at the walk's expense, see [the intake](#github-operator-direction-intake); `false` |
 | `pr.mergeQueue.tries` | Opt into existing merge-queue path with bounded attempts, 1–5; section absent/off, present default `3` |
 | `pr.staleDays` | Act on a stopped bot pull request the operator left alone this many days, 0–30, see below; a bot pull request not updated this long is no longer In Progress (stage 5); `0` (off) |
 | `promote.forks` | Map of each fork repository (`OWNER/REPO`) to `{"upstream": "OWNER/REPO", "base": "BRANCH"}`, shared by standalone `promote` and the read-only pass view; destination comes from here, never a PR body; a fork is named once ignoring case, is not its own upstream, and may also be in `follow` only under the midstream owner with topic membership verified in stage 2; `base` non-empty; absent or `{}` means off with no forge reads |

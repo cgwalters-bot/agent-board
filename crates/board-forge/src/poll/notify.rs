@@ -1968,6 +1968,68 @@ mod tests {
         assert!(replies(&fake).is_empty());
     }
 
+    /// cgwalters-forge/composefs-rs#54 (agent-board#840): the operator asked
+    /// the bot on a draft the poll had stopped following, and the intake
+    /// found it every pass but ran after the followed repositories had spent
+    /// the stage's share. With `directionFirst` it runs before them and
+    /// starts a fix round on the stop; without, it is still deferred.
+    #[test]
+    fn direction_first_answers_a_stopped_draft_before_the_share_is_spent() {
+        let repo = "upstream/app";
+        let followed = "upstream/followed".to_owned();
+        for first in [false, true] {
+            let fake = intake_github(repo, true, "mention", OPERATOR);
+            let issue = format!("{API_ROOT}repos/{repo}/issues/2");
+            fake.rest.borrow_mut().get_mut(&issue).unwrap()["user"]["login"] = BOT.into();
+            let stop = json!({"rounds": 0, "sha": "abcdef0123456789", "stopped": true});
+            let thread = format!("{issue}/comments?per_page=100");
+            fake.rest.borrow_mut().get_mut(&thread).unwrap()[0]["body"] =
+                "@worker why did this commit lose its authorship?".into();
+            (fake
+                .rest
+                .borrow_mut()
+                .get_mut(&thread)
+                .unwrap()
+                .as_array_mut())
+            .unwrap()
+            .insert(
+                0,
+                json!({"id": 5, "user": {"login": BOT}, "created_at": "2026-10-15T08:00:00Z",
+                    "body": marker_body(&stop, "a draft with no checkpoint", &Footer::default())}),
+            );
+            fake.page(
+                &format!("repos/{repo}/pulls/2"),
+                json!({"head": {"sha": "abcdef0123456789"}, "labels": [], "draft": true}),
+            );
+            *fake.share_spent_at.borrow_mut() = Some(format!("repos/{followed}/"));
+            let mut config = search_intake(&fake, repo);
+            config.policy.direction_first = first;
+            let outcome = run_capped(
+                &fake,
+                &fake,
+                &config,
+                State::default(),
+                (&[], std::slice::from_ref(&followed)),
+                Some(Apply {
+                    dispatcher: &fake,
+                    workflow: "dispatch.yml".into(),
+                    pools: vec![],
+                    git_ref: None,
+                }),
+                None,
+                now(),
+            )
+            .unwrap();
+            let fixes: Vec<Value> = (dispatches(&fake).into_iter())
+                .filter(|i| i["kind"] == "fix" && i["item"] == "2")
+                .collect();
+            assert_eq!(fixes.len(), usize::from(first), "{:?}", outcome.lines);
+            let deferred =
+                (outcome.lines.iter()).any(|l| l.starts_with("operator comments deferred"));
+            assert_eq!(deferred, !first, "{:?}", outcome.lines);
+        }
+    }
+
     #[test]
     fn each_reason_and_sender_is_routed_once() {
         // The sender class: who commented, where, on what, and what the

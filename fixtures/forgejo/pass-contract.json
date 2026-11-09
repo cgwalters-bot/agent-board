@@ -265,6 +265,7 @@
     "pr.checkReruns": {"verdict": "refused", "reason": "PR check retries (stage 2) require GitHub checks and Actions runs"},
     "pr.ownerBranches": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.unstall": {"verdict": "refused", "reason": "PR follow-up (stage 2) reruns GitHub Actions review runs"},
+    "pr.directionFirst": {"verdict": "refused", "reason": "PR follow-up (stage 2) orders GitHub's operator-direction search"},
     "pr.ownSpaceOnly": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},
     "pr.foldRounds": {"verdict": "refused", "reason": "PR follow-up (stage 2) minimizes GitHub comments"},
     "pr.reviewPools": {"verdict": "refused", "reason": "PR follow-up (stage 2)"},

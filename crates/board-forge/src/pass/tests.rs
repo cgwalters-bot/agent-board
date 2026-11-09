@@ -13673,6 +13673,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
             p.rebase_rounds,
             p.check_reruns,
             p.unstall,
+            p.direction_first,
             p.owner_branches,
             p.own_space_only,
             p.fold_rounds,
@@ -13687,7 +13688,7 @@ fn pr_block_is_one_policy_for_pass_and_poll() {
     };
     let repo = "cgwalters-forge/bootc";
     let every = json!({
-        "checkReruns": true, "unstall": true, "ownerBranches": true,
+        "checkReruns": true, "unstall": true, "directionFirst": true, "ownerBranches": true,
         "ownSpaceOnly": true, "foldRounds": true, "reviewWorkflow": "review.yml",
         "reviewPools": ["claude"], "reviewDispatchRepositories": [repo],
         "draftReviewRepositories": [repo], "headOwners": ["cgwalters-forge"],
