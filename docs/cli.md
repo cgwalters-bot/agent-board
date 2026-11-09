@@ -941,6 +941,7 @@ agent-board supervise [OPTIONS] <COMMAND>
 
 Commands:
 
+- [`previous`](#agent-board-supervise-previous): Restore a verified previous report directory (read-only; GH_TOKEN Actions reads; explicit opt-in)
 - [`health`](#agent-board-supervise-health): Read the health observations and write the report (read-only; GH_TOKEN reads)
 - [`trigger`](#agent-board-supervise-trigger): Say whether the agent runs on this pass and print its inputs for $GITHUB_OUTPUT
 - [`execute`](#agent-board-supervise-execute): Perform the agent's validated dispatch requests and log them (writes with GH_TOKEN, the bot's)
@@ -950,6 +951,23 @@ Commands:
 - [`preview`](#agent-board-supervise-preview): Print the agent's result comment without applying it (GH_TOKEN reads)
 - [`session`](#agent-board-supervise-session): Print an operator session's wrapper inputs for $GITHUB_OUTPUT (GH_TOKEN reads)
 - [`restart`](#agent-board-supervise-restart): Start the poll workflow once when its chain has stopped, and tell the operator once if that does not take; off unless the supervisor's file sets restartPass (writes with GH_TOKEN, the bot's: actions on dispatchRepo, comments on the log issue)
+
+## agent-board supervise previous
+
+Restore a verified previous report directory (read-only; GH_TOKEN Actions reads; explicit opt-in)
+
+```text
+agent-board supervise previous [OPTIONS] --repository <REPOSITORY> --workflow <WORKFLOW> --artifact <ARTIFACT> --branch <BRANCH> --event <EVENT> --destination <DIR>
+```
+
+Options:
+
+- `--repository <REPOSITORY>`: Repository OWNER/REPO holding the artifact and its run
+- `--workflow <WORKFLOW>`: Full workflow path, such as .github/workflows/health.yml
+- `--artifact <ARTIFACT>`: Exact artifact name
+- `--branch <BRANCH>`: Expected default branch (without refs/heads/)
+- `--event <EVENT>`: Allowed run event; repeat for each event (at least one required)
+- `--destination <DIR>`: Fresh output directory; parent must already exist
 
 ## agent-board supervise health
 

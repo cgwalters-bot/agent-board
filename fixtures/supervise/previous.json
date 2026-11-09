@@ -1,0 +1,18 @@
+{
+  "/repos/example/control/actions/artifacts?name=health-report&per_page=10": {
+    "total_count": 3,
+    "artifacts": [
+      {"id": 101, "name": "health-report", "expired": false, "created_at": "2026-11-08T10:00:00Z", "size_in_bytes": 512, "workflow_run": {"id": 201}},
+      {"id": 103, "name": "health-report", "expired": true, "created_at": "2026-11-08T12:00:00Z", "size_in_bytes": 512, "workflow_run": {"id": 203}},
+      {"id": 102, "name": "health-report", "expired": false, "created_at": "2026-11-08T11:00:00Z", "size_in_bytes": 512, "workflow_run": {"id": 202}}
+    ]
+  },
+  "/repos/example/control/actions/runs/201": {
+    "id": 201, "path": ".github/workflows/health.yml", "head_branch": "default",
+    "repository": {"id": 42, "full_name": "example/control"}, "head_repository": {"id": 42}, "event": "schedule"
+  },
+  "/repos/example/control/actions/runs/202": {
+    "id": 202, "path": ".github/workflows/health.yml", "head_branch": "default",
+    "repository": {"id": 42, "full_name": "example/control"}, "head_repository": {"id": 42}, "event": "workflow_dispatch"
+  }
+}
