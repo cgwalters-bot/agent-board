@@ -1940,7 +1940,10 @@ repository's pull requests before it, so a share too small for every followed
 pull request leaves none out pass after pass. Stage 2's share, spent when it
 searches the bot's pull requests (`authored`), defers the stage to the next pass
 (`budget: pull requests stopped at its share; authored pull requests wait for
-the next pass`). Stage 3 defers the live epics it
+the next pass`). Spent when it reads the followed repositories' events, it
+defers the rest of them, keeping their last page (`activity: the stage's
+request share is spent at OWNER/REPO; M repositories' events wait for the next
+pass`). Stage 3 defers the live epics it
 has no share left for, its census included (`budget: epics stopped at its
 share`). A stage whose reads were refused by its share says so (`budget: STAGE
 stopped at its share`). None of these is a failure.
