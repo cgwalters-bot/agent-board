@@ -575,6 +575,65 @@ starts and reasons, counted in its `omitted`, then the last runs in flight,
 counted in the view's. Only where even that leaves no room is it left out
 whole. The pass's line says `holds: published URL, with the pass view`.
 
+#### Epic focus
+
+With `holds.epicFocus: true` (off by default; needs `epics` and a GitHub
+board; agent-board#813), the snapshot also has `epic_focus`, what review's
+Focus view (review#298) reads: a card for each open epic of
+`epics.repository` whose board Priority is `P0`. The
+[fixture](../fixtures/epic-focus.json) is the consumer contract; its test
+builds it from mixed blocked, moving and done children, a child shared by
+two epics, and an epic the listing could not read.
+
+It is built from what the pass already read and adds no request: stage 3's
+listing of the epics and their sub-issues (with each issue's `title` and
+`updatedAt`, which the option adds to that listing's queries), the runs in
+flight and those the pass started, stage 2's pull request steps, stage 4's
+board read and the hold snapshot. It schedules nothing and is no authority
+for a write.
+
+A card has the epic's `item`, `url`, `title` and `goal` (the first sentence
+of its body's first paragraph), `changed_at` (the latest `updatedAt` of the
+epic and its sub-issues), `progress` (`done` of `total` children),
+`operator_blocked`, the epic's own `blocker`, its `runs` (the
+[pass view](#pass-view)'s run records, on the epic or a child, at most 8,
+the rest in `runs_omitted`) and `children`, open first, at most 50, the
+rest in `omitted` (progress and `operator_blocked` count them all). A
+child is a sub-issue, open or closed, or a task line of the body (`- [ ]`
+or `- [x]`, outside code and HTML blocks, at most 100) naming an item
+(`#N`, `OWNER/REPO#N` or its GitHub URL) or none. A task naming a
+sub-issue is that sub-issue (`source` `both`) and its state counts, not the
+box; tasks alike are one. A child is `done` once its sub-issue is closed,
+or, as a task alone, once ticked.
+
+An open child with a run is moving: its `blocker` is null. Otherwise its
+`blocker` is `{"type", "kind", "reason", "since", "pull"}`, its type the
+first that holds:
+
+- `operator`: a hold that waits on the operator; `reason` is its Why's
+  question where it has one;
+- `ci`: a `pr-open` hold whose pull request (`pull`) stage 2 decided on
+  with a failing check;
+- `review`: any other `pr-open` hold, a pull request waiting on review or
+  merge;
+- `hold`: any other hold of the pass, with its `kind` and `reason`;
+- `not-started`: stage 4 read it on the board this pass with nothing under
+  way (no hold, open dependency or open pull request that closes it) and no
+  run was listed on it: nothing is moving it now, not that nothing ever ran;
+- `unknown`: the pass has no fact about it, as for a task outside the
+  board, or wherever the runs or the board were not read.
+
+`kind`, `reason` (at most 240 characters), and `since` (when the snapshots
+first had the hold) come from the hold, null otherwise. Cards are ordered by
+`operator_blocked`, most first, then by `changed_at`, oldest first; at
+most 10 are listed, the rest counted in `omitted`. `sources` says which
+were read: `epics` is `partial` where an epic could not be read whole
+(counted in `unread_epics`, as its Priority is unknown) and `unread` where
+stage 3 did not list them; `runs` and `board` are `complete` or `unread`.
+`complete` is true only where all three are complete. `observed_at` alone is
+no change; past the snapshot's size the section goes whole before any
+other, and the line says `without the epic focus, over the comments' size`.
+
 With `holds.needsYou` set (off unless set; tracker#976), the snapshot also
 has `needs_you`, after `pass` and any `leases`: the ranked list of what waits
 on the operator, for review's needs-you view, so that review need not work
@@ -4114,6 +4173,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `holds.actNow` | Add the [Act now](#act-now-optional-v2-extension) shortlist to the needs-you list; needs `holds.needsYou` and `holds.approvalEvidence`, GitHub only; `false` |
 | `holds.passView` | Add the [pass view](#pass-view) (`agent-board/pass-view/v1`): the last passes, pool pace and runs in flight; needs `holds`, GitHub only; `false` |
 | `holds.today` | Add [today's activity](#today) (`agent-board/today/v1`): UTC-day changes and starts, yesterday's private cost; needs `holds`, GitHub only; `false` |
+| `holds.epicFocus` | Add the [epic focus](#epic-focus) (`agent-board/epic-focus/v1`): each open P0 epic's progress, runs and blockers; needs `holds` and `epics`, a GitHub board only; `false` |
 | `decisions.repository`, `decisions.issue` | Existing decisions document read only with `holds.needsYou`; GitHub only; absent (off) |
 | `direction.repository`, `direction.issue` | The issue whose body, the [operator's direction](#operator-direction), starts every brief the pass writes; a private repository the pass starts no run on; absent (off) |
 | `stall.holdHours`, `stall.idleHours` | Tune the [stall alarms](#stall-alarms), which are on wherever `holds` is: hours (1–168) the same stuck hold may stay on an epic or a P0 or P1 item, and hours (1–168) an applying pass with candidates may start, apply and merge nothing; needs `holds`; `6`, `4` |

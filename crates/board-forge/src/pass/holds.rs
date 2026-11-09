@@ -583,6 +583,10 @@ pub struct Snapshot {
     /// The pass view ([`super::view`]); absent unless `holds.passView`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass_view: Option<Value>,
+    /// The epic focus ([`super::focus`]); absent unless `holds.epicFocus`,
+    /// or where it did not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_focus: Option<Value>,
     pub schema: &'static str,
     /// The clock of the pass that wrote it.
     pub at: String,
@@ -654,7 +658,7 @@ pub fn question(why: &str) -> Option<String> {
     (!asked.is_empty()).then(|| asked.to_owned())
 }
 
-fn url(item: &ItemRef) -> String {
+pub(super) fn url(item: &ItemRef) -> String {
     // A Forgejo pass's host is its instance, scheme and path included.
     let base = match item.host.contains("://") {
         true => item.host.clone(),
@@ -739,6 +743,7 @@ pub fn snapshot(entries: &[Entry], at: String, (wip, mut pass): (Wip, PassSummar
     Snapshot {
         dispatchable_work: None,
         pass_view: None,
+        epic_focus: None,
         today: None,
         schema: HOLDS_SCHEMA,
         at,
@@ -2792,8 +2797,10 @@ pub fn changed(body: Option<&str>, snapshot: &Snapshot) -> Result<bool> {
         let due = due || super::view::due(s.get("pass_view"), now.get("pass_view"));
         // Observation time alone is not activity. Counts and UTC rollover are.
         for value in [&mut s, &mut now] {
-            if let Some(today) = value.get_mut("today").and_then(Value::as_object_mut) {
-                today.remove("observed_at");
+            for section in ["today", "epic_focus"] {
+                if let Some(fields) = value.get_mut(section).and_then(Value::as_object_mut) {
+                    fields.remove("observed_at");
+                }
             }
         }
         s["at"] = Value::Null;
@@ -2845,8 +2852,12 @@ pub fn render(snapshot: &Snapshot) -> Result<String> {
         Some(today) => format!(",\"today\":{}", serde_json::to_string(today)?),
         None => String::new(),
     };
+    let focus = match &snapshot.epic_focus {
+        Some(focus) => format!(",\"epic_focus\":{}", serde_json::to_string(focus)?),
+        None => String::new(),
+    };
     Ok(format!(
-        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work}{view}{today},\"holds\":[{lines}\n]}}\n```\n",
+        "{HOLDS_MARKER}\nHolds as of {}. Written by `agent-board pass`; the review app reads the JSON below.\n\n```json\n{{\"schema\":{},\"at\":{},\"truncated\":{},\"wip\":{},\"pass\":{}{leases}{needs_you}{work}{view}{today}{focus},\"holds\":[{lines}\n]}}\n```\n",
         snapshot.at,
         serde_json::to_string(snapshot.schema)?,
         serde_json::to_string(&snapshot.at)?,
@@ -2932,6 +2943,10 @@ impl Bound {
 
 /// [`fit`] within `bound`.
 pub fn fit_to(mut snapshot: Snapshot, bound: Bound) -> Result<(Snapshot, String)> {
+    // The epic focus summarizes the holds below; it goes whole, first.
+    if snapshot.epic_focus.is_some() && bound.over(&render(&snapshot)?)? > 0 {
+        snapshot.epic_focus = None;
+    }
     if snapshot.today.is_some() && bound.over(&render(&snapshot)?)? > 0 {
         snapshot.today = None;
     }
@@ -2978,6 +2993,7 @@ pub fn fit_to(mut snapshot: Snapshot, bound: Bound) -> Result<(Snapshot, String)
                    pass_view: &Option<Value>| Snapshot {
         dispatchable_work: snapshot.dispatchable_work.clone(),
         pass_view: pass_view.clone(),
+        epic_focus: snapshot.epic_focus.clone(),
         today: snapshot.today.clone(),
         schema: snapshot.schema,
         at: snapshot.at.clone(),

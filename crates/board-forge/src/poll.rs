@@ -1347,6 +1347,11 @@ impl PollPolicy {
     }
 }
 
+/// What a decision's reason says of each failing check, around its name,
+/// among its failures joined with `, `: the pass's epic focus reads it
+/// back as a failing check.
+pub(crate) const FAILED_CHECK: [&str; 2] = ["check ", " failed"];
+
 /// `OWNER/REPO` as it may be put into an API path: anything else could point
 /// a token-bearing request at another endpoint.
 pub fn validate_repository(repo: &str) -> Result<()> {
@@ -3786,11 +3791,12 @@ pub fn decide(
     if review == Some(Review::ChangesRequested) {
         failing.push("review requested changes".to_owned());
     }
+    let [before, after] = FAILED_CHECK;
     failing.extend(
         checks
             .failed
             .iter()
-            .map(|(name, _)| format!("check {name} failed")),
+            .map(|(name, _)| format!("{before}{name}{after}")),
     );
     if pull["mergeable"] == CONFLICTING {
         failing.push(format!("conflicts with {base}"));

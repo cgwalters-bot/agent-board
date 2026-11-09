@@ -827,12 +827,16 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let checked: Vec<&Value> = used.iter().map(|&n| &parts[n]).collect();
             let snapshot = self.hold_snapshot(previous.as_ref(), (comment.as_ref(), &checked));
             let asked = snapshot.pass_view.is_some();
+            let focus = snapshot.epic_focus.is_some();
             let (snapshot, body) = holds::fit_to(snapshot, holds::Bound::Parts)?;
             let mut view = match (asked, snapshot.pass_view.is_some()) {
                 (true, true) => ", with the pass view".to_owned(),
                 (true, false) => ", without the pass view, over the comments' size".to_owned(),
                 (false, _) => String::new(),
             };
+            if focus && snapshot.epic_focus.is_none() {
+                view.push_str(", without the epic focus, over the comments' size");
+            }
             let changed = holds::changed(published.as_deref(), &snapshot)?;
             let bodies = holds::parts(&body, &snapshot.at)?;
             if bodies.len() > 1 {
@@ -975,6 +979,18 @@ impl<C: Rest + Transport + Broker> Scheduler<'_, C> {
             let flights = self.flights.borrow();
             let view = view::snapshot(at, pass, previous, usage.as_ref(), flights.as_deref());
             snapshot.pass_view = Some(view);
+        }
+        if self.config.epic_focus() {
+            let (flights, started) = (self.flights.borrow(), self.client.bounds.started.borrow());
+            let sources = focus::Sources {
+                read: self.focus_read.as_ref(),
+                holds: &snapshot.holds,
+                flights: flights.as_deref(),
+                started: &started,
+                steps: &self.stepped,
+                quiet: self.quiet.as_ref(),
+            };
+            snapshot.epic_focus = Some(focus::snapshot(&snapshot.at, &sources));
         }
         if self.apply && self.config.holds.as_ref().is_some_and(|h| h.today) {
             snapshot.today = Some(self.today(snapshot.pass.overhead.as_ref()));

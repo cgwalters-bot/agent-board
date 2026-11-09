@@ -442,6 +442,9 @@ impl<C: ForgejoTransport> Schedule<'_, C> {
                 body: String::new(),
                 census,
                 priorities,
+                // Only the GitHub pass's `holds.epicFocus` reads them.
+                detail: Default::default(),
+                sub_details: BTreeMap::new(),
             },
             thread,
             listed,

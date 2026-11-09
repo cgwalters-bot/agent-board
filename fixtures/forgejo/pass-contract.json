@@ -238,6 +238,7 @@
     "holds.actNow": {"verdict": "refused", "reason": "only the GitHub scheduler's needs-you step ranks it, beside the approval evidence it reads; the Forgejo publisher does not"},
     "holds.passView": {"verdict": "refused", "reason": "starts and runs in flight come from GitHub's dispatch answers and workflow run listings"},
     "holds.today": {"verdict": "refused", "reason": "daily changes and cost use GitHub's project and Actions APIs"},
+    "holds.epicFocus": {"verdict": "refused", "reason": "P0 and progress come from the GitHub board's Priority and native sub-issues"},
     "decisions.repository": {"verdict": "refused", "reason": "decisions source needs authenticated GitHub body edit attribution"},
     "decisions.issue": {"verdict": "refused", "reason": "decisions source needs authenticated GitHub body edit attribution"},
     "direction.repository": {"verdict": "refused", "reason": "an issue body's last editor cannot be read"},

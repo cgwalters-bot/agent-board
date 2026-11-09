@@ -3071,6 +3071,11 @@ impl Transport for Forge {
             }
             Err(_) if query == wait::WAIT_QUERY => json!({"repository": {"issue": {
                 "assignees": {"nodes": [], "totalCount": 0}, "assignments": {"nodes": []}}}}),
+            // An epic listing with titles, recorded without: none read.
+            Err(_) if query.contains(epics::FOCUS_FIELDS) => {
+                let plain = query.replacen(epics::FOCUS_FIELDS, epics::PLAIN_FIELDS, 1);
+                self.replay.graphql(&plain, variables.clone())?
+            }
             // A board read with assignees, recorded without: none read, so
             // each candidate's assignment is read as before.
             Err(_) if query.contains(BOARD_ASSIGNEES) => {
@@ -3916,6 +3921,62 @@ fn apply_publishes_the_pass_view() {
             ),
         }
     }
+}
+
+/// With `holds.epicFocus`, the hold snapshot has the recorded board's P0
+/// epics, read in the requests a pass without it makes, and every source
+/// read; off, the epic queries are the recorded ones and there is none.
+#[test]
+fn apply_publishes_the_epic_focus() {
+    let mut requests = Vec::new();
+    for focus in [true, false] {
+        let mut forge = Forge::new(None, false);
+        // With the recorded epics, [`EPIC_LINES`].
+        forge.replay = replay();
+        only(&mut forge.replay, FIRST);
+        let mut settings = json!({"wip": 8, "holds": forge.holds_destination(true)});
+        settings["holds"]["epicFocus"] = focus.into();
+        let now = forge.replay.now;
+        let mode = (Mode::Actions(&own()), Limits::default());
+        let config = config(settings);
+        let report = block(run(&forge, &forge, &config, State::default(), mode, now)).unwrap();
+        // The same decisions, from the same reads.
+        let lines = report.lines.iter().filter(|l| !l.starts_with("holds"));
+        requests.push(lines.cloned().collect::<Vec<_>>());
+        let (_, body) = forge.published_holds().unwrap();
+        let published = holds::published(&body).unwrap();
+        let Some(focus) = published.get("epic_focus").filter(|_| focus) else {
+            assert!(published.get("epic_focus").is_none());
+            continue;
+        };
+        assert_eq!(focus["schema"], focus::SCHEMA);
+        assert_eq!(focus["observed_at"], now.format(&Rfc3339).unwrap());
+        assert_eq!(
+            focus["sources"],
+            json!({"epics": "complete", "runs": "complete", "board": "complete"}),
+            "{focus:#}"
+        );
+        let cards = focus["epics"].as_array().unwrap();
+        // tracker#596 and #890, not #766, which has no Priority.
+        let items: Vec<_> = cards.iter().map(|c| c["item"].as_str().unwrap()).collect();
+        assert_eq!(
+            items,
+            ["cgwalters-forge/tracker#596", "cgwalters-forge/tracker#890"],
+            "{focus:#}"
+        );
+        for card in cards {
+            let total = card["progress"]["total"].as_u64().unwrap();
+            assert!(card["progress"]["done"].as_u64() <= Some(total), "{card}");
+            // An open child is blocked by something, or moved by a run.
+            let runs = card["runs"].as_array().unwrap();
+            for child in card["children"].as_array().unwrap() {
+                let running = runs.iter().any(|r| r["item"] == child["item"]);
+                let open = child["state"] == "open" && !running;
+                assert_eq!(!child["blocker"].is_null(), open, "{child}");
+            }
+        }
+    }
+    assert_eq!(requests[0], requests[1]);
 }
 
 /// Default-off and preview have no activity reads; auxiliary read failure
@@ -13413,6 +13474,14 @@ fn config_table() {
         (
             json!({"holds": {"repository": "o/ops", "issue": 1, "needsYou": true, "drafts": "../other"}}),
             "holds drafts repository",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "epicFocus": true}}),
+            "holds epicFocus needs epics",
+        ),
+        (
+            json!({"holds": {"repository": "o/ops", "issue": 1, "epicFocus": "yes"}}),
+            "invalid type",
         ),
         (
             json!({"decisions": {"repository": "o/ops", "issue": 0}}),

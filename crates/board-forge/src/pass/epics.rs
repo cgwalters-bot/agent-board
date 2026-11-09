@@ -128,6 +128,22 @@ pub(super) const EPIC_SUBS_QUERY: &str = r#"query($owner: String!, $name: String
   }
 }"#;
 
+/// What [`EPICS_QUERY`] and [`EPIC_SUBS_QUERY`] read of each issue, and what
+/// they read with `holds.epicFocus` ([`focused`]).
+pub(super) const PLAIN_FIELDS: &str = "number state";
+pub(super) const FOCUS_FIELDS: &str = "number title updatedAt state";
+
+/// `query`, one of [`EPICS_QUERY`] and [`EPIC_SUBS_QUERY`], with each issue's
+/// title and last change where `focus` asks for them: a pass without
+/// `holds.epicFocus` sends the query it always did, which recorded boards
+/// replay.
+pub(super) fn focused(query: &str, focus: bool) -> String {
+    match focus {
+        true => query.replacen(PLAIN_FIELDS, FOCUS_FIELDS, 1),
+        false => query.to_owned(),
+    }
+}
+
 /// The board's node id and its Priority field's, with the options in board
 /// order, which an apply writes by id.
 const PROJECT_QUERY: &str = r#"query($owner: String!, $number: Int!, $field: String!) {
@@ -189,6 +205,26 @@ pub struct EpicFacts {
     /// Each sub-issue's board Priority, where the board shows it to the
     /// bot, by lower-case key.
     pub priorities: BTreeMap<String, String>,
+    /// Its title and last change, and each sub-issue's by lower-case key,
+    /// read only with `holds.epicFocus` ([`focused`]).
+    pub detail: Detail,
+    pub sub_details: BTreeMap<String, Detail>,
+}
+
+/// An issue's title and when it last changed, where read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Detail {
+    pub title: Option<String>,
+    pub updated: Option<OffsetDateTime>,
+}
+
+impl Detail {
+    fn from_node(node: &Value) -> Self {
+        Self {
+            title: node["title"].as_str().map(str::to_owned),
+            updated: time(node, "updatedAt"),
+        }
+    }
 }
 
 /// The open epics of a repository as [`Scheduler::open_epics`] lists them:
@@ -261,6 +297,7 @@ impl EpicFacts {
             closed: Vec::new(),
         };
         let mut priorities = BTreeMap::new();
+        let mut sub_details = BTreeMap::new();
         for sub in nodes {
             let at = issue_ref(sub)?;
             let child = IssueRef {
@@ -268,6 +305,7 @@ impl EpicFacts {
                 number: at.number,
             };
             let name = key(&at);
+            sub_details.insert(name.clone(), Detail::from_node(sub));
             // A sub-issue whose boards were not all read shows no Priority,
             // as one the board does not show to the bot.
             if let Ok(BoardFields {
@@ -293,6 +331,8 @@ impl EpicFacts {
             body: text(node, "/body").to_owned(),
             census,
             priorities,
+            detail: Detail::from_node(node),
+            sub_details,
         })
     }
 }
@@ -1226,6 +1266,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             None => self.open_epics(repository, None)?,
         };
         let open = listed.len();
+        if self.config.epic_focus() {
+            self.focus_read = Some(focus::Read::new(&listed));
+        }
         let mut live = Vec::new();
         for facts in listed {
             let facts = match facts {
@@ -1406,7 +1449,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut out = Vec::new();
         for _ in 0..EPIC_PAGES {
             let data = self.client.graphql(
-                EPICS_QUERY,
+                &focused(EPICS_QUERY, self.config.epic_focus()),
                 json!({"owner": owner, "name": name, "label": EPIC_LABEL, "field": field,
                     "first": EPICS_PER_PAGE, "cursor": cursor}),
             )?;
@@ -1459,7 +1502,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let mut seen = BTreeSet::new();
         for _ in 0..SUB_PAGES {
             let data = self.client.graphql(
-                EPIC_SUBS_QUERY,
+                &focused(EPIC_SUBS_QUERY, self.config.epic_focus()),
                 json!({"owner": owner, "name": name, "number": issue.number, "field": field,
                     "first": SUBS_PER_PAGE, "cursor": cursor}),
             )?;
