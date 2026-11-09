@@ -2257,6 +2257,41 @@ uses `architecture`. Everything else takes the recommended option and records
 why. The fixture is an example caller value tested here, not a built-in default;
 no tracker config or pin is changed in this repository.
 
+### Repository guidance
+
+The optional `guidance` key maps a repository to the file holding its own
+instructions, so that a brief points at them rather than restating them
+(agent-board#788). Every GitHub triage brief the pass writes for an issue of a
+named repository (issue, epic, revisit and sweep triage) ends with a paragraph
+naming that file: to read it before acting, say so if it cannot, follow it
+where the brief leaves a choice open, and name the same file in any job plan
+brief the run writes there. The key is the repository holding the triaged
+issue. The pass does not read the file; the run does, and the brief records
+which one, with its revision where `ref` pins it.
+
+```json
+"guidance": {
+  "cgwalters-forge/agent-board": {"path": "AGENTS.md"},
+  "cgwalters-forge/composefs-rs": {
+    "repository": "cgwalters/agenthome",
+    "path": "midstream/composefs-rs/AGENTS.md",
+    "ref": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
+```
+
+Without `repository`, the file is in the repository itself, at the run's
+checkout unless `ref` pins it. A midstream fork, which carries upstream's tree
+unchanged, names agenthome's per-upstream path instead, and such a file in
+another repository must be pinned by `ref` to a full lowercase commit: unpinned,
+whoever can write there would change every brief that names it, and the brief
+would not say which text it was built from. A `path` is relative, at most 200
+bytes of letters, digits, `.`, `_`, `-` and `/`, with no empty, `.` or `..`
+part, so it can neither leave the repository nor carry markup into the brief.
+At most 50 repositories, distinct ignoring ASCII case; unknown fields are
+refused. It is off by default and supports only GitHub. It only adds text to a
+brief: it grants no scope, and a guidance file cannot authorize a write.
+
 ### Prompt and policy migration audit
 
 Audit for agent-board#788 after operator-ask and harness extraction, by runtime string family (test fixtures
@@ -2270,6 +2305,7 @@ not migrated by this change:
 | `pass.rs`: former `MECHANICAL` and the verdict's “never done or needs-operator” instruction | Mechanical escalation and trailer policy now live only in the caller example's `operatorAsk.text`; neutral defaults retain verdict meanings, not that policy. |
 | `pass/wait.rs`: `RELEASE_TEXT` | Removed the compiled credentials/budget/ruleset/upstream/bounds list; the receipt now describes the configured policy decision without inventing its domains. |
 | `pass.rs`: former `HARNESS`, `OPERATOR_LABELS`, `TARGET_LABEL_PREFIX`, same-owner classification | Moved to optional `operatorAsk.harness`: `replanText`, `excludedLabels`, `foreignTargetLabelPrefix` and explicit `repositories`. No delegation without it; complete-label, work-scope, noMerge and verified-midstream checks remain enforced. |
+| Where a run finds repository procedure (no compiled string moved yet) | Optional `guidance` names each repository's file (its own `AGENTS.md`, or an agenthome midstream path pinned by commit); triage briefs end by naming it. |
 | `pass.rs`: `PROMOTED`, `NO_UPSTREAM_COMMENT`, `verdict_ask` | Promoted-work routing and upstream-silence policy remain behind `fixPlans`. Move wording together with the checked fix-plan contract, never remove its bounds as a prose-only migration. |
 | `pass.rs`: `verdict_ask` active-work and follow-up-issue instructions | Routing guidance remains coupled to `skipActiveWork` and the verdict/plan protocol. Separate caller preference from required output shape. |
 | `pass/epics.rs`, `pass/forgejo/epics.rs`: planning tasks | Planning procedure, repository scope, operator-comment precedence and epic-edit restrictions remain duplicated. Repository planning norms should move to repository guidance; authenticated scope stays enforced. |
@@ -2284,9 +2320,14 @@ and checks of approvals, heads and bounds. A caller's prose cannot authorize a
 write. Labels, status names and numeric scheduling defaults are also controller
 policy, not repository prompts; making them configurable is separate work.
 The existing `direction` issue is authenticated cross-run direction, not a
-repository-guidance loader. Repository `AGENTS.md` and pinned agenthome midstream
-loading, source precedence, missing-source handling and provenance fixtures are
-still unimplemented acceptance work for #788. This audit is recorded here because
+repository-guidance loader. [`guidance`](#repository-guidance) points triage
+briefs at a repository's `AGENTS.md` or a pinned agenthome midstream path; it
+is where the procedure in the families above moves as each is cut down to its
+protocol. Still unimplemented for #788: the pass neither fetches nor checks
+those files (the brief asks the run to say when it cannot read one), an
+unpinned entry records no revision, there is no precedence between sources,
+and a fork whose issues are tracked in `dispatchRepo` gets that repository's
+entry, not its own. This audit is recorded here because
 the worker handback cannot post a comment directly to that issue.
 
 Work already promoted upstream is the exception (agent-board#735). Its

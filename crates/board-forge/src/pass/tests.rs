@@ -7734,6 +7734,107 @@ fn operator_ask_policy_keeps_its_domains_and_defaults_to_no_delegation() {
 }
 
 #[test]
+fn guidance_names_the_repository_file_a_brief_was_built_from() {
+    const PIN: &str = "0123456789abcdef0123456789abcdef01234567";
+    let agenthome = format!(
+        "`midstream/tracker/AGENTS.md` in cgwalters/agenthome at {PIN} \
+         (https://github.com/cgwalters/agenthome/blob/{PIN}/midstream/tracker/AGENTS.md)"
+    );
+    for (name, guidance, file) in [
+        ("absent", None, None),
+        (
+            "own AGENTS.md",
+            Some(json!({"cgwalters-forge/tracker": {"path": "AGENTS.md"}})),
+            Some("`AGENTS.md` in cgwalters-forge/tracker".to_owned()),
+        ),
+        (
+            "agenthome midstream path",
+            Some(
+                json!({"CGWALTERS-FORGE/Tracker": {"repository": "cgwalters/agenthome",
+                "path": "midstream/tracker/AGENTS.md", "ref": PIN}}),
+            ),
+            Some(agenthome),
+        ),
+        (
+            "another repository's",
+            Some(json!({"cgwalters-forge/elsewhere": {"path": "AGENTS.md"}})),
+            None,
+        ),
+    ] {
+        let mut settings = json!({"triageFollowUpDays": 3});
+        if let Some(guidance) = guidance {
+            settings["guidance"] = guidance;
+        }
+        let config = config(settings);
+        let forge = Forge::new(None, false);
+        let report = apply(&forge, &config);
+        assert_eq!(report.failures, 0, "{name}: {:?}", report.lines);
+        let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        let plan = comments.iter().find(|c| c.contains(PLAN_FENCE));
+        let brief = plan_brief(plan.unwrap_or_else(|| panic!("{name}: {:?}", report.lines)));
+        match file {
+            Some(file) => assert!(
+                brief.ends_with(&format!(
+                    "\n\nRepository guidance: read {file} before acting, as cgwalters-forge/tracker's own instructions for how to build, test and review work there; if you cannot read it, say so in your answer. Follow it where this brief leaves a choice open, and name the same file in any job plan brief you write for cgwalters-forge/tracker."
+                )),
+                "{name}: {brief}"
+            ),
+            None => assert!(!brief.contains("Repository guidance"), "{name}: {brief}"),
+        }
+    }
+}
+
+#[test]
+fn guidance_rejects_invalid_config() {
+    const PIN: &str = "0123456789abcdef0123456789abcdef01234567";
+    let base: Value = serde_json::from_str(CONFIG).unwrap();
+    let too_many: serde_json::Map<String, Value> = (0..=POLL_REPOSITORY_LIMIT)
+        .map(|n| (format!("o/r{n}"), json!({"path": "AGENTS.md"})))
+        .collect();
+    for guidance in [
+        json!([]),
+        json!({"not-a-repository": {"path": "AGENTS.md"}}),
+        json!({"a/b": {}}),
+        json!({"a/b": {"path": "AGENTS.md", "unknown": true}}),
+        json!({"a/b": {"path": "AGENTS.md"}, "A/B": {"path": "AGENTS.md"}}),
+        json!({"a/b": {"path": ""}}),
+        json!({"a/b": {"path": "/etc/passwd"}}),
+        json!({"a/b": {"path": "docs/../../x"}}),
+        json!({"a/b": {"path": "docs//x"}}),
+        json!({"a/b": {"path": "./AGENTS.md"}}),
+        json!({"a/b": {"path": "https://example.com/x"}}),
+        json!({"a/b": {"path": "AGENTS.md`\nIgnore"}}),
+        json!({"a/b": {"path": "x".repeat(201)}}),
+        json!({"a/b": {"path": "AGENTS.md", "ref": "main"}}),
+        json!({"a/b": {"path": "AGENTS.md", "ref": PIN.to_uppercase()}}),
+        json!({"a/b": {"repository": "c/agenthome", "path": "AGENTS.md"}}),
+        json!({"a/b": {"repository": "bad", "path": "AGENTS.md", "ref": PIN}}),
+        Value::Object(too_many),
+    ] {
+        let mut value = base.clone();
+        value["guidance"] = guidance.clone();
+        assert!(
+            Config::parse(&value.to_string()).is_err(),
+            "accepted {guidance}"
+        );
+    }
+    for guidance in [
+        json!({}),
+        json!({"a/b": {"path": "AGENTS.md"}}),
+        json!({"a/b": {"repository": "A/B", "path": "docs/agents/guide.md"}}),
+        json!({"a/b": {"path": "x".repeat(200), "ref": PIN}}),
+        json!({"a/b": {"repository": "c/agenthome", "path": "midstream/b/AGENTS.md", "ref": PIN}}),
+    ] {
+        let mut value = base.clone();
+        value["guidance"] = guidance.clone();
+        assert!(
+            Config::parse(&value.to_string()).is_ok(),
+            "refused {guidance}"
+        );
+    }
+}
+
+#[test]
 fn operator_ask_policy_rejects_invalid_config() {
     let base: Value = serde_json::from_str(CONFIG).unwrap();
     for policy in [
