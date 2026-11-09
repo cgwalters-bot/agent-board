@@ -1444,6 +1444,31 @@ Backlog discovery and automatic activation of heavy pools are not implemented
 by this option; effort routing and approval holds are unchanged. Forgejo
 refuses the option rather than silently ignoring it.
 
+Neither path plans an epic that nothing changed, or whose last plan had
+nothing to do, so a board whose every candidate waits on a person can sit
+idle with pools under pace (agent-board#803). `epics.heldPlanHours` (GitHub
+only, **off** at `0`, at most 168) covers that case, and only that case. Stage
+3 keeps the highest-Priority live epic it leaves unplanned for one of those
+two reasons, with no run in flight and no person's hold, once its last
+planning request (its record, or its newest plan) is at least that many hours
+old. Stage 4 plans that one epic where it would otherwise start nothing: it
+must have read and held every candidate, whatever held it (none unread,
+failed or deferred; a board with no candidates qualifies too). Stage 3 must
+have planned nothing, and a `planPools` pool must be under its pace, with
+room left at it. Only such pools are drawn for the run. The pass logs
+`pools: P under pace with every candidate held; planning OWNER/REPO#N (one epic a pass)`,
+P listing those pools, and then `start planning OWNER/REPO#N pool=P: its last
+planning request was at T, H hour(s) or more ago; every candidate is held,
+with P under pace and N slot(s) free and nothing started`. The epic's backoff
+hold, where it has one, is taken back. The start uses the same early-planning
+path as above, with all its budget, WIP, overlap and `--max-dispatch` checks.
+The start writes a
+new planning request, so the next one for that epic waits another
+`heldPlanHours` however long the board stays held. The threat it bounds is a
+held board turning spare quota into a planning run per epic per pass. The
+caller is `cgwalters-forge/tracker`'s `.github/pass.json`; for example
+`"epics": {"heldPlanHours": 24}` beside its existing `epics` keys.
+
 The opt-in supervisor [`plan_epic`](supervisor-requests.md#lines) action is an
 explicit exception: its executor's exact fixed marker comment, authored by the
 configured bot and unedited, newer than the epic's last planning request,
@@ -4188,6 +4213,7 @@ remain open; this inventory is not an implementation claim for proposed behavior
 | `epics.focus` | The one live epic, `OWNER/REPO#N`, whose planning, applies and children go first, everything else starting only as spillover; refused where it is not a live epic, and on a Forgejo board, see [scheduling](#scheduling); unset (no focus) |
 | `epics.maxAppliesPerPass` | The most accepted epic plans a pass applies (1–10), the focus epic's first, then in Priority order; a refused plan does not count, and `--max-writes` still holds what they write; `1` |
 | `epics.close` | Close as completed a due epic whose sub-issues are all closed, rather than ask the operator once, see [what is built](#what-is-built); `false` |
+| `epics.heldPlanHours` | GitHub only: where stage 4 held every candidate and a `planPools` pool is under pace, plan one unplanned live epic a pass whose last planning request is at least this many hours (0–168) old, see [what is built](#what-is-built); `0` (off) |
 | `wip` | Total active-run limit, integer 0–100; `0` (new work off) |
 | `triage` | Permit no-plan triage: `true` (scope `all`, every candidate) or `{"scope": "epics"\|"all"}` (default `epics`: only the children of live epics; needs `epics`), see [scheduling](#scheduling); `false` |
 | `planPools`, `triagePools` | Ordered pool names for epic planning/no-plan triage; `[]`, `planPools` |
