@@ -18817,6 +18817,331 @@ fn sweep_config_table() {
     }
 }
 
+/// Daily sessions on agent-board#40, the recording's anchor, with claude
+/// the one triage pool.
+fn session_settings() -> Value {
+    json!({"triagePools": ["claude"], "wip": 12,
+        "sessions": {"hourUtc": 0, "issues": ["cgwalters-forge/agent-board#40"]}})
+}
+
+const SESSION_START: &str = "start session cgwalters-forge/agent-board#40 pool=claude";
+
+/// `author`'s `kind` plan on agent-board#40, comment 9 of 2026-10-22, and
+/// the bot's dispatch record of it at `recorded`, if any.
+fn anchor_plan(replay: &mut Replay, kind: &str, author: &str, recorded: Option<&str>) {
+    let comments = &mut answer(replay, r#""name":"agent-board","number":40"#)["data"]["repository"]
+        ["issue"]["comments"]["nodes"];
+    let plan = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/agent-board", "item": 40,
+        "kind": kind, "runner": "hosted", "brief": "Triage the repository as a whole."});
+    let created = "2026-10-22T06:00:00Z";
+    let at = "https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-";
+    let nodes = comments.as_array_mut().unwrap();
+    nodes.push(json!({
+        "url": format!("{at}9"), "body": format!("```{PLAN_FENCE}\n{plan}\n```"),
+        "createdAt": created, "lastEditedAt": null,
+        "author": {"login": author}, "editor": null,
+    }));
+    if let Some(recorded) = recorded {
+        nodes.push(json!({
+            "url": format!("{at}10"),
+            "body": format!("<!-- agent-board-dispatch: 9@{created} -->\nDispatched."),
+            "createdAt": recorded, "lastEditedAt": null,
+            "author": {"login": "cgwalters-bot"}, "editor": null,
+        }));
+    }
+}
+
+/// The pass's session lines and the session start.
+fn session_lines(report: &Report) -> Vec<&str> {
+    (report.lines.iter())
+        .map(String::as_str)
+        .filter(|l| {
+            l.starts_with("session ")
+                || l.starts_with("start session ")
+                || l.starts_with("held by --max-dispatch: start session ")
+                || l.starts_with("hold cgwalters-forge/agent-board#40")
+        })
+        .collect()
+}
+
+/// A daily session (agent-board#830) on the recording: due, with no plan
+/// on its anchor yet, a preview plans its start before the item starts,
+/// and the anchor is no candidate of its own. An apply posts the pass's
+/// session plan, whose brief names the configured bounds and their offline
+/// check, and dispatches it; the next pass today reads its record as the
+/// day's receipt and starts nothing more on it.
+#[test]
+fn sessions_start_once_a_day_on_the_anchor() {
+    let settings = session_settings();
+    let forge = Forge::new(None, false);
+    let report = preview(&config(settings.clone()), &forge.replay);
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let starts: Vec<&str> = (report.lines.iter())
+        .map(String::as_str)
+        .filter(|l| l.starts_with("start "))
+        .collect();
+    assert_eq!(starts.first(), Some(&SESSION_START), "{:#?}", report.lines);
+    assert!(
+        !(report.lines.iter())
+            .any(|l| l.contains("triage cgwalters-forge/agent-board#40") || l.contains("#40:")),
+        "{:#?}",
+        report.lines
+    );
+    assert_eq!(report.planned_starts.get("session"), Some(&1));
+
+    let report = apply(&forge, &config(settings.clone()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let started = session_lines(&report);
+    assert!(
+        started.len() == 1 && started[0].starts_with(&format!("{SESSION_START} record=")),
+        "{started:#?}"
+    );
+    assert_eq!(forge.dispatches()[0], "cgwalters-forge/agent-board#40");
+    let comments = forge.comments_on("cgwalters-forge/agent-board", 40);
+    assert_eq!(comments.len(), 2, "{comments:#?}");
+    let plan = &comments[0];
+    assert!(plan.starts_with(sessions::SESSION_INTRO), "{plan}");
+    for part in [
+        "\"kind\": \"session\"",
+        "Session on cgwalters-forge/agent-board, reporting on cgwalters-forge/agent-board#40",
+        "only cgwalters's own comments are decisions",
+        "ask cgwalters nothing: no ask domain is configured",
+        "`agent-board check session-batch --body FILE --allow-repo cgwalters-forge/tracker --allow-repo cgwalters-forge/agentic-job --allow-repo cgwalters-forge/agent-board",
+        "--priority-option P0 --priority-option P1 --priority-option P2",
+    ] {
+        assert!(plan.contains(part), "{part}: {plan}");
+    }
+    assert!(comments[1].starts_with("<!-- agent-board-dispatch: "));
+
+    // The next pass today: the record is the day's receipt.
+    let report = apply(&forge, &config(settings));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let again = session_lines(&report);
+    assert!(
+        again.len() == 1
+            && again[0].starts_with(
+                "session cgwalters-forge/agent-board: today's started at 2026-10-23T15:"
+            )
+            && again[0].ends_with("; the next is due from 2026-10-24T00:00:00Z"),
+        "{again:#?}"
+    );
+    let sessions = |forge: &Forge| {
+        (forge.dispatches().iter())
+            .filter(|d| *d == "cgwalters-forge/agent-board#40")
+            .count()
+    };
+    assert_eq!(sessions(&forge), 1);
+
+    // Tomorrow, with yesterday's recorded plan on the anchor: started again
+    // through the start's recheck and the plan protocol, under a new plan.
+    let mut forge = Forge::new(None, false);
+    anchor_plan(
+        &mut forge.replay,
+        "session",
+        "cgwalters-bot",
+        Some("2026-10-22T06:05:00Z"),
+    );
+    let report = apply(&forge, &config(session_settings()));
+    assert_eq!(report.failures, 0, "{:#?}", report.lines);
+    let started = session_lines(&report);
+    assert!(
+        started.len() == 1 && started[0].starts_with(&format!("{SESSION_START} record=")),
+        "{started:#?}"
+    );
+    assert_eq!(sessions(&forge), 1);
+    let comments = forge.comments_on("cgwalters-forge/agent-board", 40);
+    assert!(
+        comments.len() == 2
+            && comments[0].starts_with(sessions::SESSION_INTRO)
+            && comments[1].starts_with("<!-- agent-board-dispatch: "),
+        "{comments:#?}"
+    );
+}
+
+/// What the anchor's newest plan decides: the pass's own recorded session
+/// plan from yesterday lets today's start, one recorded today is the day's
+/// receipt, and anything else on the anchor waits on a person, as does an
+/// anchor off the board or with a run in flight; `--max-dispatch` holds
+/// the start as any.
+#[test]
+fn sessions_wait_on_the_anchors_plan_or_a_person() {
+    let recorded_today = "session cgwalters-forge/agent-board: today's started at 2026-10-23T06:00:00Z, https://github.com/cgwalters-forge/agent-board/issues/40#issuecomment-10; the next is due from 2026-10-24T00:00:00Z";
+    let unrecorded = "hold cgwalters-forge/agent-board#40: its session plan 9@2026-10-22T06:00:00Z has no dispatch record; a person dispatches it by hand or removes it, and its session waits";
+    let other_kind = "hold cgwalters-forge/agent-board#40: its newest plan 9@2026-10-22T06:00:00Z is for implement, not a session; a person moves it, and its session waits";
+    for (name, plan, want) in [
+        (
+            "recorded yesterday",
+            Some(("session", "cgwalters-bot", Some("2026-10-22T06:05:00Z"))),
+            SESSION_START,
+        ),
+        (
+            "recorded today",
+            Some(("session", "cgwalters-bot", Some("2026-10-23T06:00:00Z"))),
+            recorded_today,
+        ),
+        (
+            "the operator's, unrecorded",
+            Some(("session", "cgwalters", None)),
+            unrecorded,
+        ),
+        (
+            "another kind",
+            Some(("implement", "cgwalters", None)),
+            other_kind,
+        ),
+        ("no plan", None, SESSION_START),
+    ] {
+        let mut forge = Forge::new(None, false);
+        if let Some((kind, author, recorded)) = plan {
+            anchor_plan(&mut forge.replay, kind, author, recorded);
+        }
+        let report = preview(&config(session_settings()), &forge.replay);
+        assert_eq!(report.failures, 0, "{name}: {:#?}", report.lines);
+        assert_eq!(session_lines(&report), [want], "{name}");
+        // The anchor is never a candidate of its own, and a stuck anchor
+        // is a hold the snapshot lists, waiting on the operator.
+        assert!(
+            !(report.lines.iter()).any(|l| l.contains("triage cgwalters-forge/agent-board#40")),
+            "{name}: {:#?}",
+            report.lines
+        );
+        let stuck = (report.holds.iter()).filter(|h| h.line() == want).count();
+        assert_eq!(stuck, usize::from(want.starts_with("hold ")), "{name}");
+    }
+
+    // Off the board: the anchor must be an open issue the pass reads.
+    let mut settings = session_settings();
+    settings["sessions"]["issues"] = json!(["cgwalters-forge/agent-board#4040"]);
+    let forge = Forge::new(None, false);
+    let report = preview(&config(settings), &forge.replay);
+    assert_eq!(
+        session_lines(&report),
+        [
+            "session cgwalters-forge/agent-board: its issue cgwalters-forge/agent-board#4040 is not an open issue on the board; no session starts"
+        ]
+    );
+
+    // A run in flight on the anchor, a session's or any other.
+    let mut forge = Forge::new(None, false);
+    let run = "https://github.com/cgwalters-forge/tracker/actions/runs/4040";
+    in_flight(
+        &mut forge.replay,
+        vec![
+            json!({"id": 4040, "display_title": "session cgwalters-forge/agent-board#40 (claude)",
+            "html_url": run}),
+        ],
+    );
+    let report = preview(&config(session_settings()), &forge.replay);
+    assert_eq!(
+        session_lines(&report),
+        [format!(
+            "session cgwalters-forge/agent-board: its run is in flight, {run}"
+        )]
+    );
+
+    // Held by --max-dispatch where it would start.
+    let forge = Forge::new(None, false);
+    let limits = Limits {
+        dispatch: Some(0),
+        ..Limits::default()
+    };
+    let report = apply_limited(&forge, &config(session_settings()), limits);
+    assert_eq!(
+        session_lines(&report),
+        [format!("held by --max-dispatch: {SESSION_START}")]
+    );
+    assert!(forge.dispatches().is_empty());
+}
+
+#[test]
+fn sessions_config_table() {
+    let sessions = |edit: Value| {
+        let mut section = json!({"hourUtc": 6, "issues": ["cgwalters-forge/agent-board#830"]});
+        section
+            .as_object_mut()
+            .unwrap()
+            .extend(edit.as_object().unwrap().clone());
+        section
+    };
+    for (pools, section, error) in [
+        (json!(["claude"]), sessions(json!({})), None),
+        (
+            json!([]),
+            sessions(json!({})),
+            Some("sessions need triagePools or planPools"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"hourUtc": 24})),
+            Some("sessions hourUtc is not 0 to 23"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"issues": []})),
+            Some("sessions issues names no issue"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"issues": ["cgwalters-forge/agent-board"]})),
+            Some("\"cgwalters-forge/agent-board\" is not OWNER/REPO#N"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"issues": ["cgwalters-forge/elsewhere#1"]})),
+            Some("sessions issue cgwalters-forge/elsewhere#1 is not in a work repository"),
+        ),
+        (
+            json!(["claude"]),
+            sessions(
+                json!({"issues": ["cgwalters-forge/agent-board#830", "cgwalters-forge/Agent-Board#40"]}),
+            ),
+            Some(
+                "sessions issues name cgwalters-forge/Agent-Board twice; a repository has one session a day",
+            ),
+        ),
+        (
+            json!(["claude"]),
+            sessions(json!({"pools": ["claude"]})),
+            Some("unknown field `pools`"),
+        ),
+    ] {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        // Pools are the sessions' own need here, not no-plan triage's.
+        value["triage"] = json!(false);
+        value["planPools"] = pools;
+        value["sessions"] = section.clone();
+        let parsed = Config::parse(&value.to_string());
+        match error {
+            None => {
+                let parsed = parsed.unwrap();
+                let sessions = parsed.sessions.as_ref().unwrap();
+                assert_eq!(sessions.hour_utc, 6);
+                assert_eq!(
+                    sessions
+                        .anchors()
+                        .iter()
+                        .map(ItemRef::display)
+                        .collect::<Vec<_>>(),
+                    ["cgwalters-forge/agent-board#830"]
+                );
+            }
+            Some(error) => {
+                let got = format!("{:#}", parsed.unwrap_err());
+                assert!(got.contains(error), "{section}: {got}");
+            }
+        }
+    }
+    // The pass's other configured issues keep their one role.
+    let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+    value["sessions"] = sessions(json!({}));
+    value["usage"] = json!({"repository": "cgwalters-forge/agent-board", "issue": 830});
+    let got = format!("{:#}", Config::parse(&value.to_string()).unwrap_err());
+    assert!(
+        got.contains("sessions issue cgwalters-forge/agent-board#830 is the usage issue"),
+        "{got}"
+    );
+}
+
 /// tracker#889 closes tracker#468, at P0, and agentic-job#9 closes
 /// tracker#527, at P2: the bot's pull requests from its fork, followed with
 /// `pr.reviewPools`, whose head `abc` has no review yet. Repository and

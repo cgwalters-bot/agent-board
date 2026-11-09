@@ -11,6 +11,17 @@ lists what v1.0 waits on and what a caller may rely on.
 The first release will be v1.0.0, once every gate in docs/release.md is met.
 Since the workspace started at 0.1.0 it has gained:
 
+- Daily sessions, the second slice of agent-board#830: with the pass
+  configuration's `sessions` section (`hourUtc` and the anchor issue of
+  each work repository that gets one, off by default), stage 4 starts one
+  `session` run a day on each anchor, before its per-item starts and
+  within the same WIP, pacing, budget and `--max-dispatch`, its brief
+  naming the caller's bounds and the offline batch check; the dispatch
+  record on the anchor is the day's receipt, the anchor is no candidate
+  of its own, and a session run in flight now counts as a dispatch run
+  (docs/sessions.md#daily-sessions). Nothing a session proposes is applied
+  yet.
+
 - A `session` job plan kind, the first slice of triage per repository in
   one long run instead of many one-comment item triages (agent-board#830,
   the per-repository maintainer of tracker#1356): a session answers with
