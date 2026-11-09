@@ -25,6 +25,7 @@ Commands:
 - [`run`](#agent-board-run): Propose run field updates, or write them with --apply
 - [`request`](#agent-board-request): Prepare an operator-approved workflow dispatch (no network writes)
 - [`dispatch`](#agent-board-dispatch): Start the job an issue's newest accepted plan comment proposes, once (--dry-run prints the request)
+- [`pools`](#agent-board-pools): Resolve deployment-owned pool settings (offline; no inference or writes)
 - [`overlap`](#agent-board-overlap): The open pull requests of -R, of any author, and the implement runs in flight that share a path with a change, with their age and last activity and which drafts are stale, as the dispatch overlap check reads them (read-only; docs/job-plans.md#the-overlap-command)
 - [`epic`](#agent-board-epic): Check a coordinator's plan for an epic's sub-issues
 - [`review`](#agent-board-review): Send an operator-approved review draft as the bot
@@ -510,6 +511,37 @@ Options:
 - `--bot <LOGIN>`: Login that opens the implement runs' pull requests: before dispatching, compare the issue with its open pull requests and the runs in flight on the plan's repository, and wait for or run beside them. Off without it; from the caller's configuration
 - `--collaborators-only`: Refuse the plan unless each issue the run reads is locked and was written only by accounts with write access to its repository. Off without it; from the caller's configuration
 - `--status-app-id <ID>`: With --collaborators-only, also admit issue comments that the GitHub App with this id posted as its bot: the status app (docs/apps.md). From the caller's configuration
+
+## agent-board pools
+
+Resolve deployment-owned pool settings (offline; no inference or writes)
+
+```text
+agent-board pools [OPTIONS] <COMMAND>
+```
+
+Commands:
+
+- [`resolve`](#agent-board-pools-resolve): Print agent=, model=, budget= and skilled= lines for $GITHUB_OUTPUT
+
+## agent-board pools resolve
+
+Print agent=, model=, budget= and skilled= lines for $GITHUB_OUTPUT.
+
+Append stdout to $GITHUB_OUTPUT. Errors print no outputs. Nothing calls this automatically: use only the caller's trusted pools file, not a target checkout. Every pool's model and positive-integer budget string is validated on load. Heavy changes only the model; no pool and empty effort leave agent, model and budget empty for the wrapper's fallbacks.
+
+```text
+agent-board pools resolve [OPTIONS] --pools <FILE> --kind <KIND>
+```
+
+Options:
+
+- `--pools <FILE>`: Caller-owned pools.json from a trusted checkout
+- `--pool <POOL>`: Explicit pool; empty uses the caller's fallbacks
+- `--effort <EFFORT>`: Empty or heavy; heavy requires the selected pool's valid heavy.model
+- `--kind <KIND>`: Run kind; review rejects heavy effort
+- `--fallback-agent <FALLBACK_AGENT>`: Wrapper's fallback agent, also used to identify an inherited heavy pool (default: `opencode`)
+- `--fallback-model <FALLBACK_MODEL>`: Wrapper's fallback model; heavy inheritance needs exactly one matching pool
 
 ## agent-board overlap
 

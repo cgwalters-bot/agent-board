@@ -493,10 +493,10 @@ pub fn tiers(pools: Option<&Value>, named: &[(&str, &str)]) -> Result<Tiers> {
     let Some((setting, tier)) = named.first() else {
         return Ok(Tiers::new());
     };
-    let pools = pools
-        .with_context(|| format!("{setting} names {tier}, but no pools file gives the tiers"))?
-        .as_object()
-        .context("pools file is not an object")?;
+    let pools =
+        crate::pools::object(pools.with_context(|| {
+            format!("{setting} names {tier}, but no pools file gives the tiers")
+        })?)?;
     let mut tiers = Tiers::new();
     for (pool, entry) in pools {
         ensure!(
