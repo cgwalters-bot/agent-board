@@ -14,6 +14,8 @@ pub struct Supervise {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Restore a verified previous report directory (read-only; GH_TOKEN Actions reads; explicit opt-in).
+    Previous(Previous),
     /// Read the health observations and write the report (read-only; GH_TOKEN reads).
     Health(Health),
     /// Say whether the agent runs on this pass and print its inputs for $GITHUB_OUTPUT.
@@ -32,6 +34,31 @@ enum Command {
     Session(Session),
     /// Start the poll workflow once when its chain has stopped, and tell the operator once if that does not take; off unless the supervisor's file sets restartPass (writes with GH_TOKEN, the bot's: actions on dispatchRepo, comments on the log issue).
     Restart(Restart),
+}
+
+#[derive(clap::Args)]
+#[command(
+    long_about = "Restore the first eligible artifact among the newest ten of the configured name, newest created first, skipping expired entries. Verify the run's repository, full workflow path, branch, head/base repository IDs and allowed event. All identities come from the trusted caller. No forge writes.\n\nPrint read=true only after complete restoration or proved absence (no nonexpired candidates). Absence creates no directory. Ineligible-only listings, API/download/extraction/publication errors fail without read=true. The destination must not exist and its parent must exist. Extraction is staged beside it and published by rename; errors leave no partial destination.\n\nBounds: 12 API operations (one listing, up to ten run reads, one download), 90-second collection deadline checked between calls and before publication, existing transport timeouts/retry bounds (an in-flight request may extend the deadline), 8 MiB compressed and unpacked, 64 archive entries. No links or unsafe paths.\n\nAppend stdout to $GITHUB_OUTPUT. Only when read=true, pass --previous DIR/times.json to supervise due, even on absence; otherwise omit due's --previous. Existing due behavior is unchanged."
+)]
+struct Previous {
+    /// Repository OWNER/REPO holding the artifact and its run.
+    #[arg(long)]
+    repository: String,
+    /// Full workflow path, such as .github/workflows/health.yml.
+    #[arg(long)]
+    workflow: String,
+    /// Exact artifact name.
+    #[arg(long)]
+    artifact: String,
+    /// Expected default branch (without refs/heads/).
+    #[arg(long)]
+    branch: String,
+    /// Allowed run event; repeat for each event (at least one required).
+    #[arg(long, required = true)]
+    event: Vec<String>,
+    /// Fresh output directory; parent must already exist.
+    #[arg(long, value_name = "DIR")]
+    destination: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -303,6 +330,23 @@ fn read_optional(path: Option<&Path>) -> Option<Value> {
 
 pub fn run(args: &Supervise) -> Result<()> {
     match &args.command {
+        Command::Previous(args) => {
+            let policy = supervise::previous::Policy {
+                repository: args.repository.clone(),
+                workflow: args.workflow.clone(),
+                artifact: args.artifact.clone(),
+                branch: args.branch.clone(),
+                events: args.event.clone(),
+            };
+            policy.validate()?;
+            let client = board_forge::github::Client::from_env()?.retry_within(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(supervise::previous::SECONDS),
+            );
+            supervise::previous::restore(&client, &policy, &args.destination, &now)?;
+            std::io::stdout().lock().write_all(b"read=true\n")?;
+            Ok(())
+        }
         Command::Health(args) => {
             let s = settings(&args.files)?;
             // No previous report starts each unavailable observation's clock afresh.

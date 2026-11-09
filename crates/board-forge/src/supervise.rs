@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 pub mod agent;
 pub mod health;
 pub mod pace;
+pub mod previous;
 pub mod profile;
 pub mod restart;
 

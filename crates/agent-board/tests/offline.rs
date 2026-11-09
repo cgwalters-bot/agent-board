@@ -2801,6 +2801,65 @@ fn supervise_offline_table() {
 }
 
 #[test]
+fn supervise_previous_requires_explicit_identity_and_never_claims_failed_reads() {
+    let args = [
+        "supervise",
+        "previous",
+        "--repository",
+        "example/control",
+        "--workflow",
+        ".github/workflows/health.yml",
+        "--artifact",
+        "health-report",
+        "--branch",
+        "default",
+        "--event",
+        "schedule",
+        "--event",
+        "issue_comment",
+        "--destination",
+        "previous-health",
+    ];
+    let failed = command()
+        .args(args)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("GH_TOKEN"));
+    for flag in [
+        "--repository",
+        "--workflow",
+        "--artifact",
+        "--branch",
+        "--event",
+        "--destination",
+    ] {
+        let mut missing = args.to_vec();
+        // Remove all occurrences, including repeated --event values.
+        while let Some(i) = missing.iter().position(|v| *v == flag) {
+            missing.drain(i..i + 2);
+        }
+        command().args(missing).assert().failure().stdout("");
+    }
+    let mut invalid = args;
+    invalid[3] = "../foreign";
+    let failed = command()
+        .args(invalid)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("invalid repository"));
+}
+
+#[test]
 fn cli_reference_is_current() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/cli.md");
     let output = command().arg("help-markdown").assert().success();

@@ -21,8 +21,9 @@ leave out (the loaders' `POLL_OPTIONS`, `SUPERVISOR_OPTIONS` and
 `AGENT_OPTIONS` tables), so a feature merged off shows until it is switched on
 or confirmed off (agent-board#141). An observation it cannot read whole is `warn`, and becomes
 `fail` once `--previous` shows it has been unavailable for an hour. The
-previous report now comes from a file the workflow downloads, not from an
-artifact the binary unzips. The epics check reuses the pass's readers for each
+previous report comes from a local file; the caller can opt into
+[`supervise previous`](cli.md#agent-board-supervise-previous) to restore that
+directory from an artifact before collection. The epics check reuses the pass's readers for each
 live epic's latest plan, apply receipt, done comment and planning request,
 without the census's board read. It warns when no record exists, fails a pending
 plan, unfinished apply or unanswered request older than `epicStaleHours`, and
@@ -32,6 +33,60 @@ apply is not stale just because it is old; a done comment ends the streak.
 Unreadable records make the observation unavailable rather than reviving an
 older plan. The old `coordinator/v1` comments are not read. No option or caller
 setting changes, and collection remains read-only and bounded.
+### Restoring the previous report (opt-in)
+
+The artifact name alone is not provenance: another workflow or a fork's main
+branch could upload it and steer sweep timing or failure history. The explicit
+`supervise previous` command verifies the producing run before reading it. It
+ports only the lookup/download policy from tracker `supervisor.yml` at
+`82d4ef6ec3f6524b328211ffe8adcf33a72cfe7a`, lines 127–158. No existing command
+calls it automatically; credentials, pacing and trigger admission are unchanged.
+
+For a generic caller, after installing the trusted binary:
+
+```sh
+agent-board supervise previous --repository "$GITHUB_REPOSITORY" \
+  --workflow .github/workflows/health.yml --artifact health-report \
+  --branch "$DEFAULT_BRANCH" --event schedule --event workflow_dispatch \
+  --event issue_comment --destination "$RUNNER_TEMP/previous-health" >> "$GITHUB_OUTPUT"
+```
+
+All flags are required, with one or more repeated `--event` flags. The full
+workflow path, artifact name, branch, repository, allowed events and destination
+are trusted caller inputs with no deployment defaults. `GH_TOKEN` needs Actions
+read access. The destination must not exist (even on absence); its parent must
+exist. Nothing is written to GitHub.
+
+One name-filtered request inspects at most ten artifacts, sorted newest created
+first, skipping expired entries. Each candidate's run must have the configured
+repository name, workflow path and branch, positive matching base/head repository
+IDs, a matching run ID and an allowed event. The first eligible artifact is
+downloaded by artifact ID; failed verification reads or downloads are errors,
+not permission to try an older report. Ineligible runs are skipped, but a
+nonempty nonexpired list without an eligible run is unknown/error, never absence.
+Only an empty nonexpired candidate list proves absence; older pages are not read.
+
+Success prints exactly `read=true` and a newline, both for restoration and proved
+absence; absence leaves no directory. Errors exit nonzero without that output.
+Append stdout to the step outputs. When and only when `read` is `true`, pass
+`--previous "$RUNNER_TEMP/previous-health/times.json"` to `supervise due`, **even
+on absence**: the missing file then means no previous sweep. On error, omit
+`due`'s `--previous`, keeping timing unknown. `health` and `repeat` may continue
+to use their existing local report paths. No `due` semantics change.
+
+To stop stalled reads or oversized/malicious archives consuming the runner,
+lookup has fixed bounds: twelve API operations, a 90-second collection deadline
+(checked between requests and before publication), existing transport timeouts
+and retries, 8 MiB downloaded, 8 MiB total unpacked and 64 entries. An in-flight
+request may finish after the collection deadline; the caller should retain its
+step timeout. Archives are extracted into a fresh private sibling directory;
+links, unsafe paths, duplicates and corrupt entries are refused. Only a complete
+successful extraction is renamed into place; failures clean staging and leave
+no partially published report. A complete archive need not contain `times.json`:
+as before, a missing times file after successful lookup is no previous sweep.
+
+### Triggering the agent
+
 `supervise trigger` decides whether the agent
 runs: on a failing check, outside a cooldown, or on the daily pass. It prints
 the agent's inputs for `$GITHUB_OUTPUT`. The task is the compiled-in playbook,
