@@ -444,6 +444,19 @@ pub(super) fn preview(config: &Config, replay: &Replay) -> Report {
     .unwrap()
 }
 
+/// [`preview`] within a budget of `limit` requests.
+pub(super) fn preview_within(config: &Config, replay: &Replay, limit: usize) -> Report {
+    let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
+    let within = (
+        State::default(),
+        Mode::Preview,
+        Limits::default(),
+        replay.now,
+    );
+    let bounds = Bounds::new(limit, admit_by);
+    block(run_within(replay, replay, config, within, &bounds)).unwrap()
+}
+
 /// The recorded answer to the request whose JSON contains `needle`.
 pub(super) fn answer<'a>(replay: &'a mut Replay, needle: &str) -> &'a mut Value {
     replay
@@ -3233,7 +3246,7 @@ pub(super) fn apply_limited(forge: &Forge, config: &Config, limits: Limits) -> R
 }
 
 /// [`apply`] within a budget of `limit` requests.
-fn apply_within(forge: &Forge, config: &Config, limit: usize) -> Report {
+pub(super) fn apply_within(forge: &Forge, config: &Config, limit: usize) -> Report {
     let admit_by = Instant::now() + Duration::from_secs(PASS_SECONDS_LIMIT);
     let state = (State::default(), Mode::Actions(&own()), Limits::default());
     let within = (state.0, state.1, state.2, forge.replay.now);

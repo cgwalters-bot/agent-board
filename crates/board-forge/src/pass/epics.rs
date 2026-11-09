@@ -1031,8 +1031,8 @@ pub(super) struct Waited {
     turn: Turn,
     changed: bool,
     /// Kept by `epics.heldPlanHours` ([`Scheduler::keep_held`]): planned only
-    /// where stage 4 held every candidate, and its hold, if any, found by
-    /// its scope rather than `at`.
+    /// where stage 4 held every candidate it read, the rest unread only for
+    /// its budget, and its hold, if any, found by its scope rather than `at`.
     held: bool,
 }
 
@@ -1182,6 +1182,36 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         started
     }
 
+    /// With `epics.heldPlanHours`, plans the kept epic where stage 4's
+    /// budget stopped it with `free` slots and nothing started
+    /// ([`Scheduler::budget_stop`]): on a board larger than a pass's budget
+    /// the stop always leaves candidates unread, so a board whose every
+    /// candidate read is held would never be planned otherwise
+    /// (agent-board#803). The start spends the requests the stop kept for
+    /// one, as a candidate's would, where they are whole: a candidate's
+    /// recheck that held spent into them, and the start would run short.
+    pub(super) fn replan_held(&mut self, free: usize, holds: &mut usize) -> usize {
+        let Some(waited) = self.held_epic.take() else {
+            return 0;
+        };
+        // Every read the reserve gates checks before it is sent, so the stop
+        // leaves exactly what stage 4 keeps: less means a recheck spent into
+        // it, and its hold from stage 3 stands.
+        let bounds = self.client.bounds;
+        let (left, kept) = (bounds.left.get(), WRITE_RESERVE + bounds.reserve.get());
+        if left < kept {
+            self.line(format!(
+                "budget: {left} requests left, fewer than stage 4 keeps for a start ({kept}); planning {} waits",
+                waited.facts.issue.display()
+            ));
+            return 0;
+        }
+        bounds.starting.set(true);
+        let started = self.replan_waited(waited, free, holds, 0);
+        self.client.bounds.end_start();
+        started
+    }
+
     fn replan_waited(
         &mut self,
         mut waited: Waited,
@@ -1223,16 +1253,29 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         // Every candidate held: stage 4 read and judged them all, and none
         // could start. Slots free beside an unread or failed candidate are
-        // not proof that nothing is ready.
+        // not proof that nothing is ready; the candidates its budget left
+        // unread past one it held are the one exception, since on a large
+        // board the budget always leaves some.
+        let budget_unread = self.budget_stop.map_or(0, |stop| stop.unread);
         let all_held = self.holds_whole
             && self.deferred_epics.is_empty()
             && self.report.failures == 0
-            && self.unconsidered == 0
+            && self.unconsidered == budget_unread
             && self.unread == 0;
         let under = self.under_pace(snapshot.as_ref()).join(", ");
         if waited.held && (under.is_empty() || !all_held) {
             return 0;
         }
+        let (held_all, is_held) = match budget_unread {
+            0 => (
+                "every candidate held".to_owned(),
+                "every candidate is held".to_owned(),
+            ),
+            n => (
+                format!("every candidate read held, {n} unread for the budget"),
+                format!("every candidate read is held, {n} unread for the budget"),
+            ),
+        };
         let scope = Scope::Epic(waited.facts.issue.clone());
         let at = if waited.held {
             // An unchanged epic has no hold; one in its backoff has one.
@@ -1252,7 +1295,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let not_started = self.not_started;
         let why = match waited.held {
             true => format!(
-                "{}; every candidate is held, with {under} under pace and {free} slot(s) free and nothing started",
+                "{}; {is_held}, with {under} under pace and {free} slot(s) free and nothing started",
                 waited.why
             ),
             false => format!(
@@ -1272,7 +1315,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             ));
         } else if waited.held {
             self.line(format!(
-                "pools: {under} under pace with every candidate held; planning {} (one epic a pass)",
+                "pools: {under} under pace with {held_all}; planning {} (one epic a pass)",
                 waited.facts.issue.display()
             ));
         }
