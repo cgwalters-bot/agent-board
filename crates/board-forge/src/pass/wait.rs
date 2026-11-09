@@ -6,7 +6,11 @@
 //! while no one has assigned or unassigned them since, and the operator's
 //! comments after it. Any response releases it: a comment or a close of
 //! theirs, or an unassignment by anyone but the bot (a closed issue is no
-//! candidate, so a close releases it once the issue is open again). While the
+//! candidate, so a close releases it once the issue is open again), as
+//! does the controller's explicit release decision, `triage apply`'s
+//! comment ([`VERDICT_APPLY_MARKER`]) followed by the bot's unassignment,
+//! so that the pass does not hold again what the controller released
+//! (agent-board#826). While the
 //! assignment stands, the pass takes it off itself and goes on with the
 //! issue. An assignment that is not the bot's, such as the operator's own, is
 //! no wait; but so that the bot's is always recorded, the pass unassigns the
@@ -47,6 +51,9 @@ pub(super) struct Assignment {
     pub standing: bool,
     /// Someone but the bot unassigned them since.
     pub unassigned: bool,
+    /// The bot unassigned them since, as `triage apply` does after its
+    /// decision comment ([`response`]).
+    pub released: bool,
     /// The operator closed the issue since.
     pub closed: bool,
 }
@@ -135,23 +142,39 @@ pub(super) fn assignment(node: &Value, operator: &str, bot: &str) -> Result<Opti
         unassigned: later
             .iter()
             .any(|&(assigned, _, by_bot)| !assigned && !by_bot),
+        released: later
+            .iter()
+            .any(|&(assigned, _, by_bot)| !assigned && by_bot),
         closed: closes.iter().any(|at| *at > since),
     }))
 }
 
-/// The response to `assignment` among `comments`, if any: the operator's
-/// newest comment created after it, unedited or edited by a writer only,
-/// else an unassignment, else a close.
+/// The response to `assignment` among `comments`, if any: the newest
+/// comment created after it, unedited or edited by a writer only, that is
+/// the operator's, or the controller's release decision: a writer's
+/// comment whose hidden first line is `triage apply`'s
+/// ([`VERDICT_APPLY_MARKER`]), not a run's output, and the bot's
+/// unassignment of the operator since the assignment, which `triage apply`
+/// makes after its comment: two signals, as the label path's answer and
+/// removal, so that an agent's comment posted as the bot, which can carry
+/// the marker but not unassign anyone, releases nothing (agent-board#826);
+/// else an unassignment by anyone else, else a close.
 pub(super) fn response<'c>(
     assignment: &Assignment,
     comments: &'c [plan::Comment],
     (operator, writers): (&str, &[&str]),
 ) -> Option<Response<'c>> {
+    let released = |c: &plan::Comment| {
+        assignment.released
+            && is(c.author.as_deref(), writers)
+            && c.body.starts_with(VERDICT_APPLY_MARKER)
+            && !run_output(&c.body)
+    };
     let answer = comments
         .iter()
         .filter(|c| {
             c.created > assignment.since
-                && is(c.author.as_deref(), &[operator])
+                && (is(c.author.as_deref(), &[operator]) || released(c))
                 && ((!c.edited && c.editor.is_none()) || is(c.editor.as_deref(), writers))
         })
         .max_by_key(|c| c.created);
@@ -507,6 +530,14 @@ mod tests {
         }
     }
 
+    /// A [`comment`] with `body`.
+    fn saying(author: &str, created: &str, editor: Option<&str>, body: &str) -> plan::Comment {
+        plan::Comment {
+            body: body.into(),
+            ..comment(author, created, editor)
+        }
+    }
+
     /// Each case: the events, the assignees (and their total) and the
     /// assignment read, or `None`.
     #[test]
@@ -514,11 +545,12 @@ mod tests {
         let assigned = |by: &str, when: &str| event("AssignedEvent", when, by, "op");
         let unassigned = |by: &str, when: &str| event("UnassignedEvent", when, by, "op");
         let closed = |by: &str, when: &str| json!({"__typename": "ClosedEvent", "createdAt": when, "actor": {"login": by}});
-        let wait = |since: &str, standing, unassigned, closed| {
+        let wait = |since: &str, standing, unassigned, released, closed| {
             Some(Assignment {
                 since: at(since),
                 standing,
                 unassigned,
+                released,
                 closed,
             })
         };
@@ -546,28 +578,28 @@ mod tests {
                 vec![assigned("bot", t1)],
                 vec!["op"],
                 1,
-                wait(t1, true, false, false),
+                wait(t1, true, false, false, false),
             ),
             (
                 "case",
                 vec![assigned("BOT", t1)],
                 vec!["OP"],
                 1,
-                wait(t1, true, false, false),
+                wait(t1, true, false, false, false),
             ),
             (
                 "unassigned by the operator",
                 vec![assigned("bot", t1), unassigned("op", t2)],
                 vec![],
                 0,
-                wait(t1, false, true, false),
+                wait(t1, false, true, false, false),
             ),
             (
                 "unassigned by the bot",
                 vec![assigned("bot", t1), unassigned("bot", t2)],
                 vec![],
                 0,
-                wait(t1, false, false, false),
+                wait(t1, false, false, true, false),
             ),
             (
                 "taken over by the operator",
@@ -578,7 +610,7 @@ mod tests {
                 ],
                 vec!["op"],
                 1,
-                wait(t1, false, true, false),
+                wait(t1, false, true, false, false),
             ),
             (
                 "assigned again",
@@ -589,7 +621,7 @@ mod tests {
                 ],
                 vec!["op"],
                 1,
-                wait(t3, true, false, false),
+                wait(t3, true, false, false, false),
             ),
             (
                 "out of order",
@@ -600,49 +632,49 @@ mod tests {
                 ],
                 vec!["op"],
                 1,
-                wait(t3, true, false, false),
+                wait(t3, true, false, false, false),
             ),
             (
                 "closed since",
                 vec![assigned("bot", t1), closed("op", t2)],
                 vec!["op"],
                 1,
-                wait(t1, true, false, true),
+                wait(t1, true, false, false, true),
             ),
             (
                 "closed before",
                 vec![closed("op", t1), assigned("bot", t2)],
                 vec!["op"],
                 1,
-                wait(t2, true, false, false),
+                wait(t2, true, false, false, false),
             ),
             (
                 "closed by the bot",
                 vec![assigned("bot", t1), closed("bot", t2)],
                 vec!["op"],
                 1,
-                wait(t1, true, false, false),
+                wait(t1, true, false, false, false),
             ),
             (
                 "closed by its author",
                 vec![assigned("bot", t1), closed("visitor", t2)],
                 vec!["op"],
                 1,
-                wait(t1, true, false, false),
+                wait(t1, true, false, false, false),
             ),
             (
                 "assignees unread",
                 vec![assigned("bot", t1)],
                 vec!["a"],
                 21,
-                wait(t1, true, false, false),
+                wait(t1, true, false, false, false),
             ),
             (
                 "not assigned",
                 vec![assigned("bot", t1)],
                 vec![],
                 0,
-                wait(t1, false, false, false),
+                wait(t1, false, false, false, false),
             ),
         ] {
             let nodes: Vec<_> = assignees.iter().map(|l| json!({"login": l})).collect();
@@ -665,7 +697,7 @@ mod tests {
         );
         assert_eq!(
             truncated(vec![assigned("bot", t1), closed("visitor", t2)], vec!["op"]).unwrap(),
-            wait(t1, true, false, false)
+            wait(t1, true, false, false, false)
         );
         let odd = json!({"assignees": {"nodes": [], "totalCount": 0},
             "assignments": {"nodes": [event("LabeledEvent", t1, "bot", "op")]}});
@@ -675,82 +707,154 @@ mod tests {
 
     /// Each case: the comments, whether someone unassigned the operator or
     /// closed the issue since, and what answers: a comment's index, or the
-    /// unassignment or close.
+    /// unassignment or close. The bot's comment answers only as the
+    /// controller's release decision, [`VERDICT_APPLY_MARKER`] first, not a
+    /// run's output, and followed by the bot's unassignment
+    /// (agent-board#826).
     #[test]
     fn any_operator_response_releases() {
         let since = "2026-11-02T00:00:00Z";
         let before = "2026-11-01T00:00:00Z";
         let after = "2026-11-03T00:00:00Z";
         let later = "2026-11-04T00:00:00Z";
-        for (name, comments, (unassigned, closed), expected) in [
-            ("nothing", vec![], (false, false), None),
+        let decided = format!("{VERDICT_APPLY_MARKER}\nTriage verdict: proceed\n\nGo.");
+        let output = format!(
+            "{decided}\n\n{}dispatch, id: 7 -->",
+            crate::poll::RUN_MARKER
+        );
+        let quoted = format!("Decided:\n{VERDICT_APPLY_MARKER}");
+        for (name, comments, (unassigned, released, closed), expected) in [
+            ("nothing", vec![], (false, false, false), None),
             (
                 "before",
                 vec![comment("op", before, None)],
-                (false, false),
+                (false, false, false),
                 None,
             ),
             (
                 "at the assignment",
                 vec![comment("op", since, None)],
-                (false, false),
+                (false, false, false),
                 None,
             ),
             (
                 "answered",
                 vec![comment("op", after, None)],
-                (false, false),
+                (false, false, false),
                 Some("0"),
             ),
             (
                 "the newest",
                 vec![comment("op", after, None), comment("OP", later, None)],
-                (false, false),
+                (false, false, false),
                 Some("1"),
             ),
             (
                 "the bot's",
                 vec![comment("bot", after, None)],
-                (false, false),
+                (false, false, false),
                 None,
             ),
             (
                 "a visitor's",
                 vec![comment("visitor", after, None)],
-                (false, false),
+                (false, false, false),
                 None,
             ),
             (
                 "edited by a visitor",
                 vec![comment("op", after, Some("visitor"))],
-                (false, false),
+                (false, false, false),
                 None,
             ),
             (
                 "edited by the bot",
                 vec![comment("op", after, Some("bot"))],
-                (false, false),
+                (false, false, false),
                 Some("0"),
             ),
-            ("unassigned", vec![], (true, false), Some("unassigned")),
-            ("closed", vec![], (false, true), Some("closed")),
+            (
+                "the bot's release decision, the operator unassigned by the bot",
+                vec![saying("bot", after, None, &decided)],
+                (false, true, false),
+                Some("0"),
+            ),
+            (
+                "the bot's decision without its unassignment",
+                vec![saying("bot", after, None, &decided)],
+                (false, false, false),
+                None,
+            ),
+            (
+                "the bot's unassignment without its decision",
+                vec![comment("bot", after, None)],
+                (false, true, false),
+                None,
+            ),
+            (
+                "the newest of the operator's and the bot's",
+                vec![
+                    saying("bot", after, None, &decided),
+                    comment("op", later, None),
+                ],
+                (false, true, false),
+                Some("1"),
+            ),
+            (
+                "the bot's decision before the assignment",
+                vec![saying("bot", before, None, &decided)],
+                (false, true, false),
+                None,
+            ),
+            (
+                "a visitor's with the marker",
+                vec![saying("visitor", after, None, &decided)],
+                (false, true, false),
+                None,
+            ),
+            (
+                "the bot's decision edited by a visitor",
+                vec![saying("bot", after, Some("visitor"), &decided)],
+                (false, true, false),
+                None,
+            ),
+            (
+                "a run's output with the marker",
+                vec![saying("bot", after, None, &output)],
+                (false, true, false),
+                None,
+            ),
+            (
+                "the marker quoted below the first line",
+                vec![saying("bot", after, None, &quoted)],
+                (false, true, false),
+                None,
+            ),
+            (
+                "unassigned",
+                vec![],
+                (true, false, false),
+                Some("unassigned"),
+            ),
+            ("closed", vec![], (false, false, true), Some("closed")),
             (
                 "unassigned and closed",
                 vec![],
-                (true, true),
+                (true, false, true),
                 Some("unassigned"),
             ),
             (
                 "all",
                 vec![comment("op", after, None)],
-                (true, true),
+                (true, false, true),
                 Some("0"),
             ),
         ] {
             let assigned = Assignment {
                 since: at(since),
-                standing: !unassigned,
+                standing: !unassigned && !released,
                 unassigned,
+                released,
                 closed,
             };
             let got = match response(&assigned, &comments, ("op", &["op", "bot"])) {

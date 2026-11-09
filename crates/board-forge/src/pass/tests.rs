@@ -6111,6 +6111,14 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             LABEL,
         ),
         (
+            "a verdict's own decision line heads the hold comment",
+            vec![(bot, None, "decided", 0)],
+            (true, None),
+            "hold cgwalters-forge/tracker#446: triage verdict needs-operator, {answer}; label needs-human",
+            false,
+            LABEL,
+        ),
+        (
             "--max-writes holds the label",
             vec![(bot, None, "done", 0)],
             (false, Some(0)),
@@ -6401,6 +6409,11 @@ fn apply_follows_up_a_triage_by_its_verdict() {
                     "Not done yet.\n\n<!-- {}: 99@abc -->",
                     plan::DISPATCH_MARKER
                 ),
+                // A verdict with the decision line the brief asks for.
+                "decided" => format!(
+                    "Found.\n\n**Decision needed:** Ship now, or after 1.0? Options: now, after.\n- **Recommendation**: Now.\n\n{}",
+                    verdict("needs-operator")
+                ),
                 "implement-plan" => {
                     unpathed(&mut forge.replay);
                     let job = json!({"schema": JOB_PLAN_SCHEMA, "repo": "cgwalters-forge/tracker",
@@ -6531,18 +6544,51 @@ fn apply_follows_up_a_triage_by_its_verdict() {
             wrote(&issue, &answer, held),
             "{name}"
         );
-        // A refused close says why in its hold comment too.
-        if let Some((_, why)) = expected.split_once(", not closed: ") {
+        // The hold comment's second line states the one decision wanted,
+        // with its options: for a close, why the pass did not close it; for
+        // a decision, the verdict's own decision line, else what it asks
+        // (agent-board#826).
+        if held == LABEL {
             let hold = (forge.writes.borrow().iter()).find_map(|(_, url, b)| {
                 let body = b["body"].as_str()?;
                 (url.starts_with(&issue) && body.starts_with("<!-- agent-board-hold"))
                     .then(|| body.to_owned())
             });
-            assert!(
-                (hold.as_deref())
-                    .is_some_and(|h| h.contains(&format!(" It was not closed: {why}."))),
-                "{name}: {hold:?}"
+            let hold = hold.unwrap_or_else(|| panic!("{name}: no hold comment"));
+            let decision = hold.lines().nth(1).unwrap_or_default();
+            let verdict = (expected.split("triage verdict ").nth(1))
+                .and_then(|v| v.split(',').next())
+                .unwrap();
+            let wanted = match verdict {
+                "done" => {
+                    "**Decision needed:** Close this issue as completed, as its triage found it done? Close it, or comment what remains, and it is triaged again."
+                }
+                "obsolete" => {
+                    "**Decision needed:** Close this issue as not planned, as its triage found it obsolete? Close it, or comment what remains, and it is triaged again."
+                }
+                "needs-design" => "**Decision needed:** Decide the design [this triage verdict](",
+                _ if name.contains("decision line") => {
+                    "**Decision needed:** Ship now, or after 1.0? Options: now, after."
+                }
+                _ => "**Decision needed:** Decide what [this triage verdict](",
+            };
+            assert!(decision.starts_with(wanted), "{name}: {decision}");
+            // The verdict's recommendation comes along, so that the needs-you
+            // list, reading the newest summary, keeps it.
+            let recommended = hold.lines().nth(2).unwrap_or_default();
+            assert_eq!(
+                recommended.starts_with("**Recommendation:** Now."),
+                name.contains("decision line"),
+                "{name}: {recommended}"
             );
+            if let "done" | "obsolete" = verdict {
+                let why = (expected.split_once(", not closed: "))
+                    .map_or("triageClose is off", |(_, why)| why);
+                let why = format!(" The pass did not close it: {why}.");
+                assert!(decision.ends_with(&why), "{name}: {decision}");
+            }
+            let waits = format!("\n\n[This triage verdict]({answer}) waits on cgwalters: ");
+            assert!(hold.contains(&waits), "{name}: {hold}");
         }
     }
 }
@@ -7072,17 +7118,39 @@ fn assign_holds_wait_on_the_operator() {
 /// operator label: it is triaged again, once, with caller replan text first. The
 /// bot's standing assignment, or a `needs-human` label, is released with
 /// one comment and the issue planned, and an assignment the bot took off
-/// itself is not put back. Each case: the verdict's JSON, the assignment
-/// events and assignees, the issue's added labels, the write limit, what
-/// tracker#446's line contains, the writes and whether it was triaged again.
+/// itself is not put back. A close verdict asks no one either
+/// (agent-board#826): `done` closes the issue with `triageClose`, and a
+/// close the pass does not make waits as `partly` does. The controller's
+/// decision comment (`triage apply`, [`VERDICT_APPLY_MARKER`]) releases an
+/// operator-domain hold as the operator's own response would, so that the
+/// pass does not hold it again; the bot's unassignment alone, or a run's
+/// output carrying the marker, does not. Each case: the verdict's JSON, the
+/// bot's comment a day after it (none for `""`), the assignment events and
+/// assignees, the issue's added labels, the write limit, what tracker#446's
+/// line contains, the writes and whether it was triaged again.
 #[test]
 fn harness_work_is_planned_rather_than_held() {
     let assigned = ("AssignedEvent", "cgwalters-bot", 1);
+    let unassigned = ("UnassignedEvent", "cgwalters-bot", 2);
     let asks = r#"{"verdict":"needs-operator"}"#;
     let credentials = r#"{"verdict":"needs-operator","operator":"credentials"}"#;
+    let done = r#"{"verdict":"done"}"#;
     let planned = ("start triage", vec![], true);
     let assign = vec!["DELETE /assignees", "POST /assignees", "POST hold"];
+    let decided =
+        format!("{VERDICT_APPLY_MARKER}\nTriage verdict: proceed\n\nUse the recommended option.");
+    let output = format!(
+        "{decided}\n\n{}dispatch, id: 7 -->",
+        crate::poll::RUN_MARKER
+    );
+    let released = (
+        "answered its assignment; old verdict hold released",
+        vec![],
+        true,
+    );
+    let refused = "harness work held for no one; not closed: a comment was posted or edited after this verdict; triaged again from";
     type Case<'a> = (
+        &'a str,
         &'a str,
         &'a str,
         Vec<(&'a str, &'a str, i64)>,
@@ -7092,10 +7160,11 @@ fn harness_work_is_planned_rather_than_held() {
         (&'a str, Vec<&'a str>, bool),
     );
     let cases: Vec<Case> = vec![
-        ("asks", asks, vec![], &[], &[], None, planned.clone()),
+        ("asks", asks, "", vec![], &[], &[], None, planned.clone()),
         (
             "needs-design",
             r#"{"verdict":"needs-design"}"#,
+            "",
             vec![],
             &[],
             &[],
@@ -7105,6 +7174,7 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "an operator-domain verdict",
             credentials,
+            "",
             vec![],
             &[],
             &[],
@@ -7114,6 +7184,7 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "an operator label",
             asks,
+            "",
             vec![],
             &[],
             &["operator-action"],
@@ -7123,15 +7194,17 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "another organization's work",
             asks,
+            "",
             vec![],
             &[],
             &["target:bootc-dev"],
             None,
-            ("assign cgwalters", assign, false),
+            ("assign cgwalters", assign.clone(), false),
         ),
         (
             "our own organization's target",
             asks,
+            "",
             vec![],
             &[],
             &["target:cgwalters-forge"],
@@ -7141,6 +7214,7 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "assigned",
             asks,
+            "",
             vec![assigned],
             &["cgwalters"],
             &[],
@@ -7154,6 +7228,7 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "assigned on an operator-domain verdict",
             credentials,
+            "",
             vec![assigned],
             &["cgwalters"],
             &[],
@@ -7163,6 +7238,7 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "assigned, capped",
             asks,
+            "",
             vec![assigned],
             &["cgwalters"],
             &[],
@@ -7172,7 +7248,8 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "released by the bot last pass",
             asks,
-            vec![assigned, ("UnassignedEvent", "cgwalters-bot", 2)],
+            "",
+            vec![assigned, unassigned],
             &[],
             &[],
             None,
@@ -7181,6 +7258,7 @@ fn harness_work_is_planned_rather_than_held() {
         (
             "labelled",
             asks,
+            "",
             vec![],
             &[],
             &["needs-human"],
@@ -7191,13 +7269,115 @@ fn harness_work_is_planned_rather_than_held() {
                 true,
             ),
         ),
+        (
+            "done closes",
+            done,
+            "",
+            vec![],
+            &[],
+            &[],
+            None,
+            ("close as completed", vec!["PATCH close"], false),
+        ),
+        (
+            // Planned again once, so that a fresh verdict with nothing
+            // after it closes; refused again, it waits for no one.
+            "done, its close refused, is triaged again",
+            done,
+            "An operator question is being opened for this item.",
+            vec![],
+            &[],
+            &[],
+            None,
+            planned.clone(),
+        ),
+        (
+            "done without triageClose waits for no one",
+            done,
+            "",
+            vec![],
+            &[],
+            &[],
+            None,
+            (
+                "harness work held for no one; not closed: triageClose is off; triaged again from",
+                vec![],
+                false,
+            ),
+        ),
+        (
+            "assigned on an earlier done, released and triaged",
+            done,
+            "",
+            vec![assigned],
+            &["cgwalters"],
+            &[],
+            None,
+            (
+                "harness work: unassign cgwalters, released for planning",
+                vec!["DELETE /assignees", "POST release"],
+                true,
+            ),
+        ),
+        (
+            "the controller's decision releases an operator-domain hold",
+            credentials,
+            &decided,
+            vec![assigned, unassigned],
+            &[],
+            &[],
+            None,
+            released.clone(),
+        ),
+        (
+            // One signal of the two: a comment alone, as an agent's could be.
+            "the controller's decision without its unassignment holds",
+            credentials,
+            &decided,
+            vec![assigned],
+            &["cgwalters"],
+            &[],
+            None,
+            ("assigned to cgwalters since ", vec![], false),
+        ),
+        (
+            "the bot's unassignment alone holds it again",
+            credentials,
+            "",
+            vec![assigned, unassigned],
+            &[],
+            &[],
+            None,
+            ("assign cgwalters", assign.clone(), false),
+        ),
+        (
+            "a run's output with the marker is no decision",
+            credentials,
+            &output,
+            vec![assigned, unassigned],
+            &[],
+            &[],
+            None,
+            ("assign cgwalters", assign.clone(), false),
+        ),
     ];
-    for (name, verdict, events, assignees, labels, writes, expected) in cases {
+    for (name, verdict, after, events, assignees, labels, writes, expected) in cases {
         let (line, held, again) = expected;
+        // `triageClose` on, but for the case without it: only a close
+        // verdict makes any difference.
         let config = config(json!({"triageFollowUpDays": 3, "assignHolds": true,
+            "triageClose": !name.contains("without triageClose"),
             "operatorAsk": tracker_operator_ask()}));
         let mut forge = Forge::new(None, false);
         only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        // The first pass starts the triage the close cases follow up, once
+        // it can read the issue's assignments; the other cases' first pass
+        // holds the issue unreadable, so that their verdict is an earlier
+        // one, which the pass takes before a first triage of its own.
+        let owned = verdict == done && events.is_empty();
+        if owned {
+            assignments(&mut forge.replay, 446, &events, assignees);
+        }
         assert_eq!(apply(&forge, &config).failures, 0, "{name}");
         answered(
             &forge,
@@ -7205,7 +7385,13 @@ fn harness_work_is_planned_rather_than_held() {
             &format!("```{TRIAGE_FENCE}\n{verdict}\n```"),
             0,
         );
-        assignments(&mut forge.replay, 446, &events, assignees);
+        // After the bot's assignment, an hour from now.
+        if !after.is_empty() {
+            answered(&forge, ("cgwalters-bot", None), after, 1);
+        }
+        if !owned {
+            assignments(&mut forge.replay, 446, &events, assignees);
+        }
         for label in labels {
             board_labelled(&mut forge.replay, label);
         }
@@ -7246,6 +7432,10 @@ fn harness_work_is_planned_rather_than_held() {
                     );
                     return Some(format!("{method} release"));
                 }
+                if method == "PATCH" && path.is_empty() {
+                    assert_eq!(body, "", "{name}");
+                    return Some("PATCH close".to_owned());
+                }
                 let held = path.ends_with("/assignees") || path.starts_with("/labels");
                 held.then(|| format!("{method} {path}"))
             })
@@ -7258,22 +7448,33 @@ fn harness_work_is_planned_rather_than_held() {
             report.lines
         );
         let comments = forge.comments_on("cgwalters-forge/tracker", 446);
+        // The controller's decision triages the issue again with it as
+        // context, as the operator's answer would, not with the replan text.
+        let replanned = again && !name.contains("controller's decision");
         if again {
             let plan = (comments.iter().rev()).find(|c| c.contains(PLAN_FENCE));
             let plan = plan.unwrap();
             let ask = tracker_operator_ask();
-            assert!(
-                plan.starts_with(ask["harness"]["replanText"].as_str().unwrap()),
-                "{name}: {plan}"
-            );
+            let intro = match replanned {
+                true => ask["harness"]["replanText"].as_str().unwrap(),
+                false => AGAIN,
+            };
+            assert!(plan.starts_with(intro), "{name}: {plan}");
             // The whole caller policy, not just its opening phrase.
             assert!(
                 plan_brief(plan).contains(ask["text"].as_str().unwrap()),
                 "{name}: {plan}"
             );
+            assert_eq!(
+                plan_brief(plan).contains("The earlier triage verdict was answered in "),
+                !replanned,
+                "{name}: {plan}"
+            );
         }
-        // The plan again answered as before: it waits, held for no one.
-        if again && held.is_empty() {
+        // The plan again answered as before: it waits, held for no one; a
+        // close refused again (the comment after the first verdict is after
+        // this one too) says why.
+        if replanned && held.is_empty() {
             answered(
                 &forge,
                 ("cgwalters-bot", None),
@@ -7282,9 +7483,12 @@ fn harness_work_is_planned_rather_than_held() {
             );
             let before = forge.writes.borrow().len();
             let report = apply(&forge, &config);
+            let waits = match verdict == done {
+                true => refused,
+                false => "harness work held for no one; triaged again from",
+            };
             assert!(
-                (report.lines.iter()).any(|l| l.contains("tracker#446")
-                    && l.contains("harness work held for no one; triaged again from")),
+                (report.lines.iter()).any(|l| l.contains("tracker#446") && l.contains(waits)),
                 "{name}: {:#?}",
                 report.lines
             );

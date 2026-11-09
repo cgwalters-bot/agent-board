@@ -243,6 +243,12 @@ const RELEASES_PER_PASS: usize = 5;
 /// The hidden first line of the comment the pass posts as it releases one,
 /// which answers no verdict ([`Scheduler::verdict_answers`]).
 const RELEASE_MARKER: &str = "<!-- agent-board-release -->";
+/// The hidden first line of the decision comment `agent-board triage apply`
+/// posts as it releases a hold (agent-board#805): the controller's explicit
+/// release, which answers the operator's assignment as their own response
+/// would ([`wait::response`]), so that the next pass does not hold the
+/// issue again (agent-board#826). A run's output carrying it is not one.
+pub const VERDICT_APPLY_MARKER: &str = "<!-- agent-board-verdict-apply -->";
 /// What a triage brief adds with [`Config::fix_plans`]:
 /// a promoted pull request's midstream one is closed, and only a `fix` run
 /// on the upstream one rewrites its branch in place, where an implement
@@ -262,6 +268,16 @@ const INPUTS_MARKER: &str = "agent-board-inputs";
 /// only with it (agent-board#363), as `ask create --apply` adds the same
 /// label as the same bot.
 const HOLD_MARKER: &str = "agent-board-hold";
+/// What the [`HOLD_MARKER`] comment's second line starts with, the one
+/// decision the hold asks of the operator ([`Scheduler::decision`]), which
+/// the triage brief asks a verdict for too and the needs-you list reads as
+/// the hold's ask ([`holds::summary`]) (agent-board#826).
+const DECISION_PREFIX: &str = "**Decision needed:**";
+/// What the recommendation line after it starts with, the verdict's own
+/// carried over ([`Scheduler::decision`]).
+const RECOMMENDATION_PREFIX: &str = "**Recommendation:**";
+/// Why a close verdict closed nothing without [`Config::triage_close`].
+const TRIAGE_CLOSE_OFF: &str = "triageClose is off";
 /// The most characters the operator's direction may have: past it the pass
 /// reports an error rather than cut it short.
 const DIRECTION_LIMIT: usize = 4_000;
@@ -748,9 +764,12 @@ impl OperatorAsk {
         Ok(())
     }
 
-    fn operator_verdict(&self, verdict: &str, body: &str) -> bool {
-        CLOSE_VERDICTS.iter().any(|(v, _)| *v == verdict)
-            || plan::triage_operator(body).is_some_and(|d| self.domains.contains(&d))
+    /// Whether the verdict in the comment `body` names one of the configured
+    /// domains: the only verdict the operator settles on harness work. A
+    /// close (`done`, `obsolete`) is not theirs to confirm there
+    /// (agent-board#826).
+    fn operator_verdict(&self, body: &str) -> bool {
+        plan::triage_operator(body).is_some_and(|d| self.domains.contains(&d))
     }
 }
 
@@ -3472,6 +3491,31 @@ impl Step {
     }
 }
 
+/// What [`Scheduler::act_on_verdict`] made of a triage verdict.
+enum Acted {
+    /// Its step: a close, or a hold for the operator or the controller.
+    Step(Step),
+    /// A close a check refused ([`Scheduler::close_refused`]) on harness
+    /// work, which asks no one (agent-board#826): why. A fresh verdict,
+    /// with nothing after it, may close the issue.
+    Refused(&'static str),
+    /// A close verdict on harness work without [`Config::triage_close`]:
+    /// nothing closes the issue, and no one is asked.
+    Unclosed,
+    /// Nothing: the verdict had nothing to do by itself.
+    Nothing,
+}
+
+impl Acted {
+    /// The step, where the verdict asked the operator or was acted on.
+    fn step(self) -> Option<Step> {
+        match self {
+            Acted::Step(step) => Some(step),
+            Acted::Refused(_) | Acted::Unclosed | Acted::Nothing => None,
+        }
+    }
+}
+
 /// Stage 4's stop for the budget with nothing started ([`Halt::Budget`]).
 #[derive(Clone, Copy)]
 struct BudgetStop {
@@ -3775,15 +3819,16 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             && !facts.labels.iter().any(|l| foreign(l))
     }
 
-    /// Whether the triage verdict `verdict`, in the comment `body`, is the
-    /// operator's to settle on harness work: a close to confirm, or a
-    /// decision naming one of the caller's configured domains. With no policy,
-    /// keep waits rather than inferring delegation from repository ownership.
-    fn operator_verdict(&self, verdict: &str, body: &str) -> bool {
+    /// Whether the triage verdict in the comment `body` is the operator's to
+    /// settle on harness work: a decision naming one of the caller's
+    /// configured domains ([`OperatorAsk::operator_verdict`]). With no
+    /// policy, keep waits rather than inferring delegation from repository
+    /// ownership.
+    fn operator_verdict(&self, body: &str) -> bool {
         self.config
             .operator_ask
             .as_ref()
-            .is_none_or(|policy| policy.operator_verdict(verdict, body))
+            .is_none_or(|policy| policy.operator_verdict(body))
     }
 
     /// Whether the wait on the operator over `facts`, whose newest triage
@@ -3793,7 +3838,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         self.harness_item(facts)
             && !self
                 .newest_verdict(comments)
-                .is_some_and(|(_, c, verdict)| self.operator_verdict(&verdict, &c.body))
+                .is_some_and(|(_, c, _)| self.operator_verdict(&c.body))
     }
 
     /// With `pr.reviewPools`, what stage 2's review starts and reruns go by:
@@ -6290,7 +6335,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
              needs-issue (a follow-up needs a real issue number: give its repository, title and body \
              in your comment for the controller, not needs-operator; do not invent an issue number), \
              partly, not-done or {FOLLOW_THROUGH_VERDICT} (only mechanical follow-through \
-              remains and you could not plan it).{harness}{active}"
+              remains and you could not plan it). With needs-design or needs-operator, put the one \
+             decision wanted and its options on one line starting \"{DECISION_PREFIX}\", which the \
+             pass puts to the operator.{harness}{active}"
         )
     }
 
@@ -6366,28 +6413,35 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         let harness = verdict.as_ref().is_some_and(|(_, c, verdict)| {
             ASK_VERDICTS.contains(&verdict.as_str())
                 && self.harness_item(facts)
-                && !self.operator_verdict(verdict, &c.body)
+                && !self.operator_verdict(&c.body)
         });
         let replan = self.harness_policy().map(|p| p.replan_text.as_str());
-        if harness
+        let mut said = match harness {
+            true => format!("{said}, harness work held for no one"),
+            false => said,
+        };
+        // A close verdict on harness work closes the issue, or is planned
+        // again only where a check refused the close, which a fresh verdict
+        // with nothing after it may pass; without `triageClose` nothing
+        // would (agent-board#826).
+        let mut again = !harness;
+        if let Some((_, c, verdict)) = verdict.as_ref() {
+            let on = (*c, comments, Some((from, record)));
+            match self.act_on_verdict(&facts.issue, on, verdict, &said, !harness)? {
+                Acted::Step(step) => return Ok(step),
+                Acted::Refused(why) => said = format!("{said}; not closed: {why}"),
+                Acted::Unclosed => {
+                    said = format!("{said}; not closed: {TRIAGE_CLOSE_OFF}");
+                    again = true;
+                }
+                Acted::Nothing => {}
+            }
+        }
+        if !again
             && let Some(text) = replan
             && !from.body.starts_with(text)
         {
             return self.triage(read, text, (snapshot, target, slots));
-        }
-        let said = match harness {
-            true => format!("{said}, harness work held for no one"),
-            false => said,
-        };
-        if let Some((_, c, verdict)) = verdict.as_ref().filter(|_| !harness)
-            && let Some(step) = self.act_on_verdict(
-                &facts.issue,
-                (c, comments, Some((from, record))),
-                verdict,
-                &said,
-            )?
-        {
-            return Ok(step);
         }
         // Not triaged again, so neither its wait nor its inputs matter.
         if let Some(held) = self.outside_epics(facts) {
@@ -6479,28 +6533,33 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
     /// [`Config::triage_close`] one of [`CLOSE_VERDICTS`] posts a line
     /// linking `c`, so the operator can reopen it, and closes the issue,
     /// unless [`Self::close_refused`] given the triage plan `triage` the
-    /// verdict answers; else one of [`ASK_VERDICTS`] labels it
-    /// [`NEEDS_HUMAN`], or with [`Config::assign_holds`] assigns the
-    /// operator, and posts the [`hold_marker`] comment. Each is one
-    /// step of two writes under `--max-writes` (three for an assignment,
-    /// [`wait::ASSIGN_WRITES`]), none made in a preview.
-    /// `None` for any other verdict, which had nothing to do.
+    /// verdict answers; else, where the verdict `asks` the operator, one of
+    /// [`ASK_VERDICTS`] labels it [`NEEDS_HUMAN`], or with
+    /// [`Config::assign_holds`] assigns the operator, and posts the
+    /// [`hold_marker`] comment, which states the one decision wanted
+    /// ([`Self::decision`]). Each is one step of two writes under
+    /// `--max-writes` (three for an assignment, [`wait::ASSIGN_WRITES`]),
+    /// none made in a preview. Harness work outside the operator's domains
+    /// does not ask ([`Self::operator_verdict`]): a close it could not make
+    /// is [`Acted::Refused`] or [`Acted::Unclosed`], for the caller's wait
+    /// (agent-board#826). [`Acted::Nothing`] for any other verdict, which
+    /// had nothing to do.
     fn act_on_verdict(
         &self,
         issue: &ItemRef,
         (c, comments, triage): (&plan::Comment, &[plan::Comment], Option<Triage<'_>>),
         verdict: &str,
         said: &str,
-    ) -> Result<Option<Step>> {
+        asks: bool,
+    ) -> Result<Acted> {
         if verdict == "needs-issue" {
-            return Ok(Some(Step::Hold(Hold::new(
+            return Ok(Acted::Step(Step::Hold(Hold::new(
                 HoldKind::NeedsIssue,
                 format!("{said}; controller: create the follow-up issue before planning it"),
             ))));
         }
-        let mut close = (CLOSE_VERDICTS.iter())
-            .find(|(v, _)| *v == verdict)
-            .filter(|_| self.config.triage_close);
+        let closing = CLOSE_VERDICTS.iter().find(|(v, _)| *v == verdict);
+        let mut close = closing.filter(|_| self.config.triage_close);
         let assign = self.config.assign_holds;
         let operator = &self.config.operator;
         let mut label = match assign {
@@ -6517,8 +6576,15 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let (kind, act) = match close {
             Some((_, reason)) => (HoldKind::Closed, format!("close as {reason}")),
+            None if !asks => {
+                return Ok(match (closing, refused) {
+                    (Some(_), Some(why)) => Acted::Refused(why),
+                    (Some(_), None) => Acted::Unclosed,
+                    (None, _) => Acted::Nothing,
+                });
+            }
             None if ASK_VERDICTS.contains(&verdict) => (HoldKind::NeedsHuman, label),
-            None => return Ok(None),
+            None => return Ok(Acted::Nothing),
         };
         let rule = match (close, assign) {
             (Some(_), _) => String::new(),
@@ -6543,7 +6609,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 Some(_) => HoldKind::Other,
                 None => HoldKind::NeedsHuman,
             };
-            return Ok(Some(Step::Hold(Hold::new(kind, why))));
+            return Ok(Acted::Step(Step::Hold(Hold::new(kind, why))));
         }
         let id = plan::comment_id(&c.url).with_context(|| format!("{} has no id", c.url))?;
         // Counted once sent, whether or not its answer comes back.
@@ -6575,7 +6641,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                     let with = match assign {
                         true => {
                             self.assign(issue)?;
-                            format!("by assigning {operator}; any response of theirs releases it")
+                            format!("assigned to {operator}; any response of theirs releases it")
                         }
                         false => {
                             plan::send(
@@ -6585,30 +6651,72 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                                 &json!({"labels": [NEEDS_HUMAN]}),
                                 0,
                             )?;
-                            format!("with the label {NEEDS_HUMAN}")
+                            format!(
+                                "labelled {NEEDS_HUMAN}; a comment, then the label taken off, releases it"
+                            )
                         }
                     };
                     // After the label: should this fail, the hold has no
                     // marker and waits for the operator, rather than a
-                    // second marker being posted by the next pass. A
-                    // refused close says why on the issue, not only in the
-                    // pass's log, so that the operator and the supervisor
-                    // see why.
-                    let why = refused
-                        .map(|why| format!(" It was not closed: {why}."))
-                        .unwrap_or_default();
+                    // second marker being posted by the next pass. The
+                    // decision first, as the needs-you list reads it
+                    // ([`holds::summary`]); a refused close says why on
+                    // the issue, not only in the pass's log, so that the
+                    // operator and the supervisor see why.
+                    let decision = self.decision(verdict, c, closing, refused);
                     post(format!(
-                        "{}\nThe board pass held [this triage verdict]({}) for the operator {with}.{why}",
+                        "{}\n{decision}\n\n[This triage verdict]({}) waits on {operator}: {with}.",
                         hold_marker(id),
                         c.url
                     ))?;
                 }
             }
         }
-        Ok(Some(Step::Hold(Hold::new(
+        Ok(Acted::Step(Step::Hold(Hold::new(
             kind,
             format!("{said}; {act}{rule}"),
         ))))
+    }
+
+    /// The one decision the hold of `verdict`, the bot's comment `c`, asks
+    /// of the operator, a [`DECISION_PREFIX`] line with its options
+    /// (agent-board#826). For a close verdict `closing`, whether to close
+    /// the issue, and why the pass did not (`refused`, or
+    /// [`TRIAGE_CLOSE_OFF`]). Else the verdict's own decision line, which
+    /// the brief asks for, one line cut as the needs-you list cuts it
+    /// ([`holds::summary`]), with its recommendation line where it has one,
+    /// so that the newest summary, this comment, says both; or what the
+    /// verdict asks for, without it.
+    fn decision(
+        &self,
+        verdict: &str,
+        c: &plan::Comment,
+        closing: Option<&(&str, &str)>,
+        refused: Option<&str>,
+    ) -> String {
+        if let Some((_, reason)) = closing {
+            let why = refused.unwrap_or(TRIAGE_CLOSE_OFF);
+            return format!(
+                "{DECISION_PREFIX} Close this issue as {}, as its triage found it {verdict}? Close it, or comment what remains, and it is triaged again. The pass did not close it: {why}.",
+                reason.replace('_', " ")
+            );
+        }
+        let said = holds::summary(&c.body);
+        if let Some(question) = said.question {
+            return match said.recommendation {
+                Some(r) => format!("{DECISION_PREFIX} {question}\n{RECOMMENDATION_PREFIX} {r}"),
+                None => format!("{DECISION_PREFIX} {question}"),
+            };
+        }
+        let link = format!("[this triage verdict]({})", c.url);
+        match verdict {
+            "needs-design" => format!(
+                "{DECISION_PREFIX} Decide the design {link} asks for: comment the direction, or close the issue."
+            ),
+            _ => format!(
+                "{DECISION_PREFIX} Decide what {link} asks: comment the decision, or close the issue."
+            ),
+        }
     }
 
     /// A writer's newer word settles a hold only when a later label removal
@@ -6844,7 +6952,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         if ASK_VERDICTS.contains(&verdict.as_str())
             && self.harness_item(facts)
-            && !self.operator_verdict(&verdict, &c.body)
+            && !self.operator_verdict(&c.body)
             && let Some(policy) = self.harness_policy()
         {
             // Harness work, as in a follow-up (agent-board#778).
@@ -6862,7 +6970,9 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(None);
             }
             let said = format!("earlier triage verdict {verdict}, {}", c.url);
-            return self.act_on_verdict(&facts.issue, (c, comments, None), &verdict, &said);
+            let acted =
+                self.act_on_verdict(&facts.issue, (c, comments, None), &verdict, &said, true)?;
+            return Ok(acted.step());
         }
         // Nothing posted or edited since but agentic-job's status comments,
         // which it updates as a run ends: a person's word, an ask's hold or
@@ -6888,7 +6998,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         }
         let said = format!("earlier triage verdict {verdict}, {}", c.url);
         let read = (c, comments, None);
-        if let Some(step) = self.act_on_verdict(&facts.issue, read, &verdict, &said)? {
+        if let Some(step) = self
+            .act_on_verdict(&facts.issue, read, &verdict, &said, true)?
+            .step()
+        {
             return Ok(Some(step));
         }
         let due = c.changed + time::Duration::days(days as i64);

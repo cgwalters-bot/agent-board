@@ -2,6 +2,7 @@
 //! The cap prevents a mistaken bulk list from making unbounded forge writes.
 use anyhow::{Context, Result, ensure};
 use board_forge::github::{DEFAULT_HOST, is_github_login, parse_github_issue};
+use board_forge::pass::VERDICT_APPLY_MARKER;
 use board_forge::poll::Rest;
 use clap::Args;
 use serde::Deserialize;
@@ -97,7 +98,15 @@ pub fn run<C: Rest>(
         let assignees = issue["assignees"]
             .as_array()
             .context("issue assignees missing")?;
-        requests.push(json!({"method":"POST", "url":format!("{url}/comments"), "body":{"body":format!("Triage verdict: {}\n\n{}", verdict.verdict, verdict.decision)}}));
+        // The marker first: with `assignHolds` the pass takes the comment
+        // as the operator's response, so that it does not hold again what
+        // this released (agent-board#826).
+        let body = format!(
+            "{VERDICT_APPLY_MARKER}\nTriage verdict: {}\n\n{}",
+            verdict.verdict, verdict.decision
+        );
+        requests
+            .push(json!({"method":"POST", "url":format!("{url}/comments"), "body":{"body":body}}));
         for label in ["needs-human", "needs-operator"] {
             if labels.iter().any(|l| l["name"] == label) {
                 requests.push(
@@ -254,7 +263,9 @@ mod tests {
         assert_eq!(requests.len(), 4);
         assert_eq!(
             requests[0]["body"]["body"],
-            "Triage verdict: proceed\n\nUse the recommended option."
+            format!(
+                "{VERDICT_APPLY_MARKER}\nTriage verdict: proceed\n\nUse the recommended option."
+            )
         );
         assert!(
             requests[1]["url"]
