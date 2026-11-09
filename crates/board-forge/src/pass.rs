@@ -620,6 +620,9 @@ pub struct Config {
     pub overlap: Option<Overlap>,
     #[serde(default)]
     pub pools: Pools,
+    /// Off unless set: sample hard-item starts on named model variants.
+    #[serde(default)]
+    pub mix: BTreeMap<String, mix::Setting>,
     pub usage: Option<Usage>,
     /// Off unless set.
     pub holds: Option<HoldsAt>,
@@ -1181,6 +1184,7 @@ impl Config {
                 "pools.{name}.burst is not 0 to {BURST_LIMIT}"
             );
         }
+        mix::validate(self)?;
         for (what, list) in [
             ("planPools", &self.plan_pools),
             ("triagePools", self.triage_pools()),
@@ -5650,6 +5654,11 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(Step::Hold(Hold::new(HoldKind::Pools, why)));
             }
         };
+        let pool = if plan.pool.is_empty() {
+            mix::select(config, snapshot, &facts, false, pool, self.now)
+        } else {
+            pool
+        };
         let on = match dest == *issue {
             true => String::new(),
             false => format!(" target={}", dest.display()),
@@ -5933,10 +5942,40 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         names: &[String],
         slots: &Slots,
     ) -> std::result::Result<String, String> {
-        choose(snapshot, &self.config.pools, names, self.now).or_else(|why| {
-            let probe = names.iter().find(|name| slots.probes.contains_key(*name));
-            probe.cloned().ok_or(why)
-        })
+        // A mixed run's rerun keeps its model but paces by its account.
+        // Burst admission is not proof of being under pace, even without leases.
+        for name in names {
+            if self.config.mix.contains_key(name)
+                && let Some(account) = mix::account(name)
+                && !self.config.pool(account).is_some_and(|settings| {
+                    room(snapshot, account, settings, self.now).is_ok_and(|r| r > 0.0)
+                })
+            {
+                return Err(format!("{name}'s account {account} is not under pace"));
+            }
+        }
+        let accounts: Vec<String> = names
+            .iter()
+            .map(|name| {
+                if self.config.mix.contains_key(name) {
+                    mix::account(name).unwrap_or(name).to_owned()
+                } else {
+                    name.clone()
+                }
+            })
+            .collect();
+        choose(snapshot, &self.config.pools, &accounts, self.now)
+            .map(|pool| {
+                names
+                    .iter()
+                    .zip(&accounts)
+                    .find(|(_, account)| **account == pool)
+                    .map_or(pool.clone(), |(name, _)| name.clone())
+            })
+            .or_else(|why| {
+                let probe = names.iter().find(|name| slots.probes.contains_key(*name));
+                probe.cloned().ok_or(why)
+            })
     }
 
     /// Takes the pool of a start's `line` off `slots`' probes, saying so,
@@ -6079,6 +6118,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 return Ok(Step::Hold(Hold::new(HoldKind::Pools, why)));
             }
         };
+        let pool = mix::select(config, snapshot, read.0, false, pool, self.now);
         let line = format!("start triage {} pool={pool}", issue.display());
         let url = format!(
             "https://github.com/{}/issues/{}",
@@ -7570,6 +7610,7 @@ pub mod decision;
 pub mod lease;
 pub mod maintain;
 pub mod midstream;
+pub mod mix;
 pub mod needs;
 pub mod next;
 pub mod promote;

@@ -2483,6 +2483,7 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
             return;
         }
         turn.planned = true;
+        let pool = mix::planning(config, snapshot.as_ref(), facts, pool, self.now);
         let options: Vec<String> = (project.iter())
             .flat_map(|p| p.options.iter().map(|(_, n)| n.clone()))
             .collect();

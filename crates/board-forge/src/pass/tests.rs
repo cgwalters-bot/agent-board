@@ -8497,6 +8497,52 @@ fn apply_reruns_a_failed_run_once() {
     }
 }
 
+#[test]
+fn mixed_rerun_needs_positive_parent_room_without_leases() {
+    for under in [false, true] {
+        let cfg = config(json!({"reruns":true,"mix":{"fable":{"share":0.25,"when":["P0"]}}}));
+        assert!(!cfg.leases);
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#468"]);
+        failed(
+            &mut forge.replay,
+            vec![json!({"id":39718949900_u64,
+            "display_title":"implement cgwalters-forge/tracker#468 (fable)",
+            "conclusion":"failure","run_attempt":1})],
+        );
+        text_468(&mut forge.replay, "Work.");
+        for exchange in &mut forge.replay.requests {
+            if let Some(nodes) = exchange["answer"]
+                .pointer_mut("/data/repository/pullRequests/nodes")
+                .and_then(Value::as_array_mut)
+            {
+                nodes.retain(|n| n["number"] != 889);
+            }
+        }
+        let mut snapshot = usage(&mut forge.replay);
+        snapshot["pools"]["claude"]["hold"] = false.into();
+        snapshot["pools"]["claude"]["used_percent"] = if under { 1 } else { 99 }.into();
+        set_usage(&mut forge.replay, &snapshot);
+        let report = apply(&forge, &cfg);
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        let writes = forge.writes.borrow();
+        let reruns = writes
+            .iter()
+            .filter(|(_, url, _)| url.ends_with("/runs/39718949900/rerun-failed-jobs"))
+            .count();
+        assert_eq!(reruns, usize::from(under), "{:#?}", report.lines);
+        assert!(
+            report.lines.iter().any(|l| if under {
+                l.contains("pool=fable run=")
+            } else {
+                l.contains("fable's account claude is not under pace")
+            }),
+            "{:#?}",
+            report.lines
+        );
+    }
+}
+
 /// What agentic-job's `run` said in the outage of agent-board#440.
 const NOT_STARTED: &str = "the run did not start: runner-sandbox cannot run podman";
 
@@ -12630,6 +12676,76 @@ fn implement_takes_the_paced_pool() {
         assert_eq!(sent["inputs"]["kind"], "implement");
         assert_eq!(sent["inputs"]["pool"], expected);
         assert_eq!(sent["ref"], "main");
+    }
+}
+
+#[test]
+fn mixed_start_keeps_model_in_plan_dispatch_and_log() {
+    for (pool, held, expected, kind) in [
+        ("fable", false, "fable", "implement"),
+        ("astra", false, "astra", "implement"),
+        ("astra", true, "claude", "implement"),
+        ("fable", false, "fable", "triage"),
+    ] {
+        let mut forge = Forge::new(None, false);
+        only(&mut forge.replay, &["cgwalters-forge/tracker#446"]);
+        if kind == "implement" {
+            implement_plan(&mut forge.replay);
+        }
+        unpathed(&mut forge.replay);
+        // Use a complete label selector on every fresh read of this item.
+        for exchange in &mut forge.replay.requests {
+            let request = exchange["request"].to_string();
+            if request.contains(r#""number":446"#)
+                && let Some(issue) = exchange["answer"].pointer_mut("/data/repository/issue")
+                && issue["labels"].is_object()
+            {
+                issue["labels"] = json!({"nodes":[{"name":"review:deep"}],"totalCount":1});
+            }
+            if let Some(nodes) = exchange["answer"]
+                .pointer_mut("/data/repositoryOwner/projectV2/items/nodes")
+                .and_then(Value::as_array_mut)
+            {
+                for node in nodes {
+                    if node["content"]["number"] == 446 {
+                        node["content"]["labels"] =
+                            json!({"nodes":[{"name":"review:deep"}],"totalCount":1});
+                    }
+                }
+            }
+        }
+        if pool == "astra" && !held {
+            let mut snapshot = usage(&mut forge.replay);
+            snapshot["pools"]["openai"]["hold"] = false.into();
+            snapshot["pools"]["openai"]["used_percent"] = 1.into();
+            set_usage(&mut forge.replay, &snapshot);
+        }
+        let cfg = config(json!({"wip":3, "mix": {pool: {"share":1.0,"when":["review:deep"]}}}));
+        let report = crate::pool_choice::with_index(0, || apply(&forge, &cfg));
+        assert_eq!(report.failures, 0, "{:#?}", report.lines);
+        assert!(
+            report
+                .lines
+                .iter()
+                .any(|l| l.starts_with(&format!("start {kind} "))
+                    && l.contains(&format!("pool={expected} record="))),
+            "{:#?}",
+            report.lines
+        );
+        let writes = forge.writes.borrow();
+        let (_, _, sent) = writes
+            .iter()
+            .find(|(_, url, _)| url.ends_with("/dispatches"))
+            .unwrap();
+        assert_eq!(sent["inputs"]["pool"], expected);
+        if kind == "triage" {
+            assert!(
+                forge
+                    .comments_on("cgwalters-forge/tracker", 446)
+                    .iter()
+                    .any(|body| body.replace(' ', "").contains("\"pool\":\"fable\""))
+            );
+        }
     }
 }
 

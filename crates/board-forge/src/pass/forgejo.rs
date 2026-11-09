@@ -38,6 +38,10 @@ const LEASE_BRANCH: &str = "agent-board-leases";
 /// decoding can discard their presence or hide the capability diagnostic.
 pub(super) fn check_options(value: &Value) -> Result<()> {
     ensure!(
+        value.get("mix").is_none(),
+        "unsupported_capability: mix: GitHub pool mixing only"
+    );
+    ensure!(
         value.get("reserveScheduling").is_none(),
         "unsupported_capability: reserveScheduling: GitHub stage shares only"
     );

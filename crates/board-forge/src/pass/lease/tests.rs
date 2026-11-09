@@ -415,6 +415,31 @@ fn racing(forge: &Forge, config: &Rc<Config>, id: u64) -> Rc<RefCell<Option<Held
     won
 }
 
+#[test]
+fn mixed_admission_keeps_variant_and_checks_parent_pace() {
+    let config = config(json!({"wip": 2, "mix": {"fable": {"share": 0.25, "when": ["P0"]}}}));
+    for held in [false, true] {
+        let mut forge = forge(BOT, &[]);
+        forge.usage["pools"]["claude"]["hold"] = held.into();
+        let item = item();
+        let request = Request {
+            pool: "fable",
+            item: &item,
+            run: 11,
+            overridden: false,
+        };
+        let answer = admit(&forge, &config, &request, now(), &mut Vec::new()).unwrap();
+        if held {
+            assert_eq!(
+                answer.unwrap_err(),
+                "fable's account claude is not under pace"
+            );
+        } else {
+            assert_eq!(answer.unwrap().lease.pool, "fable");
+        }
+    }
+}
+
 /// Two admits race for the last slot of two: the second reads the leases
 /// after the first did, and creates its ref before the first. Exactly one
 /// wins; the other is refused with the reason.
