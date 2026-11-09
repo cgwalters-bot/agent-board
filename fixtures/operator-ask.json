@@ -10,5 +10,20 @@
     "budget",
     "security",
     "bounds"
-  ]
+  ],
+  "harness": {
+    "repositories": [
+      "cgwalters-forge/tracker",
+      "cgwalters-forge/agentic-job",
+      "cgwalters-forge/agent-board",
+      "cgwalters-forge/review",
+      "cgwalters-forge/actions",
+      "cgwalters-forge/agenthome",
+      "cgwalters-forge/misctool",
+      "cgwalters-forge/atomic-linux-sandbox"
+    ],
+    "excludedLabels": ["operator-action", "decision", "question", "review-draft"],
+    "foreignTargetLabelPrefix": "target:",
+    "replanText": "The board pass asks a triage run to plan this issue again: it is our own infrastructure, not an operator decision."
+  }
 }

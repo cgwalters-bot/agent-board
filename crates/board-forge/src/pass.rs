@@ -231,23 +231,12 @@ const FOLLOW_THROUGH_VERDICT: &str = "follow-through";
 /// starts so is not planned at once again, so that the two cannot loop.
 const FOLLOW_THROUGH: &str =
     "The board pass asks a triage run to plan the mechanical follow-through its last triage found.";
-/// What the triage plan [`Scheduler::follow_up`] posts for an asking
-/// verdict on harness work ([`Scheduler::harness_item`]) says first, in
-/// place of holding it for the operator (agent-board#778); a verdict
-/// answering a plan that starts so waits as `partly` does, so that the two
-/// cannot loop.
-const HARNESS: &str = "The board pass asks a triage run to plan this issue again: it is our own infrastructure, not an operator decision.";
 /// Bounds on caller policy text and the verdict domains rendered into a brief.
 const OPERATOR_POLICY_CHARS: usize = 4_000;
 const OPERATOR_POLICY_DOMAINS: usize = 16;
 const OPERATOR_DOMAIN_BYTES: usize = 64;
-/// Labels that make an issue the operator's whatever its repository:
-/// proposed operator actions, consolidated decisions, an ask's question and
-/// a review draft before its first upstream posting.
-const OPERATOR_LABELS: &[&str] = &["operator-action", "decision", "question", "review-draft"];
-/// The prefix of a label naming the organization an issue's work is for:
-/// one naming another than `dispatchRepo`'s is not harness work.
-const TARGET_LABEL_PREFIX: &str = "target:";
+const HARNESS_LABEL_LIMIT: usize = 32;
+const HARNESS_LABEL_BYTES: usize = 50;
 /// The most waits on the operator the pass releases from harness work in
 /// one pass ([`Scheduler::harness_item`]), each two writes.
 const RELEASES_PER_PASS: usize = 5;
@@ -677,6 +666,60 @@ pub struct Config {
 pub struct OperatorAsk {
     pub text: String,
     pub domains: Vec<String>,
+    pub harness: Option<HarnessPolicy>,
+}
+
+/// Explicit delegation prevents shared ownership from releasing unrelated waits.
+/// These fields classify work; they do not extend its authenticated scope.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HarnessPolicy {
+    pub repositories: Vec<String>,
+    pub excluded_labels: Vec<String>,
+    pub foreign_target_label_prefix: String,
+    pub replan_text: String,
+}
+
+impl HarnessPolicy {
+    fn check(&self) -> Result<()> {
+        ensure!(
+            !self.repositories.is_empty() && self.repositories.len() <= POLL_REPOSITORY_LIMIT,
+            "operatorAsk.harness.repositories must have 1 to {POLL_REPOSITORY_LIMIT} entries"
+        );
+        let mut seen = BTreeSet::new();
+        for repo in &self.repositories {
+            ensure!(
+                seen.insert(repo.to_ascii_lowercase()),
+                "operatorAsk.harness.repositories names {repo} twice"
+            );
+        }
+        ensure!(
+            self.excluded_labels.len() <= HARNESS_LABEL_LIMIT,
+            "operatorAsk.harness.excludedLabels exceeds {HARNESS_LABEL_LIMIT} entries"
+        );
+        let label = |s: &str| {
+            !s.trim().is_empty()
+                && s.len() <= HARNESS_LABEL_BYTES
+                && !s.chars().any(char::is_control)
+        };
+        let mut seen = BTreeSet::new();
+        for excluded in &self.excluded_labels {
+            ensure!(
+                label(excluded) && seen.insert(excluded.to_ascii_lowercase()),
+                "operatorAsk.harness.excludedLabels must be distinct nonblank labels of at most {HARNESS_LABEL_BYTES} bytes without controls"
+            );
+        }
+        ensure!(
+            label(&self.foreign_target_label_prefix),
+            "operatorAsk.harness.foreignTargetLabelPrefix must be nonblank, at most {HARNESS_LABEL_BYTES} bytes and without controls"
+        );
+        ensure!(
+            !self.replan_text.trim().is_empty()
+                && self.replan_text.chars().count() <= OPERATOR_POLICY_CHARS,
+            "operatorAsk.harness.replanText must be nonblank and at most {OPERATOR_POLICY_CHARS} characters"
+        );
+        Ok(())
+    }
 }
 
 impl OperatorAsk {
@@ -698,6 +741,9 @@ impl OperatorAsk {
                     && seen.insert(domain),
                 "operatorAsk.domains entries must be distinct lowercase ASCII names (letters or hyphens), at most {OPERATOR_DOMAIN_BYTES} bytes"
             );
+        }
+        if let Some(harness) = &self.harness {
+            harness.check()?;
         }
         Ok(())
     }
@@ -1231,6 +1277,13 @@ impl Config {
                 "operatorAsk supports only GitHub"
             );
             policy.check()?;
+            if let Some(harness) = &policy.harness {
+                for repo in &harness.repositories {
+                    naming
+                        .validate_repository(repo)
+                        .context("operatorAsk.harness.repositories")?;
+                }
+            }
         }
         ensure!(
             !self.triage_close || self.triage_follow_up_days > 0,
@@ -3676,41 +3729,49 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         [&self.config.operator, &self.config.bot]
     }
 
-    /// Whether `repository` is the harness's own (agent-board#778): a work
-    /// repository of `dispatchRepo`'s owner that is neither in
-    /// `pr.noMerge` nor a midstream fork, whose work is always ours. None
-    /// is where the midstreams were not read.
+    fn harness_policy(&self) -> Option<&HarnessPolicy> {
+        self.config.operator_ask.as_ref()?.harness.as_ref()
+    }
+
+    /// Explicitly delegated work, excluding noMerge and verified midstreams.
+    /// Unread midstreams cannot establish eligibility.
     fn harness_repository(&self, repository: &str) -> bool {
         let config = self.config;
         let named = |list: &[String]| list.iter().any(|r| r.eq_ignore_ascii_case(repository));
-        let owner = |r: &str| {
-            r.split_once('/')
-                .map(|(owner, _)| owner.to_ascii_lowercase())
+        let Some(policy) = self.harness_policy() else {
+            return false;
         };
         let Some(midstreams) = &self.midstreams else {
             return false;
         };
         config.works_in(repository)
-            && owner(repository).is_some_and(|o| owner(&config.dispatch_repo) == Some(o))
+            && named(&policy.repositories)
             && !named(&config.pr.poll.no_merge)
             && !named(midstreams)
     }
 
     /// Whether `facts` is harness work: in a [`Self::harness_repository`],
-    /// its labels all read, none of [`OPERATOR_LABELS`] and no
-    /// [`TARGET_LABEL_PREFIX`] label naming another organization.
+    /// its labels all read, no excluded label and no configured target label
+    /// naming another organization than the issue repository's owner.
     fn harness_item(&self, facts: &Facts) -> bool {
-        let ours = (self.config.dispatch_repo.split_once('/')).map_or("", |(owner, _)| owner);
-        let len = TARGET_LABEL_PREFIX.len();
+        let Some(policy) = self.harness_policy() else {
+            return false;
+        };
+        let ours = facts
+            .issue
+            .repository
+            .split_once('/')
+            .map_or("", |(owner, _)| owner);
+        let prefix = &policy.foreign_target_label_prefix;
+        let len = prefix.len();
         let foreign = |label: &str| {
-            (label.get(..len)).is_some_and(|p| p.eq_ignore_ascii_case(TARGET_LABEL_PREFIX))
+            (label.get(..len)).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
                 && (label.get(len..))
                     .is_some_and(|o| !o.is_empty() && !o.eq_ignore_ascii_case(ours))
         };
-        self.config.operator_ask.is_some()
-            && self.harness_repository(&facts.issue.repository)
+        self.harness_repository(&facts.issue.repository)
             && facts.labels_complete
-            && !OPERATOR_LABELS.iter().any(|l| facts.labelled(l))
+            && !policy.excluded_labels.iter().any(|l| facts.labelled(l))
             && !facts.labels.iter().any(|l| foreign(l))
     }
 
@@ -6307,8 +6368,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 && self.harness_item(facts)
                 && !self.operator_verdict(verdict, &c.body)
         });
-        if harness && !from.body.starts_with(HARNESS) {
-            return self.triage(read, HARNESS, (snapshot, target, slots));
+        let replan = self.harness_policy().map(|p| p.replan_text.as_str());
+        if harness
+            && let Some(text) = replan
+            && !from.body.starts_with(text)
+        {
+            return self.triage(read, text, (snapshot, target, slots));
         }
         let said = match harness {
             true => format!("{said}, harness work held for no one"),
@@ -6344,9 +6409,10 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
                 let again = (comments.iter().rev())
                     .filter(planned)
                     .take_while(|c| {
-                        [AGAIN, FOLLOW_THROUGH, HARNESS]
+                        [AGAIN, FOLLOW_THROUGH]
                             .iter()
                             .any(|s| c.body.starts_with(s))
+                            || replan.is_some_and(|s| c.body.starts_with(s))
                     })
                     .count();
                 let wait = backoff(FOLLOW_UP_SECONDS, again, days.whole_seconds());
@@ -6779,9 +6845,12 @@ impl<'a, C: Rest + Transport> Scheduler<'a, C> {
         if ASK_VERDICTS.contains(&verdict.as_str())
             && self.harness_item(facts)
             && !self.operator_verdict(&verdict, &c.body)
+            && let Some(policy) = self.harness_policy()
         {
             // Harness work, as in a follow-up (agent-board#778).
-            return self.triage((facts, comments), HARNESS, context).map(Some);
+            return self
+                .triage((facts, comments), &policy.replan_text, context)
+                .map(Some);
         }
         if ASK_VERDICTS.contains(&verdict.as_str()) {
             // A hold marker or an unconfirmed answer is not new direction.
