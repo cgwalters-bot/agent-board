@@ -150,6 +150,46 @@ Caller: in `cgwalters-forge/tracker`, `.github/pass.json`, set `notifications`
 to `true`, set `midstream: {"owner":"cgwalters-forge","topic":"bot-midstream"}`,
 and keep the existing pass token. No deployed config or token is changed here.
 
+## Hard-item pool mixing
+
+The concrete risk is a model variant bypassing its shared account's pace.
+On GitHub, `mix` is off by default and opts hard-item starts into sampling:
+
+```json
+"mix": {
+  "fable": {"share": 0.25, "when": ["P0", "review:deep", "epic"]},
+  "astra": {"share": 0.25, "when": ["P0", "review:deep", "epic"]}
+}
+```
+
+Only these two variant names are supported: `fable` draws on `pools.claude`,
+`astra` on `pools.openai`. Keep the variants out of pass `pools` and leave
+their caller pools-file `auto` settings false. Shares must be positive and
+sum to at most one; `when` is a nonempty OR of the listed selectors. `P0`
+matches board Priority, `review:deep` and `epic` match complete issue labels,
+and epic planning also matches `epic`. No title or body text is a selector.
+
+After ordinary pool admission, one bounded random draw assigns each variant
+its configured share of matching starts. A selected variant starts only if
+its parent account has a fresh, unheld reading and strictly positive room
+below pace (burst alone does not qualify). Otherwise the ordinary pool is
+kept; shares are not redistributed. Missing entropy also keeps that pool.
+This applies to stage 3 epic planning and stage 4 triage and unpinned job
+plans, not PR follow-up, maintenance, revisits or an explicit plan pool.
+Existing WIP, budget, lease and dispatch/write caps are unchanged; there are
+no extra network reads. Forgejo refuses the option rather than ignoring it.
+
+The generated plan, dispatch input, pass line, lease and caller run title
+keep the variant name. Reruns keep that name and pace by its parent account.
+Run conclusions remain in Actions alongside that title; the existing cost
+reader records the run summary's actual `model` and `outcome` for later model
+comparison, without a second outcome ledger. This change does not enable
+cost publication or change artifact retention.
+
+Caller activation is separate: in `cgwalters-forge/tracker`, file
+`.github/pass.json`, set `mix` to the object above. The caller's `pools.json`
+continues to resolve the variant models; no deployed configuration changes here.
+
 ## What is built
 
 The GitHub pass implements the configuration below and stages 1 to 5, except

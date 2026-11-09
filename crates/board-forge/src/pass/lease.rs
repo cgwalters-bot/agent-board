@@ -348,8 +348,13 @@ pub fn admit(
     lines: &mut Vec<String>,
 ) -> Result<std::result::Result<Held, String>> {
     let pool = request.pool;
+    let account = if config.mix.contains_key(pool) {
+        mix::account(pool).unwrap_or(pool)
+    } else {
+        pool
+    };
     let settings = (config.pools.0.iter())
-        .find(|(name, _)| name == pool)
+        .find(|(name, _)| name == account)
         .map(|(_, settings)| settings)
         .with_context(|| format!("{pool} is not in pools"))?;
     if request.overridden {
@@ -386,7 +391,12 @@ pub fn admit(
         true => (LEASE_SLOTS, false),
         false => {
             let snapshot = published_usage(client, config)?;
-            match slots(config, snapshot.as_ref(), (pool, settings), now) {
+            if account != pool
+                && !room(snapshot.as_ref(), account, settings, now).is_ok_and(|r| r > 0.0)
+            {
+                return Ok(Err(format!("{pool}'s account {account} is not under pace")));
+            }
+            match slots(config, snapshot.as_ref(), (account, settings), now) {
                 Ok(capacity) => capacity,
                 Err(why) => return Ok(Err(why)),
             }
